@@ -4,8 +4,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const REASON_APPROVAL_POLICY_NEVER: &str = "approval policy forbids approval requests";
-const REASON_APPROVAL_POLICY_ON_FAILURE: &str =
-    "deprecated on-failure approval policy does not allow native approval requests";
 const REASON_MATCHED_PERMISSION_RULE: &str = "matched permission rule";
 const REASON_NO_RULE: &str = "no permission rule matched; approval required";
 const REASON_NETWORK_ACCESS_DENIED: &str = "network access is denied by the permission profile";
@@ -30,10 +28,6 @@ pub enum NetworkAccess {
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalPolicy {
     Untrusted,
-    #[deprecated(
-        note = "Codex CLI keeps on-failure only as a deprecated historical mode; native runtime rejects approval escalation for it"
-    )]
-    OnFailure,
     OnRequest,
     Never,
 }
@@ -312,13 +306,6 @@ impl PolicyEngine {
             ApprovalPolicy::Never => PermissionDecision {
                 outcome: PermissionDecisionOutcome::Deny,
                 reason: REASON_APPROVAL_POLICY_NEVER.to_string(),
-                rule_id: decision.rule_id,
-                scope: decision.scope,
-            },
-            #[allow(deprecated)]
-            ApprovalPolicy::OnFailure => PermissionDecision {
-                outcome: PermissionDecisionOutcome::Deny,
-                reason: REASON_APPROVAL_POLICY_ON_FAILURE.to_string(),
                 rule_id: decision.rule_id,
                 scope: decision.scope,
             },

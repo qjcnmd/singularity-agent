@@ -1,96 +1,63 @@
-# Singularity Agent 指令
+# Singularity 仓库指令
 
-## 仓库事实入口
+## 事实入口与范围
 
-处理本仓库任务前，先读取 `.codex/repo-map.json`，用它定位最小相关文件集，不要默认全仓扫描。根据 repo map 判断入口、类、函数、导入导出和相邻测试；只有范围明确后再读源码。`.codex/repo-map.json` 是本地缓存，CI / 新克隆不能依赖它存在或为最新；除非缺失、过期或明显不一致，否则不要刷新；刷新需要使用本地 `repo-mapping` skill，且不要提交该文件。
+1. 先读取 `.codex/repo-map.json` 定位最小相关 Rust crate、符号和测试；该文件不存在或明显过期时，使用本地 `repo-mapping` skill 刷新，但不要提交。
+2. 先读实现、调用方、配置和相邻测试，再修改。不要把报告、旧文档或历史提交当作当前事实。
+3. 默认不读取 `.git/`、`.singularity/`、`target/`、`work/` 或其他运行产物，除非任务明确涉及 Git、缓存、产物或环境诊断。
+4. 不读取、输出或提交 `.env` 中的敏感值；环境检查只报告脱敏的 present/missing 状态。
 
-默认不要读取这些路径，除非任务明确涉及运行状态、缓存、产物或环境诊断：`.git/`、`.singularity/`、`.venv/`、`.pytest_cache/`、`.ruff_cache/`、`outputs/`、`work/`、`__pycache__/`。不要读取 `.env`，除非用户明确要求环境诊断并确认可以检查敏感值。
+## 命令与磁盘
 
-## 当前结构原则
+1. Windows 上所有仓库命令必须通过 PowerShell 7（`pwsh.exe`）执行，不使用 Windows PowerShell 5.1。
+2. Rust 构建和测试优先为单次命令设置 `CARGO_TARGET_DIR` 到空间充足的非系统盘，并复用同一目录；不要修改用户的全局 Cargo 配置。
+3. 尽量不占用 C 盘。任务完成后，默认删除本次产生且可重建的 Cargo target、临时 evaluation、测试缓存、日志、临时工作树和一次性中间文件；用户明确要求保留时除外。
+4. 删除或移动目录前先解析并校验绝对路径位于当前工作区或本次明确指定的临时目录。不得删除源码、用户数据、任务开始前已存在且归属不明的产物。
+5. 最终回复说明已清理的产物，以及因交付或后续验证而保留的内容。
 
-当前工作树只表达当前真实结构，历史信息由 git history 保留。不要保留旧阶段报告、旧优先级报告、旧生产审查报告、旧路线图报告、旧 manifest、旧命名文档或兼容说明。仓库文档只描述当前源码树中真实存在的结构、字段、调用链、schema、CLI 入口和数据流。
+## Rust-only 边界
 
-除非用户明确要求兼容，不允许实现或恢复兼容垫片、旧 schema、弃用别名、迁移读取入口、旧 CLI 入口、旧类名 re-export、旧 schema alias 或旧命名读取逻辑。不要为了文档或测试制造无运行价值字段，也不要把解释性概念硬塞进 runtime、result schema 或 trace payload。
+1. Singularity 的实现、构建、测试、持续集成（CI）和发布链路只使用 Rust。不要新增 Python runtime、包、脚本、测试、oracle、parity fixture、sidecar 或兼容入口。
+2. `sg` 只通过 stdio JSON-RPC 调用 `singularity_app_server`；CLI 不直接依赖 agent、model、tools 或 store crate。
+3. 当前工作树只保留当前真实结构。历史命名、schema、CLI、环境变量和迁移说明由 Git 历史保存，不新增兼容垫片、弃用别名、迁移读取入口或旧路径 re-export。
+4. Evaluation 使用 `evaluation`、`eval`、`task`、`task set`、`runner`、`result`、`report` 等主流命名，不恢复迁移期自造分类。
 
-## 命名规则
+## 运行时与安全
 
-生产运行时对象、文件、schema 和 CLI 命令使用主流领域命名。Evaluation 相关命名必须使用 `evaluation`、`eval`、`evaluator`、`evaluation harness`、`benchmark`、`task`、`task set`、`result`、`report`、`runner`、`experiment` 等主流概念；不要恢复 `live` 命名。
+1. 主链路为 `sg -> AppServer -> AgentLoop -> ToolBroker -> WorkspaceTools -> SandboxBackend -> SessionStore`。
+2. sandbox 保持 fail closed，并复用仓库内来自 Codex 的 Windows restricted-token、Job Object 和 elevated helper 实现。不得增加 local-process、no-sandbox 或 relaxed fallback。
+3. `workspace-write` 下的命令必须在严格 sandbox 内执行；网络默认拒绝。权限、approval、protected path、cwd canonicalization 和越界写入检查不得弱化。
+4. 取消必须传播到 provider 和在途 sandbox command；取消请求之后的晚到 completion、assistant item 或 terminal trace 不得覆盖 interrupted 状态。
+5. provider 原始响应、prompt、tool raw arguments、环境变量、密钥和内部 audit metadata 不得进入公共 CLI、model tool payload 或未脱敏 trace。
 
-不要引入提示词污染式名称、解释性静态字段、重复 alias 字段或非主流自造名。用户明确要求移除兼容层时，修复现有路径，不要建立并行结构。
+## 文档
 
-## 范围纪律
+1. `docs/singularity.md` 是唯一架构事实文档，只描述当前 Rust 源码中的 crate 边界、对象、调用链、持久化和失败路径。
+2. 主链路、协议、状态映射、sandbox、approval、provider、evaluation、trace 或 store 变化时，同步更新 `docs/singularity.md` 的相关部分。
+3. 不恢复 `docs/architecture/modules/`、迁移报告、阶段报告、旧路线图或 Python 时代文档。
 
-代码任务从映射出的子系统和对应测试开始，保持改动在任务边界内，保留当前运行时分层，不做无关清理。涉及大改、重构、删除、迁移或高风险操作前，先简短说明影响。
+## 验证
 
-## 临时产物与磁盘清理
-
-执行任务时应尽量减少 C 盘占用。每次任务完成后，默认及时释放本次任务在 C 盘产生且不属于交付物的可重建产物，包括 Cargo `target/`、测试/覆盖率缓存、临时 evaluation 输出、调试日志、临时工作树和一次性中间文件；只有用户明确要求保留时才不清理。不得删除用户数据、源码、提交所需文件或任务开始前已存在且归属不明的产物。
-
-产生较大 Rust 构建产物时，优先通过单次命令的 `CARGO_TARGET_DIR` 将产物放到空间充足的非系统盘或复用同一个共享目录，不修改全局 Cargo 配置，不为并行任务重复创建独立 `target/`。执行递归清理前必须校验解析后的绝对路径位于仓库或本次任务明确指定的临时目录内。最终回复需说明清理了什么，以及因验证、交付或用户要求而保留了什么。
-
-## 模块数据流文档
-
-仓库级主调用结构图位于：
-
-```text
-docs/singularity.md
-```
-
-该文件记录当前 CLI -> KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop -> ToolProtocolEngine -> ToolExecutor -> FinalReport 的主链路和全部分支路径。任何改变主链路、状态映射、错误码路由、工具协议执行、最终化、失败分析、shutdown/finalize 或 trace/report 生成路径的变更，都必须同步更新本文件对应段落；只更新受影响段落，不重写整份结构图。结构图内容必须来自当前源码或明确指定的提交快照，不允许保留过期行号、历史评审标签、旧命名或未实现设计。
-
-核心模块文档位于：
-
-```text
-docs/architecture/modules/
-```
-
-每个核心模块必须有一份中文“模块数据流”文档。文档以当前源码为唯一事实来源，按真实模块边界组织，不按历史阶段、历史任务或旧报告组织。文档展示真实对象时必须列出当前源码完整字段，不允许只列子集。
-
-每份模块文档必须包含：
-
-- 这一层解决什么问题
-- 当前源码位置
-- 关键类、函数、字段
-- 真实运行时调用链
-- 真实对象完整结构
-- 谁生成这些对象
-- 谁消费这些对象
-- 是否落盘
-- 是否进入 trace / audit
-- 失败路径
-- 当前结构问题
-- 维护规则
-
-代码结构、模块边界、类、字段、函数、调用链、CLI、schema、manifest、trace event、report schema、evaluation result 变化时，必须同步更新对应模块文档；如果变化影响主链路或分支路径，也必须同步更新 `docs/singularity.md` 的对应部分。模块文档必须用中文客观描述；英文术语可以保留，但首次出现要给中文说明。
-
-完成运行时敏感变更前运行：
+根据影响范围运行以下检查；完整收口必须全部执行：
 
 ```text
-python scripts/verify_runtime_docs.py
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
+cargo test --workspace --all-targets --locked --no-fail-fast
+git diff --check
 ```
 
-最终回复需要说明修改了哪些源码文件、更新了哪些 `docs/architecture/modules/*.md` 文件，以及是否更新了 `docs/singularity.md`；如果没有更新这些运行时文档，必须说明该变更为什么不影响已记录的数据流或主调用结构图。
-
-## 真实模型验证
-
-Singularity 是生产级本地 CLI coding agent harness。任何影响 agent 能力、执行行为、模型交互、prompt assembly、context management、tool exposure、tool execution、planner、repair flow、verification flow、evaluation harness、CLI task execution、tracing、reporting、policy/approval 或 benchmark 行为的改动，必须至少运行一次真实模型验证。
-
-Fake provider、mock provider、unit tests 和 synthetic harness tests 只能作为辅助验证，不能替代最终 agent 能力验证。
-
-真实验证要求：
-
-1. 先运行相关 unit/static checks，再运行至少一个真实模型 Singularity agent 验证。
-2. 真实验证必须进入真实 AgentLoop 路径，例如 `KernelBootstrap -> AgentGraphBuilder -> AgentKernel -> AgentLoop.run`。
-3. 不要绕过 AgentLoop 直接调用 Planner、ToolExecutor、VerificationRunner、FailureAnalyzer、RepairPlanner 或 EvaluationHarness internals 来声称真实验证。
-4. 使用项目现有 `.env` / 配置加载路径读取 provider 配置。不要打印、复制、提交或暴露 API keys、secrets、原始敏感 trace、截图或 markdown。
-5. 环境就绪检查只报告脱敏状态，例如 `SINGULARITY_API_KEY=present(redacted)`、`SINGULARITY_BASE_URL=present`、`SINGULARITY_MODEL=present`。
-6. Evaluation/benchmark 工作优先运行真实 evaluation benchmark：
+影响 AgentLoop、provider、工具、sandbox、approval、evaluation、trace 或 completion 的改动还必须运行至少一次真实 provider 验证：
 
 ```text
 cargo run -p singularity_cli --bin sg -- eval run docs/evaluation/public-representative-task.json --run-id <meaningful-run-id> --json
 ```
 
-7. 非 evaluation 的 agent 变更运行能覆盖变更路径的最小真实任务，但仍必须使用真实模型 provider 和真实 AgentLoop。
-8. 最终输出必须包括真实模型命令、脱敏 provider/model/config 状态、是否进入 AgentLoop、是否不是 fake/scripted/mock/fallback、result/report/trace artifact 路径、状态、turn/tool 统计、verification result 和失败摘要。
-9. 如果真实模型验证无法运行，必须明确分类 blocker：`.env` not found or not loaded、required env var missing、authentication/provider error、base_url/network error、model name/config error、sandbox/permission error、AgentLoop/runtime error、verification failure、user explicitly prohibited real model calls。
-10. 不要静默用 fake-provider tests 替代真实验证。真实模型调用成功或 blocker 被修复前，任务不能算完全验证。
+真实验证必须进入 Rust AgentLoop，不能用 fake、mock、scripted provider 或直接调用内部组件替代。无法运行时明确分类 `.env`、配置、认证、网络、模型、sandbox、runtime 或 verification blocker，不得声称完全验证。
+
+## Git
+
+1. 修改前确认仓库、分支、工作树和用户未提交改动；不覆盖无关内容。
+2. 验证通过后创建范围单一、信息明确的本地提交。
+3. 未经用户明确要求不得 push、merge、rebase、reset、删除 stash 或改写历史。

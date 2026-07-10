@@ -1641,7 +1641,7 @@ fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
         AgentStatus::Blocked => TurnStatus::Blocked,
         AgentStatus::CancelRequested | AgentStatus::Cancelled => TurnStatus::Interrupted,
         AgentStatus::Running => TurnStatus::Running,
-        AgentStatus::Failed | AgentStatus::NotMigrated => TurnStatus::Failed,
+        AgentStatus::Failed => TurnStatus::Failed,
     }
 }
 
@@ -2143,7 +2143,7 @@ mod tests {
             tool_call_id: "call_1".to_string(),
             tool_name: TOOL_COMMAND.to_string(),
             raw_arguments: json!({
-                "argv": ["python", "-c", "print('ok')"],
+                "argv": ["test-program", "success"],
                 "sandbox_mode": "workspace_write",
                 "network_access": "allowed"
             })
@@ -2230,7 +2230,7 @@ mod tests {
             "approved",
         );
         let valid_command = json!({
-            "argv": ["python", "-c", "print('ok')"],
+            "argv": ["test-program", "success"],
             "sandbox_mode": "workspace_write",
             "network_access": "allowed"
         })

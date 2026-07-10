@@ -38,7 +38,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
         .create_thread(Some("gpt-test"), Some("C:/repo"))
         .expect("thread");
     let turn = store
-        .create_turn(&thread.thread_id, "not_migrated")
+        .create_turn(&thread.thread_id, "running")
         .expect("turn");
     let item = store
         .append_item(
@@ -251,7 +251,7 @@ fn missing_thread_turn_event_and_artifact_refs_fail_closed() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
 
     assert!(matches!(
-        store.create_turn("missing_thread", "not_migrated"),
+        store.create_turn("missing_thread", "running"),
         Err(StoreError::NotFound(message)) if message == "thread missing_thread"
     ));
     assert!(matches!(
@@ -760,7 +760,7 @@ fn transactional_turn_start_rolls_back_when_trace_insert_fails() {
 
     let failed = store.create_turn_with_input_and_trace(
         &thread.thread_id,
-        "not_migrated",
+        "running",
         serde_json::json!([{"type": "text", "text": "rollback"}]),
         "test",
         "rollback trace",
@@ -771,7 +771,7 @@ fn transactional_turn_start_rolls_back_when_trace_insert_fails() {
     let successful = store
         .create_turn_with_input_and_trace(
             &thread.thread_id,
-            "not_migrated",
+            "running",
             serde_json::json!([{"type": "text", "text": "ok"}]),
             "test",
             "turn trace",

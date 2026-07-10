@@ -206,11 +206,7 @@ fn registry_rejects_duplicate_tools() {
 fn registry_accepts_only_stable_tool_namespaces() {
     let mut registry = ToolRegistry::default();
 
-    for name in [
-        "builtin.shell",
-        "mcp.github.search",
-        "python.formatter.black",
-    ] {
+    for name in ["builtin.shell", "mcp.github.search"] {
         registry
             .register(ToolSpec::new(
                 name,
@@ -220,7 +216,13 @@ fn registry_accepts_only_stable_tool_namespaces() {
             .expect("stable namespace is accepted");
     }
 
-    for name in ["read_file", "builtin", "mcp.github", "python..tool"] {
+    for name in [
+        "read_file",
+        "builtin",
+        "mcp.github",
+        "mcp..tool",
+        "plugin.formatter.run",
+    ] {
         let result = registry.register(ToolSpec::new(
             name,
             "Tool description",
@@ -291,7 +293,7 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
         "session_1",
         "task_1",
         "call_2",
-        "python.missing.tool",
+        "mcp.missing.tool",
         "{}",
     );
     let unknown = broker.execute(&missing, ToolBrokerDecision::Allow, |_envelope| {
@@ -306,8 +308,8 @@ fn broker_executes_allowed_tool_and_tool_result_payload_stays_safe() {
     let mut broker = ToolBroker::default();
     broker
         .register(ToolSpec::new(
-            "python.formatter.black",
-            "Format Python code",
+            "mcp.formatter.run",
+            "Format code",
             serde_json::json!({"type": "object"}),
         ))
         .expect("register tool");
@@ -316,7 +318,7 @@ fn broker_executes_allowed_tool_and_tool_result_payload_stays_safe() {
         "session_1",
         "task_1",
         "call_1",
-        "python.formatter.black",
+        "mcp.formatter.run",
         r#"{"path": ".env"}"#,
     );
 
@@ -327,7 +329,7 @@ fn broker_executes_allowed_tool_and_tool_result_payload_stays_safe() {
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
     assert!(tool_result.ok);
-    assert_eq!(payload["tool_name"], "python.formatter.black");
+    assert_eq!(payload["tool_name"], "mcp.formatter.run");
     assert!(!serialized.contains("raw_arguments"));
     assert!(!serialized.contains(".env"));
 }
@@ -1048,7 +1050,7 @@ fn workspace_command_tool_fails_closed_without_sandbox_backend() {
     let tools = WorkspaceTools::new(&workspace);
 
     let result = tools.command(CommandToolInput {
-        argv: python_command("print('should not run')"),
+        argv: test_command("must-not-run"),
         cwd: None,
         timeout_seconds: Some(5),
         sandbox_mode: None,
@@ -1068,7 +1070,7 @@ fn workspace_command_tool_rejects_non_strict_backend_without_execution() {
     let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(NonStrictSandboxBackend);
 
     let result = tools.command(CommandToolInput {
-        argv: python_command("print('should not run')"),
+        argv: test_command("must-not-run"),
         cwd: None,
         timeout_seconds: Some(5),
         sandbox_mode: None,
@@ -1089,7 +1091,7 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
 
     let result = tools
         .command(CommandToolInput {
-            argv: python_command("print('command ok')"),
+            argv: test_command("success"),
             cwd: None,
             timeout_seconds: Some(5),
             sandbox_mode: None,
@@ -1126,7 +1128,7 @@ fn workspace_command_tool_records_audit_for_explicit_danger_full_access() {
 
     let result = tools
         .command(CommandToolInput {
-            argv: python_command("print('command ok')"),
+            argv: test_command("success"),
             cwd: None,
             timeout_seconds: Some(5),
             sandbox_mode: Some(SandboxFilesystemMode::DangerFullAccess),
@@ -1162,9 +1164,9 @@ fn workspace_command_tool_records_audit_for_explicit_danger_full_access() {
 #[test]
 fn command_scope_digest_binds_exact_argv_cwd_and_timeout() {
     let argv = vec![
-        "python".to_string(),
-        "-c".to_string(),
-        "print('A')".to_string(),
+        "test-program".to_string(),
+        "--check".to_string(),
+        "A".to_string(),
     ];
     let base = command_scope_digest(
         &argv,
@@ -1175,7 +1177,7 @@ fn command_scope_digest_binds_exact_argv_cwd_and_timeout() {
     );
     assert_eq!(
         base,
-        "sha256:09435cb1188173d01bddfe96a06a92333a3242b26ff7c68c7df670791c37cc0c"
+        "sha256:ece623945e0ecd850e29830be37f7c47675c84314d8a5f8304653e808154479b"
     );
     let resource = singularity_tools::command_scope_resource(
         &argv,
@@ -1192,9 +1194,9 @@ fn command_scope_digest_binds_exact_argv_cwd_and_timeout() {
         base,
         command_scope_digest(
             &[
-                "python".to_string(),
-                "-c".to_string(),
-                "print('a')".to_string()
+                "test-program".to_string(),
+                "--check".to_string(),
+                "a".to_string()
             ],
             ".",
             5,
@@ -1322,18 +1324,8 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }
 
-fn python_command(code: &str) -> Vec<String> {
-    vec![python_bin(), "-c".to_string(), code.to_string()]
-}
-
-fn python_bin() -> String {
-    std::env::var("PYTHON").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "python".to_string()
-        } else {
-            "python3".to_string()
-        }
-    })
+fn test_command(argument: &str) -> Vec<String> {
+    vec!["test-program".to_string(), argument.to_string()]
 }
 
 #[cfg(windows)]

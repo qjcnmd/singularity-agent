@@ -14,15 +14,6 @@ const BUILTIN_TOOL_NAMES: [&str; 6] = [
     "builtin.command",
 ];
 
-const LEGACY_TOOL_NAMES: [&str; 6] = [
-    "read_file",
-    "search_text",
-    "edit_apply",
-    "apply_patch",
-    "run_verification",
-    "inspect_diff",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TaskId(String);
 
@@ -355,9 +346,6 @@ fn validate_remote_repository(value: &str) -> Result<(), String> {
 }
 
 fn validate_tool_name(value: &str) -> Result<(), String> {
-    if LEGACY_TOOL_NAMES.contains(&value) {
-        return Err(format!("unsupported legacy tool name: {value}"));
-    }
     if BUILTIN_TOOL_NAMES.contains(&value) {
         Ok(())
     } else {

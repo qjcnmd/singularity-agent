@@ -115,25 +115,22 @@ fn allowed_profile_network_still_requires_a_matching_rule() {
 
 #[test]
 fn policy_engine_evaluates_hooks_and_rules_in_fail_closed_order() {
-    let request = PermissionRequest::new(
-        "builtin.shell",
-        PermissionOperation::Execute,
-        "python -m pytest",
-    );
+    let request =
+        PermissionRequest::new("builtin.shell", PermissionOperation::Execute, "cargo test");
     let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
         .with_rule(rule(
             "allow_test",
             SettingsScope::Project,
             PermissionDecisionOutcome::Allow,
             PermissionOperation::Execute,
-            "python -m pytest",
+            "cargo test",
         ))
         .with_rule(rule(
             "deny_test",
             SettingsScope::User,
             PermissionDecisionOutcome::Deny,
             PermissionOperation::Execute,
-            "python -m pytest",
+            "cargo test",
         ));
 
     let decision = engine.evaluate(&request);
@@ -193,18 +190,15 @@ fn sensitive_resources_are_denied_when_marked_by_caller() {
 
 #[test]
 fn explicit_ask_rule_creates_approval_flow() {
-    let request = PermissionRequest::new(
-        "builtin.shell",
-        PermissionOperation::Execute,
-        "python -m pytest",
-    );
+    let request =
+        PermissionRequest::new("builtin.shell", PermissionOperation::Execute, "cargo test");
     let decision = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
         .with_rule(rule(
             "ask_tests",
             SettingsScope::Project,
             PermissionDecisionOutcome::Ask,
             PermissionOperation::Execute,
-            "python -m pytest",
+            "cargo test",
         ))
         .evaluate(&request);
 
@@ -227,12 +221,12 @@ fn approval_policy_never_turns_approval_requests_into_deny() {
             SettingsScope::Project,
             PermissionDecisionOutcome::Ask,
             PermissionOperation::Execute,
-            "python -m pytest",
+            "cargo test",
         ))
         .evaluate(&PermissionRequest::new(
             "builtin.shell",
             PermissionOperation::Execute,
-            "python -m pytest",
+            "cargo test",
         ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
@@ -251,35 +245,16 @@ fn approval_policy_untrusted_preserves_approval_requests() {
             SettingsScope::Project,
             PermissionDecisionOutcome::Ask,
             PermissionOperation::Execute,
-            "python -m pytest",
+            "cargo test",
         ))
         .evaluate(&PermissionRequest::new(
             "builtin.shell",
             PermissionOperation::Execute,
-            "python -m pytest",
+            "cargo test",
         ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Ask);
     assert_eq!(decision.rule_id.as_deref(), Some("ask_tests"));
-}
-
-#[allow(deprecated)]
-#[test]
-fn deprecated_on_failure_policy_is_rejected_as_native_approval_path() {
-    let mut profile = PermissionProfile::workspace_write("C:/repo");
-    profile.approval_policy = ApprovalPolicy::OnFailure;
-
-    let decision = PolicyEngine::new(profile).evaluate(&PermissionRequest::new(
-        "builtin.shell",
-        PermissionOperation::Execute,
-        "python -m pytest",
-    ));
-
-    assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
-    assert_eq!(
-        decision.reason,
-        "deprecated on-failure approval policy does not allow native approval requests"
-    );
 }
 
 #[test]
@@ -291,7 +266,7 @@ fn explicit_danger_full_access_profile_does_not_bypass_approval_policy() {
     let decision = PolicyEngine::new(profile).evaluate(&PermissionRequest::new(
         "builtin.command",
         PermissionOperation::Execute,
-        "python -m pytest",
+        "cargo test",
     ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
@@ -311,23 +286,20 @@ fn unmatched_permission_requests_require_approval() {
 #[test]
 fn equivalent_shell_forms_are_not_a_policy_special_case() {
     let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(rule(
-        "deny_pytest",
+        "deny_cargo_test",
         SettingsScope::Managed,
         PermissionDecisionOutcome::Deny,
         PermissionOperation::Execute,
-        "python -m pytest",
+        "cargo test",
     ));
 
     let wrapped = PermissionRequest::new(
         "builtin.shell",
         PermissionOperation::Execute,
-        "cmd.exe /c python -m pytest",
+        "cmd.exe /c cargo test",
     );
-    let normalized = PermissionRequest::new(
-        "builtin.shell",
-        PermissionOperation::Execute,
-        "python -m pytest",
-    );
+    let normalized =
+        PermissionRequest::new("builtin.shell", PermissionOperation::Execute, "cargo test");
 
     assert_eq!(
         engine.evaluate(&wrapped).outcome,

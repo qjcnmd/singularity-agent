@@ -13,8 +13,6 @@ use singularity_protocol::{InitializeParams, JsonRpcMessage, Method};
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
 const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
-const LEGACY_PYTHON_RUNTIME_ENV_PREFIXES: [&str; 2] =
-    ["SINGULARITY_PYTHON_", "SINGULARITY_SIDECAR_"];
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const CLI_CLIENT_NAME: &str = "singularity_cli";
 const CLI_CLIENT_TITLE: &str = "Singularity Rust CLI";
@@ -50,14 +48,6 @@ enum Command {
     },
     /// Start a thread, submit a goal, and render protocol events.
     Run {
-        goal: String,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Alias for run with chat-oriented wording.
-    Chat {
         goal: String,
         #[arg(long)]
         model: Option<String>,
@@ -177,7 +167,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             ))
         }
         Command::Daemon { db } => run_daemon(db),
-        Command::Run { goal, model, json } | Command::Chat { goal, model, json } => {
+        Command::Run { goal, model, json } => {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
@@ -414,7 +404,6 @@ fn run_daemon(db: Option<PathBuf>) -> Result<(), String> {
     if let Some(db) = db {
         command.env(APP_SERVER_DB_ENV, db);
     }
-    scrub_legacy_python_runtime_env(&mut command);
     let status = command
         .status()
         .map_err(|error| format!("failed to start app-server daemon: {error}"))?;
@@ -422,18 +411,6 @@ fn run_daemon(db: Option<PathBuf>) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("app-server daemon exited with {status}"))
-    }
-}
-
-fn scrub_legacy_python_runtime_env(command: &mut ProcessCommand) {
-    for (name, _) in std::env::vars_os() {
-        let name_upper = name.to_string_lossy().to_ascii_uppercase();
-        if LEGACY_PYTHON_RUNTIME_ENV_PREFIXES
-            .iter()
-            .any(|prefix| name_upper.starts_with(prefix))
-        {
-            command.env_remove(name);
-        }
     }
 }
 
@@ -453,7 +430,6 @@ impl AppServerClient {
         if let Ok(db) = std::env::var(APP_SERVER_DB_ENV) {
             command.env(APP_SERVER_DB_ENV, db);
         }
-        scrub_legacy_python_runtime_env(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("failed to start app-server: {error}"))?;
@@ -544,10 +520,8 @@ impl AppServerClient {
         ))?;
         let mut turn = first_result_ref(&responses)?.clone();
         if render {
-            render_messages(&responses, should_render_assistant_alias(&turn["turn"]));
-            if should_render_response_turn(&responses, &turn["turn"]) {
-                render_turn(&turn["turn"]);
-            }
+            render_messages(&responses, should_render_assistant_summary(&turn["turn"]));
+            render_turn(&turn["turn"]);
         }
         if should_poll_running_turn(&turn["turn"]) {
             let terminal =
@@ -875,12 +849,6 @@ fn first_result_ref(messages: &[Value]) -> Result<&Value, String> {
         .ok_or_else(|| "app-server response did not include result".to_string())
 }
 
-fn has_method(messages: &[Value], method: &str) -> bool {
-    messages
-        .iter()
-        .any(|message| message["method"].as_str() == Some(method))
-}
-
 fn protocol_events(messages: Vec<Value>) -> Vec<Value> {
     messages
         .into_iter()
@@ -907,7 +875,7 @@ fn safe_protocol_event(message: Value) -> Option<Value> {
     }
 }
 
-fn render_messages(messages: &[Value], render_assistant_alias: bool) {
+fn render_messages(messages: &[Value], render_assistant_summary: bool) {
     for message in messages {
         if let Some(method) = message["method"].as_str() {
             match method {
@@ -933,7 +901,7 @@ fn render_messages(messages: &[Value], render_assistant_alias: bool) {
                         .or_else(|| message["params"]["output"].as_str())
                         .unwrap_or("");
                     println!("{method} {text}");
-                    if render_assistant_alias && method == "item/agentMessage/delta" {
+                    if render_assistant_summary && method == "item/agentMessage/delta" {
                         println!("assistant {text}");
                     }
                 }
@@ -943,16 +911,9 @@ fn render_messages(messages: &[Value], render_assistant_alias: bool) {
     }
 }
 
-fn should_render_assistant_alias(turn: &Value) -> bool {
+fn should_render_assistant_summary(turn: &Value) -> bool {
     turn["status"].as_str() == Some("completed")
         && turn["agent_loop_status"].as_str() == Some("completed")
-}
-
-fn should_render_response_turn(messages: &[Value], turn: &Value) -> bool {
-    if !has_method(messages, "turn/started") {
-        return true;
-    }
-    turn["agent_loop_status"].as_str() != Some("not_migrated")
 }
 
 fn should_poll_running_turn(turn: &Value) -> bool {
@@ -998,10 +959,7 @@ fn fail_for_failed_turn(turn: &Value) -> Result<(), String> {
     let non_terminal_running = status == "running" && !should_poll_running_turn(turn);
     if non_terminal_running
         || matches!(status, "failed" | "blocked" | "interrupted" | "cancelled")
-        || matches!(
-            agent_loop_status,
-            "failed" | "blocked" | "cancelled" | "not_migrated"
-        )
+        || matches!(agent_loop_status, "failed" | "blocked" | "cancelled")
     {
         let turn_id = turn["turn_id"].as_str().unwrap_or("");
         if turn_id.is_empty() {

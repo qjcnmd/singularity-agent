@@ -124,7 +124,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":5,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":5,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
     assert!(
@@ -514,7 +514,7 @@ fn app_server_reports_native_agent_loop_capability_as_unsupported_off_windows() 
 }
 
 #[test]
-fn app_server_eval_run_writes_blocked_native_result_artifacts_without_python_sidecar() {
+fn app_server_eval_run_writes_blocked_native_result_artifacts_without_fallback() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
@@ -749,7 +749,7 @@ fn app_server_rejects_public_agent_host_selector() {
 
     let response = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
 
@@ -781,7 +781,7 @@ fn public_agent_host_rejection_does_not_create_turn() {
 
     let response = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
 
@@ -820,7 +820,7 @@ fn turn_start_rejects_agent_host_selector_before_turn_creation() {
 
     let response = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"python","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
 

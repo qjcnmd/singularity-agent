@@ -23,7 +23,7 @@ fn valid_manifest() -> Value {
                         "commit": IMMUTABLE_COMMIT
                     },
                     "setup_commands": [
-                        {"argv": ["python", "-m", "pip", "install", "-e", "."]}
+                        {"argv": ["cargo", "fetch"]}
                     ]
                 },
                 "agent": {
@@ -38,10 +38,8 @@ fn valid_manifest() -> Value {
                     "smoke_commands": [
                         {
                             "argv": [
-                                "python",
-                                "-m",
-                                "py_compile",
-                                "src/sqlfluff/rules/L060.py"
+                                "cargo",
+                                "check"
                             ],
                             "timeout_seconds": 60
                         }
@@ -56,10 +54,9 @@ fn valid_manifest() -> Value {
                         "commands": [
                             {
                                 "argv": [
-                                    "python",
-                                    "-m",
-                                    "pytest",
-                                    "test/rules/std_L060_test.py::test__rules__std_L060_raised"
+                                    "cargo",
+                                    "test",
+                                    "--workspace"
                                 ]
                             }
                         ]
@@ -68,10 +65,9 @@ fn valid_manifest() -> Value {
                         "commands": [
                             {
                                 "argv": [
-                                    "python",
-                                    "-m",
-                                    "pytest",
-                                    "test/rules/std_L060_test.py::test__rules__std_L060_raised"
+                                    "cargo",
+                                    "test",
+                                    "--workspace"
                                 ]
                             }
                         ]
@@ -80,10 +76,9 @@ fn valid_manifest() -> Value {
                         "commands": [
                             {
                                 "argv": [
-                                    "python",
-                                    "-m",
-                                    "pytest",
-                                    "test/rules/std_L060_test.py::test__rules__std_L060_raised"
+                                    "cargo",
+                                    "test",
+                                    "--workspace"
                                 ]
                             }
                         ]
@@ -293,7 +288,7 @@ fn task_paths_reject_parent_absolute_ads_and_backslash_forms() {
 #[test]
 fn commands_require_nonempty_argv_arrays_and_reject_shell_string_wrappers() {
     let mut raw_string = valid_manifest();
-    raw_string["tasks"][0]["evaluator"]["public"]["commands"] = json!(["python -m pytest"]);
+    raw_string["tasks"][0]["evaluator"]["public"]["commands"] = json!(["cargo test"]);
     assert!(parse_manifest(&raw_string).is_err());
 
     let mut empty_argv = valid_manifest();
@@ -301,10 +296,10 @@ fn commands_require_nonempty_argv_arrays_and_reject_shell_string_wrappers() {
     assert!(parse_manifest(&empty_argv).is_err());
 
     for argv in [
-        json!(["sh", "-c", "python -m pytest"]),
-        json!(["bash", "-c", "python -m pytest"]),
-        json!(["cmd.exe", "/C", "python -m pytest"]),
-        json!(["powershell.exe", "-Command", "python -m pytest"]),
+        json!(["sh", "-c", "cargo test"]),
+        json!(["bash", "-c", "cargo test"]),
+        json!(["cmd.exe", "/C", "cargo test"]),
+        json!(["powershell.exe", "-Command", "cargo test"]),
     ] {
         let mut shell = valid_manifest();
         shell["tasks"][0]["evaluator"]["public"]["commands"] = json!([{"argv": argv}]);
@@ -340,23 +335,6 @@ fn remote_git_workspace_requires_remote_url_and_full_immutable_commit() {
 }
 
 #[test]
-fn legacy_tool_names_are_rejected_instead_of_aliased() {
-    for legacy in [
-        "read_file",
-        "search_text",
-        "edit_apply",
-        "apply_patch",
-        "run_verification",
-        "inspect_diff",
-    ] {
-        let mut manifest = valid_manifest();
-        manifest["tasks"][0]["agent"]["allowed_tools"] = json!([legacy]);
-        let error = parse_manifest(&manifest).expect_err("reject legacy tool name");
-        assert!(error.to_string().contains("legacy tool name"), "{legacy}");
-    }
-}
-
-#[test]
 fn evaluation_commands_default_to_denied_network_and_allow_explicit_opt_in() {
     let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
     let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
@@ -377,7 +355,7 @@ fn evaluation_commands_default_to_denied_network_and_allow_explicit_opt_in() {
 
 #[test]
 fn evaluation_rejects_unimplemented_tool_namespaces() {
-    for unsupported in ["python.plugin.tool", "mcp.server.tool", "builtin.unknown"] {
+    for unsupported in ["plugin.server.tool", "mcp.server.tool", "builtin.unknown"] {
         let mut manifest = valid_manifest();
         manifest["tasks"][0]["agent"]["allowed_tools"] = json!([unsupported]);
         let error = parse_manifest(&manifest).expect_err("reject unsupported tool");
@@ -533,14 +511,14 @@ fn blocked_status_requires_a_typed_blocker() {
 }
 
 #[test]
-fn public_representative_v2_manifest_is_validated_by_the_crate() {
+fn public_representative_manifest_is_validated_by_the_crate() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("docs")
         .join("evaluation")
-        .join("public-representative-task-v2.json");
-    let manifest = EvaluationManifest::load(&path).expect("load v2 public manifest");
+        .join("public-representative-task.json");
+    let manifest = EvaluationManifest::load(&path).expect("load public manifest");
 
     assert_eq!(manifest.task_set().tasks.len(), 1);
     let projection = manifest.task_set().tasks[0].agent_projection();

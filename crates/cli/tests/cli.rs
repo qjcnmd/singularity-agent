@@ -287,9 +287,9 @@ fn cli_rejects_native_run_when_capability_is_disabled() {
                 "agent/capability",
                 native_capability(
                     false,
-                    "not_migrated",
-                    "not migrated",
-                    &["model_provider_adapter"],
+                    "blocked",
+                    "sandbox unavailable",
+                    &["strict_command_sandbox_unavailable"],
                 ),
             )
             .shutdown()
@@ -303,7 +303,7 @@ fn cli_rejects_native_run_when_capability_is_disabled() {
 
     assert!(!output.status.success());
     assert!(stderr(&output).contains(
-        "Rust AgentLoop is not available: status=not_migrated; blockers=model_provider_adapter"
+        "Rust AgentLoop is not available: status=blocked; blockers=strict_command_sandbox_unavailable"
     ));
     let trace = std::fs::read_to_string(trace_path).expect("method trace");
     assert!(trace.contains("initialize"));
@@ -386,10 +386,13 @@ fn cli_rejects_native_turn_without_agent_loop_terminal_status() {
         Scenario::new()
             .initialized()
             .native_ready()
-            .respond("thread/start", json!({"thread": fake_thread("thread_native")}))
+            .respond(
+                "thread/start",
+                json!({"thread": fake_thread("thread_native")}),
+            )
             .respond(
                 "turn/start",
-                json!({"turn": fake_turn("turn_native", "thread_native", "running", "not_migrated")}),
+                json!({"turn": fake_turn("turn_native", "thread_native", "running", "unknown")}),
             )
             .shutdown(),
     );
@@ -1158,14 +1161,17 @@ fn cli_ignores_non_matching_response_before_next_matching_response() {
         Scenario::new()
             .initialized()
             .native_ready()
-            .respond("thread/start", json!({"thread": fake_thread("thread_fake")}))
+            .respond(
+                "thread/start",
+                json!({"thread": fake_thread("thread_fake")}),
+            )
             .interaction(
                 "turn/start",
                 vec![
                     send(json!({
                         "id": NON_MATCHING_RESPONSE_ID,
                         "result": {
-                            "turn": fake_turn("wrong_turn", "thread_fake", "running", "not_migrated")
+                            "turn": fake_turn("wrong_turn", "thread_fake", "running", "unknown")
                         }
                     })),
                     respond(json!({
@@ -1285,30 +1291,6 @@ fn cli_outputs_json_rpc_thread_start_request() {
 }
 
 #[test]
-fn cli_test_support_has_no_external_script_runtime_markers() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = vec![manifest_dir.join("Cargo.toml")];
-    collect_files(&manifest_dir.join("tests"), &mut files);
-    let forbidden = [
-        ["import", " json"].concat(),
-        [".", "py"].concat(),
-        ["py", "thon"].concat(),
-        ["SINGULARITY_", "PYTHON_"].concat(),
-        ["SINGULARITY_", "SIDECAR_"].concat(),
-    ];
-
-    for path in files {
-        let contents = std::fs::read_to_string(&path).expect("read CLI test support source");
-        for marker in &forbidden {
-            assert!(
-                !contents.contains(marker),
-                "{} contains forbidden external script runtime marker {marker:?}",
-                path.display()
-            );
-        }
-    }
-}
-#[test]
 fn cli_manifest_does_not_depend_on_core_runtime_crates() {
     let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let manifest = std::fs::read_to_string(manifest_path).expect("read cli manifest");
@@ -1375,16 +1357,6 @@ fn expected_native_agent_loop_status() -> &'static str {
     }
 }
 
-fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("read CLI test support directory") {
-        let path = entry.expect("CLI test support entry").path();
-        if path.is_dir() {
-            collect_files(&path, files);
-        } else {
-            files.push(path);
-        }
-    }
-}
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }

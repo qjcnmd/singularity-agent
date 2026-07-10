@@ -58,7 +58,7 @@ fn sandbox_policy_and_backend_contract_are_serializable() {
 fn command_request_and_result_are_schema_backed_boundaries() {
     let request = CommandRequest::project_verification(
         "command_1",
-        vec!["python".to_string(), "-m".to_string(), "pytest".to_string()],
+        vec!["cargo".to_string(), "test".to_string()],
         ".",
         "C:/repo",
     );
@@ -71,7 +71,7 @@ fn command_request_and_result_are_schema_backed_boundaries() {
     assert_eq!(request_value["network"]["mode"], "denied");
     assert_eq!(result_value["semantic_status"], "succeeded");
     assert_eq!(result_value["redacted"], true);
-    assert_eq!(request.permission_resource(), "python -m pytest");
+    assert_eq!(request.permission_resource(), "cargo test");
     assert_eq!(
         schema_for!(CommandRequest)
             .schema
@@ -99,15 +99,14 @@ fn command_resource_normalization_belongs_to_command_boundary() {
         vec![
             "cmd.exe".to_string(),
             "/c".to_string(),
-            "python".to_string(),
-            "-m".to_string(),
-            "pytest".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
         ],
         ".",
         "C:/repo",
     );
 
-    assert_eq!(request.permission_resource(), "python -m pytest");
+    assert_eq!(request.permission_resource(), "cargo test");
 }
 
 #[test]
@@ -321,11 +320,7 @@ fn unavailable_sandbox_backend_fails_closed_without_spawning() {
     let workspace = tempfile::tempdir().expect("workspace");
     let request = CommandRequest::project_verification(
         "command_echo",
-        vec![
-            "python".to_string(),
-            "-c".to_string(),
-            "print('ok')".to_string(),
-        ],
+        vec!["test-program".to_string(), "success".to_string()],
         path_str(workspace.path()),
         path_str(workspace.path()),
     );

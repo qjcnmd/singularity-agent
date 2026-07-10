@@ -1052,9 +1052,8 @@ fn validate_tool_name(name: &str) -> Result<(), String> {
     match parts.as_slice() {
         ["builtin", _tool] => Ok(()),
         ["mcp", _server, _tool] => Ok(()),
-        ["python", _plugin, _tool] => Ok(()),
         _ => Err(format!(
-            "tool name must use builtin.*, mcp.<server>.<tool>, or python.<plugin>.<tool>: {name}"
+            "tool name must use builtin.* or mcp.<server>.<tool>: {name}"
         )),
     }
 }

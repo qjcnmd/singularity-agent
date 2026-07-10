@@ -73,7 +73,7 @@ fn thread_read_uses_typed_paginated_safe_conversation_history() {
 }
 #[test]
 fn turn_start_params_reject_agent_host_selector() {
-    let raw = r#"{"method":"turn/start","id":2,"params":{"threadId":"thread_1","agentHost":"python","input":[{"type":"text","text":"hi"}]}}"#;
+    let raw = r#"{"method":"turn/start","id":2,"params":{"threadId":"thread_1","agentHost":"alternate","input":[{"type":"text","text":"hi"}]}}"#;
     let message: JsonRpcMessage = serde_json::from_str(raw).expect("parse json-rpc message");
 
     let error = message

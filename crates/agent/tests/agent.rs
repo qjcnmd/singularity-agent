@@ -1,10 +1,6 @@
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopCapability, AgentLoopInput,
-    AgentLoopStep, AgentRunStatus, AgentStatus, ApprovalGrant, CompletionGateInput, ContextBundle,
-    ContextSummaryEnvelope, EvaluationDiagnostics, EvaluationRunReport, FinalReportMapping,
-    PlannerNextAction, PlannerState, RepairNextAction, ToolRepair, assemble_context_items,
-    completion_gate_allows_final, final_mapping_from_status, planner_next_action,
-    repair_next_action,
+    AgentLoopStep, AgentStatus, ApprovalGrant, assemble_context_items,
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -154,28 +150,8 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ModelToolCal
     }
 }
 
-fn python_command(code: &str) -> Vec<String> {
-    vec![python_bin(), "-c".to_string(), code.to_string()]
-}
-
-fn python_bin() -> String {
-    std::env::var("PYTHON").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "python".to_string()
-        } else {
-            "python3".to_string()
-        }
-    })
-}
-
-#[test]
-fn agent_run_status_reports_not_migrated_without_claiming_completion() {
-    let run_status = AgentRunStatus::not_migrated();
-
-    assert_eq!(run_status.status, AgentStatus::NotMigrated);
-    assert!(!run_status.completed);
-    assert_eq!(run_status.status.as_str(), "not_migrated");
-    assert!(run_status.final_answer.is_none());
+fn test_command(argument: &str) -> Vec<String> {
+    vec!["test-program".to_string(), argument.to_string()]
 }
 
 #[cfg(windows)]
@@ -813,7 +789,7 @@ fn agent_loop_command_fails_closed_without_sandbox_backend() {
         "call_1",
         "builtin.command",
         serde_json::json!({
-            "argv": python_command("print('command ok')"),
+            "argv": test_command("success"),
             "timeout_seconds": 5
         }),
     ));
@@ -850,7 +826,7 @@ fn agent_loop_command_fails_closed_without_sandbox_backend() {
     assert_eq!(
         audit["command_scope_digest"],
         command_scope_digest(
-            &python_command("print('command ok')"),
+            &test_command("success"),
             ".",
             5,
             &SandboxFilesystemMode::WorkspaceWrite,
@@ -881,7 +857,7 @@ fn agent_loop_command_uses_strict_sandbox_backend_when_injected() {
         "call_1",
         "builtin.command",
         serde_json::json!({
-            "argv": python_command("print('command ok')"),
+            "argv": test_command("success"),
             "timeout_seconds": 5
         }),
     ));
@@ -924,7 +900,7 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
         "call_1",
         "builtin.command",
         serde_json::json!({
-            "argv": python_command("raise SystemExit(1)"),
+            "argv": test_command("failure"),
             "timeout_seconds": 5
         }),
     ));
@@ -934,7 +910,7 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
         "call_2",
         "builtin.command",
         serde_json::json!({
-            "argv": python_command("print('repaired')"),
+            "argv": test_command("repaired"),
             "timeout_seconds": 5
         }),
     ));
@@ -1034,7 +1010,7 @@ fn agent_loop_cancels_a_running_sandbox_command() {
 #[test]
 fn agent_loop_approval_grant_cannot_override_denied_profile_network() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let argv = python_command("print('must not execute')");
+    let argv = test_command("must-not-execute");
     let resource = command_scope_resource(
         &argv,
         ".",
@@ -1100,7 +1076,7 @@ fn agent_loop_approval_grant_cannot_override_denied_profile_network() {
 #[test]
 fn agent_loop_command_approval_grant_requires_exact_command_resource() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let argv = python_command("print('command ok')");
+    let argv = test_command("success");
     let command_resource = command_scope_resource(
         &argv,
         ".",
@@ -1175,7 +1151,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         "call_1",
         "builtin.command",
         serde_json::json!({
-            "argv": python_command("print('command ok')"),
+            "argv": test_command("success"),
             "sandbox_mode": "danger_full_access",
             "network_access": "allowed",
             "timeout_seconds": 5
@@ -1231,7 +1207,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     assert_eq!(
         run_status.audit_events[0]["command_scope_digest"],
         command_scope_digest(
-            &python_command("print('command ok')"),
+            &test_command("success"),
             ".",
             5,
             &SandboxFilesystemMode::DangerFullAccess,
@@ -1711,40 +1687,6 @@ fn agent_loop_denies_sensitive_workspace_tool_before_execution() {
 }
 
 #[test]
-fn evaluation_report_contract_keeps_gate_fields_separate_from_diagnostics() {
-    let report = EvaluationRunReport {
-        evaluation_passed: false,
-        agent_completed: true,
-        tests_passed: true,
-        public_verification_passed: true,
-        hidden_verification_passed: false,
-        local_process_fallback_count: 0,
-        diagnostics: EvaluationDiagnostics {
-            base_verification_passed: Some(false),
-            sandbox_required: true,
-            notes: vec!["diagnostic-only timing note".to_string()],
-        },
-    };
-
-    let value = serde_json::to_value(&report).expect("serialize evaluation report");
-
-    assert_eq!(value["evaluation_passed"], false);
-    assert_eq!(value["agent_completed"], true);
-    assert_eq!(value["tests_passed"], true);
-    assert_eq!(value["public_verification_passed"], true);
-    assert_eq!(value["hidden_verification_passed"], false);
-    assert_eq!(value["local_process_fallback_count"], 0);
-    assert_eq!(value["diagnostics"]["base_verification_passed"], false);
-    assert_eq!(value["diagnostics"]["sandbox_required"], true);
-    assert!(value["diagnostics"].get("evaluation_passed").is_none());
-    assert!(value.get("base_verification_passed").is_none());
-
-    let round_trip: EvaluationRunReport =
-        serde_json::from_value(value).expect("deserialize evaluation report");
-    assert_eq!(round_trip, report);
-}
-
-#[test]
 fn history_constructors_use_safe_roles_visibility_and_estimated_tokens() {
     let history_user = AgentContextItem::history_user("history_user_1", "你好世界你好世界");
     let history_assistant =
@@ -2020,234 +1962,8 @@ fn agent_loop_reserves_the_requested_model_output_budget() {
     assert!(seen_requests.lock().expect("seen requests").is_empty());
 }
 #[test]
-fn planner_repair_completion_and_final_mapping_are_deterministic() {
-    let pending_approval = PlannerState {
-        task_id: "task_1".to_string(),
-        current_phase: "running_verification".to_string(),
-        status: "running".to_string(),
-        current_plan: Vec::new(),
-        completion_criteria: serde_json::json!({}),
-        open_actions: vec![serde_json::json!({"kind": "approval", "status": "pending"})],
-        blocked_actions: Vec::new(),
-        risk_escalations: Vec::new(),
-        evidence_refs: Vec::new(),
-    };
-    let pending_tool = PlannerState {
-        open_actions: vec![serde_json::json!({"kind": "tool", "status": "pending"})],
-        ..pending_approval.clone()
-    };
-    let repair = ToolRepair {
-        repair_id: "repair_1".to_string(),
-        run_id: "run_1".to_string(),
-        session_id: "session_1".to_string(),
-        task_id: "task_1".to_string(),
-        phase_id: "repairing_failures".to_string(),
-        failed_tool_call_id: "call_1".to_string(),
-        failure_kind: "tool_executor_failed".to_string(),
-        next_action: "repair_then_verify".to_string(),
-        failed_result: serde_json::json!({"ok": false}),
-        recovery_report: serde_json::json!({}),
-        repair_contract: serde_json::json!({}),
-        created_at: "2026-01-01T00:00:00+00:00".to_string(),
-        metadata: serde_json::json!({}),
-    };
-
-    assert_eq!(
-        planner_next_action(&pending_approval),
-        PlannerNextAction::ResumePendingApproval
-    );
-    assert_eq!(
-        planner_next_action(&pending_tool),
-        PlannerNextAction::ExecutePendingTool
-    );
-    assert_eq!(
-        repair_next_action(&repair),
-        RepairNextAction::RepairThenVerify
-    );
-    assert!(!completion_gate_allows_final(&CompletionGateInput {
-        verification_passed: false,
-        unresolved_failures: Vec::new(),
-        interrupted: false,
-    }));
-
-    let mapping = final_mapping_from_status(
-        "mapping_1",
-        "run_1",
-        "session_1",
-        "task_1",
-        AgentStatus::Completed,
-        "done",
-    );
-
-    assert_eq!(mapping.run_status, "completed");
-    assert_eq!(mapping.final_report_status, "completed");
-    assert_eq!(mapping.completion_status, "completed");
-    assert_eq!(mapping.final_answer, "done");
-}
-
-#[test]
 fn agent_status_mapping_preserves_blocked_and_cancelled() {
     assert_eq!(AgentStatus::from("blocked"), AgentStatus::Blocked);
     assert_eq!(AgentStatus::from("cancelled"), AgentStatus::Cancelled);
     assert_eq!(AgentStatus::from("max_turns_exceeded"), AgentStatus::Failed);
-}
-
-#[test]
-fn planner_state_round_trips_python_oracle() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/rust_parity/python_oracle.json"
-    ))
-    .expect("parse python oracle fixture");
-
-    let planner: PlannerState =
-        serde_json::from_value(fixture["planner_state"].clone()).expect("planner state");
-
-    assert_eq!(planner.task_id, "task_1");
-    assert_eq!(planner.current_phase, "running_verification");
-    assert_eq!(planner.status, "repairing_failures");
-    assert_eq!(planner.evidence_refs, vec!["obs_1"]);
-
-    assert_eq!(
-        serde_json::from_value::<PlannerState>(
-            serde_json::to_value(&planner).expect("serialize planner")
-        )
-        .expect("deserialize planner"),
-        planner
-    );
-}
-
-#[test]
-fn context_bundle_round_trips_python_oracle() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/rust_parity/python_oracle.json"
-    ))
-    .expect("parse python oracle fixture");
-
-    let context: ContextBundle =
-        serde_json::from_value(fixture["context_bundle"].clone()).expect("context bundle");
-
-    assert_eq!(context.bundle_id, "bundle_1");
-    assert_eq!(context.phase_id, "running_verification");
-    assert_eq!(context.included_item_ids, vec!["item_goal", "item_plan"]);
-    assert_eq!(context.excluded_item_ids, vec!["item_raw_tool"]);
-    assert_eq!(context.budget["model_context_window"], 128000);
-    assert_eq!(context.budget["message_tokens"], 62);
-    assert_eq!(context.render_policy["include_raw_tool_outputs"], false);
-    assert_eq!(context.metadata["source"], "python_oracle");
-
-    assert_eq!(
-        serde_json::from_value::<ContextBundle>(
-            serde_json::to_value(&context).expect("serialize context")
-        )
-        .expect("deserialize context"),
-        context
-    );
-}
-
-#[test]
-fn context_summary_envelope_round_trips_python_oracle() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/rust_parity/python_oracle.json"
-    ))
-    .expect("parse python oracle fixture");
-
-    let summary: ContextSummaryEnvelope =
-        serde_json::from_value(fixture["context_summary_envelope"].clone())
-            .expect("context summary envelope");
-
-    assert_eq!(summary.version, 1);
-    assert_eq!(summary.summary_id, "summary_1");
-    assert_eq!(summary.source_item_ids, vec!["item_raw_tool"]);
-    assert_eq!(summary.summary_payload["verification_status"], "passed");
-    assert_eq!(
-        summary.summary_payload["omitted_item_ids"],
-        serde_json::json!(["item_raw_tool"])
-    );
-    assert_eq!(summary.cache_attribution["source"], "component_inferred");
-    assert_eq!(summary.metadata["source"], "python_oracle");
-    assert!(summary.rendered_summary.contains("verification=passed"));
-
-    assert_eq!(
-        serde_json::from_value::<ContextSummaryEnvelope>(
-            serde_json::to_value(&summary).expect("serialize context summary")
-        )
-        .expect("deserialize context summary"),
-        summary
-    );
-}
-
-#[test]
-fn tool_repair_round_trips_python_oracle() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/rust_parity/python_oracle.json"
-    ))
-    .expect("parse python oracle fixture");
-
-    let repair: ToolRepair =
-        serde_json::from_value(fixture["tool_repair"].clone()).expect("tool repair");
-
-    assert_eq!(repair.repair_id, "tool_repair_1");
-    assert_eq!(repair.failed_tool_call_id, "call_failed_1");
-    assert_eq!(repair.failure_kind, "tool_executor_failed");
-    assert_eq!(repair.next_action, "repair_then_verify");
-    assert_eq!(repair.failed_result["ok"], false);
-    assert_eq!(
-        repair.recovery_report["succeeded_but_not_appended_call_ids"],
-        serde_json::json!(["call_failed_1"])
-    );
-    assert_eq!(
-        repair.repair_contract["allowed_tool_names"],
-        serde_json::json!(["apply_patch", "read_file", "run_verification"])
-    );
-    assert_eq!(
-        repair.repair_contract["verification_contract"]["contract_id"],
-        "verification_contract_1"
-    );
-    assert_eq!(repair.metadata["source"], "python_oracle");
-
-    assert_eq!(
-        serde_json::from_value::<ToolRepair>(
-            serde_json::to_value(&repair).expect("serialize tool repair")
-        )
-        .expect("deserialize tool repair"),
-        repair
-    );
-}
-
-#[test]
-fn final_report_mapping_round_trips_python_oracle() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/rust_parity/python_oracle.json"
-    ))
-    .expect("parse python oracle fixture");
-
-    let mapping: FinalReportMapping =
-        serde_json::from_value(fixture["final_report_mapping"].clone())
-            .expect("final report mapping");
-
-    assert_eq!(mapping.mapping_id, "finalization_mapping_1");
-    assert_eq!(mapping.phase_id, "finalizing");
-    assert_eq!(mapping.agent_loop_status, "completed");
-    assert_eq!(mapping.run_status, "completed");
-    assert_eq!(mapping.final_report_status, "completed");
-    assert_eq!(mapping.completion_status, "completed");
-    assert_eq!(
-        mapping.final_report["verification_summary"]["status"],
-        "ready"
-    );
-    assert_eq!(
-        mapping.completion_assessment["unmet"],
-        serde_json::json!([])
-    );
-    assert_eq!(mapping.contract_satisfaction["satisfied"], true);
-    assert!(mapping.final_answer.contains("verification: ready"));
-    assert_eq!(mapping.metadata["source"], "python_oracle");
-
-    assert_eq!(
-        serde_json::from_value::<FinalReportMapping>(
-            serde_json::to_value(&mapping).expect("serialize finalization mapping")
-        )
-        .expect("deserialize finalization mapping"),
-        mapping
-    );
 }

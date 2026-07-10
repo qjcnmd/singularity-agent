@@ -68,7 +68,6 @@ const TOOL_COMMAND: &str = "builtin.command";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
-    NotMigrated,
     Running,
     CancelRequested,
     Completed,
@@ -80,7 +79,6 @@ pub enum AgentStatus {
 impl AgentStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::NotMigrated => "not_migrated",
             Self::Running => "running",
             Self::CancelRequested => "cancel_requested",
             Self::Completed => "completed",
@@ -100,7 +98,6 @@ impl From<&str> for AgentStatus {
             "blocked" => Self::Blocked,
             "cancelled" | "canceled" => Self::Cancelled,
             "failed" | "max_turns_exceeded" => Self::Failed,
-            "not_migrated" => Self::NotMigrated,
             _ => Self::Failed,
         }
     }
@@ -132,24 +129,6 @@ pub struct AgentRunStatus {
 }
 
 impl AgentRunStatus {
-    pub fn not_migrated() -> Self {
-        Self {
-            status: AgentStatus::NotMigrated,
-            completed: false,
-            final_answer: None,
-            run_id: None,
-            session_id: None,
-            task_id: None,
-            model_turns: 0,
-            tool_calls: 0,
-            approval_count: 0,
-            audit_events: Vec::new(),
-            trace_path: None,
-            verification: AgentVerification::default(),
-            error: None,
-        }
-    }
-
     pub fn failed(message: impl Into<String>) -> Self {
         Self {
             status: AgentStatus::Failed,
@@ -990,24 +969,6 @@ enum AgentLoopToolError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct EvaluationDiagnostics {
-    pub base_verification_passed: Option<bool>,
-    pub sandbox_required: bool,
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct EvaluationRunReport {
-    pub evaluation_passed: bool,
-    pub agent_completed: bool,
-    pub tests_passed: bool,
-    pub public_verification_passed: bool,
-    pub hidden_verification_passed: bool,
-    pub local_process_fallback_count: u32,
-    pub diagnostics: EvaluationDiagnostics,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum AgentContextItemPriority {
     System,
     CurrentTurn,
@@ -1104,31 +1065,6 @@ fn approximate_token_count(content: &str) -> u32 {
         / APPROXIMATE_ASCII_CHARS_PER_TOKEN;
     let estimated = ascii_tokens.saturating_add(non_ascii_chars);
     u32::try_from(estimated.max(1)).unwrap_or(u32::MAX)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PlannerNextAction {
-    ResumePendingApproval,
-    ExecutePendingTool,
-    Final,
-    AskUser,
-    Continue,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RepairNextAction {
-    RepairThenVerify,
-    RequestModel,
-    Blocked,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct CompletionGateInput {
-    pub verification_passed: bool,
-    pub unresolved_failures: Vec<String>,
-    pub interrupted: bool,
 }
 
 fn context_input_token_budget(input: &AgentLoopInput, loop_tools: &ToolBroker) -> u32 {
@@ -1332,89 +1268,6 @@ fn context_overflow_result() -> AgentLoopResult {
         error: Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
     }
 }
-pub fn planner_next_action(state: &PlannerState) -> PlannerNextAction {
-    if state
-        .open_actions
-        .iter()
-        .any(|action| action_matches(action, "approval", "pending"))
-    {
-        return PlannerNextAction::ResumePendingApproval;
-    }
-    if state
-        .open_actions
-        .iter()
-        .any(|action| action_matches(action, "tool", "pending"))
-    {
-        return PlannerNextAction::ExecutePendingTool;
-    }
-    if state.current_phase == "finalizing" {
-        return PlannerNextAction::Final;
-    }
-    if !state.blocked_actions.is_empty() {
-        return PlannerNextAction::AskUser;
-    }
-    PlannerNextAction::Continue
-}
-
-pub fn repair_next_action(repair: &ToolRepair) -> RepairNextAction {
-    match repair.next_action.as_str() {
-        "repair_then_verify" => RepairNextAction::RepairThenVerify,
-        "request_model" => RepairNextAction::RequestModel,
-        _ => RepairNextAction::Blocked,
-    }
-}
-
-pub fn completion_gate_allows_final(input: &CompletionGateInput) -> bool {
-    input.verification_passed && input.unresolved_failures.is_empty() && !input.interrupted
-}
-
-pub fn final_mapping_from_status(
-    mapping_id: &str,
-    run_id: &str,
-    session_id: &str,
-    task_id: &str,
-    status: AgentStatus,
-    final_answer: &str,
-) -> FinalReportMapping {
-    let run_status = match status {
-        AgentStatus::Completed => "completed",
-        AgentStatus::Blocked => "blocked",
-        AgentStatus::Cancelled | AgentStatus::CancelRequested => "interrupted",
-        AgentStatus::Failed => "failed",
-        AgentStatus::Running | AgentStatus::NotMigrated => "running",
-    };
-    FinalReportMapping {
-        mapping_id: mapping_id.to_string(),
-        run_id: run_id.to_string(),
-        session_id: session_id.to_string(),
-        task_id: task_id.to_string(),
-        phase_id: "finalizing".to_string(),
-        agent_loop_status: status.as_str().to_string(),
-        run_status: run_status.to_string(),
-        final_report_status: run_status.to_string(),
-        completion_status: run_status.to_string(),
-        final_answer: final_answer.to_string(),
-        final_report: json!({"status": run_status}),
-        completion_assessment: json!({"status": run_status}),
-        contract_satisfaction: json!({"satisfied": status == AgentStatus::Completed}),
-        created_at: String::new(),
-        metadata: json!({}),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct PlannerState {
-    pub task_id: String,
-    pub current_phase: String,
-    pub status: String,
-    pub current_plan: Vec<Value>,
-    pub completion_criteria: Value,
-    pub open_actions: Vec<Value>,
-    pub blocked_actions: Vec<Value>,
-    pub risk_escalations: Vec<Value>,
-    pub evidence_refs: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ContextBundle {
     pub bundle_id: String,
@@ -1436,20 +1289,6 @@ pub struct ContextBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ContextSummaryEnvelope {
-    pub version: u32,
-    pub summary_id: String,
-    pub summary_payload: Value,
-    pub source_item_ids: Vec<String>,
-    pub cache_attribution: Value,
-    pub previous_summary_digest: Option<String>,
-    pub summary_digest: String,
-    pub rendered_summary: String,
-    pub created_at: String,
-    pub metadata: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolRepair {
     pub repair_id: String,
     pub run_id: String,
@@ -1462,25 +1301,6 @@ pub struct ToolRepair {
     pub failed_result: Value,
     pub recovery_report: Value,
     pub repair_contract: Value,
-    pub created_at: String,
-    pub metadata: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct FinalReportMapping {
-    pub mapping_id: String,
-    pub run_id: String,
-    pub session_id: String,
-    pub task_id: String,
-    pub phase_id: String,
-    pub agent_loop_status: String,
-    pub run_status: String,
-    pub final_report_status: String,
-    pub completion_status: String,
-    pub final_answer: String,
-    pub final_report: Value,
-    pub completion_assessment: Value,
-    pub contract_satisfaction: Value,
     pub created_at: String,
     pub metadata: Value,
 }
@@ -1950,9 +1770,4 @@ fn command_workspace_tool_failure(
         "command_provenance": "agent_requested",
     });
     output
-}
-
-fn action_matches(action: &Value, kind: &str, status: &str) -> bool {
-    action.get("kind").and_then(Value::as_str) == Some(kind)
-        && action.get("status").and_then(Value::as_str) == Some(status)
 }
