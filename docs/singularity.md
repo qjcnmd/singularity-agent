@@ -241,7 +241,7 @@ store 在写入 item、trace 和 artifact reference 前执行敏感文本检查�
 
 ## 12. Evaluation
 
-`sg eval run` 发送 `eval/run`，app-server 读取 `evaluation.task_set/v2` manifest 并执行 AgentLoop runner：
+`sg eval run` 发送 `eval/run`，app-server 读取 `evaluation.task_set/v3` manifest 并执行 AgentLoop runner：
 
 ```text
 prepare source
@@ -252,7 +252,7 @@ prepare source
   -> atomic result.json + report.json
 ```
 
-每个 stage 都通过同一个 `SandboxBackend` 执行 command。agent 只能看到 `agent.instructions`、allowed paths/tools 和 smoke commands；evaluator patch、baseline/public/hidden 命令不进入模型 payload。Evaluation 暴露的 command schema 只接受 manifest 声明的 smoke 输入，完成门使用规范化后的实际 cwd 计算同一 command scope，避免模型看到的能力与策略或验收口径分叉。
+每个 stage 都通过同一个 `SandboxBackend` 执行 command。baseline 和 public 使用 `public_test_patch`，hidden 只使用 `hidden_test_patch`；两者以及 baseline/public/hidden 命令都不进入 `AgentTaskProjection` 或模型 payload。public 与 hidden 必须具有不同的 patch 内容或命令 `argv`/`cwd` 证据；timeout 和 network 等执行设置不算独立证据。Evaluation 暴露的 command schema 只接受 manifest 声明的 smoke 输入，完成门使用规范化后的实际 cwd 计算同一 command scope，避免模型看到的能力与策略或验收口径分叉。
 
 `EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。全部 task 通过时 run 才通过。blocker 分类包括 environment、workspace preparation、provider configuration、provider authentication、network、sandbox 和 agent runtime。report 另外记录 changed/disallowed files、smoke、model turns、tool calls、approval count、trace path 和 `local_process_fallback_count`。
 

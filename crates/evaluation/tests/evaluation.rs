@@ -12,7 +12,7 @@ const HIDDEN_TEST_PATCH_MARKER: &str = "HIDDEN_EVALUATOR_ONLY_PATCH_MARKER";
 
 fn valid_manifest() -> Value {
     json!({
-        "schema_version": "evaluation.task_set/v2",
+        "schema_version": "evaluation.task_set/v3",
         "tasks": [
             {
                 "task_id": "sqlfluff__sqlfluff-2419",
@@ -164,13 +164,18 @@ fn result_rejects_unknown_fields() {
 }
 
 #[test]
-fn legacy_v1_schemas_and_legacy_task_fields_are_rejected() {
+fn legacy_task_set_versions_and_legacy_task_fields_are_rejected() {
     let mut manifest = valid_manifest();
     manifest["schema_version"] = json!("evaluation.task_set/v1");
-    let error = parse_manifest(&manifest).expect_err("reject task_set v1");
     assert!(matches!(
-        error,
-        EvaluationError::UnsupportedSchemaVersion { .. }
+        parse_manifest(&manifest),
+        Err(EvaluationError::UnsupportedSchemaVersion { .. })
+    ));
+
+    manifest["schema_version"] = json!("evaluation.task_set/v2");
+    assert!(matches!(
+        parse_manifest(&manifest),
+        Err(EvaluationError::UnsupportedSchemaVersion { .. })
     ));
 
     let mut result = valid_result();
@@ -469,6 +474,39 @@ fn manifest_rejects_duplicate_public_and_hidden_verification_evidence() {
 
     let error = parse_manifest(&value).expect_err("duplicate evidence must be rejected");
     assert!(error.to_string().contains("independent public and hidden"));
+}
+
+#[test]
+fn manifest_rejects_verification_evidence_that_only_differs_in_execution_settings() {
+    for (field, setting) in [
+        ("timeout_seconds", json!(60)),
+        ("network_access", json!("allowed")),
+    ] {
+        let mut value = valid_manifest();
+        value["tasks"][0]["evaluator"]["hidden_test_patch"] =
+            value["tasks"][0]["evaluator"]["public_test_patch"].clone();
+        value["tasks"][0]["evaluator"]["hidden"]["commands"][0][field] = setting;
+
+        let error =
+            parse_manifest(&value).expect_err("execution-setting-only evidence must be rejected");
+        assert!(error.to_string().contains("independent public and hidden"));
+    }
+}
+
+#[test]
+fn manifest_accepts_independent_patch_or_command_scope_evidence() {
+    let mut different_patch = valid_manifest();
+    different_patch["tasks"][0]["evaluator"]["hidden"]["commands"] =
+        different_patch["tasks"][0]["evaluator"]["public"]["commands"].clone();
+    parse_manifest(&different_patch).expect("different patches are independent evidence");
+
+    let mut different_command_scope = valid_manifest();
+    different_command_scope["tasks"][0]["evaluator"]["hidden_test_patch"] =
+        different_command_scope["tasks"][0]["evaluator"]["public_test_patch"].clone();
+    different_command_scope["tasks"][0]["evaluator"]["hidden"]["commands"][0]["argv"] =
+        json!(["cargo", "test", "--all-targets"]);
+    parse_manifest(&different_command_scope)
+        .expect("different command argv is independent evidence");
 }
 
 #[test]

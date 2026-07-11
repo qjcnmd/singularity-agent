@@ -1,5 +1,5 @@
 {
-  "schema_version": "evaluation.task_set/v2",
+  "schema_version": "evaluation.task_set/v3",
   "tasks": [
     {
       "task_id": "sqlfluff__sqlfluff-2419",

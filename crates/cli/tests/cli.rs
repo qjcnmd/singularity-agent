@@ -581,7 +581,7 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v2",
+  "schema_version": "evaluation.task_set/v3",
   "tasks": [{
     "task_id": "fixture_native",
     "description": "Exercise the AgentLoop evaluation transport.",
@@ -594,7 +594,7 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     "evaluator": {
       "baseline": {"commands": [{"argv": ["rustc", "--version"]}]},
       "public": {"commands": [{"argv": ["rustc", "--version"]}]},
-      "hidden": {"commands": [{"argv": ["rustc", "--version"]}]}
+      "hidden": {"commands": [{"argv": ["rustc", "--version", "--verbose"]}]}
     }
   }]
 }"#,

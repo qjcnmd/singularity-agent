@@ -15,8 +15,8 @@ const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskSetSchemaVersion {
-    #[serde(rename = "evaluation.task_set/v2")]
-    V2,
+    #[serde(rename = "evaluation.task_set/v3")]
+    V3,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,9 +226,7 @@ impl EvaluatorSpec {
         if let Some(test_patch) = &self.hidden_test_patch {
             test_patch.validate(task_id, "evaluator.hidden_test_patch")?;
         }
-        if self.public_test_patch == self.hidden_test_patch
-            && self.public.commands == self.hidden.commands
-        {
+        if self.verification_evidence_is_identical() {
             return Err(validation_error(format!(
                 "evaluation task {task_id} requires independent public and hidden verification evidence"
             )));
@@ -236,6 +234,17 @@ impl EvaluatorSpec {
         self.baseline.validate(task_id, "evaluator.baseline")?;
         self.public.validate(task_id, "evaluator.public")?;
         self.hidden.validate(task_id, "evaluator.hidden")
+    }
+
+    fn verification_evidence_is_identical(&self) -> bool {
+        self.public_test_patch == self.hidden_test_patch
+            && self.public.commands.len() == self.hidden.commands.len()
+            && self
+                .public
+                .commands
+                .iter()
+                .zip(&self.hidden.commands)
+                .all(|(public, hidden)| public.argv == hidden.argv && public.cwd == hidden.cwd)
     }
 }
 

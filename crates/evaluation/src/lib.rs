@@ -19,7 +19,7 @@ pub use result::{
 };
 pub use value::{Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId, ToolName};
 
-pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v2";
+pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v3";
 pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v2";
 
 #[derive(Debug, thiserror::Error)]

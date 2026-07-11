@@ -511,7 +511,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v2",
+  "schema_version": "evaluation.task_set/v3",
   "tasks": [
     {
       "task_id": "fixture_eval",
@@ -527,7 +527,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
       "evaluator": {
         "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
         "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "hidden": {"commands": [{"argv": ["git", "status", "--short"]}]}
+        "hidden": {"commands": [{"argv": ["git", "status", "--porcelain"]}]}
       }
     }
   ]
@@ -598,7 +598,7 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v2",
+  "schema_version": "evaluation.task_set/v3",
   "tasks": [
     {
       "task_id": "fixture_eval",
@@ -617,7 +617,7 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
       "evaluator": {
         "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
         "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "hidden": {"commands": [{"argv": ["git", "status", "--short"]}]}
+        "hidden": {"commands": [{"argv": ["git", "status", "--porcelain"]}]}
       }
     }
   ]
@@ -667,7 +667,7 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v2",
+  "schema_version": "evaluation.task_set/v3",
   "tasks": [
     {
       "task_id": "fixture_eval",
@@ -683,7 +683,7 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
       "evaluator": {
         "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
         "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "hidden": {"commands": [{"argv": ["git", "status", "--short"]}]}
+        "hidden": {"commands": [{"argv": ["git", "status", "--porcelain"]}]}
       }
     }
   ]
