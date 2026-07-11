@@ -2,9 +2,9 @@ use singularity_core::ClientInfo;
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ArtifactFetchParams, ArtifactRef, ConversationMessage,
     ConversationRole, EventSubscribeParams, InitializeParams, InitializeResult, ItemKind,
-    JsonRpcMessage, Method, ProviderReadiness, ThreadIdParams, ThreadReadParams, ThreadReadResult,
-    ThreadStartParams, TraceListParams, TraceShowParams, TraceTailParams, TurnIdParams,
-    TurnStartParams,
+    JsonRpcMessage, Method, ProviderConfigurationStatus, ThreadIdParams, ThreadReadParams,
+    ThreadReadResult, ThreadStartParams, TraceListParams, TraceShowParams, TraceTailParams,
+    TurnIdParams, TurnStartParams,
 };
 
 #[test]
@@ -123,7 +123,7 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
 fn agent_capability_uses_the_canonical_agent_loop_wire_name() {
     let result = AgentCapabilityResult {
         agent_loop: serde_json::json!({"available": true}),
-        provider_readiness: ProviderReadiness {
+        provider_configuration: ProviderConfigurationStatus {
             source: None,
             snapshot_id: "provider_snapshot_test".to_string(),
             configured: false,
@@ -263,8 +263,8 @@ fn new_trace_is_unredacted_until_the_store_sanitizes_it() {
 }
 
 #[test]
-fn provider_readiness_uses_camel_case_redacted_wire_fields() {
-    let readiness = ProviderReadiness {
+fn provider_configuration_uses_camel_case_redacted_wire_fields() {
+    let configuration = ProviderConfigurationStatus {
         source: Some("process_env".to_string()),
         snapshot_id: "provider_snapshot_test".to_string(),
         configured: false,
@@ -275,7 +275,7 @@ fn provider_readiness_uses_camel_case_redacted_wire_fields() {
     };
 
     assert_eq!(
-        serde_json::to_value(readiness).unwrap(),
+        serde_json::to_value(configuration).unwrap(),
         serde_json::json!({
             "source": "process_env",
             "snapshotId": "provider_snapshot_test",

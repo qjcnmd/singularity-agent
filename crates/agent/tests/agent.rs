@@ -4,9 +4,9 @@ use singularity_agent::{
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind,
-    ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
-    ModelTurnStatus, Provider, ProviderError,
+    DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelRole,
+    ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
+    Provider, ProviderError, ProviderProtocolContract,
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
@@ -26,11 +26,11 @@ use std::time::Duration;
 struct StaticProvider {
     responses: Vec<ModelTurnResponse>,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
-    capabilities: ModelCapabilities,
+    capabilities: ProviderProtocolContract,
 }
 
 impl Provider for StaticProvider {
-    fn capabilities(&self) -> ModelCapabilities {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
         self.capabilities.clone()
     }
 
@@ -55,8 +55,8 @@ struct BlockingProvider {
 }
 
 impl Provider for BlockingProvider {
-    fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities::default()
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
     }
 
     fn complete(
@@ -102,7 +102,7 @@ fn agent_loop_with_responses_and_requests(
         responses,
         policy,
         seen_requests,
-        ModelCapabilities::default(),
+        ProviderProtocolContract::default(),
     )
 }
 
@@ -110,7 +110,7 @@ fn agent_loop_with_capabilities(
     responses: Vec<ModelTurnResponse>,
     policy: PolicyEngine,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
-    capabilities: ModelCapabilities,
+    capabilities: ProviderProtocolContract,
 ) -> AgentLoop<StaticProvider> {
     let mut registry = ToolRegistry::default();
     registry
@@ -431,9 +431,9 @@ fn agent_loop_fails_closed_on_multiple_tool_calls_before_execution() {
         vec![response],
         allow_read_policy(),
         Arc::clone(&seen_requests),
-        ModelCapabilities {
+        ProviderProtocolContract {
             supports_parallel_tool_calls: true,
-            ..ModelCapabilities::default()
+            ..ProviderProtocolContract::default()
         },
     )
     .run(&input);
@@ -817,10 +817,10 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
 #[test]
 fn agent_loop_uses_provider_capabilities_for_budget_metadata() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let capabilities = ModelCapabilities {
+    let capabilities = ProviderProtocolContract {
         max_context_tokens: 64_000,
         max_output_tokens: 128,
-        ..ModelCapabilities::default()
+        ..ProviderProtocolContract::default()
     };
     let result = agent_loop_with_capabilities(
         vec![ModelTurnResponse::completed(
@@ -858,9 +858,9 @@ fn agent_loop_rejects_requested_output_above_provider_capability() {
         )],
         allow_read_policy(),
         Arc::clone(&seen_requests),
-        ModelCapabilities {
+        ProviderProtocolContract {
             max_output_tokens: 128,
-            ..ModelCapabilities::default()
+            ..ProviderProtocolContract::default()
         },
     );
     let mut input = AgentLoopInput::new("thread_1", "turn_1", "hello");
@@ -889,9 +889,9 @@ fn agent_loop_rejects_unsupported_tool_capability_before_provider() {
         vec![response],
         allow_read_policy(),
         Arc::clone(&seen_requests),
-        ModelCapabilities {
+        ProviderProtocolContract {
             supports_tools: false,
-            ..ModelCapabilities::default()
+            ..ProviderProtocolContract::default()
         },
     )
     .run(&AgentLoopInput::new("thread_1", "turn_1", "hello"));

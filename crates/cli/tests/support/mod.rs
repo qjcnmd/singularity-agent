@@ -177,7 +177,7 @@ pub fn agent_loop_capability(
             "reason": reason,
             "blockers": blockers,
         },
-        "providerReadiness": {
+        "providerConfiguration": {
             "source": "project_env",
             "snapshotId": "provider_snapshot_fake_server",
             "configured": true,

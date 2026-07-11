@@ -48,6 +48,11 @@ impl CommandDiagnostic {
             local_process_fallback: result.sandbox.local_process_fallback,
         }
     }
+
+    pub(super) fn is_strictly_sandboxed(&self) -> bool {
+        !self.local_process_fallback
+            && self.sandbox_enforcement != singularity_tools::SandboxBackendEnforcement::Unavailable
+    }
 }
 
 pub(super) fn run_command_spec(

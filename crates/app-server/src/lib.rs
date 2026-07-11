@@ -27,14 +27,14 @@ use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams,
     ArtifactFetchResult, ConversationMessage, ConversationRole, EvalRunParams,
     EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult, Item,
-    JsonRpcMessage, Method, ProviderReadiness, ServerCapabilitiesResult, Thread,
+    JsonRpcMessage, Method, ProviderConfigurationStatus, ServerCapabilitiesResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
     TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceTailParams,
     TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
     TurnStartResult, TurnStatus,
 };
-use singularity_store::{CommittedTurnOutcome, PendingExecutionState, SessionStore, StoreError};
+use singularity_store::{CommittedTurnOutcome, SessionStore, StoreError};
 use singularity_tools::{
     CommandToolInput, SandboxBackend, ToolBroker, ToolRegistry, ToolSpec, WindowsSandboxBackend,
     WorkspaceTools, command_scope_digest,
@@ -553,7 +553,7 @@ impl AppServer {
             message.id,
             AgentCapabilityResult {
                 agent_loop: serde_json::to_value(AgentLoopCapability::current())?,
-                provider_readiness: provider_readiness(&self.provider_snapshot),
+                provider_configuration: provider_configuration(&self.provider_snapshot),
             },
         )
     }
@@ -863,6 +863,25 @@ impl AppServer {
         )
     }
 
+    fn commit_effective_turn_status_resolving_approval(
+        &self,
+        request_id: &str,
+        turn: &Turn,
+        run_status: &AgentRunStatus,
+    ) -> Result<CommittedTurnOutcome, StoreError> {
+        let assistant_delta = agent_completed_delta(run_status);
+        let event = agent_loop_trace(turn, run_status);
+        self.store
+            .commit_turn_outcome_and_resolve_pending_execution(
+                request_id,
+                &turn.turn_id,
+                turn_status_for_agent(&run_status.status),
+                run_status.status.as_str(),
+                assistant_delta.as_deref(),
+                &event,
+            )
+    }
+
     fn turn_interrupt(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnIdParams = parse_params(&message)?;
         match self.store.get_turn(&params.turn_id) {
@@ -1006,12 +1025,21 @@ impl AppServer {
             }
         };
         let pending_tool_call = recorded.pending_tool_call.clone();
-        if matches!(decision.outcome, ApprovalOutcome::Allow) && pending_tool_call.is_some() {
-            self.store.transition_pending_execution(
-                &decision.request_id,
-                PendingExecutionState::Approved,
-                PendingExecutionState::Executing,
-            )?;
+        if matches!(decision.outcome, ApprovalOutcome::Defer) {
+            return Ok(vec![
+                JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
+            ]);
+        }
+        if matches!(decision.outcome, ApprovalOutcome::Deny) {
+            let mut messages = Vec::new();
+            if pending_tool_call.is_some() {
+                let turn = self.store.get_turn(&recorded.request.turn_id)?;
+                messages.extend(self.event_notification(AppEvent::turn_completed(&turn)));
+            }
+            messages.push(
+                JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
+            );
+            return Ok(messages);
         }
         let active_turn =
             if matches!(decision.outcome, ApprovalOutcome::Allow) && pending_tool_call.is_some() {
@@ -1031,11 +1059,6 @@ impl AppServer {
         )?;
         let mut messages = Vec::new();
         let terminal = if let Some(resumed) = resumed {
-            self.store.transition_pending_execution(
-                &decision.request_id,
-                PendingExecutionState::Executing,
-                PendingExecutionState::OutcomeRecorded,
-            )?;
             Some(resumed)
         } else {
             self.approval_no_resume_status(
@@ -1045,10 +1068,15 @@ impl AppServer {
             )?
         };
         if let Some((turn, run_status)) = terminal {
-            let committed = self.commit_turn_run_status(turn, &run_status, &cancellation)?;
-            if matches!(decision.outcome, ApprovalOutcome::Allow) && pending_tool_call.is_some() {
-                self.store.delete_pending_execution(&decision.request_id)?;
+            let mut effective_status = run_status.clone();
+            if cancellation.is_cancelled() {
+                mark_run_cancelled(&mut effective_status);
             }
+            let committed = self.commit_effective_turn_status_resolving_approval(
+                &decision.request_id,
+                &turn,
+                &effective_status,
+            )?;
             messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
             messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
         }
@@ -1432,14 +1460,14 @@ fn agent_loop_ready() -> bool {
     agent_loop_capability_ready(&capability)
 }
 
-fn provider_readiness(snapshot: &ProviderConfigSnapshot) -> ProviderReadiness {
+fn provider_configuration(snapshot: &ProviderConfigSnapshot) -> ProviderConfigurationStatus {
     let config = snapshot.redacted_config();
-    let readiness = snapshot.readiness();
-    ProviderReadiness {
+    let configuration = snapshot.configuration();
+    ProviderConfigurationStatus {
         source: snapshot.source().map(|source| source.as_str().to_string()),
         snapshot_id: snapshot.snapshot_id().to_string(),
-        configured: readiness.ready,
-        configuration_blocker: readiness
+        configured: configuration.configured,
+        configuration_blocker: configuration
             .blocker
             .as_ref()
             .map(|blocker| blocker.code().to_string()),
@@ -1638,7 +1666,12 @@ fn mark_run_cancelled(status: &mut AgentRunStatus) {
 
 fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
     let mut event = TraceEvent::new(
-        format!("trace_{}_agent_loop", turn.turn_id),
+        format!(
+            "trace_{}_agent_loop_{}_{}",
+            turn.turn_id,
+            status.status.as_str(),
+            status.model_turns
+        ),
         &turn.thread_id,
         &turn.turn_id,
         "agent_loop",
@@ -1713,9 +1746,9 @@ mod tests {
 
     use singularity_agent::PendingToolCall;
     use singularity_model::{
-        ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind, ModelRole,
-        ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-        Provider, ProviderError,
+        ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall,
+        ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, Provider,
+        ProviderError, ProviderProtocolContract,
     };
     use singularity_protocol::ItemKind;
     use singularity_tools::{CommandRequest, CommandResult};
@@ -1745,8 +1778,8 @@ mod tests {
     }
 
     impl Provider for StaticProvider {
-        fn capabilities(&self) -> ModelCapabilities {
-            ModelCapabilities::default()
+        fn protocol_contract(&self) -> ProviderProtocolContract {
+            ProviderProtocolContract::default()
         }
 
         fn complete(
@@ -2355,11 +2388,12 @@ mod tests {
     #[test]
     fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
         let file_path = workspace.join("README.md");
         std::fs::write(&file_path, "before").expect("write readme");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let store = SessionStore::open(&db_path).expect("store");
         let thread = store
             .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
             .expect("thread");
@@ -2516,6 +2550,9 @@ mod tests {
             assert!(!trace_json.contains("checkpoint_version"));
             assert!(!trace_json.contains("raw_arguments"));
         }
+        drop(server);
+        let server = app_server(SessionStore::open(&db_path).expect("reopen store"))
+            .with_sandbox_backend(CompletedSandboxBackend);
         let request = server
             .store
             .get_pending_approval(&format!("approval_{}_call_1", turn.turn_id))
@@ -2554,6 +2591,20 @@ mod tests {
         assert!(resumed.1.verification.required);
         assert!(resumed.1.verification.passed);
         assert_eq!(resumed.1.verification.successful_command_count, 1);
+        let committed = server
+            .commit_effective_turn_status_resolving_approval(
+                &request.request_id,
+                &resumed.0,
+                &resumed.1,
+            )
+            .expect("commit resumed outcome");
+        assert_eq!(committed.turn.status, TurnStatus::Completed);
+        assert!(
+            !server
+                .store
+                .has_pending_tool_call(&request.request_id)
+                .expect("pending lookup")
+        );
         assert_eq!(
             std::fs::read_to_string(&file_path).expect("read readme"),
             "after"

@@ -9,8 +9,20 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvaluationResultSchemaVersion {
-    #[serde(rename = "evaluation.result/v2")]
-    V2,
+    #[serde(rename = "evaluation.result/v3")]
+    V3,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationEvidenceSummary {
+    pub workspace_change_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_digest: Option<String>,
+    pub tool_calls: u32,
+    pub smoke_command_satisfied: bool,
+    pub strict_sandbox_command_count: u32,
+    pub local_process_fallback_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +122,7 @@ pub struct EvaluationTaskResult {
     pub agent_completed: bool,
     pub tests_passed: bool,
     pub evaluation_passed: bool,
+    pub evidence: EvaluationEvidenceSummary,
 }
 
 impl EvaluationTaskResult {
@@ -143,6 +156,16 @@ impl EvaluationTaskResult {
         if self.evaluation_passed && self.status != EvaluationStatus::Completed {
             return Err(validation_error(format!(
                 "{context} evaluation_passed requires completed status"
+            )));
+        }
+        if self.evaluation_passed
+            && (!self.evidence.smoke_command_satisfied
+                || self.evidence.strict_sandbox_command_count == 0
+                || self.evidence.local_process_fallback_count != 0
+                || self.evidence.patch_digest.is_none())
+        {
+            return Err(validation_error(format!(
+                "{context} evaluation_passed requires patch, smoke, and strict sandbox evidence"
             )));
         }
         Ok(())

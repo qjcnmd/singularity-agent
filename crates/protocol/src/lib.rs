@@ -395,7 +395,7 @@ pub struct TurnStartResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ProviderReadiness {
+pub struct ProviderConfigurationStatus {
     pub source: Option<String>,
     pub snapshot_id: String,
     pub configured: bool,
@@ -409,8 +409,8 @@ pub struct ProviderReadiness {
 pub struct AgentCapabilityResult {
     #[serde(rename = "agentLoop")]
     pub agent_loop: Value,
-    #[serde(rename = "providerReadiness")]
-    pub provider_readiness: ProviderReadiness,
+    #[serde(rename = "providerConfiguration")]
+    pub provider_configuration: ProviderConfigurationStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

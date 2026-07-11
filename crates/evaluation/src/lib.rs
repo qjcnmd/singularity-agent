@@ -14,13 +14,14 @@ pub use manifest::{
     WorkspaceSpec,
 };
 pub use result::{
-    BlockerKind, EvaluationBlocker, EvaluationResult, EvaluationResultSchemaVersion,
-    EvaluationStageResults, EvaluationStatus, EvaluationTaskResult, StageResult, StageStatus,
+    BlockerKind, EvaluationBlocker, EvaluationEvidenceSummary, EvaluationResult,
+    EvaluationResultSchemaVersion, EvaluationStageResults, EvaluationStatus, EvaluationTaskResult,
+    StageResult, StageStatus,
 };
 pub use value::{Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId, ToolName};
 
 pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v3";
-pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v2";
+pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v3";
 
 #[derive(Debug, thiserror::Error)]
 pub enum EvaluationError {

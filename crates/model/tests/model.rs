@@ -1,12 +1,13 @@
 use schemars::schema_for;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelCapabilities,
-    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig,
-    ModelProviderStatus, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
-    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider,
-    OpenAiProviderConfig, Provider, ProviderConfigSnapshot, ProviderConfigSource, ToolChoiceMode,
-    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, resolve_provider_config,
-    validate_model_request, validate_model_request_with_capabilities, validate_model_response,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelError,
+    ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
+    ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
+    ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
+    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
+    ProviderProtocolContract, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
+    classify_model_error, resolve_provider_config, validate_model_request,
+    validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
@@ -239,7 +240,7 @@ fn provider_config_snapshot_is_atomic_immutable_and_secret_safe() {
         snapshot.redacted_config().model_name.as_deref(),
         Some("snapshot-model")
     );
-    assert!(snapshot.readiness().ready);
+    assert!(snapshot.configuration().configured);
     assert!(snapshot.provider().is_ok());
     assert!(snapshot.snapshot_id().starts_with("provider_snapshot_"));
     let debug = format!("{snapshot:?}");
@@ -264,13 +265,65 @@ fn provider_config_snapshot_preserves_the_original_configuration_error() {
     let snapshot = in_current_dir(temp.path(), || ProviderConfigSnapshot::capture(|_| None));
 
     assert_eq!(snapshot.source(), None);
-    assert!(!snapshot.readiness().ready);
+    assert!(!snapshot.configuration().configured);
     let first = snapshot.provider().expect_err("missing provider config");
     let second = snapshot
         .provider()
         .expect_err("same missing provider config");
     assert_eq!(first, second);
     assert!(first.message.contains("SINGULARITY_MODEL"));
+    assert_eq!(
+        first.error.code.as_deref(),
+        Some("provider_configuration_missing")
+    );
+    assert_eq!(
+        first.error.stage,
+        Some(ProviderErrorStage::ClientInitialization)
+    );
+}
+
+#[test]
+fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics() {
+    let malformed_url = single_response_server("HTTP/1.1 200 OK", "not-json");
+    let malformed =
+        OpenAiProvider::new(provider_test_config(malformed_url)).expect("malformed provider");
+    let request = ModelTurnRequest::new(
+        "request_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let decode_error = malformed
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect_err("decode failure");
+    assert_eq!(
+        decode_error.error.code.as_deref(),
+        Some("provider_response_json_decode_failed")
+    );
+    assert_eq!(
+        decode_error.error.stage,
+        Some(ProviderErrorStage::ResponseJsonDecode)
+    );
+
+    let missing_choices_url = single_response_server("HTTP/1.1 200 OK", r#"{"id":"response_1"}"#);
+    let missing_choices = OpenAiProvider::new(provider_test_config(missing_choices_url))
+        .expect("missing choices provider");
+    let envelope_error = missing_choices
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect_err("envelope failure");
+    assert_eq!(
+        envelope_error.error.code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert_eq!(
+        envelope_error.error.stage,
+        Some(ProviderErrorStage::ResponseValidation)
+    );
+    assert_eq!(
+        envelope_error.error.validation_errors,
+        vec!["response_choices_missing"]
+    );
+    let serialized = serde_json::to_string(&envelope_error.error).expect("serialize error");
+    assert!(!serialized.contains("hello"));
+    assert!(!serialized.contains("not-json"));
 }
 
 #[test]
@@ -401,7 +454,7 @@ fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
 
     assert_eq!(config.provider_name, "openai_compatible");
     assert_eq!(config.source, ProviderConfigSource::ProcessEnvironment);
-    assert!(status.ready);
+    assert!(status.configured);
     assert_eq!(status.api_key_status, "present(redacted)");
     assert!(!serialized.contains("sk-secret-value"));
     assert!(!serialized.contains("provider.example"));
@@ -417,15 +470,19 @@ fn provider_token_limits_default_and_configured_capabilities_are_explicit() {
     })
     .expect("provider config");
     assert_eq!(
-        default_config.capabilities().max_context_tokens,
+        default_config.protocol_contract().max_context_tokens,
         DEFAULT_MAX_CONTEXT_TOKENS
     );
     assert_eq!(
-        default_config.capabilities().max_output_tokens,
+        default_config.protocol_contract().max_output_tokens,
         DEFAULT_MAX_OUTPUT_TOKENS
     );
-    assert!(default_config.capabilities().supports_developer_message);
-    assert!(default_config.capabilities().supports_json_mode);
+    assert!(
+        default_config
+            .protocol_contract()
+            .supports_developer_message
+    );
+    assert!(default_config.protocol_contract().supports_json_mode);
 
     let configured = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
@@ -436,12 +493,12 @@ fn provider_token_limits_default_and_configured_capabilities_are_explicit() {
         _ => None,
     })
     .expect("configured provider");
-    let capabilities = configured.capabilities();
+    let capabilities = configured.protocol_contract();
     assert_eq!(capabilities.max_context_tokens, 131_072);
     assert_eq!(capabilities.max_output_tokens, 8_192);
 
     let provider = OpenAiProvider::new(configured).expect("provider");
-    assert_eq!(Provider::capabilities(&provider), capabilities);
+    assert_eq!(Provider::protocol_contract(&provider), capabilities);
 }
 
 #[test]
@@ -496,9 +553,9 @@ fn model_request_validation_rejects_output_above_provider_capability() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.model_preferences.max_output_tokens = Some(9);
-    let capabilities = ModelCapabilities {
+    let capabilities = ProviderProtocolContract {
         max_output_tokens: 8,
-        ..ModelCapabilities::default()
+        ..ProviderProtocolContract::default()
     };
 
     let result = validate_model_request_with_capabilities(&request, Some(&capabilities));
@@ -522,11 +579,11 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
         parameters_schema: serde_json::json!({"type": "object"}),
     });
     request.model_preferences.json_mode = true;
-    let capabilities = ModelCapabilities {
+    let capabilities = ProviderProtocolContract {
         supports_tools: false,
         supports_json_mode: false,
         supports_developer_message: false,
-        ..ModelCapabilities::default()
+        ..ProviderProtocolContract::default()
     };
 
     let result = validate_model_request_with_capabilities(&request, Some(&capabilities));
@@ -849,14 +906,14 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
 
 #[test]
 fn provider_status_reports_required_env_missing_blocker() {
-    let status = ModelProviderStatus::from_config(&ModelProviderConfig {
+    let status = ProviderConfigurationStatus::from_config(&ModelProviderConfig {
         provider_name: Some("openai_compatible".to_string()),
         model_name: None,
         base_url_present: true,
         api_key_present: false,
     });
 
-    assert!(!status.ready);
+    assert!(!status.configured);
     assert_eq!(status.blocker, Some(ModelBlockerKind::RequiredEnvMissing));
     assert_eq!(
         status.blocker.as_ref().unwrap().as_str(),
@@ -952,7 +1009,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         &[call.clone(), call],
         &ToolChoicePolicy::default(),
         &["builtin.read_file".to_string()],
-        Some(&ModelCapabilities::default()),
+        Some(&ProviderProtocolContract::default()),
     );
 
     assert_eq!(
@@ -1030,7 +1087,10 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
     assert_eq!(restored_error, model_error);
     assert_eq!(schema_title::<ModelToolSchema>(), "ModelToolSchema");
     assert_eq!(schema_title::<ModelToolCall>(), "ModelToolCall");
-    assert_eq!(schema_title::<ModelCapabilities>(), "ModelCapabilities");
+    assert_eq!(
+        schema_title::<ProviderProtocolContract>(),
+        "ProviderProtocolContract"
+    );
     assert_eq!(schema_title::<ModelProviderConfig>(), "ModelProviderConfig");
     assert_eq!(schema_title::<ModelUsage>(), "ModelUsage");
     assert_eq!(schema_title::<ModelTurnRequest>(), "ModelTurnRequest");

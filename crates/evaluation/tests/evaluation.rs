@@ -96,7 +96,7 @@ fn valid_manifest() -> Value {
 
 fn valid_result() -> Value {
     json!({
-        "schema_version": "evaluation.result/v2",
+        "schema_version": "evaluation.result/v3",
         "run_id": "public-representative-20260710",
         "status": "completed",
         "evaluation_passed": false,
@@ -112,7 +112,15 @@ fn valid_result() -> Value {
                 },
                 "agent_completed": true,
                 "tests_passed": false,
-                "evaluation_passed": false
+                "evaluation_passed": false,
+                "evidence": {
+                    "workspace_change_count": 1,
+                    "patch_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "tool_calls": 2,
+                    "smoke_command_satisfied": true,
+                    "strict_sandbox_command_count": 3,
+                    "local_process_fallback_count": 0
+                }
             }
         ]
     })
@@ -582,7 +590,7 @@ fn public_representative_manifest_is_validated_by_the_crate() {
         .join("public-representative-task.json");
     let manifest = EvaluationManifest::load(&path).expect("load public manifest");
 
-    assert_eq!(manifest.task_set().tasks.len(), 2);
+    assert_eq!(manifest.task_set().tasks.len(), 3);
     for task in &manifest.task_set().tasks {
         let projection = task.agent_projection();
         let projection_json = serde_json::to_string(&projection).expect("serialize projection");
@@ -634,6 +642,23 @@ fn public_representative_manifest_is_validated_by_the_crate() {
     assert!(hidden_patch.content().contains("test_hidden_receipt.py"));
     assert_ne!(public_patch.content(), hidden_patch.content());
     assert_ne!(plan.public.commands, plan.hidden.commands);
+
+    let cross_language = manifest
+        .task_set()
+        .tasks
+        .iter()
+        .find(|task| task.task_id.as_str() == "rust_node_calculator__multi_line_total")
+        .expect("cross-language task");
+    let projection = cross_language.agent_projection();
+    assert_eq!(projection.smoke_commands.len(), 2);
+    assert_eq!(
+        projection.smoke_commands[0].argv.as_slice(),
+        ["cargo", "test", "--locked", "--lib"]
+    );
+    assert_eq!(
+        projection.smoke_commands[1].argv.as_slice(),
+        ["node", "smoke_test.mjs"]
+    );
 }
 
 #[test]

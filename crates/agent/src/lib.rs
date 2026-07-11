@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelCapabilities, ModelError,
-    ModelErrorCategory, ModelMessage, ModelPreferences, ModelRole, ModelToolCall,
-    ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnStatus, Provider,
-    ProviderDiagnostic, provider_error_response, validate_model_request_with_capabilities,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
+    ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
+    ModelToolSchema, ModelTurnRequest, ModelTurnStatus, Provider, ProviderDiagnostic,
+    ProviderProtocolContract, provider_error_response, validate_model_request_with_capabilities,
     validate_model_turn_response,
 };
 use singularity_policy::{
@@ -660,7 +660,7 @@ where
     }
 
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
-        let capabilities = self.provider.capabilities();
+        let capabilities = self.provider.protocol_contract();
         let budget = match context_budget(input, &self.tool_broker, &capabilities) {
             Ok(budget) => budget,
             Err(error) => return failed_result(error),
@@ -684,7 +684,7 @@ where
         &self,
         input: &AgentLoopInput,
         budget: &ContextBudget,
-        capabilities: &ModelCapabilities,
+        capabilities: &ProviderProtocolContract,
         mut state: AgentLoopState,
         model_turn_offset: u32,
     ) -> AgentLoopResult {
@@ -935,7 +935,7 @@ where
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
         }
-        let capabilities = self.provider.capabilities();
+        let capabilities = self.provider.protocol_contract();
         let budget = match context_budget(input, &self.tool_broker, &capabilities) {
             Ok(budget) => budget,
             Err(error) => {
@@ -1288,7 +1288,7 @@ impl ContextBudget {
 
 fn output_token_reservation(
     input: &AgentLoopInput,
-    capabilities: &ModelCapabilities,
+    capabilities: &ProviderProtocolContract,
 ) -> Result<u32, String> {
     match input.model_preferences.max_output_tokens {
         Some(requested) if requested > capabilities.max_output_tokens => Err(format!(
@@ -1303,7 +1303,7 @@ fn output_token_reservation(
 fn context_budget(
     input: &AgentLoopInput,
     loop_tools: &ToolBroker,
-    capabilities: &ModelCapabilities,
+    capabilities: &ProviderProtocolContract,
 ) -> Result<ContextBudget, String> {
     if capabilities.max_context_tokens == 0 || capabilities.max_output_tokens == 0 {
         return Err("provider token capabilities must be greater than zero".to_string());

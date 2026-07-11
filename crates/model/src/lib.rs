@@ -152,7 +152,7 @@ pub struct ModelToolCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ModelCapabilities {
+pub struct ProviderProtocolContract {
     pub supports_tools: bool,
     pub supports_parallel_tool_calls: bool,
     pub supports_json_mode: bool,
@@ -162,7 +162,7 @@ pub struct ModelCapabilities {
     pub max_output_tokens: u32,
 }
 
-impl Default for ModelCapabilities {
+impl Default for ProviderProtocolContract {
     fn default() -> Self {
         Self {
             supports_tools: true,
@@ -219,7 +219,7 @@ pub struct ProviderConfigSnapshot {
     snapshot_id: String,
     source: Option<ProviderConfigSource>,
     redacted_config: ModelProviderConfig,
-    readiness: ModelProviderStatus,
+    configuration: ProviderConfigurationStatus,
     provider: Result<OpenAiProvider, ProviderError>,
 }
 
@@ -230,7 +230,7 @@ impl fmt::Debug for ProviderConfigSnapshot {
             .field("snapshot_id", &self.snapshot_id)
             .field("source", &self.source)
             .field("redacted_config", &self.redacted_config)
-            .field("readiness", &self.readiness)
+            .field("configuration", &self.configuration)
             .finish()
     }
 }
@@ -246,18 +246,18 @@ impl ProviderConfigSnapshot {
         let redacted_config = provider_config_resolution(&values).config;
         let provider =
             OpenAiProviderConfig::from_resolved_values(values).and_then(OpenAiProvider::new);
-        let mut readiness = ModelProviderStatus::from_config(&redacted_config);
-        if readiness.ready
+        let mut configuration = ProviderConfigurationStatus::from_config(&redacted_config);
+        if configuration.configured
             && let Err(error) = &provider
         {
-            readiness.ready = false;
-            readiness.blocker = provider_initialization_blocker(&error.error.category());
+            configuration.configured = false;
+            configuration.blocker = provider_initialization_blocker(&error.error.category());
         }
         Self {
             snapshot_id: format!("{PROVIDER_SNAPSHOT_ID_PREFIX}{}", Uuid::new_v4().simple()),
             source,
             redacted_config,
-            readiness,
+            configuration,
             provider,
         }
     }
@@ -270,8 +270,8 @@ impl ProviderConfigSnapshot {
         &self.redacted_config
     }
 
-    pub fn readiness(&self) -> &ModelProviderStatus {
-        &self.readiness
+    pub fn configuration(&self) -> &ProviderConfigurationStatus {
+        &self.configuration
     }
 
     pub fn snapshot_id(&self) -> &str {
@@ -336,8 +336,8 @@ fn provider_initialization_blocker(category: &ModelErrorCategory) -> Option<Mode
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ModelProviderStatus {
-    pub ready: bool,
+pub struct ProviderConfigurationStatus {
+    pub configured: bool,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
     pub api_key_status: String,
@@ -345,11 +345,11 @@ pub struct ModelProviderStatus {
     pub blocker: Option<ModelBlockerKind>,
 }
 
-impl ModelProviderStatus {
+impl ProviderConfigurationStatus {
     pub fn from_config(config: &ModelProviderConfig) -> Self {
         let validation = validate_provider_config(config);
         Self {
-            ready: validation.valid,
+            configured: validation.valid,
             provider_name: config.provider_name.clone(),
             model_name: config.model_name.clone(),
             api_key_status: redacted_presence(config.api_key_present),
@@ -606,7 +606,7 @@ impl ModelTurnResponse {
 }
 
 pub trait Provider {
-    fn capabilities(&self) -> ModelCapabilities;
+    fn protocol_contract(&self) -> ProviderProtocolContract;
 
     fn complete(
         &self,
@@ -667,12 +667,18 @@ impl OpenAiProviderConfig {
             source,
         )?;
         if max_output_tokens >= max_context_tokens {
-            return Err(ProviderError::from_model_error(ModelError::new(
-                ModelErrorKind::InvalidRequest,
-                format!(
-                    "invalid model configuration: {ENV_MAX_OUTPUT_TOKENS} must be smaller than {ENV_CONTEXT_TOKENS}"
+            return Err(ProviderError::from_model_error(
+                ModelError::new(
+                    ModelErrorKind::InvalidRequest,
+                    format!(
+                        "invalid model configuration: {ENV_MAX_OUTPUT_TOKENS} must be smaller than {ENV_CONTEXT_TOKENS}"
+                    ),
+                )
+                .with_provider_diagnostic(
+                    "provider_configuration_invalid",
+                    ProviderErrorStage::ClientInitialization,
                 ),
-            )));
+            ));
         }
         let provider_name = values
             .provider_name
@@ -698,8 +704,8 @@ impl OpenAiProviderConfig {
         })
     }
 
-    pub fn redacted_status(&self) -> ModelProviderStatus {
-        ModelProviderStatus::from_config(&ModelProviderConfig {
+    pub fn redacted_status(&self) -> ProviderConfigurationStatus {
+        ProviderConfigurationStatus::from_config(&ModelProviderConfig {
             provider_name: Some(self.provider_name.clone()),
             model_name: Some(self.model_name.clone()),
             base_url_present: true,
@@ -711,8 +717,8 @@ impl OpenAiProviderConfig {
         chat_completions_endpoint(&self.base_url)
     }
 
-    pub fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities {
+    pub fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract {
             supports_tools: true,
             supports_parallel_tool_calls: false,
             supports_json_mode: true,
@@ -745,7 +751,7 @@ impl OpenAiProvider {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
             .build()
-            .map_err(provider_transport_error)?;
+            .map_err(provider_client_initialization_error)?;
         Ok(Self { config, client })
     }
 
@@ -758,8 +764,8 @@ impl OpenAiProvider {
 }
 
 impl Provider for OpenAiProvider {
-    fn capabilities(&self) -> ModelCapabilities {
-        self.config.capabilities()
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.config.protocol_contract()
     }
 
     fn complete(
@@ -770,33 +776,40 @@ impl Provider for OpenAiProvider {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
-        let capabilities = self.capabilities();
+        let capabilities = self.protocol_contract();
         let request_validation =
             validate_model_request_with_capabilities(request, Some(&capabilities));
         if !request_validation.valid {
-            return Err(ProviderError::from_model_error(
-                ModelError::new(
-                    ModelErrorKind::InvalidRequest,
-                    format!(
-                        "model request validation failed: {}",
-                        request_validation.errors.join(", ")
-                    ),
-                )
-                .with_provider(self.config.provider_name.clone())
-                .with_model(self.config.model_name.clone()),
-            ));
+            let mut error = ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                format!(
+                    "model request validation failed: {}",
+                    request_validation.errors.join(", ")
+                ),
+            )
+            .with_provider(self.config.provider_name.clone())
+            .with_model(self.config.model_name.clone())
+            .with_provider_diagnostic("provider_request_invalid", ProviderErrorStage::RequestSend);
+            error.validation_errors = request_validation.errors;
+            return Err(ProviderError::from_model_error(error));
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(provider_runtime_error)?;
-        let response = block_on_provider_future(&runtime, cancellation, || {
-            self.client
-                .post(self.config.endpoint())
-                .bearer_auth(&self.config.api_key)
-                .json(&openai_request_payload(request, &self.config.model_name))
-                .send()
-        })?;
+        let response = block_on_provider_future(
+            &runtime,
+            cancellation,
+            "provider_request_send_failed",
+            ProviderErrorStage::RequestSend,
+            || {
+                self.client
+                    .post(self.config.endpoint())
+                    .bearer_auth(&self.config.api_key)
+                    .json(&openai_request_payload(request, &self.config.model_name))
+                    .send()
+            },
+        )?;
         let status = response.status();
         if !status.is_success() {
             return Err(ProviderError::from_model_error(
@@ -807,14 +820,15 @@ impl Provider for OpenAiProvider {
                 ),
             ));
         }
-        let payload = block_on_provider_future(&runtime, cancellation, || response.json::<Value>())
-            .map_err(|error| {
-                if error.error.kind == ModelErrorKind::Cancelled {
-                    error
-                } else {
-                    ProviderError::from_model_error(provider_response_json_error())
-                }
-            })?;
+        let body = block_on_provider_future(
+            &runtime,
+            cancellation,
+            "provider_response_body_read_failed",
+            ProviderErrorStage::ResponseBodyRead,
+            || response.bytes(),
+        )?;
+        let payload = serde_json::from_slice::<Value>(&body)
+            .map_err(|_| ProviderError::from_model_error(provider_response_json_error()))?;
         parse_openai_response(request, &self.config, payload)
     }
 }
@@ -1021,14 +1035,18 @@ fn parse_openai_response(
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .ok_or_else(|| {
-            ProviderError::from_model_error(
-                ModelError::new(
-                    ModelErrorKind::JsonSchemaViolation,
-                    "provider response missing choices",
-                )
-                .with_provider(config.provider_name.clone())
-                .with_model(config.model_name.clone()),
+            let mut error = ModelError::new(
+                ModelErrorKind::JsonSchemaViolation,
+                "provider response missing choices",
             )
+            .with_provider(config.provider_name.clone())
+            .with_model(config.model_name.clone())
+            .with_provider_diagnostic(
+                "provider_response_invalid",
+                ProviderErrorStage::ResponseValidation,
+            );
+            error.validation_errors = vec!["response_choices_missing".to_string()];
+            ProviderError::from_model_error(error)
         })?;
     let message = choice.get("message").unwrap_or(&Value::Null);
     let content = parse_openai_content(message.get("content"));
@@ -1059,7 +1077,7 @@ fn parse_openai_response(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    let capabilities = config.capabilities();
+    let capabilities = config.protocol_contract();
     let validation =
         validate_model_turn_response(request, &response, &allowed_tool_names, Some(&capabilities));
     if !validation.valid {
@@ -1220,17 +1238,29 @@ fn missing_provider_config_error(
     source: Option<ProviderConfigSource>,
 ) -> ProviderError {
     let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
-    ProviderError::from_model_error(ModelError::new(
-        ModelErrorKind::InvalidRequest,
-        format!("required provider configuration is missing: {name} (source={source})"),
-    ))
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            format!("required provider configuration is missing: {name} (source={source})"),
+        )
+        .with_provider_diagnostic(
+            "provider_configuration_missing",
+            ProviderErrorStage::ClientInitialization,
+        ),
+    )
 }
 
 fn provider_source_missing_error() -> ProviderError {
-    ProviderError::from_model_error(ModelError::new(
-        ModelErrorKind::InvalidRequest,
-        "provider configuration source is missing",
-    ))
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            "provider configuration source is missing",
+        )
+        .with_provider_diagnostic(
+            "provider_configuration_missing",
+            ProviderErrorStage::ClientInitialization,
+        ),
+    )
 }
 
 fn parse_provider_token_limit(
@@ -1248,12 +1278,18 @@ fn parse_provider_token_limit(
         Some(value) if value <= upper_bound => Ok(value),
         _ => {
             let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
-            Err(ProviderError::from_model_error(ModelError::new(
-                ModelErrorKind::InvalidRequest,
-                format!(
-                    "invalid model configuration: {name} must be between 1 and {upper_bound} (source={source})"
+            Err(ProviderError::from_model_error(
+                ModelError::new(
+                    ModelErrorKind::InvalidRequest,
+                    format!(
+                        "invalid model configuration: {name} must be between 1 and {upper_bound} (source={source})"
+                    ),
+                )
+                .with_provider_diagnostic(
+                    "provider_configuration_invalid",
+                    ProviderErrorStage::ClientInitialization,
                 ),
-            )))
+            ))
         }
     }
 }
@@ -1279,7 +1315,11 @@ fn model_error_from_http_status(status: u16, provider_name: &str, model_name: &s
     error
 }
 
-fn provider_transport_error(error: reqwest::Error) -> ProviderError {
+fn provider_transport_error(
+    error: reqwest::Error,
+    code: &'static str,
+    stage: ProviderErrorStage,
+) -> ProviderError {
     let kind = if error.is_timeout() {
         ModelErrorKind::Timeout
     } else {
@@ -1296,17 +1336,31 @@ fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     } else {
         ProviderTransportCategory::Unknown
     };
-    let mut model_error = ModelError::new(kind, "provider transport failed")
-        .with_provider_diagnostic("provider_transport_failed", ProviderErrorStage::RequestSend);
+    let mut model_error =
+        ModelError::new(kind, "provider transport failed").with_provider_diagnostic(code, stage);
     model_error.transport_category = Some(category);
     ProviderError::from_model_error(model_error)
 }
 
 fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
-    ProviderError::from_model_error(ModelError::new(
-        ModelErrorKind::UnknownProviderError,
-        "provider runtime initialization failed",
-    ))
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnknownProviderError,
+            "provider runtime initialization failed",
+        )
+        .with_provider_diagnostic(
+            "provider_runtime_initialization_failed",
+            ProviderErrorStage::ClientInitialization,
+        ),
+    )
+}
+
+fn provider_client_initialization_error(error: reqwest::Error) -> ProviderError {
+    provider_transport_error(
+        error,
+        "provider_client_initialization_failed",
+        ProviderErrorStage::ClientInitialization,
+    )
 }
 
 fn provider_cancelled_error() -> ProviderError {
@@ -1319,6 +1373,8 @@ fn provider_cancelled_error() -> ProviderError {
 fn block_on_provider_future<C, F, T>(
     runtime: &tokio::runtime::Runtime,
     cancellation: &CancellationToken,
+    error_code: &'static str,
+    error_stage: ProviderErrorStage,
     create_future: C,
 ) -> Result<T, ProviderError>
 where
@@ -1340,7 +1396,11 @@ where
             )
             .await
         }) {
-            Ok(result) => return result.map_err(provider_transport_error),
+            Ok(result) => {
+                return result.map_err(|error| {
+                    provider_transport_error(error, error_code, error_stage.clone())
+                });
+            }
             Err(_) => continue,
         }
     }
@@ -1380,7 +1440,7 @@ pub fn validate_model_request(request: &ModelTurnRequest) -> ModelValidationResu
 
 pub fn validate_model_request_with_capabilities(
     request: &ModelTurnRequest,
-    capabilities: Option<&ModelCapabilities>,
+    capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
     let mut errors = Vec::new();
     if request.request_id.trim().is_empty() {
@@ -1425,7 +1485,7 @@ pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
     allowed_tool_names: &[String],
-    capabilities: Option<&ModelCapabilities>,
+    capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
     let mut result = validate_model_response(
         response.assistant_message.as_ref(),
@@ -1465,7 +1525,7 @@ pub fn validate_model_response(
     tool_calls: &[ModelToolCall],
     tool_choice: &ToolChoicePolicy,
     allowed_tool_names: &[String],
-    capabilities: Option<&ModelCapabilities>,
+    capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();

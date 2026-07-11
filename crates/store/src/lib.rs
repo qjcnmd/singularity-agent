@@ -20,13 +20,14 @@ pub use singularity_protocol::{ConversationMessage, ConversationRole};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 const DURABLE_LEDGER_SCHEMA_MIGRATION: &str = "0002_durable_ledger";
 const PENDING_TOOL_CALL_SCHEMA_MIGRATION: &str = "0004_pending_tool_calls";
 const STORE_HARDENING_SCHEMA_MIGRATION: &str = "0005_store_hardening";
 const CONVERSATION_HISTORY_SCHEMA_MIGRATION: &str = "0006_conversation_history";
 const PENDING_EXECUTION_STATE_SCHEMA_MIGRATION: &str = "0007_pending_execution_state";
+const APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION: &str = "0008_approval_execution_recovery";
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const STORE_INITIALIZATION_LOCK_RETRY_MS: u64 = 10;
 const SQLITE_FOREIGN_KEYS_PRAGMA: &str = "foreign_keys";
@@ -125,26 +126,6 @@ pub struct RecordedApprovalDecision {
     pub decision: ApprovalDecision,
     pub pending_tool_call: Option<Value>,
     pub trace: TraceEvent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PendingExecutionState {
-    Pending,
-    Approved,
-    Executing,
-    OutcomeRecorded,
-}
-
-impl PendingExecutionState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Approved => "approved",
-            Self::Executing => "executing",
-            Self::OutcomeRecorded => "outcome_recorded",
-        }
-    }
 }
 
 pub struct RegisterArtifactRefParams<'a> {
@@ -489,6 +470,27 @@ impl SessionStore {
     ) -> StoreResult<CommittedTurnOutcome> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let committed = self.commit_turn_outcome_in_transaction(
+            &transaction,
+            turn_id,
+            status,
+            agent_loop_status,
+            assistant_delta,
+            trace,
+        )?;
+        transaction.commit()?;
+        Ok(committed)
+    }
+
+    fn commit_turn_outcome_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        turn_id: &str,
+        status: TurnStatus,
+        agent_loop_status: &str,
+        assistant_delta: Option<&str>,
+        trace: &TraceEvent,
+    ) -> StoreResult<CommittedTurnOutcome> {
         let current = transaction
             .query_row(
                 "select turn_id, thread_id, status, agent_loop_status from turns where turn_id = ?1",
@@ -537,13 +539,12 @@ impl SessionStore {
                 let (payload, redacted) =
                     sanitize_item_payload(&kind, serde_json::json!({"delta": delta}))?;
                 let item = Self::new_item(turn_id, kind, payload);
-                let item_sequence = Self::next_item_sequence(&transaction, turn_id)?;
-                Self::insert_item(&transaction, &item, item_sequence, redacted)?;
+                let item_sequence = Self::next_item_sequence(transaction, turn_id)?;
+                Self::insert_item(transaction, &item, item_sequence, redacted)?;
                 Ok(item)
             })
             .transpose()?;
-        let trace = Self::insert_trace(&transaction, trace)?;
-        transaction.commit()?;
+        let trace = Self::insert_trace(transaction, trace)?;
         Ok(CommittedTurnOutcome {
             turn,
             assistant_item,
@@ -739,6 +740,19 @@ impl SessionStore {
                     serde_json::to_string(&payload)?
                 ],
             )?;
+            let changed = transaction.execute(
+                "update turns set status = ?1, agent_loop_status = 'blocked' where turn_id = ?2 and status in (?3, ?1)",
+                params![
+                    serde_json::to_string(&TurnStatus::Blocked)?,
+                    request.turn_id,
+                    serde_json::to_string(&TurnStatus::Running)?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidState(
+                    "pending approval requires a running or blocked turn".to_string(),
+                ));
+            }
         }
         let trace = TraceEvent::new(
             format!("trace_{}", request.request_id),
@@ -875,6 +889,20 @@ impl SessionStore {
                 None
             }
         };
+        if pending_tool_call.is_some() {
+            let (turn_status, agent_loop_status): (String, String) = transaction.query_row(
+                "select status, agent_loop_status from turns where turn_id = ?1",
+                params![request.turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if turn_status != serde_json::to_string(&TurnStatus::Blocked)?
+                || agent_loop_status != "blocked"
+            {
+                return Err(StoreError::InvalidState(
+                    "pending approval is not bound to a blocked turn".to_string(),
+                ));
+            }
+        }
         if decision.outcome == ApprovalOutcome::Defer {
             let trace = TraceEvent {
                 task_id: Some(request.turn_id.clone()),
@@ -925,15 +953,52 @@ impl SessionStore {
             ],
         )?;
         if decision.outcome == ApprovalOutcome::Allow {
-            transaction.execute(
-                "update pending_tool_calls set execution_state = 'approved' where request_id = ?1 and execution_state = 'pending'",
+            let changed = transaction.execute(
+                "update pending_tool_calls set execution_state = 'executing' where request_id = ?1 and execution_state = 'pending'",
                 params![decision.request_id],
             )?;
+            if pending_tool_call.is_some() && changed != 1 {
+                return Err(StoreError::InvalidState(format!(
+                    "pending execution {} is not in pending state",
+                    decision.request_id
+                )));
+            }
         } else {
             transaction.execute(
                 "delete from pending_tool_calls where request_id = ?1",
                 params![decision.request_id],
             )?;
+            if pending_tool_call.is_some() {
+                let terminal_trace = TraceEvent {
+                    task_id: Some(request.turn_id.clone()),
+                    payload: serde_json::json!({
+                        "request_id": decision.request_id,
+                        "decision_id": decision.decision_id,
+                        "outcome": decision.outcome,
+                    }),
+                    ..TraceEvent::new(
+                        format!("trace_{}_denied", decision.decision_id),
+                        request.thread_id.clone(),
+                        request.turn_id.clone(),
+                        "agent_loop",
+                        "approval denied",
+                    )
+                };
+                let changed = transaction.execute(
+                    "update turns set status = ?1, agent_loop_status = 'failed' where turn_id = ?2 and status = ?3 and agent_loop_status = 'blocked'",
+                    params![
+                        serde_json::to_string(&TurnStatus::Failed)?,
+                        request.turn_id,
+                        serde_json::to_string(&TurnStatus::Blocked)?,
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::InvalidState(
+                        "pending approval is not bound to a blocked turn".to_string(),
+                    ));
+                }
+                Self::insert_trace(&transaction, &terminal_trace)?;
+            }
         }
         let trace = TraceEvent::new(
             format!("trace_{}", decision.decision_id),
@@ -961,36 +1026,199 @@ impl SessionStore {
         })
     }
 
-    pub fn transition_pending_execution(
+    pub fn commit_turn_outcome_and_resolve_pending_execution(
         &self,
         request_id: &str,
-        from: PendingExecutionState,
-        to: PendingExecutionState,
-    ) -> StoreResult<()> {
-        let changed = self.connection.execute(
-            "update pending_tool_calls set execution_state = ?1 where request_id = ?2 and execution_state = ?3",
-            params![to.as_str(), request_id, from.as_str()],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::InvalidState(format!(
-                "pending execution {request_id} is not in {} state",
-                from.as_str()
-            )));
+        turn_id: &str,
+        status: TurnStatus,
+        agent_loop_status: &str,
+        assistant_delta: Option<&str>,
+        trace: &TraceEvent,
+    ) -> StoreResult<CommittedTurnOutcome> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let bound_turn_id: String = transaction
+            .query_row(
+                "select turn_id from pending_tool_calls where request_id = ?1 and execution_state = 'executing'",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::InvalidState(format!(
+                    "pending execution {request_id} is not in executing state"
+                )),
+                other => StoreError::Sqlite(other),
+            })?;
+        if bound_turn_id != turn_id {
+            return Err(StoreError::InvalidState(
+                "pending execution turn binding mismatch".to_string(),
+            ));
         }
-        Ok(())
-    }
-
-    pub fn delete_pending_execution(&self, request_id: &str) -> StoreResult<()> {
-        let changed = self.connection.execute(
-            "delete from pending_tool_calls where request_id = ?1 and execution_state = 'outcome_recorded'",
+        let committed = self.commit_turn_outcome_in_transaction(
+            &transaction,
+            turn_id,
+            status,
+            agent_loop_status,
+            assistant_delta,
+            trace,
+        )?;
+        let deleted = transaction.execute(
+            "delete from pending_tool_calls where request_id = ?1 and execution_state = 'executing'",
             params![request_id],
         )?;
-        if changed != 1 {
+        if deleted != 1 {
             return Err(StoreError::InvalidState(format!(
-                "pending execution {request_id} has no recorded outcome"
+                "pending execution {request_id} was not resolved"
             )));
         }
-        Ok(())
+        transaction.commit()?;
+        Ok(committed)
+    }
+
+    pub fn recover_incomplete_approval_executions(&self) -> StoreResult<Vec<String>> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let mut approval_statement = transaction.prepare(
+            "select a.request_id, a.payload, a.decision_outcome,
+                    count(p.request_id), min(p.execution_state)
+             from approvals a
+             left join pending_tool_calls p on p.request_id = a.request_id
+             group by a.request_id, a.payload, a.decision_outcome
+             order by a.rowid",
+        )?;
+        let approvals = approval_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(approval_statement);
+        for (request_id, payload, decision, pending_count, pending_state) in approvals {
+            let request: ApprovalRequest = serde_json::from_str(&payload)?;
+            let turn_status = transaction
+                .query_row(
+                    "select status from turns where turn_id = ?1 and thread_id = ?2",
+                    params![request.turn_id, request.thread_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "approval {request_id} is not bound to an existing turn"
+                    ))
+                })?;
+            let status: TurnStatus = serde_json::from_str(&turn_status)?;
+            let decision = decision
+                .as_deref()
+                .map(serde_json::from_str::<ApprovalOutcome>)
+                .transpose()?;
+            let valid = match (
+                request.tool_call_id.is_some(),
+                decision,
+                is_terminal_turn_status(&status),
+            ) {
+                (false, _, _) => pending_count == 0,
+                (true, None, false) => {
+                    pending_count == 1 && pending_state.as_deref() == Some("pending")
+                }
+                (true, Some(ApprovalOutcome::Allow), false) => {
+                    pending_count == 1 && pending_state.as_deref() == Some("executing")
+                }
+                (true, Some(ApprovalOutcome::Allow), true) => {
+                    pending_count == 0
+                        || (pending_count == 1 && pending_state.as_deref() == Some("executing"))
+                }
+                (true, Some(ApprovalOutcome::Deny), true) => pending_count == 0,
+                (true, Some(ApprovalOutcome::Defer), _)
+                | (true, Some(ApprovalOutcome::Deny), false)
+                | (true, None, true) => false,
+            };
+            if !valid {
+                return Err(StoreError::InvalidState(format!(
+                    "approval {request_id} has inconsistent checkpoint state"
+                )));
+            }
+        }
+        let mut statement = transaction.prepare(
+            "select p.request_id, p.turn_id, p.execution_state, a.decision_outcome, t.thread_id, t.status, t.agent_loop_status
+             from pending_tool_calls p
+             join approvals a on a.request_id = p.request_id
+             join turns t on t.turn_id = p.turn_id
+             order by p.rowid",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut recovered = Vec::new();
+        let allow_decision = serde_json::to_string(&ApprovalOutcome::Allow)?;
+        for (request_id, turn_id, state, decision, thread_id, turn_status, agent_status) in rows {
+            if state == "pending" {
+                if decision.is_some()
+                    || turn_status != serde_json::to_string(&TurnStatus::Blocked)?
+                    || agent_status != "blocked"
+                {
+                    return Err(StoreError::InvalidState(format!(
+                        "pending approval {request_id} has inconsistent durable state"
+                    )));
+                }
+                continue;
+            }
+            if state != "executing" || decision.as_deref() != Some(allow_decision.as_str()) {
+                return Err(StoreError::InvalidState(format!(
+                    "approval execution {request_id} has inconsistent durable state"
+                )));
+            }
+            let status: TurnStatus = serde_json::from_str(&turn_status)?;
+            if !is_terminal_turn_status(&status) {
+                transaction.execute(
+                    "update turns set status = ?1, agent_loop_status = 'interrupted' where turn_id = ?2",
+                    params![serde_json::to_string(&TurnStatus::Interrupted)?, turn_id],
+                )?;
+                let trace = TraceEvent {
+                    task_id: Some(turn_id.clone()),
+                    payload: serde_json::json!({
+                        "request_id": request_id,
+                        "recovery_reason": "approval_execution_outcome_unknown",
+                        "tool_replayed": false,
+                    }),
+                    ..TraceEvent::new(
+                        format!("trace_{request_id}_recovered"),
+                        thread_id,
+                        turn_id.clone(),
+                        "app_server",
+                        "approval execution interrupted during process recovery",
+                    )
+                };
+                Self::insert_trace(&transaction, &trace)?;
+            }
+            transaction.execute(
+                "delete from pending_tool_calls where request_id = ?1",
+                params![request_id],
+            )?;
+            transaction.execute(
+                "delete from pending_tool_calls where turn_id = ?1 and execution_state = 'pending'",
+                params![turn_id],
+            )?;
+            recovered.push(request_id);
+        }
+        transaction.commit()?;
+        Ok(recovered)
     }
 
     pub fn get_approval_decision(&self, decision_id: &str) -> StoreResult<ApprovalDecision> {
@@ -1437,7 +1665,7 @@ impl SessionStore {
                 tool_call_id text not null,
                 payload text not null,
                 execution_state text not null default 'pending'
-                    check(execution_state in ('pending', 'approved', 'executing', 'outcome_recorded')),
+                    check(execution_state in ('pending', 'executing')),
                 foreign key(request_id) references approvals(request_id),
                 foreign key(thread_id) references threads(thread_id),
                 foreign key(turn_id) references turns(turn_id)
@@ -1462,7 +1690,77 @@ impl SessionStore {
         }
         self.migrate_conversation_history()?;
         self.ensure_required_foreign_keys()?;
+        self.migrate_approval_execution_schema()?;
         self.fail_closed_on_foreign_key_violations()?;
+        Ok(())
+    }
+
+    fn migrate_approval_execution_schema(&self) -> StoreResult<()> {
+        self.connection
+            .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "OFF")?;
+        let migration_result = (|| -> StoreResult<()> {
+            let transaction =
+                Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+            let applied = Self::exists_in_transaction(
+                &transaction,
+                "select 1 from schema_migrations where migration_id = ?1",
+                APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION,
+            )?;
+            let table_sql: String = transaction.query_row(
+                "select sql from sqlite_master where type = 'table' and name = 'pending_tool_calls'",
+                [],
+                |row| row.get(0),
+            )?;
+            let normalized = table_sql
+                .to_ascii_lowercase()
+                .replace(char::is_whitespace, "");
+            let has_v8_check =
+                normalized.contains("check(execution_statein('pending','executing'))");
+            if applied && !has_v8_check {
+                return Err(StoreError::InvalidState(
+                    "approval execution migration is recorded but schema is incomplete".to_string(),
+                ));
+            }
+            if !applied {
+                transaction.execute_batch(
+                    "
+                    create table pending_tool_calls_v8(
+                        request_id text primary key,
+                        thread_id text not null,
+                        turn_id text not null,
+                        tool_call_id text not null,
+                        payload text not null,
+                        execution_state text not null default 'pending'
+                            check(execution_state in ('pending', 'executing')),
+                        foreign key(request_id) references approvals(request_id),
+                        foreign key(thread_id) references threads(thread_id),
+                        foreign key(turn_id) references turns(turn_id)
+                    );
+                    insert into pending_tool_calls_v8(
+                        request_id, thread_id, turn_id, tool_call_id, payload, execution_state
+                    )
+                    select request_id, thread_id, turn_id, tool_call_id, payload,
+                           case when execution_state = 'pending' then 'pending' else 'executing' end
+                    from pending_tool_calls;
+                    drop table pending_tool_calls;
+                    alter table pending_tool_calls_v8 rename to pending_tool_calls;
+                    ",
+                )?;
+                transaction.execute(
+                    "insert into schema_migrations(migration_id) values(?1)",
+                    params![APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION],
+                )?;
+                write_schema_version(&transaction)?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })();
+        let foreign_keys_result = self
+            .connection
+            .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "ON")
+            .map_err(StoreError::Sqlite);
+        migration_result?;
+        foreign_keys_result?;
         Ok(())
     }
 
@@ -1765,13 +2063,15 @@ impl SessionStore {
                     tool_call_id text not null,
                     payload text not null,
                     execution_state text not null default 'pending'
-                        check(execution_state in ('pending', 'approved', 'executing', 'outcome_recorded')),
+                        check(execution_state in ('pending', 'executing')),
                     foreign key(request_id) references approvals(request_id),
                     foreign key(thread_id) references threads(thread_id),
                     foreign key(turn_id) references turns(turn_id)
                 );
                 insert into pending_tool_calls_new(request_id, thread_id, turn_id, tool_call_id, payload, execution_state)
-                select request_id, thread_id, turn_id, tool_call_id, payload, execution_state from pending_tool_calls;
+                select request_id, thread_id, turn_id, tool_call_id, payload,
+                       case when execution_state = 'pending' then 'pending' else 'executing' end
+                from pending_tool_calls;
                 drop table pending_tool_calls;
                 alter table pending_tool_calls_new rename to pending_tool_calls;
                 ",

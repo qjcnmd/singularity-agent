@@ -296,34 +296,34 @@ fn print_readiness() -> Result<(), String> {
         agent_loop["status"].as_str().unwrap_or("unknown")
     );
     println!("evaluation=agent_loop");
-    print_provider_readiness(&capability["providerReadiness"])
+    print_provider_configuration(&capability["providerConfiguration"])
 }
 
-fn print_provider_readiness(provider: &Value) -> Result<(), String> {
+fn print_provider_configuration(provider: &Value) -> Result<(), String> {
     let source = match provider["source"].as_str() {
         Some("process_env") => "process_env",
         Some("project_env") => "project_env",
         None if provider["source"].is_null() => "unconfigured",
         _ => {
-            return Err("invalid agent capability: providerReadiness.source".to_string());
+            return Err("invalid agent capability: providerConfiguration.source".to_string());
         }
     };
     println!("provider_config_source={source}");
     let snapshot_id = provider["snapshotId"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "invalid agent capability: providerReadiness.snapshotId".to_string())?;
+        .ok_or_else(|| "invalid agent capability: providerConfiguration.snapshotId".to_string())?;
     println!("provider_snapshot_id={snapshot_id}");
     let configured = provider["configured"]
         .as_bool()
-        .ok_or_else(|| "invalid agent capability: providerReadiness.configured".to_string())?;
+        .ok_or_else(|| "invalid agent capability: providerConfiguration.configured".to_string())?;
     println!("provider_configured={configured}");
     let blocker = match provider.get("configurationBlocker") {
         Some(Value::Null) | None => "none",
         Some(Value::String(blocker)) if !blocker.trim().is_empty() => blocker,
         _ => {
             return Err(
-                "invalid agent capability: providerReadiness.configurationBlocker".to_string(),
+                "invalid agent capability: providerConfiguration.configurationBlocker".to_string(),
             );
         }
     };
@@ -335,7 +335,7 @@ fn print_provider_readiness(provider: &Value) -> Result<(), String> {
     ] {
         let present = provider[field]
             .as_bool()
-            .ok_or_else(|| format!("invalid agent capability: providerReadiness.{field}"))?;
+            .ok_or_else(|| format!("invalid agent capability: providerConfiguration.{field}"))?;
         let status = if present {
             "present(redacted)"
         } else {

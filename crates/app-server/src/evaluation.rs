@@ -13,10 +13,10 @@ use singularity_agent::{
 use singularity_core::{contains_sensitive_text, load_project_instructions_from_cwd};
 use singularity_evaluation::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
-    EvaluationBlocker, EvaluationManifest, EvaluationResult, EvaluationResultSchemaVersion,
-    EvaluationStageResults, EvaluationStatus, EvaluationTaskResult, PatchFormat,
-    PlannedWorkspaceSource, RunId, StageResult, StageStatus, TaskId, VerificationStagePlan,
-    WorkspacePlan,
+    EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationResult,
+    EvaluationResultSchemaVersion, EvaluationStageResults, EvaluationStatus, EvaluationTaskResult,
+    PatchFormat, PlannedWorkspaceSource, RunId, StageResult, StageStatus, TaskId,
+    VerificationStagePlan, WorkspacePlan,
 };
 use singularity_model::{
     ModelErrorCategory, OpenAiProvider, ProviderConfigSnapshot, ProviderDiagnostic, ProviderError,
@@ -43,8 +43,9 @@ use command::{
     run_command_spec, run_raw_command, sandbox_network_mode,
 };
 use workspace::{
-    apply_agent_changes, changed_paths, copy_tree_checked, path_is_allowed, snapshot_workspace,
-    validate_tree,
+    WorkspaceChangeEvidence, apply_agent_changes, changed_paths, copy_tree_checked,
+    patch_evidence_digest, path_is_allowed, snapshot_workspace, validate_tree,
+    workspace_change_evidence,
 };
 
 const RUNNER_NAME: &str = "agent_loop";
@@ -63,6 +64,7 @@ const EVALUATOR_PATCH_FILE: &str = ".singularity-evaluator.patch";
 const RESULT_FILE: &str = "result.json";
 const REPORT_FILE: &str = "report.json";
 const AGENT_TRACE_FILE: &str = "agent-trace.json";
+const PATCH_EVIDENCE_FILE: &str = "patch-evidence.json";
 const ARTIFACT_TEMP_FILE_ATTEMPTS: usize = 64;
 
 static ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -83,6 +85,9 @@ struct TaskDiagnostics {
     public: StageDiagnostics,
     hidden: StageDiagnostics,
     changed_files: Vec<String>,
+    patch_evidence: Vec<WorkspaceChangeEvidence>,
+    patch_digest: Option<String>,
+    patch_evidence_path: Option<String>,
     disallowed_changed_files: Vec<String>,
     smoke_command_satisfied: bool,
     model_turns: u32,
@@ -146,6 +151,9 @@ struct AgentStageExecution {
     stage: StageExecution,
     workspace: Option<PathBuf>,
     changed_files: Vec<String>,
+    patch_evidence: Vec<WorkspaceChangeEvidence>,
+    patch_digest: Option<String>,
+    patch_evidence_path: Option<String>,
     disallowed_changed_files: Vec<String>,
     smoke_command_satisfied: bool,
     model_turns: u32,
@@ -214,7 +222,7 @@ pub(crate) fn run_evaluation(
         EvaluationStatus::Failed
     };
     let result = EvaluationResult {
-        schema_version: EvaluationResultSchemaVersion::V2,
+        schema_version: EvaluationResultSchemaVersion::V3,
         run_id: run_id.clone(),
         status,
         blocker,
@@ -369,6 +377,9 @@ fn run_task(
     );
     diagnostics.agent = agent_execution.stage.diagnostics.clone();
     diagnostics.changed_files = agent_execution.changed_files.clone();
+    diagnostics.patch_evidence = agent_execution.patch_evidence.clone();
+    diagnostics.patch_digest = agent_execution.patch_digest.clone();
+    diagnostics.patch_evidence_path = agent_execution.patch_evidence_path.clone();
     diagnostics.disallowed_changed_files = agent_execution.disallowed_changed_files.clone();
     diagnostics.smoke_command_satisfied = agent_execution.smoke_command_satisfied;
     diagnostics.model_turns = agent_execution.model_turns;
@@ -481,6 +492,15 @@ fn finish_task(
         && agent_completed
         && tests_passed
         && diagnostics.local_process_fallback_count == 0;
+    let strict_sandbox_command_count = diagnostics
+        .source_commands
+        .iter()
+        .chain(diagnostics.baseline.commands.iter())
+        .chain(diagnostics.agent.commands.iter())
+        .chain(diagnostics.public.commands.iter())
+        .chain(diagnostics.hidden.commands.iter())
+        .filter(|command| command.is_strictly_sandboxed())
+        .count();
     let status = if blocker.is_some() {
         EvaluationStatus::Blocked
     } else if evaluation_passed {
@@ -496,6 +516,17 @@ fn finish_task(
         agent_completed,
         tests_passed,
         evaluation_passed,
+        evidence: EvaluationEvidenceSummary {
+            workspace_change_count: u32::try_from(diagnostics.patch_evidence.len())
+                .unwrap_or(u32::MAX),
+            patch_digest: diagnostics.patch_digest.clone(),
+            tool_calls: diagnostics.tool_calls,
+            smoke_command_satisfied: diagnostics.smoke_command_satisfied,
+            strict_sandbox_command_count: u32::try_from(strict_sandbox_command_count)
+                .unwrap_or(u32::MAX),
+            local_process_fallback_count: u32::try_from(diagnostics.local_process_fallback_count)
+                .unwrap_or(u32::MAX),
+        },
     };
     let mut report = serde_json::to_value(&result).expect("evaluation task result serializes");
     if let Some(object) = report.as_object_mut() {
@@ -999,6 +1030,13 @@ fn run_agent_stage(
             "budget": &context.budget,
         })),
         "tool_calls": run_status.tool_calls,
+        "tool_outcomes": result.tool_results.iter().map(|tool_result| json!({
+            "tool_call_id": safe_text(&tool_result.tool_call_id),
+            "tool_name": safe_text(&tool_result.tool_name),
+            "ok": tool_result.ok,
+            "error_code": tool_result.error_code.as_deref().map(safe_text),
+            "truncated": tool_result.truncated,
+        })).collect::<Vec<_>>(),
         "approval_count": run_status.approval_count,
         "audit_events": run_status.audit_events,
         "error": run_status.error.as_deref().map(safe_text),
@@ -1014,6 +1052,9 @@ fn run_agent_stage(
                 ),
                 workspace: None,
                 changed_files: Vec::new(),
+                patch_evidence: Vec::new(),
+                patch_digest: None,
+                patch_evidence_path: None,
                 disallowed_changed_files: Vec::new(),
                 smoke_command_satisfied: false,
                 model_turns: result.model_turns,
@@ -1034,6 +1075,9 @@ fn run_agent_stage(
                 stage: StageExecution::failed(error.clone(), command_diagnostics),
                 workspace: Some(agent_dir.to_path_buf()),
                 changed_files: Vec::new(),
+                patch_evidence: Vec::new(),
+                patch_digest: None,
+                patch_evidence_path: None,
                 disallowed_changed_files: Vec::new(),
                 smoke_command_satisfied: false,
                 model_turns: result.model_turns,
@@ -1047,6 +1091,34 @@ fn run_agent_stage(
         }
     };
     let changed_files = changed_paths(&before, &after);
+    let patch_evidence = workspace_change_evidence(&before, &after, &projection.allowed_paths);
+    let patch_digest = patch_evidence_digest(&patch_evidence);
+    let patch_evidence_path = task_dir.join(PATCH_EVIDENCE_FILE);
+    let patch_evidence_path = match write_json_atomic(&patch_evidence_path, &patch_evidence) {
+        Ok(()) => Some(patch_evidence_path.to_string_lossy().into_owned()),
+        Err(error) => {
+            return AgentStageExecution {
+                stage: StageExecution::blocked(
+                    evaluation_blocker(BlockerKind::WorkspacePreparation, error.clone()),
+                    command_diagnostics,
+                ),
+                workspace: Some(agent_dir.to_path_buf()),
+                changed_files,
+                patch_evidence,
+                patch_digest,
+                patch_evidence_path: None,
+                disallowed_changed_files: Vec::new(),
+                smoke_command_satisfied: false,
+                model_turns: result.model_turns,
+                tool_calls: result.tool_calls,
+                approval_count: result.approval_count,
+                audit_events: run_status.audit_events,
+                trace_path: trace_path_string,
+                error: Some(safe_text(error)),
+                provider_diagnostic: run_status.provider_diagnostic,
+            };
+        }
+    };
     let disallowed_changed_files = changed_files
         .iter()
         .filter(|path| !path_is_allowed(path, &projection.allowed_paths))
@@ -1106,6 +1178,9 @@ fn run_agent_stage(
         stage,
         workspace: Some(agent_dir.to_path_buf()),
         changed_files,
+        patch_evidence,
+        patch_digest,
+        patch_evidence_path,
         disallowed_changed_files,
         smoke_command_satisfied,
         model_turns: result.model_turns,
@@ -1126,6 +1201,9 @@ fn blocked_agent_stage(
         stage: StageExecution::blocked(blocker.clone(), commands),
         workspace: None,
         changed_files: Vec::new(),
+        patch_evidence: Vec::new(),
+        patch_digest: None,
+        patch_evidence_path: None,
         disallowed_changed_files: Vec::new(),
         smoke_command_satisfied: false,
         model_turns: 0,

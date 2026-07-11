@@ -160,7 +160,7 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_eval_readiness() {
                         "reason": "enabled",
                         "blockers": [],
                     },
-                    "providerReadiness": {
+                    "providerConfiguration": {
                         "source": "project_env",
                         "snapshotId": "provider_snapshot_cli_test",
                         "configured": false,

@@ -223,6 +223,68 @@
           ]
         }
       }
+    },
+    {
+      "task_id": "rust_node_calculator__multi_line_total",
+      "description": "Local cross-language task proving host Cargo and Node execution in the strict Windows sandbox.",
+      "workspace": {
+        "source": {
+          "type": "local",
+          "path": "fixtures/rust-node-calculator"
+        }
+      },
+      "agent": {
+        "instructions": "Fix the seeded Rust and Node multi-line total bugs. Only modify src/lib.rs and calculator.mjs. Run both exact smoke commands through builtin.command and continue until both succeed.",
+        "allowed_paths": [
+          "src/lib.rs",
+          "calculator.mjs"
+        ],
+        "allowed_tools": [
+          "builtin.read",
+          "builtin.grep",
+          "builtin.edit",
+          "builtin.patch",
+          "builtin.command"
+        ],
+        "smoke_commands": [
+          {
+            "argv": ["cargo", "test", "--locked", "--lib"],
+            "timeout_seconds": 120
+          },
+          {
+            "argv": ["node", "smoke_test.mjs"],
+            "timeout_seconds": 30
+          }
+        ]
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/public.rs b/tests/public.rs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/public.rs\n@@ -0,0 +1,6 @@\n+use rust_node_calculator::line_total;\n+\n+#[test]\n+fn public_quantity_is_applied() {\n+    assert_eq!(line_total(11, 4), 44);\n+}\ndiff --git a/public_test.mjs b/public_test.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/public_test.mjs\n@@ -0,0 +1,5 @@\n+import assert from \"node:assert/strict\";\n+import { grandTotal } from \"./calculator.mjs\";\n+\n+assert.equal(grandTotal([{ unitPrice: 2, quantity: 4 }, { unitPrice: 3, quantity: 5 }]), 23);\n+assert.equal(grandTotal([]), 0);\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/hidden.rs b/tests/hidden.rs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/hidden.rs\n@@ -0,0 +1,6 @@\n+use rust_node_calculator::line_total;\n+\n+#[test]\n+fn hidden_zero_quantity_is_zero() {\n+    assert_eq!(line_total(99, 0), 0);\n+}\ndiff --git a/hidden_test.mjs b/hidden_test.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/hidden_test.mjs\n@@ -0,0 +1,5 @@\n+import assert from \"node:assert/strict\";\n+import { grandTotal } from \"./calculator.mjs\";\n+\n+assert.equal(grandTotal([{ unitPrice: 10, quantity: 0 }, { unitPrice: -2, quantity: 3 }]), -6);\n+assert.equal(grandTotal([{ unitPrice: 4, quantity: 1 }]), 4);\n"
+        },
+        "baseline": {
+          "commands": [
+            {"argv": ["cargo", "test", "--locked", "--test", "public"], "timeout_seconds": 120},
+            {"argv": ["node", "public_test.mjs"], "timeout_seconds": 30}
+          ]
+        },
+        "public": {
+          "commands": [
+            {"argv": ["cargo", "test", "--locked", "--test", "public"], "timeout_seconds": 120},
+            {"argv": ["node", "public_test.mjs"], "timeout_seconds": 30}
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {"argv": ["cargo", "test", "--locked", "--test", "hidden"], "timeout_seconds": 120},
+            {"argv": ["node", "hidden_test.mjs"], "timeout_seconds": 30}
+          ]
+        }
+      }
     }
   ]
 }

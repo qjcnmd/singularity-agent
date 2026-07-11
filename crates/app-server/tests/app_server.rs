@@ -348,7 +348,7 @@ fn thread_read_reports_invalid_params_and_keeps_the_connection_usable() {
 }
 
 #[test]
-fn app_server_binary_reports_only_redacted_provider_readiness() {
+fn app_server_binary_reports_only_redacted_provider_configuration() {
     let dir = tempfile::tempdir().expect("temp dir");
     let api_key = "sentinel-provider-api-key";
     let base_url = "https://sentinel-provider.example/v1";
@@ -385,7 +385,7 @@ fn app_server_binary_reports_only_redacted_provider_readiness() {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|message| message["id"] == 2)
         .expect("agent capability response");
-    let provider = &capability["result"]["providerReadiness"];
+    let provider = &capability["result"]["providerConfiguration"];
 
     assert_eq!(provider["source"], "process_env");
     assert!(
@@ -428,7 +428,7 @@ fn app_server_reuses_one_provider_snapshot_for_capability_reads() {
                 r#"{{"method":"agent/capability","id":{id},"params":{{}}}}"#
             ))
             .unwrap();
-        let provider = &capability[0]["result"]["providerReadiness"];
+        let provider = &capability[0]["result"]["providerConfiguration"];
         assert_eq!(provider["snapshotId"], expected_snapshot_id);
         assert_eq!(provider["configured"], true);
         assert!(provider["blocker"].is_null());
@@ -459,7 +459,7 @@ fn app_server_reports_agent_loop_capability_as_available() {
             .unwrap()
             .is_empty()
     );
-    let provider = &capability[0]["result"]["providerReadiness"];
+    let provider = &capability[0]["result"]["providerConfiguration"];
     assert!(provider["source"].is_null() || provider["source"].is_string());
     assert!(
         provider["snapshotId"]
@@ -575,7 +575,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
-    assert_eq!(payload["schema_version"], "evaluation.result/v2");
+    assert_eq!(payload["schema_version"], "evaluation.result/v3");
     assert_eq!(payload["status"], "blocked");
     assert_eq!(
         payload["tasks"][0]["blocker"]["kind"],

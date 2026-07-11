@@ -3,9 +3,19 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 const REPARSE_POINT_ATTRIBUTE: u32 = 0x0400;
 type WorkspaceSnapshot = BTreeMap<String, String>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct WorkspaceChangeEvidence {
+    pub path: String,
+    pub change_kind: &'static str,
+    pub before_sha256: Option<String>,
+    pub after_sha256: Option<String>,
+    pub allowed: bool,
+}
 
 pub(super) fn apply_agent_changes(
     agent_workspace: &Path,
@@ -278,6 +288,36 @@ pub(super) fn changed_paths(before: &WorkspaceSnapshot, after: &WorkspaceSnapsho
         .filter(|path| before.get(*path) != after.get(*path))
         .cloned()
         .collect()
+}
+
+pub(super) fn workspace_change_evidence(
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+    allowed_paths: &[singularity_evaluation::RelativePath],
+) -> Vec<WorkspaceChangeEvidence> {
+    changed_paths(before, after)
+        .into_iter()
+        .map(|path| WorkspaceChangeEvidence {
+            change_kind: match (before.contains_key(&path), after.contains_key(&path)) {
+                (false, true) => "added",
+                (true, false) => "deleted",
+                (true, true) => "modified",
+                (false, false) => unreachable!("changed path must exist in one snapshot"),
+            },
+            before_sha256: before.get(&path).cloned(),
+            after_sha256: after.get(&path).cloned(),
+            allowed: path_is_allowed(&path, allowed_paths),
+            path,
+        })
+        .collect()
+}
+
+pub(super) fn patch_evidence_digest(evidence: &[WorkspaceChangeEvidence]) -> Option<String> {
+    if evidence.is_empty() {
+        return None;
+    }
+    let canonical = serde_json::to_vec(evidence).expect("workspace evidence serializes");
+    Some(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
 
 pub(super) fn path_is_allowed(

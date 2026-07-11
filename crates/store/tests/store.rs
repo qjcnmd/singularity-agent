@@ -13,7 +13,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 7);
+    assert_eq!(descriptor.schema_version, 8);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
@@ -22,7 +22,8 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
             "0004_pending_tool_calls".to_string(),
             "0005_store_hardening".to_string(),
             "0006_conversation_history".to_string(),
-            "0007_pending_execution_state".to_string()
+            "0007_pending_execution_state".to_string(),
+            "0008_approval_execution_recovery".to_string()
         ]
     );
     assert_eq!(
@@ -95,7 +96,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
         .query_row("pragma journal_mode", [], |row| row.get(0))
         .expect("journal mode");
 
-    assert_eq!(schema_version, 7);
+    assert_eq!(schema_version, 8);
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 }
 
@@ -118,7 +119,7 @@ fn sqlite_store_rejects_future_schema_version() {
         SessionStore::open(&db_path),
         Err(StoreError::UnsupportedSchema {
             found: 999,
-            supported: 7
+            supported: 8
         })
     ));
 }
@@ -218,6 +219,12 @@ fn migrated_schema_rebuilds_foreign_key_tables() {
             [],
         )
         .is_err());
+    assert!(connection
+        .execute(
+            "update pending_tool_calls set execution_state = 'approved' where request_id = 'approval_1'",
+            [],
+        )
+        .is_err());
 }
 
 #[test]
@@ -241,6 +248,12 @@ fn fresh_schema_rejects_orphan_turn_and_pending_tool_call_rows() {
     assert!(connection
         .execute(
             "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload) values('approval_missing', 'thread_missing', 'turn_missing', 'call_1', '{}')",
+            [],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload, execution_state) values('approval_invalid', 'thread_missing', 'turn_missing', 'call_2', '{}', 'approved')",
             [],
         )
         .is_err());
@@ -689,6 +702,172 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
             ));
         }
     }
+}
+
+#[test]
+fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Blocked, "blocked")
+        .expect("blocked turn");
+    let request = ApprovalRequest::new(
+        "approval_recovery",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.edit",
+    )
+    .with_tool_call_id("call_1")
+    .with_resources(["README.md"]);
+    let checkpoint = serde_json::json!({
+        "request_id": &request.request_id,
+        "thread_id": &request.thread_id,
+        "turn_id": &request.turn_id,
+        "tool_call_id": "call_1",
+        "tool_name": "builtin.edit",
+        "raw_arguments": "{}",
+        "resources": ["README.md"],
+        "checkpoint_version": 1,
+        "messages": [{"role":"assistant","content":[],"tool_calls":[{"tool_call_id":"call_1","tool_name":"builtin.edit","arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {},
+        "last_completion_error": null
+    });
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(checkpoint),
+            "approval",
+            "approval requested",
+        )
+        .expect("approval checkpoint");
+    let decision = ApprovalDecision::new(
+        request.request_id.clone(),
+        ApprovalOutcome::Allow,
+        "approved",
+    );
+    store
+        .record_approval_decision(&decision, "approval", "approval decision recorded")
+        .expect("claim execution");
+    drop(store);
+
+    let reopened = SessionStore::open(&db_path).expect("reopen store");
+    let recovered = reopened
+        .recover_incomplete_approval_executions()
+        .expect("recover executing approval");
+
+    assert_eq!(recovered, vec!["approval_recovery"]);
+    let recovered_turn = reopened.get_turn(&turn.turn_id).expect("recovered turn");
+    assert_eq!(recovered_turn.status, TurnStatus::Interrupted);
+    assert_eq!(recovered_turn.agent_loop_status, "interrupted");
+    assert!(
+        !reopened
+            .has_pending_tool_call(&request.request_id)
+            .expect("pending lookup")
+    );
+    let recovery_trace = reopened
+        .list_trace(&thread.thread_id)
+        .expect("trace list")
+        .into_iter()
+        .find(|trace| trace.event_id == "trace_approval_recovery_recovered")
+        .expect("recovery trace");
+    assert_eq!(recovery_trace.payload["tool_replayed"], false);
+    assert_eq!(
+        recovery_trace.payload["recovery_reason"],
+        "approval_execution_outcome_unknown"
+    );
+}
+
+#[test]
+fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Blocked, "blocked")
+        .expect("blocked turn");
+    let request = ApprovalRequest::new(
+        "approval_missing_checkpoint",
+        thread.thread_id,
+        turn.turn_id,
+        "builtin.edit",
+    )
+    .with_tool_call_id("call_1");
+    store.create_approval(&request).expect("approval ledger");
+
+    assert!(matches!(
+        store.recover_incomplete_approval_executions(),
+        Err(StoreError::InvalidState(message))
+            if message == "approval approval_missing_checkpoint has inconsistent checkpoint state"
+    ));
+}
+
+#[test]
+fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_deny",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.edit",
+    )
+    .with_tool_call_id("call_1");
+    let checkpoint = serde_json::json!({
+        "request_id": &request.request_id,
+        "thread_id": &request.thread_id,
+        "turn_id": &request.turn_id,
+        "tool_call_id": "call_1",
+        "tool_name": "builtin.edit",
+        "raw_arguments": "{}",
+        "resources": [],
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(checkpoint),
+            "approval",
+            "approval requested",
+        )
+        .expect("approval checkpoint");
+    let decision =
+        ApprovalDecision::new(request.request_id.clone(), ApprovalOutcome::Deny, "denied");
+
+    store
+        .record_approval_decision(&decision, "approval", "approval decision recorded")
+        .expect("deny approval");
+
+    let denied_turn = store.get_turn(&turn.turn_id).expect("denied turn");
+    assert_eq!(denied_turn.status, TurnStatus::Failed);
+    assert_eq!(denied_turn.agent_loop_status, "failed");
+    assert!(
+        !store
+            .has_pending_tool_call(&request.request_id)
+            .expect("pending lookup")
+    );
 }
 
 #[test]

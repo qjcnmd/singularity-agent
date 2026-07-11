@@ -32,6 +32,9 @@ fn run() -> Result<(), String> {
     }
     let store = SessionStore::open(&db_path)
         .map_err(|error| format!("failed to open app-server store {db_path}: {error}"))?;
+    store
+        .recover_incomplete_approval_executions()
+        .map_err(|error| format!("failed to recover app-server approval executions: {error}"))?;
     let provider_snapshot = ProviderConfigSnapshot::capture(|name| std::env::var(name).ok());
     let mut server = AppServer::new(store, provider_snapshot);
     let (output_tx, output_rx) = mpsc::channel::<Value>();

@@ -30,7 +30,7 @@ Singularity 是 Windows 本地命令行编码代理，由四个 release binary �
 | `model` | provider 配置快照、模型对象、OpenAI-compatible HTTP adapter | `ProviderConfigSnapshot`、`ModelTurnRequest`、`OpenAiProvider` |
 | `agent` | 上下文组装、模型/工具循环、approval checkpoint resume 和 completion gate | `AgentLoop`、`AgentLoopInput`、`AgentLoopResult` |
 | `store` | SQLite thread/turn/item/trace/approval/artifact ledger | `SessionStore`、`StartedTurn`、`CommittedTurnOutcome` |
-| `evaluation` | `evaluation.task_set/v3` manifest、计划和 `evaluation.result/v2` result 数据模型 | `EvaluationManifest`、`WorkspacePlan`、`EvaluationResult` |
+| `evaluation` | `evaluation.task_set/v3` manifest、计划和 `evaluation.result/v3` result 数据模型 | `EvaluationManifest`、`WorkspacePlan`、`EvaluationResult` |
 | `app-server` | 协议调度、runtime 装配、并发 turn、持久化和 evaluation 执行 | `AppServer` |
 | `cli` | 最终用户命令和 app-server 子进程客户端 | `Command`、`AppServerClient` |
 
@@ -118,7 +118,7 @@ sg run <goal>
 - symlink/junction 解析到 workspace 外、I/O 失败、非法 UTF-8 或超限都关闭失败。
 - 指令作为 developer message 注入，不修改 user goal。
 
-`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求只保留本次 provider 调用所需的 `request_id`，工具请求只保留 tool call 标识、名称和原始参数；运行状态不再复制 run/session/task/phase/action 占位字段。AgentLoop 先读取 `Provider::capabilities()`，用 provider 的实际 context window 和 output limit 预留 developer 指令、tool schema、消息 framing、固定开销以及输出空间，并把预留的 output limit 写入真实 provider 请求，再按优先级组装上下文。当前保守估算按每 4 个 ASCII 字符约 1 token、每个非 ASCII 字符 1 token，并另计消息 framing、工具 schema、developer 指令、固定开销和输出预算；它用于关闭失败的容量门禁，不声称等同 provider tokenizer。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算；最终 AgentLoop trace 记录脱敏后的包含/排除 item ID、预算明细和模型回合上限，不记录消息内容。
+`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求只保留本次 provider 调用所需的 `request_id`，工具请求只保留 tool call 标识、名称和原始参数；运行状态不再复制 run/session/task/phase/action 占位字段。AgentLoop 读取 `Provider::protocol_contract()`，按 adapter 静态协议约束和配置声明的 context/output 上限预留 developer 指令、tool schema、消息 framing、固定开销以及输出空间。这些字段不是动态 provider 探测结果。当前保守估算按每 4 个 ASCII 字符约 1 token、每个非 ASCII 字符 1 token，并另计消息 framing、工具 schema、developer 指令、固定开销和输出预算；它用于关闭失败的容量门禁，不声称等同 provider tokenizer。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算；最终 AgentLoop trace 记录脱敏后的包含/排除 item ID、预算明细和模型回合上限，不记录消息内容。
 
 ## 6. AgentLoop
 
@@ -145,13 +145,13 @@ completion gate 保持以下不变量：
 
 ## 7. Model 与 provider
 
-`ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY`、`SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。context window 默认为 128000，output limit 默认 4096；token limit 只在配置快照中解析并以脱敏错误暴露，provider 通过 `capabilities()` 将实际上限交给 AgentLoop。请求声明的 output token 超过 provider 上限时，在发出 provider 请求前失败。
+`ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY`、`SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。context window 默认为 128000，output limit 默认 4096；这些 token limit 是配置声明的 contract 上限，请求超过上限时在发送前失败。
 
 Provider 失败通过 `ProviderDiagnostic` 投影稳定的 `code`、`stage`、transport category、HTTP status 和 response validation codes。该对象不包含 API key、Authorization、endpoint、prompt、原始响应、provider/model 名称或底层 error source；AgentLoop、app-server trace 与 Evaluation result/report 只持久化这一安全投影。原始错误 message 仍经过公共边界脱敏，诊断字段不会因 message 被整体替换为 `[redacted]` 而丢失。
 
-`OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；超时、认证、rate limit、网络、model 配置和 response schema 错误保留不同类别。`AgentLoopResult` 和 `AgentRunStatus` 在内部携带 typed `ModelErrorCategory`（不进入 serde、CLI 或普通 trace）；Evaluation 依据该类别映射 `BlockerKind`，不从 human-readable error 文本推断。`evaluation.task_set/v3` 和 `evaluation.result/v2` 的公共语义不变。
+`OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；配置/client/runtime 初始化、请求校验与发送、HTTP status、body read、JSON decode 和 response validation 使用稳定的结构化诊断。`AgentLoopResult` 和 `AgentRunStatus` 在内部携带 typed `ModelErrorCategory`（不进入 serde、CLI 或普通 trace）；Evaluation 依据该类别映射 `BlockerKind`，不从 human-readable error 文本推断。
 
-公共 readiness 只表示配置状态，包含来源、snapshot id、`configured`、`configurationBlocker` 和三个字段的 present/missing；它不声称网络或模型请求已经成功。Provider error 只投影稳定 code、阶段、可靠 transport 类别、HTTP status 和 response validation codes。API key、base URL 原值、Authorization header、原始 response 和原始 prompt 不进入 CLI、Evaluation 或 trace。
+公共 `providerConfiguration` 只表示配置状态，包含来源、snapshot id、`configured`、`configurationBlocker` 和三个字段的 present/missing；它不声称网络或模型请求已经成功。Provider error 只投影稳定 code、阶段、可靠 transport 类别、HTTP status 和 response validation codes。API key、base URL 原值、Authorization header、原始 response 和原始 prompt 不进入 CLI、Evaluation 或 trace。
 
 ## 8. Tool、Policy 与 Approval
 
@@ -170,7 +170,7 @@ builtin.command
 
 默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。`WorkspaceTools` 对所有路径执行 lexical normalize、canonicalize existing parent、workspace containment 和 protected component 检查；多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
 
-当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint。allow/deny 是单次消费；defer 只写脱敏审计事件，不写 decision ledger、不消费 approval，也不删除 checkpoint，因此之后仍可 allow、deny 或再次 defer。allow 在恢复前把内部 execution state 从 `pending` 推进为 `approved`、再认领为 `executing`；工具循环返回持久化边界后记为 `outcome_recorded`，Turn 结果提交后才清理 checkpoint。停在 `executing` 的调用不得静默重放非幂等工具；当前保证是 at-most-once execution attempt，不宣称 exactly-once。deny 不执行工具并终止 blocked Turn。客户端不能通过 `approval/request` 自行向 ledger 注入请求。checkpoint 与 execution state 不进入 approval list、result 或 trace 的公共投影。
+当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint。Turn Blocked、request、checkpoint 和 approval trace 在同一事务提交。allow/deny 是单次消费；defer 只写脱敏审计事件，不写 decision ledger、不消费 approval，也不删除 checkpoint。allow 在 decision ledger 同一事务把 `pending` 直接认领为 `executing`；工具返回后，脱敏 tool outcome、Turn outcome、terminal trace 和 checkpoint 删除在同一事务提交。deny 在 decision 同一事务终结 Turn 并删除 checkpoint。主进程启动时，遗留 `executing` 只会被归约为 `Interrupted` 和 `approval_execution_outcome_unknown`，绝不重放；当前保证是 at-most-once execution attempt，不宣称 exactly-once。客户端不能通过 `approval/request` 自行向 ledger 注入请求。
 
 发送给模型的 tool result 只包含 `ok`、工具/调用标识、有界且脱敏的 `preview`、可用的 artifact references、错误码和截断标记；内部 result id、raw arguments、approval id、policy id、audit metadata 和 secret-like 文本不投影。已有 artifact reference 时不重复发送 preview；只有内部 result id 而没有 artifact reference 时仍保留有界 preview。
 
@@ -223,7 +223,7 @@ provider HTTP wait、AgentLoop 回合边界和 sandbox command 都检查同一�
 
 ## 11. Store、Trace 与 Artifact
 
-`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/rust-app-server.sqlite3`。`pending_tool_calls.payload` 保存经版本和 request/thread/turn/tool-call 绑定校验的内部 AgentLoop checkpoint；request、pending row 与 approval trace 在同一事务中写入，缺少或错绑 checkpoint 时整个写入失败。
+`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/rust-app-server.sqlite3`。schema v8 的 `pending_tool_calls.execution_state` 只允许 `pending` 和 `executing`；历史状态在迁移时保守归为 `executing`。`payload` 保存经版本和 request/thread/turn/tool-call 绑定校验的内部 AgentLoop checkpoint，缺少或错绑 checkpoint 时整个写入失败。
 
 主要表：
 
@@ -258,9 +258,9 @@ prepare source
 
 每个 stage 都通过同一个 `SandboxBackend` 执行 command。baseline 和 public 使用 `public_test_patch`，hidden 只使用 `hidden_test_patch`；两者以及 baseline/public/hidden 命令都不进入 `AgentTaskProjection` 或模型 payload。public 与 hidden 必须具有不同的 patch 内容或命令 `argv`/`cwd` 证据；timeout 和 network 等执行设置不算独立证据。Evaluation 暴露的 command schema 只接受 manifest 声明的 smoke 输入，完成门使用规范化后的实际 cwd 计算同一 command scope，避免模型看到的能力与策略或验收口径分叉。
 
-`EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。全部 task 通过时 run 才通过。blocker 分类包括 environment、workspace preparation、provider configuration、provider authentication、network、sandbox 和 agent runtime。report 另外记录 changed/disallowed files、smoke、model turns、tool calls、approval count、trace path 和 `local_process_fallback_count`。
+`EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。v3 evidence 记录 workspace change 数、canonical patch digest、tool-call 数、exact smoke、strict sandbox command 数和 `local_process_fallback_count`。report 另外保存逐文件 before/after SHA-256、allowlist 判定、patch evidence 路径、命令诊断和 trace 路径；Agent trace 只保存脱敏 tool outcome，不保存 prompt、raw response 或 raw arguments。
 
-默认产物目录为 `work/evaluations/<run-id>`；`result.json` 是稳定 v2 result，`report.json` 是诊断报告。任一产物原子发布失败时删除不完整 run 目录。
+默认产物目录为 `work/evaluations/<run-id>`；`result.json` 是稳定 v3 result，`report.json` 是诊断报告。任一产物原子发布失败时删除不完整 run 目录。
 
 ## 13. 失败与安全不变量
 
