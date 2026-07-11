@@ -711,7 +711,7 @@ fn foreign_key_parents(connection: &rusqlite::Connection, table: &str) -> Vec<St
 }
 
 #[test]
-fn turn_user_input_can_be_read_for_native_resume() {
+fn turn_user_input_can_be_read_for_approval_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");

@@ -369,12 +369,12 @@ fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
         Scenario::new()
             .initialized()
             .agent_loop_ready()
-            .respond("thread/start", json!({"thread": fake_thread("thread_native")}))
+            .respond("thread/start", json!({"thread": fake_thread("thread_agent")}))
             .interaction(
                 "turn/start",
                 vec![
                     capture_params(&trace_path),
-                    respond(json!({"turn": fake_turn("turn_native", "thread_native", "completed", "completed")})),
+                    respond(json!({"turn": fake_turn("turn_agent", "thread_agent", "completed", "completed")})),
                 ],
             )
             .shutdown(),
@@ -390,7 +390,7 @@ fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
         serde_json::from_str(&std::fs::read_to_string(trace_path).expect("turn trace"))
             .expect("turn trace json");
     assert!(params.get("agentHost").is_none());
-    assert_eq!(params["threadId"], "thread_native");
+    assert_eq!(params["threadId"], "thread_agent");
 }
 
 #[test]
@@ -404,11 +404,11 @@ fn cli_rejects_turn_without_agent_loop_terminal_status() {
             .agent_loop_ready()
             .respond(
                 "thread/start",
-                json!({"thread": fake_thread("thread_native")}),
+                json!({"thread": fake_thread("thread_agent")}),
             )
             .respond(
                 "turn/start",
-                json!({"turn": fake_turn("turn_native", "thread_native", "running", "unknown")}),
+                json!({"turn": fake_turn("turn_agent", "thread_agent", "running", "unknown")}),
             )
             .shutdown(),
     );
@@ -583,7 +583,7 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
         r#"{
   "schema_version": "evaluation.task_set/v3",
   "tasks": [{
-    "task_id": "fixture_native",
+    "task_id": "fixture_agent",
     "description": "Exercise the AgentLoop evaluation transport.",
     "workspace": {"source": {"type": "local", "path": "."}},
     "agent": {
@@ -609,14 +609,14 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
                 vec![
                     capture_params(&agent_loop_trace),
                     respond(json!({
-                        "run_id": "eval_native",
+                        "run_id": "eval_agent",
                         "manifest": path_str(&manifest),
                         "runner": "agent_loop",
                         "status": "completed",
                         "blocker": null,
                         "evaluation_passed": true,
                         "tasks": [{
-                            "task_id": "fixture_native",
+                            "task_id": "fixture_agent",
                             "status": "completed",
                             "blocker": null,
                             "stages": {
@@ -633,8 +633,8 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
                                 "local_process_fallback_count": 0
                             }
                         }],
-                        "result_path": path_str(&eval_output.join("eval_native/result.json")),
-                        "report_path": path_str(&eval_output.join("eval_native/report.json"))
+                        "result_path": path_str(&eval_output.join("eval_agent/result.json")),
+                        "report_path": path_str(&eval_output.join("eval_agent/report.json"))
                     })),
                 ],
             )
@@ -647,7 +647,7 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
             "run",
             path_str(&manifest),
             "--run-id",
-            "eval_native",
+            "eval_agent",
             "--json",
         ])
         .env(EVAL_OUTPUT_DIR_ENV, &eval_output)
@@ -669,7 +669,7 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     let params: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(agent_loop_trace).expect("agent loop trace"))
             .expect("agent loop turn params");
-    assert_eq!(params["runId"], "eval_native");
+    assert_eq!(params["runId"], "eval_agent");
     assert_eq!(params["manifest"], path_str(&manifest));
     assert_eq!(params["outputRoot"], path_str(&eval_output));
 }
