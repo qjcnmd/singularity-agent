@@ -33,7 +33,9 @@ const NATIVE_AGENT_LOOP_READY_REASON: &str = "AgentLoop uses automatic Windows e
 #[cfg(not(windows))]
 const NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
     "AgentLoop requires the Windows restricted-token command sandbox";
-const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 4;
+const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
+const MAX_TOOL_CALLS_PER_TURN: u32 = 1;
+const APPROVAL_CHECKPOINT_VERSION: u32 = 1;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Use the available tools to inspect real files before making claims. Make requested changes through tools, keep all writes inside the workspace, and run a relevant verification command after the last workspace mutation. Report only work and verification that actually completed. Read-only questions may be answered without changing files or running verification.";
 const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
 const USER_MESSAGE_ROLE: &str = "user";
@@ -187,34 +189,10 @@ impl AgentLoopCapability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentLoopStep {
-    LoadTurn,
-    AssembleContext,
-    CallModel,
-    AdmitToolCalls,
-    ExecuteApprovedTools,
-    AppendToolResults,
-    RepairOnFailure,
-    FinalizeReport,
-    PersistItemsTraceArtifacts,
-    HandleInterrupt,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct AgentLoopPlan {
-    pub steps: Vec<AgentLoopStep>,
-    pub blockers: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopInput {
     pub thread_id: String,
     pub turn_id: String,
-    pub run_id: String,
-    pub session_id: String,
-    pub task_id: String,
     pub model_preferences: ModelPreferences,
     #[serde(skip)]
     #[schemars(skip)]
@@ -234,9 +212,6 @@ impl AgentLoopInput {
         let turn_id = turn_id.into();
         Self {
             thread_id: thread_id.into(),
-            run_id: turn_id.clone(),
-            session_id: turn_id.clone(),
-            task_id: turn_id.clone(),
             turn_id,
             model_preferences: ModelPreferences::default(),
             project_instructions: None,
@@ -315,22 +290,38 @@ pub struct AgentLoopResult {
     pub tool_calls: u32,
     pub approval_count: u32,
     pub approval_requests: Vec<ApprovalRequest>,
+    #[serde(skip)]
+    #[schemars(skip)]
     pub pending_tool_calls: Vec<PendingToolCall>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub approval_checkpoints: Vec<Value>,
     pub tool_results: Vec<ToolResult>,
-    pub tool_repairs: Vec<ToolRepair>,
     pub verification: AgentVerification,
     pub error: Option<String>,
 }
 
 impl AgentLoopResult {
+    pub fn approval_checkpoint(&self, request_id: &str) -> Option<Value> {
+        self.approval_checkpoints
+            .iter()
+            .find(|checkpoint| {
+                checkpoint
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == request_id)
+            })
+            .cloned()
+    }
+
     pub fn to_run_status(&self, input: &AgentLoopInput) -> AgentRunStatus {
         AgentRunStatus {
             status: self.status.clone(),
             completed: self.completed,
             final_answer: self.final_answer.clone(),
-            run_id: Some(input.run_id.clone()),
-            session_id: Some(input.session_id.clone()),
-            task_id: Some(input.task_id.clone()),
+            run_id: Some(input.turn_id.clone()),
+            session_id: Some(input.turn_id.clone()),
+            task_id: Some(input.turn_id.clone()),
             model_turns: self.model_turns,
             tool_calls: self.tool_calls,
             approval_count: self.approval_count,
@@ -375,7 +366,7 @@ impl PendingToolCall {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct CompletionTracker {
     workspace_mutated: bool,
     verified_after_last_mutation: bool,
@@ -458,13 +449,51 @@ impl CompletionTracker {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CheckpointToolResult {
+    result: ToolResult,
+    audit_metadata: Option<Value>,
+}
+
+impl CheckpointToolResult {
+    fn from_tool_result(result: &ToolResult) -> Self {
+        Self {
+            result: result.clone(),
+            audit_metadata: result.audit_metadata().cloned(),
+        }
+    }
+
+    fn into_tool_result(self) -> ToolResult {
+        match self.audit_metadata {
+            Some(audit_metadata) => self.result.with_audit(audit_metadata),
+            None => self.result,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentLoopCheckpoint {
+    #[serde(flatten)]
+    pending_tool_call: PendingToolCall,
+    checkpoint_version: u32,
+    thread_id: String,
+    turn_id: String,
+    messages: Vec<ModelMessage>,
+    tool_results: Vec<CheckpointToolResult>,
+    used_approval_grants: Vec<String>,
+    approval_count: u32,
+    model_turns: u32,
+    completion: CompletionTracker,
+    last_completion_error: Option<String>,
+}
+
 struct AgentLoopState {
     messages: Vec<ModelMessage>,
     tool_results: Vec<ToolResult>,
-    tool_repairs: Vec<ToolRepair>,
     approval_requests: Vec<ApprovalRequest>,
     pending_tool_calls: Vec<PendingToolCall>,
-    used_approval_grants: HashSet<String>,
+    approval_checkpoints: Vec<Value>,
+    used_approval_grants: BTreeSet<String>,
     prior_approval_count: u32,
     completion: CompletionTracker,
     last_completion_error: Option<String>,
@@ -475,10 +504,10 @@ impl AgentLoopState {
         Self {
             messages,
             tool_results: Vec::new(),
-            tool_repairs: Vec::new(),
             approval_requests: Vec::new(),
             pending_tool_calls: Vec::new(),
-            used_approval_grants: HashSet::new(),
+            approval_checkpoints: Vec::new(),
+            used_approval_grants: BTreeSet::new(),
             prior_approval_count: 0,
             completion: CompletionTracker::default(),
             last_completion_error: None,
@@ -505,11 +534,42 @@ impl AgentLoopState {
             approval_count,
             approval_requests: self.approval_requests,
             pending_tool_calls: self.pending_tool_calls,
+            approval_checkpoints: self.approval_checkpoints,
             tool_results: self.tool_results,
-            tool_repairs: self.tool_repairs,
             verification: self.completion.summary(),
             error,
         }
+    }
+
+    fn approval_count(&self) -> u32 {
+        self.prior_approval_count
+            .saturating_add(self.approval_requests.len() as u32)
+    }
+
+    fn checkpoint(
+        &self,
+        input: &AgentLoopInput,
+        pending_tool_call: &PendingToolCall,
+        model_turns: u32,
+    ) -> Value {
+        let checkpoint = AgentLoopCheckpoint {
+            pending_tool_call: pending_tool_call.clone(),
+            checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
+            thread_id: input.thread_id.clone(),
+            turn_id: input.turn_id.clone(),
+            messages: self.messages.clone(),
+            tool_results: self
+                .tool_results
+                .iter()
+                .map(CheckpointToolResult::from_tool_result)
+                .collect(),
+            used_approval_grants: self.used_approval_grants.iter().cloned().collect(),
+            approval_count: self.approval_count(),
+            model_turns,
+            completion: self.completion.clone(),
+            last_completion_error: self.last_completion_error.clone(),
+        };
+        serde_json::to_value(checkpoint).expect("AgentLoop checkpoint serializes")
     }
 }
 
@@ -545,24 +605,6 @@ where
         self
     }
 
-    pub fn integration_plan() -> AgentLoopPlan {
-        AgentLoopPlan {
-            steps: vec![
-                AgentLoopStep::LoadTurn,
-                AgentLoopStep::AssembleContext,
-                AgentLoopStep::CallModel,
-                AgentLoopStep::AdmitToolCalls,
-                AgentLoopStep::ExecuteApprovedTools,
-                AgentLoopStep::AppendToolResults,
-                AgentLoopStep::RepairOnFailure,
-                AgentLoopStep::FinalizeReport,
-                AgentLoopStep::PersistItemsTraceArtifacts,
-                AgentLoopStep::HandleInterrupt,
-            ],
-            blockers: Vec::new(),
-        }
-    }
-
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
         let capabilities = self.provider.capabilities();
         let budget = match context_budget(input, &self.tool_broker, &capabilities) {
@@ -577,7 +619,7 @@ where
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, 0, None);
         }
-        self.continue_run(input, &context, &budget, &capabilities, state)
+        self.continue_run(input, &context, &budget, &capabilities, state, 0)
     }
 
     fn continue_run(
@@ -587,9 +629,20 @@ where
         budget: &ContextBudget,
         capabilities: &ModelCapabilities,
         mut state: AgentLoopState,
+        model_turn_offset: u32,
     ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
-        for turn_index in 0..max_turns {
+        if model_turn_offset >= max_turns {
+            let model_turns = model_turn_offset.max(max_turns);
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turns,
+                Some("max turns exceeded".to_string()),
+            );
+        }
+        for turn_index in model_turn_offset..max_turns {
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
             }
@@ -659,6 +712,19 @@ where
                     )),
                 );
             }
+            if response.assistant_message.as_ref().is_some_and(|message| {
+                !message.tool_calls.is_empty() && message.tool_calls != response.tool_calls
+            }) {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index + 1,
+                    Some(format!(
+                        "{MODEL_RESPONSE_VALIDATION_ERROR}: assistant_tool_calls_mismatch"
+                    )),
+                );
+            }
             if response.tool_calls.is_empty() {
                 let final_answer = assistant_message_text(response.assistant_message.as_ref());
                 if final_answer.trim().is_empty() {
@@ -691,12 +757,13 @@ where
                 ));
                 continue;
             }
-            let assistant_tool_message = response
+            let mut assistant_tool_message = response
                 .assistant_message
-                .as_ref()
-                .filter(|message| !message.tool_calls.is_empty())
-                .cloned()
+                .clone()
                 .unwrap_or_else(|| ModelMessage::assistant_tool_calls(response.tool_calls.clone()));
+            if assistant_tool_message.tool_calls.is_empty() {
+                assistant_tool_message.tool_calls = response.tool_calls.clone();
+            }
             state.messages.push(assistant_tool_message);
             for provider_call in &response.tool_calls {
                 let (bound_call, forced_decision) =
@@ -728,6 +795,13 @@ where
                     state
                         .pending_tool_calls
                         .push(PendingToolCall::new(input, call));
+                    let pending = state
+                        .pending_tool_calls
+                        .last()
+                        .expect("pending tool call was just inserted")
+                        .clone();
+                    let checkpoint = state.checkpoint(input, &pending, turn_index + 1);
+                    state.approval_checkpoints.push(checkpoint);
                     let tool_result = self.execute_tool(input, call, decision);
                     state.tool_results.push(tool_result);
                     return state.finish(AgentStatus::Blocked, false, None, turn_index + 1, None);
@@ -742,9 +816,6 @@ where
                 }
                 if failed_tool_result {
                     if is_repairable_tool_result(&tool_result) {
-                        state
-                            .tool_repairs
-                            .push(tool_repair(input, turn_index, &tool_result));
                         continue;
                     }
                     let error_code = tool_result
@@ -772,16 +843,8 @@ where
         &self,
         input: &AgentLoopInput,
         pending: &PendingToolCall,
+        checkpoint_payload: &Value,
     ) -> AgentLoopResult {
-        if self.is_cancelled(input) {
-            return AgentLoopState::new(Vec::new()).finish(
-                AgentStatus::Cancelled,
-                false,
-                None,
-                0,
-                None,
-            );
-        }
         let call = match pending
             .to_model_tool_call()
             .map_err(|error| format!("invalid pending tool call arguments: {error}"))
@@ -798,44 +861,65 @@ where
                 );
             }
         };
+        let (mut state, model_turn_offset) =
+            match restore_checkpoint(input, pending, checkpoint_payload) {
+                Ok(restored) => restored,
+                Err(error) => {
+                    return AgentLoopState::new(Vec::new()).finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        0,
+                        Some(error),
+                    );
+                }
+            };
+        if self.is_cancelled(input) {
+            return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
+        }
         let capabilities = self.provider.capabilities();
         let budget = match context_budget(input, &self.tool_broker, &capabilities) {
             Ok(budget) => budget,
-            Err(error) => return failed_result(error),
+            Err(error) => {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    model_turn_offset,
+                    Some(error),
+                );
+            }
         };
         let context = assemble_context_items_with_budget(&input.input, &budget);
         if current_turn_excluded(input, &context) {
-            return context_overflow_result();
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
+            );
         }
-        let mut state = AgentLoopState::new(model_messages_from_input(input, &context));
-        state
-            .messages
-            .push(ModelMessage::assistant_tool_calls(vec![call.clone()]));
-        state.prior_approval_count = 1;
-        let mut used_approval_grants = HashSet::new();
-        let decision = self.tool_decision(input, &call, &mut used_approval_grants);
+        let decision = self.tool_decision(input, &call, &mut state.used_approval_grants);
         if !matches!(decision, ToolBrokerDecision::Approved { .. }) {
             return state.finish(
                 AgentStatus::Failed,
                 false,
                 None,
-                0,
+                model_turn_offset,
                 Some("pending tool call approval did not match".to_string()),
             );
         }
-        state.used_approval_grants = used_approval_grants;
         let tool_result = self.execute_tool(input, &call, decision);
         let failed_tool_result = !tool_result.ok;
         state.completion.observe(&tool_result);
         state.messages.push(tool_result_message(&tool_result));
         state.tool_results.push(tool_result.clone());
         if self.is_cancelled(input) {
-            return state.finish(AgentStatus::Cancelled, false, None, 0, None);
+            return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
         }
         if failed_tool_result {
-            if is_repairable_tool_result(&tool_result) {
-                state.tool_repairs.push(tool_repair(input, 0, &tool_result));
-            } else {
+            if !is_repairable_tool_result(&tool_result) {
                 let error_code = tool_result
                     .error_code
                     .as_deref()
@@ -844,12 +928,19 @@ where
                     AgentStatus::Failed,
                     false,
                     None,
-                    0,
+                    model_turn_offset,
                     Some(format!("tool execution failed: {error_code}")),
                 );
             }
         }
-        self.continue_run(input, &context, &budget, &capabilities, state)
+        self.continue_run(
+            input,
+            &context,
+            &budget,
+            &capabilities,
+            state,
+            model_turn_offset,
+        )
     }
 
     fn is_cancelled(&self, input: &AgentLoopInput) -> bool {
@@ -860,7 +951,7 @@ where
         &self,
         input: &AgentLoopInput,
         call: &ModelToolCall,
-        used_approval_grants: &mut HashSet<String>,
+        used_approval_grants: &mut BTreeSet<String>,
     ) -> ToolBrokerDecision {
         if call.parse_status != ModelToolParseStatus::Valid || !call.arguments.is_object() {
             return ToolBrokerDecision::deny("invalid tool call arguments");
@@ -868,13 +959,15 @@ where
         let request_id = approval_request_id(input, call);
         let resources = permission_resources_for_tool(call);
         let permission = self.tool_permission_decision(call);
+        if used_approval_grants.contains(&request_id) {
+            return ToolBrokerDecision::deny("approval grant already consumed");
+        }
         if !matches!(permission.outcome, PermissionDecisionOutcome::Deny)
             && let Some(grant) = input.approval_grants.iter().find(|grant| {
                 grant.request_id == request_id
                     && grant.tool_name == call.tool_name
                     && grant.resources == resources
                     && matches!(grant.outcome, ApprovalOutcome::Allow)
-                    && !used_approval_grants.contains(&grant.request_id)
             })
         {
             used_approval_grants.insert(grant.request_id.clone());
@@ -932,9 +1025,9 @@ where
         decision: ToolBrokerDecision,
     ) -> ToolResult {
         let envelope = ToolCallRequest::new(
-            input.run_id.clone(),
-            input.session_id.clone(),
-            input.task_id.clone(),
+            input.turn_id.clone(),
+            input.turn_id.clone(),
+            input.turn_id.clone(),
             call.tool_call_id.clone(),
             call.tool_name.clone(),
             call.raw_arguments.clone(),
@@ -1361,6 +1454,83 @@ fn current_turn_excluded(input: &AgentLoopInput, context: &ContextBundle) -> boo
     })
 }
 
+fn restore_checkpoint(
+    input: &AgentLoopInput,
+    pending: &PendingToolCall,
+    payload: &Value,
+) -> Result<(AgentLoopState, u32), String> {
+    let checkpoint: AgentLoopCheckpoint = serde_json::from_value(payload.clone())
+        .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
+    if checkpoint.checkpoint_version != APPROVAL_CHECKPOINT_VERSION {
+        return Err("unsupported approval checkpoint version".to_string());
+    }
+    if checkpoint.thread_id != input.thread_id {
+        return Err("approval checkpoint thread mismatch".to_string());
+    }
+    if checkpoint.turn_id != input.turn_id {
+        return Err("approval checkpoint turn mismatch".to_string());
+    }
+    if checkpoint.pending_tool_call != *pending {
+        return Err("approval checkpoint tool call mismatch".to_string());
+    }
+    let expected_request_id =
+        approval_request_id_from_tool_call_id(&input.turn_id, &pending.tool_call_id);
+    if pending.request_id != expected_request_id
+        || checkpoint.pending_tool_call.request_id != expected_request_id
+    {
+        return Err("approval checkpoint request mismatch".to_string());
+    }
+    if checkpoint.model_turns == 0 {
+        return Err("approval checkpoint model-turn offset is invalid".to_string());
+    }
+    if checkpoint.approval_count == 0 {
+        return Err("approval checkpoint approval count is invalid".to_string());
+    }
+    if checkpoint.messages.is_empty() {
+        return Err("approval checkpoint messages are missing".to_string());
+    }
+    let last_message = checkpoint
+        .messages
+        .last()
+        .ok_or_else(|| "approval checkpoint messages are missing".to_string())?;
+    if last_message.role != ModelRole::Assistant
+        || last_message.tool_calls.len() != MAX_TOOL_CALLS_PER_TURN as usize
+        || last_message.tool_calls[0].tool_call_id != pending.tool_call_id
+    {
+        return Err("approval checkpoint assistant tool-call ordering is invalid".to_string());
+    }
+    let used_approval_grants = checkpoint
+        .used_approval_grants
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if used_approval_grants.len() != checkpoint.used_approval_grants.len() {
+        return Err("approval checkpoint contains duplicate grants".to_string());
+    }
+    if used_approval_grants.contains(&pending.request_id) {
+        return Err("approval checkpoint consumed the pending grant".to_string());
+    }
+    let tool_results = checkpoint
+        .tool_results
+        .into_iter()
+        .map(CheckpointToolResult::into_tool_result)
+        .collect::<Vec<_>>();
+    let mut derived_completion = CompletionTracker::default();
+    for tool_result in &tool_results {
+        derived_completion.observe(tool_result);
+    }
+    if derived_completion != checkpoint.completion {
+        return Err("approval checkpoint completion state mismatch".to_string());
+    }
+    let mut state = AgentLoopState::new(checkpoint.messages);
+    state.tool_results = tool_results;
+    state.used_approval_grants = used_approval_grants;
+    state.prior_approval_count = checkpoint.approval_count;
+    state.completion = derived_completion;
+    state.last_completion_error = checkpoint.last_completion_error;
+    Ok((state, checkpoint.model_turns))
+}
+
 fn failed_result(error: impl Into<String>) -> AgentLoopResult {
     AgentLoopResult {
         status: AgentStatus::Failed,
@@ -1371,8 +1541,8 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         approval_count: 0,
         approval_requests: Vec::new(),
         pending_tool_calls: Vec::new(),
+        approval_checkpoints: Vec::new(),
         tool_results: Vec::new(),
-        tool_repairs: Vec::new(),
         verification: AgentVerification::default(),
         error: Some(error.into()),
     }
@@ -1389,23 +1559,6 @@ pub struct ContextBundle {
     pub budget: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ToolRepair {
-    pub repair_id: String,
-    pub run_id: String,
-    pub session_id: String,
-    pub task_id: String,
-    pub phase_id: String,
-    pub failed_tool_call_id: String,
-    pub failure_kind: String,
-    pub next_action: String,
-    pub failed_result: Value,
-    pub recovery_report: Value,
-    pub repair_contract: Value,
-    pub created_at: String,
-    pub metadata: Value,
-}
-
 fn model_turn_request(
     loop_tools: &ToolBroker,
     input: &AgentLoopInput,
@@ -1414,12 +1567,12 @@ fn model_turn_request(
     turn_index: u32,
     messages: Vec<ModelMessage>,
 ) -> ModelTurnRequest {
-    ModelTurnRequest {
+    let mut request = ModelTurnRequest {
         purpose: ModelPurpose::PlanNextAction,
         request_id: format!("model_request_{}_{}", input.turn_id, turn_index),
-        run_id: input.run_id.clone(),
-        session_id: input.session_id.clone(),
-        task_id: input.task_id.clone(),
+        run_id: input.turn_id.clone(),
+        session_id: input.turn_id.clone(),
+        task_id: input.turn_id.clone(),
         phase_id: "model".to_string(),
         action_id: format!("model_action_{}_{}", input.turn_id, turn_index),
         messages,
@@ -1444,11 +1597,13 @@ fn model_turn_request(
         }),
         trace_metadata: json!({
             "turn_id": &input.turn_id,
-            "run_id": &input.run_id,
-            "session_id": &input.session_id,
-            "task_id": &input.task_id,
+            "run_id": &input.turn_id,
+            "session_id": &input.turn_id,
+            "task_id": &input.turn_id,
         }),
-    }
+    };
+    request.tool_choice.max_tool_calls = MAX_TOOL_CALLS_PER_TURN;
+    request
 }
 
 fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
@@ -1624,39 +1779,6 @@ fn is_repairable_tool_result(tool_result: &ToolResult) -> bool {
         .is_some_and(|error_code| REPAIRABLE_TOOL_ERROR_CODES.contains(&error_code))
 }
 
-fn tool_repair(input: &AgentLoopInput, turn_index: u32, tool_result: &ToolResult) -> ToolRepair {
-    let failure_kind = tool_result
-        .error_code
-        .clone()
-        .unwrap_or_else(|| "tool_result_failed".to_string());
-    ToolRepair {
-        repair_id: format!(
-            "repair_{}_{}_{}",
-            input.turn_id, tool_result.tool_call_id, turn_index
-        ),
-        run_id: input.run_id.clone(),
-        session_id: input.session_id.clone(),
-        task_id: input.task_id.clone(),
-        phase_id: "tool_repair".to_string(),
-        failed_tool_call_id: tool_result.tool_call_id.clone(),
-        failure_kind,
-        next_action: "request_model".to_string(),
-        failed_result: tool_result.to_message_payload(),
-        recovery_report: json!({
-            "status": "queued",
-            "reason": "repairable_tool_result",
-        }),
-        repair_contract: json!({
-            "max_turns": input.max_turns,
-            "retry_after_turn": turn_index + 1,
-        }),
-        created_at: String::new(),
-        metadata: json!({
-            "tool_name": &tool_result.tool_name,
-        }),
-    }
-}
-
 fn approval_request(
     input: &AgentLoopInput,
     approval_request_id: &str,
@@ -1676,7 +1798,11 @@ fn approval_request(
 }
 
 fn approval_request_id(input: &AgentLoopInput, call: &ModelToolCall) -> String {
-    format!("approval_{}_{}", input.turn_id, call.tool_call_id)
+    approval_request_id_from_tool_call_id(&input.turn_id, &call.tool_call_id)
+}
+
+fn approval_request_id_from_tool_call_id(turn_id: &str, tool_call_id: &str) -> String {
+    format!("approval_{}_{}", turn_id, tool_call_id)
 }
 
 fn bind_tool_call_to_profile(

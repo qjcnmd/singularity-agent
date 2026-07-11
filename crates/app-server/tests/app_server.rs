@@ -1050,10 +1050,19 @@ fn archived_thread_rejects_approval_decision_without_consuming_it() {
             &request,
             Some(serde_json::json!({
                 "request_id": &request.request_id,
+                "thread_id": &thread.thread_id,
+                "turn_id": &turn.turn_id,
                 "tool_call_id": "call_1",
                 "tool_name": "builtin.edit",
                 "raw_arguments": "{}",
-                "resources": ["README.md"]
+                "resources": ["README.md"],
+                "checkpoint_version": 1,
+                "messages": [],
+                "tool_results": [],
+                "used_approval_grants": [],
+                "approval_count": 1,
+                "model_turns": 1,
+                "completion": {}
             })),
             "approval",
             "approval requested",

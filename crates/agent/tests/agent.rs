@@ -1,6 +1,6 @@
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopCapability, AgentLoopInput,
-    AgentLoopStep, AgentStatus, ApprovalGrant, assemble_context_items,
+    AgentStatus, ApprovalGrant, assemble_context_items,
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -203,28 +203,6 @@ fn agent_loop_capability_reports_unsupported_platform_blocker() {
 }
 
 #[test]
-fn agent_loop_plan_lists_real_integration_steps() {
-    let plan = AgentLoop::<StaticProvider>::integration_plan();
-
-    assert_eq!(
-        plan.steps,
-        vec![
-            AgentLoopStep::LoadTurn,
-            AgentLoopStep::AssembleContext,
-            AgentLoopStep::CallModel,
-            AgentLoopStep::AdmitToolCalls,
-            AgentLoopStep::ExecuteApprovedTools,
-            AgentLoopStep::AppendToolResults,
-            AgentLoopStep::RepairOnFailure,
-            AgentLoopStep::FinalizeReport,
-            AgentLoopStep::PersistItemsTraceArtifacts,
-            AgentLoopStep::HandleInterrupt,
-        ]
-    );
-    assert!(plan.blockers.is_empty());
-}
-
-#[test]
 fn agent_loop_read_only_final_answer_completes_without_verification() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello");
     let result = agent_loop_with_response(
@@ -380,6 +358,290 @@ fn agent_loop_ask_decision_blocks_without_executing_tool() {
         result.tool_results[0].error_code.as_deref(),
         Some("approval_required")
     );
+}
+
+#[test]
+fn agent_loop_fails_closed_on_multiple_tool_calls_before_execution() {
+    let input = AgentLoopInput::new("thread_1", "turn_1", "read two files");
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    response.tool_calls.push(tool_call(
+        "call_2",
+        "builtin.read",
+        serde_json::json!({"path": "CHANGELOG.md"}),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_capabilities(
+        vec![response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ModelCapabilities {
+            supports_parallel_tool_calls: true,
+            ..ModelCapabilities::default()
+        },
+    )
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.model_turns, 1);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("model response validation failed: max_tool_calls_exceeded")
+    );
+    assert!(result.tool_results.is_empty());
+    let requests = seen_requests.lock().expect("seen requests lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tool_choice.max_tool_calls, 1);
+}
+
+#[test]
+fn agent_loop_fails_closed_on_mismatched_assistant_tool_calls() {
+    let input = AgentLoopInput::new("thread_1", "turn_1", "read a file");
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    response
+        .assistant_message
+        .as_mut()
+        .expect("assistant message")
+        .tool_calls
+        .push(tool_call(
+            "call_2",
+            "builtin.read",
+            serde_json::json!({"path": "CHANGELOG.md"}),
+        ));
+
+    let result = agent_loop_with_response(response, allow_read_policy()).run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.model_turns, 1);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("model response validation failed: assistant_tool_calls_mismatch")
+    );
+    assert!(result.tool_results.is_empty());
+}
+
+#[test]
+fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit the file");
+    let mut response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "before approval");
+    response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+
+    let result = agent_loop_with_response(
+        response,
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+    )
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Blocked);
+    let pending = &result.pending_tool_calls[0];
+    assert_eq!(pending.request_id, "approval_turn_1_call_1");
+    let checkpoint = result
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    assert_eq!(checkpoint["checkpoint_version"], 1);
+    assert_eq!(checkpoint["thread_id"], "thread_1");
+    assert_eq!(checkpoint["turn_id"], "turn_1");
+    assert_eq!(checkpoint["request_id"], "approval_turn_1_call_1");
+    assert_eq!(checkpoint["tool_call_id"], "call_1");
+    assert_eq!(checkpoint["approval_count"], 1);
+    assert_eq!(checkpoint["model_turns"], 1);
+    assert_eq!(checkpoint["used_approval_grants"], serde_json::json!([]));
+    assert_eq!(checkpoint["tool_results"], serde_json::json!([]));
+    let messages = checkpoint["messages"]
+        .as_array()
+        .expect("checkpoint messages");
+    let assistant = messages.last().expect("assistant checkpoint message");
+    assert_eq!(assistant["role"], "assistant");
+    assert_eq!(assistant["content"][0]["text"], "before approval");
+    assert_eq!(assistant["tool_calls"][0]["tool_call_id"], "call_1");
+
+    let public_result = serde_json::to_string(&result).expect("serialize public result");
+    assert!(!public_result.contains("checkpoint_version"));
+    assert!(!public_result.contains("raw_arguments"));
+    assert!(!public_result.contains("before approval"));
+}
+
+#[test]
+fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file_path = dir.path().join("README.md");
+    std::fs::write(&file_path, "before").expect("write file");
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit the file").with_max_turns(1);
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let agent_loop = agent_loop_with_response(
+        response,
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()));
+    let blocked = agent_loop.run(&input);
+    let pending = blocked.pending_tool_calls[0].clone();
+    let checkpoint = blocked
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    let resume_input = input.clone().with_approval_grant(ApprovalGrant::allow(
+        pending.request_id.clone(),
+        pending.tool_name.clone(),
+        pending.resources.clone(),
+    ));
+
+    let resumed = agent_loop.resume_pending_tool_call(&resume_input, &pending, &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Failed);
+    assert_eq!(resumed.model_turns, 1);
+    assert_eq!(resumed.approval_count, 1);
+    assert_eq!(resumed.tool_results.len(), 1);
+    assert_eq!(resumed.error.as_deref(), Some("max turns exceeded"));
+    assert_eq!(
+        std::fs::read_to_string(file_path).expect("read file"),
+        "after"
+    );
+}
+
+#[test]
+fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file_path = dir.path().join("README.md");
+    std::fs::write(&file_path, "one").expect("write file");
+    let first_grant = ApprovalGrant::allow("approval_turn_1_call_1", "builtin.edit", ["README.md"]);
+    let second_grant =
+        ApprovalGrant::allow("approval_turn_1_call_2", "builtin.edit", ["README.md"]);
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice")
+        .with_max_turns(4)
+        .with_approval_grant(first_grant.clone());
+    let mut first_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    first_response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "one",
+            "replacement": "two"
+        }),
+    ));
+    let mut second_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    second_response.tool_calls.push(tool_call(
+        "call_2",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "two",
+            "replacement": "three"
+        }),
+    ));
+    let mut reused_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    reused_response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "three",
+            "replacement": "four"
+        }),
+    ));
+    let agent_loop = agent_loop_with_responses_and_requests(
+        vec![first_response, second_response, reused_response],
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()));
+
+    let blocked = agent_loop.run(&input);
+    assert_eq!(blocked.status, AgentStatus::Blocked);
+    let pending = blocked.pending_tool_calls[0].clone();
+    let checkpoint = blocked
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    assert_eq!(
+        checkpoint["used_approval_grants"],
+        serde_json::json!(["approval_turn_1_call_1"])
+    );
+    let resume_input = input
+        .with_approval_grant(second_grant)
+        .with_approval_grant(first_grant);
+
+    let resumed = agent_loop.resume_pending_tool_call(&resume_input, &pending, &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Failed);
+    assert_eq!(resumed.model_turns, 3);
+    assert_eq!(resumed.approval_count, 1);
+    assert!(resumed.approval_requests.is_empty());
+    assert_eq!(
+        resumed.error.as_deref(),
+        Some("tool execution failed: tool_denied")
+    );
+    assert_eq!(
+        std::fs::read_to_string(file_path).expect("read file"),
+        "three"
+    );
+}
+
+#[test]
+fn agent_loop_resume_rejects_tampered_completion_checkpoint() {
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit the file");
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let agent_loop = agent_loop_with_response(
+        response,
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+    );
+    let blocked = agent_loop.run(&input);
+    let pending = blocked.pending_tool_calls[0].clone();
+    let mut checkpoint = blocked
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    checkpoint["completion"]["workspace_mutated"] = serde_json::json!(true);
+    let resume_input = input.with_approval_grant(ApprovalGrant::allow(
+        pending.request_id.clone(),
+        pending.tool_name.clone(),
+        pending.resources.clone(),
+    ));
+
+    let resumed = agent_loop.resume_pending_tool_call(&resume_input, &pending, &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Failed);
+    assert_eq!(
+        resumed.error.as_deref(),
+        Some("approval checkpoint completion state mismatch")
+    );
+    assert!(resumed.tool_results.is_empty());
 }
 
 #[test]
@@ -705,7 +967,7 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
         )
     };
     let mut tool_response =
-        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "before edit");
     tool_response.tool_calls.push(tool_call(
         "call_1",
         "builtin.edit",
@@ -759,6 +1021,10 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[1].messages[2].role, ModelRole::Assistant);
+    assert_eq!(
+        requests[1].messages[2].content[0].text.as_deref(),
+        Some("before edit")
+    );
     assert_eq!(requests[1].messages[2].tool_calls.len(), 1);
     assert_eq!(requests[1].messages[2].tool_calls[0].tool_call_id, "call_1");
     assert_eq!(requests[1].messages[3].role, ModelRole::Tool);
@@ -843,26 +1109,9 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.model_turns, 4);
     assert_eq!(result.tool_results.len(), 3);
-    assert_eq!(result.tool_repairs.len(), 1);
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
         Some("expected_content_missing")
-    );
-    assert_eq!(
-        result.tool_repairs[0].failed_tool_call_id.as_str(),
-        "call_1"
-    );
-    assert_eq!(
-        result.tool_repairs[0].failure_kind.as_str(),
-        "expected_content_missing"
-    );
-    assert_eq!(
-        result.tool_repairs[0].failed_result["error_code"],
-        serde_json::json!("expected_content_missing")
-    );
-    assert_eq!(
-        result.tool_repairs[0].repair_contract["retry_after_turn"],
-        serde_json::json!(1)
     );
     assert!(result.tool_results[1].ok);
     assert!(result.tool_results[2].ok);
@@ -1058,13 +1307,8 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
         result.tool_results[0].error_code.as_deref(),
         Some("command_exit_nonzero")
     );
-    assert_eq!(result.tool_repairs.len(), 1);
     assert!(result.tool_results[1].ok);
     assert!(result.verification.unresolved_failures.is_empty());
-    assert_eq!(
-        result.tool_repairs[0].failure_kind.as_str(),
-        "command_exit_nonzero"
-    );
     assert_eq!(result.final_answer.as_deref(), Some("handled failure"));
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);

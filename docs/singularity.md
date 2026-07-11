@@ -28,7 +28,7 @@ Singularity 是 Windows 本地命令行编码代理，由四个 release binary �
 | `sandbox` | 产品命令请求/结果模型及 Windows adapter | `CommandRequest`、`CommandResult`、`WindowsSandboxBackend` |
 | `tools` | 模型可见工具注册、准入、工作区文件操作和 command adapter | `ToolBroker`、`ToolResult`、`WorkspaceTools` |
 | `model` | provider 配置快照、模型对象、OpenAI-compatible HTTP adapter | `ProviderConfigSnapshot`、`ModelTurnRequest`、`OpenAiProvider` |
-| `agent` | 上下文组装、模型/工具循环、repair、approval resume 和 completion gate | `AgentLoop`、`AgentLoopInput`、`AgentLoopResult` |
+| `agent` | 上下文组装、模型/工具循环、approval checkpoint resume 和 completion gate | `AgentLoop`、`AgentLoopInput`、`AgentLoopResult` |
 | `store` | SQLite thread/turn/item/trace/approval/artifact ledger | `SessionStore`、`StartedTurn`、`CommittedTurnOutcome` |
 | `evaluation` | `evaluation.task_set/v3` manifest、计划和 `evaluation.result/v2` result 数据模型 | `EvaluationManifest`、`WorkspacePlan`、`EvaluationResult` |
 | `app-server` | 协议调度、runtime 装配、并发 turn、持久化和 evaluation 执行 | `AppServer` |
@@ -74,7 +74,7 @@ sg run <goal>
            -> OpenAiProvider::complete
            -> ToolBroker admission
            -> WorkspaceTools execution
-           -> repair or next model turn
+           -> append tool result or next model turn
            -> completion gate
      -> SessionStore::commit_turn_outcome
      -> terminal item events
@@ -118,20 +118,22 @@ sg run <goal>
 - symlink/junction 解析到 workspace 外、I/O 失败、非法 UTF-8 或超限都关闭失败。
 - 指令作为 developer message 注入，不修改 user goal。
 
-`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants。AgentLoop 先读取 `Provider::capabilities()`，用 provider 的实际 context window 和 output limit 预留 developer 指令、tool schema、消息 framing、固定开销以及输出空间，并把预留的 output limit 写入真实 provider 请求，再按优先级组装上下文。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算。
+`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求、工具请求和运行状态使用 `turn_id` 作为当前回合的统一运行标识，不再在输入对象中重复保存 run/session/task 标识。AgentLoop 先读取 `Provider::capabilities()`，用 provider 的实际 context window 和 output limit 预留 developer 指令、tool schema、消息 framing、固定开销以及输出空间，并把预留的 output limit 写入真实 provider 请求，再按优先级组装上下文。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算。
 
 ## 6. AgentLoop
 
 `AgentLoop::run` 的真实步骤为：
 
 1. 组装 developer、history 和当前 user message。
-2. 构造 `ModelTurnRequest` 和 builtin tool schema，并按 provider capabilities 检查完整请求是否适合 context window。
+2. 构造 `ModelTurnRequest` 和 builtin tool schema；每个模型回合请求最多允许一个 tool call，并按 provider capabilities 检查完整请求是否适合 context window。
 3. 调用 provider，并在调用前后检查 `CancellationToken`。
-4. 按 provider capabilities 验证 response、tool call 名称和 JSON arguments。
+4. 在执行前按 provider capabilities 验证 response、tool call 数量、名称和 JSON arguments；违反单 tool-call 边界的响应直接 failed。
 5. 通过 `PolicyEngine` 得到 allow、deny 或 ask。
-6. 执行允许的工具，把 `ToolResult::to_message_payload()` 作为 tool message 送回模型。
-7. 对可修复 tool failure 记录 `ToolRepair`，要求后续模型回合处理。
+6. ask 时生成绑定 request/thread/turn/tool call 的内部 checkpoint；checkpoint 与 pending approval 在 store 的同一事务中写入，包含继续运行所需的 messages、既有 tool results、已消费 grants、approval count、completion tracker 和 model-turn offset。
+7. 执行允许的工具，把 `ToolResult::to_message_payload()` 按原顺序作为 tool message 送回下一模型回合；失败结果直接作为模型反馈，repairable failure 由 completion tracker 和下一回合反馈处理。
 8. 没有 tool call 时应用 completion gate，接受或拒绝 final answer。
+
+checkpoint、pending tool call、原始 prompt、provider payload 和内部 audit metadata 不序列化到 `AgentLoopResult`、CLI response 或普通 trace payload。allow-resume 只接受当前 active blocked turn 的一次性 decision，校验 checkpoint 的完整绑定后恢复原 messages、tool results、已消费 grants、approval count 和 model-turn offset，再执行 pending tool 并继续模型循环；取消、失败和 max-turn 返回都保留恢复前的回合计数。
 
 completion gate 保持以下不变量：
 
@@ -166,7 +168,7 @@ builtin.command
 
 默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。`WorkspaceTools` 对所有路径执行 lexical normalize、canonicalize existing parent、workspace containment 和 protected component 检查；多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
 
-当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化 `PendingToolCall`。`approval/decision` 是单次消费：只有 allow、绑定完全匹配、原 turn 仍 blocked、thread active 时才恢复该 pending call，然后继续完整 AgentLoop；deny/defer 不执行工具。客户端不能通过 `approval/request` 自行向 ledger 注入请求。
+当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint。`approval/decision` 是单次消费：只有 allow、绑定完全匹配、checkpoint 完整、原 turn 仍 blocked、thread active 时才恢复该 pending call，然后继续完整 AgentLoop；deny/defer 不执行工具。客户端不能通过 `approval/request` 自行向 ledger 注入请求。checkpoint 不进入 approval list、result 或 trace 的公共投影。
 
 发送给模型的 tool result 只包含 `ok`、工具/调用标识、有界且脱敏的 `preview`、可用的 artifact references、错误码和截断标记；内部 result id、raw arguments、approval id、policy id、audit metadata 和 secret-like 文本不投影。已有 artifact reference 时不重复发送 preview；只有内部 result id 而没有 artifact reference 时仍保留有界 preview。
 
@@ -219,7 +221,7 @@ provider HTTP wait、AgentLoop 回合边界和 sandbox command 都检查同一�
 
 ## 11. Store、Trace 与 Artifact
 
-`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/rust-app-server.sqlite3`。
+`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/rust-app-server.sqlite3`。`pending_tool_calls.payload` 保存经版本和 request/thread/turn/tool-call 绑定校验的内部 AgentLoop checkpoint；request、pending row 与 approval trace 在同一事务中写入，缺少或错绑 checkpoint 时整个写入失败。
 
 主要表：
 
@@ -265,6 +267,7 @@ prepare source
 - thread workspace 必须是存在的绝对目录；archive thread 不能开始或恢复 pending turn。
 - protected path、workspace 越界、非法 tool arguments 和扩大 sandbox/network 权限在执行前拒绝。
 - approval 必须显式绑定 thread、turn 和 tool call，不能重放。
+- approval checkpoint 缺失、版本未知、身份错绑、消息/tool-call 顺序不合法或重复消费 grant 时 fail closed。
 - cancelled turn 的晚到结果不能恢复为 completed。
 - evaluation 的 fake/mock 测试只用于确定性回归，不能替代真实 provider + AgentLoop 证明。
 

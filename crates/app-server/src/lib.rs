@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentRunStatus, AgentStatus,
-    ApprovalGrant, PendingToolCall,
+    AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult,
+    AgentRunStatus, AgentStatus, ApprovalGrant, PendingToolCall,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
@@ -49,6 +49,8 @@ const TURN_NOT_FOUND: &str = "Turn not found";
 const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
 const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
 const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
+const APPROVAL_CHECKPOINT_REQUIRED: &str =
+    "approval request requires an internal AgentLoop checkpoint";
 const APPROVAL_REQUEST_INTERNAL_ONLY: &str =
     "approval/request is internal to the AgentLoop approval ledger";
 const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
@@ -757,11 +759,8 @@ impl AppServer {
                 Arc::clone(&self.sandbox_backend),
             ))
             .with_cancellation_token(cancellation.clone())
-            .resume_pending_tool_call(&loop_input, &pending);
-        self.persist_agent_approval_requests(
-            &result.approval_requests,
-            &result.pending_tool_calls,
-        )?;
+            .resume_pending_tool_call(&loop_input, &pending, &pending_tool_call);
+        self.persist_agent_approval_requests(&result)?;
         let mut run_status = result.to_run_status(&loop_input);
         if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
             let audit_status = approval_terminal_status(
@@ -805,27 +804,18 @@ impl AppServer {
             ))
             .with_cancellation_token(cancellation.clone())
             .run(&loop_input);
-        self.persist_agent_approval_requests(
-            &result.approval_requests,
-            &result.pending_tool_calls,
-        )?;
+        self.persist_agent_approval_requests(&result)?;
         Ok(result.to_run_status(&loop_input))
     }
 
-    fn persist_agent_approval_requests(
-        &self,
-        approval_requests: &[ApprovalRequest],
-        pending_tool_calls: &[PendingToolCall],
-    ) -> AppServerResult<()> {
-        let pending_by_request = pending_tool_calls
-            .iter()
-            .map(|pending| (pending.request_id.as_str(), pending))
-            .collect::<HashMap<_, _>>();
-        for request in approval_requests {
-            let pending_tool_call = pending_by_request
-                .get(request.request_id.as_str())
-                .map(|pending| serde_json::to_value(*pending))
-                .transpose()?;
+    fn persist_agent_approval_requests(&self, result: &AgentLoopResult) -> AppServerResult<()> {
+        for request in &result.approval_requests {
+            let pending_tool_call = result.approval_checkpoint(&request.request_id);
+            if request.tool_call_id.is_some() && pending_tool_call.is_none() {
+                return Err(AppServerError::Store(StoreError::InvalidState(
+                    APPROVAL_CHECKPOINT_REQUIRED.to_string(),
+                )));
+            }
             match self.store.create_approval_with_pending_tool_call_and_trace(
                 request,
                 pending_tool_call,
@@ -2392,34 +2382,40 @@ mod tests {
                 AgentStatus::Completed.as_str(),
             )
             .expect("complete future turn");
-        let request = ApprovalRequest::new(
-            format!("approval_{}_call_1", turn.turn_id),
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            TOOL_EDIT,
-        )
-        .with_tool_call_id("call_1")
-        .with_resources(["README.md"]);
-        let pending = PendingToolCall {
-            request_id: request.request_id.clone(),
+        let history = store
+            .read_thread_history_before_turn(
+                &thread.thread_id,
+                &turn.turn_id,
+                DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+            )
+            .expect("history before approval turn");
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "edit readme".to_string(),
+            }],
+        };
+        let mut initial_response =
+            ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "before approval");
+        initial_response.tool_calls.push(ModelToolCall {
             tool_call_id: "call_1".to_string(),
             tool_name: TOOL_EDIT.to_string(),
+            arguments: json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            }),
             raw_arguments: json!({
                 "path": "README.md",
                 "expected": "before",
                 "replacement": "after"
             })
             .to_string(),
-            resources: vec!["README.md".to_string()],
-        };
-        let pending_payload = serde_json::to_value(&pending).expect("pending payload");
-        let decision = ApprovalDecision::new(
-            request.request_id.clone(),
-            ApprovalOutcome::Allow,
-            "approved",
-        );
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
         let mut verification_response =
-            ModelTurnResponse::completed("model_request_turn_1_0", "response_2", "");
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
         verification_response.tool_calls.push(ModelToolCall {
             tool_call_id: "call_verify".to_string(),
             tool_name: TOOL_COMMAND.to_string(),
@@ -2436,20 +2432,71 @@ mod tests {
             validation_errors: Vec::new(),
         });
         let final_response =
-            ModelTurnResponse::completed("model_request_turn_1_1", "response_3", "done");
-        let seen_requests = Arc::new(Mutex::new(Vec::new()));
-        let provider = StaticProvider {
+            ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+        let initial_seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let initial_provider = StaticProvider {
+            responses: vec![initial_response],
+            seen_requests: Arc::clone(&initial_seen_requests),
+        };
+        let resumed_seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let resumed_provider = StaticProvider {
             responses: vec![verification_response, final_response],
-            seen_requests: Arc::clone(&seen_requests),
+            seen_requests: Arc::clone(&resumed_seen_requests),
         };
         let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+
+        let cancellation = CancellationToken::new();
+        let blocked_status = server
+            .run_agent_loop_with_provider(
+                initial_provider,
+                &thread,
+                &params,
+                &turn.turn_id,
+                &history.messages,
+                &cancellation,
+            )
+            .expect("initial agent loop");
+        assert_eq!(blocked_status.status, AgentStatus::Blocked);
+        assert_eq!(blocked_status.approval_count, 1);
+        server
+            .commit_turn_run_status(turn.clone(), &blocked_status, &cancellation)
+            .expect("commit blocked turn");
+        let blocked_json = serde_json::to_string(&blocked_status).expect("blocked status json");
+        assert!(!blocked_json.contains("checkpoint_version"));
+        assert!(!blocked_json.contains("raw_arguments"));
+        for trace in server
+            .store
+            .list_trace(&thread.thread_id)
+            .expect("thread trace")
+        {
+            let trace_json = serde_json::to_string(&trace.payload).expect("trace payload json");
+            assert!(!trace_json.contains("checkpoint_version"));
+            assert!(!trace_json.contains("raw_arguments"));
+        }
+        let request = server
+            .store
+            .get_pending_approval(&format!("approval_{}_call_1", turn.turn_id))
+            .expect("stored approval");
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let recorded = server
+            .store
+            .record_approval_decision(&decision, "approval", "approval decision recorded")
+            .expect("record approval");
+        let pending_payload = recorded.pending_tool_call.expect("checkpoint payload");
+        assert_eq!(pending_payload["checkpoint_version"], 1);
+        assert!(pending_payload["messages"].is_array());
+        assert!(pending_payload["tool_results"].is_array());
 
         let resumed = server
             .resume_agent_loop_after_gate(
                 &request,
                 &decision,
                 Some(pending_payload),
-                provider,
+                resumed_provider,
                 &CancellationToken::new(),
             )
             .expect("resume")
@@ -2458,6 +2505,9 @@ mod tests {
         assert_eq!(resumed.0.turn_id, turn.turn_id);
         assert_eq!(resumed.1.status, AgentStatus::Completed);
         assert_eq!(resumed.1.final_answer.as_deref(), Some("done"));
+        assert_eq!(resumed.1.model_turns, 3);
+        assert_eq!(resumed.1.tool_calls, 2);
+        assert_eq!(resumed.1.approval_count, 1);
         assert!(resumed.1.verification.required);
         assert!(resumed.1.verification.passed);
         assert_eq!(resumed.1.verification.successful_command_count, 1);
@@ -2465,7 +2515,7 @@ mod tests {
             std::fs::read_to_string(&file_path).expect("read readme"),
             "after"
         );
-        let requests = seen_requests.lock().expect("seen requests");
+        let requests = resumed_seen_requests.lock().expect("seen requests");
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
         assert_eq!(requests[0].messages[1].role, ModelRole::User);
@@ -2482,6 +2532,17 @@ mod tests {
         assert_eq!(
             requests[0].messages[3].content[0].text.as_deref(),
             Some("edit readme")
+        );
+        assert_eq!(requests[0].messages[4].role, ModelRole::Assistant);
+        assert_eq!(
+            requests[0].messages[4].content[0].text.as_deref(),
+            Some("before approval")
+        );
+        assert_eq!(requests[0].messages[4].tool_calls.len(), 1);
+        assert_eq!(requests[0].messages[5].role, ModelRole::Tool);
+        assert_eq!(
+            requests[0].messages[5].tool_call_id.as_deref(),
+            Some("call_1")
         );
         let request_json = serde_json::to_string(&requests[0]).expect("request json");
         assert!(!request_json.contains("future user must not replay"));

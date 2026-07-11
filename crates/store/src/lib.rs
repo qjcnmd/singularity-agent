@@ -43,10 +43,25 @@ const APPROVAL_BINDING_REQUIRED: &str =
 const APPROVAL_TURN_THREAD_MISMATCH: &str = "approval request thread_id must match bound turn";
 const PENDING_TOOL_CALL_ID_MISMATCH: &str =
     "pending tool call tool_call_id must match approval request";
+const PENDING_TOOL_CALL_NAME_MISMATCH: &str =
+    "pending tool call tool_name must match approval request";
+const PENDING_TOOL_CALL_RESOURCES_MISMATCH: &str =
+    "pending tool call resources must match approval request";
 const PENDING_TOOL_CALL_TURN_MISMATCH: &str =
     "pending tool call turn_id must match approval request";
 const PENDING_TOOL_CALL_THREAD_MISMATCH: &str =
     "pending tool call thread_id must match approval request";
+const APPROVAL_CHECKPOINT_REQUIRED: &str =
+    "pending approval must include an internal AgentLoop checkpoint";
+const APPROVAL_CHECKPOINT_VERSION: u64 = 1;
+const APPROVAL_CHECKPOINT_THREAD_MISMATCH: &str =
+    "approval checkpoint thread_id must match approval request";
+const APPROVAL_CHECKPOINT_TURN_MISMATCH: &str =
+    "approval checkpoint turn_id must match approval request";
+const APPROVAL_CHECKPOINT_REQUEST_MISMATCH: &str =
+    "approval checkpoint request_id must match approval request";
+const APPROVAL_CHECKPOINT_TOOL_CALL_MISMATCH: &str =
+    "approval checkpoint tool_call_id must match pending tool call";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -825,7 +840,9 @@ impl SessionStore {
                         PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
                     ));
                 }
-                Some(serde_json::from_str(&payload)?)
+                let payload = serde_json::from_str::<Value>(&payload)?;
+                let _ = pending_tool_call_id(&transaction, &request, &payload)?;
+                Some(payload)
             }
             None => {
                 if request.tool_call_id.is_some() {
@@ -2088,6 +2105,88 @@ fn pending_tool_call_id(
         return Err(StoreError::InvalidState(
             PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
         ));
+    }
+    let tool_name = payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
+    if tool_name != request.action {
+        return Err(StoreError::InvalidState(
+            PENDING_TOOL_CALL_NAME_MISMATCH.to_string(),
+        ));
+    }
+    let resources = payload
+        .get("resources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
+    if resources != request.resources {
+        return Err(StoreError::InvalidState(
+            PENDING_TOOL_CALL_RESOURCES_MISMATCH.to_string(),
+        ));
+    }
+    let checkpoint_version = payload
+        .get("checkpoint_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
+    if checkpoint_version != APPROVAL_CHECKPOINT_VERSION {
+        return Err(StoreError::InvalidState(
+            "unsupported approval checkpoint version".to_string(),
+        ));
+    }
+    let checkpoint_request_id = payload
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
+    if checkpoint_request_id != request.request_id {
+        return Err(StoreError::InvalidState(
+            APPROVAL_CHECKPOINT_REQUEST_MISMATCH.to_string(),
+        ));
+    }
+    let checkpoint_thread_id = payload
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
+    if checkpoint_thread_id != request.thread_id {
+        return Err(StoreError::InvalidState(
+            APPROVAL_CHECKPOINT_THREAD_MISMATCH.to_string(),
+        ));
+    }
+    let checkpoint_turn_id = payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
+    if checkpoint_turn_id != request.turn_id {
+        return Err(StoreError::InvalidState(
+            APPROVAL_CHECKPOINT_TURN_MISMATCH.to_string(),
+        ));
+    }
+    let checkpoint_tool_call_id = payload
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
+    if checkpoint_tool_call_id != tool_call_id {
+        return Err(StoreError::InvalidState(
+            APPROVAL_CHECKPOINT_TOOL_CALL_MISMATCH.to_string(),
+        ));
+    }
+    for field in [
+        "messages",
+        "tool_results",
+        "used_approval_grants",
+        "approval_count",
+        "model_turns",
+        "completion",
+    ] {
+        if payload.get(field).is_none() {
+            return Err(StoreError::InvalidState(
+                APPROVAL_CHECKPOINT_REQUIRED.to_string(),
+            ));
+        }
     }
     Ok(tool_call_id.to_string())
 }

@@ -365,8 +365,54 @@ fn pending_tool_call_binding_requires_request_tool_call_id() {
     );
     let pending_tool_call = serde_json::json!({
         "request_id": "approval_turn_call_1",
+        "thread_id": &thread.thread_id,
+        "turn_id": &turn.turn_id,
         "tool_call_id": "call_1",
         "tool_name": "builtin.patch",
+        "raw_arguments": "{}",
+        "resources": [],
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+
+    assert!(matches!(
+        store.create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(pending_tool_call),
+            "approval",
+            "approval requested",
+        ),
+        Err(StoreError::InvalidState(message))
+            if message == "pending tool call tool_call_id must match approval request"
+    ));
+}
+
+#[test]
+fn pending_tool_call_requires_checkpoint_and_rolls_back_atomically() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "blocked")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_turn_call_1",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.edit",
+    )
+    .with_tool_call_id("call_1");
+    let pending_tool_call = serde_json::json!({
+        "request_id": "approval_turn_call_1",
+        "thread_id": &thread.thread_id,
+        "turn_id": &turn.turn_id,
+        "tool_call_id": "call_1",
+        "tool_name": "builtin.edit",
         "raw_arguments": "{}",
         "resources": []
     });
@@ -379,7 +425,13 @@ fn pending_tool_call_binding_requires_request_tool_call_id() {
             "approval requested",
         ),
         Err(StoreError::InvalidState(message))
-            if message == "pending tool call tool_call_id must match approval request"
+            if message == "pending approval must include an internal AgentLoop checkpoint"
+    ));
+    assert!(store.list_pending_approvals().expect("pending").is_empty());
+    assert!(matches!(
+        store.list_trace(&thread.thread_id),
+        Err(StoreError::NotFound(message))
+            if message == format!("trace run {}", thread.thread_id)
     ));
 }
 
@@ -643,10 +695,19 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
     .with_tool_call_id("call_1");
     let pending_tool_call = serde_json::json!({
         "request_id": "approval_turn_call_1",
+        "thread_id": &thread.thread_id,
+        "turn_id": &turn.turn_id,
         "tool_call_id": "call_1",
         "tool_name": "builtin.patch",
         "raw_arguments": "{}",
-        "resources": []
+        "resources": [],
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
     });
     let request_trace = store
         .create_approval_with_pending_tool_call_and_trace(
