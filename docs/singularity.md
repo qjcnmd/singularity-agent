@@ -118,7 +118,7 @@ sg run <goal>
 - symlink/junction 解析到 workspace 外、I/O 失败、非法 UTF-8 或超限都关闭失败。
 - 指令作为 developer message 注入，不修改 user goal。
 
-`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求、工具请求和运行状态使用 `turn_id` 作为当前回合的统一运行标识，不再在输入对象中重复保存 run/session/task 标识。AgentLoop 先读取 `Provider::capabilities()`，用 provider 的实际 context window 和 output limit 预留 developer 指令、tool schema、消息 framing、固定开销以及输出空间，并把预留的 output limit 写入真实 provider 请求，再按优先级组装上下文。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算。
+`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求只保留本次 provider 调用所需的 `request_id`，工具请求只保留 tool call 标识、名称和原始参数；运行状态不再复制 run/session/task/phase/action 占位字段。AgentLoop 先读取 `Provider::capabilities()`，用 provider 的实际 context window 和 output limit 预留 developer 指令、tool schema、消息 framing、固定开销以及输出空间，并把预留的 output limit 写入真实 provider 请求，再按优先级组装上下文。当前保守估算按每 4 个 ASCII 字符约 1 token、每个非 ASCII 字符 1 token，并另计消息 framing、工具 schema、developer 指令、固定开销和输出预算；它用于关闭失败的容量门禁，不声称等同 provider tokenizer。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算；最终 AgentLoop trace 记录脱敏后的包含/排除 item ID、预算明细和模型回合上限，不记录消息内容。
 
 ## 6. AgentLoop
 
@@ -147,7 +147,7 @@ completion gate 保持以下不变量：
 
 `ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY`、`SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。context window 默认为 128000，output limit 默认 4096；token limit 只在配置快照中解析并以脱敏错误暴露，provider 通过 `capabilities()` 将实际上限交给 AgentLoop。请求声明的 output token 超过 provider 上限时，在发出 provider 请求前失败。
 
-`OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；超时、认证、rate limit、网络、model 配置和 response schema 错误保留不同类别。
+`OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；超时、认证、rate limit、网络、model 配置和 response schema 错误保留不同类别。`AgentLoopResult` 和 `AgentRunStatus` 在内部携带 typed `ModelErrorCategory`（不进入 serde、CLI 或普通 trace）；Evaluation 依据该类别映射 `BlockerKind`，不从 human-readable error 文本推断。`evaluation.task_set/v3` 和 `evaluation.result/v2` 的公共语义不变。
 
 公共 readiness 只包含来源、snapshot id、ready、blocker code 和三个字段的 present/missing。API key、base URL 原值、Authorization header、原始 response 和原始 prompt 不进入 CLI 或 trace。
 

@@ -139,12 +139,9 @@ fn captured_request_server(
 }
 
 #[test]
-fn model_turn_request_uses_embedded_boundary_fields() {
+fn model_turn_request_serializes_provider_boundary_fields() {
     let request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     let value = serde_json::to_value(&request).expect("serialize model request");
@@ -157,23 +154,27 @@ fn model_turn_request_uses_embedded_boundary_fields() {
 }
 
 #[test]
-fn model_turn_schema_carries_runtime_boundary_fields() {
+fn model_turn_schema_excludes_runtime_and_trace_metadata() {
     let request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     let value = serde_json::to_value(&request).expect("serialize model request");
 
-    assert_eq!(value["phase_id"], "model");
-    assert_eq!(value["action_id"], "request_1");
     assert_eq!(value["tools"], serde_json::json!([]));
     assert_eq!(value["tool_choice"]["mode"], "auto");
-    assert!(value["context_metadata"].is_object());
-    assert!(value["policy_metadata"].is_object());
-    assert!(value["trace_metadata"].is_object());
+    for excluded_field in [
+        "run_id",
+        "session_id",
+        "task_id",
+        "phase_id",
+        "action_id",
+        "context_metadata",
+        "policy_metadata",
+        "trace_metadata",
+    ] {
+        assert!(value.get(excluded_field).is_none());
+    }
 
     let response = ModelTurnResponse::completed("request_1", "response_1", "done");
     let response_value = serde_json::to_value(&response).expect("serialize model response");
@@ -492,9 +493,6 @@ fn provider_rejects_output_limit_that_cannot_fit_the_context_window() {
 fn model_request_validation_rejects_output_above_provider_capability() {
     let mut request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.model_preferences.max_output_tokens = Some(9);
@@ -516,18 +514,12 @@ fn model_request_validation_rejects_output_above_provider_capability() {
 fn model_request_validation_rejects_unsupported_declared_capabilities() {
     let mut request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![ModelMessage::text(ModelRole::Developer, "instructions")],
     );
     request.tools.push(ModelToolSchema {
         name: "builtin.read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
-        capability_tags: Vec::new(),
-        risk_tags: Vec::new(),
-        metadata: serde_json::json!({}),
     });
     request.model_preferences.json_mode = true;
     let capabilities = ModelCapabilities {
@@ -585,18 +577,12 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
     let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
         name: "builtin.read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
-        capability_tags: vec!["read".to_string()],
-        risk_tags: vec![],
-        metadata: serde_json::json!({}),
     });
 
     let response = provider
@@ -638,9 +624,6 @@ fn openai_provider_cancels_an_inflight_http_request() {
         OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
     let request = ModelTurnRequest::new(
         "request_cancel",
-        "run_cancel",
-        "session_cancel",
-        "task_cancel",
         vec![ModelMessage::text(ModelRole::User, "wait")],
     );
     let cancellation = singularity_core::CancellationToken::new();
@@ -680,9 +663,6 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
     tool_message.tool_call_id = Some("call_1".to_string());
     let request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![
             ModelMessage::text(ModelRole::User, "hello"),
             ModelMessage::assistant_tool_calls(vec![tool_call("call_1", "builtin.read")]),
@@ -736,18 +716,12 @@ fn openai_provider_maps_internal_tool_names_to_wire_names_and_back() {
     let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
         name: "builtin.read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
-        capability_tags: Vec::new(),
-        risk_tags: Vec::new(),
-        metadata: serde_json::json!({}),
     });
 
     let response = provider
@@ -774,9 +748,6 @@ fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
     let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
     let request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
 
@@ -818,9 +789,6 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
         let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
         let request = ModelTurnRequest::new(
             "request_1",
-            "run_1",
-            "session_1",
-            "task_1",
             vec![ModelMessage::text(ModelRole::User, "hello")],
         );
 
@@ -856,18 +824,12 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
     let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_1",
-        "run_1",
-        "session_1",
-        "task_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
         name: "builtin.read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
-        capability_tags: Vec::new(),
-        risk_tags: Vec::new(),
-        metadata: serde_json::json!({}),
     });
 
     let response = provider
@@ -935,7 +897,7 @@ fn model_errors_classify_provider_failures_without_transport_calls() {
 
 #[test]
 fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes() {
-    let mut request = ModelTurnRequest::new("request_1", "run_1", "session_1", "task_1", vec![]);
+    let mut request = ModelTurnRequest::new("request_1", vec![]);
     request.model_preferences.provider_name = Some("openai_compatible".to_string());
     request.model_preferences.model_name = Some("gpt-test".to_string());
 
@@ -1047,9 +1009,6 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
         name: "builtin.read_file".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
-        capability_tags: vec!["read".to_string()],
-        risk_tags: vec!["workspace_read".to_string()],
-        metadata: serde_json::json!({}),
     };
     let provider_config = ModelProviderConfig {
         provider_name: Some("openai_compatible".to_string()),

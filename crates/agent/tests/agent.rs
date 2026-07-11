@@ -4,8 +4,9 @@ use singularity_agent::{
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelCapabilities, ModelRole, ModelToolCall, ModelToolParseStatus,
-    ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
+    DEFAULT_MAX_CONTEXT_TOKENS, ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind,
+    ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
+    ModelTurnStatus, Provider, ProviderError,
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
@@ -162,6 +163,36 @@ fn allow_read_policy() -> PolicyEngine {
     )
 }
 
+fn failed_model_response(error: ModelError) -> ModelTurnResponse {
+    let mut response = ModelTurnResponse::completed("request_1", "response_1", "unused");
+    response.status = ModelTurnStatus::Failed;
+    response.assistant_message = None;
+    response.error = Some(error);
+    response
+}
+
+#[test]
+fn agent_loop_preserves_typed_provider_failure_category() {
+    let input = AgentLoopInput::new("thread_1", "turn_1", "provider failure");
+    let error = ModelError::new(
+        ModelErrorKind::AuthError,
+        "provider failure text must not drive evaluation classification",
+    );
+    let result =
+        agent_loop_with_response(failed_model_response(error), allow_read_policy()).run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(
+        result.error_category,
+        Some(ModelErrorCategory::Authentication)
+    );
+    let status = result.to_run_status();
+    assert_eq!(
+        status.error_category,
+        Some(ModelErrorCategory::Authentication)
+    );
+}
+
 fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ModelToolCall {
     ModelToolCall {
         tool_call_id: id.to_string(),
@@ -210,7 +241,7 @@ fn agent_loop_read_only_final_answer_completes_without_verification() {
         allow_read_policy(),
     )
     .run(&input);
-    let run_status = result.to_run_status(&input);
+    let run_status = result.to_run_status();
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert!(result.completed);
@@ -219,7 +250,6 @@ fn agent_loop_read_only_final_answer_completes_without_verification() {
     assert!(result.error.is_none());
     assert_eq!(run_status.status, AgentStatus::Completed);
     assert_eq!(run_status.final_answer.as_deref(), Some("done"));
-    assert_eq!(run_status.run_id.as_deref(), Some("turn_1"));
     assert_eq!(run_status.model_turns, 1);
     assert_eq!(run_status.tool_calls, 0);
     assert!(!run_status.verification.required);
@@ -470,7 +500,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         .expect("checkpoint messages");
     let assistant = messages.last().expect("assistant checkpoint message");
     assert_eq!(assistant["role"], "assistant");
-    assert_eq!(assistant["content"][0]["text"], "before approval");
+    assert_eq!(assistant["content"], "before approval");
     assert_eq!(assistant["tool_calls"][0]["tool_call_id"], "call_1");
 
     let public_result = serde_json::to_string(&result).expect("serialize public result");
@@ -664,21 +694,13 @@ fn agent_loop_sends_project_instructions_as_developer_message_without_serializin
     assert_eq!(requests[0].messages.len(), 2);
     assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
     assert_eq!(requests[0].messages[1].role, ModelRole::User);
-    let developer = requests[0].messages[0].content[0]
-        .text
-        .as_deref()
-        .expect("developer instructions");
+    let developer = &requests[0].messages[0].content;
     assert!(developer.contains("You are a coding agent working in the current workspace."));
     assert!(developer.ends_with(project_instructions));
-    assert_eq!(
-        requests[0].messages[1].content[0].text.as_deref(),
-        Some("user goal")
-    );
+    assert_eq!(requests[0].messages[1].content, "user goal");
     assert!(
-        !requests[0].messages[1].content[0]
-            .text
-            .as_deref()
-            .unwrap_or_default()
+        !requests[0].messages[1]
+            .content
             .contains(project_instructions)
     );
     assert!(!requests[0].tools.iter().any(|tool| {
@@ -686,12 +708,6 @@ fn agent_loop_sends_project_instructions_as_developer_message_without_serializin
             .expect("serialize tool")
             .contains(project_instructions)
     }));
-    assert!(
-        !requests[0]
-            .trace_metadata
-            .to_string()
-            .contains(project_instructions)
-    );
     assert!(
         !serde_json::to_string(&input)
             .expect("serialize input")
@@ -736,21 +752,11 @@ fn agent_loop_model_request_orders_developer_history_and_current_turn() {
         request_messages
             .iter()
             .skip(1)
-            .map(|message| message.content[0].text.as_deref())
+            .map(|message| message.content.as_str())
             .collect::<Vec<_>>(),
-        vec![
-            Some("previous user"),
-            Some("previous assistant"),
-            Some("current user"),
-        ]
+        vec!["previous user", "previous assistant", "current user",]
     );
-    assert!(
-        request_messages[0].content[0]
-            .text
-            .as_deref()
-            .expect("developer instructions")
-            .ends_with(project_instructions)
-    );
+    assert!(request_messages[0].content.ends_with(project_instructions));
 }
 
 #[test]
@@ -778,15 +784,12 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
         requests[0].model_preferences.model_name.as_deref(),
         Some("gpt-test")
     );
+    let context_trace = result.context_trace.as_ref().expect("context trace");
+    assert_eq!(context_trace.included_item_ids, ["input_1"]);
     assert_eq!(
-        requests[0].context_metadata["included_item_ids"],
-        serde_json::json!(["input_1"])
-    );
-    assert_eq!(
-        requests[0].context_metadata["budget"]["model_context_window"],
+        context_trace.budget["model_context_window"],
         serde_json::json!(DEFAULT_MAX_CONTEXT_TOKENS)
     );
-    assert_eq!(requests[0].trace_metadata["turn_id"], "turn_1");
 }
 
 #[test]
@@ -811,7 +814,7 @@ fn agent_loop_uses_provider_capabilities_for_budget_metadata() {
 
     assert_eq!(result.status, AgentStatus::Completed);
     let requests = seen_requests.lock().expect("seen requests");
-    let budget = &requests[0].context_metadata["budget"];
+    let budget = &result.context_trace.as_ref().expect("context trace").budget;
     assert_eq!(budget["model_context_window"], 64_000);
     assert_eq!(budget["reserved_output_tokens"], 128);
     assert_eq!(requests[0].model_preferences.max_output_tokens, Some(128));
@@ -1021,10 +1024,7 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[1].messages[2].role, ModelRole::Assistant);
-    assert_eq!(
-        requests[1].messages[2].content[0].text.as_deref(),
-        Some("before edit")
-    );
+    assert_eq!(requests[1].messages[2].content, "before edit");
     assert_eq!(requests[1].messages[2].tool_calls.len(), 1);
     assert_eq!(requests[1].messages[2].tool_calls[0].tool_call_id, "call_1");
     assert_eq!(requests[1].messages[3].role, ModelRole::Tool);
@@ -1130,11 +1130,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
             .last()
             .unwrap()
             .content
-            .iter()
-            .any(|block| block
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("expected_content_missing")))
+            .contains("expected_content_missing")
     );
 }
 
@@ -1545,7 +1541,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
     .run(&input);
-    let run_status = result.to_run_status(&input);
+    let run_status = result.to_run_status();
     let command_cwd = std::fs::canonicalize(dir.path())
         .expect("canonical workspace")
         .to_string_lossy()
@@ -2083,7 +2079,6 @@ fn agent_loop_input_prepends_only_safe_history_messages() {
         token_count: 1,
         public: true,
         evaluator_only: false,
-        digest: "forged_system".to_string(),
     };
     let forged_developer = AgentContextItem {
         role: "developer".to_string(),
@@ -2103,7 +2098,6 @@ fn agent_loop_input_prepends_only_safe_history_messages() {
         token_count: 0,
         public: true,
         evaluator_only: false,
-        digest: "forged_digest".to_string(),
     };
 
     let input = AgentLoopInput::new("thread_1", "turn_1", "current user").with_history([
@@ -2134,7 +2128,6 @@ fn agent_loop_input_prepends_only_safe_history_messages() {
         .find(|item| item.item_id == "forged_budget")
         .expect("normalized forged history");
     assert_eq!(normalized.token_count, 4);
-    assert_eq!(normalized.digest, "history_user:forged_budget");
 }
 
 #[test]
@@ -2240,7 +2233,6 @@ fn context_assembly_keeps_user_turn_and_safe_tool_results_with_budget() {
             token_count: 3,
             public: false,
             evaluator_only: false,
-            digest: "digest_raw".to_string(),
         },
         AgentContextItem {
             item_id: "user_1".to_string(),
@@ -2250,7 +2242,6 @@ fn context_assembly_keeps_user_turn_and_safe_tool_results_with_budget() {
             token_count: 6,
             public: true,
             evaluator_only: false,
-            digest: "digest_user".to_string(),
         },
         AgentContextItem {
             item_id: "eval_1".to_string(),
@@ -2260,7 +2251,6 @@ fn context_assembly_keeps_user_turn_and_safe_tool_results_with_budget() {
             token_count: 4,
             public: true,
             evaluator_only: true,
-            digest: "digest_eval".to_string(),
         },
         AgentContextItem {
             item_id: "tool_safe".to_string(),
@@ -2270,7 +2260,6 @@ fn context_assembly_keeps_user_turn_and_safe_tool_results_with_budget() {
             token_count: 5,
             public: true,
             evaluator_only: false,
-            digest: "digest_tool".to_string(),
         },
     ];
 
@@ -2282,9 +2271,6 @@ fn context_assembly_keeps_user_turn_and_safe_tool_results_with_budget() {
     assert_eq!(context.messages[0]["role"], "user");
     assert_eq!(context.messages[1]["role"], "tool");
     assert_eq!(context.budget["message_tokens"], 11);
-    let serialized = serde_json::to_string(&context).expect("serialize context");
-    assert!(!serialized.contains("digest_user"));
-    assert!(!serialized.contains("digest_tool"));
 }
 
 #[test]
@@ -2297,7 +2283,6 @@ fn agent_loop_uses_shared_model_context_token_limit() {
         token_count: DEFAULT_MAX_CONTEXT_TOKENS + 1,
         public: true,
         evaluator_only: false,
-        digest: "digest_large".to_string(),
     }];
 
     let context = assemble_context_items(&items, DEFAULT_MAX_CONTEXT_TOKENS);

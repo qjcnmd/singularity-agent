@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelCapabilities, ModelMessage,
-    ModelPreferences, ModelPurpose, ModelRole, ModelToolCall, ModelToolParseStatus,
-    ModelToolSchema, ModelTurnRequest, ModelTurnStatus, Provider, provider_error_response,
-    validate_model_request_with_capabilities, validate_model_turn_response,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelCapabilities, ModelError,
+    ModelErrorCategory, ModelMessage, ModelPreferences, ModelRole, ModelToolCall,
+    ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnStatus, Provider,
+    provider_error_response, validate_model_request_with_capabilities,
+    validate_model_turn_response,
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
@@ -29,9 +30,9 @@ use thiserror::Error;
 const STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM: &str =
     "strict_command_sandbox_unsupported_platform";
 #[cfg(windows)]
-const NATIVE_AGENT_LOOP_READY_REASON: &str = "AgentLoop uses automatic Windows elevated sandbox setup with restricted-token fallback only for network-enabled profiles";
+const AGENT_LOOP_READY_REASON: &str = "AgentLoop uses automatic Windows elevated sandbox setup with restricted-token fallback only for network-enabled profiles";
 #[cfg(not(windows))]
-const NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
+const AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
     "AgentLoop requires the Windows restricted-token command sandbox";
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_TOOL_CALLS_PER_TURN: u32 = 1;
@@ -120,16 +121,21 @@ pub struct AgentRunStatus {
     pub status: AgentStatus,
     pub completed: bool,
     pub final_answer: Option<String>,
-    pub run_id: Option<String>,
-    pub session_id: Option<String>,
-    pub task_id: Option<String>,
     pub model_turns: u32,
     pub tool_calls: u32,
     pub approval_count: u32,
     pub audit_events: Vec<Value>,
-    pub trace_path: Option<String>,
     pub verification: AgentVerification,
     pub error: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub model_turn_limit: u32,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub context_trace: Option<AgentContextTrace>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub error_category: Option<ModelErrorCategory>,
 }
 
 impl AgentRunStatus {
@@ -138,17 +144,25 @@ impl AgentRunStatus {
             status: AgentStatus::Failed,
             completed: false,
             final_answer: None,
-            run_id: None,
-            session_id: None,
-            task_id: None,
             model_turns: 0,
             tool_calls: 0,
             approval_count: 0,
             audit_events: Vec::new(),
-            trace_path: None,
             verification: AgentVerification::default(),
             error: Some(message.into()),
+            model_turn_limit: 0,
+            context_trace: None,
+            error_category: None,
         }
+    }
+
+    pub fn failed_with_category(
+        message: impl Into<String>,
+        error_category: Option<ModelErrorCategory>,
+    ) -> Self {
+        let mut status = Self::failed(message);
+        status.error_category = error_category;
+        status
     }
 
     pub fn with_status(mut self, status: AgentStatus) -> Self {
@@ -173,7 +187,7 @@ impl AgentLoopCapability {
             Self {
                 available: true,
                 status: AgentStatus::Completed,
-                reason: NATIVE_AGENT_LOOP_READY_REASON.to_string(),
+                reason: AGENT_LOOP_READY_REASON.to_string(),
                 blockers: Vec::new(),
             }
         }
@@ -182,7 +196,7 @@ impl AgentLoopCapability {
             Self {
                 available: false,
                 status: AgentStatus::Blocked,
-                reason: NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON.to_string(),
+                reason: AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON.to_string(),
                 blockers: vec![STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM.to_string()],
             }
         }
@@ -299,6 +313,15 @@ pub struct AgentLoopResult {
     pub tool_results: Vec<ToolResult>,
     pub verification: AgentVerification,
     pub error: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub model_turn_limit: u32,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub context_trace: Option<AgentContextTrace>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub error_category: Option<ModelErrorCategory>,
 }
 
 impl AgentLoopResult {
@@ -314,21 +337,20 @@ impl AgentLoopResult {
             .cloned()
     }
 
-    pub fn to_run_status(&self, input: &AgentLoopInput) -> AgentRunStatus {
+    pub fn to_run_status(&self) -> AgentRunStatus {
         AgentRunStatus {
             status: self.status.clone(),
             completed: self.completed,
             final_answer: self.final_answer.clone(),
-            run_id: Some(input.turn_id.clone()),
-            session_id: Some(input.turn_id.clone()),
-            task_id: Some(input.turn_id.clone()),
             model_turns: self.model_turns,
             tool_calls: self.tool_calls,
             approval_count: self.approval_count,
             audit_events: audit_events_from_tool_results(&self.tool_results),
-            trace_path: None,
             verification: self.verification.clone(),
             error: self.error.clone(),
+            model_turn_limit: self.model_turn_limit,
+            context_trace: self.context_trace.clone(),
+            error_category: self.error_category.clone(),
         }
     }
 }
@@ -497,10 +519,16 @@ struct AgentLoopState {
     prior_approval_count: u32,
     completion: CompletionTracker,
     last_completion_error: Option<String>,
+    model_turn_limit: u32,
+    context_trace: Option<AgentContextTrace>,
 }
 
 impl AgentLoopState {
-    fn new(messages: Vec<ModelMessage>) -> Self {
+    fn new(
+        messages: Vec<ModelMessage>,
+        model_turn_limit: u32,
+        context_trace: Option<AgentContextTrace>,
+    ) -> Self {
         Self {
             messages,
             tool_results: Vec::new(),
@@ -511,6 +539,8 @@ impl AgentLoopState {
             prior_approval_count: 0,
             completion: CompletionTracker::default(),
             last_completion_error: None,
+            model_turn_limit,
+            context_trace,
         }
     }
 
@@ -521,6 +551,18 @@ impl AgentLoopState {
         final_answer: Option<String>,
         model_turns: u32,
         error: Option<String>,
+    ) -> AgentLoopResult {
+        self.finish_with_error_category(status, completed, final_answer, model_turns, error, None)
+    }
+
+    fn finish_with_error_category(
+        self,
+        status: AgentStatus,
+        completed: bool,
+        final_answer: Option<String>,
+        model_turns: u32,
+        error: Option<String>,
+        error_category: Option<ModelErrorCategory>,
     ) -> AgentLoopResult {
         let approval_count = self
             .prior_approval_count
@@ -538,6 +580,9 @@ impl AgentLoopState {
             tool_results: self.tool_results,
             verification: self.completion.summary(),
             error,
+            model_turn_limit: self.model_turn_limit,
+            context_trace: self.context_trace,
+            error_category,
         }
     }
 
@@ -615,17 +660,20 @@ where
         if current_turn_excluded(input, &context) {
             return context_overflow_result();
         }
-        let state = AgentLoopState::new(model_messages_from_input(input, &context));
+        let state = AgentLoopState::new(
+            model_messages_from_input(input, &context),
+            input.max_turns.max(1),
+            Some(AgentContextTrace::from(&context)),
+        );
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, 0, None);
         }
-        self.continue_run(input, &context, &budget, &capabilities, state, 0)
+        self.continue_run(input, &budget, &capabilities, state, 0)
     }
 
     fn continue_run(
         &self,
         input: &AgentLoopInput,
-        context: &ContextBundle,
         budget: &ContextBudget,
         capabilities: &ModelCapabilities,
         mut state: AgentLoopState,
@@ -658,7 +706,6 @@ where
             let request = model_turn_request(
                 &self.tool_broker,
                 input,
-                context,
                 budget,
                 turn_index,
                 state.messages.clone(),
@@ -685,12 +732,14 @@ where
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
             }
             if response.status != ModelTurnStatus::Success {
-                return state.finish(
+                let error_category = response.error.as_ref().map(ModelError::category);
+                return state.finish_with_error_category(
                     AgentStatus::Failed,
                     false,
                     None,
                     turn_index + 1,
                     response.error.map(|error| error.message),
+                    error_category,
                 );
             }
             let allowed_tool_names = model_tool_names(&self.tool_broker);
@@ -802,11 +851,11 @@ where
                         .clone();
                     let checkpoint = state.checkpoint(input, &pending, turn_index + 1);
                     state.approval_checkpoints.push(checkpoint);
-                    let tool_result = self.execute_tool(input, call, decision);
+                    let tool_result = self.execute_tool(call, decision);
                     state.tool_results.push(tool_result);
                     return state.finish(AgentStatus::Blocked, false, None, turn_index + 1, None);
                 }
-                let tool_result = self.execute_tool(input, call, decision);
+                let tool_result = self.execute_tool(call, decision);
                 let failed_tool_result = !tool_result.ok;
                 state.completion.observe(&tool_result);
                 state.tool_results.push(tool_result.clone());
@@ -852,7 +901,7 @@ where
         {
             Ok(call) => call,
             Err(error) => {
-                return AgentLoopState::new(Vec::new()).finish(
+                return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
                     AgentStatus::Failed,
                     false,
                     None,
@@ -865,7 +914,7 @@ where
             match restore_checkpoint(input, pending, checkpoint_payload) {
                 Ok(restored) => restored,
                 Err(error) => {
-                    return AgentLoopState::new(Vec::new()).finish(
+                    return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
                         AgentStatus::Failed,
                         false,
                         None,
@@ -891,6 +940,7 @@ where
             }
         };
         let context = assemble_context_items_with_budget(&input.input, &budget);
+        state.context_trace = Some(AgentContextTrace::from(&context));
         if current_turn_excluded(input, &context) {
             return state.finish(
                 AgentStatus::Failed,
@@ -910,7 +960,7 @@ where
                 Some("pending tool call approval did not match".to_string()),
             );
         }
-        let tool_result = self.execute_tool(input, &call, decision);
+        let tool_result = self.execute_tool(&call, decision);
         let failed_tool_result = !tool_result.ok;
         state.completion.observe(&tool_result);
         state.messages.push(tool_result_message(&tool_result));
@@ -918,29 +968,20 @@ where
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
         }
-        if failed_tool_result {
-            if !is_repairable_tool_result(&tool_result) {
-                let error_code = tool_result
-                    .error_code
-                    .as_deref()
-                    .unwrap_or("tool_execution_failed");
-                return state.finish(
-                    AgentStatus::Failed,
-                    false,
-                    None,
-                    model_turn_offset,
-                    Some(format!("tool execution failed: {error_code}")),
-                );
-            }
+        if failed_tool_result && !is_repairable_tool_result(&tool_result) {
+            let error_code = tool_result
+                .error_code
+                .as_deref()
+                .unwrap_or("tool_execution_failed");
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some(format!("tool execution failed: {error_code}")),
+            );
         }
-        self.continue_run(
-            input,
-            &context,
-            &budget,
-            &capabilities,
-            state,
-            model_turn_offset,
-        )
+        self.continue_run(input, &budget, &capabilities, state, model_turn_offset)
     }
 
     fn is_cancelled(&self, input: &AgentLoopInput) -> bool {
@@ -1018,16 +1059,8 @@ where
         })
     }
 
-    fn execute_tool(
-        &self,
-        input: &AgentLoopInput,
-        call: &ModelToolCall,
-        decision: ToolBrokerDecision,
-    ) -> ToolResult {
+    fn execute_tool(&self, call: &ModelToolCall, decision: ToolBrokerDecision) -> ToolResult {
         let envelope = ToolCallRequest::new(
-            input.turn_id.clone(),
-            input.turn_id.clone(),
-            input.turn_id.clone(),
             call.tool_call_id.clone(),
             call.tool_name.clone(),
             call.raw_arguments.clone(),
@@ -1130,7 +1163,6 @@ pub struct AgentContextItem {
     pub token_count: u32,
     pub public: bool,
     pub evaluator_only: bool,
-    pub digest: String,
 }
 
 impl AgentContextItem {
@@ -1144,7 +1176,6 @@ impl AgentContextItem {
             priority: AgentContextItemPriority::CurrentTurn,
             public: true,
             evaluator_only: false,
-            digest: "user_input".to_string(),
         }
     }
 
@@ -1159,7 +1190,6 @@ impl AgentContextItem {
     fn history(item_id: impl Into<String>, content: impl Into<String>, role: &'static str) -> Self {
         let item_id = item_id.into();
         let content = content.into();
-        let digest = format!("history_{role}:{item_id}");
         Self {
             item_id,
             role: role.to_string(),
@@ -1168,7 +1198,6 @@ impl AgentContextItem {
             priority: AgentContextItemPriority::History,
             public: true,
             evaluator_only: false,
-            digest,
         }
     }
 
@@ -1310,12 +1339,7 @@ fn model_request_fits_context(
     let projected_messages = messages
         .iter()
         .map(|message| {
-            let content = message
-                .content
-                .iter()
-                .filter_map(|block| block.text.as_deref())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let content = &message.content;
             let tool_calls = message
                 .tool_calls
                 .iter()
@@ -1522,7 +1546,7 @@ fn restore_checkpoint(
     if derived_completion != checkpoint.completion {
         return Err("approval checkpoint completion state mismatch".to_string());
     }
-    let mut state = AgentLoopState::new(checkpoint.messages);
+    let mut state = AgentLoopState::new(checkpoint.messages, input.max_turns.max(1), None);
     state.tool_results = tool_results;
     state.used_approval_grants = used_approval_grants;
     state.prior_approval_count = checkpoint.approval_count;
@@ -1545,6 +1569,9 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         tool_results: Vec::new(),
         verification: AgentVerification::default(),
         error: Some(error.into()),
+        model_turn_limit: 0,
+        context_trace: None,
+        error_category: None,
     }
 }
 
@@ -1559,22 +1586,32 @@ pub struct ContextBundle {
     pub budget: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentContextTrace {
+    pub included_item_ids: Vec<String>,
+    pub excluded_item_ids: Vec<String>,
+    pub budget: Value,
+}
+
+impl From<&ContextBundle> for AgentContextTrace {
+    fn from(context: &ContextBundle) -> Self {
+        Self {
+            included_item_ids: context.included_item_ids.clone(),
+            excluded_item_ids: context.excluded_item_ids.clone(),
+            budget: context.budget.clone(),
+        }
+    }
+}
+
 fn model_turn_request(
     loop_tools: &ToolBroker,
     input: &AgentLoopInput,
-    context: &ContextBundle,
     budget: &ContextBudget,
     turn_index: u32,
     messages: Vec<ModelMessage>,
 ) -> ModelTurnRequest {
     let mut request = ModelTurnRequest {
-        purpose: ModelPurpose::PlanNextAction,
         request_id: format!("model_request_{}_{}", input.turn_id, turn_index),
-        run_id: input.turn_id.clone(),
-        session_id: input.turn_id.clone(),
-        task_id: input.turn_id.clone(),
-        phase_id: "model".to_string(),
-        action_id: format!("model_action_{}_{}", input.turn_id, turn_index),
         messages,
         tools: model_tool_schemas(loop_tools),
         tool_choice: Default::default(),
@@ -1582,25 +1619,6 @@ fn model_turn_request(
             max_output_tokens: Some(budget.reserved_output_tokens),
             ..input.model_preferences.clone()
         },
-        context_metadata: context_metadata(context),
-        policy_metadata: json!({
-            "approval_grants": input
-                .approval_grants
-                .iter()
-                .map(|grant| json!({
-                    "request_id": &grant.request_id,
-                    "tool_name": &grant.tool_name,
-                    "resources": &grant.resources,
-                    "outcome": grant.outcome,
-                }))
-                .collect::<Vec<_>>(),
-        }),
-        trace_metadata: json!({
-            "turn_id": &input.turn_id,
-            "run_id": &input.turn_id,
-            "session_id": &input.turn_id,
-            "task_id": &input.turn_id,
-        }),
     };
     request.tool_choice.max_tool_calls = MAX_TOOL_CALLS_PER_TURN;
     request
@@ -1622,9 +1640,6 @@ fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
                     .get("input_schema")
                     .cloned()
                     .unwrap_or_else(|| json!({})),
-                capability_tags: Vec::new(),
-                risk_tags: Vec::new(),
-                metadata: json!({}),
             })
         })
         .collect()
@@ -1675,21 +1690,10 @@ fn model_messages_from_context(context: &ContextBundle) -> Vec<ModelMessage> {
         .collect()
 }
 
-fn context_metadata(context: &ContextBundle) -> Value {
-    json!({
-        "included_item_ids": &context.included_item_ids,
-        "excluded_item_ids": &context.excluded_item_ids,
-        "budget": &context.budget,
-    })
-}
-
 fn assistant_message_text(message: Option<&ModelMessage>) -> String {
     message
-        .into_iter()
-        .flat_map(|message| &message.content)
-        .filter_map(|block| block.text.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
 }
 
 fn tool_result_message(tool_result: &ToolResult) -> ModelMessage {

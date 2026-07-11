@@ -47,6 +47,8 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 2. 否则从启动目录向父目录查找最近的 `.env`。
 3. 三个必需值必须来自同一层，缺失时关闭失败。
 
+可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。它们也必须与其他 provider 配置来自同一层。
+
 修改配置后，新启动一次 `sg` 命令即可取得新快照。不要把 `.env` 提交到 Git。
 
 ## Windows sandbox 首次运行

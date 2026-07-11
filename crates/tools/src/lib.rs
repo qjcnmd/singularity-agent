@@ -20,7 +20,6 @@ pub use singularity_sandbox::{
     command_permission_resource,
 };
 
-const TOOL_PROTOCOL_VERSION: &str = "1.0";
 const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";
 const UNKNOWN_TOOL_ERROR: &str = "unknown_tool";
 const TOOL_DENIED_ERROR: &str = "tool_denied";
@@ -206,10 +205,6 @@ impl ToolBroker {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolCallRequest {
-    pub protocol_version: String,
-    pub run_id: String,
-    pub session_id: String,
-    pub task_id: String,
     pub tool_call_id: String,
     pub tool_name: String,
     pub raw_arguments: String,
@@ -217,18 +212,11 @@ pub struct ToolCallRequest {
 
 impl ToolCallRequest {
     pub fn new(
-        run_id: impl Into<String>,
-        session_id: impl Into<String>,
-        task_id: impl Into<String>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
         raw_arguments: impl Into<String>,
     ) -> Self {
         Self {
-            protocol_version: TOOL_PROTOCOL_VERSION.to_string(),
-            run_id: run_id.into(),
-            session_id: session_id.into(),
-            task_id: task_id.into(),
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             raw_arguments: raw_arguments.into(),

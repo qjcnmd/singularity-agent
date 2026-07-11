@@ -581,7 +581,11 @@ impl AppServer {
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
             Err(error) => {
-                return Ok(AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed));
+                let category = error.error.category();
+                return Ok(
+                    AgentRunStatus::failed_with_category(error.message, Some(category))
+                        .with_status(AgentStatus::Failed),
+                );
             }
         };
         match self.run_agent_loop_with_provider(
@@ -621,17 +625,17 @@ impl AppServer {
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
             Err(error) => {
+                let category = error.error.category();
                 let turn_id = &request.turn_id;
                 let turn = self.store.get_turn(turn_id)?;
-                let run_status = approval_terminal_status(
-                    &turn,
-                    request,
+                let mut run_status = approval_terminal_status(
                     decision,
                     pending_tool_call.as_ref(),
                     AgentStatus::Failed,
                     "unavailable",
                     error.message,
                 );
+                run_status.error_category = Some(category);
                 return Ok(Some((turn, run_status)));
             }
         };
@@ -672,8 +676,6 @@ impl AppServer {
             Ok(pending) => pending,
             Err(error) => {
                 let run_status = approval_terminal_status(
-                    &turn,
-                    request,
                     decision,
                     Some(&pending_tool_call),
                     AgentStatus::Failed,
@@ -685,8 +687,6 @@ impl AppServer {
         };
         if pending.request_id != request.request_id {
             let run_status = approval_terminal_status(
-                &turn,
-                request,
                 decision,
                 Some(&pending_tool_call),
                 AgentStatus::Failed,
@@ -703,8 +703,6 @@ impl AppServer {
             Ok(workspace_root) => workspace_root,
             Err(error) => {
                 let run_status = approval_terminal_status(
-                    &turn,
-                    request,
                     decision,
                     Some(&pending_tool_call),
                     AgentStatus::Failed,
@@ -742,8 +740,6 @@ impl AppServer {
             Ok(input) => input.with_approval_grant(grant),
             Err(error) => {
                 let run_status = approval_terminal_status(
-                    &turn,
-                    request,
                     decision,
                     Some(&pending_tool_call),
                     AgentStatus::Failed,
@@ -761,11 +757,9 @@ impl AppServer {
             .with_cancellation_token(cancellation.clone())
             .resume_pending_tool_call(&loop_input, &pending, &pending_tool_call);
         self.persist_agent_approval_requests(&result)?;
-        let mut run_status = result.to_run_status(&loop_input);
+        let mut run_status = result.to_run_status();
         if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
             let audit_status = approval_terminal_status(
-                &turn,
-                request,
                 decision,
                 Some(&pending_tool_call),
                 run_status.status.clone(),
@@ -805,7 +799,7 @@ impl AppServer {
             .with_cancellation_token(cancellation.clone())
             .run(&loop_input);
         self.persist_agent_approval_requests(&result)?;
-        Ok(result.to_run_status(&loop_input))
+        Ok(result.to_run_status())
     }
 
     fn persist_agent_approval_requests(&self, result: &AgentLoopResult) -> AppServerResult<()> {
@@ -1080,15 +1074,8 @@ impl AppServer {
             ApprovalOutcome::Deny => (AgentStatus::Failed, "denied", "approval denied"),
             ApprovalOutcome::Defer => (AgentStatus::Blocked, "deferred", "approval deferred"),
         };
-        let run_status = approval_terminal_status(
-            &turn,
-            request,
-            decision,
-            pending_tool_call,
-            status,
-            audit_decision,
-            message,
-        );
+        let run_status =
+            approval_terminal_status(decision, pending_tool_call, status, audit_decision, message);
         Ok(Some((turn, run_status)))
     }
 
@@ -1241,8 +1228,6 @@ fn cancellation_monitor(
 }
 
 fn approval_terminal_status(
-    turn: &Turn,
-    request: &ApprovalRequest,
     decision: &ApprovalDecision,
     pending_tool_call: Option<&Value>,
     status: AgentStatus,
@@ -1250,9 +1235,6 @@ fn approval_terminal_status(
     message: impl Into<String>,
 ) -> AgentRunStatus {
     let mut run_status = AgentRunStatus::failed(message).with_status(status);
-    run_status.run_id = Some(turn.turn_id.clone());
-    run_status.session_id = Some(request.thread_id.clone());
-    run_status.task_id = Some(turn.turn_id.clone());
     run_status.approval_count = 1;
     let mut audit_event = json!({
         "approval_policy": ApprovalPolicy::OnRequest,
@@ -1635,6 +1617,7 @@ fn mark_run_cancelled(status: &mut AgentRunStatus) {
     status.completed = false;
     status.final_answer = None;
     status.error = None;
+    status.error_category = None;
 }
 
 fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
@@ -1648,10 +1631,21 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
     event.payload = json!({
         "component": "agent_loop",
         "status": status.status.as_str(),
-        "run_id": &status.run_id,
-        "session_id": &status.session_id,
-        "task_id": &status.task_id,
         "model_turns": status.model_turns,
+        "model_turn_limit": status.model_turn_limit,
+        "context": status.context_trace.as_ref().map(|context| json!({
+            "included_item_ids": context
+                .included_item_ids
+                .iter()
+                .map(|item_id| redact_app_server_text(item_id))
+                .collect::<Vec<_>>(),
+            "excluded_item_ids": context
+                .excluded_item_ids
+                .iter()
+                .map(|item_id| redact_app_server_text(item_id))
+                .collect::<Vec<_>>(),
+            "budget": &context.budget,
+        })),
         "tool_calls": status.tool_calls,
         "approval_count": status.approval_count,
         "audit_events": &status.audit_events,
@@ -1702,8 +1696,9 @@ mod tests {
 
     use singularity_agent::PendingToolCall;
     use singularity_model::{
-        ModelCapabilities, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-        ModelTurnResponse, Provider, ProviderError,
+        ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind, ModelRole,
+        ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
+        Provider, ProviderError,
     };
     use singularity_protocol::ItemKind;
     use singularity_tools::{CommandRequest, CommandResult};
@@ -1753,6 +1748,60 @@ mod tests {
             response.request_id = request.request_id.clone();
             Ok(response)
         }
+    }
+
+    fn failed_model_response(error: ModelError) -> ModelTurnResponse {
+        let mut response = ModelTurnResponse::completed("request_1", "response_1", "unused");
+        response.status = ModelTurnStatus::Failed;
+        response.assistant_message = None;
+        response.error = Some(error);
+        response
+    }
+
+    #[test]
+    fn app_server_preserves_typed_provider_failure_category() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+        let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "user goal".to_string(),
+            }],
+        };
+        let provider = StaticProvider {
+            responses: vec![failed_model_response(ModelError::new(
+                ModelErrorKind::AuthError,
+                "provider failure remains diagnostic text",
+            ))],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let status = app_server(store)
+            .run_agent_loop_with_provider(
+                provider,
+                &thread,
+                &params,
+                "turn_1",
+                &[],
+                &CancellationToken::new(),
+            )
+            .expect("agent loop");
+
+        assert_eq!(status.status, AgentStatus::Failed);
+        assert_eq!(
+            status.error_category,
+            Some(ModelErrorCategory::Authentication)
+        );
+        assert!(
+            !serde_json::to_string(&status)
+                .expect("serialize status")
+                .contains("error_category")
+        );
     }
 
     #[test]
@@ -1810,30 +1859,18 @@ mod tests {
         assert_eq!(requests[0].messages.len(), 2);
         assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
         assert_eq!(requests[0].messages[1].role, ModelRole::User);
-        let developer = requests[0].messages[0].content[0]
-            .text
-            .as_deref()
-            .expect("developer instructions");
+        let developer = &requests[0].messages[0].content;
         assert!(developer.starts_with("You are a coding agent working in the current workspace."));
         assert!(developer.ends_with(
             "Project instructions:\nroot instructions\n\ncrate instructions\n\nagent instructions"
         ));
-        assert_eq!(
-            requests[0].messages[1].content[0].text.as_deref(),
-            Some("user goal")
-        );
+        assert_eq!(requests[0].messages[1].content, "user goal");
         let hidden_workspace_marker = workspace.to_string_lossy();
         assert!(!requests[0].tools.iter().any(|tool| {
             serde_json::to_string(tool)
                 .expect("serialize tool")
                 .contains(hidden_workspace_marker.as_ref())
         }));
-        assert!(
-            !requests[0]
-                .trace_metadata
-                .to_string()
-                .contains(hidden_workspace_marker.as_ref())
-        );
         assert!(
             !serde_json::to_string(&status)
                 .expect("serialize status")
@@ -1989,22 +2026,15 @@ mod tests {
                 ModelRole::User,
             ]
         );
-        let developer = requests[0].messages[0].content[0]
-            .text
-            .as_deref()
-            .expect("developer instructions");
+        let developer = &requests[0].messages[0].content;
         assert!(developer.starts_with("You are a coding agent working in the current workspace."));
         assert!(developer.ends_with("Project instructions:\nproject instructions"));
         assert_eq!(
             requests[0].messages[1..]
                 .iter()
-                .map(|message| message.content[0].text.as_deref())
+                .map(|message| message.content.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                Some("previous user"),
-                Some("previous assistant"),
-                Some("current user"),
-            ]
+            vec!["previous user", "previous assistant", "current user",]
         );
         let request_json = serde_json::to_string(&requests[0]).expect("request json");
         for forbidden in [
@@ -2158,10 +2188,6 @@ mod tests {
             .expect("status")
             .expect("terminal status");
 
-        assert_eq!(
-            run_status.session_id.as_deref(),
-            Some(thread.thread_id.as_str())
-        );
         assert_eq!(
             run_status.audit_events[0]["sandbox_mode"],
             "workspace_write"
@@ -2519,25 +2545,16 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
         assert_eq!(requests[0].messages[1].role, ModelRole::User);
-        assert_eq!(
-            requests[0].messages[1].content[0].text.as_deref(),
-            Some("previous approval user")
-        );
+        assert_eq!(requests[0].messages[1].content, "previous approval user");
         assert_eq!(requests[0].messages[2].role, ModelRole::Assistant);
         assert_eq!(
-            requests[0].messages[2].content[0].text.as_deref(),
-            Some("previous approval assistant")
+            requests[0].messages[2].content,
+            "previous approval assistant"
         );
         assert_eq!(requests[0].messages[3].role, ModelRole::User);
-        assert_eq!(
-            requests[0].messages[3].content[0].text.as_deref(),
-            Some("edit readme")
-        );
+        assert_eq!(requests[0].messages[3].content, "edit readme");
         assert_eq!(requests[0].messages[4].role, ModelRole::Assistant);
-        assert_eq!(
-            requests[0].messages[4].content[0].text.as_deref(),
-            Some("before approval")
-        );
+        assert_eq!(requests[0].messages[4].content, "before approval");
         assert_eq!(requests[0].messages[4].tool_calls.len(), 1);
         assert_eq!(requests[0].messages[5].role, ModelRole::Tool);
         assert_eq!(

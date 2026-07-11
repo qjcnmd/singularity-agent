@@ -64,70 +64,34 @@ pub enum ModelRole {
     Tool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelPurpose {
-    PlanNextAction,
-    FinalAnswer,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelMessage {
     pub role: ModelRole,
-    pub content: Vec<ContentBlock>,
+    pub content: String,
     pub name: Option<String>,
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ModelToolCall>,
-    pub metadata: Value,
 }
 
 impl ModelMessage {
     pub fn text(role: ModelRole, content: impl Into<String>) -> Self {
         Self {
             role,
-            content: vec![ContentBlock::text(content)],
+            content: content.into(),
             name: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
-            metadata: json!({}),
         }
     }
 
     pub fn assistant_tool_calls(tool_calls: Vec<ModelToolCall>) -> Self {
         Self {
             role: ModelRole::Assistant,
-            content: Vec::new(),
+            content: String::new(),
             name: None,
             tool_call_id: None,
             tool_calls,
-            metadata: json!({}),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ContentBlockType {
-    Text,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct ContentBlock {
-    #[serde(rename = "type")]
-    pub block_type: ContentBlockType,
-    pub text: Option<String>,
-    pub artifact_ref: Option<String>,
-    pub metadata: Value,
-}
-
-impl ContentBlock {
-    pub fn text(content: impl Into<String>) -> Self {
-        Self {
-            block_type: ContentBlockType::Text,
-            text: Some(content.into()),
-            artifact_ref: None,
-            metadata: json!({}),
         }
     }
 }
@@ -175,9 +139,6 @@ pub struct ModelToolSchema {
     pub name: String,
     pub description: String,
     pub parameters_schema: Value,
-    pub capability_tags: Vec<String>,
-    pub risk_tags: Vec<String>,
-    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -299,7 +260,7 @@ impl ProviderConfigSnapshot {
             && let Err(error) = &provider
         {
             readiness.ready = false;
-            readiness.blocker = Some((&error.error.category()).into());
+            readiness.blocker = provider_initialization_blocker(&error.error.category());
         }
         Self {
             snapshot_id: format!("{PROVIDER_SNAPSHOT_ID_PREFIX}{}", Uuid::new_v4().simple()),
@@ -363,6 +324,26 @@ impl ModelBlockerKind {
     }
 }
 
+fn provider_initialization_blocker(category: &ModelErrorCategory) -> Option<ModelBlockerKind> {
+    match category {
+        ModelErrorCategory::Authentication => Some(ModelBlockerKind::AuthenticationProviderError),
+        ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {
+            Some(ModelBlockerKind::BaseUrlNetworkError)
+        }
+        ModelErrorCategory::SandboxPermission => Some(ModelBlockerKind::SandboxPermissionError),
+        ModelErrorCategory::ModelConfiguration
+        | ModelErrorCategory::InvalidRequest
+        | ModelErrorCategory::UnsupportedCapability => Some(ModelBlockerKind::ModelNameConfigError),
+        ModelErrorCategory::Cancelled
+        | ModelErrorCategory::ContextLengthExceeded
+        | ModelErrorCategory::BudgetExceeded
+        | ModelErrorCategory::ToolCallParse
+        | ModelErrorCategory::JsonSchema
+        | ModelErrorCategory::ContentFilter
+        | ModelErrorCategory::UnknownProviderError => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelProviderStatus {
     pub ready: bool,
@@ -406,8 +387,6 @@ pub struct ModelValidationResult {
     pub valid: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
-    pub repaired: bool,
-    pub repair_message: Option<String>,
 }
 
 impl ModelValidationResult {
@@ -416,8 +395,6 @@ impl ModelValidationResult {
             valid: true,
             errors: Vec::new(),
             warnings: Vec::new(),
-            repaired: false,
-            repair_message: None,
         }
     }
 
@@ -426,8 +403,6 @@ impl ModelValidationResult {
             valid: false,
             errors,
             warnings: Vec::new(),
-            repaired: false,
-            repair_message: None,
         }
     }
 }
@@ -476,7 +451,6 @@ pub struct ModelError {
     pub message: String,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
-    pub metadata: Value,
 }
 
 impl ModelError {
@@ -486,7 +460,6 @@ impl ModelError {
             message: message.into(),
             provider_name: None,
             model_name: None,
-            metadata: json!({}),
         }
     }
 
@@ -509,75 +482,24 @@ pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
     model_error_category(error)
 }
 
-impl From<&ModelErrorCategory> for ModelBlockerKind {
-    fn from(category: &ModelErrorCategory) -> Self {
-        match category {
-            ModelErrorCategory::Authentication => Self::AuthenticationProviderError,
-            ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {
-                Self::BaseUrlNetworkError
-            }
-            ModelErrorCategory::SandboxPermission => Self::SandboxPermissionError,
-            ModelErrorCategory::ModelConfiguration
-            | ModelErrorCategory::InvalidRequest
-            | ModelErrorCategory::UnsupportedCapability => Self::ModelNameConfigError,
-            _ => Self::BaseUrlNetworkError,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelTurnRequest {
     pub request_id: String,
-    pub run_id: String,
-    pub session_id: String,
-    pub task_id: String,
-    pub phase_id: String,
-    pub action_id: String,
-    pub purpose: ModelPurpose,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ModelToolSchema>,
     pub tool_choice: ToolChoicePolicy,
     pub model_preferences: ModelPreferences,
-    pub context_metadata: Value,
-    pub policy_metadata: Value,
-    pub trace_metadata: Value,
 }
 
 impl ModelTurnRequest {
-    pub fn new(
-        request_id: impl Into<String>,
-        run_id: impl Into<String>,
-        session_id: impl Into<String>,
-        task_id: impl Into<String>,
-        messages: Vec<ModelMessage>,
-    ) -> Self {
-        let request_id = request_id.into();
+    pub fn new(request_id: impl Into<String>, messages: Vec<ModelMessage>) -> Self {
         Self {
-            action_id: request_id.clone(),
-            request_id,
-            run_id: run_id.into(),
-            session_id: session_id.into(),
-            task_id: task_id.into(),
-            phase_id: "model".to_string(),
-            purpose: ModelPurpose::PlanNextAction,
+            request_id: request_id.into(),
             messages,
             tools: Vec::new(),
             tool_choice: ToolChoicePolicy::default(),
             model_preferences: ModelPreferences::default(),
-            context_metadata: json!({}),
-            policy_metadata: json!({}),
-            trace_metadata: json!({}),
         }
-    }
-
-    pub fn with_phase_action(
-        mut self,
-        phase_id: impl Into<String>,
-        action_id: impl Into<String>,
-    ) -> Self {
-        self.phase_id = phase_id.into();
-        self.action_id = action_id.into();
-        self
     }
 }
 
@@ -1357,17 +1279,8 @@ pub fn validate_model_request_with_capabilities(
     capabilities: Option<&ModelCapabilities>,
 ) -> ModelValidationResult {
     let mut errors = Vec::new();
-    for (field, value) in [
-        ("request_id_required", &request.request_id),
-        ("run_id_required", &request.run_id),
-        ("session_id_required", &request.session_id),
-        ("task_id_required", &request.task_id),
-        ("phase_id_required", &request.phase_id),
-        ("action_id_required", &request.action_id),
-    ] {
-        if value.trim().is_empty() {
-            errors.push(field.to_string());
-        }
+    if request.request_id.trim().is_empty() {
+        errors.push("request_id_required".to_string());
     }
     if request.messages.is_empty() {
         errors.push("messages_required".to_string());
@@ -1586,12 +1499,8 @@ fn validation_result(mut errors: Vec<String>, warnings: Vec<String>) -> ModelVal
     }
 }
 
-fn message_text(message: &ModelMessage) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| block.text.as_deref())
-        .collect()
+fn message_text(message: &ModelMessage) -> &str {
+    &message.content
 }
 
 fn missing(value: &Option<String>) -> bool {

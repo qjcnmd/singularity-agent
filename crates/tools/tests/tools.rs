@@ -97,14 +97,7 @@ fn tool_result_payload_keeps_safe_token_metrics_text() {
 
 #[test]
 fn tool_result_payload_redacts_raw_provider_and_evaluator_markers() {
-    let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_1",
-        "builtin.read",
-        "{}",
-    );
+    let envelope = ToolCallRequest::new("call_1", "builtin.read", "{}");
     let result = ToolOutput::success(serde_json::json!({
         "raw_prompt": "developer-only prompt",
         "raw_response": "provider body",
@@ -178,14 +171,7 @@ fn registry_rejects_duplicate_tools() {
 
     assert!(registry.register(spec).is_err());
 
-    let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_1",
-        "builtin.read",
-        "{}",
-    );
+    let envelope = ToolCallRequest::new("call_1", "builtin.read", "{}");
     let result = ToolOutput::success(serde_json::json!({"ok": true}));
     let tool_result = ToolResult::from_result(&envelope, &result);
     assert_eq!(tool_result.tool_name, "builtin.read");
@@ -252,14 +238,8 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
             serde_json::json!({"type": "object"}),
         ))
         .expect("register tool");
-    let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_1",
-        "builtin.shell",
-        r#"{"cmd": "echo token=secret"}"#,
-    );
+    let envelope =
+        ToolCallRequest::new("call_1", "builtin.shell", r#"{"cmd": "echo token=secret"}"#);
     let denied = broker.execute(
         &envelope,
         ToolBrokerDecision::deny("policy denied"),
@@ -276,14 +256,7 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
             .contains("token=secret")
     );
 
-    let missing = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_2",
-        "mcp.missing.tool",
-        "{}",
-    );
+    let missing = ToolCallRequest::new("call_2", "mcp.missing.tool", "{}");
     let unknown = broker.execute(&missing, ToolBrokerDecision::Allow, |_envelope| {
         panic!("unknown tool must not execute")
     });
@@ -301,14 +274,7 @@ fn broker_executes_allowed_tool_and_tool_result_payload_stays_safe() {
             serde_json::json!({"type": "object"}),
         ))
         .expect("register tool");
-    let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_1",
-        "builtin.formatter",
-        r#"{"path": ".env"}"#,
-    );
+    let envelope = ToolCallRequest::new("call_1", "builtin.formatter", r#"{"path": ".env"}"#);
 
     let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
         ToolOutput::success(serde_json::json!({"summary": "formatted"}))
@@ -332,14 +298,7 @@ fn broker_tool_result_omits_preview_for_truncated_artifact_result() {
             serde_json::json!({"type": "object"}),
         ))
         .expect("register tool");
-    let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_1",
-        "builtin.read",
-        r#"{"path": "README.md"}"#,
-    );
+    let envelope = ToolCallRequest::new("call_1", "builtin.read", r#"{"path": "README.md"}"#);
 
     let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
         let mut output = ToolOutput::success(serde_json::json!({
@@ -362,14 +321,7 @@ fn broker_tool_result_omits_preview_for_truncated_artifact_result() {
 
 #[test]
 fn source_truncation_with_only_internal_result_id_keeps_bounded_preview() {
-    let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_1",
-        "builtin.list",
-        r#"{"path":"."}"#,
-    );
+    let envelope = ToolCallRequest::new("call_1", "builtin.list", r#"{"path":"."}"#);
     let mut result = ToolOutput::success(serde_json::json!({
         "stdout_preview": "bounded command output",
         "output_truncated": true,
@@ -393,9 +345,6 @@ fn source_truncation_with_only_internal_result_id_keeps_bounded_preview() {
 #[test]
 fn truncated_tool_result_payload_is_a_reference_only_safe_snapshot() {
     let envelope = ToolCallRequest::new(
-        "run_internal_1",
-        "session_internal_1",
-        "task_internal_1",
         "call_1",
         "builtin.search",
         r#"{"query": "token=abc123", "limit": 1000}"#,
@@ -408,9 +357,9 @@ fn truncated_tool_result_payload_is_a_reference_only_safe_snapshot() {
     result.truncated = true;
     result.metadata = serde_json::json!({
         "raw_arguments": envelope.raw_arguments,
-        "run_id": envelope.run_id,
-        "session_id": envelope.session_id,
-        "task_id": envelope.task_id,
+        "run_id": "run_internal_1",
+        "session_id": "session_internal_1",
+        "task_id": "task_internal_1",
     });
 
     let tool_result = ToolResult::from_result(&envelope, &result);
@@ -445,14 +394,7 @@ fn truncated_tool_result_payload_is_a_reference_only_safe_snapshot() {
 
 #[test]
 fn tool_result_carries_artifact_and_result_refs_from_tool_output() {
-    let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_1",
-        "builtin.patch",
-        r#"{"changes":[]}"#,
-    );
+    let envelope = ToolCallRequest::new("call_1", "builtin.patch", r#"{"changes":[]}"#);
     let mut result = ToolOutput::success(serde_json::json!({
         "changed_files": ["README.md"],
         "diff_ref": "artifact://diff/readme",
@@ -480,14 +422,7 @@ fn tool_result_carries_artifact_and_result_refs_from_tool_output() {
 
 #[test]
 fn tool_result_payload_redacts_sensitive_artifact_refs() {
-    let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
-        "call_1",
-        "builtin.patch",
-        "{}",
-    );
+    let envelope = ToolCallRequest::new("call_1", "builtin.patch", "{}");
     let result = ToolOutput::success(serde_json::json!({
         "artifact_ref": "artifact://result/.env",
         "artifact_refs": ["artifact://result/readme", "artifact://result/.ssh/id_rsa"],
@@ -982,9 +917,6 @@ fn broker_ask_decision_blocks_execution_with_safe_approval_tool_result() {
         ))
         .expect("register tool");
     let envelope = ToolCallRequest::new(
-        "run_1",
-        "session_1",
-        "task_1",
         "call_1",
         "builtin.patch",
         r#"{"path": ".env", "replacement": "secret"}"#,

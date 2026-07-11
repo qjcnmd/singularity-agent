@@ -46,6 +46,8 @@ SINGULARITY_MODEL=your-model-name
 
 只要进程环境中出现任一 provider 变量，Singularity 就只使用该环境层；否则从当前目录向父目录查找最近的 `.env`。`SINGULARITY_MODEL_PROVIDER` 可选，默认值为 `openai_compatible`。密钥不会通过 CLI 参数接收，doctor 只显示脱敏的 present/missing 状态。
 
+可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。两个覆盖值必须与其他 provider 配置来自同一配置层。
+
 检查配置：
 
 ```powershell

@@ -901,15 +901,22 @@ fn run_agent_stage(
             WorkspaceTools::new(agent_dir).with_shared_sandbox_backend(sandbox_backend),
         )
         .run(&input);
-    let run_status = result.to_run_status(&input);
+    let run_status = result.to_run_status();
     let trace_path = task_dir.join(AGENT_TRACE_FILE);
     let trace = json!({
         "status": run_status.status,
         "completed": run_status.completed,
-        "run_id": run_status.run_id,
-        "session_id": run_status.session_id,
-        "task_id": run_status.task_id,
+        "run_id": run_id.as_str(),
+        "thread_id": &input.thread_id,
+        "turn_id": &input.turn_id,
+        "task_id": projection.task_id.as_str(),
         "model_turns": run_status.model_turns,
+        "model_turn_limit": run_status.model_turn_limit,
+        "context": run_status.context_trace.as_ref().map(|context| json!({
+            "included_item_ids": context.included_item_ids.iter().map(safe_text).collect::<Vec<_>>(),
+            "excluded_item_ids": context.excluded_item_ids.iter().map(safe_text).collect::<Vec<_>>(),
+            "budget": &context.budget,
+        })),
         "tool_calls": run_status.tool_calls,
         "approval_count": run_status.approval_count,
         "audit_events": run_status.audit_events,
@@ -967,10 +974,20 @@ fn run_agent_stage(
     let sandbox_blocker = agent_sandbox_blocker(&run_status.audit_events);
     let stage = if let Some(blocker) = sandbox_blocker {
         StageExecution::blocked(blocker, command_diagnostics)
+    } else if let Some(kind) = agent_blocker_kind(result.error_category.as_ref()) {
+        StageExecution::blocked(
+            evaluation_blocker(
+                kind,
+                error
+                    .clone()
+                    .unwrap_or_else(|| "provider request failed".to_string()),
+            ),
+            command_diagnostics,
+        )
     } else if result.status == AgentStatus::Blocked {
         StageExecution::blocked(
             evaluation_blocker(
-                agent_blocker_kind(result.error.as_deref()),
+                BlockerKind::AgentRuntime,
                 error
                     .clone()
                     .unwrap_or_else(|| "agent loop blocked".to_string()),
@@ -1288,19 +1305,28 @@ fn provider_blocker(error: &ProviderError) -> EvaluationBlocker {
     evaluation_blocker(kind, error.message.clone())
 }
 
-fn agent_blocker_kind(error: Option<&str>) -> BlockerKind {
-    let error = error.unwrap_or_default().to_ascii_lowercase();
-    if error.contains("auth") || error.contains("api key") {
-        BlockerKind::ProviderAuthentication
-    } else if error.contains("network") || error.contains("base_url") || error.contains("base url")
-    {
-        BlockerKind::Network
-    } else if error.contains("sandbox") || error.contains("permission") {
-        BlockerKind::Sandbox
-    } else if error.contains("provider") || error.contains("model") || error.contains("config") {
-        BlockerKind::ProviderConfiguration
-    } else {
-        BlockerKind::AgentRuntime
+fn agent_blocker_kind(category: Option<&ModelErrorCategory>) -> Option<BlockerKind> {
+    match category {
+        Some(ModelErrorCategory::Authentication) => Some(BlockerKind::ProviderAuthentication),
+        Some(ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable) => {
+            Some(BlockerKind::Network)
+        }
+        Some(ModelErrorCategory::SandboxPermission) => Some(BlockerKind::Sandbox),
+        Some(
+            ModelErrorCategory::ModelConfiguration
+            | ModelErrorCategory::InvalidRequest
+            | ModelErrorCategory::UnsupportedCapability,
+        ) => Some(BlockerKind::ProviderConfiguration),
+        Some(
+            ModelErrorCategory::Cancelled
+            | ModelErrorCategory::ContextLengthExceeded
+            | ModelErrorCategory::BudgetExceeded
+            | ModelErrorCategory::ToolCallParse
+            | ModelErrorCategory::JsonSchema
+            | ModelErrorCategory::ContentFilter,
+        )
+        | None => None,
+        Some(ModelErrorCategory::UnknownProviderError) => None,
     }
 }
 
@@ -1500,6 +1526,9 @@ mod tests {
             approval_checkpoints: Vec::new(),
             verification: singularity_agent::AgentVerification::default(),
             error: None,
+            model_turn_limit: 0,
+            context_trace: None,
+            error_category: None,
         }
     }
 
@@ -1522,6 +1551,37 @@ mod tests {
         assert!(prompt.contains("\"network_access\":\"denied\""));
         assert!(!prompt.contains("evaluator"));
         assert!(!prompt.contains("test_patch"));
+    }
+
+    #[test]
+    fn agent_blocker_kind_maps_typed_provider_categories() {
+        for (category, expected) in [
+            (
+                ModelErrorCategory::Authentication,
+                BlockerKind::ProviderAuthentication,
+            ),
+            (ModelErrorCategory::Network, BlockerKind::Network),
+            (
+                ModelErrorCategory::ProviderUnavailable,
+                BlockerKind::Network,
+            ),
+            (
+                ModelErrorCategory::ModelConfiguration,
+                BlockerKind::ProviderConfiguration,
+            ),
+            (ModelErrorCategory::SandboxPermission, BlockerKind::Sandbox),
+        ] {
+            assert_eq!(agent_blocker_kind(Some(&category)), Some(expected));
+        }
+        assert_eq!(agent_blocker_kind(None), None);
+        assert_eq!(
+            agent_blocker_kind(Some(&ModelErrorCategory::UnknownProviderError)),
+            None
+        );
+        assert_eq!(
+            agent_blocker_kind(Some(&ModelErrorCategory::JsonSchema)),
+            None
+        );
     }
 
     #[test]
