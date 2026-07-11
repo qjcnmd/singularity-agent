@@ -22,6 +22,7 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::ptr;
 use std::sync::mpsc;
@@ -317,10 +318,20 @@ pub(crate) fn spawn_runner_transport(
     spawn_request: SpawnRequest,
 ) -> Result<RunnerTransport> {
     let (pipe_in_name, pipe_out_name) = pipe_pair();
-    let h_pipe_in =
-        create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
-    let h_pipe_out =
-        create_named_pipe(&pipe_out_name, PIPE_ACCESS_INBOUND, &sandbox_creds.username)?;
+    let h_pipe_in = unsafe {
+        OwnedHandle::from_raw_handle(create_named_pipe(
+            &pipe_in_name,
+            PIPE_ACCESS_OUTBOUND,
+            &sandbox_creds.username,
+        )? as _)
+    };
+    let h_pipe_out = unsafe {
+        OwnedHandle::from_raw_handle(create_named_pipe(
+            &pipe_out_name,
+            PIPE_ACCESS_INBOUND,
+            &sandbox_creds.username,
+        )? as _)
+    };
 
     let runner_exe = find_runner_exe(sandbox_home, log_dir);
     let runner_cmdline = runner_exe
@@ -369,17 +380,21 @@ pub(crate) fn spawn_runner_transport(
     }
     if spawn_res == 0 {
         let err = unsafe { GetLastError() };
-        unsafe {
-            CloseHandle(h_pipe_in);
-            CloseHandle(h_pipe_out);
-        }
         return Err(RunnerLogonError { code: err }.into());
     }
     let expected_runner_pid = pi.dwProcessId;
 
     let connect_result = (|| -> Result<()> {
-        connect_pipe_with_timeout(h_pipe_in, expected_runner_pid, "pipe-in")?;
-        connect_pipe_with_timeout(h_pipe_out, expected_runner_pid, "pipe-out")?;
+        connect_pipe_with_timeout(
+            h_pipe_in.as_raw_handle() as HANDLE,
+            expected_runner_pid,
+            "pipe-in",
+        )?;
+        connect_pipe_with_timeout(
+            h_pipe_out.as_raw_handle() as HANDLE,
+            expected_runner_pid,
+            "pipe-out",
+        )?;
         Ok(())
     })();
 
@@ -398,8 +413,6 @@ pub(crate) fn spawn_runner_transport(
                 let _ = TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hProcess);
             }
-            CloseHandle(h_pipe_in);
-            CloseHandle(h_pipe_out);
         }
         return Err(err);
     }
@@ -407,8 +420,8 @@ pub(crate) fn spawn_runner_transport(
     let mut transport = RunnerTransport {
         // Once the pipe connect phase succeeds we can transfer the raw HANDLEs into `File`s.
         // From here on, the `RunnerTransport` owns closing the pipes on every success/error path.
-        pipe_write: unsafe { File::from_raw_handle(h_pipe_in as _) },
-        pipe_read: unsafe { File::from_raw_handle(h_pipe_out as _) },
+        pipe_write: File::from(h_pipe_in),
+        pipe_read: File::from(h_pipe_out),
     };
     let startup_result = (|| -> Result<()> {
         // Keep the runner process HANDLE alive until the *entire* startup handshake finishes.
