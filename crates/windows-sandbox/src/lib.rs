@@ -287,6 +287,8 @@ pub use logging::log_writer;
 #[cfg(target_os = "windows")]
 pub use path_normalization::canonicalize_path;
 #[cfg(target_os = "windows")]
+pub use process::JobObject;
+#[cfg(target_os = "windows")]
 pub use process::PipeSpawnHandles;
 #[cfg(target_os = "windows")]
 pub use process::StderrMode;
@@ -500,21 +502,43 @@ mod windows_impl {
             return Err(io::Error::from_raw_os_error(GetLastError() as i32));
         }
         if CreatePipe(&mut out_r, &mut out_w, ptr::null_mut(), 0) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            let error = GetLastError() as i32;
+            CloseHandle(in_r);
+            CloseHandle(in_w);
+            return Err(io::Error::from_raw_os_error(error));
         }
         if CreatePipe(&mut err_r, &mut err_w, ptr::null_mut(), 0) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            let error = GetLastError() as i32;
+            CloseHandle(in_r);
+            CloseHandle(in_w);
+            CloseHandle(out_r);
+            CloseHandle(out_w);
+            return Err(io::Error::from_raw_os_error(error));
         }
         if SetHandleInformation(in_r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            let error = GetLastError() as i32;
+            close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
+            return Err(io::Error::from_raw_os_error(error));
         }
         if SetHandleInformation(out_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            let error = GetLastError() as i32;
+            close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
+            return Err(io::Error::from_raw_os_error(error));
         }
         if SetHandleInformation(err_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            let error = GetLastError() as i32;
+            close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
+            return Err(io::Error::from_raw_os_error(error));
         }
         Ok(((in_r, in_w), (out_r, out_w), (err_r, err_w)))
+    }
+
+    unsafe fn close_pipe_handles(handles: [HANDLE; 6]) {
+        for handle in handles {
+            if handle != 0 {
+                CloseHandle(handle);
+            }
+        }
     }
 
     pub struct CaptureResult {
@@ -663,6 +687,7 @@ mod windows_impl {
             }
         };
         let pi = created.process_info;
+        let job = created.job.clone();
         let _desktop = created;
 
         unsafe {
@@ -680,14 +705,13 @@ mod windows_impl {
         let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
         let cancelled = matches!(wait_outcome, WaitOutcome::Cancelled);
         let mut exit_code_u32: u32 = 1;
+        let mut termination_error = None;
         if !timed_out && !cancelled {
             unsafe {
                 GetExitCodeProcess(pi.hProcess, &mut exit_code_u32);
             }
         } else {
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
-            }
+            termination_error = job.terminate_and_wait(pi.hProcess, 1).err();
         }
 
         unsafe {
@@ -705,6 +729,9 @@ mod windows_impl {
         let stderr_capture = stderr_reader.join().unwrap_or_else(|_| {
             crate::BoundedCapture::new(crate::DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM)
         });
+        if let Some(error) = termination_error {
+            return Err(error.context("terminate restricted-token sandbox process tree"));
+        }
         let (stdout, stdout_truncated) = stdout_capture.into_parts();
         let (stderr, stderr_truncated) = stderr_capture.into_parts();
         let exit_code = if timed_out {

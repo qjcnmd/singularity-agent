@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr;
+use std::sync::Arc;
+use std::sync::Mutex;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -22,18 +24,217 @@ use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
+use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
+use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+use windows_sys::Win32::System::Threading::ResumeThread;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
+use windows_sys::Win32::System::Threading::TerminateProcess;
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+const TERMINATION_WAIT_MS: u32 = 10_000;
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
+const WAIT_FAILED: u32 = u32::MAX;
+
+#[derive(Clone)]
+pub struct JobObject {
+    inner: Arc<JobObjectInner>,
+}
+
+struct JobObjectInner {
+    handle: Mutex<Option<HANDLE>>,
+}
+
+impl JobObject {
+    pub fn create_kill_on_close() -> Result<Self> {
+        let handle = unsafe { CreateJobObjectW(ptr::null_mut(), ptr::null()) };
+        if handle == 0 {
+            return Err(last_error("CreateJobObjectW failed"));
+        }
+
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &mut limits as *mut _ as *mut c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            let error = last_error("SetInformationJobObject failed");
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(error);
+        }
+
+        Ok(Self {
+            inner: Arc::new(JobObjectInner {
+                handle: Mutex::new(Some(handle)),
+            }),
+        })
+    }
+
+    pub fn assign_process(&self, process: HANDLE) -> Result<()> {
+        let guard = self
+            .inner
+            .handle
+            .lock()
+            .map_err(|_| anyhow!("Job Object handle lock poisoned"))?;
+        let handle = guard
+            .as_ref()
+            .copied()
+            .ok_or_else(|| anyhow!("Job Object is already closed"))?;
+        if unsafe { AssignProcessToJobObject(handle, process) } == 0 {
+            return Err(last_error("AssignProcessToJobObject failed"));
+        }
+        Ok(())
+    }
+
+    /// Terminates every process in the Job Object. If direct termination fails, close the
+    /// kill-on-close handle before returning the error so the containment boundary stays closed.
+    pub fn terminate(&self, exit_code: u32) -> Result<()> {
+        let mut guard = self
+            .inner
+            .handle
+            .lock()
+            .map_err(|_| anyhow!("Job Object handle lock poisoned"))?;
+        let handle = guard
+            .as_ref()
+            .copied()
+            .ok_or_else(|| anyhow!("Job Object is already closed"))?;
+        if unsafe { TerminateJobObject(handle, exit_code) } != 0 {
+            return Ok(());
+        }
+
+        let error = last_error("TerminateJobObject failed");
+        if let Some(handle) = guard.take() {
+            if unsafe { CloseHandle(handle) } == 0 {
+                let close_error = last_error("CloseHandle failed for kill-on-close Job Object");
+                *guard = Some(handle);
+                return Err(anyhow!("{error:#}; {close_error:#}"));
+            }
+        }
+        Err(error)
+    }
+
+    pub fn terminate_and_wait(&self, process: HANDLE, exit_code: u32) -> Result<()> {
+        let termination_error = self.terminate(exit_code).err();
+        let wait_error = wait_for_process_termination(process).err();
+        match (termination_error, wait_error) {
+            (None, None) => Ok(()),
+            (Some(error), None) | (None, Some(error)) => Err(error),
+            (Some(termination_error), Some(wait_error)) => Err(anyhow!(
+                "{termination_error:#}; process termination wait also failed: {wait_error:#}"
+            )),
+        }
+    }
+}
+
+impl Drop for JobObjectInner {
+    fn drop(&mut self) {
+        let handle = self
+            .handle
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handle) = handle.take() {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+
+fn last_error(context: &'static str) -> anyhow::Error {
+    let error = unsafe { GetLastError() } as i32;
+    anyhow::Error::new(std::io::Error::from_raw_os_error(error)).context(context)
+}
+
+unsafe fn close_process_info(process_info: &PROCESS_INFORMATION) {
+    if process_info.hThread != 0 {
+        CloseHandle(process_info.hThread);
+    }
+    if process_info.hProcess != 0 {
+        CloseHandle(process_info.hProcess);
+    }
+}
+
+unsafe fn terminate_unassigned_process(process_info: &PROCESS_INFORMATION) -> Result<()> {
+    let terminated = TerminateProcess(process_info.hProcess, 1);
+    let result = if terminated == 0 {
+        Err(last_error("TerminateProcess failed for suspended child"))
+    } else {
+        wait_for_process_termination(process_info.hProcess)
+    };
+    close_process_info(process_info);
+    result
+}
+
+unsafe fn terminate_assigned_process(
+    process_info: &PROCESS_INFORMATION,
+    job: &JobObject,
+) -> Result<()> {
+    let result = job.terminate_and_wait(process_info.hProcess, 1);
+    close_process_info(process_info);
+    result
+}
+
+fn wait_for_process_termination(process: HANDLE) -> Result<()> {
+    match unsafe { WaitForSingleObject(process, TERMINATION_WAIT_MS) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => Err(anyhow!(
+            "process did not terminate within {TERMINATION_WAIT_MS} ms"
+        )),
+        WAIT_FAILED => Err(last_error(
+            "WaitForSingleObject failed while terminating process",
+        )),
+        status => Err(anyhow!(
+            "WaitForSingleObject returned unexpected status {status} while terminating process"
+        )),
+    }
+}
+
+unsafe fn assign_job_and_resume(process_info: &PROCESS_INFORMATION, job: &JobObject) -> Result<()> {
+    if let Err(assign_error) = job.assign_process(process_info.hProcess) {
+        return match terminate_unassigned_process(process_info) {
+            Ok(()) => Err(assign_error),
+            Err(cleanup_error) => Err(anyhow!(
+                "{assign_error:#}; suspended child cleanup also failed: {cleanup_error:#}"
+            )),
+        };
+    }
+
+    if ResumeThread(process_info.hThread) == u32::MAX {
+        let resume_error = last_error("ResumeThread failed");
+        return match terminate_assigned_process(process_info, job) {
+            Ok(()) => Err(resume_error),
+            Err(cleanup_error) => Err(anyhow!(
+                "{resume_error:#}; assigned child cleanup also failed: {cleanup_error:#}"
+            )),
+        };
+    }
+    Ok(())
+}
 
 pub struct CreatedProcess {
     pub process_info: PROCESS_INFORMATION,
     pub startup_info: STARTUPINFOW,
+    pub job: JobObject,
     _desktop: LaunchDesktop,
 }
 
@@ -89,6 +290,7 @@ pub unsafe fn create_process_as_user(
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
     let env_block = make_env_block(env_map);
     let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
+    let job = JobObject::create_kill_on_close()?;
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
     let cwd_wide = to_wide(cwd);
     let env_block_len = env_block.len();
@@ -120,7 +322,8 @@ pub unsafe fn create_process_as_user(
             attrs.set_handle_list(inherited_handles)?;
             si.lpAttributeList = attrs.as_mut_ptr();
 
-            let creation_flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+            let creation_flags =
+                CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
             let ok = CreateProcessAsUserW(
                 h_token,
                 std::ptr::null(),
@@ -149,9 +352,11 @@ pub unsafe fn create_process_as_user(
                 logging::debug_log(&msg, logs_base_dir);
                 return Err(std::io::Error::from_raw_os_error(err)).context(msg);
             }
+            assign_job_and_resume(&pi, &job)?;
             Ok(CreatedProcess {
                 process_info: pi,
                 startup_info: si.StartupInfo,
+                job,
                 _desktop: desktop,
             })
         }
@@ -161,7 +366,7 @@ pub unsafe fn create_process_as_user(
             si.lpDesktop = desktop.startup_info_desktop();
             ensure_inheritable_stdio(&mut si)?;
 
-            let creation_flags = CREATE_UNICODE_ENVIRONMENT;
+            let creation_flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
             let ok = CreateProcessAsUserW(
                 h_token,
                 std::ptr::null(),
@@ -190,9 +395,11 @@ pub unsafe fn create_process_as_user(
                 logging::debug_log(&msg, logs_base_dir);
                 return Err(std::io::Error::from_raw_os_error(err)).context(msg);
             }
+            assign_job_and_resume(&pi, &job)?;
             Ok(CreatedProcess {
                 process_info: pi,
                 startup_info: si,
+                job,
                 _desktop: desktop,
             })
         }
@@ -217,6 +424,7 @@ pub enum StderrMode {
 #[allow(dead_code)]
 pub struct PipeSpawnHandles {
     pub process: PROCESS_INFORMATION,
+    pub job: JobObject,
     pub stdin_write: Option<HANDLE>,
     pub stdout_read: HANDLE,
     pub stderr_read: Option<HANDLE>,
@@ -296,6 +504,7 @@ pub fn spawn_process_with_pipes(
     };
     let CreatedProcess {
         process_info: pi,
+        job,
         _desktop: desktop,
         ..
     } = created;
@@ -313,6 +522,7 @@ pub fn spawn_process_with_pipes(
 
     Ok(PipeSpawnHandles {
         process: pi,
+        job,
         stdin_write: match stdin_mode {
             StdinMode::Open => Some(in_w),
             StdinMode::Closed => None,
@@ -353,4 +563,81 @@ where
             CloseHandle(handle);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobObject;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Command;
+    use std::time::Duration;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    const WAIT_OBJECT_0: u32 = 0;
+
+    #[test]
+    fn terminating_job_terminates_descendant_processes() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let start_marker = temp.path().join("start");
+        let descendant_pid_file = temp.path().join("descendant.pid");
+        let start_marker_literal = start_marker.display().to_string().replace('\'', "''");
+        let descendant_pid_literal = descendant_pid_file
+            .display()
+            .to_string()
+            .replace('\'', "''");
+        let script = format!(
+            "$deadline=[DateTime]::UtcNow.AddSeconds(10); \
+             while(-not (Test-Path -LiteralPath '{start_marker_literal}')) {{ \
+                 if([DateTime]::UtcNow -gt $deadline) {{ exit 2 }}; \
+                 Start-Sleep -Milliseconds 10 \
+             }}; \
+             $child=Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') \
+                 -ArgumentList @('-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 60') \
+                 -PassThru; \
+             Set-Content -LiteralPath '{descendant_pid_literal}' -Value $child.Id; \
+             Wait-Process -Id $child.Id"
+        );
+
+        let job = JobObject::create_kill_on_close().expect("create kill-on-close Job Object");
+        let mut root = Command::new("pwsh.exe")
+            .args(["-NoLogo", "-NoProfile", "-Command", &script])
+            .spawn()
+            .expect("spawn synchronized root process");
+        job.assign_process(root.as_raw_handle() as HANDLE)
+            .expect("assign root process before allowing descendant spawn");
+        std::fs::write(&start_marker, b"go").expect("release root process");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let descendant_pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&descendant_pid_file)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "root process did not report descendant PID"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let descendant = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, descendant_pid) };
+        assert_ne!(descendant, 0, "open descendant process for synchronization");
+
+        job.terminate_and_wait(root.as_raw_handle() as HANDLE, 1)
+            .expect("terminate complete process tree");
+        root.wait().expect("reap root process");
+        let descendant_wait = unsafe { WaitForSingleObject(descendant, 5_000) };
+        unsafe {
+            CloseHandle(descendant);
+        }
+        assert_eq!(
+            descendant_wait, WAIT_OBJECT_0,
+            "descendant must exit when its Job Object is terminated"
+        );
+    }
 }

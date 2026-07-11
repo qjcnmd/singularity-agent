@@ -16,6 +16,7 @@ use singularity_windows_sandbox::ErrorStage;
 use singularity_windows_sandbox::ExitPayload;
 use singularity_windows_sandbox::FramedMessage;
 use singularity_windows_sandbox::IPC_PROTOCOL_VERSION;
+use singularity_windows_sandbox::JobObject;
 use singularity_windows_sandbox::LocalSid;
 use singularity_windows_sandbox::Message;
 use singularity_windows_sandbox::OutputPayload;
@@ -57,19 +58,12 @@ use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
-use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
-use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
-use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
-use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::GetProcessId;
 use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::MUTEX_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::OpenMutexW;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
-use windows_sys::Win32::System::Threading::TerminateProcess;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
@@ -79,6 +73,7 @@ struct IpcSpawnedProcess {
     pi: PROCESS_INFORMATION,
     stdout_handle: HANDLE,
     stderr_handle: HANDLE,
+    job: JobObject,
     _pipe_handles: Option<PipeSpawnHandles>,
 }
 
@@ -115,25 +110,6 @@ impl Drop for OwnedWinHandle {
             }
         }
     }
-}
-
-unsafe fn create_job_kill_on_close() -> Result<HANDLE> {
-    let h_job = OwnedWinHandle::new(CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()));
-    if h_job.raw() == 0 {
-        return Err(anyhow::anyhow!("CreateJobObjectW failed"));
-    }
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let ok = SetInformationJobObject(
-        h_job.raw(),
-        JobObjectExtendedLimitInformation,
-        &mut limits as *mut _ as *mut _,
-        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-    );
-    if ok == 0 {
-        return Err(anyhow::anyhow!("SetInformationJobObject failed"));
-    }
-    Ok(h_job.into_raw())
 }
 
 /// Open a named pipe created by the parent process.
@@ -298,6 +274,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         Some(log_dir.as_path()),
     )?;
     let pi = spawned_pipes.process;
+    let job = spawned_pipes.job.clone();
     let stdout_handle = spawned_pipes.stdout_read;
     let stderr_handle = spawned_pipes
         .stderr_read
@@ -307,6 +284,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         pi,
         stdout_handle,
         stderr_handle,
+        job,
         _pipe_handles: Some(spawned_pipes),
     })
 }
@@ -342,8 +320,10 @@ fn spawn_output_reader(
 /// Read capture-control frames and terminate the child when requested.
 fn spawn_control_loop(
     mut reader: File,
-    process_handle: Arc<StdMutex<Option<HANDLE>>>,
+    job: JobObject,
+    process: HANDLE,
     cancel_requested: Arc<AtomicBool>,
+    termination_error: Arc<StdMutex<Option<String>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
@@ -353,13 +333,12 @@ fn spawn_control_loop(
             };
             if matches!(message.message, Message::Terminate { .. }) {
                 cancel_requested.store(true, Ordering::SeqCst);
-                if let Ok(guard) = process_handle.lock()
-                    && let Some(handle) = guard.as_ref()
+                if let Err(error) = job.terminate_and_wait(process, 1)
+                    && let Ok(mut guard) = termination_error.lock()
                 {
-                    unsafe {
-                        let _ = TerminateProcess(*handle, 1);
-                    }
+                    *guard = Some(error.to_string());
                 }
+                break;
             }
         }
     })
@@ -423,15 +402,7 @@ pub fn main() -> Result<()> {
     let pi = ipc_spawn.pi;
     let stdout_handle = ipc_spawn.stdout_handle;
     let stderr_handle = ipc_spawn.stderr_handle;
-
-    let h_job = unsafe { create_job_kill_on_close().ok() };
-    if let Some(job) = h_job {
-        unsafe {
-            let _ = AssignProcessToJobObject(job, pi.hProcess);
-        }
-    }
-
-    let process_handle = Arc::new(StdMutex::new(Some(pi.hProcess)));
+    let job = ipc_spawn.job.clone();
 
     let msg = FramedMessage {
         version: IPC_PROTOCOL_VERSION,
@@ -473,25 +444,34 @@ pub fn main() -> Result<()> {
     };
 
     let cancel_requested = Arc::new(AtomicBool::new(false));
-    let _control_thread = spawn_control_loop(
+    let termination_error = Arc::new(StdMutex::new(None));
+    let control_thread = spawn_control_loop(
         pipe_read,
-        Arc::clone(&process_handle),
+        job.clone(),
+        pi.hProcess,
         Arc::clone(&cancel_requested),
+        Arc::clone(&termination_error),
     );
 
     let timeout = req.timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
     let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
     let timed_out = wait_res == WAIT_TIMEOUT;
+    if timed_out {
+        if let Err(error) = job.terminate_and_wait(pi.hProcess, 1)
+            && let Ok(mut guard) = termination_error.lock()
+        {
+            *guard = Some(error.to_string());
+        }
+    }
     let cancelled = !timed_out && cancel_requested.load(Ordering::SeqCst);
+    if cancelled {
+        let _ = control_thread.join();
+    }
 
     let exit_code: i32;
-    if let Ok(mut guard) = process_handle.lock() {
-        *guard = None;
-    }
 
     unsafe {
         if timed_out {
-            let _ = TerminateProcess(pi.hProcess, 1);
             exit_code = 128 + 64;
         } else {
             let mut raw_exit: u32 = 1;
@@ -504,14 +484,25 @@ pub fn main() -> Result<()> {
         if pi.hProcess != 0 {
             CloseHandle(pi.hProcess);
         }
-        if let Some(job) = h_job {
-            CloseHandle(job);
-        }
     }
 
     let _ = out_thread.join();
     if let Some(thread) = err_thread {
         let _ = thread.join();
+    }
+
+    let termination_error = termination_error
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(message) = termination_error {
+        let _ = send_error(
+            &pipe_write,
+            ErrorStage::SpawnChild,
+            /*windows_error_code*/ None,
+            message.clone(),
+        );
+        anyhow::bail!(message);
     }
 
     let exit_msg = FramedMessage {

@@ -47,6 +47,58 @@ fn product_identity_literals_are_centralized() {
     assert!(violations.is_empty(), "{}", violations.join("\n"));
 }
 
+#[test]
+fn restricted_children_are_job_bound_before_they_can_run() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let process_source = fs::read_to_string(source_root.join("process.rs")).expect("read process");
+    let runner_source = fs::read_to_string(
+        source_root
+            .join("bin")
+            .join("command_runner")
+            .join("win.rs"),
+    )
+    .expect("read command runner");
+    let library_source = fs::read_to_string(source_root.join("lib.rs")).expect("read library");
+
+    assert!(
+        process_source.contains(
+            "CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED"
+        ),
+        "explicit-stdio launches must create the child suspended"
+    );
+    assert!(
+        process_source.contains("CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED"),
+        "inherited-stdio launches must create the child suspended"
+    );
+    let assign = process_source
+        .find("job.assign_process(process_info.hProcess)")
+        .expect("job assignment must be mandatory");
+    let resume = process_source
+        .find("ResumeThread(process_info.hThread)")
+        .expect("the primary thread must be resumed explicitly");
+    assert!(
+        assign < resume,
+        "job assignment must happen before ResumeThread"
+    );
+    assert!(
+        !runner_source.contains("create_job_kill_on_close().ok()"),
+        "the elevated runner must not ignore Job Object creation failures"
+    );
+    assert!(
+        !runner_source.contains("TerminateProcess("),
+        "runner cancellation and timeout must terminate the whole Job Object"
+    );
+    assert!(
+        runner_source.contains("job.terminate_and_wait(process, 1)")
+            && runner_source.contains("job.terminate_and_wait(pi.hProcess, 1)"),
+        "runner cancellation and timeout must both terminate and await the Job Object"
+    );
+    assert!(
+        library_source.contains("job.terminate_and_wait(pi.hProcess, 1)"),
+        "restricted-token fallback cancellation and timeout must terminate the Job Object"
+    );
+}
+
 fn collect_literal_violations(
     root: &Path,
     forbidden_literals: &[&str],
