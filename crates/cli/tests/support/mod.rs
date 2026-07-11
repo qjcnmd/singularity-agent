@@ -180,8 +180,8 @@ pub fn agent_loop_capability(
         "providerReadiness": {
             "source": "project_env",
             "snapshotId": "provider_snapshot_fake_server",
-            "ready": true,
-            "blocker": null,
+            "configured": true,
+            "configurationBlocker": null,
             "apiKeyPresent": true,
             "baseUrlPresent": true,
             "modelPresent": true,

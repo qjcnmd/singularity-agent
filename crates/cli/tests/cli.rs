@@ -163,8 +163,8 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_eval_readiness() {
                     "providerReadiness": {
                         "source": "project_env",
                         "snapshotId": "provider_snapshot_cli_test",
-                        "ready": false,
-                        "blocker": "required_env_missing",
+                        "configured": false,
+                        "configurationBlocker": "required_env_missing",
                         "apiKeyPresent": false,
                         "baseUrlPresent": true,
                         "modelPresent": false,
@@ -200,8 +200,8 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_eval_readiness() {
     assert!(doctor_stdout.contains("evaluation=agent_loop"));
     assert!(doctor_stdout.contains("provider_config_source=project_env"));
     assert!(doctor_stdout.contains("provider_snapshot_id=provider_snapshot_cli_test"));
-    assert!(doctor_stdout.contains("provider_ready=false"));
-    assert!(doctor_stdout.contains("provider_blocker=required_env_missing"));
+    assert!(doctor_stdout.contains("provider_configured=false"));
+    assert!(doctor_stdout.contains("provider_configuration_blocker=required_env_missing"));
     assert!(doctor_stdout.contains("SINGULARITY_API_KEY=missing"));
     assert!(doctor_stdout.contains("SINGULARITY_BASE_URL=present(redacted)"));
     assert!(doctor_stdout.contains("SINGULARITY_MODEL=missing"));
