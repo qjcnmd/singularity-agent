@@ -118,16 +118,16 @@ sg run <goal>
 - symlink/junction 解析到 workspace 外、I/O 失败、非法 UTF-8 或超限都关闭失败。
 - 指令作为 developer message 注入，不修改 user goal。
 
-`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants。`assemble_context_items` 按优先级和 token 预算选择项目指令、历史与当前输入；当前输入不能容纳时直接返回 context overflow，而不是截断任务含义。
+`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants。AgentLoop 先读取 `Provider::capabilities()`，用 provider 的实际 context window 和 output limit 预留 developer 指令、tool schema、消息 framing、固定开销以及输出空间，并把预留的 output limit 写入真实 provider 请求，再按优先级组装上下文。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算。
 
 ## 6. AgentLoop
 
 `AgentLoop::run` 的真实步骤为：
 
 1. 组装 developer、history 和当前 user message。
-2. 构造 `ModelTurnRequest` 和六个 builtin tool schema。
+2. 构造 `ModelTurnRequest` 和 builtin tool schema，并按 provider capabilities 检查完整请求是否适合 context window。
 3. 调用 provider，并在调用前后检查 `CancellationToken`。
-4. 验证模型 tool call 名称和 JSON arguments。
+4. 按 provider capabilities 验证 response、tool call 名称和 JSON arguments。
 5. 通过 `PolicyEngine` 得到 allow、deny 或 ask。
 6. 执行允许的工具，把 `ToolResult::to_message_payload()` 作为 tool message 送回模型。
 7. 对可修复 tool failure 记录 `ToolRepair`，要求后续模型回合处理。
@@ -143,7 +143,7 @@ completion gate 保持以下不变量：
 
 ## 7. Model 与 provider
 
-`ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY` 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。
+`ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY`、`SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。context window 默认为 128000，output limit 默认 4096；token limit 只在配置快照中解析并以脱敏错误暴露，provider 通过 `capabilities()` 将实际上限交给 AgentLoop。请求声明的 output token 超过 provider 上限时，在发出 provider 请求前失败。
 
 `OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；超时、认证、rate limit、网络、model 配置和 response schema 错误保留不同类别。
 

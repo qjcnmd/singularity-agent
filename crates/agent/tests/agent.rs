@@ -4,8 +4,8 @@ use singularity_agent::{
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-    ModelTurnResponse, Provider, ProviderError,
+    DEFAULT_MAX_CONTEXT_TOKENS, ModelCapabilities, ModelRole, ModelToolCall, ModelToolParseStatus,
+    ModelTurnRequest, ModelTurnResponse, Provider, ProviderError,
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
@@ -25,9 +25,14 @@ use std::time::Duration;
 struct StaticProvider {
     responses: Vec<ModelTurnResponse>,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    capabilities: ModelCapabilities,
 }
 
 impl Provider for StaticProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        self.capabilities.clone()
+    }
+
     fn complete(
         &self,
         request: &ModelTurnRequest,
@@ -49,6 +54,10 @@ struct BlockingProvider {
 }
 
 impl Provider for BlockingProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
     fn complete(
         &self,
         request: &ModelTurnRequest,
@@ -88,6 +97,20 @@ fn agent_loop_with_responses_and_requests(
     policy: PolicyEngine,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
 ) -> AgentLoop<StaticProvider> {
+    agent_loop_with_capabilities(
+        responses,
+        policy,
+        seen_requests,
+        ModelCapabilities::default(),
+    )
+}
+
+fn agent_loop_with_capabilities(
+    responses: Vec<ModelTurnResponse>,
+    policy: PolicyEngine,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    capabilities: ModelCapabilities,
+) -> AgentLoop<StaticProvider> {
     let mut registry = ToolRegistry::default();
     registry
         .register(ToolSpec::new(
@@ -121,6 +144,7 @@ fn agent_loop_with_responses_and_requests(
         StaticProvider {
             responses,
             seen_requests,
+            capabilities,
         },
         ToolBroker::new(registry),
         policy,
@@ -261,7 +285,7 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
         max_turns: 2,
         ..AgentLoopInput::new("thread_1", "turn_1", "change the file")
     };
-    let mut edit = ModelTurnResponse::completed("request_1", "response_1", "");
+    let mut edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     edit.tool_calls.push(tool_call(
         "call_1",
         "builtin.edit",
@@ -271,7 +295,8 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
             "replacement": "after"
         }),
     ));
-    let final_response = ModelTurnResponse::completed("request_2", "response_2", "done");
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
     let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
         .with_rule(
             PermissionRule::new(
@@ -311,7 +336,7 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
 }
 
 #[test]
-fn agent_loop_unknown_tool_does_not_execute_and_fails_closed_after_budget() {
+fn agent_loop_rejects_unknown_tool_response_before_execution() {
     let input = AgentLoopInput {
         max_turns: 1,
         ..AgentLoopInput::new("thread_1", "turn_1", "hello")
@@ -327,13 +352,10 @@ fn agent_loop_unknown_tool_does_not_execute_and_fails_closed_after_budget() {
 
     assert_eq!(result.status, AgentStatus::Failed);
     assert_eq!(
-        result.tool_results[0].error_code.as_deref(),
-        Some("unknown_tool")
-    );
-    assert_eq!(
         result.error.as_deref(),
-        Some("tool execution failed: unknown_tool")
+        Some("model response validation failed: unknown_tool")
     );
+    assert!(result.tool_results.is_empty());
 }
 
 #[test]
@@ -503,6 +525,98 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
         serde_json::json!(DEFAULT_MAX_CONTEXT_TOKENS)
     );
     assert_eq!(requests[0].trace_metadata["turn_id"], "turn_1");
+}
+
+#[test]
+fn agent_loop_uses_provider_capabilities_for_budget_metadata() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let capabilities = ModelCapabilities {
+        max_context_tokens: 64_000,
+        max_output_tokens: 128,
+        ..ModelCapabilities::default()
+    };
+    let result = agent_loop_with_capabilities(
+        vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "done",
+        )],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        capabilities,
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "hello"));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    let requests = seen_requests.lock().expect("seen requests");
+    let budget = &requests[0].context_metadata["budget"];
+    assert_eq!(budget["model_context_window"], 64_000);
+    assert_eq!(budget["reserved_output_tokens"], 128);
+    assert_eq!(requests[0].model_preferences.max_output_tokens, Some(128));
+    assert!(
+        budget["reserved_request_tokens"].as_u64().unwrap()
+            >= budget["reserved_output_tokens"].as_u64().unwrap()
+    );
+    assert!(budget["input_token_budget"].as_u64().unwrap() < u64::from(DEFAULT_MAX_CONTEXT_TOKENS));
+}
+
+#[test]
+fn agent_loop_rejects_requested_output_above_provider_capability() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = agent_loop_with_capabilities(
+        vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "must not be used",
+        )],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ModelCapabilities {
+            max_output_tokens: 128,
+            ..ModelCapabilities::default()
+        },
+    );
+    let mut input = AgentLoopInput::new("thread_1", "turn_1", "hello");
+    input.model_preferences.max_output_tokens = Some(129);
+
+    let result = agent_loop.run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("requested output tokens (129) exceed provider output limit (128)")
+    );
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
+}
+
+#[test]
+fn agent_loop_rejects_unsupported_tool_capability_before_provider() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    let result = agent_loop_with_capabilities(
+        vec![response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ModelCapabilities {
+            supports_tools: false,
+            ..ModelCapabilities::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "hello"));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.model_turns, 0);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("model request validation failed: provider_does_not_support_tools")
+    );
+    assert!(result.tool_results.is_empty());
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
 }
 
 #[test]
@@ -967,7 +1081,8 @@ fn agent_loop_cancels_a_running_sandbox_command() {
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.clone();
     let (started_tx, started_rx) = mpsc::channel();
-    let mut command_response = ModelTurnResponse::completed("request_1", "response_1", "");
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
         "call_1",
         "builtin.command",
@@ -1798,10 +1913,23 @@ fn context_assembly_renders_history_in_original_conversation_order() {
     assert_eq!(context.messages[0]["content"], "previous user");
     assert_eq!(context.messages[1]["content"], "previous assistant");
     assert_eq!(context.messages[2]["content"], "current user");
-    assert_eq!(
-        context.bundle_digest,
-        "history_user:history_user_1:history_assistant:history_assistant_1:user_input"
-    );
+    let serialized = serde_json::to_value(&context).expect("serialize context bundle");
+    for removed_field in [
+        "run_id",
+        "task_id",
+        "phase_id",
+        "model",
+        "provider",
+        "compression_snapshot_id",
+        "retrieval_query",
+        "created_at",
+        "metadata",
+        "bundle_id",
+        "render_policy",
+        "bundle_digest",
+    ] {
+        assert!(!serialized.as_object().unwrap().contains_key(removed_field));
+    }
 }
 
 #[test]
@@ -1843,6 +1971,18 @@ fn context_assembly_keeps_current_user_when_history_exceeds_budget() {
     assert_eq!(context.messages.len(), 1);
     assert_eq!(context.messages[0]["content"], "qrstuvwx");
     assert_eq!(context.budget["message_tokens"], 2);
+}
+
+#[test]
+fn context_assembly_does_not_truncate_the_current_turn() {
+    let current = AgentContextItem::user("input_1", "current turn content");
+    let max_tokens = current.token_count.saturating_sub(1);
+
+    let context = assemble_context_items(&[current], max_tokens);
+
+    assert!(context.messages.is_empty());
+    assert_eq!(context.included_item_ids, Vec::<String>::new());
+    assert_eq!(context.excluded_item_ids, vec!["input_1"]);
 }
 
 #[test]
@@ -1898,8 +2038,9 @@ fn context_assembly_keeps_user_turn_and_safe_tool_results_with_budget() {
     assert_eq!(context.messages[0]["role"], "user");
     assert_eq!(context.messages[1]["role"], "tool");
     assert_eq!(context.budget["message_tokens"], 11);
-    assert!(context.bundle_digest.contains("digest_user"));
-    assert!(context.bundle_digest.contains("digest_tool"));
+    let serialized = serde_json::to_string(&context).expect("serialize context");
+    assert!(!serialized.contains("digest_user"));
+    assert!(!serialized.contains("digest_tool"));
 }
 
 #[test]
@@ -1944,7 +2085,7 @@ fn agent_loop_fails_closed_before_provider_when_current_turn_exceeds_context_bud
 }
 
 #[test]
-fn agent_loop_reserves_the_requested_model_output_budget() {
+fn agent_loop_rejects_requested_output_above_provider_limit() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let agent_loop = agent_loop_with_response_and_requests(
         ModelTurnResponse::completed("req_1", "resp_1", "should not be used"),
@@ -1959,7 +2100,7 @@ fn agent_loop_reserves_the_requested_model_output_budget() {
     assert_eq!(result.status, AgentStatus::Failed);
     assert_eq!(
         result.error.as_deref(),
-        Some("current turn exceeds the model context budget")
+        Some("requested output tokens (128000) exceed provider output limit (4096)")
     );
     assert_eq!(result.model_turns, 0);
     assert!(seen_requests.lock().expect("seen requests").is_empty());

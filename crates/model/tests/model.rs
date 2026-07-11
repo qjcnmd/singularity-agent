@@ -1,11 +1,12 @@
 use schemars::schema_for;
 use singularity_model::{
-    ModelBlockerKind, ModelCapabilities, ModelError, ModelErrorCategory, ModelErrorKind,
-    ModelMessage, ModelProviderConfig, ModelProviderStatus, ModelRole, ModelToolCall,
-    ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-    ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider, ProviderConfigSnapshot,
-    ProviderConfigSource, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
-    classify_model_error, resolve_provider_config, validate_model_request, validate_model_response,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelCapabilities,
+    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig,
+    ModelProviderStatus, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
+    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider,
+    OpenAiProviderConfig, Provider, ProviderConfigSnapshot, ProviderConfigSource, ToolChoiceMode,
+    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, resolve_provider_config,
+    validate_model_request, validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
@@ -54,6 +55,8 @@ fn provider_test_config(base_url: String) -> OpenAiProviderConfig {
         base_url,
         api_key: "sk-secret-value".to_string(),
         source: ProviderConfigSource::ProcessEnvironment,
+        max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+        max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
     }
 }
 
@@ -178,7 +181,17 @@ fn model_turn_schema_carries_runtime_boundary_fields() {
     assert_eq!(response_value["assistant_message"]["role"], "assistant");
     assert_eq!(response_value["tool_calls"], serde_json::json!([]));
     assert_eq!(response_value["usage"]["total_tokens"], 0);
-    assert!(response_value["trace_event_ids"].is_array());
+    assert_eq!(response_value["request_id"], "request_1");
+    assert_eq!(response_value["response_id"], "response_1");
+    assert_eq!(response_value["status"], "success");
+    for removed_field in ["latency_ms", "trace_event_ids", "metadata"] {
+        assert!(
+            !response_value
+                .as_object()
+                .unwrap()
+                .contains_key(removed_field)
+        );
+    }
 }
 
 #[test]
@@ -391,6 +404,149 @@ fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
     assert_eq!(status.api_key_status, "present(redacted)");
     assert!(!serialized.contains("sk-secret-value"));
     assert!(!serialized.contains("provider.example"));
+}
+
+#[test]
+fn provider_token_limits_default_and_configured_capabilities_are_explicit() {
+    let default_config = OpenAiProviderConfig::from_env(|name| match name {
+        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    })
+    .expect("provider config");
+    assert_eq!(
+        default_config.capabilities().max_context_tokens,
+        DEFAULT_MAX_CONTEXT_TOKENS
+    );
+    assert_eq!(
+        default_config.capabilities().max_output_tokens,
+        DEFAULT_MAX_OUTPUT_TOKENS
+    );
+    assert!(default_config.capabilities().supports_developer_message);
+    assert!(default_config.capabilities().supports_json_mode);
+
+    let configured = OpenAiProviderConfig::from_env(|name| match name {
+        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some(" 131072 ".to_string()),
+        "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS" => Some("8192".to_string()),
+        _ => None,
+    })
+    .expect("configured provider");
+    let capabilities = configured.capabilities();
+    assert_eq!(capabilities.max_context_tokens, 131_072);
+    assert_eq!(capabilities.max_output_tokens, 8_192);
+
+    let provider = OpenAiProvider::new(configured).expect("provider");
+    assert_eq!(Provider::capabilities(&provider), capabilities);
+}
+
+#[test]
+fn provider_token_limit_validation_has_bounded_secret_free_errors() {
+    for (name, value) in [
+        ("SINGULARITY_MODEL_CONTEXT_TOKENS", "zero-limit"),
+        ("SINGULARITY_MODEL_CONTEXT_TOKENS", "2000001"),
+        ("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS", "256001"),
+        ("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS", "not-a-token-limit"),
+    ] {
+        let result = OpenAiProviderConfig::from_env(|candidate| match candidate {
+            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+            "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+            candidate if candidate == name => Some(value.to_string()),
+            _ => None,
+        });
+        let error = result.expect_err("invalid token limit");
+
+        assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
+        assert!(error.message.contains(name));
+        assert!(!error.message.contains(value));
+    }
+}
+
+#[test]
+fn provider_rejects_output_limit_that_cannot_fit_the_context_window() {
+    let error = OpenAiProviderConfig::from_env(|name| match name {
+        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some("4096".to_string()),
+        "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS" => Some("4096".to_string()),
+        _ => None,
+    })
+    .expect_err("inconsistent provider token limits");
+
+    assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
+    assert!(
+        error
+            .message
+            .contains("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS")
+    );
+    assert!(error.message.contains("SINGULARITY_MODEL_CONTEXT_TOKENS"));
+    assert!(!error.message.contains("sk-secret-value"));
+}
+
+#[test]
+fn model_request_validation_rejects_output_above_provider_capability() {
+    let mut request = ModelTurnRequest::new(
+        "request_1",
+        "run_1",
+        "session_1",
+        "task_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.model_preferences.max_output_tokens = Some(9);
+    let capabilities = ModelCapabilities {
+        max_output_tokens: 8,
+        ..ModelCapabilities::default()
+    };
+
+    let result = validate_model_request_with_capabilities(&request, Some(&capabilities));
+
+    assert!(!result.valid);
+    assert_eq!(
+        result.errors,
+        vec!["requested_output_tokens_exceed_provider_limit"]
+    );
+}
+
+#[test]
+fn model_request_validation_rejects_unsupported_declared_capabilities() {
+    let mut request = ModelTurnRequest::new(
+        "request_1",
+        "run_1",
+        "session_1",
+        "task_1",
+        vec![ModelMessage::text(ModelRole::Developer, "instructions")],
+    );
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "read".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+        capability_tags: Vec::new(),
+        risk_tags: Vec::new(),
+        metadata: serde_json::json!({}),
+    });
+    request.model_preferences.json_mode = true;
+    let capabilities = ModelCapabilities {
+        supports_tools: false,
+        supports_json_mode: false,
+        supports_developer_message: false,
+        ..ModelCapabilities::default()
+    };
+
+    let result = validate_model_request_with_capabilities(&request, Some(&capabilities));
+
+    assert_eq!(
+        result.errors,
+        vec![
+            "provider_does_not_support_developer_messages",
+            "provider_does_not_support_json_mode",
+            "provider_does_not_support_tools",
+        ]
+    );
 }
 
 #[test]

@@ -16,8 +16,12 @@ use uuid::Uuid;
 const DEFAULT_MAX_TOOL_CALLS: u32 = 8;
 pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
+const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;
+const MAX_CONFIGURED_OUTPUT_TOKENS: u32 = 256_000;
 const ENV_PROVIDER: &str = "SINGULARITY_MODEL_PROVIDER";
 const ENV_MODEL: &str = "SINGULARITY_MODEL";
+const ENV_CONTEXT_TOKENS: &str = "SINGULARITY_MODEL_CONTEXT_TOKENS";
+const ENV_MAX_OUTPUT_TOKENS: &str = "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS";
 const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
 const ENV_API_KEY: &str = "SINGULARITY_API_KEY";
 const PROJECT_ENV_FILE: &str = ".env";
@@ -210,7 +214,7 @@ impl Default for ModelCapabilities {
             supports_json_mode: false,
             supports_structured_outputs: false,
             supports_system_message: true,
-            supports_developer_message: false,
+            supports_developer_message: true,
             max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             input_modalities: vec!["text".to_string()],
@@ -513,7 +517,9 @@ impl From<&ModelErrorCategory> for ModelBlockerKind {
                 Self::BaseUrlNetworkError
             }
             ModelErrorCategory::SandboxPermission => Self::SandboxPermissionError,
-            ModelErrorCategory::ModelConfiguration => Self::ModelNameConfigError,
+            ModelErrorCategory::ModelConfiguration
+            | ModelErrorCategory::InvalidRequest
+            | ModelErrorCategory::UnsupportedCapability => Self::ModelNameConfigError,
             _ => Self::BaseUrlNetworkError,
         }
     }
@@ -596,9 +602,6 @@ pub struct ModelTurnResponse {
     pub error: Option<ModelError>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
-    pub latency_ms: Option<u64>,
-    pub trace_event_ids: Vec<String>,
-    pub metadata: Value,
 }
 
 impl ModelTurnResponse {
@@ -619,14 +622,13 @@ impl ModelTurnResponse {
             error: None,
             provider_name: None,
             model_name: None,
-            latency_ms: None,
-            trace_event_ids: Vec::new(),
-            metadata: json!({}),
         }
     }
 }
 
 pub trait Provider {
+    fn capabilities(&self) -> ModelCapabilities;
+
     fn complete(
         &self,
         request: &ModelTurnRequest,
@@ -641,6 +643,8 @@ pub struct OpenAiProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub source: ProviderConfigSource,
+    pub max_context_tokens: u32,
+    pub max_output_tokens: u32,
 }
 
 impl fmt::Debug for OpenAiProviderConfig {
@@ -652,6 +656,8 @@ impl fmt::Debug for OpenAiProviderConfig {
             .field("base_url", &"[redacted]")
             .field("api_key", &"[redacted]")
             .field("source", &self.source)
+            .field("max_context_tokens", &self.max_context_tokens)
+            .field("max_output_tokens", &self.max_output_tokens)
             .finish()
     }
 }
@@ -667,6 +673,28 @@ impl OpenAiProviderConfig {
 
     fn from_resolved_values(values: ResolvedProviderValues) -> Result<Self, ProviderError> {
         let source = values.source;
+        let max_context_tokens = parse_provider_token_limit(
+            values.context_tokens.as_deref(),
+            ENV_CONTEXT_TOKENS,
+            DEFAULT_MAX_CONTEXT_TOKENS,
+            MAX_CONFIGURED_CONTEXT_TOKENS,
+            source,
+        )?;
+        let max_output_tokens = parse_provider_token_limit(
+            values.max_output_tokens.as_deref(),
+            ENV_MAX_OUTPUT_TOKENS,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            MAX_CONFIGURED_OUTPUT_TOKENS,
+            source,
+        )?;
+        if max_output_tokens >= max_context_tokens {
+            return Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                format!(
+                    "invalid model configuration: {ENV_MAX_OUTPUT_TOKENS} must be smaller than {ENV_CONTEXT_TOKENS}"
+                ),
+            )));
+        }
         let provider_name = values
             .provider_name
             .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string());
@@ -686,6 +714,8 @@ impl OpenAiProviderConfig {
             base_url,
             api_key,
             source,
+            max_context_tokens,
+            max_output_tokens,
         })
     }
 
@@ -700,6 +730,22 @@ impl OpenAiProviderConfig {
 
     pub fn endpoint(&self) -> String {
         chat_completions_endpoint(&self.base_url)
+    }
+
+    pub fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            supports_tools: true,
+            supports_parallel_tool_calls: false,
+            supports_streaming: false,
+            supports_json_mode: true,
+            supports_structured_outputs: false,
+            supports_system_message: true,
+            supports_developer_message: true,
+            max_context_tokens: self.max_context_tokens,
+            max_output_tokens: self.max_output_tokens,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+        }
     }
 }
 
@@ -737,6 +783,10 @@ impl OpenAiProvider {
 }
 
 impl Provider for OpenAiProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        self.config.capabilities()
+    }
+
     fn complete(
         &self,
         request: &ModelTurnRequest,
@@ -745,12 +795,17 @@ impl Provider for OpenAiProvider {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
-        let request_validation = validate_model_request(request);
+        let capabilities = self.capabilities();
+        let request_validation =
+            validate_model_request_with_capabilities(request, Some(&capabilities));
         if !request_validation.valid {
             return Err(ProviderError::from_model_error(
                 ModelError::new(
                     ModelErrorKind::InvalidRequest,
-                    "model request validation failed",
+                    format!(
+                        "model request validation failed: {}",
+                        request_validation.errors.join(", ")
+                    ),
                 )
                 .with_provider(self.config.provider_name.clone())
                 .with_model(self.config.model_name.clone()),
@@ -832,9 +887,6 @@ pub fn provider_error_response(
         error: Some(*error.error),
         provider_name: None,
         model_name: request.model_preferences.model_name.clone(),
-        latency_ms: None,
-        trace_event_ids: Vec::new(),
-        metadata: json!({}),
     }
 }
 
@@ -1029,16 +1081,15 @@ fn parse_openai_response(
         error: None,
         provider_name: Some(config.provider_name.clone()),
         model_name: Some(config.model_name.clone()),
-        latency_ms: None,
-        trace_event_ids: Vec::new(),
-        metadata: json!({}),
     };
     let allowed_tool_names = request
         .tools
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    let validation = validate_model_turn_response(request, &response, &allowed_tool_names, None);
+    let capabilities = config.capabilities();
+    let validation =
+        validate_model_turn_response(request, &response, &allowed_tool_names, Some(&capabilities));
     if !validation.valid {
         response.status = ModelTurnStatus::Invalid;
         response.error = Some(
@@ -1177,6 +1228,31 @@ fn provider_source_missing_error() -> ProviderError {
     ))
 }
 
+fn parse_provider_token_limit(
+    value: Option<&str>,
+    name: &str,
+    fallback: u32,
+    upper_bound: u32,
+    source: Option<ProviderConfigSource>,
+) -> Result<u32, ProviderError> {
+    let Some(value) = value else {
+        return Ok(fallback);
+    };
+    let parsed = value.trim().parse::<u32>().ok().filter(|value| *value > 0);
+    match parsed {
+        Some(value) if value <= upper_bound => Ok(value),
+        _ => {
+            let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
+            Err(ProviderError::from_model_error(ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                format!(
+                    "invalid model configuration: {name} must be between 1 and {upper_bound} (source={source})"
+                ),
+            )))
+        }
+    }
+}
+
 fn model_error_from_http_status(status: u16, provider_name: &str, model_name: &str) -> ModelError {
     let kind = match status {
         HTTP_STATUS_UNAUTHORIZED | HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
@@ -1273,6 +1349,13 @@ pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidation
 }
 
 pub fn validate_model_request(request: &ModelTurnRequest) -> ModelValidationResult {
+    validate_model_request_with_capabilities(request, None)
+}
+
+pub fn validate_model_request_with_capabilities(
+    request: &ModelTurnRequest,
+    capabilities: Option<&ModelCapabilities>,
+) -> ModelValidationResult {
     let mut errors = Vec::new();
     for (field, value) in [
         ("request_id_required", &request.request_id),
@@ -1288,6 +1371,35 @@ pub fn validate_model_request(request: &ModelTurnRequest) -> ModelValidationResu
     }
     if request.messages.is_empty() {
         errors.push("messages_required".to_string());
+    }
+    if let Some(capabilities) = capabilities {
+        if !request.tools.is_empty() && !capabilities.supports_tools {
+            errors.push("provider_does_not_support_tools".to_string());
+        }
+        if request.model_preferences.json_mode && !capabilities.supports_json_mode {
+            errors.push("provider_does_not_support_json_mode".to_string());
+        }
+        if request
+            .messages
+            .iter()
+            .any(|message| message.role == ModelRole::System)
+            && !capabilities.supports_system_message
+        {
+            errors.push("provider_does_not_support_system_messages".to_string());
+        }
+        if request
+            .messages
+            .iter()
+            .any(|message| message.role == ModelRole::Developer)
+            && !capabilities.supports_developer_message
+        {
+            errors.push("provider_does_not_support_developer_messages".to_string());
+        }
+        if let Some(requested_output_tokens) = request.model_preferences.max_output_tokens
+            && requested_output_tokens > capabilities.max_output_tokens
+        {
+            errors.push("requested_output_tokens_exceed_provider_limit".to_string());
+        }
     }
     validation_result(errors, Vec::new())
 }
@@ -1317,6 +1429,13 @@ pub fn validate_model_turn_response(
         result
             .errors
             .push("successful_response_has_error".to_string());
+    }
+    if let Some(capabilities) = capabilities
+        && response.usage.output_tokens > u64::from(capabilities.max_output_tokens)
+    {
+        result
+            .errors
+            .push("response_output_tokens_exceed_provider_limit".to_string());
     }
     result.errors.sort();
     result.errors.dedup();
@@ -1483,6 +1602,8 @@ fn missing(value: &Option<String>) -> bool {
 struct ProviderConfigLayer {
     provider_name: Option<String>,
     model_name: Option<String>,
+    context_tokens: Option<String>,
+    max_output_tokens: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
 }
@@ -1495,6 +1616,8 @@ impl ProviderConfigLayer {
         Self {
             provider_name: get_env(ENV_PROVIDER),
             model_name: get_env(ENV_MODEL),
+            context_tokens: get_env(ENV_CONTEXT_TOKENS),
+            max_output_tokens: get_env(ENV_MAX_OUTPUT_TOKENS),
             base_url: get_env(ENV_BASE_URL),
             api_key: get_env(ENV_API_KEY),
         }
@@ -1503,6 +1626,8 @@ impl ProviderConfigLayer {
     fn any_present(&self) -> bool {
         self.provider_name.is_some()
             || self.model_name.is_some()
+            || self.context_tokens.is_some()
+            || self.max_output_tokens.is_some()
             || self.base_url.is_some()
             || self.api_key.is_some()
     }
@@ -1512,6 +1637,8 @@ impl ProviderConfigLayer {
             source: Some(source),
             provider_name: normalized_provider_value(self.provider_name),
             model_name: normalized_provider_value(self.model_name),
+            context_tokens: normalized_provider_value(self.context_tokens),
+            max_output_tokens: normalized_provider_value(self.max_output_tokens),
             base_url: normalized_provider_value(self.base_url),
             api_key: normalized_provider_value(self.api_key),
         }
@@ -1523,6 +1650,8 @@ struct ResolvedProviderValues {
     source: Option<ProviderConfigSource>,
     provider_name: Option<String>,
     model_name: Option<String>,
+    context_tokens: Option<String>,
+    max_output_tokens: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
 }
@@ -1597,6 +1726,8 @@ fn read_project_env_layer(path: &Path) -> ProviderConfigLayer {
         let target = match name.as_str() {
             ENV_PROVIDER => &mut layer.provider_name,
             ENV_MODEL => &mut layer.model_name,
+            ENV_CONTEXT_TOKENS => &mut layer.context_tokens,
+            ENV_MAX_OUTPUT_TOKENS => &mut layer.max_output_tokens,
             ENV_BASE_URL => &mut layer.base_url,
             ENV_API_KEY => &mut layer.api_key,
             _ => continue,

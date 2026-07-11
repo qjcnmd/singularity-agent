@@ -1712,8 +1712,8 @@ mod tests {
 
     use singularity_agent::PendingToolCall;
     use singularity_model::{
-        ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
-        Provider, ProviderError,
+        ModelCapabilities, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
+        ModelTurnResponse, Provider, ProviderError,
     };
     use singularity_protocol::ItemKind;
     use singularity_tools::{CommandRequest, CommandResult};
@@ -1743,6 +1743,10 @@ mod tests {
     }
 
     impl Provider for StaticProvider {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+
         fn complete(
             &self,
             request: &ModelTurnRequest,
@@ -1751,11 +1755,13 @@ mod tests {
             let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
             let response_index = seen_requests.len();
             seen_requests.push(request.clone());
-            Ok(self
+            let mut response = self
                 .responses
                 .get(response_index)
                 .unwrap_or_else(|| self.responses.last().expect("static provider response"))
-                .clone())
+                .clone();
+            response.request_id = request.request_id.clone();
+            Ok(response)
         }
     }
 
@@ -1957,7 +1963,11 @@ mod tests {
         };
         let seen_requests = Arc::new(Mutex::new(Vec::new()));
         let provider = StaticProvider {
-            responses: vec![ModelTurnResponse::completed("request", "response", "done")],
+            responses: vec![ModelTurnResponse::completed(
+                "model_request_turn_1_0",
+                "response",
+                "done",
+            )],
             seen_requests: Arc::clone(&seen_requests),
         };
         let server = app_server(store);
@@ -2409,7 +2419,7 @@ mod tests {
             "approved",
         );
         let mut verification_response =
-            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+            ModelTurnResponse::completed("model_request_turn_1_0", "response_2", "");
         verification_response.tool_calls.push(ModelToolCall {
             tool_call_id: "call_verify".to_string(),
             tool_name: TOOL_COMMAND.to_string(),
@@ -2426,7 +2436,7 @@ mod tests {
             validation_errors: Vec::new(),
         });
         let final_response =
-            ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_3", "done");
         let seen_requests = Arc::new(Mutex::new(Vec::new()));
         let provider = StaticProvider {
             responses: vec![verification_response, final_response],

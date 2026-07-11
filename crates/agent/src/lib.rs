@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelMessage, ModelPreferences,
-    ModelPurpose, ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema,
-    ModelTurnRequest, ModelTurnStatus, Provider, provider_error_response,
+    DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelCapabilities, ModelMessage,
+    ModelPreferences, ModelPurpose, ModelRole, ModelToolCall, ModelToolParseStatus,
+    ModelToolSchema, ModelTurnRequest, ModelTurnStatus, Provider, provider_error_response,
+    validate_model_request_with_capabilities, validate_model_turn_response,
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
@@ -42,6 +43,7 @@ const MODEL_REQUEST_FIXED_OVERHEAD_TOKENS: u32 = 256;
 const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
 const CURRENT_TURN_CONTEXT_OVERFLOW_ERROR: &str = "current turn exceeds the model context budget";
 const MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR: &str = "model request exceeds the model context budget";
+const MODEL_RESPONSE_VALIDATION_ERROR: &str = "model response validation failed";
 const POST_MUTATION_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: verification required after workspace mutation";
 const COMMAND_SANDBOX_PROFILE_DENIED: &str =
@@ -562,10 +564,12 @@ where
     }
 
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
-        let context = assemble_context_items(
-            &input.input,
-            context_input_token_budget(input, &self.tool_broker),
-        );
+        let capabilities = self.provider.capabilities();
+        let budget = match context_budget(input, &self.tool_broker, &capabilities) {
+            Ok(budget) => budget,
+            Err(error) => return failed_result(error),
+        };
+        let context = assemble_context_items_with_budget(&input.input, &budget);
         if current_turn_excluded(input, &context) {
             return context_overflow_result();
         }
@@ -573,13 +577,15 @@ where
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, 0, None);
         }
-        self.continue_run(input, &context, state)
+        self.continue_run(input, &context, &budget, &capabilities, state)
     }
 
     fn continue_run(
         &self,
         input: &AgentLoopInput,
         context: &ContextBundle,
+        budget: &ContextBudget,
+        capabilities: &ModelCapabilities,
         mut state: AgentLoopState,
     ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
@@ -587,7 +593,7 @@ where
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
             }
-            if !model_request_fits_context(input, &self.tool_broker, &state.messages) {
+            if !model_request_fits_context(&self.tool_broker, &state.messages, budget) {
                 return state.finish(
                     AgentStatus::Failed,
                     false,
@@ -600,9 +606,24 @@ where
                 &self.tool_broker,
                 input,
                 context,
+                budget,
                 turn_index,
                 state.messages.clone(),
             );
+            let request_validation =
+                validate_model_request_with_capabilities(&request, Some(capabilities));
+            if !request_validation.valid {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(format!(
+                        "model request validation failed: {}",
+                        request_validation.errors.join(", ")
+                    )),
+                );
+            }
             let response = match self.provider.complete(&request, &self.cancellation) {
                 Ok(response) => response,
                 Err(error) => provider_error_response(&request, error),
@@ -617,6 +638,25 @@ where
                     None,
                     turn_index + 1,
                     response.error.map(|error| error.message),
+                );
+            }
+            let allowed_tool_names = model_tool_names(&self.tool_broker);
+            let validation = validate_model_turn_response(
+                &request,
+                &response,
+                &allowed_tool_names,
+                Some(capabilities),
+            );
+            if !validation.valid {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index + 1,
+                    Some(format!(
+                        "{MODEL_RESPONSE_VALIDATION_ERROR}: {}",
+                        validation.errors.join(", ")
+                    )),
                 );
             }
             if response.tool_calls.is_empty() {
@@ -758,10 +798,12 @@ where
                 );
             }
         };
-        let context = assemble_context_items(
-            &input.input,
-            context_input_token_budget(input, &self.tool_broker),
-        );
+        let capabilities = self.provider.capabilities();
+        let budget = match context_budget(input, &self.tool_broker, &capabilities) {
+            Ok(budget) => budget,
+            Err(error) => return failed_result(error),
+        };
+        let context = assemble_context_items_with_budget(&input.input, &budget);
         if current_turn_excluded(input, &context) {
             return context_overflow_result();
         }
@@ -807,7 +849,7 @@ where
                 );
             }
         }
-        self.continue_run(input, &context, state)
+        self.continue_run(input, &context, &budget, &capabilities, state)
     }
 
     fn is_cancelled(&self, input: &AgentLoopInput) -> bool {
@@ -1066,28 +1108,111 @@ fn approximate_token_count(content: &str) -> u32 {
     u32::try_from(estimated.max(1)).unwrap_or(u32::MAX)
 }
 
-fn context_input_token_budget(input: &AgentLoopInput, loop_tools: &ToolBroker) -> u32 {
+#[derive(Debug, Clone)]
+struct ContextBudget {
+    model_context_window: u32,
+    reserved_output_tokens: u32,
+    fixed_overhead_tokens: u32,
+    developer_instruction_tokens: u32,
+    tool_tokens: u32,
+    message_framing_tokens: u32,
+    input_token_budget: u32,
+}
+
+impl ContextBudget {
+    fn reserved_request_tokens(&self) -> u32 {
+        self.reserved_output_tokens
+            .saturating_add(self.fixed_overhead_tokens)
+            .saturating_add(self.developer_instruction_tokens)
+            .saturating_add(self.tool_tokens)
+            .saturating_add(self.message_framing_tokens)
+    }
+
+    fn metadata(&self, message_tokens: u32) -> Value {
+        json!({
+            "model_context_window": self.model_context_window,
+            "input_token_budget": self.input_token_budget,
+            "reserved_output_tokens": self.reserved_output_tokens,
+            "fixed_overhead_tokens": self.fixed_overhead_tokens,
+            "developer_instruction_tokens": self.developer_instruction_tokens,
+            "tool_tokens": self.tool_tokens,
+            "message_framing_tokens": self.message_framing_tokens,
+            "reserved_request_tokens": self.reserved_request_tokens(),
+            "message_tokens": message_tokens,
+        })
+    }
+
+    fn for_public_assembly(max_tokens: u32) -> Self {
+        Self {
+            model_context_window: DEFAULT_MAX_CONTEXT_TOKENS,
+            reserved_output_tokens: 0,
+            fixed_overhead_tokens: 0,
+            developer_instruction_tokens: 0,
+            tool_tokens: 0,
+            message_framing_tokens: 0,
+            input_token_budget: max_tokens,
+        }
+    }
+}
+
+fn output_token_reservation(
+    input: &AgentLoopInput,
+    capabilities: &ModelCapabilities,
+) -> Result<u32, String> {
+    match input.model_preferences.max_output_tokens {
+        Some(requested) if requested > capabilities.max_output_tokens => Err(format!(
+            "requested output tokens ({requested}) exceed provider output limit ({})",
+            capabilities.max_output_tokens
+        )),
+        Some(requested) => Ok(requested),
+        None => Ok(DEFAULT_MAX_OUTPUT_TOKENS.min(capabilities.max_output_tokens)),
+    }
+}
+
+fn context_budget(
+    input: &AgentLoopInput,
+    loop_tools: &ToolBroker,
+    capabilities: &ModelCapabilities,
+) -> Result<ContextBudget, String> {
+    if capabilities.max_context_tokens == 0 || capabilities.max_output_tokens == 0 {
+        return Err("provider token capabilities must be greater than zero".to_string());
+    }
     let developer_instruction_tokens = approximate_token_count(&developer_instructions(input));
     let tool_tokens = serde_json::to_string(&model_tool_schemas(loop_tools))
         .map_or(u32::MAX, |tools| approximate_token_count(&tools));
     let message_count = u32::try_from(input.input.len().saturating_add(1)).unwrap_or(u32::MAX);
-    let framing_tokens = message_count.saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
-    let output_tokens = input
-        .model_preferences
-        .max_output_tokens
-        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-    let reserved_tokens = output_tokens
-        .saturating_add(MODEL_REQUEST_FIXED_OVERHEAD_TOKENS)
+    let message_framing_tokens = message_count.saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
+    let reserved_output_tokens = output_token_reservation(input, capabilities)?;
+    let fixed_overhead_tokens = MODEL_REQUEST_FIXED_OVERHEAD_TOKENS;
+    let reserved_request_tokens = reserved_output_tokens
+        .saturating_add(fixed_overhead_tokens)
         .saturating_add(developer_instruction_tokens)
         .saturating_add(tool_tokens)
-        .saturating_add(framing_tokens);
-    DEFAULT_MAX_CONTEXT_TOKENS.saturating_sub(reserved_tokens)
+        .saturating_add(message_framing_tokens);
+    if reserved_request_tokens >= capabilities.max_context_tokens {
+        return Err(
+            "provider context window cannot fit the reserved output and request overhead"
+                .to_string(),
+        );
+    }
+
+    Ok(ContextBudget {
+        model_context_window: capabilities.max_context_tokens,
+        reserved_output_tokens,
+        fixed_overhead_tokens,
+        developer_instruction_tokens,
+        tool_tokens,
+        message_framing_tokens,
+        input_token_budget: capabilities
+            .max_context_tokens
+            .saturating_sub(reserved_request_tokens),
+    })
 }
 
 fn model_request_fits_context(
-    input: &AgentLoopInput,
     loop_tools: &ToolBroker,
     messages: &[ModelMessage],
+    budget: &ContextBudget,
 ) -> bool {
     let projected_messages = messages
         .iter()
@@ -1130,20 +1255,26 @@ fn model_request_fits_context(
         .collect::<Vec<_>>();
     let payload_tokens = serde_json::to_string(&(projected_messages, projected_tools))
         .map_or(u32::MAX, |payload| approximate_token_count(&payload));
-    let output_tokens = input
-        .model_preferences
-        .max_output_tokens
-        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let message_framing = u32::try_from(messages.len())
         .unwrap_or(u32::MAX)
         .saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
     payload_tokens
-        .saturating_add(output_tokens)
+        .saturating_add(budget.reserved_output_tokens)
         .saturating_add(message_framing)
-        .saturating_add(MODEL_REQUEST_FIXED_OVERHEAD_TOKENS)
-        <= DEFAULT_MAX_CONTEXT_TOKENS
+        .saturating_add(budget.fixed_overhead_tokens)
+        <= budget.model_context_window
 }
+
 pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> ContextBundle {
+    let budget = ContextBudget::for_public_assembly(max_tokens);
+    assemble_context_items_with_budget(items, &budget)
+}
+
+fn assemble_context_items_with_budget(
+    items: &[AgentContextItem],
+    budget: &ContextBudget,
+) -> ContextBundle {
+    let max_tokens = budget.input_token_budget;
     let mut candidates: Vec<(usize, &AgentContextItem)> = items
         .iter()
         .enumerate()
@@ -1201,14 +1332,12 @@ pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> Co
     let mut included_item_ids = Vec::new();
     let mut excluded_item_ids = Vec::new();
     let mut messages = Vec::new();
-    let mut digest_parts = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if !included_indices.contains(&index) {
             excluded_item_ids.push(item.item_id.clone());
             continue;
         }
         included_item_ids.push(item.item_id.clone());
-        digest_parts.push(item.digest.clone());
         messages.push(json!({
             "role": item.role,
             "content": item.content,
@@ -1216,29 +1345,10 @@ pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> Co
     }
 
     ContextBundle {
-        bundle_id: "rust_context_bundle".to_string(),
-        run_id: String::new(),
-        task_id: String::new(),
-        phase_id: "context".to_string(),
-        model: String::new(),
-        provider: String::new(),
         messages,
         included_item_ids,
         excluded_item_ids,
-        budget: json!({
-            "model_context_window": DEFAULT_MAX_CONTEXT_TOKENS,
-            "input_token_budget": max_tokens,
-            "message_tokens": used_tokens,
-        }),
-        compression_snapshot_id: None,
-        retrieval_query: None,
-        render_policy: json!({
-            "include_raw_tool_outputs": false,
-            "redact_sensitive": true,
-        }),
-        created_at: String::new(),
-        bundle_digest: digest_parts.join(":"),
-        metadata: json!({}),
+        budget: budget.metadata(used_tokens),
     }
 }
 
@@ -1251,7 +1361,7 @@ fn current_turn_excluded(input: &AgentLoopInput, context: &ContextBundle) -> boo
     })
 }
 
-fn context_overflow_result() -> AgentLoopResult {
+fn failed_result(error: impl Into<String>) -> AgentLoopResult {
     AgentLoopResult {
         status: AgentStatus::Failed,
         completed: false,
@@ -1264,27 +1374,19 @@ fn context_overflow_result() -> AgentLoopResult {
         tool_results: Vec::new(),
         tool_repairs: Vec::new(),
         verification: AgentVerification::default(),
-        error: Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
+        error: Some(error.into()),
     }
+}
+
+fn context_overflow_result() -> AgentLoopResult {
+    failed_result(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR)
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ContextBundle {
-    pub bundle_id: String,
-    pub run_id: String,
-    pub task_id: String,
-    pub phase_id: String,
-    pub model: String,
-    pub provider: String,
     pub messages: Vec<Value>,
     pub included_item_ids: Vec<String>,
     pub excluded_item_ids: Vec<String>,
     pub budget: Value,
-    pub compression_snapshot_id: Option<String>,
-    pub retrieval_query: Option<String>,
-    pub render_policy: Value,
-    pub created_at: String,
-    pub bundle_digest: String,
-    pub metadata: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1308,6 +1410,7 @@ fn model_turn_request(
     loop_tools: &ToolBroker,
     input: &AgentLoopInput,
     context: &ContextBundle,
+    budget: &ContextBudget,
     turn_index: u32,
     messages: Vec<ModelMessage>,
 ) -> ModelTurnRequest {
@@ -1322,7 +1425,10 @@ fn model_turn_request(
         messages,
         tools: model_tool_schemas(loop_tools),
         tool_choice: Default::default(),
-        model_preferences: input.model_preferences.clone(),
+        model_preferences: ModelPreferences {
+            max_output_tokens: Some(budget.reserved_output_tokens),
+            ..input.model_preferences.clone()
+        },
         context_metadata: context_metadata(context),
         policy_metadata: json!({
             "approval_grants": input
@@ -1369,6 +1475,13 @@ fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
         .collect()
 }
 
+fn model_tool_names(loop_tools: &ToolBroker) -> Vec<String> {
+    model_tool_schemas(loop_tools)
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect()
+}
+
 fn model_messages_from_input(input: &AgentLoopInput, context: &ContextBundle) -> Vec<ModelMessage> {
     let mut messages = vec![ModelMessage::text(
         ModelRole::Developer,
@@ -1409,12 +1522,9 @@ fn model_messages_from_context(context: &ContextBundle) -> Vec<ModelMessage> {
 
 fn context_metadata(context: &ContextBundle) -> Value {
     json!({
-        "bundle_id": &context.bundle_id,
         "included_item_ids": &context.included_item_ids,
         "excluded_item_ids": &context.excluded_item_ids,
         "budget": &context.budget,
-        "render_policy": &context.render_policy,
-        "bundle_digest": &context.bundle_digest,
     })
 }
 
