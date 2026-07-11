@@ -365,7 +365,7 @@ pub use windows_impl::run_windows_sandbox_capture;
 #[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides;
 #[cfg(target_os = "windows")]
-pub use windows_impl::run_windows_sandbox_legacy_preflight;
+pub use windows_impl::run_windows_sandbox_restricted_token_preflight;
 #[cfg(target_os = "windows")]
 pub use winutil::quote_windows_arg;
 #[cfg(target_os = "windows")]
@@ -380,7 +380,7 @@ pub use stub::CaptureResult;
 #[cfg(not(target_os = "windows"))]
 pub use stub::run_windows_sandbox_capture;
 #[cfg(not(target_os = "windows"))]
-pub use stub::run_windows_sandbox_legacy_preflight;
+pub use stub::run_windows_sandbox_restricted_token_preflight;
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
@@ -390,13 +390,13 @@ mod windows_impl {
     use super::process::create_process_as_user;
     use super::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use super::sandbox_utils::ensure_sandbox_home_exists;
-    use super::spawn_prep::LegacyAclSids;
+    use super::spawn_prep::RestrictedTokenAclSids;
     use super::spawn_prep::SpawnPrepOptions;
     use super::spawn_prep::allow_null_device_for_workspace_write;
-    use super::spawn_prep::apply_legacy_session_acl_rules;
-    use super::spawn_prep::legacy_session_capability_roots;
-    use super::spawn_prep::prepare_legacy_session_security;
-    use super::spawn_prep::prepare_legacy_spawn_context;
+    use super::spawn_prep::apply_restricted_token_acl_rules;
+    use super::spawn_prep::prepare_restricted_token_security;
+    use super::spawn_prep::prepare_restricted_token_spawn_context;
+    use super::spawn_prep::restricted_token_capability_roots;
     use super::spawn_prep::root_capability_sids;
     use crate::absolute_path::AbsolutePathBuf;
     use crate::permissions::PermissionProfile;
@@ -610,7 +610,7 @@ mod windows_impl {
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
             .collect::<Vec<_>>();
-        let common = prepare_legacy_spawn_context(
+        let common = prepare_restricted_token_spawn_context(
             permission_profile,
             workspace_roots,
             sandbox_home,
@@ -637,22 +637,22 @@ mod windows_impl {
             anyhow::bail!("deny-read overrides require the elevated Windows sandbox backend");
         }
         let capability_roots =
-            legacy_session_capability_roots(&permissions, &current_dir, &env_map, sandbox_home);
-        let security = prepare_legacy_session_security(
+            restricted_token_capability_roots(&permissions, &current_dir, &env_map, sandbox_home);
+        let security = prepare_restricted_token_security(
             uses_write_capabilities,
             sandbox_home,
             cwd,
             capability_roots,
         )?;
         allow_null_device_for_workspace_write(uses_write_capabilities);
-        apply_legacy_session_acl_rules(
+        apply_restricted_token_acl_rules(
             &permissions,
             sandbox_home,
             &current_dir,
             &env_map,
             &additional_deny_read_paths,
             &additional_deny_write_paths,
-            LegacyAclSids {
+            RestrictedTokenAclSids {
                 readonly_sid: security.readonly_sid.as_ref(),
                 readonly_sid_str: security.readonly_sid_str.as_deref(),
                 write_root_sids: &security.write_root_sids,
@@ -754,7 +754,7 @@ mod windows_impl {
         })
     }
 
-    pub fn run_windows_sandbox_legacy_preflight(
+    pub fn run_windows_sandbox_restricted_token_preflight(
         permission_profile: &PermissionProfile,
         workspace_roots: &[AbsolutePathBuf],
         sandbox_home: &Path,
@@ -774,16 +774,16 @@ mod windows_impl {
         ensure_sandbox_home_exists(sandbox_home)?;
         let current_dir = cwd.to_path_buf();
         let capability_roots =
-            legacy_session_capability_roots(&permissions, &current_dir, env_map, sandbox_home);
+            restricted_token_capability_roots(&permissions, &current_dir, env_map, sandbox_home);
         let write_root_sids = root_capability_sids(sandbox_home, cwd, capability_roots)?;
-        apply_legacy_session_acl_rules(
+        apply_restricted_token_acl_rules(
             &permissions,
             sandbox_home,
             &current_dir,
             env_map,
             &[],
             &[],
-            LegacyAclSids {
+            RestrictedTokenAclSids {
                 readonly_sid: None,
                 readonly_sid_str: None,
                 write_root_sids: &write_root_sids,
@@ -839,14 +839,14 @@ mod windows_impl {
         }
 
         #[test]
-        fn legacy_preflight_skips_profiles_without_managed_filesystem_permissions() {
+        fn restricted_token_preflight_skips_profiles_without_managed_filesystem_permissions() {
             for permission_profile in [
                 PermissionProfile::Disabled,
                 PermissionProfile::External {
                     network: NetworkSandboxPolicy::Restricted,
                 },
             ] {
-                super::run_windows_sandbox_legacy_preflight(
+                super::run_windows_sandbox_restricted_token_preflight(
                     &permission_profile,
                     &[],
                     Path::new("."),
@@ -894,7 +894,7 @@ mod stub {
         bail!("Windows sandbox is only available on Windows")
     }
 
-    pub fn run_windows_sandbox_legacy_preflight(
+    pub fn run_windows_sandbox_restricted_token_preflight(
         _permission_profile: &PermissionProfile,
         _workspace_roots: &[AbsolutePathBuf],
         _sandbox_home: &Path,

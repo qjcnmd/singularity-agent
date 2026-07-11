@@ -1,6 +1,6 @@
 //! Shared helper utilities for Windows sandbox setup.
 //!
-//! These helpers centralize small pieces of setup logic used across both legacy and
+//! These helpers centralize small pieces of setup logic used across both restricted-token and
 //! elevated paths, including capture execution sessions and capture flows. They cover
 //! singularity home directory creation and git safe.directory injection so sandboxed
 //! users can run git inside a repo owned by the primary user.

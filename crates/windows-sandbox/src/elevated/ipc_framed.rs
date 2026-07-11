@@ -1,7 +1,7 @@
 //! Framed IPC protocol used between the parent (CLI) and the elevated command runner.
 //!
 //! This module defines the capture-only JSON message schema (spawn request/ready,
-//! output, exit, error, terminate) plus length-prefixed framing helpers. The legacy
+//! output, exit, error, terminate) plus length-prefixed framing helpers. The restricted-token
 //! restricted-token path spawns the child directly and does not use this protocol.
 
 use crate::absolute_path::AbsolutePathBuf;

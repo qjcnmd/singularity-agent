@@ -54,7 +54,7 @@ pub(crate) fn helper_bin_dir(sandbox_home: &Path) -> PathBuf {
     sandbox_bin_dir(sandbox_home)
 }
 
-pub(crate) fn legacy_lookup(kind: HelperExecutable) -> PathBuf {
+pub(crate) fn direct_helper_lookup(kind: HelperExecutable) -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
         && let Some(candidate) = bundled_executable_path_for_exe(&exe, kind.file_name())
     {
@@ -81,10 +81,10 @@ pub(crate) fn resolve_helper_for_launch(
             path
         }
         Err(err) => {
-            let fallback = legacy_lookup(kind);
+            let fallback = direct_helper_lookup(kind);
             log_note(
                 &format!(
-                    "helper copy failed for {}: {err:#}; falling back to legacy path {}",
+                    "helper copy failed for {}: {err:#}; using direct helper path {}",
                     kind.label(),
                     fallback.display()
                 ),
@@ -114,7 +114,7 @@ pub fn resolve_exe_for_launch(source: &Path, sandbox_home: &Path) -> PathBuf {
             let sandbox_log_dir = crate::sandbox_dir(sandbox_home);
             log_note(
                 &format!(
-                    "helper copy failed for executable: {err:#}; falling back to legacy path {}",
+                    "helper copy failed for executable: {err:#}; using source executable path {}",
                     source.display()
                 ),
                 Some(&sandbox_log_dir),

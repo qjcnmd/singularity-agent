@@ -3,7 +3,7 @@
 //! This module generates paired pipe names, creates server‑side pipes with
 //! sandbox-user-scoped ACLs, and waits for the runner to connect. It is
 //! **elevated-path only** and is
-//! used by the parent to establish the capture IPC channel. The legacy
+//! used by the parent to establish the capture IPC channel. The restricted-token
 //! restricted-token path spawns the child directly
 //! and does not use these helpers.
 
@@ -40,7 +40,7 @@ pub const PIPE_ACCESS_INBOUND: u32 = 0x0000_0001;
 pub const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
 
 /// Resolves the elevated command runner path, preferring the copied helper under
-/// `.sandbox-bin` and falling back to the legacy sibling lookup when needed.
+/// `.sandbox-bin` and using the bundled sibling lookup when needed.
 pub fn find_runner_exe(sandbox_home: &Path, log_dir: Option<&Path>) -> PathBuf {
     resolve_helper_for_launch(HelperExecutable::CommandRunner, sandbox_home, log_dir)
 }

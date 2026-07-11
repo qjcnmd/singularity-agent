@@ -52,7 +52,7 @@ pub(crate) struct SpawnPrepOptions {
     pub(crate) add_git_safe_directory: bool,
 }
 
-pub(crate) struct LegacySessionSecurity {
+pub(crate) struct RestrictedTokenSecurity {
     pub(crate) h_token: HANDLE,
     pub(crate) readonly_sid: Option<LocalSid>,
     pub(crate) readonly_sid_str: Option<String>,
@@ -65,7 +65,7 @@ pub(crate) struct RootCapabilitySid {
     pub(crate) sid_str: String,
 }
 
-pub(crate) struct LegacyAclSids<'a> {
+pub(crate) struct RestrictedTokenAclSids<'a> {
     pub(crate) readonly_sid: Option<&'a LocalSid>,
     pub(crate) readonly_sid_str: Option<&'a str>,
     pub(crate) write_root_sids: &'a [RootCapabilitySid],
@@ -111,7 +111,7 @@ fn prepare_spawn_context_common(
     })
 }
 
-pub(crate) fn prepare_legacy_spawn_context(
+pub(crate) fn prepare_restricted_token_spawn_context(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
     sandbox_home: &Path,
@@ -135,12 +135,12 @@ pub(crate) fn prepare_legacy_spawn_context(
     Ok(common)
 }
 
-pub(crate) fn prepare_legacy_session_security(
+pub(crate) fn prepare_restricted_token_security(
     uses_write_capabilities: bool,
     sandbox_home: &Path,
     cwd: &Path,
     capability_roots: impl IntoIterator<Item = PathBuf>,
-) -> Result<LegacySessionSecurity> {
+) -> Result<RestrictedTokenSecurity> {
     let caps = load_or_create_cap_sids(sandbox_home)?;
     let (h_token, readonly_sid, readonly_sid_str, write_root_sids) = unsafe {
         if uses_write_capabilities {
@@ -164,7 +164,7 @@ pub(crate) fn prepare_legacy_session_security(
         }
     };
 
-    Ok(LegacySessionSecurity {
+    Ok(RestrictedTokenSecurity {
         h_token,
         readonly_sid,
         readonly_sid_str,
@@ -172,7 +172,7 @@ pub(crate) fn prepare_legacy_session_security(
     })
 }
 
-pub(crate) fn legacy_session_capability_roots(
+pub(crate) fn restricted_token_capability_roots(
     permissions: &ResolvedWindowsSandboxPermissions,
     current_dir: &Path,
     env_map: &HashMap<String, String>,
@@ -256,14 +256,14 @@ pub(crate) fn allow_null_device_for_workspace_write(is_workspace_write: bool) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_legacy_session_acl_rules(
+pub(crate) fn apply_restricted_token_acl_rules(
     permissions: &ResolvedWindowsSandboxPermissions,
     sandbox_home: &Path,
     current_dir: &Path,
     env_map: &HashMap<String, String>,
     additional_deny_read_paths: &[PathBuf],
     additional_deny_write_paths: &[PathBuf],
-    acl_sids: LegacyAclSids<'_>,
+    acl_sids: RestrictedTokenAclSids<'_>,
 ) -> Result<()> {
     let AllowDenyPaths { allow, mut deny } =
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
@@ -340,9 +340,9 @@ pub(crate) fn apply_legacy_session_acl_rules(
 mod tests {
     use super::SpawnPrepOptions;
     use super::deny_root_capabilities_for_path;
-    use super::legacy_session_capability_roots;
-    use super::prepare_legacy_spawn_context;
+    use super::prepare_restricted_token_spawn_context;
     use super::prepare_spawn_context_common;
+    use super::restricted_token_capability_roots;
     use super::root_capability_sids;
     use crate::absolute_path::AbsolutePathBuf;
     use crate::cap::load_or_create_cap_sids;
@@ -400,13 +400,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_spawn_env_applies_offline_network_rewrite() {
+    fn restricted_token_spawn_env_applies_offline_network_rewrite() {
         let sandbox_home = TempDir::new().expect("tempdir");
         let cwd = TempDir::new().expect("tempdir");
         let mut env_map = HashMap::new();
         let workspace_roots = workspace_roots_for(cwd.path());
 
-        let _context = prepare_legacy_spawn_context(
+        let _context = prepare_restricted_token_spawn_context(
             &PermissionProfile::workspace_write(),
             workspace_roots.as_slice(),
             sandbox_home.path(),
@@ -418,7 +418,7 @@ mod tests {
                 add_git_safe_directory: false,
             },
         )
-        .expect("legacy env prep");
+        .expect("restricted-token env prep");
 
         assert_eq!(env_map.get("SBX_NONET_ACTIVE"), Some(&"1".to_string()));
         assert_eq!(
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_capability_roots_use_runtime_workspace_roots_for_workspace_root() {
+    fn restricted_token_capability_roots_use_runtime_workspace_roots_for_workspace_root() {
         let tmp = TempDir::new().expect("tempdir");
         let sandbox_home = tmp.path().join("singularity-home");
         let workspace_root = tmp.path().join("workspace");
@@ -482,7 +482,7 @@ mod tests {
             )
             .expect("managed permission profile");
 
-        let roots = legacy_session_capability_roots(
+        let roots = restricted_token_capability_roots(
             &permissions,
             &command_cwd,
             &HashMap::new(),
@@ -533,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_deny_path_includes_nested_active_root_sid() {
+    fn restricted_token_deny_path_includes_nested_active_root_sid() {
         let temp = TempDir::new().expect("tempdir");
         let sandbox_home = temp.path().join("singularity-home");
         let workspace = temp.path().join("workspace");
@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_capability_roots_use_effective_write_roots() {
+    fn restricted_token_capability_roots_use_effective_write_roots() {
         let temp = TempDir::new().expect("tempdir");
         let sandbox_home = temp.path().join("singularity-home");
         let workspace = temp.path().join("workspace");
@@ -599,7 +599,7 @@ mod tests {
             )
             .expect("managed permission profile");
 
-        let roots = legacy_session_capability_roots(
+        let roots = restricted_token_capability_roots(
             &permissions,
             &workspace,
             &HashMap::new(),
