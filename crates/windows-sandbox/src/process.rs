@@ -106,42 +106,63 @@ impl JobObject {
         Ok(())
     }
 
-    /// Terminates every process in the Job Object. If direct termination fails, close the
-    /// kill-on-close handle before returning the error so the containment boundary stays closed.
-    pub fn terminate(&self, exit_code: u32) -> Result<()> {
+    /// Closes the kill-on-close handle and therefore terminates any remaining processes in the
+    /// Job Object. This is idempotent so independent cleanup paths can converge safely.
+    pub fn close(&self) -> Result<()> {
         let mut guard = self
             .inner
             .handle
             .lock()
             .map_err(|_| anyhow!("Job Object handle lock poisoned"))?;
-        let handle = guard
-            .as_ref()
-            .copied()
-            .ok_or_else(|| anyhow!("Job Object is already closed"))?;
+        let Some(handle) = guard.take() else {
+            return Ok(());
+        };
+        if unsafe { CloseHandle(handle) } == 0 {
+            let close_error = last_error("CloseHandle failed for kill-on-close Job Object");
+            *guard = Some(handle);
+            if unsafe { TerminateJobObject(handle, 1) } != 0 {
+                return Err(close_error.context(
+                    "TerminateJobObject fallback succeeded after Job Object close failed",
+                ));
+            }
+            let terminate_error = last_error("TerminateJobObject fallback also failed");
+            return Err(anyhow!("{close_error:#}; {terminate_error:#}"));
+        }
+        Ok(())
+    }
+
+    /// Terminates every process in the Job Object. The handle remains available for a separate
+    /// cleanup step; callers that need to release capture pipes must use
+    /// [`JobObject::terminate_and_wait`].
+    pub fn terminate(&self, exit_code: u32) -> Result<()> {
+        let guard = self
+            .inner
+            .handle
+            .lock()
+            .map_err(|_| anyhow!("Job Object handle lock poisoned"))?;
+        let Some(handle) = guard.as_ref().copied() else {
+            return Ok(());
+        };
         if unsafe { TerminateJobObject(handle, exit_code) } != 0 {
             return Ok(());
         }
 
-        let error = last_error("TerminateJobObject failed");
-        if let Some(handle) = guard.take() {
-            if unsafe { CloseHandle(handle) } == 0 {
-                let close_error = last_error("CloseHandle failed for kill-on-close Job Object");
-                *guard = Some(handle);
-                return Err(anyhow!("{error:#}; {close_error:#}"));
-            }
-        }
-        Err(error)
+        Err(last_error("TerminateJobObject failed"))
     }
 
     pub fn terminate_and_wait(&self, process: HANDLE, exit_code: u32) -> Result<()> {
         let termination_error = self.terminate(exit_code).err();
+        let close_error = self.close().err();
         let wait_error = wait_for_process_termination(process).err();
-        match (termination_error, wait_error) {
-            (None, None) => Ok(()),
-            (Some(error), None) | (None, Some(error)) => Err(error),
-            (Some(termination_error), Some(wait_error)) => Err(anyhow!(
-                "{termination_error:#}; process termination wait also failed: {wait_error:#}"
-            )),
+        let errors = [termination_error, close_error, wait_error]
+            .into_iter()
+            .flatten()
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(errors.join("; ")))
         }
     }
 }
@@ -236,6 +257,19 @@ pub struct CreatedProcess {
     pub startup_info: STARTUPINFOW,
     pub job: JobObject,
     _desktop: LaunchDesktop,
+}
+
+impl CreatedProcess {
+    /// Transfers the process, Job Object, and launch desktop to the caller.
+    pub fn into_parts(self) -> (PROCESS_INFORMATION, JobObject, LaunchDesktop) {
+        let Self {
+            process_info,
+            job,
+            _desktop: desktop,
+            ..
+        } = self;
+        (process_info, job, desktop)
+    }
 }
 
 pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
@@ -431,6 +465,30 @@ pub struct PipeSpawnHandles {
     pub(crate) desktop: LaunchDesktop,
 }
 
+impl PipeSpawnHandles {
+    /// Transfers every handle and the launch desktop to the caller.
+    pub fn into_parts(
+        self,
+    ) -> (
+        PROCESS_INFORMATION,
+        JobObject,
+        Option<HANDLE>,
+        HANDLE,
+        Option<HANDLE>,
+        LaunchDesktop,
+    ) {
+        let Self {
+            process,
+            job,
+            stdin_write,
+            stdout_read,
+            stderr_read,
+            desktop,
+        } = self;
+        (process, job, stdin_write, stdout_read, stderr_read, desktop)
+    }
+}
+
 /// Spawns a process with anonymous pipes and returns the relevant handles.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_process_with_pipes(
@@ -568,8 +626,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::JobObject;
+    use std::io::Read;
     use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
     use std::process::Command;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::sync::mpsc::Receiver;
     use std::time::Duration;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -579,6 +642,153 @@ mod tests {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     const WAIT_OBJECT_0: u32 = 0;
+
+    type ReaderResult = Result<Vec<u8>, String>;
+
+    fn spawn_reader<R>(mut reader: R) -> Receiver<ReaderResult>
+    where
+        R: Read + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let result = reader
+                .read_to_end(&mut output)
+                .map(|_| output)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        receiver
+    }
+
+    fn escaped_ps_literal(path: &Path) -> String {
+        path.display().to_string().replace('\'', "''")
+    }
+
+    fn wait_for_descendant_pid(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "root process did not report descendant PID"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_reader_still_blocked(receiver: &Receiver<ReaderResult>, stream: &str) {
+        match receiver.recv_timeout(Duration::from_millis(250)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!("{stream} reader completed before Job cleanup: {other:?}"),
+        }
+    }
+
+    fn assert_reader_finished(receiver: &Receiver<ReaderResult>, stream: &str) -> Vec<u8> {
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{stream} reader did not finish after Job cleanup"))
+            .unwrap_or_else(|error| panic!("{stream} reader failed: {error}"))
+    }
+
+    fn spawn_capture_descendant(
+        parent_exits: bool,
+    ) -> (
+        tempfile::TempDir,
+        JobObject,
+        std::process::Child,
+        Receiver<ReaderResult>,
+        Receiver<ReaderResult>,
+        HANDLE,
+    ) {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let start_marker = temp.path().join("start");
+        let descendant_pid_file = temp.path().join("descendant.pid");
+        let start_marker_literal = escaped_ps_literal(&start_marker);
+        let descendant_pid_literal = escaped_ps_literal(&descendant_pid_file);
+        let parent_tail = if parent_exits {
+            "exit 0"
+        } else {
+            "Start-Sleep -Seconds 60"
+        };
+        let script = format!(
+            "$ErrorActionPreference='Stop'; \
+             while(-not (Test-Path -LiteralPath '{start_marker_literal}')) {{ \
+                 Start-Sleep -Milliseconds 10 \
+             }}; \
+             $child=Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') \
+                 -ArgumentList @('-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 60') \
+                 -NoNewWindow -PassThru; \
+             Set-Content -LiteralPath '{descendant_pid_literal}' -Value $child.Id; \
+             Write-Output 'parent stdout'; [Console]::Error.WriteLine('parent stderr'); \
+             {parent_tail}"
+        );
+
+        let mut root = Command::new("pwsh.exe")
+            .args(["-NoLogo", "-NoProfile", "-Command", &script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn capture root process");
+        let stdout = spawn_reader(root.stdout.take().expect("capture stdout"));
+        let stderr = spawn_reader(root.stderr.take().expect("capture stderr"));
+        let job = JobObject::create_kill_on_close().expect("create capture Job Object");
+        job.assign_process(root.as_raw_handle() as HANDLE)
+            .expect("assign capture root before descendant spawn");
+        std::fs::write(&start_marker, b"go").expect("release capture root process");
+
+        let descendant_pid = wait_for_descendant_pid(&descendant_pid_file);
+        let descendant = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, descendant_pid) };
+        assert_ne!(descendant, 0, "open descendant process for synchronization");
+        (temp, job, root, stdout, stderr, descendant)
+    }
+
+    #[test]
+    fn normal_parent_exit_closes_inherited_capture_handles_before_join() {
+        let (_temp, job, mut root, stdout, stderr, descendant) =
+            spawn_capture_descendant(/*parent_exits*/ true);
+        root.wait().expect("reap normal parent process");
+        assert_reader_still_blocked(&stdout, "stdout");
+        assert_reader_still_blocked(&stderr, "stderr");
+
+        job.close().expect("close capture Job Object");
+        let _ = assert_reader_finished(&stdout, "stdout");
+        let _ = assert_reader_finished(&stderr, "stderr");
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant, 5_000) },
+            WAIT_OBJECT_0,
+            "normal parent cleanup must terminate the inherited-handle descendant"
+        );
+        unsafe {
+            CloseHandle(descendant);
+        }
+    }
+
+    #[test]
+    fn timeout_termination_closes_inherited_capture_handles_before_join() {
+        let (_temp, job, mut root, stdout, stderr, descendant) =
+            spawn_capture_descendant(/*parent_exits*/ false);
+        assert_reader_still_blocked(&stdout, "stdout");
+        assert_reader_still_blocked(&stderr, "stderr");
+
+        job.terminate_and_wait(root.as_raw_handle() as HANDLE, 1)
+            .expect("terminate timed-out capture process tree");
+        root.wait().expect("reap timed-out parent process");
+        let _ = assert_reader_finished(&stdout, "stdout");
+        let _ = assert_reader_finished(&stderr, "stderr");
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant, 5_000) },
+            WAIT_OBJECT_0,
+            "timeout cleanup must terminate the inherited-handle descendant"
+        );
+        unsafe {
+            CloseHandle(descendant);
+        }
+    }
 
     #[test]
     fn terminating_job_terminates_descendant_processes() {

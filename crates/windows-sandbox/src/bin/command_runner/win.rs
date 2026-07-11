@@ -17,6 +17,7 @@ use singularity_windows_sandbox::ExitPayload;
 use singularity_windows_sandbox::FramedMessage;
 use singularity_windows_sandbox::IPC_PROTOCOL_VERSION;
 use singularity_windows_sandbox::JobObject;
+use singularity_windows_sandbox::LaunchDesktop;
 use singularity_windows_sandbox::LocalSid;
 use singularity_windows_sandbox::Message;
 use singularity_windows_sandbox::OutputPayload;
@@ -66,7 +67,9 @@ use windows_sys::Win32::System::Threading::OpenMutexW;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
+const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
+const WAIT_FAILED: u32 = u32::MAX;
 
 struct IpcSpawnedProcess {
     log_dir: PathBuf,
@@ -74,7 +77,38 @@ struct IpcSpawnedProcess {
     stdout_handle: HANDLE,
     stderr_handle: HANDLE,
     job: JobObject,
-    _pipe_handles: Option<PipeSpawnHandles>,
+    _desktop: LaunchDesktop,
+}
+
+impl IpcSpawnedProcess {
+    fn take_capture_handles(&mut self) -> (PROCESS_INFORMATION, HANDLE, HANDLE) {
+        let pi = std::mem::replace(&mut self.pi, unsafe { std::mem::zeroed() });
+        let stdout_handle = std::mem::replace(&mut self.stdout_handle, 0);
+        let stderr_handle = std::mem::replace(&mut self.stderr_handle, 0);
+        (pi, stdout_handle, stderr_handle)
+    }
+}
+
+impl Drop for IpcSpawnedProcess {
+    fn drop(&mut self) {
+        let _ = self.job.close();
+        unsafe {
+            if self.pi.hThread != 0 {
+                CloseHandle(self.pi.hThread);
+            }
+            if self.pi.hProcess != 0 {
+                CloseHandle(self.pi.hProcess);
+            }
+            if self.stdout_handle != 0 {
+                CloseHandle(self.stdout_handle);
+            }
+            if self.stderr_handle != 0
+                && self.stderr_handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            {
+                CloseHandle(self.stderr_handle);
+            }
+        }
+    }
 }
 
 /// Small RAII wrapper for raw Win32 handles.
@@ -273,19 +307,20 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         req.use_private_desktop,
         Some(log_dir.as_path()),
     )?;
-    let pi = spawned_pipes.process;
-    let job = spawned_pipes.job.clone();
-    let stdout_handle = spawned_pipes.stdout_read;
-    let stderr_handle = spawned_pipes
-        .stderr_read
-        .unwrap_or(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+    let (pi, job, stdin_write, stdout_handle, stderr_read, desktop) = spawned_pipes.into_parts();
+    if let Some(stdin_write) = stdin_write {
+        unsafe {
+            CloseHandle(stdin_write);
+        }
+    }
+    let stderr_handle = stderr_read.unwrap_or(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
     Ok(IpcSpawnedProcess {
         log_dir,
         pi,
         stdout_handle,
         stderr_handle,
         job,
-        _pipe_handles: Some(spawned_pipes),
+        _desktop: desktop,
     })
 }
 
@@ -317,26 +352,59 @@ fn spawn_output_reader(
     })
 }
 
+fn record_termination_error(slot: &StdMutex<Option<String>>, message: String) {
+    if let Ok(mut guard) = slot.lock()
+        && guard.is_none()
+    {
+        *guard = Some(message);
+    }
+}
+
 /// Read capture-control frames and terminate the child when requested.
 fn spawn_control_loop(
     mut reader: File,
     job: JobObject,
-    process: HANDLE,
     cancel_requested: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
     termination_error: Arc<StdMutex<Option<String>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         loop {
             let message = match read_frame(&mut reader) {
                 Ok(Some(message)) => message,
-                Ok(None) | Err(_) => break,
+                Ok(None) => {
+                    if shutdown_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    cancel_requested.store(true, Ordering::SeqCst);
+                    let message = match job.terminate(1) {
+                        Ok(()) => "runner control pipe closed before child completion".to_string(),
+                        Err(error) => format!(
+                            "runner control pipe closed before child completion; Job Object termination failed: {error:#}"
+                        ),
+                    };
+                    record_termination_error(&termination_error, message);
+                    break;
+                }
+                Err(error) => {
+                    if shutdown_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    cancel_requested.store(true, Ordering::SeqCst);
+                    let message = match job.terminate(1) {
+                        Ok(()) => format!("runner control pipe read failed: {error:#}"),
+                        Err(termination_error) => format!(
+                            "runner control pipe read failed: {error:#}; Job Object termination failed: {termination_error:#}"
+                        ),
+                    };
+                    record_termination_error(&termination_error, message);
+                    break;
+                }
             };
             if matches!(message.message, Message::Terminate { .. }) {
                 cancel_requested.store(true, Ordering::SeqCst);
-                if let Err(error) = job.terminate_and_wait(process, 1)
-                    && let Ok(mut guard) = termination_error.lock()
-                {
-                    *guard = Some(error.to_string());
+                if let Err(error) = job.terminate(1) {
+                    record_termination_error(&termination_error, error.to_string());
                 }
                 break;
             }
@@ -386,7 +454,7 @@ pub fn main() -> Result<()> {
         }
     };
 
-    let ipc_spawn = match spawn_ipc_process(&req) {
+    let mut ipc_spawn = match spawn_ipc_process(&req) {
         Ok(value) => value,
         Err(err) => {
             let _ = send_error(
@@ -398,11 +466,10 @@ pub fn main() -> Result<()> {
             return Err(err);
         }
     };
-    let log_dir = Some(ipc_spawn.log_dir.as_path());
-    let pi = ipc_spawn.pi;
-    let stdout_handle = ipc_spawn.stdout_handle;
-    let stderr_handle = ipc_spawn.stderr_handle;
+    let log_dir_path = ipc_spawn.log_dir.clone();
+    let log_dir = Some(log_dir_path.as_path());
     let job = ipc_spawn.job.clone();
+    let (pi, stdout_handle, stderr_handle) = ipc_spawn.take_capture_handles();
 
     let msg = FramedMessage {
         version: IPC_PROTOCOL_VERSION,
@@ -444,28 +511,40 @@ pub fn main() -> Result<()> {
     };
 
     let cancel_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
     let termination_error = Arc::new(StdMutex::new(None));
     let control_thread = spawn_control_loop(
         pipe_read,
         job.clone(),
-        pi.hProcess,
         Arc::clone(&cancel_requested),
+        Arc::clone(&shutdown_requested),
         Arc::clone(&termination_error),
     );
 
     let timeout = req.timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
     let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
     let timed_out = wait_res == WAIT_TIMEOUT;
-    if timed_out {
-        if let Err(error) = job.terminate_and_wait(pi.hProcess, 1)
-            && let Ok(mut guard) = termination_error.lock()
-        {
-            *guard = Some(error.to_string());
-        }
-    }
+    let wait_error = if wait_res != WAIT_OBJECT_0 && wait_res != WAIT_TIMEOUT {
+        Some(if wait_res == WAIT_FAILED {
+            let error = unsafe { GetLastError() };
+            format!("WaitForSingleObject failed while waiting for child: {error}")
+        } else {
+            format!("WaitForSingleObject returned unexpected status {wait_res}")
+        })
+    } else {
+        None
+    };
     let cancelled = !timed_out && cancel_requested.load(Ordering::SeqCst);
-    if cancelled {
-        let _ = control_thread.join();
+    let cleanup_error = if timed_out || cancelled || wait_error.is_some() {
+        job.terminate_and_wait(pi.hProcess, 1).err()
+    } else {
+        job.close().err()
+    };
+    if let Some(error) = wait_error {
+        record_termination_error(&termination_error, error);
+    }
+    if let Some(error) = cleanup_error {
+        record_termination_error(&termination_error, error.to_string());
     }
 
     let exit_code: i32;
@@ -502,6 +581,10 @@ pub fn main() -> Result<()> {
             /*windows_error_code*/ None,
             message.clone(),
         );
+        shutdown_requested.store(true, Ordering::SeqCst);
+        drop(pipe_write);
+        let _ = control_thread.join();
+        drop(ipc_spawn);
         anyhow::bail!(message);
     }
 
@@ -521,5 +604,9 @@ pub fn main() -> Result<()> {
         log_note(&format!("runner exit write failed: {err}"), log_dir);
     }
 
+    shutdown_requested.store(true, Ordering::SeqCst);
+    drop(pipe_write);
+    let _ = control_thread.join();
+    drop(ipc_spawn);
     std::process::exit(exit_code);
 }

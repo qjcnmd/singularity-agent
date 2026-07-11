@@ -89,13 +89,39 @@ fn restricted_children_are_job_bound_before_they_can_run() {
         "runner cancellation and timeout must terminate the whole Job Object"
     );
     assert!(
-        runner_source.contains("job.terminate_and_wait(process, 1)")
+        runner_source.contains("job.terminate(1)")
             && runner_source.contains("job.terminate_and_wait(pi.hProcess, 1)"),
-        "runner cancellation and timeout must both terminate and await the Job Object"
+        "runner transport, cancellation, and timeout paths must terminate the whole Job Object"
     );
     assert!(
-        library_source.contains("job.terminate_and_wait(pi.hProcess, 1)"),
-        "restricted-token fallback cancellation and timeout must terminate the Job Object"
+        runner_source.contains("runner control pipe closed before child completion")
+            && runner_source.contains("runner control pipe read failed"),
+        "runner control-pipe EOF and read errors must be treated as containment failures"
+    );
+    let runner_cleanup = runner_source
+        .find("let cleanup_error")
+        .expect("runner must close the Job Object after waiting for the child");
+    let runner_capture_join = runner_source
+        .find("out_thread.join()")
+        .expect("runner must join output readers");
+    assert!(
+        runner_cleanup < runner_capture_join,
+        "runner Job cleanup must happen before output reader joins"
+    );
+    assert!(
+        library_source.contains("job.close().err()")
+            && library_source.contains("job.terminate_and_wait(pi.hProcess, 1)"),
+        "restricted-token fallback normal exit and cancellation/timeout must clean up the Job Object"
+    );
+    let library_cleanup = library_source
+        .find("let cleanup_error")
+        .expect("restricted-token capture must clean up the Job Object");
+    let library_capture_join = library_source
+        .find("stdout_reader.join()")
+        .expect("restricted-token capture must join output readers");
+    assert!(
+        library_cleanup < library_capture_join,
+        "restricted-token Job cleanup must happen before output reader joins"
     );
 }
 

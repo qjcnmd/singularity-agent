@@ -686,9 +686,7 @@ mod windows_impl {
                 return Err(err);
             }
         };
-        let pi = created.process_info;
-        let job = created.job.clone();
-        let _desktop = created;
+        let (pi, job, _desktop) = created.into_parts();
 
         unsafe {
             CloseHandle(in_r);
@@ -705,14 +703,14 @@ mod windows_impl {
         let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
         let cancelled = matches!(wait_outcome, WaitOutcome::Cancelled);
         let mut exit_code_u32: u32 = 1;
-        let mut termination_error = None;
-        if !timed_out && !cancelled {
+        let cleanup_error = if !timed_out && !cancelled {
             unsafe {
                 GetExitCodeProcess(pi.hProcess, &mut exit_code_u32);
             }
+            job.close().err()
         } else {
-            termination_error = job.terminate_and_wait(pi.hProcess, 1).err();
-        }
+            job.terminate_and_wait(pi.hProcess, 1).err()
+        };
 
         unsafe {
             if pi.hThread != 0 {
@@ -729,8 +727,8 @@ mod windows_impl {
         let stderr_capture = stderr_reader.join().unwrap_or_else(|_| {
             crate::BoundedCapture::new(crate::DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM)
         });
-        if let Some(error) = termination_error {
-            return Err(error.context("terminate restricted-token sandbox process tree"));
+        if let Some(error) = cleanup_error {
+            return Err(error.context("clean up restricted-token sandbox process tree"));
         }
         let (stdout, stdout_truncated) = stdout_capture.into_parts();
         let (stderr, stderr_truncated) = stderr_capture.into_parts();
