@@ -126,8 +126,8 @@ fn agent_capability_uses_the_canonical_agent_loop_wire_name() {
         provider_readiness: ProviderReadiness {
             source: None,
             snapshot_id: "provider_snapshot_test".to_string(),
-            ready: false,
-            blocker: None,
+            configured: false,
+            configuration_blocker: None,
             api_key_present: false,
             base_url_present: false,
             model_present: false,
@@ -267,8 +267,8 @@ fn provider_readiness_uses_camel_case_redacted_wire_fields() {
     let readiness = ProviderReadiness {
         source: Some("process_env".to_string()),
         snapshot_id: "provider_snapshot_test".to_string(),
-        ready: false,
-        blocker: Some("required_env_missing".to_string()),
+        configured: false,
+        configuration_blocker: Some("required_env_missing".to_string()),
         api_key_present: true,
         base_url_present: false,
         model_present: true,
@@ -279,8 +279,8 @@ fn provider_readiness_uses_camel_case_redacted_wire_fields() {
         serde_json::json!({
             "source": "process_env",
             "snapshotId": "provider_snapshot_test",
-            "ready": false,
-            "blocker": "required_env_missing",
+            "configured": false,
+            "configurationBlocker": "required_env_missing",
             "apiKeyPresent": true,
             "baseUrlPresent": false,
             "modelPresent": true

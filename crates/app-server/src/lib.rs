@@ -1438,8 +1438,8 @@ fn provider_readiness(snapshot: &ProviderConfigSnapshot) -> ProviderReadiness {
     ProviderReadiness {
         source: snapshot.source().map(|source| source.as_str().to_string()),
         snapshot_id: snapshot.snapshot_id().to_string(),
-        ready: readiness.ready,
-        blocker: readiness
+        configured: readiness.ready,
+        configuration_blocker: readiness
             .blocker
             .as_ref()
             .map(|blocker| blocker.code().to_string()),

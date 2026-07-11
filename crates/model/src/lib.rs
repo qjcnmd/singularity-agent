@@ -436,12 +436,44 @@ pub enum ModelErrorCategory {
     UnknownProviderError,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorStage {
+    ClientInitialization,
+    RequestSend,
+    ResponseStatus,
+    ResponseBodyRead,
+    ResponseJsonDecode,
+    ResponseValidation,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTransportCategory {
+    Timeout,
+    Connect,
+    Request,
+    BodyRead,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelError {
     pub kind: ModelErrorKind,
     pub message: String,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ProviderErrorStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_category: Option<ProviderTransportCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_errors: Vec<String>,
 }
 
 impl ModelError {
@@ -451,6 +483,11 @@ impl ModelError {
             message: message.into(),
             provider_name: None,
             model_name: None,
+            code: None,
+            stage: None,
+            transport_category: None,
+            http_status: None,
+            validation_errors: Vec::new(),
         }
     }
 
@@ -461,6 +498,16 @@ impl ModelError {
 
     pub fn with_model(mut self, model_name: impl Into<String>) -> Self {
         self.model_name = Some(model_name.into());
+        self
+    }
+
+    pub fn with_provider_diagnostic(
+        mut self,
+        code: impl Into<String>,
+        stage: ProviderErrorStage,
+    ) -> Self {
+        self.code = Some(code.into());
+        self.stage = Some(stage);
         self
     }
 
@@ -843,6 +890,7 @@ fn openai_request_payload(request: &ModelTurnRequest, model_name: &str) -> Value
                 .collect::<Vec<_>>()
         );
         payload["tool_choice"] = openai_tool_choice_payload(request);
+        payload["parallel_tool_calls"] = json!(false);
     }
     payload
 }
@@ -964,11 +1012,7 @@ fn parse_openai_response(
             )
         })?;
     let message = choice.get("message").unwrap_or(&Value::Null);
-    let content = message
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let content = parse_openai_content(message.get("content"));
     let tool_calls = parse_openai_tool_calls(request, message);
     let assistant_message = Some(ModelMessage {
         tool_calls: tool_calls.clone(),
@@ -1004,11 +1048,18 @@ fn parse_openai_response(
         response.error = Some(
             ModelError::new(
                 ModelErrorKind::JsonSchemaViolation,
-                "provider response validation failed",
+                format!("provider_response_invalid: {}", validation.errors.join(",")),
             )
             .with_provider(config.provider_name.clone())
-            .with_model(config.model_name.clone()),
+            .with_model(config.model_name.clone())
+            .with_provider_diagnostic(
+                "provider_response_invalid",
+                ProviderErrorStage::ResponseValidation,
+            ),
         );
+        if let Some(error) = response.error.as_mut() {
+            error.validation_errors = validation.errors.clone();
+        }
     }
     response.validation = Some(validation);
     Ok(response)
@@ -1030,24 +1081,33 @@ fn parse_openai_tool_calls(request: &ModelTurnRequest, message: &Value) -> Vec<M
 }
 
 fn parse_openai_tool_call(
-    index: usize,
+    _index: usize,
     call: &Value,
     tool_name_map: &[(String, String)],
 ) -> ModelToolCall {
     let function = call.get("function").unwrap_or(&Value::Null);
-    let raw_arguments = function
-        .get("arguments")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let (arguments, parse_status, validation_errors) = parse_tool_arguments(&raw_arguments);
+    let arguments_value = function.get("arguments").unwrap_or(&Value::Null);
+    let raw_arguments = match arguments_value {
+        Value::String(raw) => raw.clone(),
+        Value::Object(_) => serde_json::to_string(arguments_value).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let (arguments, parse_status, validation_errors) = if arguments_value.is_object() {
+        (
+            arguments_value.clone(),
+            ModelToolParseStatus::Valid,
+            Vec::new(),
+        )
+    } else {
+        parse_tool_arguments(&raw_arguments)
+    };
     let wire_tool_name = function.get("name").and_then(Value::as_str).unwrap_or("");
     ModelToolCall {
         tool_call_id: call
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| format!("call_{index}")),
+            .unwrap_or_default(),
         tool_name: internal_tool_name(wire_tool_name, tool_name_map),
         arguments,
         raw_arguments,
@@ -1087,6 +1147,23 @@ fn parse_tool_arguments(raw_arguments: &str) -> (Value, ModelToolParseStatus, Ve
             ModelToolParseStatus::InvalidJson,
             vec!["invalid_json".to_string()],
         ),
+    }
+}
+
+fn parse_openai_content(content: Option<&Value>) -> String {
+    match content {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                (part.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| part.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(_) => String::new(),
     }
 }
 
@@ -1175,9 +1252,12 @@ fn model_error_from_http_status(status: u16, provider_name: &str, model_name: &s
     } else {
         format!("Provider returned HTTP {status}.")
     };
-    ModelError::new(kind, message)
+    let mut error = ModelError::new(kind, message)
         .with_provider(provider_name.to_string())
         .with_model(model_name.to_string())
+        .with_provider_diagnostic("provider_http_status", ProviderErrorStage::ResponseStatus);
+    error.http_status = Some(status);
+    error
 }
 
 fn provider_transport_error(error: reqwest::Error) -> ProviderError {
@@ -1186,7 +1266,21 @@ fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     } else {
         ModelErrorKind::NetworkError
     };
-    ProviderError::from_model_error(ModelError::new(kind, "provider transport failed"))
+    let category = if error.is_timeout() {
+        ProviderTransportCategory::Timeout
+    } else if error.is_connect() {
+        ProviderTransportCategory::Connect
+    } else if error.is_request() {
+        ProviderTransportCategory::Request
+    } else if error.is_body() {
+        ProviderTransportCategory::BodyRead
+    } else {
+        ProviderTransportCategory::Unknown
+    };
+    let mut model_error = ModelError::new(kind, "provider transport failed")
+        .with_provider_diagnostic("provider_transport_failed", ProviderErrorStage::RequestSend);
+    model_error.transport_category = Some(category);
+    ProviderError::from_model_error(model_error)
 }
 
 fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
@@ -1197,10 +1291,10 @@ fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
 }
 
 fn provider_cancelled_error() -> ProviderError {
-    ProviderError::from_model_error(ModelError::new(
-        ModelErrorKind::Cancelled,
-        "provider request cancelled",
-    ))
+    ProviderError::from_model_error(
+        ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled")
+            .with_provider_diagnostic("provider_request_cancelled", ProviderErrorStage::Cancelled),
+    )
 }
 
 fn block_on_provider_future<C, F, T>(
@@ -1237,6 +1331,10 @@ fn provider_response_json_error() -> ModelError {
     ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
         "provider response was not valid JSON",
+    )
+    .with_provider_diagnostic(
+        "provider_response_json_decode_failed",
+        ProviderErrorStage::ResponseJsonDecode,
     )
 }
 

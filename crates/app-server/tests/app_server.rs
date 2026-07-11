@@ -393,7 +393,7 @@ fn app_server_binary_reports_only_redacted_provider_readiness() {
             .as_str()
             .is_some_and(|value| value.starts_with("provider_snapshot_"))
     );
-    assert_eq!(provider["ready"], true);
+    assert_eq!(provider["configured"], true);
     assert!(provider["blocker"].is_null());
     assert_eq!(provider["apiKeyPresent"], true);
     assert_eq!(provider["baseUrlPresent"], true);
@@ -430,7 +430,7 @@ fn app_server_reuses_one_provider_snapshot_for_capability_reads() {
             .unwrap();
         let provider = &capability[0]["result"]["providerReadiness"];
         assert_eq!(provider["snapshotId"], expected_snapshot_id);
-        assert_eq!(provider["ready"], true);
+        assert_eq!(provider["configured"], true);
         assert!(provider["blocker"].is_null());
     }
 }
@@ -466,7 +466,7 @@ fn app_server_reports_agent_loop_capability_as_available() {
             .as_str()
             .is_some_and(|value| value.starts_with("provider_snapshot_"))
     );
-    assert!(provider["ready"].is_boolean());
+    assert!(provider["configured"].is_boolean());
     assert!(provider["blocker"].is_null() || provider["blocker"].is_string());
     assert!(provider["apiKeyPresent"].is_boolean());
     assert!(provider["baseUrlPresent"].is_boolean());

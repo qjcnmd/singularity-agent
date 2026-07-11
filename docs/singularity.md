@@ -125,7 +125,7 @@ sg run <goal>
 `AgentLoop::run` 的真实步骤为：
 
 1. 组装 developer、history 和当前 user message。
-2. 构造 `ModelTurnRequest` 和 builtin tool schema；每个模型回合请求最多允许一个 tool call，并按 provider capabilities 检查完整请求是否适合 context window。
+2. 构造 `ModelTurnRequest` 和 builtin tool schema；每个模型回合请求最多允许一个 tool call，OpenAI-compatible adapter 在带工具请求中发送 `parallel_tool_calls=false`，并按 adapter capability contract 检查完整请求是否适合 context window。
 3. 调用 provider，并在调用前后检查 `CancellationToken`。
 4. 在执行前按 provider capabilities 验证 response、tool call 数量、名称和 JSON arguments；违反单 tool-call 边界的响应直接 failed。
 5. 通过 `PolicyEngine` 得到 allow、deny 或 ask。
@@ -149,7 +149,7 @@ completion gate 保持以下不变量：
 
 `OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；超时、认证、rate limit、网络、model 配置和 response schema 错误保留不同类别。`AgentLoopResult` 和 `AgentRunStatus` 在内部携带 typed `ModelErrorCategory`（不进入 serde、CLI 或普通 trace）；Evaluation 依据该类别映射 `BlockerKind`，不从 human-readable error 文本推断。`evaluation.task_set/v3` 和 `evaluation.result/v2` 的公共语义不变。
 
-公共 readiness 只包含来源、snapshot id、ready、blocker code 和三个字段的 present/missing。API key、base URL 原值、Authorization header、原始 response 和原始 prompt 不进入 CLI 或 trace。
+公共 readiness 只表示配置状态，包含来源、snapshot id、`configured`、`configurationBlocker` 和三个字段的 present/missing；它不声称网络或模型请求已经成功。Provider error 只投影稳定 code、阶段、可靠 transport 类别、HTTP status 和 response validation codes。API key、base URL 原值、Authorization header、原始 response 和原始 prompt 不进入 CLI、Evaluation 或 trace。
 
 ## 8. Tool、Policy 与 Approval
 
