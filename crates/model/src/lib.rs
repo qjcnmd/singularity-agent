@@ -155,15 +155,11 @@ pub struct ModelToolCall {
 pub struct ModelCapabilities {
     pub supports_tools: bool,
     pub supports_parallel_tool_calls: bool,
-    pub supports_streaming: bool,
     pub supports_json_mode: bool,
-    pub supports_structured_outputs: bool,
     pub supports_system_message: bool,
     pub supports_developer_message: bool,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
-    pub input_modalities: Vec<String>,
-    pub output_modalities: Vec<String>,
 }
 
 impl Default for ModelCapabilities {
@@ -171,22 +167,17 @@ impl Default for ModelCapabilities {
         Self {
             supports_tools: true,
             supports_parallel_tool_calls: false,
-            supports_streaming: false,
             supports_json_mode: false,
-            supports_structured_outputs: false,
             supports_system_message: true,
             supports_developer_message: true,
             max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            input_modalities: vec!["text".to_string()],
-            output_modalities: vec!["text".to_string()],
         }
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelPreferences {
-    pub provider_name: Option<String>,
     pub model_name: Option<String>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -658,15 +649,11 @@ impl OpenAiProviderConfig {
         ModelCapabilities {
             supports_tools: true,
             supports_parallel_tool_calls: false,
-            supports_streaming: false,
             supports_json_mode: true,
-            supports_structured_outputs: false,
             supports_system_message: true,
             supports_developer_message: true,
             max_context_tokens: self.max_context_tokens,
             max_output_tokens: self.max_output_tokens,
-            input_modalities: vec!["text".to_string()],
-            output_modalities: vec!["text".to_string()],
         }
     }
 }

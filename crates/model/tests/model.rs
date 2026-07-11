@@ -898,7 +898,6 @@ fn model_errors_classify_provider_failures_without_transport_calls() {
 #[test]
 fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes() {
     let mut request = ModelTurnRequest::new("request_1", vec![]);
-    request.model_preferences.provider_name = Some("openai_compatible".to_string());
     request.model_preferences.model_name = Some("gpt-test".to_string());
 
     let request_result = validate_model_request(&request);
