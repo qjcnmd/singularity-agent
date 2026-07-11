@@ -370,7 +370,6 @@ pub enum ItemKind {
     Plan,
     CommandExecution,
     FileChange,
-    McpToolCall,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

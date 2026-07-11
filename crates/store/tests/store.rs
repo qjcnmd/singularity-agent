@@ -309,8 +309,6 @@ fn approval_creation_requires_explicit_existing_thread_turn_binding() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let request = ApprovalRequest {
         request_id: "approval_1".to_string(),
-        session_id: "session_legacy".to_string(),
-        task_id: "task_legacy".to_string(),
         thread_id: String::new(),
         turn_id: String::new(),
         tool_call_id: None,

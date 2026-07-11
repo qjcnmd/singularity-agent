@@ -251,10 +251,6 @@ fn item_kind_uses_codex_style_wire_names() {
         serde_json::to_value(ItemKind::CommandExecution).unwrap(),
         "commandExecution"
     );
-    assert_eq!(
-        serde_json::to_value(ItemKind::McpToolCall).unwrap(),
-        "mcpToolCall"
-    );
 }
 
 #[test]

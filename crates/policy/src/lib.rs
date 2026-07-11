@@ -324,8 +324,6 @@ pub enum ApprovalOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ApprovalRequest {
     pub request_id: String,
-    pub session_id: String,
-    pub task_id: String,
     pub thread_id: String,
     pub turn_id: String,
     pub tool_call_id: Option<String>,
@@ -342,14 +340,10 @@ impl ApprovalRequest {
         turn_id: impl Into<String>,
         action: impl Into<String>,
     ) -> Self {
-        let thread_id = thread_id.into();
-        let turn_id = turn_id.into();
         Self {
             request_id: request_id.into(),
-            session_id: thread_id.clone(),
-            task_id: turn_id.clone(),
-            thread_id,
-            turn_id,
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
             tool_call_id: None,
             action: action.into(),
             resources: Vec::new(),
