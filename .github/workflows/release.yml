@@ -14,7 +14,37 @@ defaults:
     shell: pwsh
 
 jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.96.0
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked --no-fail-fast
+
   windows-x86_64:
+    needs: verify
     runs-on: windows-latest
     outputs:
       package-name: ${{ steps.package.outputs.name }}
@@ -80,7 +110,7 @@ jobs:
 
   publish:
     if: github.ref_type == 'tag'
-    needs: windows-x86_64
+    needs: [verify, windows-x86_64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
