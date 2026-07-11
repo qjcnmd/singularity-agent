@@ -21,7 +21,6 @@ pub use singularity_sandbox::{
 };
 
 const TOOL_PROTOCOL_VERSION: &str = "1.0";
-const DEFAULT_TOOL_VERSION: &str = "0.0.1";
 const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";
 const UNKNOWN_TOOL_ERROR: &str = "unknown_tool";
 const TOOL_DENIED_ERROR: &str = "tool_denied";
@@ -36,9 +35,6 @@ const DEFAULT_GREP_MAX_MATCHES: usize = 200;
 const LARGE_OUTPUT_ARTIFACT_THRESHOLD: usize = 4_096;
 const DEFAULT_RESULT_PREVIEW_MAX_CHARS: usize = 4_096;
 const BINARY_CONTENT_PREVIEW: &str = "[binary content omitted]";
-const DIGEST_PREFIX: &str = "hash:";
-const FNV64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-const FNV64_PRIME: u64 = 0x100000001b3;
 const DIFF_ARTIFACT_PREFIX: &str = "artifact://diff/";
 const RESULT_ARTIFACT_PREFIX: &str = "artifact://result/";
 const PROTECTED_PATH_EXACT_MARKERS: [&str; 13] = [
@@ -67,23 +63,11 @@ const PROMPT_INJECTION_MARKERS: [&str; 4] = [
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionLevel {
-    ReadOnly,
-    Write,
-    Shell,
-    Git,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolSpec {
     pub name: String,
-    pub version: String,
     pub description: String,
     pub input_schema: Value,
-    pub permission_level: PermissionLevel,
-    pub risk_tags: Vec<String>,
 }
 
 impl ToolSpec {
@@ -94,11 +78,8 @@ impl ToolSpec {
     ) -> Self {
         Self {
             name: name.into(),
-            version: DEFAULT_TOOL_VERSION.to_string(),
             description: description.into(),
             input_schema,
-            permission_level: PermissionLevel::ReadOnly,
-            risk_tags: Vec::new(),
         }
     }
 
@@ -216,12 +197,8 @@ impl ToolBroker {
         if let ToolBrokerDecision::Deny { reason } = decision {
             return ToolResult::failed(envelope, TOOL_DENIED_ERROR, reason);
         }
-        if let ToolBrokerDecision::Ask {
-            approval_request_id,
-            reason,
-        } = decision
-        {
-            return ToolResult::approval_required(envelope, approval_request_id, reason);
+        if let ToolBrokerDecision::Ask { reason, .. } = decision {
+            return ToolResult::approval_required(envelope, reason);
         }
         ToolResult::from_result(envelope, &executor(envelope))
     }
@@ -295,21 +272,13 @@ pub struct ToolResult {
     pub tool_call_id: String,
     pub tool_name: String,
     pub ok: bool,
-    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
-    pub digest: String,
-    pub artifact_ref: Option<String>,
     pub error_code: Option<String>,
     pub artifact_refs: Vec<String>,
+    #[serde(skip)]
     pub result_id: Option<String>,
-    pub approval_request_id: Option<String>,
     pub truncated: bool,
-    pub redacted: bool,
-    #[serde(skip)]
-    policy_decision_id: Option<String>,
-    #[serde(skip)]
-    approval_grant_id: Option<String>,
     #[serde(skip)]
     audit_metadata: Option<Value>,
 }
@@ -320,38 +289,18 @@ impl ToolResult {
         tool_name: impl Into<String>,
         ok: bool,
         preview: impl Into<String>,
-        digest: impl Into<String>,
     ) -> Self {
         Self {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             ok,
-            status: if ok { "ok" } else { "error" }.to_string(),
             preview: Some(redact_public_text(&preview.into())),
-            digest: digest.into(),
-            artifact_ref: None,
             error_code: None,
             artifact_refs: Vec::new(),
             result_id: None,
-            approval_request_id: None,
             truncated: false,
-            redacted: true,
-            policy_decision_id: None,
-            approval_grant_id: None,
             audit_metadata: None,
         }
-    }
-
-    pub fn with_audit_metadata(
-        mut self,
-        policy_decision_id: impl Into<String>,
-        approval_grant_id: impl Into<String>,
-        metadata: Value,
-    ) -> Self {
-        self.policy_decision_id = Some(policy_decision_id.into());
-        self.approval_grant_id = Some(approval_grant_id.into());
-        self.audit_metadata = Some(metadata);
-        self
     }
 
     pub fn with_audit(mut self, metadata: Value) -> Self {
@@ -367,8 +316,18 @@ impl ToolResult {
         let result_content = result.content.to_string();
         let (preview, preview_truncated) =
             bounded_text(&result_content, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
-        let truncated = result.truncated || preview_truncated;
-        let artifact_ref = result_artifact_ref(&result.content, &result.metadata);
+        let truncated = result.truncated
+            || result
+                .content
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || result
+                .content
+                .get("output_truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || preview_truncated;
         let artifact_refs = result_artifact_refs(&result.content, &result.metadata);
         let result_id = result_id(&result.content, &result.metadata);
         let mut tool_result = Self {
@@ -379,17 +338,11 @@ impl ToolResult {
                 envelope.tool_name.clone(),
                 result.ok,
                 preview,
-                stable_digest(&result.content),
             )
         };
-        tool_result.artifact_ref = artifact_ref;
         tool_result.artifact_refs = artifact_refs;
         tool_result.result_id = result_id;
-        if truncated
-            && (tool_result.artifact_ref.is_some()
-                || !tool_result.artifact_refs.is_empty()
-                || tool_result.result_id.is_some())
-        {
+        if truncated && !tool_result.artifact_refs.is_empty() {
             tool_result.preview = None;
         }
         tool_result.audit_metadata = result.metadata.get("audit").cloned();
@@ -408,57 +361,38 @@ impl ToolResult {
                 envelope.tool_name.clone(),
                 false,
                 preview,
-                "",
             )
         }
     }
 
-    pub fn approval_required(
-        envelope: &ToolCallRequest,
-        approval_request_id: impl Into<String>,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            approval_request_id: Some(approval_request_id.into()),
-            ..Self::failed(envelope, TOOL_APPROVAL_REQUIRED_ERROR, reason)
-        }
+    pub fn approval_required(envelope: &ToolCallRequest, reason: impl Into<String>) -> Self {
+        Self::failed(envelope, TOOL_APPROVAL_REQUIRED_ERROR, reason)
     }
 
     pub fn to_message_payload(&self) -> Value {
-        let artifact_ref = self.artifact_ref.as_deref().and_then(safe_reference);
         let artifact_refs = self
             .artifact_refs
             .iter()
             .filter_map(|value| safe_reference(value))
             .collect::<Vec<_>>();
-        let result_id = self.result_id.as_deref().and_then(safe_reference);
         let mut payload = json!({
             "ok": self.ok,
             "tool_name": self.tool_name,
             "tool_call_id": self.tool_call_id,
-            "status": self.status,
-            "digest": self.digest,
-            "artifact_ref": artifact_ref,
-            "error_code": self.error_code,
-            "artifact_refs": artifact_refs,
-            "result_id": result_id,
             "truncated": self.truncated,
-            "redacted": self.redacted,
         });
+        if let Some(error_code) = self.error_code.as_deref() {
+            payload["error_code"] = json!(error_code);
+        }
+        if !artifact_refs.is_empty() {
+            payload["artifact_refs"] = json!(artifact_refs);
+        }
         if let Some(preview) = self.preview.as_deref() {
             let preview = redact_public_text(preview);
-            payload["content"] = json!(preview);
             payload["preview"] = json!(preview);
         }
         payload
     }
-}
-
-fn result_artifact_ref(content: &Value, metadata: &Value) -> Option<String> {
-    value_string(content.get("artifact_ref"))
-        .or_else(|| value_string(content.get("diff_ref")))
-        .or_else(|| value_string(metadata.get("artifact_ref")))
-        .or_else(|| value_string(metadata.get("diff_ref")))
 }
 
 fn result_artifact_refs(content: &Value, metadata: &Value) -> Vec<String> {
@@ -1053,10 +987,7 @@ fn validate_tool_name(name: &str) -> Result<(), String> {
     }
     match parts.as_slice() {
         ["builtin", _tool] => Ok(()),
-        ["mcp", _server, _tool] => Ok(()),
-        _ => Err(format!(
-            "tool name must use builtin.* or mcp.<server>.<tool>: {name}"
-        )),
+        _ => Err(format!("tool name must use builtin.<tool>: {name}")),
     }
 }
 
@@ -1138,15 +1069,6 @@ fn bounded_text(content: &str, max_chars: usize) -> (String, bool) {
     let preview = content.chars().take(max_chars).collect::<String>();
     let truncated = content.chars().count() > preview.chars().count();
     (preview, truncated)
-}
-
-fn stable_digest(value: &Value) -> String {
-    let mut digest = FNV64_OFFSET_BASIS;
-    for byte in value.to_string().as_bytes() {
-        digest ^= u64::from(*byte);
-        digest = digest.wrapping_mul(FNV64_PRIME);
-    }
-    format!("{DIGEST_PREFIX}{digest:016x}")
 }
 
 fn artifact_ref(prefix: &str, path: &str) -> String {

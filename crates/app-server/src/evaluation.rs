@@ -1472,13 +1472,8 @@ mod tests {
         command: &CommandSpec,
         workspace: &Path,
     ) -> singularity_tools::ToolResult {
-        let mut result = singularity_tools::ToolResult::summary(
-            tool_call_id,
-            TOOL_COMMAND,
-            true,
-            "ok",
-            "digest",
-        );
+        let mut result =
+            singularity_tools::ToolResult::summary(tool_call_id, TOOL_COMMAND, true, "ok");
         result.result_id = Some(command_scope_digest(
             command.argv.as_slice(),
             &resolved_smoke_cwd(workspace, command).expect("resolved smoke cwd"),
@@ -1572,13 +1567,8 @@ mod tests {
             ],
             smoke_commands: vec![smoke.clone()],
         };
-        let mutation = singularity_tools::ToolResult::summary(
-            "call-edit",
-            TOOL_EDIT,
-            true,
-            "changed",
-            "digest",
-        );
+        let mutation =
+            singularity_tools::ToolResult::summary("call-edit", TOOL_EDIT, true, "changed");
         let smoke_result = successful_command_result("call-smoke", &smoke, workspace.path());
 
         let stale = completed_agent_result(vec![smoke_result.clone(), mutation.clone()]);
