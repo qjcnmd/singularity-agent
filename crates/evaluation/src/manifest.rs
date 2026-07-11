@@ -104,7 +104,7 @@ impl EvaluationTask {
                 }
             }
         };
-        let test_patch = self.evaluator.test_patch.clone();
+        let public_test_patch = self.evaluator.public_test_patch.clone();
         Ok(WorkspacePlan {
             task_id: self.task_id.clone(),
             source,
@@ -113,7 +113,7 @@ impl EvaluationTask {
                 seed: WorkspaceSeed::TaskSource,
                 expectation: CommandExpectation::Failure,
                 setup_commands: self.workspace.setup_commands.clone(),
-                test_patch: test_patch.clone(),
+                test_patch: public_test_patch.clone(),
                 commands: self.evaluator.baseline.commands.clone(),
             },
             agent: AgentStagePlan {
@@ -127,7 +127,7 @@ impl EvaluationTask {
                 seed: WorkspaceSeed::AgentOutput,
                 expectation: CommandExpectation::Success,
                 setup_commands: self.workspace.setup_commands.clone(),
-                test_patch: test_patch.clone(),
+                test_patch: public_test_patch,
                 commands: self.evaluator.public.commands.clone(),
             },
             hidden: VerificationStagePlan {
@@ -135,7 +135,7 @@ impl EvaluationTask {
                 seed: WorkspaceSeed::AgentOutput,
                 expectation: CommandExpectation::Success,
                 setup_commands: self.workspace.setup_commands.clone(),
-                test_patch,
+                test_patch: self.evaluator.hidden_test_patch.clone(),
                 commands: self.evaluator.hidden.commands.clone(),
             },
         })
@@ -210,7 +210,9 @@ impl AgentTaskSpec {
 #[serde(deny_unknown_fields)]
 pub struct EvaluatorSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub test_patch: Option<EvaluatorTestPatch>,
+    pub public_test_patch: Option<EvaluatorTestPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_test_patch: Option<EvaluatorTestPatch>,
     pub baseline: EvaluatorStageSpec,
     pub public: EvaluatorStageSpec,
     pub hidden: EvaluatorStageSpec,
@@ -218,8 +220,18 @@ pub struct EvaluatorSpec {
 
 impl EvaluatorSpec {
     fn validate(&self, task_id: &TaskId) -> Result<()> {
-        if let Some(test_patch) = &self.test_patch {
-            test_patch.validate(task_id)?;
+        if let Some(test_patch) = &self.public_test_patch {
+            test_patch.validate(task_id, "evaluator.public_test_patch")?;
+        }
+        if let Some(test_patch) = &self.hidden_test_patch {
+            test_patch.validate(task_id, "evaluator.hidden_test_patch")?;
+        }
+        if self.public_test_patch == self.hidden_test_patch
+            && self.public.commands == self.hidden.commands
+        {
+            return Err(validation_error(format!(
+                "evaluation task {task_id} requires independent public and hidden verification evidence"
+            )));
         }
         self.baseline.validate(task_id, "evaluator.baseline")?;
         self.public.validate(task_id, "evaluator.public")?;
@@ -299,10 +311,10 @@ impl EvaluatorTestPatch {
         &self.content
     }
 
-    fn validate(&self, task_id: &TaskId) -> Result<()> {
+    fn validate(&self, task_id: &TaskId, field: &str) -> Result<()> {
         if self.content.trim().is_empty() {
             return Err(validation_error(format!(
-                "evaluation task {task_id} evaluator.test_patch.content must not be empty"
+                "evaluation task {task_id} {field}.content must not be empty"
             )));
         }
         Ok(())

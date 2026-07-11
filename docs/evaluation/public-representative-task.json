@@ -77,9 +77,13 @@
         ]
       },
       "evaluator": {
-        "test_patch": {
+        "public_test_patch": {
           "format": "unified_diff",
           "content": "diff --git a/test/rules/std_L060_test.py b/test/rules/std_L060_test.py\nnew file mode 100644\n--- /dev/null\n+++ b/test/rules/std_L060_test.py\n@@ -0,0 +1,12 @@\n+\"\"\"Tests the python routines within L060.\"\"\"\n+import sqlfluff\n+\n+\n+def test__rules__std_L060_raised() -> None:\n+    \"\"\"L060 is raised for use of ``IFNULL`` or ``NVL``.\"\"\"\n+    sql = \"SELECT\\n\\tIFNULL(NULL, 100),\\n\\tNVL(NULL,100);\"\n+    result = sqlfluff.lint(sql, rules=[\"L060\"])\n+\n+    assert len(result) == 2\n+    assert result[0][\"description\"] == \"Use 'COALESCE' instead of 'IFNULL'.\"\n+    assert result[1][\"description\"] == \"Use 'COALESCE' instead of 'NVL'.\"\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/test/rules/std_L060_hidden_test.py b/test/rules/std_L060_hidden_test.py\nnew file mode 100644\n--- /dev/null\n+++ b/test/rules/std_L060_hidden_test.py\n@@ -0,0 +1,14 @@\n+\"\"\"Independent hidden checks for L060 diagnostics.\"\"\"\n+import pytest\n+import sqlfluff\n+\n+\n+@pytest.mark.parametrize(\n+    (\"function_name\", \"description\"),\n+    [(\"IFNULL\", \"Use 'COALESCE' instead of 'IFNULL'.\"),\n+     (\"NVL\", \"Use 'COALESCE' instead of 'NVL'.\")],\n+)\n+def test__rules__std_L060_individual_diagnostics(function_name, description) -> None:\n+    result = sqlfluff.lint(f\"SELECT {function_name}(1, 2)\", rules=[\"L060\"])\n+    assert len(result) == 1\n+    assert result[0][\"description\"] == description\n"
         },
         "baseline": {
           "commands": [
@@ -114,7 +118,7 @@
                 ".venv/Scripts/python.exe",
                 "-m",
                 "pytest",
-                "test/rules/std_L060_test.py::test__rules__std_L060_raised"
+                "test/rules/std_L060_hidden_test.py::test__rules__std_L060_individual_diagnostics"
               ],
               "timeout_seconds": 300
             }

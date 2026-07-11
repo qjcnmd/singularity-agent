@@ -7,7 +7,8 @@ use singularity_evaluation::{
 };
 
 const IMMUTABLE_COMMIT: &str = "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030";
-const TEST_PATCH_MARKER: &str = "EVALUATOR_ONLY_PATCH_MARKER";
+const PUBLIC_TEST_PATCH_MARKER: &str = "PUBLIC_EVALUATOR_ONLY_PATCH_MARKER";
+const HIDDEN_TEST_PATCH_MARKER: &str = "HIDDEN_EVALUATOR_ONLY_PATCH_MARKER";
 
 fn valid_manifest() -> Value {
     json!({
@@ -46,9 +47,13 @@ fn valid_manifest() -> Value {
                     ]
                 },
                 "evaluator": {
-                    "test_patch": {
+                    "public_test_patch": {
                         "format": "unified_diff",
-                        "content": TEST_PATCH_MARKER
+                        "content": PUBLIC_TEST_PATCH_MARKER
+                    },
+                    "hidden_test_patch": {
+                        "format": "unified_diff",
+                        "content": HIDDEN_TEST_PATCH_MARKER
                     },
                     "baseline": {
                         "commands": [
@@ -419,32 +424,51 @@ fn workspace_plan_has_typed_isolated_baseline_agent_public_and_hidden_stages() {
 }
 
 #[test]
-fn evaluator_only_test_patch_never_enters_agent_visible_projection() {
+fn evaluator_only_test_patches_never_enter_agent_visible_projection() {
     let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
     let task = &manifest.task_set().tasks[0];
     let projection = task.agent_projection();
     let projection_json = serde_json::to_string(&projection).expect("serialize projection");
 
-    assert!(!projection_json.contains(TEST_PATCH_MARKER));
+    assert!(!projection_json.contains(PUBLIC_TEST_PATCH_MARKER));
+    assert!(!projection_json.contains(HIDDEN_TEST_PATCH_MARKER));
     assert!(!projection_json.contains("test_patch"));
     assert!(!projection_json.contains("evaluator"));
 
     let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
     let plan = manifest.workspace_plan(&task_id).expect("build plan");
     let agent_plan_json = serde_json::to_string(&plan.agent).expect("serialize agent plan");
-    assert!(!agent_plan_json.contains(TEST_PATCH_MARKER));
+    assert!(!agent_plan_json.contains(PUBLIC_TEST_PATCH_MARKER));
+    assert!(!agent_plan_json.contains(HIDDEN_TEST_PATCH_MARKER));
     assert!(
         plan.baseline
             .test_patch
             .as_ref()
-            .is_some_and(|patch| patch.content() == TEST_PATCH_MARKER)
+            .is_some_and(|patch| patch.content() == PUBLIC_TEST_PATCH_MARKER)
+    );
+    assert!(
+        plan.public
+            .test_patch
+            .as_ref()
+            .is_some_and(|patch| patch.content() == PUBLIC_TEST_PATCH_MARKER)
     );
     assert!(
         plan.hidden
             .test_patch
             .as_ref()
-            .is_some_and(|patch| patch.content() == TEST_PATCH_MARKER)
+            .is_some_and(|patch| patch.content() == HIDDEN_TEST_PATCH_MARKER)
     );
+}
+
+#[test]
+fn manifest_rejects_duplicate_public_and_hidden_verification_evidence() {
+    let mut value = valid_manifest();
+    value["tasks"][0]["evaluator"]["hidden_test_patch"] =
+        value["tasks"][0]["evaluator"]["public_test_patch"].clone();
+    value["tasks"][0]["evaluator"]["hidden"] = value["tasks"][0]["evaluator"]["public"].clone();
+
+    let error = parse_manifest(&value).expect_err("duplicate evidence must be rejected");
+    assert!(error.to_string().contains("independent public and hidden"));
 }
 
 #[test]
@@ -524,7 +548,8 @@ fn public_representative_manifest_is_validated_by_the_crate() {
     let projection = manifest.task_set().tasks[0].agent_projection();
     let projection_json = serde_json::to_string(&projection).expect("serialize projection");
     assert!(!projection_json.contains("test_patch"));
-    assert!(!projection_json.contains(TEST_PATCH_MARKER));
+    assert!(!projection_json.contains(PUBLIC_TEST_PATCH_MARKER));
+    assert!(!projection_json.contains(HIDDEN_TEST_PATCH_MARKER));
 }
 
 #[test]
