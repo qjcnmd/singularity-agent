@@ -582,12 +582,58 @@ fn public_representative_manifest_is_validated_by_the_crate() {
         .join("public-representative-task.json");
     let manifest = EvaluationManifest::load(&path).expect("load public manifest");
 
-    assert_eq!(manifest.task_set().tasks.len(), 1);
-    let projection = manifest.task_set().tasks[0].agent_projection();
-    let projection_json = serde_json::to_string(&projection).expect("serialize projection");
-    assert!(!projection_json.contains("test_patch"));
-    assert!(!projection_json.contains(PUBLIC_TEST_PATCH_MARKER));
-    assert!(!projection_json.contains(HIDDEN_TEST_PATCH_MARKER));
+    assert_eq!(manifest.task_set().tasks.len(), 2);
+    for task in &manifest.task_set().tasks {
+        let projection = task.agent_projection();
+        let projection_json = serde_json::to_string(&projection).expect("serialize projection");
+        assert!(!projection_json.contains("test_patch"));
+        assert!(!projection_json.contains(PUBLIC_TEST_PATCH_MARKER));
+        assert!(!projection_json.contains(HIDDEN_TEST_PATCH_MARKER));
+    }
+
+    let task = manifest
+        .task_set()
+        .tasks
+        .iter()
+        .find(|task| task.task_id.as_str() == "receipt_calculator__multi_line_receipt")
+        .expect("local receipt task");
+    let projection = task.agent_projection();
+    assert_eq!(
+        projection
+            .allowed_paths
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<Vec<_>>(),
+        ["pricing.py", "receipt.py"]
+    );
+    assert_eq!(
+        projection.smoke_commands[0].argv.as_slice(),
+        ["python", "-B", "smoke_test.py"]
+    );
+    let projection_json = serde_json::to_string(&projection).expect("serialize receipt projection");
+    assert!(!projection_json.contains("test_public_receipt.py"));
+    assert!(!projection_json.contains("test_hidden_receipt.py"));
+    assert!(!projection_json.contains("evaluator"));
+
+    let plan = manifest
+        .workspace_plan(&task.task_id)
+        .expect("build local receipt plan");
+    let expected_fixture = manifest
+        .manifest_dir()
+        .join("fixtures")
+        .join("receipt-calculator");
+    assert_eq!(
+        plan.source,
+        PlannedWorkspaceSource::Local {
+            path: expected_fixture
+        }
+    );
+    let public_patch = plan.public.test_patch.as_ref().expect("public patch");
+    let hidden_patch = plan.hidden.test_patch.as_ref().expect("hidden patch");
+    assert!(public_patch.content().contains("test_public_receipt.py"));
+    assert!(hidden_patch.content().contains("test_hidden_receipt.py"));
+    assert_ne!(public_patch.content(), hidden_patch.content());
+    assert_ne!(plan.public.commands, plan.hidden.commands);
 }
 
 #[test]

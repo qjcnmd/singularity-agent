@@ -125,6 +125,104 @@
           ]
         }
       }
+    },
+    {
+      "task_id": "receipt_calculator__multi_line_receipt",
+      "description": "Small local Python representative task for multi-line decimal receipt totals.",
+      "workspace": {
+        "source": {
+          "type": "local",
+          "path": "fixtures/receipt-calculator"
+        }
+      },
+      "agent": {
+        "instructions": "Fix the seeded multi-line receipt bug in pricing.py and receipt.py. Apply the smallest focused changes needed so subtotal handles every item and the receipt total includes tax; do not modify smoke_test.py or add dependencies. Use the host Python executable and call builtin.command with exactly [\"python\", \"-B\", \"smoke_test.py\"] after your focused edits. Continue until that exact smoke command succeeds, then report the verification result.",
+        "allowed_paths": [
+          "pricing.py",
+          "receipt.py"
+        ],
+        "allowed_tools": [
+          "builtin.read",
+          "builtin.grep",
+          "builtin.edit",
+          "builtin.patch",
+          "builtin.command"
+        ],
+        "smoke_commands": [
+          {
+            "argv": [
+              "python",
+              "-B",
+              "smoke_test.py"
+            ],
+            "timeout_seconds": 30
+          }
+        ]
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/test_public_receipt.py b/tests/test_public_receipt.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_public_receipt.py\n@@ -0,0 +1,23 @@\n+import unittest\n+from decimal import Decimal\n+\n+from pricing import subtotal\n+from receipt import build_receipt\n+\n+\n+class PublicReceiptTests(unittest.TestCase):\n+    def test_public_receipt_aggregates_all_lines(self):\n+        items = [(\"2.50\", 2), (\"1.25\", 3)]\n+        self.assertEqual(subtotal(items), Decimal(\"8.75\"))\n+        self.assertEqual(\n+            build_receipt(items, \"0.10\"),\n+            {\n+                \"subtotal\": Decimal(\"8.75\"),\n+                \"tax\": Decimal(\"0.88\"),\n+                \"total\": Decimal(\"9.63\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/test_hidden_receipt.py b/tests/test_hidden_receipt.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_hidden_receipt.py\n@@ -0,0 +1,26 @@\n+import unittest\n+from decimal import Decimal\n+\n+from pricing import subtotal\n+from receipt import build_receipt\n+\n+\n+class HiddenReceiptTests(unittest.TestCase):\n+    def test_empty_subtotal_is_zero(self):\n+        self.assertEqual(subtotal([]), Decimal(\"0.00\"))\n+\n+    def test_hidden_receipt_rounds_fractional_tax_after_all_lines(self):\n+        items = [(\"19.99\", 1), (\"0.01\", 1)]\n+        self.assertEqual(subtotal(items), Decimal(\"20.00\"))\n+        self.assertEqual(\n+            build_receipt(items, \"0.075\"),\n+            {\n+                \"subtotal\": Decimal(\"20.00\"),\n+                \"tax\": Decimal(\"1.50\"),\n+                \"total\": Decimal(\"21.50\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_public_receipt.py"
+              ],
+              "timeout_seconds": 60
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_public_receipt.py"
+              ],
+              "timeout_seconds": 60
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_hidden_receipt.py"
+              ],
+              "timeout_seconds": 60
+            }
+          ]
+        }
+      }
     }
   ]
 }

@@ -30,7 +30,7 @@ Singularity 是 Windows 本地命令行编码代理，由四个 release binary �
 | `model` | provider 配置快照、模型对象、OpenAI-compatible HTTP adapter | `ProviderConfigSnapshot`、`ModelTurnRequest`、`OpenAiProvider` |
 | `agent` | 上下文组装、模型/工具循环、repair、approval resume 和 completion gate | `AgentLoop`、`AgentLoopInput`、`AgentLoopResult` |
 | `store` | SQLite thread/turn/item/trace/approval/artifact ledger | `SessionStore`、`StartedTurn`、`CommittedTurnOutcome` |
-| `evaluation` | evaluation v2 manifest、计划和 result 数据模型 | `EvaluationManifest`、`WorkspacePlan`、`EvaluationResult` |
+| `evaluation` | `evaluation.task_set/v3` manifest、计划和 `evaluation.result/v2` result 数据模型 | `EvaluationManifest`、`WorkspacePlan`、`EvaluationResult` |
 | `app-server` | 协议调度、runtime 装配、并发 turn、持久化和 evaluation 执行 | `AppServer` |
 | `cli` | 最终用户命令和 app-server 子进程客户端 | `Command`、`AppServerClient` |
 
