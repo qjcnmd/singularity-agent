@@ -168,7 +168,7 @@ builtin.command
 
 默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。`WorkspaceTools` 对所有路径执行 lexical normalize、canonicalize existing parent、workspace containment 和 protected component 检查；多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
 
-当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint。`approval/decision` 是单次消费：只有 allow、绑定完全匹配、checkpoint 完整、原 turn 仍 blocked、thread active 时才恢复该 pending call，然后继续完整 AgentLoop；deny/defer 不执行工具。客户端不能通过 `approval/request` 自行向 ledger 注入请求。checkpoint 不进入 approval list、result 或 trace 的公共投影。
+当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint。allow/deny 是单次消费；defer 只写脱敏审计事件，不写 decision ledger、不消费 approval，也不删除 checkpoint，因此之后仍可 allow、deny 或再次 defer。allow 在恢复前把内部 execution state 从 `pending` 推进为 `approved`、再认领为 `executing`；工具循环返回持久化边界后记为 `outcome_recorded`，Turn 结果提交后才清理 checkpoint。停在 `executing` 的调用不得静默重放非幂等工具；当前保证是 at-most-once execution attempt，不宣称 exactly-once。deny 不执行工具并终止 blocked Turn。客户端不能通过 `approval/request` 自行向 ledger 注入请求。checkpoint 与 execution state 不进入 approval list、result 或 trace 的公共投影。
 
 发送给模型的 tool result 只包含 `ok`、工具/调用标识、有界且脱敏的 `preview`、可用的 artifact references、错误码和截断标记；内部 result id、raw arguments、approval id、policy id、audit metadata 和 secret-like 文本不投影。已有 artifact reference 时不重复发送 preview；只有内部 result id 而没有 artifact reference 时仍保留有界 preview。
 

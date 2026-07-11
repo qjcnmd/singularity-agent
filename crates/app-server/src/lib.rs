@@ -34,7 +34,7 @@ use singularity_protocol::{
     TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
     TurnStartResult, TurnStatus,
 };
-use singularity_store::{CommittedTurnOutcome, SessionStore, StoreError};
+use singularity_store::{CommittedTurnOutcome, PendingExecutionState, SessionStore, StoreError};
 use singularity_tools::{
     CommandToolInput, SandboxBackend, ToolBroker, ToolRegistry, ToolSpec, WindowsSandboxBackend,
     WorkspaceTools, command_scope_digest,
@@ -1006,6 +1006,13 @@ impl AppServer {
             }
         };
         let pending_tool_call = recorded.pending_tool_call.clone();
+        if matches!(decision.outcome, ApprovalOutcome::Allow) && pending_tool_call.is_some() {
+            self.store.transition_pending_execution(
+                &decision.request_id,
+                PendingExecutionState::Approved,
+                PendingExecutionState::Executing,
+            )?;
+        }
         let active_turn =
             if matches!(decision.outcome, ApprovalOutcome::Allow) && pending_tool_call.is_some() {
                 Some(self.activate_turn(&recorded.request.turn_id)?)
@@ -1024,6 +1031,11 @@ impl AppServer {
         )?;
         let mut messages = Vec::new();
         let terminal = if let Some(resumed) = resumed {
+            self.store.transition_pending_execution(
+                &decision.request_id,
+                PendingExecutionState::Executing,
+                PendingExecutionState::OutcomeRecorded,
+            )?;
             Some(resumed)
         } else {
             self.approval_no_resume_status(
@@ -1034,6 +1046,9 @@ impl AppServer {
         };
         if let Some((turn, run_status)) = terminal {
             let committed = self.commit_turn_run_status(turn, &run_status, &cancellation)?;
+            if matches!(decision.outcome, ApprovalOutcome::Allow) && pending_tool_call.is_some() {
+                self.store.delete_pending_execution(&decision.request_id)?;
+            }
             messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
             messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
         }

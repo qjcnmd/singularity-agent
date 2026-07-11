@@ -821,7 +821,7 @@ fn turn_start_rejects_agent_host_selector_before_turn_creation() {
 }
 
 #[test]
-fn approval_decisions_consume_pending_requests_once_for_all_outcomes() {
+fn approval_defer_remains_pending_while_allow_and_deny_are_consumed() {
     for outcome in [
         ApprovalOutcome::Allow,
         ApprovalOutcome::Deny,
@@ -898,22 +898,39 @@ fn approval_decisions_consume_pending_requests_once_for_all_outcomes() {
         let center_after_decision = server
             .handle_json(r#"{"method":"approval/center","id":24,"params":{}}"#)
             .unwrap();
-        assert!(
-            center_after_decision[0]["result"]["pendingApprovals"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            center_after_decision[0]["result"]["decisions"][0]["request_id"],
-            "approval_1"
-        );
-
-        let duplicate = server.handle_json(&decision_message.to_string()).unwrap();
-        assert_eq!(
-            duplicate[0]["error"]["message"],
-            "Pending approval not found"
-        );
+        if outcome == ApprovalOutcome::Defer {
+            assert_eq!(
+                center_after_decision[0]["result"]["pendingApprovals"][0]["request_id"],
+                "approval_1"
+            );
+            assert!(
+                center_after_decision[0]["result"]["decisions"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let repeated = server.handle_json(&decision_message.to_string()).unwrap();
+            assert_eq!(
+                repeated[0]["result"]["decision"]["request_id"],
+                "approval_1"
+            );
+        } else {
+            assert!(
+                center_after_decision[0]["result"]["pendingApprovals"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                center_after_decision[0]["result"]["decisions"][0]["request_id"],
+                "approval_1"
+            );
+            let duplicate = server.handle_json(&decision_message.to_string()).unwrap();
+            assert_eq!(
+                duplicate[0]["error"]["message"],
+                "Pending approval not found"
+            );
+        }
     }
 }
 

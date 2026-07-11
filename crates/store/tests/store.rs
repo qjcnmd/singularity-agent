@@ -13,7 +13,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 6);
+    assert_eq!(descriptor.schema_version, 7);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
@@ -21,7 +21,8 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
             "0002_durable_ledger".to_string(),
             "0004_pending_tool_calls".to_string(),
             "0005_store_hardening".to_string(),
-            "0006_conversation_history".to_string()
+            "0006_conversation_history".to_string(),
+            "0007_pending_execution_state".to_string()
         ]
     );
     assert_eq!(
@@ -94,7 +95,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
         .query_row("pragma journal_mode", [], |row| row.get(0))
         .expect("journal mode");
 
-    assert_eq!(schema_version, 6);
+    assert_eq!(schema_version, 7);
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 }
 
@@ -117,7 +118,7 @@ fn sqlite_store_rejects_future_schema_version() {
         SessionStore::open(&db_path),
         Err(StoreError::UnsupportedSchema {
             found: 999,
-            supported: 6
+            supported: 7
         })
     ));
 }
@@ -657,22 +658,36 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
             store.list_trace(&thread.thread_id).expect("trace list")[0].event_id,
             trace.event_id
         );
-        assert_eq!(
+        if outcome == ApprovalOutcome::Defer {
+            assert!(matches!(
+                store.get_approval_decision(&decision.decision_id),
+                Err(StoreError::NotFound(_))
+            ));
+            assert_eq!(
+                store.list_pending_approvals().expect("pending"),
+                vec![request]
+            );
             store
-                .get_approval_decision(&decision.decision_id)
-                .expect("ledger")
-                .outcome,
-            outcome
-        );
-        assert!(store.list_pending_approvals().expect("pending").is_empty());
-        assert!(matches!(
-            store.record_approval_decision(
-                &decision,
-                "approval",
-                "approval decision recorded"
-            ),
-            Err(StoreError::NotFound(message)) if message == "approval approval_1"
-        ));
+                .record_approval_decision(&decision, "approval", "approval deferred")
+                .expect("repeated defer");
+        } else {
+            assert_eq!(
+                store
+                    .get_approval_decision(&decision.decision_id)
+                    .expect("ledger")
+                    .outcome,
+                outcome
+            );
+            assert!(store.list_pending_approvals().expect("pending").is_empty());
+            assert!(matches!(
+                store.record_approval_decision(
+                    &decision,
+                    "approval",
+                    "approval decision recorded"
+                ),
+                Err(StoreError::NotFound(message)) if message == "approval approval_1"
+            ));
+        }
     }
 }
 
