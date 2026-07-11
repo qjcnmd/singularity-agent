@@ -961,7 +961,8 @@ fn app_server_bin() -> Result<String, String> {
 }
 
 fn app_server_db_display() -> String {
-    std::env::var(APP_SERVER_DB_ENV).unwrap_or_else(|_| ".singularity/sessions.sqlite3".to_string())
+    std::env::var(APP_SERVER_DB_ENV)
+        .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string())
 }
 
 fn sibling_app_server_bin() -> Option<PathBuf> {

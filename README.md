@@ -90,7 +90,7 @@ sg trace show <event-id>
 sg eval run docs/evaluation/public-representative-task.json --run-id representative-001 --json
 ```
 
-默认状态库位于当前工作目录的 `.singularity/sessions.sqlite3`。sandbox 自身的受限账户元数据和 helper 缓存默认位于 `%USERPROFILE%\.singularity`；只有需要改变该位置时才设置 `SINGULARITY_HOME`。
+默认状态库位于当前工作目录的 `.singularity/rust-app-server.sqlite3`。sandbox 自身的受限账户元数据和 helper 缓存默认位于 `%USERPROFILE%\.singularity`；只有需要改变该位置时才设置 `SINGULARITY_HOME`。
 
 ## 安全边界
 

@@ -219,7 +219,7 @@ provider HTTP wait、AgentLoop 回合边界和 sandbox command 都检查同一�
 
 ## 11. Store、Trace 与 Artifact
 
-`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/sessions.sqlite3`。
+`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/rust-app-server.sqlite3`。
 
 主要表：
 
