@@ -108,6 +108,20 @@ fn restricted_children_are_job_bound_before_they_can_run() {
         runner_cleanup < runner_capture_join,
         "runner Job cleanup must happen before output reader joins"
     );
+    let spawn_ready = runner_source
+        .find("message: Message::SpawnReady")
+        .expect("runner must emit spawn_ready");
+    let spawn_ready_write = runner_source[spawn_ready..]
+        .find("write_frame(&mut *guard, &msg)")
+        .map(|offset| spawn_ready + offset)
+        .expect("runner must write spawn_ready");
+    let capture_transfer = runner_source
+        .find("let (pi, stdout_handle, stderr_handle) = ipc_spawn.take_capture_handles()")
+        .expect("runner must transfer capture handles after spawn_ready");
+    assert!(
+        spawn_ready_write < capture_transfer,
+        "spawn_ready failures must leave process and capture handles under RAII ownership"
+    );
     assert!(
         library_source.contains("job.close().err()")
             && library_source.contains("job.terminate_and_wait(pi.hProcess, 1)"),

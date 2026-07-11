@@ -468,14 +468,12 @@ pub fn main() -> Result<()> {
     };
     let log_dir_path = ipc_spawn.log_dir.clone();
     let log_dir = Some(log_dir_path.as_path());
-    let job = ipc_spawn.job.clone();
-    let (pi, stdout_handle, stderr_handle) = ipc_spawn.take_capture_handles();
 
     let msg = FramedMessage {
         version: IPC_PROTOCOL_VERSION,
         message: Message::SpawnReady {
             payload: SpawnReady {
-                process_id: unsafe { GetProcessId(pi.hProcess) },
+                process_id: unsafe { GetProcessId(ipc_spawn.pi.hProcess) },
             },
         },
     };
@@ -492,6 +490,8 @@ pub fn main() -> Result<()> {
         );
         return Err(err);
     }
+    let job = ipc_spawn.job.clone();
+    let (pi, stdout_handle, stderr_handle) = ipc_spawn.take_capture_handles();
     let log_dir_owned = log_dir.map(Path::to_path_buf);
     let out_thread = spawn_output_reader(
         Arc::clone(&pipe_write),
