@@ -804,6 +804,49 @@ fn apply_evaluator_patch(
     })?;
     drop(file);
 
+    let init_result = run_raw_command(
+        workspace,
+        workspace,
+        vec!["git".to_string(), "init".to_string(), "--quiet".to_string()],
+        DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        SandboxNetworkMode::Denied,
+        Arc::clone(&sandbox_backend),
+    );
+    diagnostics.push(CommandDiagnostic::new("evaluator.git_init", &init_result));
+    if !command_succeeded(&init_result) {
+        return Err(command_blocker(
+            &init_result,
+            BlockerKind::WorkspacePreparation,
+            "failed to isolate evaluator patch workspace",
+        ));
+    }
+
+    let check_result = run_raw_command(
+        workspace,
+        workspace,
+        vec![
+            "git".to_string(),
+            "apply".to_string(),
+            "--check".to_string(),
+            "--whitespace=nowarn".to_string(),
+            EVALUATOR_PATCH_FILE.to_string(),
+        ],
+        DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        SandboxNetworkMode::Denied,
+        Arc::clone(&sandbox_backend),
+    );
+    diagnostics.push(CommandDiagnostic::new(
+        "evaluator.apply_check",
+        &check_result,
+    ));
+    if !command_succeeded(&check_result) {
+        return Err(command_blocker(
+            &check_result,
+            BlockerKind::WorkspacePreparation,
+            "evaluator patch validation failed",
+        ));
+    }
+
     let result = run_raw_command(
         workspace,
         workspace,
@@ -815,16 +858,51 @@ fn apply_evaluator_patch(
         ],
         DEFAULT_COMMAND_TIMEOUT_SECONDS,
         SandboxNetworkMode::Denied,
-        sandbox_backend,
+        Arc::clone(&sandbox_backend),
     );
     diagnostics.push(CommandDiagnostic::new("evaluator.apply_patch", &result));
-    let remove_result = fs::remove_file(&patch_path);
     if !command_succeeded(&result) {
         return Err(command_blocker(
             &result,
             BlockerKind::WorkspacePreparation,
             "failed to apply evaluator patch",
         ));
+    }
+    let reverse_check = run_raw_command(
+        workspace,
+        workspace,
+        vec![
+            "git".to_string(),
+            "apply".to_string(),
+            "--reverse".to_string(),
+            "--check".to_string(),
+            "--whitespace=nowarn".to_string(),
+            EVALUATOR_PATCH_FILE.to_string(),
+        ],
+        DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        SandboxNetworkMode::Denied,
+        sandbox_backend,
+    );
+    diagnostics.push(CommandDiagnostic::new(
+        "evaluator.reverse_check",
+        &reverse_check,
+    ));
+    if !command_succeeded(&reverse_check) {
+        return Err(command_blocker(
+            &reverse_check,
+            BlockerKind::WorkspacePreparation,
+            "evaluator patch did not materialize in stage workspace",
+        ));
+    }
+    let remove_result = fs::remove_file(&patch_path);
+    let git_dir = workspace.join(".git");
+    if git_dir.exists() {
+        fs::remove_dir_all(&git_dir).map_err(|error| {
+            evaluation_blocker(
+                BlockerKind::WorkspacePreparation,
+                format!("failed to remove evaluator git metadata: {error}"),
+            )
+        })?;
     }
     remove_result.map_err(|error| {
         evaluation_blocker(
