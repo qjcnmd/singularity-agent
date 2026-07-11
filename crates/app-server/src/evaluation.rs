@@ -32,8 +32,7 @@ use singularity_tools::{
 };
 
 use super::{
-    TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ,
-    native_workspace_tool_specs,
+    TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ, workspace_tool_specs,
 };
 
 mod command;
@@ -48,7 +47,7 @@ use workspace::{
     validate_tree,
 };
 
-const RUNNER_NAME: &str = "rust_native";
+const RUNNER_NAME: &str = "agent_loop";
 const OUTPUT_ROOT_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const DEFAULT_OUTPUT_ROOT: [&str; 2] = ["work", "evaluations"];
 const DEFAULT_AGENT_MAX_TURNS: u32 = 24;
@@ -1043,7 +1042,7 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
         .map(|tool| tool.as_str())
         .collect::<BTreeSet<_>>();
     let mut registry = ToolRegistry::default();
-    for mut spec in native_workspace_tool_specs() {
+    for mut spec in workspace_tool_specs() {
         if !allowed.contains(spec.name.as_str()) {
             continue;
         }

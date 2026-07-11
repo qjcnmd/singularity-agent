@@ -67,7 +67,7 @@ sg run <goal>
   -> turn/start
      -> SessionStore::create_turn_with_input_trace_and_history
      -> AppEvent::turn_started
-     -> AppServer::run_native_agent_loop
+     -> AppServer::run_agent_loop
         -> load_project_instructions_from_cwd
         -> AgentLoop::run
            -> assemble context
@@ -164,7 +164,7 @@ builtin.command
 
 `ToolBroker` 只接受 `builtin.*` 和 `mcp.<server>.<tool>` 命名。未知工具、非法参数、deny 和 ask 都不会调用 executor。
 
-默认 native profile 是 workspace-write、network denied、approval on-request、protected paths enforced。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。`WorkspaceTools` 对所有路径执行 lexical normalize、canonicalize existing parent、workspace containment 和 protected component 检查；多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
+默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。`WorkspaceTools` 对所有路径执行 lexical normalize、canonicalize existing parent、workspace containment 和 protected component 检查；多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
 
 当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化 `PendingToolCall`。`approval/decision` 是单次消费：只有 allow、绑定完全匹配、原 turn 仍 blocked、thread active 时才恢复该 pending call，然后继续完整 AgentLoop；deny/defer 不执行工具。客户端不能通过 `approval/request` 自行向 ledger 注入请求。
 
@@ -219,7 +219,7 @@ provider HTTP wait、AgentLoop 回合边界和 sandbox command 都检查同一�
 
 ## 11. Store、Trace 与 Artifact
 
-`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/rust-app-server.sqlite3`。
+`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/sessions.sqlite3`。
 
 主要表：
 
@@ -241,7 +241,7 @@ store 在写入 item、trace 和 artifact reference 前执行敏感文本检查�
 
 ## 12. Evaluation
 
-`sg eval run` 发送 `eval/run`，app-server 读取 `evaluation.task_set/v2` manifest 并执行 Rust native runner：
+`sg eval run` 发送 `eval/run`，app-server 读取 `evaluation.task_set/v2` manifest 并执行 AgentLoop runner：
 
 ```text
 prepare source

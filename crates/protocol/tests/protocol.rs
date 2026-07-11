@@ -1,9 +1,10 @@
 use singularity_core::ClientInfo;
 use singularity_protocol::{
-    AppEvent, ArtifactFetchParams, ArtifactRef, ConversationMessage, ConversationRole,
-    EventSubscribeParams, InitializeParams, ItemKind, JsonRpcMessage, Method, ProviderReadiness,
-    ThreadIdParams, ThreadReadParams, ThreadReadResult, ThreadStartParams, TraceListParams,
-    TraceShowParams, TraceTailParams, TurnIdParams, TurnStartParams,
+    AgentCapabilityResult, AppEvent, ArtifactFetchParams, ArtifactRef, ConversationMessage,
+    ConversationRole, EventSubscribeParams, InitializeParams, InitializeResult, ItemKind,
+    JsonRpcMessage, Method, ProviderReadiness, ThreadIdParams, ThreadReadParams, ThreadReadResult,
+    ThreadStartParams, TraceListParams, TraceShowParams, TraceTailParams, TurnIdParams,
+    TurnStartParams,
 };
 
 #[test]
@@ -92,6 +93,12 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
     let value = serde_json::to_value(&initialize).expect("serialize initialize params");
     assert_eq!(value["clientInfo"]["name"], "test");
 
+    let initialize_result = serde_json::to_value(InitializeResult::local()).unwrap();
+    assert_eq!(
+        initialize_result["userAgent"],
+        concat!("singularity-app-server/", env!("CARGO_PKG_VERSION"))
+    );
+
     let thread = ThreadStartParams {
         model: Some("gpt-test".to_string()),
         cwd: Some("C:/repo".to_string()),
@@ -110,6 +117,26 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
         AppEvent::item_command_execution_output_delta("item_1", "stdout", "hi").method(),
         "item/commandExecution/outputDelta"
     );
+}
+
+#[test]
+fn agent_capability_uses_the_canonical_agent_loop_wire_name() {
+    let result = AgentCapabilityResult {
+        agent_loop: serde_json::json!({"available": true}),
+        provider_readiness: ProviderReadiness {
+            source: None,
+            snapshot_id: "provider_snapshot_test".to_string(),
+            ready: false,
+            blocker: None,
+            api_key_present: false,
+            base_url_present: false,
+            model_present: false,
+        },
+    };
+
+    let value = serde_json::to_value(result).unwrap();
+    assert_eq!(value["agentLoop"]["available"], true);
+    assert_eq!(value.as_object().map(serde_json::Map::len), Some(2));
 }
 
 #[test]

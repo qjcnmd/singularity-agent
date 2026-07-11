@@ -18,7 +18,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
-        .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
+        .unwrap_or_else(|_| ".singularity/sessions.sqlite3".to_string());
     if let Some(parent) = std::path::Path::new(&db_path)
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

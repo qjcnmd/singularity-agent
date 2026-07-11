@@ -352,7 +352,7 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        if let Err(error) = native_workspace_root(&thread) {
+        if let Err(error) = workspace_root(&thread) {
             return invalid_request_response(message.id, error);
         }
         match self.store.update_thread_status(
@@ -490,18 +490,15 @@ impl AppServer {
             );
             return Ok(());
         }
-        if let Err(error) = native_workspace_root(&thread) {
+        if let Err(error) = workspace_root(&thread) {
             emit_messages(&mut emit, invalid_request_response(message.id, error)?);
             return Ok(());
         }
         let capability = AgentLoopCapability::current();
-        if !native_capability_ready(&capability) {
+        if !agent_loop_capability_ready(&capability) {
             emit_messages(
                 &mut emit,
-                invalid_request_response(
-                    message.id,
-                    native_agent_loop_unavailable_message(&capability),
-                )?,
+                invalid_request_response(message.id, agent_loop_unavailable_message(&capability))?,
             );
             return Ok(());
         }
@@ -526,7 +523,7 @@ impl AppServer {
         if let Some(event) = self.event_notification(AppEvent::turn_started(&turn)) {
             emit(event);
         }
-        let status = self.run_native_agent_loop(
+        let status = self.run_agent_loop(
             &thread,
             &params,
             &turn.turn_id,
@@ -553,7 +550,7 @@ impl AppServer {
         json_response(
             message.id,
             AgentCapabilityResult {
-                native_agent_loop: serde_json::to_value(AgentLoopCapability::current())?,
+                agent_loop: serde_json::to_value(AgentLoopCapability::current())?,
                 provider_readiness: provider_readiness(&self.provider_snapshot),
             },
         )
@@ -571,7 +568,7 @@ impl AppServer {
         }
     }
 
-    fn run_native_agent_loop(
+    fn run_agent_loop(
         &self,
         thread: &Thread,
         params: &TurnStartParams,
@@ -585,7 +582,7 @@ impl AppServer {
                 return Ok(AgentRunStatus::failed(error.message).with_status(AgentStatus::Failed));
             }
         };
-        match self.run_native_agent_loop_with_provider(
+        match self.run_agent_loop_with_provider(
             provider,
             thread,
             params,
@@ -603,14 +600,14 @@ impl AppServer {
         }
     }
 
-    fn resume_native_agent_loop(
+    fn resume_agent_loop(
         &self,
         request: &ApprovalRequest,
         decision: &ApprovalDecision,
         pending_tool_call: Option<Value>,
         cancellation: &CancellationToken,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
-        if !native_agent_loop_ready() {
+        if !agent_loop_ready() {
             return Ok(None);
         }
         if !matches!(decision.outcome, ApprovalOutcome::Allow) {
@@ -624,7 +621,7 @@ impl AppServer {
             Err(error) => {
                 let turn_id = &request.turn_id;
                 let turn = self.store.get_turn(turn_id)?;
-                let run_status = native_approval_terminal_status(
+                let run_status = approval_terminal_status(
                     &turn,
                     request,
                     decision,
@@ -636,7 +633,7 @@ impl AppServer {
                 return Ok(Some((turn, run_status)));
             }
         };
-        self.resume_native_agent_loop_after_gate(
+        self.resume_agent_loop_after_gate(
             request,
             decision,
             pending_tool_call,
@@ -645,7 +642,7 @@ impl AppServer {
         )
     }
 
-    fn resume_native_agent_loop_after_gate<P>(
+    fn resume_agent_loop_after_gate<P>(
         &self,
         request: &ApprovalRequest,
         decision: &ApprovalDecision,
@@ -672,7 +669,7 @@ impl AppServer {
         let pending = match serde_json::from_value::<PendingToolCall>(pending_tool_call.clone()) {
             Ok(pending) => pending,
             Err(error) => {
-                let run_status = native_approval_terminal_status(
+                let run_status = approval_terminal_status(
                     &turn,
                     request,
                     decision,
@@ -685,7 +682,7 @@ impl AppServer {
             }
         };
         if pending.request_id != request.request_id {
-            let run_status = native_approval_terminal_status(
+            let run_status = approval_terminal_status(
                 &turn,
                 request,
                 decision,
@@ -700,10 +697,10 @@ impl AppServer {
         if thread.status != singularity_protocol::ThreadStatus::Active {
             return Ok(None);
         }
-        let workspace_root = match native_workspace_root(&thread) {
+        let workspace_root = match workspace_root(&thread) {
             Ok(workspace_root) => workspace_root,
             Err(error) => {
-                let run_status = native_approval_terminal_status(
+                let run_status = approval_terminal_status(
                     &turn,
                     request,
                     decision,
@@ -730,10 +727,10 @@ impl AppServer {
             turn_id,
             DEFAULT_THREAD_HISTORY_TURN_LIMIT,
         )?;
-        let registry = native_workspace_registry();
+        let registry = workspace_tool_registry();
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
-        let policy = native_workspace_policy(workspace_root_display);
-        let loop_input = match native_loop_input(
+        let policy = workspace_policy(workspace_root_display);
+        let loop_input = match agent_loop_input(
             &thread,
             &params,
             turn_id,
@@ -742,7 +739,7 @@ impl AppServer {
         ) {
             Ok(input) => input.with_approval_grant(grant),
             Err(error) => {
-                let run_status = native_approval_terminal_status(
+                let run_status = approval_terminal_status(
                     &turn,
                     request,
                     decision,
@@ -755,7 +752,7 @@ impl AppServer {
             }
         };
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(native_workspace_tools(
+            .with_workspace_tools(workspace_tools(
                 workspace_root,
                 Arc::clone(&self.sandbox_backend),
             ))
@@ -767,7 +764,7 @@ impl AppServer {
         )?;
         let mut run_status = result.to_run_status(&loop_input);
         if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
-            let audit_status = native_approval_terminal_status(
+            let audit_status = approval_terminal_status(
                 &turn,
                 request,
                 decision,
@@ -784,7 +781,7 @@ impl AppServer {
         Ok(Some((turn, run_status)))
     }
 
-    fn run_native_agent_loop_with_provider<P>(
+    fn run_agent_loop_with_provider<P>(
         &self,
         provider: P,
         thread: &Thread,
@@ -796,13 +793,13 @@ impl AppServer {
     where
         P: Provider,
     {
-        let registry = native_workspace_registry();
-        let workspace_root = native_workspace_root(thread).map_err(AppServerError::Workspace)?;
+        let registry = workspace_tool_registry();
+        let workspace_root = workspace_root(thread).map_err(AppServerError::Workspace)?;
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
-        let policy = native_workspace_policy(workspace_root_display);
-        let loop_input = native_loop_input(thread, params, turn_id, &workspace_root, history)?;
+        let policy = workspace_policy(workspace_root_display);
+        let loop_input = agent_loop_input(thread, params, turn_id, &workspace_root, history)?;
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(native_workspace_tools(
+            .with_workspace_tools(workspace_tools(
                 workspace_root,
                 Arc::clone(&self.sandbox_backend),
             ))
@@ -872,7 +869,7 @@ impl AppServer {
         run_status: &AgentRunStatus,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         let assistant_delta = agent_completed_delta(run_status);
-        let event = native_agent_loop_trace(turn, run_status);
+        let event = agent_loop_trace(turn, run_status);
         self.store.commit_turn_outcome(
             &turn.turn_id,
             turn_status_for_agent(&run_status.status),
@@ -1005,7 +1002,7 @@ impl AppServer {
             if pending_thread.status != singularity_protocol::ThreadStatus::Active {
                 return invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION);
             }
-            if let Err(error) = native_workspace_root(&pending_thread) {
+            if let Err(error) = workspace_root(&pending_thread) {
                 return invalid_request_response(message.id, error);
             }
         }
@@ -1035,7 +1032,7 @@ impl AppServer {
             .as_ref()
             .map(|(cancellation, _guard)| cancellation.clone())
             .unwrap_or_default();
-        let resumed = self.resume_native_agent_loop(
+        let resumed = self.resume_agent_loop(
             &recorded.request,
             &decision,
             pending_tool_call.clone(),
@@ -1045,7 +1042,7 @@ impl AppServer {
         let terminal = if let Some(resumed) = resumed {
             Some(resumed)
         } else {
-            self.native_approval_no_resume_status(
+            self.approval_no_resume_status(
                 &recorded.request,
                 &decision,
                 pending_tool_call.as_ref(),
@@ -1062,7 +1059,7 @@ impl AppServer {
         Ok(messages)
     }
 
-    fn native_approval_no_resume_status(
+    fn approval_no_resume_status(
         &self,
         request: &ApprovalRequest,
         decision: &ApprovalDecision,
@@ -1083,7 +1080,7 @@ impl AppServer {
             ApprovalOutcome::Allow if pending_tool_call.is_some() => (
                 AgentStatus::Failed,
                 "unavailable",
-                "approval allowed but native turn could not resume",
+                "approval allowed but agent loop turn could not resume",
             ),
             ApprovalOutcome::Allow => (
                 AgentStatus::Failed,
@@ -1093,7 +1090,7 @@ impl AppServer {
             ApprovalOutcome::Deny => (AgentStatus::Failed, "denied", "approval denied"),
             ApprovalOutcome::Defer => (AgentStatus::Blocked, "deferred", "approval deferred"),
         };
-        let run_status = native_approval_terminal_status(
+        let run_status = approval_terminal_status(
             &turn,
             request,
             decision,
@@ -1253,7 +1250,7 @@ fn cancellation_monitor(
     }))
 }
 
-fn native_approval_terminal_status(
+fn approval_terminal_status(
     turn: &Turn,
     request: &ApprovalRequest,
     decision: &ApprovalDecision,
@@ -1350,12 +1347,10 @@ fn merge_json_object(target: &mut Value, source: Value) {
     }
 }
 
-fn native_workspace_registry() -> ToolRegistry {
+fn workspace_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::default();
-    for spec in native_workspace_tool_specs() {
-        registry
-            .register(spec)
-            .expect("valid native workspace tool");
+    for spec in workspace_tool_specs() {
+        registry.register(spec).expect("valid workspace tool");
     }
     registry
 }
@@ -1387,7 +1382,7 @@ fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
         .map(str::to_string)
         .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())
 }
-fn native_workspace_root(thread: &Thread) -> Result<PathBuf, String> {
+fn workspace_root(thread: &Thread) -> Result<PathBuf, String> {
     let cwd = thread
         .cwd
         .as_deref()
@@ -1406,14 +1401,14 @@ fn native_workspace_root(thread: &Thread) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn native_workspace_tools(
+fn workspace_tools(
     workspace_root: PathBuf,
     sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
 ) -> WorkspaceTools {
     WorkspaceTools::new(workspace_root).with_shared_sandbox_backend(sandbox_backend)
 }
 
-fn native_loop_input(
+fn agent_loop_input(
     thread: &Thread,
     params: &TurnStartParams,
     turn_id: &str,
@@ -1445,9 +1440,9 @@ fn native_loop_input(
     Ok(input)
 }
 
-fn native_agent_loop_ready() -> bool {
+fn agent_loop_ready() -> bool {
     let capability = AgentLoopCapability::current();
-    native_capability_ready(&capability)
+    agent_loop_capability_ready(&capability)
 }
 
 fn provider_readiness(snapshot: &ProviderConfigSnapshot) -> ProviderReadiness {
@@ -1467,13 +1462,13 @@ fn provider_readiness(snapshot: &ProviderConfigSnapshot) -> ProviderReadiness {
     }
 }
 
-fn native_capability_ready(capability: &AgentLoopCapability) -> bool {
+fn agent_loop_capability_ready(capability: &AgentLoopCapability) -> bool {
     capability.available
         && capability.blockers.is_empty()
         && capability.status == AgentStatus::Completed
 }
 
-fn native_agent_loop_unavailable_message(capability: &AgentLoopCapability) -> String {
+fn agent_loop_unavailable_message(capability: &AgentLoopCapability) -> String {
     let blockers = if capability.blockers.is_empty() {
         "none".to_string()
     } else {
@@ -1484,31 +1479,31 @@ fn native_agent_loop_unavailable_message(capability: &AgentLoopCapability) -> St
         capability.status.as_str()
     )
 }
-fn native_workspace_policy(workspace_root: String) -> PolicyEngine {
+fn workspace_policy(workspace_root: String) -> PolicyEngine {
     PolicyEngine::new(PermissionProfile::workspace_write(workspace_root))
-        .with_rule(native_read_tool_rule())
-        .with_rule(native_sandbox_command_rule())
+        .with_rule(workspace_read_tool_rule())
+        .with_rule(sandbox_command_rule())
 }
 
-fn native_read_tool_rule() -> PermissionRule {
+fn workspace_read_tool_rule() -> PermissionRule {
     PermissionRule::new(
-        "allow_native_read_tools",
+        "allow_workspace_read_tools",
         SettingsScope::Project,
         PermissionDecisionOutcome::Allow,
     )
     .for_operation(PermissionOperation::Read)
 }
 
-fn native_sandbox_command_rule() -> PermissionRule {
+fn sandbox_command_rule() -> PermissionRule {
     PermissionRule::new(
-        "allow_native_sandbox_commands",
+        "allow_sandbox_commands",
         SettingsScope::Project,
         PermissionDecisionOutcome::Allow,
     )
     .for_operation(PermissionOperation::Execute)
 }
 
-fn native_workspace_tool_specs() -> Vec<ToolSpec> {
+fn workspace_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
             TOOL_READ,
@@ -1652,13 +1647,13 @@ fn mark_run_cancelled(status: &mut AgentRunStatus) {
     status.error = None;
 }
 
-fn native_agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
+fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
     let mut event = TraceEvent::new(
-        format!("trace_{}_native_agent_loop", turn.turn_id),
+        format!("trace_{}_agent_loop", turn.turn_id),
         &turn.thread_id,
         &turn.turn_id,
         "agent_loop",
-        "Rust native AgentLoop result translated",
+        "AgentLoop result translated",
     );
     event.payload = json!({
         "component": "agent_loop",
@@ -1765,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn native_agent_loop_loads_hierarchical_agents_md_from_thread_cwd() {
+    fn agent_loop_loads_hierarchical_agents_md_from_thread_cwd() {
         let temp = tempfile::tempdir().expect("temp dir");
         let workspace = temp
             .path()
@@ -1803,7 +1798,7 @@ mod tests {
         let server = app_server(store);
 
         let status = server
-            .run_native_agent_loop_with_provider(
+            .run_agent_loop_with_provider(
                 provider,
                 &thread,
                 &params,
@@ -1811,7 +1806,7 @@ mod tests {
                 &[],
                 &CancellationToken::new(),
             )
-            .expect("native loop");
+            .expect("agent loop");
 
         assert_eq!(status.status, AgentStatus::Completed);
         let requests = seen_requests.lock().expect("seen requests");
@@ -1851,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn native_agent_loop_replays_only_completed_store_history_in_order() {
+    fn agent_loop_replays_only_completed_store_history_in_order() {
         let temp = tempfile::tempdir().expect("temp dir");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
@@ -1968,7 +1963,7 @@ mod tests {
         let server = app_server(store);
 
         let status = server
-            .run_native_agent_loop_with_provider(
+            .run_agent_loop_with_provider(
                 provider,
                 &thread,
                 &params,
@@ -1976,7 +1971,7 @@ mod tests {
                 &started.history.messages,
                 &CancellationToken::new(),
             )
-            .expect("native loop");
+            .expect("agent loop");
 
         assert_eq!(status.status, AgentStatus::Completed);
         let requests = seen_requests.lock().expect("seen requests");
@@ -2023,8 +2018,8 @@ mod tests {
     }
 
     #[test]
-    fn native_command_schema_does_not_expose_permission_expansion_fields() {
-        let command = native_workspace_tool_specs()
+    fn sandbox_command_schema_does_not_expose_permission_expansion_fields() {
+        let command = workspace_tool_specs()
             .into_iter()
             .find(|spec| spec.name == TOOL_COMMAND)
             .expect("command tool spec");
@@ -2040,7 +2035,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn native_approval_resume_without_pending_tool_call_fails_closed_after_gate() {
+    fn agent_loop_approval_resume_without_pending_tool_call_fails_closed_after_gate() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2089,7 +2084,7 @@ mod tests {
         };
 
         let resumed = server
-            .resume_native_agent_loop_after_gate(
+            .resume_agent_loop_after_gate(
                 &request,
                 &decision,
                 None,
@@ -2107,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn native_approval_no_resume_status_records_session_and_command_audit() {
+    fn agent_loop_approval_no_resume_status_records_session_and_command_audit() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2159,7 +2154,7 @@ mod tests {
         let server = app_server(store);
 
         let (_turn, run_status) = server
-            .native_approval_no_resume_status(&request, &decision, Some(&pending_payload))
+            .approval_no_resume_status(&request, &decision, Some(&pending_payload))
             .expect("status")
             .expect("terminal status");
 
@@ -2193,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn native_approval_resume_failures_record_command_audit() {
+    fn agent_loop_approval_resume_failures_record_command_audit() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2253,7 +2248,7 @@ mod tests {
         let server = app_server(store);
 
         let (_turn, mismatch_status) = server
-            .resume_native_agent_loop_after_gate(
+            .resume_agent_loop_after_gate(
                 &request,
                 &decision,
                 Some(serde_json::to_value(&mismatched_pending).expect("pending payload")),
@@ -2282,7 +2277,7 @@ mod tests {
         );
 
         let (_turn, invalid_args_status) = server
-            .resume_native_agent_loop_after_gate(
+            .resume_agent_loop_after_gate(
                 &request,
                 &decision,
                 Some(serde_json::to_value(&invalid_args_pending).expect("pending payload")),
@@ -2315,7 +2310,7 @@ mod tests {
     }
 
     #[test]
-    fn native_approval_resume_uses_stored_pending_tool_call_after_gate() {
+    fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2440,7 +2435,7 @@ mod tests {
         let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
 
         let resumed = server
-            .resume_native_agent_loop_after_gate(
+            .resume_agent_loop_after_gate(
                 &request,
                 &decision,
                 Some(pending_payload),
@@ -2549,7 +2544,7 @@ mod tests {
         let server = app_server(store);
 
         let resumed = server
-            .resume_native_agent_loop_after_gate(
+            .resume_agent_loop_after_gate(
                 &request,
                 &decision,
                 Some(serde_json::to_value(pending).expect("pending payload")),
@@ -2587,7 +2582,7 @@ mod tests {
     }
 
     #[test]
-    fn native_agent_loop_command_uses_bound_sandbox_backend_without_approval() {
+    fn agent_loop_command_uses_bound_sandbox_backend_without_approval() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -2627,7 +2622,7 @@ mod tests {
         let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
 
         let status = server
-            .run_native_agent_loop_with_provider(
+            .run_agent_loop_with_provider(
                 provider,
                 &thread,
                 &params,
@@ -2635,7 +2630,7 @@ mod tests {
                 &[],
                 &CancellationToken::new(),
             )
-            .expect("native loop");
+            .expect("agent loop");
 
         assert_eq!(status.status, AgentStatus::Completed);
         assert_eq!(status.final_answer.as_deref(), Some("done"));

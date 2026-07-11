@@ -15,7 +15,7 @@ const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
 const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const CLI_CLIENT_NAME: &str = "singularity_cli";
-const CLI_CLIENT_TITLE: &str = "Singularity Rust CLI";
+const CLI_CLIENT_TITLE: &str = "Singularity CLI";
 const CLI_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_TRACE_TAIL_LIMIT: usize = 20;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -149,7 +149,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
-            ensure_native_agent_loop_available(&mut client)?;
+            ensure_agent_loop_available(&mut client)?;
             let (thread, thread_events) = client.thread_start(model, !json)?;
             if !json {
                 println!(
@@ -184,7 +184,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
-            ensure_native_agent_loop_available(&mut client)?;
+            ensure_agent_loop_available(&mut client)?;
             client.thread_resume(&thread_id)?;
             println!("thread {thread_id}");
             let (turn, _events) = client.turn_start(&thread_id, &instruction, true)?;
@@ -253,12 +253,12 @@ fn run_cli(cli: Cli) -> Result<(), String> {
     }
 }
 
-fn ensure_native_agent_loop_available(client: &mut AppServerClient) -> Result<(), String> {
+fn ensure_agent_loop_available(client: &mut AppServerClient) -> Result<(), String> {
     let capability = client.agent_capability()?;
-    let native = &capability["nativeAgentLoop"];
-    let available = native["available"].as_bool().unwrap_or(false);
-    let status = native["status"].as_str().unwrap_or("unknown");
-    let blockers = native_agent_loop_blockers(native);
+    let agent_loop = &capability["agentLoop"];
+    let available = agent_loop["available"].as_bool().unwrap_or(false);
+    let status = agent_loop["status"].as_str().unwrap_or("unknown");
+    let blockers = agent_loop_blockers(agent_loop);
     if available && blockers == "none" && status == "completed" {
         return Ok(());
     }
@@ -267,8 +267,8 @@ fn ensure_native_agent_loop_available(client: &mut AppServerClient) -> Result<()
     ))
 }
 
-fn native_agent_loop_blockers(native: &Value) -> String {
-    let blockers = native["blockers"]
+fn agent_loop_blockers(agent_loop: &Value) -> String {
+    let blockers = agent_loop["blockers"]
         .as_array()
         .map(|items| {
             items
@@ -290,12 +290,12 @@ fn print_readiness() -> Result<(), String> {
     client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
     client.initialize()?;
     let capability = client.agent_capability()?;
-    let native = &capability["nativeAgentLoop"];
+    let agent_loop = &capability["agentLoop"];
     println!(
-        "native_agent_loop={}",
-        native["status"].as_str().unwrap_or("unknown")
+        "agent_loop={}",
+        agent_loop["status"].as_str().unwrap_or("unknown")
     );
-    println!("evaluation=rust_native");
+    println!("evaluation=agent_loop");
     print_provider_readiness(&capability["providerReadiness"])
 }
 
@@ -961,8 +961,7 @@ fn app_server_bin() -> Result<String, String> {
 }
 
 fn app_server_db_display() -> String {
-    std::env::var(APP_SERVER_DB_ENV)
-        .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string())
+    std::env::var(APP_SERVER_DB_ENV).unwrap_or_else(|_| ".singularity/sessions.sqlite3".to_string())
 }
 
 fn sibling_app_server_bin() -> Option<PathBuf> {

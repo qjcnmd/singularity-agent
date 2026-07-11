@@ -436,7 +436,7 @@ fn app_server_reuses_one_provider_snapshot_for_capability_reads() {
 }
 #[cfg(windows)]
 #[test]
-fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() {
+fn app_server_reports_agent_loop_capability_as_available() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
@@ -451,16 +451,10 @@ fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() 
         .handle_json(r#"{"method":"agent/capability","id":2,"params":{}}"#)
         .unwrap();
 
-    assert_eq!(
-        capability[0]["result"]["nativeAgentLoop"]["available"],
-        true
-    );
-    assert_eq!(
-        capability[0]["result"]["nativeAgentLoop"]["status"],
-        "completed"
-    );
+    assert_eq!(capability[0]["result"]["agentLoop"]["available"], true);
+    assert_eq!(capability[0]["result"]["agentLoop"]["status"], "completed");
     assert!(
-        capability[0]["result"]["nativeAgentLoop"]["blockers"]
+        capability[0]["result"]["agentLoop"]["blockers"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -481,7 +475,7 @@ fn app_server_reports_native_agent_loop_capability_as_available_after_cutover() 
 
 #[cfg(not(windows))]
 #[test]
-fn app_server_reports_native_agent_loop_capability_as_unsupported_off_windows() {
+fn app_server_reports_agent_loop_capability_as_unsupported_off_windows() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
@@ -496,16 +490,10 @@ fn app_server_reports_native_agent_loop_capability_as_unsupported_off_windows() 
         .handle_json(r#"{"method":"agent/capability","id":2,"params":{}}"#)
         .unwrap();
 
-    assert_eq!(
-        capability[0]["result"]["nativeAgentLoop"]["available"],
-        false
-    );
-    assert_eq!(
-        capability[0]["result"]["nativeAgentLoop"]["status"],
-        "blocked"
-    );
+    assert_eq!(capability[0]["result"]["agentLoop"]["available"], false);
+    assert_eq!(capability[0]["result"]["agentLoop"]["status"], "blocked");
     assert!(
-        capability[0]["result"]["nativeAgentLoop"]["blockers"]
+        capability[0]["result"]["agentLoop"]["blockers"]
             .as_array()
             .unwrap()
             .iter()
@@ -514,7 +502,7 @@ fn app_server_reports_native_agent_loop_capability_as_unsupported_off_windows() 
 }
 
 #[test]
-fn app_server_eval_run_writes_blocked_native_result_artifacts_without_fallback() {
+fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallback() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
@@ -566,7 +554,7 @@ fn app_server_eval_run_writes_blocked_native_result_artifacts_without_fallback()
     let response = server.handle_json(&request).unwrap();
     let result = result_message(&response);
 
-    assert_eq!(result["runner"], "rust_native");
+    assert_eq!(result["runner"], "agent_loop");
     assert_eq!(result["status"], "blocked");
     assert_eq!(result["blocker"], "workspace_preparation");
     assert_eq!(result["evaluation_passed"], false);
@@ -670,7 +658,7 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
 
 #[cfg(not(windows))]
 #[test]
-fn app_server_eval_run_fails_closed_when_native_capability_is_unavailable() {
+fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
@@ -714,7 +702,7 @@ fn app_server_eval_run_fails_closed_when_native_capability_is_unavailable() {
         "id": 2,
         "params": {
             "manifest": manifest,
-            "runId": "eval_native_unavailable",
+            "runId": "eval_agent_loop_unavailable",
             "outputRoot": output_root,
         }
     })
@@ -722,7 +710,7 @@ fn app_server_eval_run_fails_closed_when_native_capability_is_unavailable() {
     let response = server.handle_json(&request).unwrap();
     let result = result_message(&response);
 
-    assert_eq!(result["runner"], "rust_native");
+    assert_eq!(result["runner"], "agent_loop");
     assert_eq!(result["status"], "blocked");
     assert_eq!(result["blocker"], "environment");
     assert_eq!(result["tasks"][0]["agent_completed"], false);
@@ -1112,7 +1100,7 @@ fn archived_thread_rejects_approval_decision_without_consuming_it() {
 }
 
 #[test]
-fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_native_turn() {
+fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_agent_loop_turn() {
     for (outcome, request_resource) in [
         (ApprovalOutcome::Deny, "README.md"),
         (ApprovalOutcome::Defer, "README.md"),

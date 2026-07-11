@@ -90,10 +90,10 @@ impl Scenario {
         self.respond("initialize", initialize_result())
     }
 
-    pub fn native_ready(self) -> Self {
+    pub fn agent_loop_ready(self) -> Self {
         self.respond(
             "agent/capability",
-            native_capability(true, "completed", "enabled", &[]),
+            agent_loop_capability(true, "completed", "enabled", &[]),
         )
     }
 
@@ -164,9 +164,14 @@ pub fn initialize_result() -> Value {
     json!({"userAgent": "fake", "platformFamily": "local", "platformOs": "test"})
 }
 
-pub fn native_capability(available: bool, status: &str, reason: &str, blockers: &[&str]) -> Value {
+pub fn agent_loop_capability(
+    available: bool,
+    status: &str,
+    reason: &str,
+    blockers: &[&str],
+) -> Value {
     json!({
-        "nativeAgentLoop": {
+        "agentLoop": {
             "available": available,
             "status": status,
             "reason": reason,

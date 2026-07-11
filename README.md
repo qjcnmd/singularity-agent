@@ -1,6 +1,6 @@
 # Singularity
 
-Singularity 是一个面向 Windows 的本地命令行编码代理。产品运行时、协议、模型调用、工具、评估和测试均由 Rust 实现；命令执行采用源自 OpenAI Codex CLI 的 Windows 原生沙箱，并在不能满足请求权限时关闭失败（fail closed）。
+Singularity 是一个面向 Windows 的本地命令行编码代理。核心产品运行时、协议、模型调用、工具、评估和发布二进制均由 Rust 实现；职责明确的辅助工具可以使用其他主流语言，但不得形成第二套产品运行时或绕过 Rust 主链路与安全协议。命令执行采用源自 OpenAI Codex CLI 的 Windows 原生沙箱，并在不能满足请求权限时关闭失败（fail closed）。
 
 当前支持 Windows x86-64。其他平台可以编译和运行确定性测试，但由于没有严格命令沙箱，AgentLoop 不会声明可用。
 
@@ -30,7 +30,7 @@ singularity-windows-sandbox-setup.exe
 
 将该目录加入 `PATH` 即可，不需要单独安装或选择 sandbox backend。第一次执行需要离线命令沙箱的任务时，系统可能显示一次 Windows UAC 提权提示；setup helper 会建立受限账户、访问控制列表和网络隔离，之后自动复用。用户拒绝提权或 setup 失败时命令不会退回本地进程执行。
 
-Singularity 自身由 Rust 实现，但可以处理 Python、Rust、Node.js、Go 等不同语言的目标仓库。目标项目所需工具链由用户安装并加入宿主机 `PATH`；sandbox 会解析真实可执行文件并授予其安装目录只读/执行权限，不需要维护额外的 sandbox 路径配置。
+Singularity 的核心产品运行时由 Rust 实现，但可以处理 Python、Rust、Node.js、Go 等不同语言的目标仓库。目标项目所需工具链由用户安装并加入宿主机 `PATH`；sandbox 会解析真实可执行文件并授予其安装目录只读/执行权限，不需要维护额外的 sandbox 路径配置。
 
 完整安装、源码构建和更新说明见 [`docs/INSTALL.md`](docs/INSTALL.md)。
 
@@ -90,7 +90,7 @@ sg trace show <event-id>
 sg eval run docs/evaluation/public-representative-task.json --run-id representative-001 --json
 ```
 
-默认状态库位于当前工作目录的 `.singularity/rust-app-server.sqlite3`。sandbox 自身的受限账户元数据和 helper 缓存默认位于 `%USERPROFILE%\.singularity`；只有需要改变该位置时才设置 `SINGULARITY_HOME`。
+默认状态库位于当前工作目录的 `.singularity/sessions.sqlite3`。sandbox 自身的受限账户元数据和 helper 缓存默认位于 `%USERPROFILE%\.singularity`；只有需要改变该位置时才设置 `SINGULARITY_HOME`。
 
 ## 安全边界
 

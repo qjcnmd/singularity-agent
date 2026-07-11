@@ -205,8 +205,7 @@ pub struct InitializeResult {
 impl InitializeResult {
     pub fn local() -> Self {
         Self {
-            user_agent: concat!("singularity-rust-app-server/", env!("CARGO_PKG_VERSION"))
-                .to_string(),
+            user_agent: concat!("singularity-app-server/", env!("CARGO_PKG_VERSION")).to_string(),
             platform_family: "local".to_string(),
             platform_os: std::env::consts::OS.to_string(),
         }
@@ -409,8 +408,8 @@ pub struct ProviderReadiness {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentCapabilityResult {
-    #[serde(rename = "nativeAgentLoop")]
-    pub native_agent_loop: Value,
+    #[serde(rename = "agentLoop")]
+    pub agent_loop: Value,
     #[serde(rename = "providerReadiness")]
     pub provider_readiness: ProviderReadiness,
 }

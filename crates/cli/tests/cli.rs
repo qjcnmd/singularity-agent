@@ -5,8 +5,8 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use support::{
-    FakeAppServer, Scenario, capture_params, exit, native_capability, print_stderr, respond, send,
-    sleep_ms, thread as fake_thread, turn as fake_turn, write_text,
+    FakeAppServer, Scenario, agent_loop_capability, capture_params, exit, print_stderr, respond,
+    send, sleep_ms, thread as fake_thread, turn as fake_turn, write_text,
 };
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
@@ -67,7 +67,7 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .interaction(
                 "thread/start",
                 vec![
@@ -144,7 +144,7 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
 }
 
 #[test]
-fn cli_config_doctor_reports_redacted_native_and_eval_readiness() {
+fn cli_config_doctor_reports_redacted_agent_loop_and_eval_readiness() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = FakeAppServer::new(
@@ -154,7 +154,7 @@ fn cli_config_doctor_reports_redacted_native_and_eval_readiness() {
             .respond(
                 "agent/capability",
                 json!({
-                    "nativeAgentLoop": {
+                    "agentLoop": {
                         "available": true,
                         "status": "completed",
                         "reason": "enabled",
@@ -196,8 +196,8 @@ fn cli_config_doctor_reports_redacted_native_and_eval_readiness() {
     assert!(doctor.status.success(), "stderr={}", stderr(&doctor));
     let doctor_stdout = stdout(&doctor);
     assert!(doctor_stdout.contains("client=protocol-only"));
-    assert!(doctor_stdout.contains("native_agent_loop=completed"));
-    assert!(doctor_stdout.contains("evaluation=rust_native"));
+    assert!(doctor_stdout.contains("agent_loop=completed"));
+    assert!(doctor_stdout.contains("evaluation=agent_loop"));
     assert!(doctor_stdout.contains("provider_config_source=project_env"));
     assert!(doctor_stdout.contains("provider_snapshot_id=provider_snapshot_cli_test"));
     assert!(doctor_stdout.contains("provider_ready=false"));
@@ -255,10 +255,7 @@ stderr={}",
         fake_app_server.display(),
         stderr(&output)
     );
-    assert!(stdout(&output).contains(&format!(
-        "native_agent_loop={}",
-        expected_native_agent_loop_status()
-    )));
+    assert!(stdout(&output).contains(&format!("agent_loop={}", expected_agent_loop_status())));
     assert!(!stderr(&output).contains("old app-server should not run"));
 }
 
@@ -296,17 +293,17 @@ fn cli_fails_closed_without_explicit_or_sibling_app_server() {
 }
 
 #[test]
-fn cli_rejects_native_run_when_capability_is_disabled() {
+fn cli_rejects_run_when_agent_loop_capability_is_disabled() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
-    let trace_path = temp.path().join("native_disabled_methods.txt");
+    let trace_path = temp.path().join("agent_loop_disabled_methods.txt");
     let fake_server = FakeAppServer::new(
         temp.path(),
         Scenario::new()
             .initialized()
             .respond(
                 "agent/capability",
-                native_capability(
+                agent_loop_capability(
                     false,
                     "blocked",
                     "sandbox unavailable",
@@ -333,17 +330,17 @@ fn cli_rejects_native_run_when_capability_is_disabled() {
 }
 
 #[test]
-fn cli_rejects_nonterminal_native_capability_without_blockers() {
+fn cli_rejects_nonterminal_agent_loop_capability_without_blockers() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
-    let trace_path = temp.path().join("native_running_methods.txt");
+    let trace_path = temp.path().join("agent_loop_running_methods.txt");
     let fake_server = FakeAppServer::new(
         temp.path(),
         Scenario::new()
             .initialized()
             .respond(
                 "agent/capability",
-                native_capability(true, "running", "probe still running", &[]),
+                agent_loop_capability(true, "running", "probe still running", &[]),
             )
             .shutdown()
             .trace_methods_to(&trace_path),
@@ -366,12 +363,12 @@ fn cli_rejects_nonterminal_native_capability_without_blockers() {
 fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
-    let trace_path = temp.path().join("native_enabled_turn.json");
+    let trace_path = temp.path().join("agent_loop_enabled_turn.json");
     let fake_server = FakeAppServer::new(
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond("thread/start", json!({"thread": fake_thread("thread_native")}))
             .interaction(
                 "turn/start",
@@ -397,14 +394,14 @@ fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
 }
 
 #[test]
-fn cli_rejects_native_turn_without_agent_loop_terminal_status() {
+fn cli_rejects_turn_without_agent_loop_terminal_status() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = FakeAppServer::new(
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond(
                 "thread/start",
                 json!({"thread": fake_thread("thread_native")}),
@@ -435,14 +432,14 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond("thread/start", json!({"thread": thread}))
             .interaction(
                 "turn/start",
                 vec![
                     send(json!({"method": "turn/started", "params": {"turn": turn.clone()}})),
                     send(json!({"method": "turn/diff/updated", "params": {"patch": "SECRET_DIFF_SHOULD_NOT_LEAK"}})),
-                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_json"}, "delta": "rust-native-ok"}})),
+                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_json"}, "delta": "agent-loop-ok"}})),
                     respond(json!({"turn": turn})),
                 ],
             )
@@ -450,7 +447,7 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
     );
 
     let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args(["run", "Reply exactly: rust-native-ok", "--json"])
+        .args(["run", "Reply exactly: agent-loop-ok", "--json"])
         .output()
         .expect("run cli");
 
@@ -466,7 +463,7 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
         .iter()
         .find(|event| event["method"] == "item/agentMessage/delta")
         .expect("agent delta event");
-    assert_eq!(item_delta["params"]["delta"], "rust-native-ok");
+    assert_eq!(item_delta["params"]["delta"], "agent-loop-ok");
     assert!(!stdout(&output).contains("turn turn_json completed"));
 }
 
@@ -478,7 +475,7 @@ fn cli_run_json_preserves_fail_closed_turn_status() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond(
                 "thread/start",
                 json!({"thread": fake_thread("thread_json")}),
@@ -502,17 +499,17 @@ fn cli_run_json_preserves_fail_closed_turn_status() {
 }
 
 #[test]
-fn cli_rejects_partial_native_capability_until_blockers_clear() {
+fn cli_rejects_partial_agent_loop_capability_until_blockers_clear() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
-    let trace_path = temp.path().join("partial_native_methods.txt");
+    let trace_path = temp.path().join("partial_agent_loop_methods.txt");
     let fake_server = FakeAppServer::new(
         temp.path(),
         Scenario::new()
             .initialized()
             .respond(
                 "agent/capability",
-                native_capability(true, "running", "partial", &["strict_command_sandbox"]),
+                agent_loop_capability(true, "running", "partial", &["strict_command_sandbox"]),
             )
             .shutdown()
             .trace_methods_to(&trace_path),
@@ -575,19 +572,19 @@ fn cli_eval_command_is_script_friendly_and_validates_manifest() {
 }
 
 #[test]
-fn cli_eval_run_uses_native_app_server_and_reports_verification_result() {
+fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let eval_output = temp.path().join("eval-output");
     let manifest = temp.path().join("eval.json");
-    let native_trace = temp.path().join("native-turn.json");
+    let agent_loop_trace = temp.path().join("agent-loop-turn.json");
     std::fs::write(
         &manifest,
         r#"{
   "schema_version": "evaluation.task_set/v2",
   "tasks": [{
     "task_id": "fixture_native",
-    "description": "Exercise the native Rust evaluation transport.",
+    "description": "Exercise the AgentLoop evaluation transport.",
     "workspace": {"source": {"type": "local", "path": "."}},
     "agent": {
       "instructions": "Change solution.txt so value is 1.",
@@ -610,11 +607,11 @@ fn cli_eval_run_uses_native_app_server_and_reports_verification_result() {
             .interaction(
                 "eval/run",
                 vec![
-                    capture_params(&native_trace),
+                    capture_params(&agent_loop_trace),
                     respond(json!({
                         "run_id": "eval_native",
                         "manifest": path_str(&manifest),
-                        "runner": "rust_native",
+                        "runner": "agent_loop",
                         "status": "completed",
                         "blocker": null,
                         "evaluation_passed": true,
@@ -659,7 +656,7 @@ fn cli_eval_run_uses_native_app_server_and_reports_verification_result() {
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("eval json");
-    assert_eq!(value["runner"], "rust_native");
+    assert_eq!(value["runner"], "agent_loop");
     assert_eq!(value["evaluation_passed"], true);
     assert_eq!(value["tasks"][0]["agent_completed"], true);
     assert_eq!(value["tasks"][0]["tests_passed"], true);
@@ -670,15 +667,15 @@ fn cli_eval_run_uses_native_app_server_and_reports_verification_result() {
     assert!(value["result_path"].as_str().is_some());
     assert!(value["report_path"].as_str().is_some());
     let params: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(native_trace).expect("native trace"))
-            .expect("native turn params");
+        serde_json::from_str(&std::fs::read_to_string(agent_loop_trace).expect("agent loop trace"))
+            .expect("agent loop turn params");
     assert_eq!(params["runId"], "eval_native");
     assert_eq!(params["manifest"], path_str(&manifest));
     assert_eq!(params["outputRoot"], path_str(&eval_output));
 }
 
 #[test]
-fn cli_renders_native_status_and_answer() {
+fn cli_renders_agent_loop_status_and_answer() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let thread = fake_thread("thread_fake");
@@ -687,7 +684,7 @@ fn cli_renders_native_status_and_answer() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .interaction(
                 "thread/start",
                 vec![
@@ -699,7 +696,7 @@ fn cli_renders_native_status_and_answer() {
                 "turn/start",
                 vec![
                     send(json!({"method": "turn/started", "params": {"turn": turn.clone()}})),
-                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "native completed"}})),
+                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "agent loop completed"}})),
                     respond(json!({"turn": turn})),
                 ],
             )
@@ -715,7 +712,7 @@ fn cli_renders_native_status_and_answer() {
     let stdout = stdout(&output);
     assert!(stdout.contains("thread thread_fake"));
     assert!(stdout.contains("turn turn_fake completed agent_loop_status=completed"));
-    assert!(stdout.contains("assistant native completed"));
+    assert!(stdout.contains("assistant agent loop completed"));
 }
 
 #[test]
@@ -726,12 +723,12 @@ fn cli_exits_nonzero_for_failed_turn_without_raw_payload() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond("thread/start", json!({"thread": fake_thread("thread_fake")}))
             .interaction(
                 "turn/start",
                 vec![
-                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "native failed"}})),
+                    send(json!({"method": "item/agentMessage/delta", "params": {"item": {"item_id": "item_fake"}, "delta": "agent loop failed"}})),
                     respond(json!({"turn": fake_turn("turn_failed", "thread_fake", "failed", "failed")})),
                 ],
             )
@@ -962,7 +959,7 @@ fn cli_continue_resumes_thread_and_does_not_upload_history() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond("thread/resume", json!({"thread": thread}))
             .interaction(
                 "turn/start",
@@ -1036,7 +1033,7 @@ fn cli_run_returns_when_turn_response_has_no_notifications() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond(
                 "thread/start",
                 json!({"thread": fake_thread("thread_fake")}),
@@ -1065,7 +1062,7 @@ fn cli_run_does_not_wait_for_post_response_messages() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond("thread/start", json!({"thread": fake_thread("thread_fake")}))
             .interaction(
                 "turn/start",
@@ -1095,7 +1092,7 @@ fn cli_run_polls_running_turn_before_shutdown() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond(
                 "thread/start",
                 json!({"thread": fake_thread("thread_fake")}),
@@ -1132,7 +1129,7 @@ fn cli_run_polling_exits_nonzero_for_interrupted_turn() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond("thread/start", json!({"thread": fake_thread("thread_fake")}))
             .respond(
                 "turn/start",
@@ -1181,7 +1178,7 @@ fn cli_ignores_non_matching_response_before_next_matching_response() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond(
                 "thread/start",
                 json!({"thread": fake_thread("thread_fake")}),
@@ -1220,7 +1217,7 @@ fn cli_ignores_non_matching_error_before_next_matching_response() {
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond(
                 "thread/start",
                 json!({"thread": fake_thread("thread_fake")}),
@@ -1310,7 +1307,7 @@ fn assert_immediate_terminal_turn_exits_nonzero(status: &str, agent_loop_status:
         temp.path(),
         Scenario::new()
             .initialized()
-            .native_ready()
+            .agent_loop_ready()
             .respond("thread/start", json!({"thread": fake_thread("thread_fake")}))
             .respond(
                 "turn/start",
@@ -1331,7 +1328,7 @@ fn assert_immediate_terminal_turn_exits_nonzero(status: &str, agent_loop_status:
     assert!(stderr(&output).contains(&format!("turn {status}")));
 }
 
-fn expected_native_agent_loop_status() -> &'static str {
+fn expected_agent_loop_status() -> &'static str {
     if cfg!(windows) {
         "completed"
     } else {

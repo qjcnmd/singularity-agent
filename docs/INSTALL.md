@@ -97,7 +97,7 @@ sg run "检查当前项目并修复一个明确问题"
 默认 app-server SQLite 位于命令启动目录下：
 
 ```text
-.singularity/rust-app-server.sqlite3
+.singularity/sessions.sqlite3
 ```
 
 开发和自动化场景可以通过 `SINGULARITY_APP_SERVER_DB` 指向另一个数据库文件；普通安装不需要设置。评估输出默认位于 `work/evaluations/<run-id>`，也可以通过 `SINGULARITY_EVAL_OUTPUT_DIR` 覆盖。

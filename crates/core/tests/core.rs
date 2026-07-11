@@ -4,11 +4,11 @@ use singularity_core::{
 
 #[test]
 fn client_metadata_and_ids_round_trip_as_json() {
-    let client = ClientInfo::new("rust_cli", "Rust CLI", "0.1.0");
+    let client = ClientInfo::new("singularity_cli", "Singularity CLI", "0.1.0");
     let value = serde_json::to_value(&client).expect("serialize client info");
 
-    assert_eq!(value["name"], "rust_cli");
-    assert_eq!(value["title"], "Rust CLI");
+    assert_eq!(value["name"], "singularity_cli");
+    assert_eq!(value["title"], "Singularity CLI");
     assert_eq!(value["version"], "0.1.0");
 
     let request_id = RequestId::from("request_1");

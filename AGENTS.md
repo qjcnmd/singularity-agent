@@ -17,7 +17,7 @@
 
 ## 项目实现与目标仓库语言边界
 
-1. Singularity 自身的实现、构建、测试、持续集成（CI）和发布链路只使用 Rust。不要为 Singularity 新增 Python runtime、包、脚本、测试、oracle、parity fixture、sidecar 或兼容入口。
+1. Singularity 的核心产品运行时、公共协议、安全边界和发布二进制使用 Rust。允许为构建、测试、审计或维护引入职责明确的主流辅助工具，但不得形成第二套产品运行时、绕过 Rust 主链路或安全协议，也不得恢复 Python agent runtime、sidecar 或兼容入口。
 2. 目标仓库可以使用 Python、Rust、Node.js、Go 或其他语言；命令工具应在严格 sandbox 中使用宿主机 `PATH` 已安装的工具链，不得把实现语言边界误作目标仓库能力限制。
 3. `sg` 只通过 stdio JSON-RPC 调用 `singularity_app_server`；CLI 不直接依赖 agent、model、tools 或 store crate。
 4. 当前工作树只保留当前真实结构。历史命名、schema、CLI、环境变量和迁移说明由 Git 历史保存，不新增兼容垫片、弃用别名、迁移读取入口或旧路径 re-export。
@@ -33,7 +33,7 @@
 
 ## 文档
 
-1. `docs/singularity.md` 是唯一架构事实文档，只描述当前 Rust 源码中的 crate 边界、对象、调用链、持久化和失败路径。
+1. `docs/singularity.md` 是唯一架构事实文档，只描述当前核心产品运行时中的 crate 边界、对象、调用链、持久化和失败路径。
 2. 主链路、协议、状态映射、sandbox、approval、provider、evaluation、trace 或 store 变化时，同步更新 `docs/singularity.md` 的相关部分。
 3. 不恢复 `docs/architecture/modules/`、迁移报告、阶段报告、旧路线图或 Python 时代文档。
 
