@@ -80,6 +80,7 @@ pub enum AppServerError {
 }
 
 pub type AppServerResult<T> = Result<T, AppServerError>;
+type ApprovalCheckpoint = (ApprovalRequest, Value);
 
 pub struct AppServer {
     store: SessionStore,
@@ -612,7 +613,7 @@ impl AppServer {
         decision: &ApprovalDecision,
         pending_tool_call: Option<Value>,
         cancellation: &CancellationToken,
-    ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<ApprovalCheckpoint>)>> {
         if !agent_loop_ready() {
             return Ok(None);
         }
@@ -636,7 +637,7 @@ impl AppServer {
                     error.message,
                 );
                 run_status.error_category = Some(category);
-                return Ok(Some((turn, run_status)));
+                return Ok(Some((turn, run_status, Vec::new())));
             }
         };
         self.resume_agent_loop_after_gate(
@@ -655,7 +656,7 @@ impl AppServer {
         pending_tool_call: Option<Value>,
         provider: P,
         cancellation: &CancellationToken,
-    ) -> AppServerResult<Option<(Turn, AgentRunStatus)>>
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<ApprovalCheckpoint>)>>
     where
         P: Provider,
     {
@@ -682,7 +683,7 @@ impl AppServer {
                     "unavailable",
                     format!("invalid pending tool call: {error}"),
                 );
-                return Ok(Some((turn, run_status)));
+                return Ok(Some((turn, run_status, Vec::new())));
             }
         };
         if pending.request_id != request.request_id {
@@ -693,7 +694,7 @@ impl AppServer {
                 "unavailable",
                 "pending tool call request mismatch",
             );
-            return Ok(Some((turn, run_status)));
+            return Ok(Some((turn, run_status, Vec::new())));
         }
         let thread = self.store.get_thread(&turn.thread_id)?;
         if thread.status != singularity_protocol::ThreadStatus::Active {
@@ -709,7 +710,7 @@ impl AppServer {
                     "unavailable",
                     error,
                 );
-                return Ok(Some((turn, run_status)));
+                return Ok(Some((turn, run_status, Vec::new())));
             }
         };
         let user_input = self.store.get_turn_user_input(turn_id)?;
@@ -746,7 +747,7 @@ impl AppServer {
                     "unavailable",
                     error.to_string(),
                 );
-                return Ok(Some((turn, run_status)));
+                return Ok(Some((turn, run_status, Vec::new())));
             }
         };
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
@@ -756,7 +757,7 @@ impl AppServer {
             ))
             .with_cancellation_token(cancellation.clone())
             .resume_pending_tool_call(&loop_input, &pending, &pending_tool_call);
-        self.persist_agent_approval_requests(&result)?;
+        let next_approvals = approval_checkpoints(&result)?;
         let mut run_status = result.to_run_status();
         if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
             let audit_status = approval_terminal_status(
@@ -771,7 +772,7 @@ impl AppServer {
             );
             run_status.audit_events = audit_status.audit_events;
         }
-        Ok(Some((turn, run_status)))
+        Ok(Some((turn, run_status, next_approvals)))
     }
 
     fn run_agent_loop_with_provider<P>(
@@ -803,16 +804,10 @@ impl AppServer {
     }
 
     fn persist_agent_approval_requests(&self, result: &AgentLoopResult) -> AppServerResult<()> {
-        for request in &result.approval_requests {
-            let pending_tool_call = result.approval_checkpoint(&request.request_id);
-            if request.tool_call_id.is_some() && pending_tool_call.is_none() {
-                return Err(AppServerError::Store(StoreError::InvalidState(
-                    APPROVAL_CHECKPOINT_REQUIRED.to_string(),
-                )));
-            }
+        for (request, pending_tool_call) in approval_checkpoints(result)? {
             match self.store.create_approval_with_pending_tool_call_and_trace(
-                request,
-                pending_tool_call,
+                &request,
+                Some(pending_tool_call),
                 "approval",
                 "approval requested",
             ) {
@@ -868,17 +863,18 @@ impl AppServer {
         request_id: &str,
         turn: &Turn,
         run_status: &AgentRunStatus,
+        next_approvals: &[ApprovalCheckpoint],
     ) -> Result<CommittedTurnOutcome, StoreError> {
         let assistant_delta = agent_completed_delta(run_status);
         let event = agent_loop_trace(turn, run_status);
         self.store
             .commit_turn_outcome_and_resolve_pending_execution(
                 request_id,
-                &turn.turn_id,
                 turn_status_for_agent(&run_status.status),
                 run_status.status.as_str(),
                 assistant_delta.as_deref(),
                 &event,
+                next_approvals,
             )
     }
 
@@ -1066,8 +1062,9 @@ impl AppServer {
                 &decision,
                 pending_tool_call.as_ref(),
             )?
+            .map(|(turn, run_status)| (turn, run_status, Vec::new()))
         };
-        if let Some((turn, run_status)) = terminal {
+        if let Some((turn, run_status, next_approvals)) = terminal {
             let mut effective_status = run_status.clone();
             if cancellation.is_cancelled() {
                 mark_run_cancelled(&mut effective_status);
@@ -1076,6 +1073,7 @@ impl AppServer {
                 &decision.request_id,
                 &turn,
                 &effective_status,
+                &next_approvals,
             )?;
             messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
             messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
@@ -1360,6 +1358,23 @@ fn merge_json_object(target: &mut Value, source: Value) {
             target.insert(key.clone(), value.clone());
         }
     }
+}
+
+fn approval_checkpoints(result: &AgentLoopResult) -> AppServerResult<Vec<ApprovalCheckpoint>> {
+    result
+        .approval_requests
+        .iter()
+        .map(|request| {
+            let checkpoint = result
+                .approval_checkpoint(&request.request_id)
+                .ok_or_else(|| {
+                    AppServerError::Store(StoreError::InvalidState(
+                        APPROVAL_CHECKPOINT_REQUIRED.to_string(),
+                    ))
+                })?;
+            Ok((request.clone(), checkpoint))
+        })
+        .collect()
 }
 
 fn workspace_tool_registry() -> ToolRegistry {
@@ -2323,7 +2338,7 @@ mod tests {
         let seen_requests = Arc::new(Mutex::new(Vec::new()));
         let server = app_server(store);
 
-        let (_turn, mismatch_status) = server
+        let (_turn, mismatch_status, _next_approvals) = server
             .resume_agent_loop_after_gate(
                 &request,
                 &decision,
@@ -2352,7 +2367,7 @@ mod tests {
                 .starts_with("sha256:")
         );
 
-        let (_turn, invalid_args_status) = server
+        let (_turn, invalid_args_status, _next_approvals) = server
             .resume_agent_loop_after_gate(
                 &request,
                 &decision,
@@ -2596,6 +2611,7 @@ mod tests {
                 &request.request_id,
                 &resumed.0,
                 &resumed.1,
+                &resumed.2,
             )
             .expect("commit resumed outcome");
         assert_eq!(committed.turn.status, TurnStatus::Completed);

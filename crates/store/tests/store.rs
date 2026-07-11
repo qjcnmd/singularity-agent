@@ -815,6 +815,100 @@ fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
 }
 
 #[test]
+fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_approval() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let first = ApprovalRequest::new(
+        "approval_first",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.edit",
+    )
+    .with_tool_call_id("call_1");
+    let checkpoint = |request_id: &str, tool_call_id: &str| {
+        serde_json::json!({
+            "request_id": request_id,
+            "thread_id": &thread.thread_id,
+            "turn_id": &turn.turn_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": "builtin.edit",
+            "raw_arguments": "{}",
+            "resources": [],
+            "checkpoint_version": 1,
+            "messages": [],
+            "tool_results": [],
+            "used_approval_grants": [],
+            "approval_count": 1,
+            "model_turns": 1,
+            "completion": {}
+        })
+    };
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &first,
+            Some(checkpoint("approval_first", "call_1")),
+            "approval",
+            "approval requested",
+        )
+        .expect("first checkpoint");
+    store
+        .record_approval_decision(
+            &ApprovalDecision::new(first.request_id.clone(), ApprovalOutcome::Allow, "allow"),
+            "approval",
+            "approval decision recorded",
+        )
+        .expect("claim first execution");
+    let next = ApprovalRequest::new(
+        "approval_next",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin.edit",
+    )
+    .with_tool_call_id("call_2");
+    let trace = TraceEvent {
+        task_id: Some(turn.turn_id.clone()),
+        ..TraceEvent::new(
+            "trace_handoff",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "agent_loop",
+            "agent loop blocked",
+        )
+    };
+
+    store
+        .commit_turn_outcome_and_resolve_pending_execution(
+            &first.request_id,
+            TurnStatus::Blocked,
+            "blocked",
+            None,
+            &trace,
+            &[(next.clone(), checkpoint("approval_next", "call_2"))],
+        )
+        .expect("atomic approval handoff");
+
+    assert!(
+        !store
+            .has_pending_tool_call(&first.request_id)
+            .expect("first")
+    );
+    assert!(store.has_pending_tool_call(&next.request_id).expect("next"));
+    assert_eq!(
+        store
+            .get_pending_approval(&next.request_id)
+            .expect("next approval"),
+        next
+    );
+    let blocked = store.get_turn(&turn.turn_id).expect("blocked turn");
+    assert_eq!(blocked.status, TurnStatus::Blocked);
+    assert_eq!(blocked.agent_loop_status, "blocked");
+}
+
+#[test]
 fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");

@@ -1029,11 +1029,11 @@ impl SessionStore {
     pub fn commit_turn_outcome_and_resolve_pending_execution(
         &self,
         request_id: &str,
-        turn_id: &str,
         status: TurnStatus,
         agent_loop_status: &str,
         assistant_delta: Option<&str>,
         trace: &TraceEvent,
+        next_approvals: &[(ApprovalRequest, Value)],
     ) -> StoreResult<CommittedTurnOutcome> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -1049,14 +1049,9 @@ impl SessionStore {
                 )),
                 other => StoreError::Sqlite(other),
             })?;
-        if bound_turn_id != turn_id {
-            return Err(StoreError::InvalidState(
-                "pending execution turn binding mismatch".to_string(),
-            ));
-        }
         let committed = self.commit_turn_outcome_in_transaction(
             &transaction,
-            turn_id,
+            &bound_turn_id,
             status,
             agent_loop_status,
             assistant_delta,
@@ -1070,6 +1065,42 @@ impl SessionStore {
             return Err(StoreError::InvalidState(format!(
                 "pending execution {request_id} was not resolved"
             )));
+        }
+        for (request, checkpoint) in next_approvals {
+            if request.turn_id != bound_turn_id {
+                return Err(StoreError::InvalidState(
+                    "next approval turn binding mismatch".to_string(),
+                ));
+            }
+            insert_approval(&transaction, request)?;
+            let tool_call_id = pending_tool_call_id(&transaction, request, checkpoint)?;
+            ensure_request_turn_binding(&transaction, request)?;
+            transaction.execute(
+                "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload, execution_state) values(?1, ?2, ?3, ?4, ?5, 'pending')",
+                params![
+                    request.request_id,
+                    request.thread_id,
+                    request.turn_id,
+                    tool_call_id,
+                    serde_json::to_string(checkpoint)?
+                ],
+            )?;
+            let approval_trace = TraceEvent {
+                task_id: Some(request.turn_id.clone()),
+                payload: serde_json::json!({
+                    "request_id": &request.request_id,
+                    "action": &request.action,
+                    "tool_call_id": &request.tool_call_id,
+                }),
+                ..TraceEvent::new(
+                    format!("trace_{}", request.request_id),
+                    request.thread_id.clone(),
+                    request.thread_id.clone(),
+                    "approval",
+                    "approval requested",
+                )
+            };
+            Self::insert_trace(&transaction, &approval_trace)?;
         }
         transaction.commit()?;
         Ok(committed)
