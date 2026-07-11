@@ -4,7 +4,7 @@ target/
 work/
 
 # Local agent state and isolated worktrees.
-.codex/repo-map.json
+.codex/
 .worktrees/
 
 # SQLite sidecars created beside runtime databases.
