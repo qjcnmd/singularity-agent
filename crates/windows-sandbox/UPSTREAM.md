@@ -95,5 +95,6 @@ The port does not depend on `codex-utils-pty`, `codex-otel`, the upstream protoc
 7. Kept private desktop support and made it the default in `ElevatedSandboxProfileCaptureRequest::new`.
 8. Changed the strict world-writable audit path to propagate incomplete ACL scans and deny-ACE failures instead of treating them as success.
 9. Replaced upstream protocol and absolute-path dependencies with the bounded local types listed above.
+10. In Cargo test layouts, helper discovery also checks the profile directory above `deps`; installed and release layouts still prefer direct siblings or packaged resources.
 
 `singularity_sandbox::WindowsSandboxBackend` is the product adapter for this crate. It maps the runtime filesystem and network policy into the permission profile above, tries the elevated path first, permits the restricted-token path only when it can enforce the requested profile, and otherwise fails closed.

@@ -19,6 +19,7 @@ use crate::product_identity::{
 use crate::sandbox_bin_dir;
 
 const DEV_BUILD_VERSION_SENTINEL: &str = "0.0.0";
+const CARGO_DEPS_DIRNAME: &str = "deps";
 pub(crate) const BIN_DIRNAME: &str = HELPER_BIN_DIR_NAME;
 pub(crate) const RESOURCES_DIRNAME: &str = HELPER_RESOURCES_DIR_NAME;
 
@@ -201,6 +202,15 @@ pub(crate) fn bundled_executable_path_for_exe(exe: &Path, file_name: &str) -> Op
         return Some(direct_candidate);
     }
 
+    if dir.file_name() == Some(OsStr::new(CARGO_DEPS_DIRNAME))
+        && let Some(profile_dir) = dir.parent()
+    {
+        let cargo_sibling = profile_dir.join(file_name);
+        if cargo_sibling.is_file() {
+            return Some(cargo_sibling);
+        }
+    }
+
     if dir.file_name() == Some(OsStr::new(BIN_DIRNAME))
         && let Some(package_dir) = dir.parent()
     {
@@ -364,6 +374,7 @@ fn destination_is_fresh(source: &Path, destination: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::BIN_DIRNAME;
+    use super::CARGO_DEPS_DIRNAME;
     use super::CopyOutcome;
     use super::DEV_BUILD_VERSION_SENTINEL;
     use super::HelperExecutable;
@@ -480,6 +491,23 @@ mod tests {
         let resolved =
             bundled_executable_path_for_exe(&exe, /*file_name*/ COMMAND_RUNNER_BINARY_NAME)
                 .expect("helper path");
+
+        assert_eq!(resolved, helper);
+    }
+
+    #[test]
+    fn helper_source_lookup_checks_cargo_profile_dir_for_test_exe() {
+        let tmp = TempDir::new().expect("tempdir");
+        let profile_dir = tmp.path().join("debug");
+        let deps_dir = profile_dir.join(CARGO_DEPS_DIRNAME);
+        fs::create_dir_all(&deps_dir).expect("create deps dir");
+        let test_exe = deps_dir.join("sandbox-test.exe");
+        let helper = profile_dir.join(COMMAND_RUNNER_BINARY_NAME);
+        fs::write(&test_exe, b"test").expect("write test exe");
+        fs::write(&helper, b"runner").expect("write helper");
+
+        let resolved =
+            bundled_executable_path_for_exe(&test_exe, COMMAND_RUNNER_BINARY_NAME).expect("helper");
 
         assert_eq!(resolved, helper);
     }
