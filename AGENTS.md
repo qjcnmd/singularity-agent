@@ -61,3 +61,17 @@ cargo run -p singularity_cli --bin sg -- eval run docs/evaluation/public-represe
 1. 修改前确认仓库、分支、工作树和用户未提交改动；不覆盖无关内容。
 2. 验证通过后创建范围单一、信息明确的本地提交。
 3. 未经用户明确要求不得 push、merge、rebase、reset、删除 stash 或改写历史。
+
+## Agent skills
+
+### Issue tracker
+
+任务和需求记录在 GitHub Issues。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用默认的五类 triage 标签。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+单上下文（single-context）布局；现有仓库指令和当前架构文档优先。详见 `docs/agents/domain.md`。
