@@ -179,3 +179,25 @@ fn next_command_id() -> String {
     let sequence = COMMAND_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("evaluation_command_{sequence}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use singularity_tools::SandboxBackendEnforcement;
+
+    #[test]
+    fn missing_host_executable_is_an_environment_blocker() {
+        let result = CommandResult::spawn_failed(
+            "missing_tool",
+            "required executable 'python' was not found on host PATH",
+        )
+        .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict);
+
+        let blocker = infrastructure_blocker(&result, "setup command failed")
+            .expect("spawn failure must block");
+
+        assert_eq!(blocker.kind, BlockerKind::Environment);
+        assert!(blocker.message.contains("'python'"));
+        assert!(!blocker.message.contains("C:\\"));
+    }
+}

@@ -30,6 +30,8 @@ singularity-windows-sandbox-setup.exe
 
 将该目录加入 `PATH` 即可，不需要单独安装或选择 sandbox backend。第一次执行需要离线命令沙箱的任务时，系统可能显示一次 Windows UAC 提权提示；setup helper 会建立受限账户、访问控制列表和网络隔离，之后自动复用。用户拒绝提权或 setup 失败时命令不会退回本地进程执行。
 
+Singularity 自身由 Rust 实现，但可以处理 Python、Rust、Node.js、Go 等不同语言的目标仓库。目标项目所需工具链由用户安装并加入宿主机 `PATH`；sandbox 会解析真实可执行文件并授予其安装目录只读/执行权限，不需要维护额外的 sandbox 路径配置。
+
 完整安装、源码构建和更新说明见 [`docs/INSTALL.md`](docs/INSTALL.md)。
 
 ## Provider 配置

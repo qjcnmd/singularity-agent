@@ -962,7 +962,7 @@ fn run_agent_stage(
         .filter(|path| !path_is_allowed(path, &projection.allowed_paths))
         .cloned()
         .collect::<Vec<_>>();
-    let smoke_command_satisfied = smoke_commands_satisfied(projection, &result);
+    let smoke_command_satisfied = smoke_commands_satisfied(agent_dir, projection, &result);
     let loop_completed = result.completed && result.status == AgentStatus::Completed;
     let error = result.error.clone().map(safe_text);
     let sandbox_blocker = agent_sandbox_blocker(&run_status.audit_events);
@@ -1042,39 +1042,22 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
         .iter()
         .map(|tool| tool.as_str())
         .collect::<BTreeSet<_>>();
-    let allows_network = projection
-        .smoke_commands
-        .iter()
-        .any(|command| command.network_access == NetworkAccess::Allowed);
     let mut registry = ToolRegistry::default();
     for mut spec in native_workspace_tool_specs() {
         if !allowed.contains(spec.name.as_str()) {
             continue;
         }
         if spec.name == TOOL_COMMAND {
-            let network_values = if allows_network {
-                json!(["denied", "allowed"])
+            let commands = projection
+                .smoke_commands
+                .iter()
+                .map(smoke_command_input_schema)
+                .collect::<Vec<_>>();
+            spec.input_schema = if commands.len() == 1 {
+                commands.into_iter().next().expect("one command schema")
             } else {
-                json!(["denied"])
+                json!({"oneOf": commands})
             };
-            spec.input_schema = json!({
-                "type": "object",
-                "properties": {
-                    "argv": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1
-                    },
-                    "cwd": {"type": "string"},
-                    "timeout_seconds": {"type": "integer", "minimum": 1},
-                    "sandbox_mode": {"type": "string", "enum": ["workspace_write"]},
-                    "network_access": {"type": "string", "enum": network_values}
-                },
-                "required": [
-                    "argv", "cwd", "timeout_seconds", "sandbox_mode", "network_access"
-                ],
-                "additionalProperties": false
-            });
         }
         registry.register(spec)?;
     }
@@ -1205,7 +1188,27 @@ fn smoke_command_payload(command: &CommandSpec) -> Value {
     })
 }
 
-fn smoke_commands_satisfied(projection: &AgentTaskProjection, result: &AgentLoopResult) -> bool {
+fn smoke_command_input_schema(command: &CommandSpec) -> Value {
+    let payload = smoke_command_payload(command);
+    json!({
+        "type": "object",
+        "properties": {
+            "argv": {"type": "array", "const": payload["argv"]},
+            "cwd": {"type": "string", "const": payload["cwd"]},
+            "timeout_seconds": {"type": "integer", "const": payload["timeout_seconds"]},
+            "sandbox_mode": {"type": "string", "const": payload["sandbox_mode"]},
+            "network_access": {"type": "string", "const": payload["network_access"]}
+        },
+        "required": ["argv", "cwd", "timeout_seconds", "sandbox_mode", "network_access"],
+        "additionalProperties": false
+    })
+}
+
+fn smoke_commands_satisfied(
+    workspace: &Path,
+    projection: &AgentTaskProjection,
+    result: &AgentLoopResult,
+) -> bool {
     let first_eligible_result = result
         .tool_results
         .iter()
@@ -1215,9 +1218,12 @@ fn smoke_commands_satisfied(projection: &AgentTaskProjection, result: &AgentLoop
     let mut matched_results = vec![false; eligible_results.len()];
     projection.smoke_commands.iter().all(|command| {
         let network = sandbox_network_mode(command.network_access);
+        let Some(cwd) = resolved_smoke_cwd(workspace, command) else {
+            return false;
+        };
         let expected = command_scope_digest(
             command.argv.as_slice(),
-            command.cwd.as_ref().map_or(".", |cwd| cwd.as_str()),
+            &cwd,
             command
                 .timeout_seconds
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
@@ -1239,6 +1245,16 @@ fn smoke_commands_satisfied(projection: &AgentTaskProjection, result: &AgentLoop
         matched_results[index] = true;
         true
     })
+}
+
+fn resolved_smoke_cwd(workspace: &Path, command: &CommandSpec) -> Option<String> {
+    let cwd = command.cwd.as_ref().map_or_else(
+        || workspace.to_path_buf(),
+        |cwd| workspace.join(cwd.as_str()),
+    );
+    fs::canonicalize(cwd)
+        .ok()
+        .map(|cwd| cwd.to_string_lossy().into_owned())
 }
 fn agent_sandbox_blocker(audit_events: &[Value]) -> Option<EvaluationBlocker> {
     if audit_events
@@ -1455,6 +1471,7 @@ mod tests {
     fn successful_command_result(
         tool_call_id: &str,
         command: &CommandSpec,
+        workspace: &Path,
     ) -> singularity_tools::ToolResult {
         let mut result = singularity_tools::ToolResult::summary(
             tool_call_id,
@@ -1465,7 +1482,7 @@ mod tests {
         );
         result.result_id = Some(command_scope_digest(
             command.argv.as_slice(),
-            command.cwd.as_ref().map_or(".", |cwd| cwd.as_str()),
+            &resolved_smoke_cwd(workspace, command).expect("resolved smoke cwd"),
             command
                 .timeout_seconds
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
@@ -1515,6 +1532,7 @@ mod tests {
 
     #[test]
     fn duplicate_smoke_commands_require_distinct_successful_tool_results() {
+        let workspace = tempfile::tempdir().expect("workspace");
         let smoke = command(&["cargo", "test"]);
         let projection = AgentTaskProjection {
             task_id: TaskId::new("task-1").expect("task id"),
@@ -1524,16 +1542,25 @@ mod tests {
             allowed_tools: vec![ToolName::new(TOOL_COMMAND).expect("tool")],
             smoke_commands: vec![smoke.clone(), smoke.clone()],
         };
-        let tool_result = successful_command_result("call-1", &smoke);
+        let tool_result = successful_command_result("call-1", &smoke, workspace.path());
         let result = completed_agent_result(vec![tool_result.clone()]);
-        assert!(!smoke_commands_satisfied(&projection, &result));
+        assert!(!smoke_commands_satisfied(
+            workspace.path(),
+            &projection,
+            &result
+        ));
 
         let result = completed_agent_result(vec![tool_result.clone(), tool_result]);
-        assert!(smoke_commands_satisfied(&projection, &result));
+        assert!(smoke_commands_satisfied(
+            workspace.path(),
+            &projection,
+            &result
+        ));
     }
 
     #[test]
     fn smoke_commands_must_run_after_the_last_workspace_mutation() {
+        let workspace = tempfile::tempdir().expect("workspace");
         let smoke = command(&["cargo", "test"]);
         let projection = AgentTaskProjection {
             task_id: TaskId::new("task-1").expect("task id"),
@@ -1553,13 +1580,21 @@ mod tests {
             "changed",
             "digest",
         );
-        let smoke_result = successful_command_result("call-smoke", &smoke);
+        let smoke_result = successful_command_result("call-smoke", &smoke, workspace.path());
 
         let stale = completed_agent_result(vec![smoke_result.clone(), mutation.clone()]);
-        assert!(!smoke_commands_satisfied(&projection, &stale));
+        assert!(!smoke_commands_satisfied(
+            workspace.path(),
+            &projection,
+            &stale
+        ));
 
         let current = completed_agent_result(vec![mutation, smoke_result]);
-        assert!(smoke_commands_satisfied(&projection, &current));
+        assert!(smoke_commands_satisfied(
+            workspace.path(),
+            &projection,
+            &current
+        ));
     }
 
     #[test]
@@ -1576,6 +1611,27 @@ mod tests {
         assert!(registry.get(TOOL_READ).is_some());
         assert!(registry.get(TOOL_COMMAND).is_none());
         assert!(registry.get(TOOL_EDIT).is_none());
+    }
+
+    #[test]
+    fn registry_command_schema_exposes_only_allowed_smoke_inputs() {
+        let smoke = command(&["cargo", "test"]);
+        let projection = AgentTaskProjection {
+            task_id: TaskId::new("task-1").expect("task id"),
+            description: "description".to_string(),
+            instructions: "fix".to_string(),
+            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
+            allowed_tools: vec![ToolName::new(TOOL_COMMAND).expect("tool")],
+            smoke_commands: vec![smoke.clone()],
+        };
+
+        let registry = evaluation_registry(&projection).expect("registry");
+        let schema = &registry
+            .get(TOOL_COMMAND)
+            .expect("command tool")
+            .input_schema;
+
+        assert_eq!(schema, &smoke_command_input_schema(&smoke));
     }
 
     #[test]

@@ -28,10 +28,10 @@ use thiserror::Error;
 const STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM: &str =
     "strict_command_sandbox_unsupported_platform";
 #[cfg(windows)]
-const NATIVE_AGENT_LOOP_READY_REASON: &str = "native Rust AgentLoop uses automatic Windows elevated sandbox setup with restricted-token fallback only for network-enabled profiles";
+const NATIVE_AGENT_LOOP_READY_REASON: &str = "AgentLoop uses automatic Windows elevated sandbox setup with restricted-token fallback only for network-enabled profiles";
 #[cfg(not(windows))]
 const NATIVE_AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
-    "native Rust AgentLoop requires the Windows restricted-token command sandbox";
+    "AgentLoop requires the Windows restricted-token command sandbox";
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 4;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Use the available tools to inspect real files before making claims. Make requested changes through tools, keep all writes inside the workspace, and run a relevant verification command after the last workspace mutation. Report only work and verification that actually completed. Read-only questions may be answered without changing files or running verification.";
 const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;

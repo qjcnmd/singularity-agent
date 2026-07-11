@@ -16,6 +16,7 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub use_private_desktop: bool,
     pub proxy_enforced: bool,
     pub read_roots_override: Option<&'a [PathBuf]>,
+    pub additional_read_roots: &'a [PathBuf],
     pub read_roots_include_platform_defaults: bool,
     pub write_roots_override: Option<&'a [PathBuf]>,
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
@@ -43,6 +44,7 @@ impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
             use_private_desktop: crate::product_identity::DEFAULT_USE_PRIVATE_DESKTOP,
             proxy_enforced: false,
             read_roots_override: None,
+            additional_read_roots: &[],
             read_roots_include_platform_defaults: true,
             write_roots_override: None,
             deny_read_paths_override: &[],
@@ -79,10 +81,12 @@ mod windows_impl {
     use crate::sandbox_utils::ensure_sandbox_home_exists;
     use crate::sandbox_utils::inject_git_safe_directory;
     use crate::setup::effective_write_roots_for_permissions;
+    use crate::setup::gather_read_roots;
     use crate::token::LocalSid;
     use anyhow::Result;
     use std::fs::File;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -140,6 +144,7 @@ mod windows_impl {
             use_private_desktop,
             proxy_enforced,
             read_roots_override,
+            additional_read_roots,
             read_roots_include_platform_defaults,
             write_roots_override,
             deny_read_paths_override,
@@ -150,6 +155,24 @@ mod windows_impl {
                 permission_profile,
                 workspace_roots,
             )?;
+        let merged_read_roots = if additional_read_roots.is_empty() {
+            None
+        } else {
+            let mut roots = read_roots_override.map_or_else(
+                || gather_read_roots(cwd, &permissions, &env_map, sandbox_home),
+                <[PathBuf]>::to_vec,
+            );
+            roots.extend(additional_read_roots.iter().cloned());
+            roots.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+            roots.dedup_by(|left, right| {
+                left.to_string_lossy()
+                    .eq_ignore_ascii_case(&right.to_string_lossy())
+            });
+            Some(roots)
+        };
+        let read_roots_override = merged_read_roots.as_deref().or(read_roots_override);
+        let read_roots_include_platform_defaults =
+            read_roots_include_platform_defaults && merged_read_roots.is_none();
         let deny_read_paths_override = deny_read_paths_override
             .iter()
             .map(AbsolutePathBuf::to_path_buf)

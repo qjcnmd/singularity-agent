@@ -180,6 +180,8 @@ builtin.command
 CommandToolInput
   -> CommandRequest
   -> validate workspace root / cwd / requested modes
+  -> resolve argv[0] from host PATH/PATHEXT and canonicalize it
+  -> add safe toolchain roots as read/execute-only ACL roots
   -> map to Windows PermissionProfile
   -> run_windows_sandbox_capture_for_permission_profile_elevated
      -> automatic UAC setup when required
@@ -195,8 +197,11 @@ CommandToolInput
 - `read-only` 和 `workspace-write` 可映射；`danger-full-access` 在 sandbox backend 中明确拒绝。
 - network denied 映射到 restricted network，必须使用 elevated offline identity；不能走 unelevated fallback。
 - network allowed 可以在 elevated 路径失败且 restricted token 足够时走 unelevated 路径。
-- 产品层只表达单一 workspace root 与 `denied` / `allowed` 两种网络模式，不暴露 allowlist 或额外读写根目录配置。
-- child environment 删除 secret-like 变量；输出有界并再次做敏感标记检查。
+- 产品层只表达单一 workspace root 与 `denied` / `allowed` 两种网络模式，不要求用户维护 allowlist 或额外读写根目录配置。
+- `argv[0]` 可以解析到 workspace 外的宿主机工具链；PATH 相对项、敏感目录、盘符根目录和整个用户目录不会成为动态读根。只有可执行文件享有该例外，其他参数中的外部数据路径仍在执行前拒绝。
+- Windows 的 `.cmd`/`.bat` 工具入口（例如 npm）会由适配层转换为受控的 `cmd.exe` 调用；脚本路径或参数包含空白、引号、环境展开或 shell 元字符时直接拒绝，不把结构化 argv 降级成任意 shell 字符串。
+- Windows adapter 使用非 verbatim 的 canonical path，避免 `\\?\` cwd/argv 破坏 Python、pip 等依赖普通 Win32 路径语义的工具。
+- child environment 删除 secret-like 变量，并把 pip/npm cache 隔离到可写 `TEMP` 下的 Singularity 专用目录，避免读取宿主用户 cache；输出有界并再次做敏感标记检查。
 - timeout 或 cancel 会终止 Job Object 中的进程树。
 - `local_process_fallback` 始终为 false；没有无沙箱 executor。
 
@@ -247,7 +252,7 @@ prepare source
   -> atomic result.json + report.json
 ```
 
-每个 stage 都通过同一个 `SandboxBackend` 执行 command。agent 只能看到 `agent.instructions`、allowed paths/tools 和 smoke commands；evaluator patch、baseline/public/hidden 命令不进入模型 payload。
+每个 stage 都通过同一个 `SandboxBackend` 执行 command。agent 只能看到 `agent.instructions`、allowed paths/tools 和 smoke commands；evaluator patch、baseline/public/hidden 命令不进入模型 payload。Evaluation 暴露的 command schema 只接受 manifest 声明的 smoke 输入，完成门使用规范化后的实际 cwd 计算同一 command scope，避免模型看到的能力与策略或验收口径分叉。
 
 `EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。全部 task 通过时 run 才通过。blocker 分类包括 environment、workspace preparation、provider configuration、provider authentication、network、sandbox 和 agent runtime。report 另外记录 changed/disallowed files、smoke、model turns、tool calls、approval count、trace path 和 `local_process_fallback_count`。
 
@@ -255,7 +260,7 @@ prepare source
 
 ## 13. 失败与安全不变量
 
-- 不支持的平台、缺失 binary、缺失 provider、无效 workspace 和 sandbox setup 失败都返回明确错误，不切换执行路径。
+- 不支持的平台、缺失 binary、缺失 provider、无效 workspace 和 sandbox setup 失败都返回明确错误，不切换执行路径。宿主机 `PATH` 中缺少工具时返回 environment/spawn failure，不伪装成 sandbox 不可用，也不暴露完整 PATH。
 - CLI 只把 matching response 之前的 notification 与 response 关联；EOF、child exit、timeout 和 JSON-RPC error 都是非零退出。
 - thread workspace 必须是存在的绝对目录；archive thread 不能开始或恢复 pending turn。
 - protected path、workspace 越界、非法 tool arguments 和扩大 sandbox/network 权限在执行前拒绝。

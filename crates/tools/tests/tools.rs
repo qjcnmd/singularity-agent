@@ -1118,6 +1118,13 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
     );
     assert!(result.content.get("argv").is_none());
     assert!(result.content.get("env").is_none());
+    assert_eq!(
+        result.metadata["audit"]["cwd"],
+        std::fs::canonicalize(&workspace)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .as_ref()
+    );
     remove_workspace(&workspace);
 }
 
@@ -1155,7 +1162,13 @@ fn workspace_command_tool_records_audit_for_explicit_danger_full_access() {
             .expect("command scope digest")
             .starts_with("sha256:")
     );
-    assert_eq!(result.metadata["audit"]["cwd"], ".");
+    assert_eq!(
+        result.metadata["audit"]["cwd"],
+        std::fs::canonicalize(&workspace)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .as_ref()
+    );
     assert_eq!(result.metadata["audit"]["timeout_seconds"], 5);
     assert!(result.content.get("argv").is_none());
     remove_workspace(&workspace);

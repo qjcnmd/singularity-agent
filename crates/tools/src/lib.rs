@@ -809,10 +809,12 @@ impl WorkspaceTools {
         }
         let filesystem_mode = input.sandbox_mode();
         let network_mode = input.network_access();
+        let requested_cwd = input.cwd.as_deref().unwrap_or(".");
+        let command_cwd = self.resolve_workspace_path(requested_cwd, false)?;
         let mut request = CommandRequest::project_verification(
             next_command_id(),
             input.argv,
-            input.cwd.unwrap_or_else(|| ".".to_string()),
+            command_cwd.to_string_lossy().into_owned(),
             self.workspace_root.to_string_lossy().into_owned(),
         );
         request.filesystem.mode = filesystem_mode.clone();

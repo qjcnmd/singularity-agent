@@ -1,6 +1,6 @@
 # 安装与运行
 
-Singularity 当前发布目标是 Windows x86-64。可执行文件之间使用同目录发现，不需要注册服务、安装解释器或配置 sandbox backend。
+Singularity 当前发布目标是 Windows x86-64。可执行文件之间使用同目录发现，不需要注册服务、为 Singularity 安装解释器或配置 sandbox backend。目标仓库需要的 Python、Node.js、Rust 等工具链仍需由用户安装并加入宿主机 `PATH`。
 
 ## 安装 release
 
@@ -58,6 +58,7 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 3. 网络被拒绝时必须使用 elevated offline identity；失败后不会降级。
 4. 只有请求允许网络、restricted token 足以满足权限时，才允许 unelevated restricted-token 路径。
 5. 所有路径都使用 Job Object、进程树终止、超时和有界输出捕获。
+6. 裸命令通过宿主机 `PATH`/`PATHEXT` 解析为规范化可执行文件；安全的外部工具链目录只获得读取和执行权限，写入仍限于 workspace 和 sandbox 临时目录。
 
 默认 sandbox home 是 `%USERPROFILE%\.singularity`。确实需要把其状态放到其他盘时，可在启动 `sg` 前设置绝对路径：
 
@@ -124,4 +125,4 @@ cargo build --workspace --bins --release --locked
 sg eval run docs/evaluation/public-representative-task.json --run-id release-validation-<timestamp> --json
 ```
 
-真实验证必须进入 Rust AgentLoop，不能用 fake、mock 或 scripted provider 代替。
+真实验证必须进入 AgentLoop，不能用 fake、mock 或 scripted provider 代替。

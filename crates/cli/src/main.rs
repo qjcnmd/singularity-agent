@@ -263,7 +263,7 @@ fn ensure_native_agent_loop_available(client: &mut AppServerClient) -> Result<()
         return Ok(());
     }
     Err(format!(
-        "Rust AgentLoop is not available: status={status}; blockers={blockers}"
+        "AgentLoop is not available: status={status}; blockers={blockers}"
     ))
 }
 

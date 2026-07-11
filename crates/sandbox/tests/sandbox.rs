@@ -273,6 +273,31 @@ fn windows_backend_denies_parent_traversal_before_execution() {
 
 #[cfg(windows)]
 #[test]
+fn windows_backend_reports_missing_host_tool_as_spawn_failure() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let request = CommandRequest::project_verification(
+        "command_missing_tool",
+        vec!["singularity-tool-that-does-not-exist".to_string()],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+
+    let result = WindowsSandboxBackend::new().execute(&request);
+
+    assert_eq!(result.execution_status, CommandExecutionStatus::SpawnFailed);
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert_eq!(
+        result.stderr_preview,
+        "sandbox command spawn failed: required executable 'singularity-tool-that-does-not-exist' was not found on host PATH"
+    );
+    assert!(!result.sandbox.local_process_fallback);
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_backend_rejects_danger_full_access_without_implicit_fallback() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut request = CommandRequest::project_verification(

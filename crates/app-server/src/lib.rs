@@ -50,7 +50,7 @@ const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
 const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
 const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
 const APPROVAL_REQUEST_INTERNAL_ONLY: &str =
-    "approval/request is internal to the Rust AgentLoop approval ledger";
+    "approval/request is internal to the AgentLoop approval ledger";
 const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 const TOOL_READ: &str = "builtin.read";
@@ -1480,7 +1480,7 @@ fn native_agent_loop_unavailable_message(capability: &AgentLoopCapability) -> St
         capability.blockers.join(",")
     };
     format!(
-        "Rust AgentLoop is not available: status={}; blockers={blockers}",
+        "AgentLoop is not available: status={}; blockers={blockers}",
         capability.status.as_str()
     )
 }

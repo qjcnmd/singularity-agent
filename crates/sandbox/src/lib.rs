@@ -550,11 +550,24 @@ fn command_executable_name(value: &str) -> String {
 
 fn command_reference_tokens(request: &CommandRequest) -> Vec<String> {
     let mut tokens = Vec::new();
-    for part in &request.argv {
+    for part in request.argv.iter().skip(1) {
         collect_command_tokens(part, &mut tokens);
     }
-    collect_command_tokens(&command_permission_resource(&request.argv), &mut tokens);
+    if request
+        .argv
+        .first()
+        .is_some_and(|value| is_shell_executable(value))
+    {
+        collect_command_tokens(&command_permission_resource(&request.argv), &mut tokens);
+    }
     tokens
+}
+
+fn is_shell_executable(value: &str) -> bool {
+    matches!(
+        command_executable_name(&value.replace('\\', "/").to_ascii_lowercase()).as_str(),
+        "cmd" | "cmd.exe" | "sh" | "bash" | "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    )
 }
 
 fn collect_command_tokens(value: &str, tokens: &mut Vec<String>) {
@@ -627,7 +640,10 @@ fn command_token_has_sensitive_path_marker(token: &str) -> bool {
 
 fn command_has_read_only_write_intent(request: &CommandRequest) -> bool {
     let resource = command_permission_resource(&request.argv);
-    command_has_file_redirection(&resource)
+    request.argv.first().is_some_and(|executable| {
+        let executable = command_executable_name(&executable.to_ascii_lowercase());
+        WRITE_COMMAND_WORDS.contains(&executable.as_str())
+    }) || command_has_file_redirection(&resource)
         || command_reference_tokens(request).iter().any(|token| {
             let lower = token.to_ascii_lowercase();
             WRITE_COMMAND_WORDS
@@ -866,6 +882,7 @@ fn sensitive_path_component(component: &str) -> bool {
 #[cfg(windows)]
 mod windows_backend {
     use std::collections::HashMap;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
@@ -877,9 +894,10 @@ mod windows_backend {
     };
 
     use super::{
-        CancellationToken, CommandRequest, CommandResult, SandboxBackend,
+        COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandExecutionStatus,
+        CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
         SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-        command_request_denial, is_secret_env_name,
+        command_request_denial, is_secret_env_name, path_has_sensitive_component,
     };
 
     const BACKEND_NAME: &str = "windows";
@@ -888,9 +906,21 @@ mod windows_backend {
     const SANDBOX_HOME_ENV: &str = "SINGULARITY_HOME";
     const USER_PROFILE_ENV: &str = "USERPROFILE";
     const DEFAULT_HOME_DIR_NAME: &str = ".singularity";
+    const UNSAFE_BATCH_ARGUMENT: &str = "batch command contains unsupported shell syntax";
     const ELEVATED_FAILURE_PREFIX: &str = "elevated Windows sandbox failed";
     const RESTRICTED_FAILURE_PREFIX: &str = "restricted-token Windows sandbox failed";
     const DANGER_FULL_ACCESS_UNSUPPORTED: &str = "danger-full-access requires an explicit unsandboxed executor and is unavailable in the sandbox backend";
+
+    #[derive(Debug)]
+    struct ResolvedExecutable {
+        argv: Vec<String>,
+        read_roots: Vec<PathBuf>,
+    }
+
+    enum PrepareCommandError {
+        Environment(String),
+        Backend(String),
+    }
 
     #[derive(Debug, Clone, Default)]
     pub struct WindowsSandboxBackend;
@@ -927,7 +957,21 @@ mod windows_backend {
                 return denied
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
-            match execute_windows_sandbox(request, cancellation) {
+            let prepared = match PreparedCommand::from_request(request) {
+                Ok(prepared) => prepared,
+                Err(PrepareCommandError::Environment(error)) => {
+                    return CommandResult::spawn_failed(&request.command_id, error)
+                        .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+                }
+                Err(PrepareCommandError::Backend(error)) => {
+                    return CommandResult::backend_error(&request.command_id, error)
+                        .with_sandbox_execution(
+                            self.name(),
+                            SandboxBackendEnforcement::Unavailable,
+                        );
+                }
+            };
+            match execute_windows_sandbox(request, cancellation, prepared) {
                 Ok(result) => result,
                 Err(error) => CommandResult::backend_error(&request.command_id, error)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
@@ -943,15 +987,23 @@ mod windows_backend {
         env_map: HashMap<String, String>,
         timeout_ms: u64,
         restricted_token_fallback: bool,
+        argv: Vec<String>,
+        read_roots: Vec<PathBuf>,
     }
 
     impl PreparedCommand {
-        fn from_request(request: &CommandRequest) -> Result<Self, String> {
-            let workspace_root =
-                canonical_directory(Path::new(&request.filesystem.workspace_root))?;
-            let cwd = canonical_directory(Path::new(&request.cwd))?;
+        fn from_request(request: &CommandRequest) -> Result<Self, PrepareCommandError> {
+            let workspace_root = canonical_directory(Path::new(&request.filesystem.workspace_root))
+                .map_err(PrepareCommandError::Backend)?;
+            let cwd = canonical_directory(Path::new(&request.cwd))
+                .map_err(PrepareCommandError::Backend)?;
+            let env_map = child_environment();
+            let resolved = resolve_executable(&request.argv, &cwd, &env_map)
+                .map_err(PrepareCommandError::Environment)?;
             let workspace_root = AbsolutePathBuf::from_absolute_path_checked(&workspace_root)
-                .map_err(|error| format!("invalid workspace root: {error}"))?;
+                .map_err(|error| {
+                    PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
+                })?;
             let workspace_roots = vec![workspace_root];
             let network = match request.network.mode {
                 SandboxNetworkMode::Denied => NetworkSandboxPolicy::Restricted,
@@ -969,23 +1021,31 @@ mod windows_backend {
                     PermissionProfile::workspace_write_with(&[], network, false, false)
                 }
                 SandboxFilesystemMode::DangerFullAccess => {
-                    return Err(DANGER_FULL_ACCESS_UNSUPPORTED.to_string());
+                    return Err(PrepareCommandError::Backend(
+                        DANGER_FULL_ACCESS_UNSUPPORTED.to_string(),
+                    ));
                 }
             };
             let restricted_token_fallback = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 &permission_profile,
                 &workspace_roots,
             )
-            .map_err(|error| format!("invalid Windows sandbox permissions: {error}"))?
+            .map_err(|error| {
+                PrepareCommandError::Backend(format!(
+                    "invalid Windows sandbox permissions: {error}"
+                ))
+            })?
             .supports_restricted_token_fallback();
             Ok(Self {
                 permission_profile,
                 workspace_roots,
-                sandbox_home: sandbox_home()?,
+                sandbox_home: sandbox_home().map_err(PrepareCommandError::Backend)?,
                 cwd,
-                env_map: child_environment(),
+                env_map,
                 timeout_ms: request.timeout_seconds.saturating_mul(1_000),
                 restricted_token_fallback,
+                argv: resolved.argv,
+                read_roots: resolved.read_roots,
             })
         }
     }
@@ -993,8 +1053,8 @@ mod windows_backend {
     fn execute_windows_sandbox(
         request: &CommandRequest,
         cancellation: &CancellationToken,
+        prepared: PreparedCommand,
     ) -> Result<CommandResult, String> {
-        let prepared = PreparedCommand::from_request(request)?;
         let started = Instant::now();
         let windows_cancellation = WindowsSandboxCancellationToken::new({
             let cancellation = cancellation.clone();
@@ -1005,23 +1065,25 @@ mod windows_backend {
                 &prepared.permission_profile,
                 &prepared.workspace_roots,
                 &prepared.sandbox_home,
-                request.argv.clone(),
+                prepared.argv.clone(),
                 &prepared.cwd,
                 prepared.env_map.clone(),
             );
             elevated.timeout_ms = Some(prepared.timeout_ms);
             elevated.cancellation = Some(windows_cancellation.clone());
+            elevated.additional_read_roots = &prepared.read_roots;
             elevated
         });
         match elevated {
             Ok(capture) => Ok(command_result_from_capture(request, capture, started)
                 .with_sandbox_execution(ELEVATED_BACKEND_NAME, SandboxBackendEnforcement::Strict)),
             Err(elevated_error) if prepared.restricted_token_fallback => {
+                let elevated_error = windows_error_summary(&elevated_error);
                 let capture = run_windows_sandbox_capture(
                     &prepared.permission_profile,
                     &prepared.workspace_roots,
                     &prepared.sandbox_home,
-                    request.argv.clone(),
+                    prepared.argv.clone(),
                     &prepared.cwd,
                     prepared.env_map,
                     Some(prepared.timeout_ms),
@@ -1029,8 +1091,9 @@ mod windows_backend {
                     true,
                 )
                 .map_err(|restricted_error| {
+                    let restricted_error = windows_error_summary(&restricted_error);
                     format!(
-                        "{ELEVATED_FAILURE_PREFIX}: {elevated_error:#}; {RESTRICTED_FAILURE_PREFIX}: {restricted_error:#}"
+                        "{ELEVATED_FAILURE_PREFIX}: {elevated_error}; {RESTRICTED_FAILURE_PREFIX}: {restricted_error}"
                     )
                 })?;
                 Ok(
@@ -1040,8 +1103,18 @@ mod windows_backend {
                     ),
                 )
             }
-            Err(error) => Err(format!("{ELEVATED_FAILURE_PREFIX}: {error:#}")),
+            Err(error) => Err(format!(
+                "{ELEVATED_FAILURE_PREFIX}: {}",
+                windows_error_summary(&error)
+            )),
         }
+    }
+
+    fn windows_error_summary(error: &impl std::fmt::Display) -> String {
+        error
+            .to_string()
+            .split_once(" | cwd=")
+            .map_or_else(|| error.to_string(), |(summary, _)| summary.to_string())
     }
 
     fn command_result_from_capture(
@@ -1051,10 +1124,24 @@ mod windows_backend {
     ) -> CommandResult {
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         if capture.cancelled {
-            return CommandResult::cancelled(&request.command_id, duration_ms);
+            return interrupted_command_result(
+                request,
+                &capture,
+                duration_ms,
+                CommandExecutionStatus::Cancelled,
+                CommandSemanticStatus::Cancelled,
+                COMMAND_CANCELLED,
+            );
         }
         if capture.timed_out {
-            return CommandResult::timed_out(&request.command_id, duration_ms);
+            return interrupted_command_result(
+                request,
+                &capture,
+                duration_ms,
+                CommandExecutionStatus::TimedOut,
+                CommandSemanticStatus::TimedOut,
+                COMMAND_TIMED_OUT,
+            );
         }
         CommandResult::executed(
             &request.command_id,
@@ -1066,13 +1153,247 @@ mod windows_backend {
         )
     }
 
+    fn interrupted_command_result(
+        request: &CommandRequest,
+        capture: &singularity_windows_sandbox::CaptureResult,
+        duration_ms: u64,
+        execution_status: CommandExecutionStatus,
+        semantic_status: CommandSemanticStatus,
+        fallback_message: &str,
+    ) -> CommandResult {
+        let mut result = CommandResult::executed(
+            &request.command_id,
+            capture.exit_code,
+            duration_ms,
+            String::from_utf8_lossy(&capture.stdout),
+            String::from_utf8_lossy(&capture.stderr),
+            capture.output_truncated,
+        );
+        result.execution_status = execution_status;
+        result.semantic_status = semantic_status;
+        result.exit_code = None;
+        result.timed_out = capture.timed_out;
+        if result.stderr_preview.is_empty() {
+            result.stderr_preview = fallback_message.to_string();
+        }
+        result
+    }
+
     fn canonical_directory(path: &Path) -> Result<PathBuf, String> {
-        let canonical = std::fs::canonicalize(path)
+        let canonical = dunce::canonicalize(path)
             .map_err(|error| format!("failed to resolve {}: {error}", path.display()))?;
         if !canonical.is_dir() {
             return Err(format!("path is not a directory: {}", path.display()));
         }
         Ok(canonical)
+    }
+
+    fn resolve_executable(
+        argv: &[String],
+        cwd: &Path,
+        env_map: &HashMap<String, String>,
+    ) -> Result<ResolvedExecutable, String> {
+        let requested = argv
+            .first()
+            .ok_or_else(|| "sandbox command argv is empty".to_string())?;
+        let requested_path = Path::new(requested);
+        let has_path = requested_path.is_absolute() || requested_path.components().count() > 1;
+        let executable = if has_path {
+            let candidate = if requested_path.is_absolute() {
+                requested_path.to_path_buf()
+            } else {
+                cwd.join(requested_path)
+            };
+            canonical_executable(&candidate).ok_or_else(|| {
+                format!(
+                    "required executable '{}' is unavailable",
+                    executable_display_name(requested)
+                )
+            })?
+        } else {
+            find_executable_on_path(requested, env_map).ok_or_else(|| {
+                format!(
+                    "required executable '{}' was not found on host PATH",
+                    executable_display_name(requested)
+                )
+            })?
+        };
+        if path_has_sensitive_component(&executable) {
+            return Err(format!(
+                "required executable '{}' is not permitted",
+                executable_display_name(requested)
+            ));
+        }
+
+        let mut read_roots = executable_read_roots(&executable);
+        let resolved_argv = if is_batch_executable(&executable) {
+            let shell = system_command_interpreter(env_map)
+                .ok_or_else(|| "required Windows command interpreter is unavailable".to_string())?;
+            read_roots.extend(executable_read_roots(&shell));
+            batch_argv(&shell, &executable, &argv[1..])?
+        } else {
+            let mut resolved = argv.to_vec();
+            resolved[0] = executable.to_string_lossy().into_owned();
+            resolved
+        };
+        read_roots.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+        read_roots.dedup_by(|left, right| {
+            left.to_string_lossy()
+                .eq_ignore_ascii_case(&right.to_string_lossy())
+        });
+        Ok(ResolvedExecutable {
+            argv: resolved_argv,
+            read_roots,
+        })
+    }
+
+    fn is_batch_executable(path: &Path) -> bool {
+        path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
+    }
+
+    fn system_command_interpreter(env_map: &HashMap<String, String>) -> Option<PathBuf> {
+        let system_root = PathBuf::from(env_value(env_map, "SystemRoot")?);
+        if !system_root.is_absolute() {
+            return None;
+        }
+        canonical_executable(&system_root.join("System32").join("cmd.exe"))
+    }
+
+    fn batch_argv(
+        shell: &Path,
+        script: &Path,
+        arguments: &[String],
+    ) -> Result<Vec<String>, String> {
+        let script = script.to_string_lossy();
+        if !batch_argument_is_safe(&script)
+            || arguments.iter().any(|arg| !batch_argument_is_safe(arg))
+        {
+            return Err(UNSAFE_BATCH_ARGUMENT.to_string());
+        }
+        let mut command = format!("call {script}");
+        for argument in arguments {
+            command.push(' ');
+            command.push_str(argument);
+        }
+        Ok(vec![
+            shell.to_string_lossy().into_owned(),
+            "/D".to_string(),
+            "/V:OFF".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            command,
+        ])
+    }
+
+    fn batch_argument_is_safe(value: &str) -> bool {
+        !value.chars().any(|character| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '\0' | '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')' | '%' | '!'
+                )
+        })
+    }
+
+    fn find_executable_on_path(
+        requested: &str,
+        env_map: &HashMap<String, String>,
+    ) -> Option<PathBuf> {
+        let path = env_value(env_map, "PATH")?;
+        let extensions = executable_extensions(requested, env_map);
+        for directory in std::env::split_paths(OsStr::new(path)) {
+            if !directory.is_absolute() {
+                continue;
+            }
+            for extension in &extensions {
+                let candidate = directory.join(format!("{requested}{extension}"));
+                if let Some(executable) = canonical_executable(&candidate) {
+                    return Some(executable);
+                }
+            }
+        }
+        None
+    }
+
+    fn executable_extensions(requested: &str, env_map: &HashMap<String, String>) -> Vec<String> {
+        if Path::new(requested).extension().is_some() {
+            return vec![String::new()];
+        }
+        env_value(env_map, "PATHEXT")
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
+            .split(';')
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if value.starts_with('.') {
+                    value.to_string()
+                } else {
+                    format!(".{value}")
+                }
+            })
+            .collect()
+    }
+
+    fn canonical_executable(path: &Path) -> Option<PathBuf> {
+        if !path.is_file() {
+            return None;
+        }
+        dunce::canonicalize(path).ok().filter(|path| path.is_file())
+    }
+
+    fn executable_read_roots(executable: &Path) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(parent) = executable.parent() {
+            push_safe_read_root(&mut roots, parent);
+            if parent.file_name().is_some_and(|name| {
+                name.eq_ignore_ascii_case("bin") || name.eq_ignore_ascii_case("scripts")
+            }) && let Some(install_root) = parent.parent()
+                && !install_root
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            {
+                push_safe_read_root(&mut roots, install_root);
+            }
+        }
+        roots
+    }
+
+    fn push_safe_read_root(roots: &mut Vec<PathBuf>, path: &Path) {
+        if !path.is_absolute() || path.parent().is_none() || path_has_sensitive_component(path) {
+            return;
+        }
+        let Ok(canonical) = dunce::canonicalize(path) else {
+            return;
+        };
+        if !canonical.is_dir()
+            || canonical.parent().is_none()
+            || path_has_sensitive_component(&canonical)
+        {
+            return;
+        }
+        if std::env::var_os(USER_PROFILE_ENV)
+            .and_then(|profile| dunce::canonicalize(profile).ok())
+            .is_some_and(|profile| canonical == profile)
+        {
+            return;
+        }
+        roots.push(canonical);
+    }
+
+    fn env_value<'a>(env_map: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+        env_map
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn executable_display_name(requested: &str) -> String {
+        Path::new(requested)
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("command"))
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn sandbox_home() -> Result<PathBuf, String> {
@@ -1102,8 +1423,230 @@ mod windows_backend {
     }
 
     fn child_environment() -> HashMap<String, String> {
-        std::env::vars()
+        let mut env_map = std::env::vars()
             .filter(|(name, _)| !is_secret_env_name(name))
-            .collect()
+            .collect::<HashMap<_, _>>();
+        if let Some(temp) = env_value(&env_map, "TEMP")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+        {
+            let cache = temp.join("singularity-tool-cache");
+            env_map.insert(
+                "PIP_CACHE_DIR".to_string(),
+                cache.join("pip").to_string_lossy().into_owned(),
+            );
+            env_map.insert(
+                "NPM_CONFIG_CACHE".to_string(),
+                cache.join("npm").to_string_lossy().into_owned(),
+            );
+        }
+        env_map
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::CommandExecutionStatus;
+        use std::fs;
+        use std::io::Write;
+
+        fn create_test_file(path: &Path, contents: &str) {
+            let mut file = fs::File::create(path).expect("create test file");
+            file.write_all(contents.as_bytes())
+                .expect("write test file");
+        }
+
+        #[test]
+        fn resolver_uses_absolute_path_entries_and_pathext_order() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let first = temp.path().join("first");
+            let second = temp.path().join("second");
+            fs::create_dir_all(&first).expect("first");
+            fs::create_dir_all(&second).expect("second");
+            create_test_file(&first.join("runner"), "extensionless");
+            create_test_file(&first.join("runner.CMD"), "first");
+            create_test_file(&second.join("runner.EXE"), "second");
+            let path = std::env::join_paths([&first, &second])
+                .expect("join PATH")
+                .to_string_lossy()
+                .into_owned();
+            let env = HashMap::from([
+                ("Path".to_string(), path),
+                ("PathExt".to_string(), ".CMD;.EXE".to_string()),
+                (
+                    "SystemRoot".to_string(),
+                    std::env::var("SystemRoot").expect("SystemRoot"),
+                ),
+            ]);
+
+            let resolved = resolve_executable(&["runner".to_string()], temp.path(), &env)
+                .expect("resolve runner");
+
+            assert!(resolved.argv[0].to_ascii_lowercase().ends_with("cmd.exe"));
+            assert!(resolved.argv[5].contains("runner.CMD"));
+            assert!(
+                !resolved.read_roots.contains(
+                    &dunce::canonicalize(second).expect("canonical unrelated PATH entry")
+                )
+            );
+        }
+
+        #[test]
+        fn resolver_rejects_unsafe_batch_arguments() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let script = temp.path().join("runner.cmd");
+            create_test_file(&script, "@exit /b 0");
+            let env = HashMap::from([(
+                "SystemRoot".to_string(),
+                std::env::var("SystemRoot").expect("SystemRoot"),
+            )]);
+
+            let error = resolve_executable(
+                &[
+                    script.to_string_lossy().into_owned(),
+                    "safe & unsafe".to_string(),
+                ],
+                temp.path(),
+                &env,
+            )
+            .expect_err("unsafe batch argument must fail closed");
+
+            assert_eq!(error, UNSAFE_BATCH_ARGUMENT);
+            assert!(!error.contains(&temp.path().to_string_lossy().to_string()));
+        }
+
+        #[test]
+        fn resolver_skips_relative_path_entries() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            create_test_file(&temp.path().join("runner.EXE"), "runner");
+            let env = HashMap::from([
+                ("PATH".to_string(), ".".to_string()),
+                ("PATHEXT".to_string(), ".EXE".to_string()),
+            ]);
+
+            let error = resolve_executable(&["runner".to_string()], temp.path(), &env)
+                .expect_err("relative PATH must be rejected");
+
+            assert_eq!(
+                error,
+                "required executable 'runner' was not found on host PATH"
+            );
+            assert!(!error.contains(&temp.path().to_string_lossy().to_string()));
+        }
+
+        #[test]
+        fn resolver_rejects_sensitive_executable_paths() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sensitive = temp.path().join(".ssh");
+            fs::create_dir(&sensitive).expect("sensitive dir");
+            let executable = sensitive.join("runner.exe");
+            create_test_file(&executable, "runner");
+
+            let error = resolve_executable(
+                &[executable.to_string_lossy().into_owned()],
+                temp.path(),
+                &HashMap::new(),
+            )
+            .expect_err("sensitive executable must be rejected");
+
+            assert_eq!(error, "required executable 'runner.exe' is not permitted");
+        }
+
+        #[test]
+        fn resolver_adds_conventional_toolchain_parent_as_read_only_root() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let toolchain = temp.path().join("runtime");
+            let bin = toolchain.join("bin");
+            fs::create_dir_all(&bin).expect("bin");
+            let executable = bin.join("runner.exe");
+            create_test_file(&executable, "runner");
+            let env = HashMap::from([("PATH".to_string(), bin.to_string_lossy().into_owned())]);
+
+            let resolved = resolve_executable(&["runner.exe".to_string()], temp.path(), &env)
+                .expect("resolve runner");
+            let canonical_toolchain = dunce::canonicalize(toolchain).expect("canonical toolchain");
+
+            assert!(resolved.read_roots.contains(&canonical_toolchain));
+        }
+
+        #[test]
+        fn resolver_does_not_expand_hidden_tool_home_parent() {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let tool_home = temp.path().join(".cargo");
+            let bin = tool_home.join("bin");
+            fs::create_dir_all(&bin).expect("create bin");
+            create_test_file(&bin.join("cargo.exe"), "cargo");
+            let env = HashMap::from([("PATH".to_string(), bin.to_string_lossy().into_owned())]);
+
+            let resolved = resolve_executable(&["cargo.exe".to_string()], temp.path(), &env)
+                .expect("resolve executable");
+            let canonical_bin = dunce::canonicalize(bin).expect("canonical bin");
+            let canonical_tool_home = dunce::canonicalize(tool_home).expect("canonical tool home");
+
+            assert!(resolved.read_roots.contains(&canonical_bin));
+            assert!(!resolved.read_roots.contains(&canonical_tool_home));
+        }
+
+        #[test]
+        fn read_root_rechecks_canonical_sensitive_target() {
+            use std::os::windows::fs::symlink_dir;
+
+            let temp = tempfile::tempdir().expect("temp dir");
+            let sensitive = temp.path().join("secrets");
+            let alias = temp.path().join("runtime");
+            fs::create_dir(&sensitive).expect("create sensitive target");
+            if symlink_dir(&sensitive, &alias).is_err() {
+                return;
+            }
+
+            let mut roots = Vec::new();
+            push_safe_read_root(&mut roots, &alias);
+
+            assert!(roots.is_empty());
+        }
+
+        #[test]
+        fn backend_error_summary_omits_resolved_process_paths() {
+            let error = "CreateProcessAsUserW failed: 193 | cwd=C:\\workspace | cmd=D:\\tools\\runner.cmd --version";
+
+            let summary = windows_error_summary(&error);
+
+            assert_eq!(summary, "CreateProcessAsUserW failed: 193");
+            assert!(!summary.contains("workspace"));
+            assert!(!summary.contains("runner.cmd"));
+        }
+
+        #[test]
+        fn admission_allows_external_argv0_but_denies_external_data_paths() {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let external = tempfile::tempdir().expect("external");
+            let executable = external.path().join("runner.exe");
+            let data = external.path().join("data.txt");
+            create_test_file(&executable, "runner");
+            create_test_file(&data, "data");
+            let allowed = CommandRequest::project_verification(
+                "external_executable",
+                vec![executable.to_string_lossy().into_owned()],
+                workspace.path().to_string_lossy(),
+                workspace.path().to_string_lossy(),
+            );
+            let denied = CommandRequest::project_verification(
+                "external_data",
+                vec![
+                    executable.to_string_lossy().into_owned(),
+                    data.to_string_lossy().into_owned(),
+                ],
+                workspace.path().to_string_lossy(),
+                workspace.path().to_string_lossy(),
+            );
+
+            assert!(command_request_denial(&allowed).is_none());
+            assert_eq!(
+                command_request_denial(&denied)
+                    .expect("external data must be denied")
+                    .execution_status,
+                CommandExecutionStatus::PolicyDenied
+            );
+        }
     }
 }

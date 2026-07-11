@@ -16,6 +16,7 @@ serde_json.workspace = true
 singularity_core = { path = "../core" }
 
 [target.'cfg(windows)'.dependencies]
+dunce = "1.0"
 singularity_windows_sandbox = { path = "../windows-sandbox" }
 
 [dev-dependencies]

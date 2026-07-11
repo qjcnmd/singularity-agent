@@ -160,7 +160,7 @@ fn agent_loop_capability_is_available_without_remaining_blockers() {
 
     assert!(capability.available);
     assert_eq!(capability.status, AgentStatus::Completed);
-    assert!(capability.reason.contains("native Rust AgentLoop"));
+    assert!(capability.reason.contains("AgentLoop"));
     assert!(capability.blockers.is_empty());
 }
 
@@ -1187,6 +1187,10 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
     .run(&input);
     let run_status = result.to_run_status(&input);
+    let command_cwd = std::fs::canonicalize(dir.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
 
     assert_eq!(run_status.status, AgentStatus::Completed);
     assert_eq!(run_status.audit_events.len(), 1);
@@ -1194,7 +1198,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         run_status.audit_events[0]["sandbox_mode"],
         "danger_full_access"
     );
-    assert_eq!(run_status.audit_events[0]["cwd"], ".");
+    assert_eq!(run_status.audit_events[0]["cwd"], command_cwd);
     assert_eq!(run_status.audit_events[0]["timeout_seconds"], 5);
     assert_eq!(run_status.audit_events[0]["network_access"], "allowed");
     assert_eq!(
@@ -1207,7 +1211,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         run_status.audit_events[0]["command_scope_digest"],
         command_scope_digest(
             &test_command("success"),
-            ".",
+            &command_cwd,
             5,
             &SandboxFilesystemMode::DangerFullAccess,
             &SandboxNetworkMode::Allowed,

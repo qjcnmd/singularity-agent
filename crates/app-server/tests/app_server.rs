@@ -1244,7 +1244,7 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
     assert_eq!(public_request[0]["error"]["code"], -32600);
     assert_eq!(
         public_request[0]["error"]["message"],
-        "approval/request is internal to the Rust AgentLoop approval ledger"
+        "approval/request is internal to the AgentLoop approval ledger"
     );
 
     let missing_artifact = server

@@ -324,7 +324,7 @@ fn cli_rejects_native_run_when_capability_is_disabled() {
 
     assert!(!output.status.success());
     assert!(stderr(&output).contains(
-        "Rust AgentLoop is not available: status=blocked; blockers=strict_command_sandbox_unavailable"
+        "AgentLoop is not available: status=blocked; blockers=strict_command_sandbox_unavailable"
     ));
     let trace = std::fs::read_to_string(trace_path).expect("method trace");
     assert!(trace.contains("initialize"));
@@ -355,9 +355,7 @@ fn cli_rejects_nonterminal_native_capability_without_blockers() {
         .expect("run cli");
 
     assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("Rust AgentLoop is not available: status=running; blockers=none")
-    );
+    assert!(stderr(&output).contains("AgentLoop is not available: status=running; blockers=none"));
     let trace = std::fs::read_to_string(trace_path).expect("method trace");
     assert!(trace.contains("initialize"));
     assert!(trace.contains("agent/capability"));
@@ -526,9 +524,11 @@ fn cli_rejects_partial_native_capability_until_blockers_clear() {
         .expect("run cli");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains(
-        "Rust AgentLoop is not available: status=running; blockers=strict_command_sandbox"
-    ));
+    assert!(
+        stderr(&output).contains(
+            "AgentLoop is not available: status=running; blockers=strict_command_sandbox"
+        )
+    );
     let trace = std::fs::read_to_string(trace_path).expect("method trace");
     assert!(trace.contains("agent/capability"));
     assert!(!trace.contains("turn/start"));
