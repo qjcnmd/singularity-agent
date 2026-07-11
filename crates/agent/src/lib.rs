@@ -10,7 +10,7 @@ use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelCapabilities, ModelError,
     ModelErrorCategory, ModelMessage, ModelPreferences, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnStatus, Provider,
-    provider_error_response, validate_model_request_with_capabilities,
+    ProviderDiagnostic, provider_error_response, validate_model_request_with_capabilities,
     validate_model_turn_response,
 };
 use singularity_policy::{
@@ -136,6 +136,9 @@ pub struct AgentRunStatus {
     #[serde(skip)]
     #[schemars(skip)]
     pub error_category: Option<ModelErrorCategory>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub provider_diagnostic: Option<ProviderDiagnostic>,
 }
 
 impl AgentRunStatus {
@@ -153,6 +156,7 @@ impl AgentRunStatus {
             model_turn_limit: 0,
             context_trace: None,
             error_category: None,
+            provider_diagnostic: None,
         }
     }
 
@@ -322,6 +326,9 @@ pub struct AgentLoopResult {
     #[serde(skip)]
     #[schemars(skip)]
     pub error_category: Option<ModelErrorCategory>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub provider_diagnostic: Option<ProviderDiagnostic>,
 }
 
 impl AgentLoopResult {
@@ -351,6 +358,7 @@ impl AgentLoopResult {
             model_turn_limit: self.model_turn_limit,
             context_trace: self.context_trace.clone(),
             error_category: self.error_category.clone(),
+            provider_diagnostic: self.provider_diagnostic.clone(),
         }
     }
 }
@@ -552,17 +560,17 @@ impl AgentLoopState {
         model_turns: u32,
         error: Option<String>,
     ) -> AgentLoopResult {
-        self.finish_with_error_category(status, completed, final_answer, model_turns, error, None)
+        self.finish_with_model_error(status, completed, final_answer, model_turns, error, None)
     }
 
-    fn finish_with_error_category(
+    fn finish_with_model_error(
         self,
         status: AgentStatus,
         completed: bool,
         final_answer: Option<String>,
         model_turns: u32,
         error: Option<String>,
-        error_category: Option<ModelErrorCategory>,
+        model_error: Option<&ModelError>,
     ) -> AgentLoopResult {
         let approval_count = self
             .prior_approval_count
@@ -582,7 +590,8 @@ impl AgentLoopState {
             error,
             model_turn_limit: self.model_turn_limit,
             context_trace: self.context_trace,
-            error_category,
+            error_category: model_error.map(ModelError::category),
+            provider_diagnostic: model_error.map(ModelError::provider_diagnostic),
         }
     }
 
@@ -732,14 +741,14 @@ where
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
             }
             if response.status != ModelTurnStatus::Success {
-                let error_category = response.error.as_ref().map(ModelError::category);
-                return state.finish_with_error_category(
+                let model_error = response.error.as_ref();
+                return state.finish_with_model_error(
                     AgentStatus::Failed,
                     false,
                     None,
                     turn_index + 1,
-                    response.error.map(|error| error.message),
-                    error_category,
+                    model_error.map(|error| error.message.clone()),
+                    model_error,
                 );
             }
             let allowed_tool_names = model_tool_names(&self.tool_broker);
@@ -1572,6 +1581,7 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         model_turn_limit: 0,
         context_trace: None,
         error_category: None,
+        provider_diagnostic: None,
     }
 }
 

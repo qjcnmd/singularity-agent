@@ -193,6 +193,28 @@ fn agent_loop_preserves_typed_provider_failure_category() {
     );
 }
 
+#[test]
+fn agent_loop_preserves_safe_provider_diagnostic() {
+    let input = AgentLoopInput::new("thread_1", "turn_1", "provider failure");
+    let mut error = ModelError::new(ModelErrorKind::JsonSchemaViolation, "unsafe raw response");
+    error.code = Some("provider_response_invalid".to_string());
+    error.stage = Some(singularity_model::ProviderErrorStage::ResponseValidation);
+    error.validation_errors = vec!["missing_tool_call_id".to_string()];
+    let result =
+        agent_loop_with_response(failed_model_response(error), allow_read_policy()).run(&input);
+
+    let diagnostic = result
+        .provider_diagnostic
+        .clone()
+        .expect("provider diagnostic");
+    assert_eq!(
+        diagnostic.code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert_eq!(diagnostic.validation_errors, ["missing_tool_call_id"]);
+    assert_eq!(result.to_run_status().provider_diagnostic, Some(diagnostic));
+}
+
 fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ModelToolCall {
     ModelToolCall {
         tool_call_id: id.to_string(),

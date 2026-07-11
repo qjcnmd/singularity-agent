@@ -476,6 +476,15 @@ pub struct ModelError {
     pub validation_errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderDiagnostic {
+    pub code: Option<String>,
+    pub stage: Option<ProviderErrorStage>,
+    pub transport_category: Option<ProviderTransportCategory>,
+    pub http_status: Option<u16>,
+    pub validation_errors: Vec<String>,
+}
+
 impl ModelError {
     pub fn new(kind: ModelErrorKind, message: impl Into<String>) -> Self {
         Self {
@@ -513,6 +522,16 @@ impl ModelError {
 
     pub fn category(&self) -> ModelErrorCategory {
         classify_model_error(self)
+    }
+
+    pub fn provider_diagnostic(&self) -> ProviderDiagnostic {
+        ProviderDiagnostic {
+            code: self.code.clone(),
+            stage: self.stage.clone(),
+            transport_category: self.transport_category.clone(),
+            http_status: self.http_status,
+            validation_errors: self.validation_errors.clone(),
+        }
     }
 }
 

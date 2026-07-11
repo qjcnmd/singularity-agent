@@ -1633,6 +1633,7 @@ fn mark_run_cancelled(status: &mut AgentRunStatus) {
     status.final_answer = None;
     status.error = None;
     status.error_category = None;
+    status.provider_diagnostic = None;
 }
 
 fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
@@ -1666,6 +1667,7 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
         "audit_events": &status.audit_events,
         "verification": &status.verification,
         "error": status.error.as_deref().map(redact_app_server_text),
+        "provider_diagnostic": status.provider_diagnostic,
     });
     event
 }

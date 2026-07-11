@@ -19,7 +19,7 @@ use singularity_evaluation::{
     WorkspacePlan,
 };
 use singularity_model::{
-    ModelErrorCategory, OpenAiProvider, ProviderConfigSnapshot, ProviderError,
+    ModelErrorCategory, OpenAiProvider, ProviderConfigSnapshot, ProviderDiagnostic, ProviderError,
 };
 use singularity_policy::{
     ApprovalPolicy, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
@@ -91,6 +91,7 @@ struct TaskDiagnostics {
     local_process_fallback_count: usize,
     trace_path: Option<String>,
     error: Option<String>,
+    provider_diagnostic: Option<ProviderDiagnostic>,
 }
 
 struct StageExecution {
@@ -153,6 +154,7 @@ struct AgentStageExecution {
     audit_events: Vec<Value>,
     trace_path: Option<String>,
     error: Option<String>,
+    provider_diagnostic: Option<ProviderDiagnostic>,
 }
 
 struct TaskExecution {
@@ -374,6 +376,7 @@ fn run_task(
     diagnostics.approval_count = agent_execution.approval_count;
     diagnostics.trace_path = agent_execution.trace_path.clone();
     diagnostics.error = agent_execution.error.clone();
+    diagnostics.provider_diagnostic = agent_execution.provider_diagnostic.clone();
     diagnostics.local_process_fallback_count = agent_execution
         .audit_events
         .iter()
@@ -999,6 +1002,7 @@ fn run_agent_stage(
         "approval_count": run_status.approval_count,
         "audit_events": run_status.audit_events,
         "error": run_status.error.as_deref().map(safe_text),
+        "provider_diagnostic": run_status.provider_diagnostic,
     });
     let trace_path_string = match write_json_atomic(&trace_path, &trace) {
         Ok(()) => Some(trace_path.to_string_lossy().into_owned()),
@@ -1018,6 +1022,7 @@ fn run_agent_stage(
                 audit_events: run_status.audit_events,
                 trace_path: None,
                 error: Some(safe_text(error)),
+                provider_diagnostic: run_status.provider_diagnostic,
             };
         }
     };
@@ -1037,6 +1042,7 @@ fn run_agent_stage(
                 audit_events: run_status.audit_events,
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
+                provider_diagnostic: run_status.provider_diagnostic,
             };
         }
     };
@@ -1108,6 +1114,7 @@ fn run_agent_stage(
         audit_events: run_status.audit_events,
         trace_path: trace_path_string,
         error,
+        provider_diagnostic: run_status.provider_diagnostic,
     }
 }
 
@@ -1127,6 +1134,7 @@ fn blocked_agent_stage(
         audit_events: Vec::new(),
         trace_path: None,
         error: Some(blocker.message),
+        provider_diagnostic: None,
     }
 }
 
@@ -1607,6 +1615,7 @@ mod tests {
             model_turn_limit: 0,
             context_trace: None,
             error_category: None,
+            provider_diagnostic: None,
         }
     }
 
@@ -1660,6 +1669,24 @@ mod tests {
             agent_blocker_kind(Some(&ModelErrorCategory::JsonSchema)),
             None
         );
+    }
+
+    #[test]
+    fn task_diagnostics_serializes_only_safe_provider_fields() {
+        let diagnostics = TaskDiagnostics {
+            provider_diagnostic: Some(ProviderDiagnostic {
+                code: Some("provider_response_invalid".to_string()),
+                stage: Some(singularity_model::ProviderErrorStage::ResponseValidation),
+                transport_category: None,
+                http_status: None,
+                validation_errors: vec!["missing_tool_call_id".to_string()],
+            }),
+            ..TaskDiagnostics::default()
+        };
+        let serialized = serde_json::to_string(&diagnostics).expect("serialize diagnostics");
+        assert!(serialized.contains("missing_tool_call_id"));
+        assert!(!serialized.contains("Authorization"));
+        assert!(!serialized.contains("raw_response"));
     }
 
     #[test]
