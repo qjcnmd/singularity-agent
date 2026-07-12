@@ -1164,15 +1164,17 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     );
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 4);
-    assert_eq!(requests[1].messages.last().unwrap().role, ModelRole::Tool);
+    let feedback = requests[1].messages.last().expect("tool feedback");
+    assert_eq!(feedback.role, ModelRole::Tool);
+    let payload: serde_json::Value =
+        serde_json::from_str(&feedback.content).expect("structured tool payload");
+    assert_eq!(payload["error_code"], "expected_content_missing");
     assert!(
-        requests[1]
-            .messages
-            .last()
-            .unwrap()
-            .content
-            .contains("expected_content_missing")
+        payload["content"]["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("expected content not found"))
     );
+    assert!(payload.get("preview").is_none());
 }
 
 #[test]
@@ -1250,10 +1252,22 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     let requests = seen_requests.lock().expect("seen requests");
     let feedback = requests[1].messages.last().expect("tool feedback");
     assert_eq!(feedback.role, ModelRole::Tool);
-    assert!(feedback.content.contains("argv_not_array"));
-    assert!(feedback.content.contains("second-success"));
-    assert!(feedback.content.contains("retry_inputs"));
-    assert!(feedback.content.contains(r#"\"argv\":"#));
+    let payload: serde_json::Value =
+        serde_json::from_str(&feedback.content).expect("structured tool payload");
+    assert_eq!(payload["error_code"], "invalid_tool_arguments");
+    assert_eq!(payload["content"]["validation_code"], "argv_not_array");
+    assert_eq!(
+        payload["content"]["retry_inputs"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert!(payload["content"]["retry_inputs"][0]["argv"].is_array());
+    assert!(payload["content"]["retry_inputs"][1]["argv"].is_array());
+    assert!(
+        payload["content"]["retry_inputs"]
+            .to_string()
+            .contains("second-success")
+    );
+    assert!(payload.get("preview").is_none());
     assert!(!feedback.content.contains("raw_arguments"));
     assert!(
         run_status.audit_events[0]

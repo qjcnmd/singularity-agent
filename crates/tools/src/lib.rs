@@ -261,6 +261,8 @@ pub struct ToolResult {
     pub tool_name: String,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
     pub error_code: Option<String>,
     pub artifact_refs: Vec<String>,
@@ -282,6 +284,7 @@ impl ToolResult {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             ok,
+            content: None,
             preview: Some(redact_public_text(&preview.into())),
             error_code: None,
             artifact_refs: Vec::new(),
@@ -302,9 +305,11 @@ impl ToolResult {
 
     pub fn from_result(envelope: &ToolCallRequest, result: &ToolOutput) -> Self {
         let result_content = result.content.to_string();
-        let (preview, preview_truncated) =
+        let content_is_safe = redact_public_text(&result_content) == result_content;
+        let (bounded_preview, preview_truncated) =
             bounded_text(&result_content, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
-        let truncated = result.truncated
+        let preview = redact_public_text(&bounded_preview);
+        let source_truncated = result.truncated
             || result
                 .content
                 .get("truncated")
@@ -314,8 +319,8 @@ impl ToolResult {
                 .content
                 .get("output_truncated")
                 .and_then(Value::as_bool)
-                .unwrap_or(false)
-            || preview_truncated;
+                .unwrap_or(false);
+        let truncated = source_truncated || preview_truncated;
         let artifact_refs = result_artifact_refs(&result.content, &result.metadata);
         let result_id = result_id(&result.content, &result.metadata);
         let mut tool_result = Self {
@@ -328,9 +333,14 @@ impl ToolResult {
                 preview,
             )
         };
+        if content_is_safe && !source_truncated && !preview_truncated {
+            tool_result.content = Some(result.content.clone());
+            tool_result.preview = None;
+        }
         tool_result.artifact_refs = artifact_refs;
         tool_result.result_id = result_id;
         if truncated && !tool_result.artifact_refs.is_empty() {
+            tool_result.content = None;
             tool_result.preview = None;
         }
         tool_result.audit_metadata = result.metadata.get("audit").cloned();
@@ -375,7 +385,17 @@ impl ToolResult {
         if !artifact_refs.is_empty() {
             payload["artifact_refs"] = json!(artifact_refs);
         }
-        if let Some(preview) = self.preview.as_deref() {
+        if let Some(content) = self.content.as_ref() {
+            let serialized = content.to_string();
+            let (bounded_preview, content_truncated) =
+                bounded_text(&serialized, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
+            if !content_truncated && redact_public_text(&serialized) == serialized {
+                payload["content"] = content.clone();
+            } else {
+                payload["preview"] = json!(redact_public_text(&bounded_preview));
+                payload["truncated"] = json!(self.truncated || content_truncated);
+            }
+        } else if let Some(preview) = self.preview.as_deref() {
             let preview = redact_public_text(preview);
             payload["preview"] = json!(preview);
         }

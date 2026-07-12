@@ -716,7 +716,17 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
     }"#;
     let (base_url, captured_request) = captured_request_server("HTTP/1.1 200 OK", body);
     let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let mut tool_message = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
+    let mut tool_message = ModelMessage::text(
+        ModelRole::Tool,
+        serde_json::json!({
+            "ok": false,
+            "content": {
+                "validation_code": "argv_not_array",
+                "retry_inputs": [{"argv": ["cargo", "test"]}],
+            }
+        })
+        .to_string(),
+    );
     tool_message.tool_call_id = Some("call_1".to_string());
     let request = ModelTurnRequest::new(
         "request_1",
@@ -750,6 +760,14 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
     );
     assert_eq!(captured["messages"][2]["role"], "tool");
     assert_eq!(captured["messages"][2]["tool_call_id"], "call_1");
+    let tool_content: serde_json::Value = serde_json::from_str(
+        captured["messages"][2]["content"]
+            .as_str()
+            .expect("tool content string"),
+    )
+    .expect("structured tool content");
+    assert_eq!(tool_content["content"]["validation_code"], "argv_not_array");
+    assert!(tool_content["content"]["retry_inputs"][0]["argv"].is_array());
 }
 
 #[test]

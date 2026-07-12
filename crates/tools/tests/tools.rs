@@ -1035,6 +1035,34 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
 }
 
 #[test]
+fn tool_result_payload_preserves_safe_structured_content() {
+    let envelope = ToolCallRequest::new("call_1", "builtin.command", r#"{"argv":"cargo test"}"#);
+    let result = ToolOutput::failure(
+        "invalid_tool_arguments",
+        serde_json::json!({
+            "summary": "argv must be an array",
+            "validation_code": "argv_not_array",
+            "retry_inputs": [{"argv": ["cargo", "test"]}],
+        }),
+    );
+
+    let tool_result = ToolResult::from_result(&envelope, &result);
+    let payload = tool_result.to_message_payload();
+
+    assert_eq!(payload["content"]["validation_code"], "argv_not_array");
+    assert_eq!(
+        payload["content"]["retry_inputs"][0]["argv"],
+        serde_json::json!(["cargo", "test"])
+    );
+    assert!(payload.get("preview").is_none());
+    assert!(
+        !serde_json::to_string(&payload)
+            .expect("serialize payload")
+            .contains(r#"\"retry_inputs\""#)
+    );
+}
+
+#[test]
 fn workspace_command_tool_propagates_evaluation_environment_policy() {
     let workspace = test_workspace("command-evaluation-environment");
     let tools = WorkspaceTools::new(&workspace)

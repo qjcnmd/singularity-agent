@@ -2999,7 +2999,7 @@ mod tests {
         assert!(terminal_trace.payload.get("tool_outcomes").is_none());
         let terminal_trace_json =
             serde_json::to_string(&terminal_trace.payload).expect("terminal trace json");
-        for full_result_field in ["preview", "artifact_refs", "result_id"] {
+        for full_result_field in ["content", "preview", "artifact_refs", "result_id"] {
             assert!(!terminal_trace_json.contains(full_result_field));
         }
         assert!(
