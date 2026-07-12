@@ -6,9 +6,8 @@ use singularity_model::{
     ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderAttemptMetadata, ProviderConfigSnapshot, ProviderConfigSource,
     ProviderConfigurationStatus, ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode,
-    ToolChoicePolicy, chat_completions_endpoint, classify_model_error,
-    is_single_tool_call_contract_violation, resolve_provider_config, validate_model_request,
-    validate_model_request_with_capabilities, validate_model_response,
+    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, resolve_provider_config,
+    validate_model_request, validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
@@ -59,6 +58,8 @@ fn provider_test_config(base_url: String) -> OpenAiProviderConfig {
         source: ProviderConfigSource::ProcessEnvironment,
         max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        max_tool_calls_per_turn: 1,
+        supports_strict_tool_schema: false,
     }
 }
 
@@ -519,7 +520,7 @@ fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
 }
 
 #[test]
-fn provider_token_limits_default_and_configured_capabilities_are_explicit() {
+fn provider_limits_default_and_configured_capabilities_are_explicit() {
     let default_config = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
@@ -541,6 +542,15 @@ fn provider_token_limits_default_and_configured_capabilities_are_explicit() {
             .supports_developer_message
     );
     assert!(default_config.protocol_contract().supports_json_mode);
+    assert_eq!(
+        default_config.protocol_contract().max_tool_calls_per_turn,
+        1
+    );
+    assert!(
+        !default_config
+            .protocol_contract()
+            .supports_strict_tool_schema
+    );
 
     let configured = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
@@ -548,24 +558,29 @@ fn provider_token_limits_default_and_configured_capabilities_are_explicit() {
         "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
         "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some(" 131072 ".to_string()),
         "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS" => Some("8192".to_string()),
+        "SINGULARITY_MODEL_MAX_TOOL_CALLS" => Some("4".to_string()),
+        "SINGULARITY_MODEL_STRICT_TOOL_SCHEMA" => Some("true".to_string()),
         _ => None,
     })
     .expect("configured provider");
     let capabilities = configured.protocol_contract();
     assert_eq!(capabilities.max_context_tokens, 131_072);
     assert_eq!(capabilities.max_output_tokens, 8_192);
+    assert_eq!(capabilities.max_tool_calls_per_turn, 4);
+    assert!(capabilities.supports_strict_tool_schema);
 
     let provider = OpenAiProvider::new(configured).expect("provider");
     assert_eq!(Provider::protocol_contract(&provider), capabilities);
 }
 
 #[test]
-fn provider_token_limit_validation_has_bounded_secret_free_errors() {
+fn provider_limit_validation_has_bounded_secret_free_errors() {
     for (name, value) in [
         ("SINGULARITY_MODEL_CONTEXT_TOKENS", "zero-limit"),
         ("SINGULARITY_MODEL_CONTEXT_TOKENS", "2000001"),
         ("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS", "256001"),
         ("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS", "not-a-token-limit"),
+        ("SINGULARITY_MODEL_MAX_TOOL_CALLS", "9"),
     ] {
         let result = OpenAiProviderConfig::from_env(|candidate| match candidate {
             "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
@@ -580,6 +595,26 @@ fn provider_token_limit_validation_has_bounded_secret_free_errors() {
         assert!(error.message.contains(name));
         assert!(!error.message.contains(value));
     }
+}
+
+#[test]
+fn provider_strict_schema_capability_rejects_ambiguous_configuration() {
+    let error = OpenAiProviderConfig::from_env(|name| match name {
+        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        "SINGULARITY_MODEL_STRICT_TOOL_SCHEMA" => Some("sometimes".to_string()),
+        _ => None,
+    })
+    .expect_err("ambiguous capability must be rejected");
+
+    assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
+    assert!(
+        error
+            .message
+            .contains("SINGULARITY_MODEL_STRICT_TOOL_SCHEMA")
+    );
+    assert!(!error.message.contains("sometimes"));
 }
 
 #[test]
@@ -626,6 +661,54 @@ fn model_request_validation_rejects_output_above_provider_capability() {
 }
 
 #[test]
+fn model_request_validation_rejects_tool_count_above_provider_capability() {
+    let mut request = ModelTurnRequest::new(
+        "request_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "read".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+    });
+    request.tool_choice.max_tool_calls = 2;
+
+    let result = validate_model_request_with_capabilities(
+        &request,
+        Some(&ProviderProtocolContract::default()),
+    );
+
+    assert_eq!(
+        result.errors,
+        vec!["requested_tool_calls_exceed_provider_limit"]
+    );
+}
+
+#[test]
+fn model_request_validation_rejects_incompatible_strict_schema_locally() {
+    let mut request = ModelTurnRequest::new(
+        "request_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "read".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+    });
+    request.tool_choice.strict_tool_schema = true;
+    let capabilities = ProviderProtocolContract {
+        supports_strict_tool_schema: true,
+        ..ProviderProtocolContract::default()
+    };
+
+    for incompatible_schema in [serde_json::json!({"type": "object"}), serde_json::json!({})] {
+        request.tools[0].parameters_schema = incompatible_schema;
+        let result = validate_model_request_with_capabilities(&request, Some(&capabilities));
+        assert_eq!(result.errors, vec!["strict_tool_schema_incompatible"]);
+    }
+}
+
+#[test]
 fn model_request_validation_rejects_unsupported_declared_capabilities() {
     let mut request = ModelTurnRequest::new(
         "request_1",
@@ -634,9 +717,15 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
     request.tools.push(ModelToolSchema {
         name: "builtin.read".to_string(),
         description: "read".to_string(),
-        parameters_schema: serde_json::json!({"type": "object"}),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
     });
     request.model_preferences.json_mode = true;
+    request.tool_choice.strict_tool_schema = true;
     let capabilities = ProviderProtocolContract {
         supports_tools: false,
         supports_json_mode: false,
@@ -651,6 +740,7 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
         vec![
             "provider_does_not_support_developer_messages",
             "provider_does_not_support_json_mode",
+            "provider_does_not_support_strict_tool_schema",
             "provider_does_not_support_tools",
         ]
     );
@@ -952,7 +1042,7 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
 }
 
 #[test]
-fn openai_provider_maps_internal_tool_names_to_wire_names_and_back() {
+fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
     let body = r#"{
         "id": "resp_1",
         "choices": [{
@@ -969,7 +1059,10 @@ fn openai_provider_maps_internal_tool_names_to_wire_names_and_back() {
         }]
     }"#;
     let (base_url, captured_request) = captured_request_server("HTTP/1.1 200 OK", body);
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut config = provider_test_config(base_url);
+    config.max_tool_calls_per_turn = 2;
+    config.supports_strict_tool_schema = true;
+    let provider = OpenAiProvider::new(config).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -977,8 +1070,15 @@ fn openai_provider_maps_internal_tool_names_to_wire_names_and_back() {
     request.tools.push(ModelToolSchema {
         name: "builtin.read".to_string(),
         description: "Read a file".to_string(),
-        parameters_schema: serde_json::json!({"type": "object"}),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
     });
+    request.tool_choice.max_tool_calls = 2;
+    request.tool_choice.strict_tool_schema = true;
 
     let response = provider
         .complete(&request, &singularity_core::CancellationToken::new())
@@ -992,13 +1092,14 @@ fn openai_provider_maps_internal_tool_names_to_wire_names_and_back() {
 
     assert_eq!(captured["tools"][0]["function"]["name"], "read");
     assert_eq!(captured["tool_choice"], "auto");
-    assert_eq!(captured["parallel_tool_calls"], false);
+    assert_eq!(captured["parallel_tool_calls"], true);
+    assert_eq!(captured["tools"][0]["function"]["strict"], true);
     assert_eq!(response.tool_calls[0].tool_name, "builtin.read");
     assert_eq!(response.status, ModelTurnStatus::Success);
 }
 
 #[test]
-fn openai_provider_classifies_multiple_tool_calls_as_single_call_contract_violation() {
+fn openai_provider_classifies_calls_above_the_negotiated_limit() {
     let body = r#"{
         "id": "resp_1",
         "choices": [{
@@ -1048,47 +1149,22 @@ fn openai_provider_classifies_multiple_tool_calls_as_single_call_contract_violat
     assert_eq!(metadata.retry_count, 0);
     let error = response.error.expect("contract violation error");
     assert_eq!(error.kind, ModelErrorKind::UnsupportedCapability);
-    assert!(is_single_tool_call_contract_violation(&error));
     assert_eq!(
         error.message,
-        "provider returned multiple tool calls for a request that permits at most one"
+        "provider returned more tool calls than the negotiated limit of 1"
     );
     assert_eq!(
         error.code.as_deref(),
-        Some("provider_single_tool_call_contract_violated")
+        Some("provider_tool_call_limit_exceeded")
     );
     assert_eq!(error.stage, Some(ProviderErrorStage::ResponseValidation));
     assert_eq!(
         error.validation_errors,
-        vec!["max_tool_calls_exceeded", "parallel_tool_calls_not_allowed"]
+        vec![
+            "max_tool_calls_exceeded",
+            "provider_tool_call_limit_exceeded"
+        ]
     );
-}
-
-#[test]
-fn single_tool_call_contract_predicate_rejects_other_diagnostics() {
-    let mut error = ModelError::new(
-        ModelErrorKind::UnsupportedCapability,
-        "provider returned multiple tool calls",
-    )
-    .with_provider_diagnostic(
-        "provider_single_tool_call_contract_violated",
-        ProviderErrorStage::ResponseValidation,
-    );
-    error.validation_errors = vec![
-        "max_tool_calls_exceeded".to_string(),
-        "parallel_tool_calls_not_allowed".to_string(),
-    ];
-
-    assert!(is_single_tool_call_contract_violation(&error));
-
-    error.validation_errors.push("unknown_tool".to_string());
-    assert!(!is_single_tool_call_contract_violation(&error));
-    error.validation_errors.pop();
-    error.stage = Some(ProviderErrorStage::ResponseBodyRead);
-    assert!(!is_single_tool_call_contract_violation(&error));
-    error.stage = Some(ProviderErrorStage::ResponseValidation);
-    error.kind = ModelErrorKind::JsonSchemaViolation;
-    assert!(!is_single_tool_call_contract_violation(&error));
 }
 
 #[test]
@@ -1333,7 +1409,11 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
 
     assert_eq!(
         duplicate_result.errors,
-        vec!["duplicate_tool_call_id", "parallel_tool_calls_not_allowed"]
+        vec![
+            "duplicate_tool_call_id",
+            "max_tool_calls_exceeded",
+            "provider_tool_call_limit_exceeded"
+        ]
     );
 }
 

@@ -74,11 +74,47 @@ pub const BUILTIN_COMMAND_TOOL: &str = "builtin.command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionMode {
+    ParallelRead,
+    Exclusive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ToolInputValidationError {
+    pub code: String,
+}
+
+impl ToolInputValidationError {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self { code: code.into() }
+    }
+}
+
+pub type ToolInputValidator = fn(&Value) -> Result<(), ToolInputValidationError>;
+
+#[derive(Clone)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub execution_mode: ToolExecutionMode,
+    input_validator: ToolInputValidator,
+    exact_inputs: Option<Vec<Value>>,
+}
+
+impl fmt::Debug for ToolSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolSpec")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("input_schema", &self.input_schema)
+            .field("execution_mode", &self.execution_mode)
+            .field("exact_inputs", &self.exact_inputs)
+            .finish()
+    }
 }
 
 impl ToolSpec {
@@ -86,12 +122,66 @@ impl ToolSpec {
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
+        execution_mode: ToolExecutionMode,
+        input_validator: ToolInputValidator,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             input_schema,
+            execution_mode,
+            input_validator,
+            exact_inputs: None,
         }
+    }
+
+    pub fn validate_input(&self, input: &Value) -> Result<(), ToolInputValidationError> {
+        (self.input_validator)(input)?;
+        if self
+            .exact_inputs
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(input))
+        {
+            return Err(ToolInputValidationError::new("input_not_allowed"));
+        }
+        Ok(())
+    }
+
+    pub fn restrict_to_exact_inputs(&mut self, inputs: Vec<Value>) -> Result<(), String> {
+        if self.exact_inputs.is_some() {
+            return Err(format!(
+                "tool {} input contract is already restricted",
+                self.name
+            ));
+        }
+        if inputs.is_empty() {
+            return Err(format!(
+                "tool {} exact input contract must not be empty",
+                self.name
+            ));
+        }
+        let mut unique_inputs = Vec::new();
+        for input in inputs {
+            if !input.is_object() {
+                return Err(format!("tool {} exact input must be an object", self.name));
+            }
+            self.validate_input(&input).map_err(|error| {
+                format!(
+                    "tool {} exact input violates its executable contract: {}",
+                    self.name, error.code
+                )
+            })?;
+            if !unique_inputs.contains(&input) {
+                unique_inputs.push(input);
+            }
+        }
+        self.input_schema = exact_inputs_schema(&unique_inputs);
+        self.exact_inputs = Some(unique_inputs);
+        Ok(())
+    }
+
+    pub fn exact_inputs(&self) -> &[Value] {
+        self.exact_inputs.as_deref().unwrap_or_default()
     }
 
     pub fn to_schema_payload(&self) -> Value {
@@ -103,6 +193,109 @@ impl ToolSpec {
     }
 }
 
+fn exact_inputs_schema(inputs: &[Value]) -> Value {
+    let schemas = inputs.iter().map(exact_input_schema).collect::<Vec<_>>();
+    if schemas.len() == 1 {
+        schemas.into_iter().next().expect("one exact input schema")
+    } else {
+        json!({"oneOf": schemas})
+    }
+}
+
+fn exact_input_schema(input: &Value) -> Value {
+    let properties = input
+        .as_object()
+        .expect("executable tool input validators require an object");
+    let required = properties.keys().cloned().collect::<Vec<_>>();
+    let properties = properties
+        .iter()
+        .map(|(name, value)| {
+            let mut property = serde_json::Map::new();
+            property.insert("const".to_string(), value.clone());
+            if let Some(value_type) = json_schema_type(value) {
+                property.insert("type".to_string(), Value::String(value_type.to_string()));
+            }
+            (name.clone(), Value::Object(property))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+fn json_schema_type(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::Null => Some("null"),
+        Value::Bool(_) => Some("boolean"),
+        Value::Number(number) if number.is_i64() || number.is_u64() => Some("integer"),
+        Value::Number(_) => Some("number"),
+        Value::String(_) => Some("string"),
+        Value::Array(_) => Some("array"),
+        Value::Object(_) => Some("object"),
+    }
+}
+
+fn validate_read_tool_input(input: &Value) -> Result<(), ToolInputValidationError> {
+    let input: ReadToolInput = deserialize_tool_input(input, "read_input_schema_mismatch")?;
+    input
+        .validate()
+        .map_err(|_| ToolInputValidationError::new("read_input_invalid"))
+}
+
+fn validate_list_tool_input(input: &Value) -> Result<(), ToolInputValidationError> {
+    let input: ListToolInput = deserialize_tool_input(input, "list_input_schema_mismatch")?;
+    input
+        .validate()
+        .map_err(|_| ToolInputValidationError::new("list_input_invalid"))
+}
+
+fn validate_grep_tool_input(input: &Value) -> Result<(), ToolInputValidationError> {
+    let input: GrepToolInput = deserialize_tool_input(input, "grep_input_schema_mismatch")?;
+    input
+        .validate()
+        .map_err(|_| ToolInputValidationError::new("grep_input_invalid"))
+}
+
+fn validate_edit_tool_input(input: &Value) -> Result<(), ToolInputValidationError> {
+    let input: EditToolInput = deserialize_tool_input(input, "edit_input_schema_mismatch")?;
+    input
+        .validate()
+        .map_err(|_| ToolInputValidationError::new("edit_input_invalid"))
+}
+
+fn validate_patch_tool_input(input: &Value) -> Result<(), ToolInputValidationError> {
+    let input: WorkspacePatch = deserialize_tool_input(input, "patch_input_schema_mismatch")?;
+    input
+        .validate()
+        .map_err(|_| ToolInputValidationError::new("patch_input_invalid"))
+}
+
+fn validate_command_tool_input(input: &Value) -> Result<(), ToolInputValidationError> {
+    let validation_code = match input.get("argv") {
+        None => "missing_argv",
+        Some(Value::Array(_)) => "invalid_command_arguments",
+        Some(_) => "argv_not_array",
+    };
+    let input: CommandToolInput = deserialize_tool_input(input, validation_code)?;
+    input
+        .validate()
+        .map_err(|_| ToolInputValidationError::new(validation_code))
+}
+
+fn deserialize_tool_input<T>(
+    input: &Value,
+    validation_code: &'static str,
+) -> Result<T, ToolInputValidationError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(input.clone())
+        .map_err(|_| ToolInputValidationError::new(validation_code))
+}
+
 pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -112,13 +305,15 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "minLength": 1},
-                    "max_chars": {"type": "integer", "minimum": 1, "maximum": MAX_READ_MAX_CHARS},
-                    "line_start": {"type": "integer", "minimum": 1},
-                    "line_end": {"type": "integer", "minimum": 1}
+                    "max_chars": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_READ_MAX_CHARS},
+                    "line_start": {"type": ["integer", "null"], "minimum": 1},
+                    "line_end": {"type": ["integer", "null"], "minimum": 1}
                 },
-                "required": ["path"],
+                "required": ["path", "max_chars", "line_start", "line_end"],
                 "additionalProperties": false
             }),
+            ToolExecutionMode::ParallelRead,
+            validate_read_tool_input,
         ),
         ToolSpec::new(
             BUILTIN_LIST_TOOL,
@@ -126,13 +321,16 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "minLength": 1},
-                    "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_ENTRIES},
-                    "recursive": {"type": "boolean", "default": false},
-                    "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_DEPTH}
+                    "path": {"type": ["string", "null"], "minLength": 1},
+                    "max_entries": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_LIST_MAX_ENTRIES},
+                    "recursive": {"type": "boolean"},
+                    "max_depth": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_LIST_MAX_DEPTH}
                 },
+                "required": ["path", "max_entries", "recursive", "max_depth"],
                 "additionalProperties": false
             }),
+            ToolExecutionMode::ParallelRead,
+            validate_list_tool_input,
         ),
         ToolSpec::new(
             BUILTIN_GREP_TOOL,
@@ -140,14 +338,16 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "minLength": 1},
+                    "path": {"type": ["string", "null"], "minLength": 1},
                     "pattern": {"type": "string", "minLength": 1},
-                    "max_matches": {"type": "integer", "minimum": 1, "maximum": MAX_GREP_MAX_MATCHES},
-                    "case_sensitive": {"type": "boolean", "default": true}
+                    "max_matches": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_GREP_MAX_MATCHES},
+                    "case_sensitive": {"type": "boolean"}
                 },
-                "required": ["pattern"],
+                "required": ["path", "pattern", "max_matches", "case_sensitive"],
                 "additionalProperties": false
             }),
+            ToolExecutionMode::ParallelRead,
+            validate_grep_tool_input,
         ),
         ToolSpec::new(
             BUILTIN_EDIT_TOOL,
@@ -162,6 +362,8 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                 "required": ["path", "expected", "replacement"],
                 "additionalProperties": false
             }),
+            ToolExecutionMode::Exclusive,
+            validate_edit_tool_input,
         ),
         ToolSpec::new(
             BUILTIN_PATCH_TOOL,
@@ -179,7 +381,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                                 "expected": {"type": ["string", "null"]},
                                 "replacement": {"type": "string"}
                             },
-                            "required": ["path", "replacement"],
+                            "required": ["path", "expected", "replacement"],
                             "additionalProperties": false
                         }
                     }
@@ -187,6 +389,8 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                 "required": ["changes"],
                 "additionalProperties": false
             }),
+            ToolExecutionMode::Exclusive,
+            validate_patch_tool_input,
         ),
         ToolSpec::new(
             BUILTIN_COMMAND_TOOL,
@@ -199,17 +403,19 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                         "items": {"type": "string"},
                         "minItems": 1
                     },
-                    "cwd": {"type": "string", "minLength": 1},
-                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_COMMAND_TIMEOUT_SECONDS}
+                    "cwd": {"type": ["string", "null"], "minLength": 1},
+                    "timeout_seconds": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_COMMAND_TIMEOUT_SECONDS}
                 },
-                "required": ["argv"],
+                "required": ["argv", "cwd", "timeout_seconds"],
                 "additionalProperties": false
             }),
+            ToolExecutionMode::Exclusive,
+            validate_command_tool_input,
         ),
     ]
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolSpec>,
 }
@@ -234,6 +440,37 @@ impl ToolRegistry {
             .map(ToolSpec::to_schema_payload)
             .collect::<Vec<_>>()
     }
+
+    pub fn validate_input(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Result<ToolExecutionMode, ToolInputValidationError> {
+        let spec = self
+            .get(name)
+            .ok_or_else(|| ToolInputValidationError::new("tool_not_visible"))?;
+        spec.validate_input(input)?;
+        Ok(spec.execution_mode)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFailureKind {
+    Input,
+    Visibility,
+    Capability,
+    Policy,
+    PermissionProfile,
+    WorkspaceBoundary,
+    ProtectedPath,
+    Approval,
+    Sandbox,
+    Backend,
+    Infrastructure,
+    Execution,
+    Timeout,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -244,6 +481,7 @@ pub enum ToolBrokerDecision {
         approval_grant_id: String,
     },
     Deny {
+        failure_kind: ToolFailureKind,
         reason: String,
     },
     Ask {
@@ -254,7 +492,12 @@ pub enum ToolBrokerDecision {
 
 impl ToolBrokerDecision {
     pub fn deny(reason: impl Into<String>) -> Self {
+        Self::deny_with_kind(ToolFailureKind::Policy, reason)
+    }
+
+    pub fn deny_with_kind(failure_kind: ToolFailureKind, reason: impl Into<String>) -> Self {
         Self::Deny {
+            failure_kind,
             reason: reason.into(),
         }
     }
@@ -277,7 +520,7 @@ impl ToolBrokerDecision {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Clone)]
 pub struct ToolBroker {
     registry: ToolRegistry,
 }
@@ -299,6 +542,14 @@ impl ToolBroker {
         self.registry.schema_payloads()
     }
 
+    pub fn validate_input(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Result<ToolExecutionMode, ToolInputValidationError> {
+        self.registry.validate_input(name, input)
+    }
+
     pub fn execute<F>(
         &self,
         envelope: &ToolCallRequest,
@@ -309,10 +560,19 @@ impl ToolBroker {
         F: FnOnce(&ToolCallRequest) -> ToolOutput,
     {
         if self.registry.get(&envelope.tool_name).is_none() {
-            return ToolResult::failed(envelope, UNKNOWN_TOOL_ERROR, "tool is not registered");
+            return ToolResult::failed_with_kind(
+                envelope,
+                ToolFailureKind::Visibility,
+                UNKNOWN_TOOL_ERROR,
+                "tool is not registered",
+            );
         }
-        if let ToolBrokerDecision::Deny { reason } = decision {
-            return ToolResult::failed(envelope, TOOL_DENIED_ERROR, reason);
+        if let ToolBrokerDecision::Deny {
+            failure_kind,
+            reason,
+        } = decision
+        {
+            return ToolResult::failed_with_kind(envelope, failure_kind, TOOL_DENIED_ERROR, reason);
         }
         if let ToolBrokerDecision::Ask { reason, .. } = decision {
             return ToolResult::approval_required(envelope, reason);
@@ -347,6 +607,7 @@ pub struct ToolOutput {
     pub ok: bool,
     pub content: Value,
     pub error_code: Option<String>,
+    pub failure_kind: Option<ToolFailureKind>,
     pub truncated: bool,
     pub metadata: Value,
 }
@@ -357,16 +618,26 @@ impl ToolOutput {
             ok: true,
             content,
             error_code: None,
+            failure_kind: None,
             truncated: false,
             metadata: json!({}),
         }
     }
 
     pub fn failure(error_code: impl Into<String>, content: Value) -> Self {
+        Self::failure_with_kind(ToolFailureKind::Execution, error_code, content)
+    }
+
+    pub fn failure_with_kind(
+        failure_kind: ToolFailureKind,
+        error_code: impl Into<String>,
+        content: Value,
+    ) -> Self {
         Self {
             ok: false,
             content,
             error_code: Some(error_code.into()),
+            failure_kind: Some(failure_kind),
             truncated: false,
             metadata: json!({}),
         }
@@ -383,6 +654,8 @@ pub struct ToolResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<ToolFailureKind>,
     pub artifact_refs: Vec<String>,
     #[serde(skip)]
     pub result_id: Option<String>,
@@ -405,6 +678,7 @@ impl ToolResult {
             content: None,
             preview: Some(redact_public_text(&preview.into())),
             error_code: None,
+            failure_kind: None,
             artifact_refs: Vec::new(),
             result_id: None,
             truncated: false,
@@ -443,6 +717,7 @@ impl ToolResult {
         let result_id = result_id(&result.content, &result.metadata);
         let mut tool_result = Self {
             error_code: result.error_code.clone(),
+            failure_kind: result.failure_kind.clone(),
             truncated,
             ..Self::summary(
                 envelope.tool_call_id.clone(),
@@ -470,8 +745,18 @@ impl ToolResult {
         error_code: impl Into<String>,
         preview: impl Into<String>,
     ) -> Self {
+        Self::failed_with_kind(envelope, ToolFailureKind::Execution, error_code, preview)
+    }
+
+    pub fn failed_with_kind(
+        envelope: &ToolCallRequest,
+        failure_kind: ToolFailureKind,
+        error_code: impl Into<String>,
+        preview: impl Into<String>,
+    ) -> Self {
         Self {
             error_code: Some(error_code.into()),
+            failure_kind: Some(failure_kind),
             ..Self::summary(
                 envelope.tool_call_id.clone(),
                 envelope.tool_name.clone(),
@@ -482,7 +767,12 @@ impl ToolResult {
     }
 
     pub fn approval_required(envelope: &ToolCallRequest, reason: impl Into<String>) -> Self {
-        Self::failed(envelope, TOOL_APPROVAL_REQUIRED_ERROR, reason)
+        Self::failed_with_kind(
+            envelope,
+            ToolFailureKind::Approval,
+            TOOL_APPROVAL_REQUIRED_ERROR,
+            reason,
+        )
     }
 
     pub fn to_message_payload(&self) -> Value {
@@ -499,6 +789,10 @@ impl ToolResult {
         });
         if let Some(error_code) = self.error_code.as_deref() {
             payload["error_code"] = json!(error_code);
+        }
+        if let Some(failure_kind) = self.failure_kind.as_ref() {
+            payload["failure_kind"] =
+                serde_json::to_value(failure_kind).unwrap_or_else(|_| json!("execution"));
         }
         if !artifact_refs.is_empty() {
             payload["artifact_refs"] = json!(artifact_refs);
@@ -618,6 +912,22 @@ pub struct ReadToolInput {
     pub line_end: Option<usize>,
 }
 
+impl ReadToolInput {
+    fn validate(&self) -> Result<(), WorkspaceToolError> {
+        validate_nonempty_path("path", &self.path)?;
+        validate_limit(
+            "max_chars",
+            self.max_chars,
+            DEFAULT_READ_MAX_CHARS,
+            MAX_READ_MAX_CHARS,
+        )?;
+        validate_line_range(
+            self.line_start.unwrap_or(1),
+            self.line_end.unwrap_or(usize::MAX),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListToolInput {
@@ -626,6 +936,27 @@ pub struct ListToolInput {
     #[serde(default)]
     pub recursive: bool,
     pub max_depth: Option<usize>,
+}
+
+impl ListToolInput {
+    fn validate(&self) -> Result<(), WorkspaceToolError> {
+        if let Some(path) = self.path.as_deref() {
+            validate_nonempty_path("path", path)?;
+        }
+        validate_limit(
+            "max_entries",
+            self.max_entries,
+            DEFAULT_LIST_MAX_ENTRIES,
+            MAX_LIST_MAX_ENTRIES,
+        )?;
+        validate_limit(
+            "max_depth",
+            self.max_depth,
+            DEFAULT_LIST_MAX_DEPTH,
+            MAX_LIST_MAX_DEPTH,
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -638,6 +969,26 @@ pub struct GrepToolInput {
     pub case_sensitive: bool,
 }
 
+impl GrepToolInput {
+    fn validate(&self) -> Result<(), WorkspaceToolError> {
+        if self.pattern.is_empty() {
+            return Err(WorkspaceToolError::InvalidInput(
+                "pattern must not be empty".to_string(),
+            ));
+        }
+        if let Some(path) = self.path.as_deref() {
+            validate_nonempty_path("path", path)?;
+        }
+        validate_limit(
+            "max_matches",
+            self.max_matches,
+            DEFAULT_GREP_MAX_MATCHES,
+            MAX_GREP_MAX_MATCHES,
+        )?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditToolInput {
@@ -646,10 +997,30 @@ pub struct EditToolInput {
     pub replacement: String,
 }
 
+impl EditToolInput {
+    fn validate(&self) -> Result<(), WorkspaceToolError> {
+        validate_nonempty_path("path", &self.path)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePatch {
     pub changes: Vec<WorkspacePatchChange>,
+}
+
+impl WorkspacePatch {
+    fn validate(&self) -> Result<(), WorkspaceToolError> {
+        if self.changes.is_empty() {
+            return Err(WorkspaceToolError::InvalidInput(
+                "patch must contain at least one change".to_string(),
+            ));
+        }
+        for change in &self.changes {
+            validate_nonempty_path("changes[].path", &change.path)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -709,17 +1080,69 @@ impl WorkspaceTools {
         self
     }
 
+    pub fn preflight(&self, tool_name: &str, input: &Value) -> Result<(), WorkspaceToolError> {
+        match tool_name {
+            BUILTIN_READ_TOOL => {
+                let input: ReadToolInput = preflight_input(input)?;
+                input.validate()?;
+                self.resolve_workspace_path(&input.path, false)?;
+            }
+            BUILTIN_LIST_TOOL => {
+                let input: ListToolInput = preflight_input(input)?;
+                input.validate()?;
+                self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
+            }
+            BUILTIN_GREP_TOOL => {
+                let input: GrepToolInput = preflight_input(input)?;
+                input.validate()?;
+                self.resolve_workspace_path(
+                    input.path.as_deref().unwrap_or("."),
+                    input.path.is_none(),
+                )?;
+            }
+            BUILTIN_EDIT_TOOL => {
+                let input: EditToolInput = preflight_input(input)?;
+                input.validate()?;
+                self.resolve_workspace_path(&input.path, false)?;
+            }
+            BUILTIN_PATCH_TOOL => {
+                let patch: WorkspacePatch = preflight_input(input)?;
+                patch.validate()?;
+                let mut targets = BTreeSet::new();
+                for change in patch.changes {
+                    let target = self.resolve_workspace_path(&change.path, false)?;
+                    if !targets.insert(target) {
+                        return Err(WorkspaceToolError::InvalidInput(
+                            DUPLICATE_PATCH_TARGET.to_string(),
+                        ));
+                    }
+                }
+            }
+            BUILTIN_COMMAND_TOOL => {
+                let input: CommandToolInput = preflight_input(input)?;
+                input.validate()?;
+                let Some(backend) = &self.sandbox_backend else {
+                    return Err(WorkspaceToolError::SandboxUnavailable);
+                };
+                if !backend.capabilities().supports_command_execution() {
+                    return Err(WorkspaceToolError::SandboxUnavailable);
+                }
+                self.resolve_workspace_path(input.cwd.as_deref().unwrap_or("."), false)?;
+            }
+            _ => {
+                return Err(WorkspaceToolError::InvalidInput(
+                    "tool backend is unavailable".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn read(&self, input: ReadToolInput) -> Result<ToolOutput, WorkspaceToolError> {
-        validate_nonempty_path("path", &input.path)?;
-        let max_chars = validate_limit(
-            "max_chars",
-            input.max_chars,
-            DEFAULT_READ_MAX_CHARS,
-            MAX_READ_MAX_CHARS,
-        )?;
+        input.validate()?;
+        let max_chars = input.max_chars.unwrap_or(DEFAULT_READ_MAX_CHARS);
         let line_start = input.line_start.unwrap_or(1);
         let line_end = input.line_end.unwrap_or(usize::MAX);
-        validate_line_range(line_start, line_end)?;
         let target = self.resolve_workspace_path(&input.path, false)?;
         let relative = self.relative_path(&target);
         let file = File::open(&target).map_err(io_error)?;
@@ -810,22 +1233,10 @@ impl WorkspaceTools {
     }
 
     pub fn list(&self, input: ListToolInput) -> Result<ToolOutput, WorkspaceToolError> {
-        if let Some(path) = input.path.as_deref() {
-            validate_nonempty_path("path", path)?;
-        }
+        input.validate()?;
         let target = self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
-        let max_entries = validate_limit(
-            "max_entries",
-            input.max_entries,
-            DEFAULT_LIST_MAX_ENTRIES,
-            MAX_LIST_MAX_ENTRIES,
-        )?;
-        let max_depth = validate_limit(
-            "max_depth",
-            input.max_depth,
-            DEFAULT_LIST_MAX_DEPTH,
-            MAX_LIST_MAX_DEPTH,
-        )?;
+        let max_entries = input.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
+        let max_depth = input.max_depth.unwrap_or(DEFAULT_LIST_MAX_DEPTH);
         let mut state = ListState {
             entries: Vec::new(),
             redacted_entries: 0,
@@ -855,22 +1266,10 @@ impl WorkspaceTools {
     }
 
     pub fn grep(&self, input: GrepToolInput) -> Result<ToolOutput, WorkspaceToolError> {
-        if input.pattern.is_empty() {
-            return Err(WorkspaceToolError::InvalidInput(
-                "pattern must not be empty".to_string(),
-            ));
-        }
-        if let Some(path) = input.path.as_deref() {
-            validate_nonempty_path("path", path)?;
-        }
+        input.validate()?;
         let root = self
             .resolve_workspace_path(input.path.as_deref().unwrap_or("."), input.path.is_none())?;
-        let max_matches = validate_limit(
-            "max_matches",
-            input.max_matches,
-            DEFAULT_GREP_MAX_MATCHES,
-            MAX_GREP_MAX_MATCHES,
-        )?;
+        let max_matches = input.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
         let mut matches = Vec::new();
         let collection_limit = max_matches.saturating_add(1);
         let truncated = self.grep_path(
@@ -892,6 +1291,7 @@ impl WorkspaceTools {
         input: EditToolInput,
         decision: &ToolBrokerDecision,
     ) -> Result<ToolOutput, WorkspaceToolError> {
+        input.validate()?;
         self.patch(
             WorkspacePatch {
                 changes: vec![WorkspacePatchChange {
@@ -914,15 +1314,10 @@ impl WorkspaceTools {
                 WORKSPACE_MUTATION_NOT_APPROVED.to_string(),
             ));
         }
-        if patch.changes.is_empty() {
-            return Err(WorkspaceToolError::InvalidInput(
-                "patch must contain at least one change".to_string(),
-            ));
-        }
+        patch.validate()?;
         let mut prepared = Vec::new();
         let mut targets = BTreeSet::new();
         for change in &patch.changes {
-            validate_nonempty_path("changes[].path", &change.path)?;
             let target = self.resolve_workspace_path(&change.path, false)?;
             let relative = self.relative_path(&target);
             if !targets.insert(target.clone()) {
@@ -1228,6 +1623,14 @@ impl WorkspaceTools {
             .trim_start_matches(['/', '\\'])
             .replace('\\', "/")
     }
+}
+
+fn preflight_input<T>(input: &Value) -> Result<T, WorkspaceToolError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(input.clone())
+        .map_err(|_| WorkspaceToolError::InvalidInput("invalid tool input".to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -1640,7 +2043,33 @@ fn command_tool_output(result: CommandResult) -> ToolOutput {
     if ok {
         ToolOutput::success(content)
     } else {
-        ToolOutput::failure(command_error_code(&result), content)
+        ToolOutput::failure_with_kind(
+            command_failure_kind(&result),
+            command_error_code(&result),
+            content,
+        )
+    }
+}
+
+fn command_failure_kind(result: &CommandResult) -> ToolFailureKind {
+    match result.execution_status {
+        CommandExecutionStatus::PolicyDenied => ToolFailureKind::Policy,
+        CommandExecutionStatus::ReviewRequired => ToolFailureKind::Approval,
+        CommandExecutionStatus::Unsupported => ToolFailureKind::Capability,
+        CommandExecutionStatus::SpawnFailed => ToolFailureKind::Infrastructure,
+        CommandExecutionStatus::TimedOut => ToolFailureKind::Timeout,
+        CommandExecutionStatus::Cancelled => ToolFailureKind::Cancelled,
+        CommandExecutionStatus::BackendError => ToolFailureKind::Backend,
+        CommandExecutionStatus::Completed => match result.semantic_status {
+            CommandSemanticStatus::Succeeded
+            | CommandSemanticStatus::ExitNonzero
+            | CommandSemanticStatus::TestsFailed
+            | CommandSemanticStatus::BuildFailed => ToolFailureKind::Execution,
+            CommandSemanticStatus::PolicyBlocked => ToolFailureKind::Policy,
+            CommandSemanticStatus::Unsupported => ToolFailureKind::Capability,
+            CommandSemanticStatus::TimedOut => ToolFailureKind::Timeout,
+            CommandSemanticStatus::Cancelled => ToolFailureKind::Cancelled,
+        },
     }
 }
 

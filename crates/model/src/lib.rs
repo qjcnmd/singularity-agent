@@ -13,15 +13,18 @@ use singularity_core::CancellationToken;
 use thiserror::Error;
 use uuid::Uuid;
 
-const DEFAULT_MAX_TOOL_CALLS: u32 = 8;
+const DEFAULT_MAX_TOOL_CALLS: u32 = 1;
 pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;
 const MAX_CONFIGURED_OUTPUT_TOKENS: u32 = 256_000;
+const MAX_CONFIGURED_TOOL_CALLS: u32 = 8;
 const ENV_PROVIDER: &str = "SINGULARITY_MODEL_PROVIDER";
 const ENV_MODEL: &str = "SINGULARITY_MODEL";
 const ENV_CONTEXT_TOKENS: &str = "SINGULARITY_MODEL_CONTEXT_TOKENS";
 const ENV_MAX_OUTPUT_TOKENS: &str = "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS";
+const ENV_MAX_TOOL_CALLS: &str = "SINGULARITY_MODEL_MAX_TOOL_CALLS";
+const ENV_STRICT_TOOL_SCHEMA: &str = "SINGULARITY_MODEL_STRICT_TOOL_SCHEMA";
 const ENV_BASE_URL: &str = "SINGULARITY_BASE_URL";
 const ENV_API_KEY: &str = "SINGULARITY_API_KEY";
 const PROJECT_ENV_FILE: &str = ".env";
@@ -33,10 +36,7 @@ const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 const MAX_PROVIDER_ATTEMPTS: u32 = 3;
 const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
-const PROVIDER_SINGLE_TOOL_CALL_CONTRACT_VIOLATED_CODE: &str =
-    "provider_single_tool_call_contract_violated";
-const MAX_TOOL_CALLS_EXCEEDED_VALIDATION_ERROR: &str = "max_tool_calls_exceeded";
-const PARALLEL_TOOL_CALLS_NOT_ALLOWED_VALIDATION_ERROR: &str = "parallel_tool_calls_not_allowed";
+const PROVIDER_TOOL_CALL_LIMIT_EXCEEDED_CODE: &str = "provider_tool_call_limit_exceeded";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
 const HTTP_STATUS_NOT_FOUND: u16 = 404;
@@ -118,6 +118,7 @@ pub struct ToolChoicePolicy {
     pub tool_name: Option<String>,
     pub allowed_tool_names: Vec<String>,
     pub max_tool_calls: u32,
+    pub strict_tool_schema: bool,
 }
 
 impl Default for ToolChoicePolicy {
@@ -127,6 +128,7 @@ impl Default for ToolChoicePolicy {
             tool_name: None,
             allowed_tool_names: Vec::new(),
             max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
+            strict_tool_schema: false,
         }
     }
 }
@@ -160,7 +162,8 @@ pub struct ModelToolCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
-    pub supports_parallel_tool_calls: bool,
+    pub supports_strict_tool_schema: bool,
+    pub max_tool_calls_per_turn: u32,
     pub supports_json_mode: bool,
     pub supports_system_message: bool,
     pub supports_developer_message: bool,
@@ -172,7 +175,8 @@ impl Default for ProviderProtocolContract {
     fn default() -> Self {
         Self {
             supports_tools: true,
-            supports_parallel_tool_calls: false,
+            supports_strict_tool_schema: false,
+            max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
             supports_json_mode: false,
             supports_system_message: true,
             supports_developer_message: true,
@@ -551,24 +555,6 @@ pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
     model_error_category(error)
 }
 
-pub fn is_single_tool_call_contract_violation(error: &ModelError) -> bool {
-    if error.kind != ModelErrorKind::UnsupportedCapability
-        || error.code.as_deref() != Some(PROVIDER_SINGLE_TOOL_CALL_CONTRACT_VIOLATED_CODE)
-        || error.stage != Some(ProviderErrorStage::ResponseValidation)
-        || error.validation_errors.len() != 2
-    {
-        return false;
-    }
-    error
-        .validation_errors
-        .iter()
-        .any(|value| value == MAX_TOOL_CALLS_EXCEEDED_VALIDATION_ERROR)
-        && error
-            .validation_errors
-            .iter()
-            .any(|value| value == PARALLEL_TOOL_CALLS_NOT_ALLOWED_VALIDATION_ERROR)
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelTurnRequest {
     pub request_id: String,
@@ -674,6 +660,8 @@ pub struct OpenAiProviderConfig {
     pub source: ProviderConfigSource,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
+    pub max_tool_calls_per_turn: u32,
+    pub supports_strict_tool_schema: bool,
 }
 
 impl fmt::Debug for OpenAiProviderConfig {
@@ -687,6 +675,11 @@ impl fmt::Debug for OpenAiProviderConfig {
             .field("source", &self.source)
             .field("max_context_tokens", &self.max_context_tokens)
             .field("max_output_tokens", &self.max_output_tokens)
+            .field("max_tool_calls_per_turn", &self.max_tool_calls_per_turn)
+            .field(
+                "supports_strict_tool_schema",
+                &self.supports_strict_tool_schema,
+            )
             .finish()
     }
 }
@@ -702,18 +695,31 @@ impl OpenAiProviderConfig {
 
     fn from_resolved_values(values: ResolvedProviderValues) -> Result<Self, ProviderError> {
         let source = values.source;
-        let max_context_tokens = parse_provider_token_limit(
+        let max_context_tokens = parse_provider_limit(
             values.context_tokens.as_deref(),
             ENV_CONTEXT_TOKENS,
             DEFAULT_MAX_CONTEXT_TOKENS,
             MAX_CONFIGURED_CONTEXT_TOKENS,
             source,
         )?;
-        let max_output_tokens = parse_provider_token_limit(
+        let max_output_tokens = parse_provider_limit(
             values.max_output_tokens.as_deref(),
             ENV_MAX_OUTPUT_TOKENS,
             DEFAULT_MAX_OUTPUT_TOKENS,
             MAX_CONFIGURED_OUTPUT_TOKENS,
+            source,
+        )?;
+        let max_tool_calls_per_turn = parse_provider_limit(
+            values.max_tool_calls.as_deref(),
+            ENV_MAX_TOOL_CALLS,
+            DEFAULT_MAX_TOOL_CALLS,
+            MAX_CONFIGURED_TOOL_CALLS,
+            source,
+        )?;
+        let supports_strict_tool_schema = parse_provider_bool(
+            values.strict_tool_schema.as_deref(),
+            ENV_STRICT_TOOL_SCHEMA,
+            false,
             source,
         )?;
         if max_output_tokens >= max_context_tokens {
@@ -751,6 +757,8 @@ impl OpenAiProviderConfig {
             source,
             max_context_tokens,
             max_output_tokens,
+            max_tool_calls_per_turn,
+            supports_strict_tool_schema,
         })
     }
 
@@ -770,7 +778,8 @@ impl OpenAiProviderConfig {
     pub fn protocol_contract(&self) -> ProviderProtocolContract {
         ProviderProtocolContract {
             supports_tools: true,
-            supports_parallel_tool_calls: false,
+            supports_strict_tool_schema: self.supports_strict_tool_schema,
+            max_tool_calls_per_turn: self.max_tool_calls_per_turn,
             supports_json_mode: true,
             supports_system_message: true,
             supports_developer_message: true,
@@ -1087,11 +1096,11 @@ fn openai_request_payload(request: &ModelTurnRequest, model_name: &str) -> Value
             request
                 .tools
                 .iter()
-                .map(openai_tool_payload)
+                .map(|tool| openai_tool_payload(tool, request.tool_choice.strict_tool_schema))
                 .collect::<Vec<_>>()
         );
         payload["tool_choice"] = openai_tool_choice_payload(request);
-        payload["parallel_tool_calls"] = json!(false);
+        payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
     }
     payload
 }
@@ -1143,15 +1152,19 @@ fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
     })
 }
 
-fn openai_tool_payload(tool: &ModelToolSchema) -> Value {
-    json!({
+fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> Value {
+    let mut payload = json!({
         "type": "function",
         "function": {
             "name": openai_wire_tool_name(&tool.name),
             "description": tool.description,
             "parameters": tool.parameters_schema,
         }
-    })
+    });
+    if strict_tool_schema {
+        payload["function"]["strict"] = json!(true);
+    }
+    payload
 }
 
 fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
@@ -1274,14 +1287,16 @@ fn parse_openai_response(
         validate_model_turn_response(request, &response, &allowed_tool_names, Some(&capabilities));
     if !validation.valid {
         response.status = ModelTurnStatus::Invalid;
-        let single_tool_call_contract_violated = request.tool_choice.max_tool_calls == 1
-            && response.tool_calls.len() > request.tool_choice.max_tool_calls as usize;
-        let (kind, message, diagnostic_code) = if single_tool_call_contract_violated {
+        let tool_call_limit_exceeded =
+            response.tool_calls.len() > request.tool_choice.max_tool_calls as usize;
+        let (kind, message, diagnostic_code) = if tool_call_limit_exceeded {
             (
                 ModelErrorKind::UnsupportedCapability,
-                "provider returned multiple tool calls for a request that permits at most one"
-                    .to_string(),
-                PROVIDER_SINGLE_TOOL_CALL_CONTRACT_VIOLATED_CODE,
+                format!(
+                    "provider returned more tool calls than the negotiated limit of {}",
+                    request.tool_choice.max_tool_calls
+                ),
+                PROVIDER_TOOL_CALL_LIMIT_EXCEEDED_CODE,
             )
         } else {
             (
@@ -1465,7 +1480,7 @@ fn provider_source_missing_error() -> ProviderError {
     )
 }
 
-fn parse_provider_token_limit(
+fn parse_provider_limit(
     value: Option<&str>,
     name: &str,
     fallback: u32,
@@ -1485,6 +1500,36 @@ fn parse_provider_token_limit(
                     ModelErrorKind::InvalidRequest,
                     format!(
                         "invalid model configuration: {name} must be between 1 and {upper_bound} (source={source})"
+                    ),
+                )
+                .with_provider_diagnostic(
+                    "provider_configuration_invalid",
+                    ProviderErrorStage::ClientInitialization,
+                ),
+            ))
+        }
+    }
+}
+
+fn parse_provider_bool(
+    value: Option<&str>,
+    name: &str,
+    fallback: bool,
+    source: Option<ProviderConfigSource>,
+) -> Result<bool, ProviderError> {
+    let Some(value) = value else {
+        return Ok(fallback);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => {
+            let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
+            Err(ProviderError::from_model_error(
+                ModelError::new(
+                    ModelErrorKind::InvalidRequest,
+                    format!(
+                        "invalid model configuration: {name} must be true or false (source={source})"
                     ),
                 )
                 .with_provider_diagnostic(
@@ -1714,6 +1759,17 @@ pub fn validate_model_request_with_capabilities(
     if request.messages.is_empty() {
         errors.push("messages_required".to_string());
     }
+    if !request.tools.is_empty() && request.tool_choice.max_tool_calls == 0 {
+        errors.push("max_tool_calls_must_be_positive".to_string());
+    }
+    if request.tool_choice.strict_tool_schema
+        && request
+            .tools
+            .iter()
+            .any(|tool| !is_strict_tool_schema_compatible(&tool.parameters_schema))
+    {
+        errors.push("strict_tool_schema_incompatible".to_string());
+    }
     if let Some(capabilities) = capabilities {
         if !request.tools.is_empty() && !capabilities.supports_tools {
             errors.push("provider_does_not_support_tools".to_string());
@@ -1742,8 +1798,75 @@ pub fn validate_model_request_with_capabilities(
         {
             errors.push("requested_output_tokens_exceed_provider_limit".to_string());
         }
+        if !request.tools.is_empty()
+            && request.tool_choice.max_tool_calls > capabilities.max_tool_calls_per_turn
+        {
+            errors.push("requested_tool_calls_exceed_provider_limit".to_string());
+        }
+        if !request.tools.is_empty()
+            && request.tool_choice.strict_tool_schema
+            && !capabilities.supports_strict_tool_schema
+        {
+            errors.push("provider_does_not_support_strict_tool_schema".to_string());
+        }
     }
     validation_result(errors, Vec::new())
+}
+
+pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
+    if schema.get("const").is_some() {
+        return true;
+    }
+    if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+        return !branches.is_empty() && branches.iter().all(is_strict_tool_schema_compatible);
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("object") {
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return false;
+        };
+        let Some(required) = schema.get("required").and_then(Value::as_array) else {
+            return false;
+        };
+        if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+            || required.iter().any(|name| {
+                name.as_str()
+                    .is_none_or(|name| !properties.contains_key(name))
+            })
+            || properties.keys().any(|name| {
+                !required
+                    .iter()
+                    .any(|required| required.as_str() == Some(name.as_str()))
+            })
+        {
+            return false;
+        }
+        return properties.values().all(is_strict_tool_schema_compatible);
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("array") {
+        return schema
+            .get("items")
+            .is_some_and(is_strict_tool_schema_compatible);
+    }
+    match schema.get("type") {
+        Some(Value::String(value_type)) => {
+            matches!(
+                value_type.as_str(),
+                "string" | "number" | "integer" | "boolean" | "null"
+            )
+        }
+        Some(Value::Array(value_types)) => {
+            !value_types.is_empty()
+                && value_types.iter().all(|value_type| {
+                    value_type.as_str().is_some_and(|value_type| {
+                        matches!(
+                            value_type,
+                            "string" | "number" | "integer" | "boolean" | "null"
+                        )
+                    })
+                })
+        }
+        _ => false,
+    }
 }
 
 pub fn validate_model_turn_response(
@@ -1822,8 +1945,8 @@ pub fn validate_model_response(
         if !tool_calls.is_empty() && !capabilities.supports_tools {
             errors.push("provider_does_not_support_tools".to_string());
         }
-        if tool_calls.len() > 1 && !capabilities.supports_parallel_tool_calls {
-            errors.push("parallel_tool_calls_not_allowed".to_string());
+        if tool_calls.len() > capabilities.max_tool_calls_per_turn as usize {
+            errors.push("provider_tool_call_limit_exceeded".to_string());
         }
     }
 
@@ -1942,6 +2065,8 @@ struct ProviderConfigLayer {
     model_name: Option<String>,
     context_tokens: Option<String>,
     max_output_tokens: Option<String>,
+    max_tool_calls: Option<String>,
+    strict_tool_schema: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
 }
@@ -1956,6 +2081,8 @@ impl ProviderConfigLayer {
             model_name: get_env(ENV_MODEL),
             context_tokens: get_env(ENV_CONTEXT_TOKENS),
             max_output_tokens: get_env(ENV_MAX_OUTPUT_TOKENS),
+            max_tool_calls: get_env(ENV_MAX_TOOL_CALLS),
+            strict_tool_schema: get_env(ENV_STRICT_TOOL_SCHEMA),
             base_url: get_env(ENV_BASE_URL),
             api_key: get_env(ENV_API_KEY),
         }
@@ -1966,6 +2093,8 @@ impl ProviderConfigLayer {
             || self.model_name.is_some()
             || self.context_tokens.is_some()
             || self.max_output_tokens.is_some()
+            || self.max_tool_calls.is_some()
+            || self.strict_tool_schema.is_some()
             || self.base_url.is_some()
             || self.api_key.is_some()
     }
@@ -1977,6 +2106,8 @@ impl ProviderConfigLayer {
             model_name: normalized_provider_value(self.model_name),
             context_tokens: normalized_provider_value(self.context_tokens),
             max_output_tokens: normalized_provider_value(self.max_output_tokens),
+            max_tool_calls: normalized_provider_value(self.max_tool_calls),
+            strict_tool_schema: normalized_provider_value(self.strict_tool_schema),
             base_url: normalized_provider_value(self.base_url),
             api_key: normalized_provider_value(self.api_key),
         }
@@ -1990,6 +2121,8 @@ struct ResolvedProviderValues {
     model_name: Option<String>,
     context_tokens: Option<String>,
     max_output_tokens: Option<String>,
+    max_tool_calls: Option<String>,
+    strict_tool_schema: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
 }
@@ -2066,6 +2199,8 @@ fn read_project_env_layer(path: &Path) -> ProviderConfigLayer {
             ENV_MODEL => &mut layer.model_name,
             ENV_CONTEXT_TOKENS => &mut layer.context_tokens,
             ENV_MAX_OUTPUT_TOKENS => &mut layer.max_output_tokens,
+            ENV_MAX_TOOL_CALLS => &mut layer.max_tool_calls,
+            ENV_STRICT_TOOL_SCHEMA => &mut layer.strict_tool_schema,
             ENV_BASE_URL => &mut layer.base_url,
             ENV_API_KEY => &mut layer.api_key,
             _ => continue,
@@ -2161,6 +2296,8 @@ mod transport_tests {
                 source: ProviderConfigSource::ProcessEnvironment,
                 max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+                max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
+                supports_strict_tool_schema: false,
             },
             1,
         )

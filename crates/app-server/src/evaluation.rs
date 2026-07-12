@@ -1411,13 +1411,9 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
             let commands = projection
                 .smoke_commands
                 .iter()
-                .map(smoke_command_input_schema)
+                .map(smoke_command_payload)
                 .collect::<Vec<_>>();
-            spec.input_schema = if commands.len() == 1 {
-                commands.into_iter().next().expect("one command schema")
-            } else {
-                json!({"oneOf": commands})
-            };
+            spec.restrict_to_exact_inputs(commands)?;
         }
         registry.register(spec)?;
     }
@@ -1545,22 +1541,6 @@ fn smoke_command_payload(command: &CommandSpec) -> Value {
             NetworkAccess::Denied => "denied",
             NetworkAccess::Allowed => "allowed",
         },
-    })
-}
-
-fn smoke_command_input_schema(command: &CommandSpec) -> Value {
-    let payload = smoke_command_payload(command);
-    json!({
-        "type": "object",
-        "properties": {
-            "argv": {"type": "array", "const": payload["argv"]},
-            "cwd": {"type": "string", "const": payload["cwd"]},
-            "timeout_seconds": {"type": "integer", "const": payload["timeout_seconds"]},
-            "sandbox_mode": {"type": "string", "const": payload["sandbox_mode"]},
-            "network_access": {"type": "string", "const": payload["network_access"]}
-        },
-        "required": ["argv", "cwd", "timeout_seconds", "sandbox_mode", "network_access"],
-        "additionalProperties": false
     })
 }
 
@@ -2071,7 +2051,7 @@ mod tests {
     #[test]
     fn agent_blocker_kind_maps_typed_provider_categories() {
         let response_validation = ProviderDiagnostic {
-            code: Some("provider_single_tool_call_contract_violated".to_string()),
+            code: Some("provider_tool_call_limit_exceeded".to_string()),
             stage: Some(ProviderErrorStage::ResponseValidation),
             transport_category: None,
             timeout_seconds: None,
@@ -2243,12 +2223,26 @@ mod tests {
         };
 
         let registry = evaluation_registry(&projection).expect("registry");
-        let schema = &registry
-            .get(TOOL_COMMAND)
-            .expect("command tool")
-            .input_schema;
+        let command = registry.get(TOOL_COMMAND).expect("command tool");
+        let payload = smoke_command_payload(&smoke);
 
-        assert_eq!(schema, &smoke_command_input_schema(&smoke));
+        assert_eq!(
+            command.input_schema["properties"]["argv"]["const"],
+            payload["argv"]
+        );
+        assert!(singularity_model::is_strict_tool_schema_compatible(
+            &command.input_schema
+        ));
+        assert!(command.validate_input(&payload).is_ok());
+        let mut undeclared = payload;
+        undeclared["argv"] = json!(["cargo", "check"]);
+        assert_eq!(
+            command
+                .validate_input(&undeclared)
+                .expect_err("undeclared command must fail locally")
+                .code,
+            "input_not_allowed"
+        );
     }
 
     #[test]

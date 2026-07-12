@@ -1,8 +1,8 @@
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess,
-    PermissionDecision, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
-    PermissionProfileName, PermissionRequest, PermissionRule, PolicyEngine, PreToolUseHook,
-    SettingsScope,
+    PermissionDecision, PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation,
+    PermissionProfile, PermissionProfileName, PermissionRequest, PermissionRule, PolicyEngine,
+    PreToolUseHook, SettingsScope,
 };
 
 fn rule(
@@ -79,6 +79,7 @@ fn denied_profile_network_cannot_be_enabled_by_permission_rule() {
         ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.cause, PermissionDecisionCause::NetworkProfile);
     assert_eq!(decision.rule_id, None);
     assert_eq!(
         decision.reason,
@@ -136,6 +137,7 @@ fn policy_engine_evaluates_hooks_and_rules_in_fail_closed_order() {
     let decision = engine.evaluate(&request);
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.cause, PermissionDecisionCause::Rule);
     assert_eq!(decision.rule_id.as_deref(), Some("deny_test"));
 
     let hook_decision = PermissionDecision::new(
@@ -172,6 +174,7 @@ fn managed_policy_precedence_wins_over_lower_scope_rules() {
     let decision = engine.evaluate(&request);
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.cause, PermissionDecisionCause::Rule);
     assert_eq!(decision.rule_id.as_deref(), Some("managed_deny"));
     assert_eq!(decision.scope, Some(SettingsScope::Managed));
 }
@@ -185,6 +188,7 @@ fn sensitive_resources_are_denied_when_marked_by_caller() {
         PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).evaluate(&request);
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.cause, PermissionDecisionCause::ProtectedResource);
     assert_eq!(decision.reason, "protected resource is denied by default");
 }
 
@@ -230,6 +234,7 @@ fn approval_policy_never_turns_approval_requests_into_deny() {
         ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.cause, PermissionDecisionCause::ApprovalPolicy);
     assert_eq!(decision.rule_id.as_deref(), Some("ask_tests"));
     assert_eq!(decision.reason, "approval policy forbids approval requests");
 }
@@ -331,6 +336,7 @@ fn pre_tool_hook_denies_before_lower_priority_allow_rule() {
     let decision = engine.evaluate(&request);
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.cause, PermissionDecisionCause::Hook);
     assert_eq!(decision.reason, "hook denied write");
     assert_eq!(decision.rule_id, None);
 }

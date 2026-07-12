@@ -177,8 +177,21 @@ fn resource_matches_prefix(resource: &str, prefix: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecisionCause {
+    Explicit,
+    Rule,
+    Hook,
+    NetworkProfile,
+    ProtectedResource,
+    NoMatchingRule,
+    ApprovalPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PermissionDecision {
     pub outcome: PermissionDecisionOutcome,
+    pub cause: PermissionDecisionCause,
     pub reason: String,
     pub rule_id: Option<String>,
     pub scope: Option<SettingsScope>,
@@ -188,15 +201,22 @@ impl PermissionDecision {
     pub fn new(outcome: PermissionDecisionOutcome, reason: impl Into<String>) -> Self {
         Self {
             outcome,
+            cause: PermissionDecisionCause::Explicit,
             reason: reason.into(),
             rule_id: None,
             scope: None,
         }
     }
 
+    fn with_cause(mut self, cause: PermissionDecisionCause) -> Self {
+        self.cause = cause;
+        self
+    }
+
     fn from_rule(rule: &PermissionRule) -> Self {
         Self {
             outcome: rule.outcome,
+            cause: PermissionDecisionCause::Rule,
             reason: REASON_MATCHED_PERMISSION_RULE.to_string(),
             rule_id: Some(rule.rule_id.clone()),
             scope: Some(rule.scope),
@@ -240,7 +260,8 @@ impl PolicyEngine {
         self
     }
 
-    pub fn with_hook(mut self, hook: PreToolUseHook) -> Self {
+    pub fn with_hook(mut self, mut hook: PreToolUseHook) -> Self {
+        hook.decision.cause = PermissionDecisionCause::Hook;
         self.hooks.push(hook);
         self
     }
@@ -252,7 +273,8 @@ impl PolicyEngine {
             return PermissionDecision::new(
                 PermissionDecisionOutcome::Deny,
                 REASON_NETWORK_ACCESS_DENIED,
-            );
+            )
+            .with_cause(PermissionDecisionCause::NetworkProfile);
         }
         let hook_decision = self
             .hooks
@@ -267,7 +289,8 @@ impl PolicyEngine {
             return PermissionDecision::new(
                 PermissionDecisionOutcome::Deny,
                 REASON_PROTECTED_RESOURCE_DENIED,
-            );
+            )
+            .with_cause(PermissionDecisionCause::ProtectedResource);
         }
         if let Some(decision) = hook_decision {
             return self.apply_approval_policy(decision);
@@ -279,10 +302,10 @@ impl PolicyEngine {
         {
             return decision;
         }
-        self.apply_approval_policy(PermissionDecision::new(
-            PermissionDecisionOutcome::Ask,
-            REASON_NO_RULE,
-        ))
+        self.apply_approval_policy(
+            PermissionDecision::new(PermissionDecisionOutcome::Ask, REASON_NO_RULE)
+                .with_cause(PermissionDecisionCause::NoMatchingRule),
+        )
     }
 
     fn first_matching_rule(
@@ -305,6 +328,7 @@ impl PolicyEngine {
             ApprovalPolicy::Untrusted | ApprovalPolicy::OnRequest => decision,
             ApprovalPolicy::Never => PermissionDecision {
                 outcome: PermissionDecisionOutcome::Deny,
+                cause: PermissionDecisionCause::ApprovalPolicy,
                 reason: REASON_APPROVAL_POLICY_NEVER.to_string(),
                 rule_id: decision.rule_id,
                 scope: decision.scope,
