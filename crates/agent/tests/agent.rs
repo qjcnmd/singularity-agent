@@ -1070,6 +1070,18 @@ fn agent_loop_rechecks_context_budget_before_each_model_request() {
 #[test]
 fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
     let dir = tempfile::tempdir().expect("temp dir");
+    let canonical_cwd = std::fs::canonicalize(dir.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let required_argv = test_command("second-success");
+    let required_digest = command_scope_digest(
+        &required_argv,
+        &canonical_cwd,
+        5,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Denied,
+    );
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
@@ -1083,8 +1095,21 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
             "network_access": "denied"
         }),
     ));
+    let mut required_verification =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    required_verification.tool_calls.push(tool_call(
+        "call_2",
+        "builtin.command",
+        serde_json::json!({
+            "argv": required_argv,
+            "cwd": ".",
+            "timeout_seconds": 5,
+            "sandbox_mode": "workspace_write",
+            "network_access": "denied"
+        }),
+    ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let capabilities = ProviderProtocolContract {
         max_context_tokens: 1_200,
@@ -1093,25 +1118,36 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
     };
 
     let result = agent_loop_with_capabilities(
-        vec![command_response, final_response],
+        vec![command_response, required_verification, final_response],
         allow_read_execute_policy(),
         Arc::clone(&seen_requests),
         capabilities,
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(LargeOutputBackend))
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "run the command").with_max_turns(2));
+    .run(
+        &AgentLoopInput::new("thread_1", "turn_1", "run the command")
+            .with_max_turns(3)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                required_digest,
+                1,
+            )]),
+    );
 
     assert_eq!(result.status, AgentStatus::Completed);
     let context_trace = result.context_trace.as_ref().expect("context trace");
-    assert_eq!(context_trace.compaction_count, 1);
-    assert_eq!(context_trace.compacted_message_count, 1);
+    assert_eq!(context_trace.compaction_count, 2);
+    assert!(context_trace.compacted_message_count >= 1);
     assert!(
         context_trace.last_compaction_before_tokens > context_trace.last_compaction_after_tokens
     );
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert!(requests[1].messages.iter().any(|message| {
-        message.role == ModelRole::Developer && message.content.contains("agent_context_compaction")
+        message.role == ModelRole::Developer
+            && message.content.contains("agent_context_compaction")
+            && message
+                .content
+                .contains("Run every exact verification command")
     }));
     assert!(requests[1].messages.iter().any(|message| {
         message.role == ModelRole::Tool && message.content.contains("\"compacted\":true")

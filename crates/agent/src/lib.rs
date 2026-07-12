@@ -2094,6 +2094,7 @@ fn compacted_tool_result_message(
 
 fn compaction_summary(state: &AgentLoopState, compacted_message_count: u32) -> String {
     let verification = state.completion.summary();
+    let active_control_instructions = compaction_control_instructions(state);
     let plan = state.plan.as_ref().map(|plan| {
         let completed = plan
             .steps
@@ -2140,8 +2141,27 @@ fn compaction_summary(state: &AgentLoopState, compacted_message_count: u32) -> S
             "unresolved_failures": verification.unresolved_failures.into_iter().take(8).collect::<Vec<_>>(),
         },
         "recovery": &state.recovery_metrics,
+        "active_control_instructions": active_control_instructions,
     })
     .to_string()
+}
+
+fn compaction_control_instructions(state: &AgentLoopState) -> Vec<String> {
+    let mut instructions = Vec::new();
+    if !state.completion.allows_final() {
+        instructions.push(state.completion.feedback());
+    }
+    if state.plan.as_ref().is_some_and(|plan| !plan.is_completed()) {
+        instructions.push(PLAN_COMPLETION_REQUIRED.to_string());
+    }
+    if state
+        .last_repair_failure
+        .as_ref()
+        .is_some_and(|failure| failure.consecutive_count >= 2)
+    {
+        instructions.push(REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string());
+    }
+    instructions
 }
 
 pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> ContextBundle {
