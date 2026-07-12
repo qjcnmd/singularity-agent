@@ -34,7 +34,7 @@ use singularity_protocol::{
     TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
     TurnStartResult, TurnStatus,
 };
-use singularity_store::{CommittedTurnOutcome, SessionStore, StoreError};
+use singularity_store::{CommitTurnOutcomeParams, CommittedTurnOutcome, SessionStore, StoreError};
 use singularity_tools::{
     BUILTIN_COMMAND_TOOL as TOOL_COMMAND, BUILTIN_EDIT_TOOL as TOOL_EDIT,
     BUILTIN_GREP_TOOL as TOOL_GREP, BUILTIN_LIST_TOOL as TOOL_LIST,
@@ -908,11 +908,13 @@ impl AppServer {
         let event = agent_loop_trace(turn, run_status);
         self.store.commit_turn_outcome(
             &turn.turn_id,
-            turn_status_for_agent(&run_status.status),
-            run_status.status.as_str(),
-            assistant_delta.as_deref(),
-            plan.as_ref(),
-            &event,
+            CommitTurnOutcomeParams {
+                status: turn_status_for_agent(&run_status.status),
+                agent_loop_status: run_status.status.as_str(),
+                assistant_delta: assistant_delta.as_deref(),
+                plan: plan.as_ref(),
+                trace: &event,
+            },
         )
     }
 
@@ -936,11 +938,13 @@ impl AppServer {
             self.store
                 .commit_turn_outcome_and_resolve_pending_execution(
                     request_id,
-                    turn_status_for_agent(&status.status),
-                    status.status.as_str(),
-                    assistant_delta.as_deref(),
-                    plan.as_ref(),
-                    &event,
+                    CommitTurnOutcomeParams {
+                        status: turn_status_for_agent(&status.status),
+                        agent_loop_status: status.status.as_str(),
+                        assistant_delta: assistant_delta.as_deref(),
+                        plan: plan.as_ref(),
+                        trace: &event,
+                    },
                     effective_next_approvals,
                 )
         };

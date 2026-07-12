@@ -141,6 +141,14 @@ pub struct RegisterArtifactRefParams<'a> {
     pub metadata: Value,
 }
 
+pub struct CommitTurnOutcomeParams<'a> {
+    pub status: TurnStatus,
+    pub agent_loop_status: &'a str,
+    pub assistant_delta: Option<&'a str>,
+    pub plan: Option<&'a Value>,
+    pub trace: &'a TraceEvent,
+}
+
 impl SessionStore {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
@@ -466,23 +474,11 @@ impl SessionStore {
     pub fn commit_turn_outcome(
         &self,
         turn_id: &str,
-        status: TurnStatus,
-        agent_loop_status: &str,
-        assistant_delta: Option<&str>,
-        plan: Option<&Value>,
-        trace: &TraceEvent,
+        params: CommitTurnOutcomeParams<'_>,
     ) -> StoreResult<CommittedTurnOutcome> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let committed = self.commit_turn_outcome_in_transaction(
-            &transaction,
-            turn_id,
-            status,
-            agent_loop_status,
-            assistant_delta,
-            plan,
-            trace,
-        )?;
+        let committed = self.commit_turn_outcome_in_transaction(&transaction, turn_id, params)?;
         transaction.commit()?;
         Ok(committed)
     }
@@ -491,12 +487,15 @@ impl SessionStore {
         &self,
         transaction: &Transaction<'_>,
         turn_id: &str,
-        status: TurnStatus,
-        agent_loop_status: &str,
-        assistant_delta: Option<&str>,
-        plan: Option<&Value>,
-        trace: &TraceEvent,
+        params: CommitTurnOutcomeParams<'_>,
     ) -> StoreResult<CommittedTurnOutcome> {
+        let CommitTurnOutcomeParams {
+            status,
+            agent_loop_status,
+            assistant_delta,
+            plan,
+            trace,
+        } = params;
         let current = transaction
             .query_row(
                 "select turn_id, thread_id, status, agent_loop_status from turns where turn_id = ?1",
@@ -1123,17 +1122,13 @@ impl SessionStore {
     pub fn commit_turn_outcome_and_resolve_pending_execution(
         &self,
         request_id: &str,
-        status: TurnStatus,
-        agent_loop_status: &str,
-        assistant_delta: Option<&str>,
-        plan: Option<&Value>,
-        trace: &TraceEvent,
+        params: CommitTurnOutcomeParams<'_>,
         next_approvals: &[(ApprovalRequest, Value)],
     ) -> StoreResult<CommittedTurnOutcome> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if !next_approvals.is_empty()
-            && (status != TurnStatus::Blocked || agent_loop_status != "blocked")
+            && (params.status != TurnStatus::Blocked || params.agent_loop_status != "blocked")
         {
             return Err(StoreError::InvalidState(
                 "next approval handoff requires a blocked turn outcome".to_string(),
@@ -1151,15 +1146,8 @@ impl SessionStore {
                 )),
                 other => StoreError::Sqlite(other),
             })?;
-        let committed = self.commit_turn_outcome_in_transaction(
-            &transaction,
-            &bound_turn_id,
-            status,
-            agent_loop_status,
-            assistant_delta,
-            plan,
-            trace,
-        )?;
+        let committed =
+            self.commit_turn_outcome_in_transaction(&transaction, &bound_turn_id, params)?;
         let deleted = transaction.execute(
             "delete from pending_tool_calls where request_id = ?1 and execution_state = 'executing'",
             params![request_id],

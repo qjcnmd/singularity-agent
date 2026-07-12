@@ -2,7 +2,8 @@ use schemars::schema_for;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_protocol::{ItemKind, ThreadStatus, TraceEvent, TurnStatus};
 use singularity_store::{
-    ConversationRole, RegisterArtifactRefParams, SessionStore, SessionStoreDescriptor, StoreError,
+    CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
+    SessionStoreDescriptor, StoreError,
 };
 use std::sync::{Arc, Barrier};
 
@@ -650,17 +651,19 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
     assert!(matches!(
         store.commit_turn_outcome(
             &turn.turn_id,
-            TurnStatus::Completed,
-            "completed",
-            Some("too late"),
-            None,
-            &TraceEvent::new(
-                "trace_too_late",
-                &thread.thread_id,
-                &turn.turn_id,
-                "agent_loop",
-                "late completion",
-            ),
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Completed,
+                agent_loop_status: "completed",
+                assistant_delta: Some("too late"),
+                plan: None,
+                trace: &TraceEvent::new(
+                    "trace_too_late",
+                    &thread.thread_id,
+                    &turn.turn_id,
+                    "agent_loop",
+                    "late completion",
+                ),
+            },
         ),
         Err(StoreError::InvalidState(message))
             if message == "cancel-requested turn can only finalize as interrupted"
@@ -668,17 +671,19 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
     let interrupted = store
         .commit_turn_outcome(
             &turn.turn_id,
-            TurnStatus::Interrupted,
-            "cancelled",
-            None,
-            None,
-            &TraceEvent::new(
-                "trace_cancelled",
-                &thread.thread_id,
-                &turn.turn_id,
-                "agent_loop",
-                "turn cancelled",
-            ),
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Interrupted,
+                agent_loop_status: "cancelled",
+                assistant_delta: None,
+                plan: None,
+                trace: &TraceEvent::new(
+                    "trace_cancelled",
+                    &thread.thread_id,
+                    &turn.turn_id,
+                    "agent_loop",
+                    "turn cancelled",
+                ),
+            },
         )
         .expect("finalize cancellation");
     assert_eq!(interrupted.turn.status, TurnStatus::Interrupted);
@@ -1291,11 +1296,13 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
     assert!(matches!(
         store.commit_turn_outcome_and_resolve_pending_execution(
             &first.request_id,
-            TurnStatus::Interrupted,
-            "interrupted",
-            None,
-            None,
-            &trace,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Interrupted,
+                agent_loop_status: "interrupted",
+                assistant_delta: None,
+                plan: None,
+                trace: &trace,
+            },
             &[(next.clone(), checkpoint("approval_next", "call_2"))],
         ),
         Err(StoreError::InvalidState(message))
@@ -1314,11 +1321,13 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
     store
         .commit_turn_outcome_and_resolve_pending_execution(
             &first.request_id,
-            TurnStatus::Blocked,
-            "blocked",
-            None,
-            None,
-            &trace,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Blocked,
+                agent_loop_status: "blocked",
+                assistant_delta: None,
+                plan: None,
+                trace: &trace,
+            },
             &[(next.clone(), checkpoint("approval_next", "call_2"))],
         )
         .expect("atomic approval handoff");
@@ -1657,11 +1666,13 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
     let committed = store
         .commit_turn_outcome(
             &turn.turn_id,
-            TurnStatus::Completed,
-            "completed",
-            Some("assistant"),
-            Some(&plan),
-            &trace,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Completed,
+                agent_loop_status: "completed",
+                assistant_delta: Some("assistant"),
+                plan: Some(&plan),
+                trace: &trace,
+            },
         )
         .expect("commit terminal outcome");
 
@@ -1737,11 +1748,13 @@ fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
 
     let result = store.commit_turn_outcome(
         &turn.turn_id,
-        TurnStatus::Completed,
-        "completed",
-        Some("assistant"),
-        None,
-        &trace,
+        CommitTurnOutcomeParams {
+            status: TurnStatus::Completed,
+            agent_loop_status: "completed",
+            assistant_delta: Some("assistant"),
+            plan: None,
+            trace: &trace,
+        },
     );
 
     assert!(result.is_err());
