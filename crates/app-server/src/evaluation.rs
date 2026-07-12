@@ -1750,6 +1750,7 @@ mod tests {
             code: Some("provider_single_tool_call_contract_violated".to_string()),
             stage: Some(ProviderErrorStage::ResponseValidation),
             transport_category: None,
+            timeout_seconds: None,
             http_status: None,
             validation_errors: vec!["max_tool_calls_exceeded".to_string()],
         };
@@ -1798,6 +1799,7 @@ mod tests {
                     code: Some("provider_request_invalid".to_string()),
                     stage: Some(ProviderErrorStage::RequestSend),
                     transport_category: None,
+                    timeout_seconds: None,
                     http_status: None,
                     validation_errors: vec!["request_id_missing".to_string()],
                 }),
@@ -1813,6 +1815,7 @@ mod tests {
                 code: Some("provider_response_invalid".to_string()),
                 stage: Some(singularity_model::ProviderErrorStage::ResponseValidation),
                 transport_category: None,
+                timeout_seconds: Some(120),
                 http_status: None,
                 validation_errors: vec!["missing_tool_call_id".to_string()],
             }),
@@ -1820,6 +1823,7 @@ mod tests {
         };
         let serialized = serde_json::to_string(&diagnostics).expect("serialize diagnostics");
         assert!(serialized.contains("missing_tool_call_id"));
+        assert!(serialized.contains("\"timeout_seconds\":120"));
         assert!(!serialized.contains("Authorization"));
         assert!(!serialized.contains("raw_response"));
     }

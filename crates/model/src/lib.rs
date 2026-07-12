@@ -471,6 +471,8 @@ pub struct ModelError {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_category: Option<ProviderTransportCategory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validation_errors: Vec<String>,
@@ -481,6 +483,8 @@ pub struct ProviderDiagnostic {
     pub code: Option<String>,
     pub stage: Option<ProviderErrorStage>,
     pub transport_category: Option<ProviderTransportCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
     pub http_status: Option<u16>,
     pub validation_errors: Vec<String>,
 }
@@ -495,6 +499,7 @@ impl ModelError {
             code: None,
             stage: None,
             transport_category: None,
+            timeout_seconds: None,
             http_status: None,
             validation_errors: Vec::new(),
         }
@@ -529,6 +534,7 @@ impl ModelError {
             code: self.code.clone(),
             stage: self.stage.clone(),
             transport_category: self.transport_category.clone(),
+            timeout_seconds: self.timeout_seconds,
             http_status: self.http_status,
             validation_errors: self.validation_errors.clone(),
         }
@@ -1349,6 +1355,9 @@ fn provider_transport_error(
     let mut model_error =
         ModelError::new(kind, "provider transport failed").with_provider_diagnostic(code, stage);
     model_error.transport_category = Some(category);
+    if error.is_timeout() {
+        model_error.timeout_seconds = Some(PROVIDER_TIMEOUT_SECONDS);
+    }
     ProviderError::from_model_error(model_error)
 }
 

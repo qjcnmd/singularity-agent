@@ -1037,13 +1037,15 @@ fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes(
 
 #[test]
 fn model_error_serializes_redacted_boundary_fields() {
-    let failure = ModelError::new(ModelErrorKind::RateLimited, "Provider returned HTTP 429.")
+    let mut failure = ModelError::new(ModelErrorKind::Timeout, "provider transport failed")
         .with_provider("openai_compatible")
         .with_model("gpt-test");
+    failure.timeout_seconds = Some(120);
 
     let value = serde_json::to_value(&failure).expect("serialize provider failure");
 
-    assert_eq!(value["kind"], "rate_limited");
+    assert_eq!(value["kind"], "timeout");
+    assert_eq!(value["timeout_seconds"], 120);
     assert_eq!(value["provider_name"], "openai_compatible");
     assert_eq!(value["model_name"], "gpt-test");
     assert!(!value.to_string().contains("sk-"));
