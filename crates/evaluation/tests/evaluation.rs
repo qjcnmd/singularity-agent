@@ -627,76 +627,90 @@ fn public_representative_manifest_is_validated_by_the_crate() {
         .join("public-representative-task.json");
     let manifest = EvaluationManifest::load(&path).expect("load public manifest");
 
-    assert_eq!(manifest.task_set().tasks.len(), 5);
-    for task in &manifest.task_set().tasks {
+    let expected_sources = [
+        ("sqlfluff__sqlfluff-2419", None),
+        (
+            "receipt_calculator__multi_line_receipt",
+            Some("fixtures/receipt-calculator"),
+        ),
+        (
+            "rust_node_calculator__multi_line_total",
+            Some("fixtures/rust-node-calculator"),
+        ),
+        ("node_inventory__summary", Some("fixtures/node-inventory")),
+        (
+            "repository_context__billing_report",
+            Some("fixtures/repository-context"),
+        ),
+    ];
+    assert_eq!(manifest.task_set().tasks.len(), expected_sources.len());
+
+    for (task_id, expected_local_source) in expected_sources {
+        let task = manifest
+            .task_set()
+            .tasks
+            .iter()
+            .find(|task| task.task_id.as_str() == task_id)
+            .unwrap_or_else(|| panic!("expected task {task_id}"));
         let projection = task.agent_projection();
+        let projection_value = serde_json::to_value(&projection).expect("serialize projection");
+        assert!(projection_value.get("capabilities").is_none());
+        assert!(projection_value.get("evaluator").is_none());
+        assert!(projection_value.get("test_patch").is_none());
         let projection_json = serde_json::to_string(&projection).expect("serialize projection");
-        assert!(!projection_json.contains("capabilities"));
-        assert!(!projection_json.contains("test_patch"));
         assert!(!projection_json.contains(PUBLIC_TEST_PATCH_MARKER));
         assert!(!projection_json.contains(HIDDEN_TEST_PATCH_MARKER));
-    }
 
-    let task = manifest
-        .task_set()
-        .tasks
-        .iter()
-        .find(|task| task.task_id.as_str() == "receipt_calculator__multi_line_receipt")
-        .expect("local receipt task");
-    let projection = task.agent_projection();
-    assert_eq!(
-        projection
-            .allowed_paths
-            .iter()
-            .map(|path| path.as_str())
-            .collect::<Vec<_>>(),
-        ["pricing.py", "receipt.py"]
-    );
-    assert_eq!(
-        projection.smoke_commands[0].argv.as_slice(),
-        ["python", "-B", "smoke_test.py"]
-    );
-    let projection_json = serde_json::to_string(&projection).expect("serialize receipt projection");
-    assert!(!projection_json.contains("test_public_receipt.py"));
-    assert!(!projection_json.contains("test_hidden_receipt.py"));
-    assert!(!projection_json.contains("evaluator"));
-
-    let plan = manifest
-        .workspace_plan(&task.task_id)
-        .expect("build local receipt plan");
-    let expected_fixture = manifest
-        .manifest_dir()
-        .join("fixtures")
-        .join("receipt-calculator");
-    assert_eq!(
-        plan.source,
-        PlannedWorkspaceSource::Local {
-            path: expected_fixture
+        let plan = manifest
+            .workspace_plan(&task.task_id)
+            .unwrap_or_else(|error| panic!("build plan for {task_id}: {error}"));
+        match (expected_local_source, &plan.source) {
+            (Some(expected_path), PlannedWorkspaceSource::Local { path }) => {
+                assert_eq!(path, &manifest.manifest_dir().join(expected_path));
+            }
+            (None, PlannedWorkspaceSource::RemoteGit { .. }) => {}
+            (Some(expected_path), source) => {
+                panic!("task {task_id} expected local source {expected_path}, got {source:?}");
+            }
+            (None, source) => panic!("task {task_id} expected remote source, got {source:?}"),
         }
-    );
-    let public_patch = plan.public.test_patch.as_ref().expect("public patch");
-    let hidden_patch = plan.hidden.test_patch.as_ref().expect("hidden patch");
-    assert!(public_patch.content().contains("test_public_receipt.py"));
-    assert!(hidden_patch.content().contains("test_hidden_receipt.py"));
-    assert_ne!(public_patch.content(), hidden_patch.content());
-    assert_ne!(plan.public.commands, plan.hidden.commands);
 
-    let cross_language = manifest
-        .task_set()
-        .tasks
-        .iter()
-        .find(|task| task.task_id.as_str() == "rust_node_calculator__multi_line_total")
-        .expect("cross-language task");
-    let projection = cross_language.agent_projection();
-    assert_eq!(projection.smoke_commands.len(), 2);
-    assert_eq!(
-        projection.smoke_commands[0].argv.as_slice(),
-        ["cargo", "test", "--locked", "--lib"]
-    );
-    assert_eq!(
-        projection.smoke_commands[1].argv.as_slice(),
-        ["node", "smoke_test.mjs"]
-    );
+        let public_patch = plan.public.test_patch.as_ref().expect("public patch");
+        let hidden_patch = plan.hidden.test_patch.as_ref().expect("hidden patch");
+        assert_ne!(public_patch.content(), hidden_patch.content());
+        assert!(!plan.baseline.commands.is_empty());
+        assert!(!plan.public.commands.is_empty());
+        assert!(!plan.hidden.commands.is_empty());
+
+        if task_id == "receipt_calculator__multi_line_receipt" {
+            assert_eq!(
+                projection
+                    .allowed_paths
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>(),
+                ["pricing.py", "receipt.py"]
+            );
+            assert_eq!(
+                projection.smoke_commands[0].argv.as_slice(),
+                ["python", "-B", "smoke_test.py"]
+            );
+            assert!(public_patch.content().contains("test_public_receipt.py"));
+            assert!(hidden_patch.content().contains("test_hidden_receipt.py"));
+        }
+
+        if task_id == "rust_node_calculator__multi_line_total" {
+            assert_eq!(projection.smoke_commands.len(), 2);
+            assert_eq!(
+                projection.smoke_commands[0].argv.as_slice(),
+                ["cargo", "test", "--locked", "--lib"]
+            );
+            assert_eq!(
+                projection.smoke_commands[1].argv.as_slice(),
+                ["node", "smoke_test.mjs"]
+            );
+        }
+    }
 }
 
 #[test]

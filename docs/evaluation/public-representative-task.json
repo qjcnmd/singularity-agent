@@ -355,7 +355,7 @@
       "evaluator": {
         "public_test_patch": {
           "format": "unified_diff",
-          "content": "diff --git a/tests/public_inventory.mjs b/tests/public_inventory.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/public_inventory.mjs\n@@ -0,0 +1,13 @@\n+import assert from \"node:assert/strict\";\n+import { summarizeInventory } from \"../inventory.mjs\";\n+\n+const result = summarizeInventory([\n+  { sku: \"A-17\", unitPrice: 4.5, quantity: 2, reorderPoint: 3 },\n+  { sku: \"B-04\", unitPrice: 3, quantity: 5, reorderPoint: 4 },\n+]);\n+\n+assert.deepEqual(result, {\n+  totalUnits: 7,\n+  totalValue: 24,\n+  lowStockSkus: [\"A-17\"],\n+});\n"
+          "content": "diff --git a/tests/public_inventory.mjs b/tests/public_inventory.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/public_inventory.mjs\n@@ -0,0 +1,20 @@\n+import assert from \"node:assert/strict\";\n+import { inventoryLine } from \"../catalog.mjs\";\n+import { summarizeInventory } from \"../inventory.mjs\";\n+\n+assert.deepEqual(inventoryLine({\n+  sku: \"A-17\",\n+  unitPrice: 4.5,\n+  quantity: 2,\n+  reorderPoint: 3,\n+}), {\n+  sku: \"A-17\",\n+  units: 2,\n+  reorderPoint: 3,\n+  value: 9,\n+});\n+\n+const result = summarizeInventory([\n+  { sku: \"A-17\", unitPrice: 4.5, quantity: 2, reorderPoint: 3 },\n+  { sku: \"B-04\", unitPrice: 3, quantity: 5, reorderPoint: 4 },\n+]);\n+\n+assert.deepEqual(result, {\n+  totalUnits: 7,\n+  totalValue: 24,\n+  lowStockSkus: [\"A-17\"],\n+});\n"
         },
         "hidden_test_patch": {
           "format": "unified_diff",
