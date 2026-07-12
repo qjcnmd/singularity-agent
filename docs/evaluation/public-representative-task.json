@@ -1,9 +1,16 @@
 {
-  "schema_version": "evaluation.task_set/v3",
+  "schema_version": "evaluation.task_set/v4",
   "tasks": [
     {
       "task_id": "sqlfluff__sqlfluff-2419",
       "description": "Public SWE-bench Lite representative task for the SQLFluff L060 IFNULL/NVL diagnostic wording.",
+      "capabilities": [
+        "single_file_fix",
+        "python",
+        "repository_context",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
       "workspace": {
         "source": {
           "type": "remote_git",
@@ -129,6 +136,13 @@
     {
       "task_id": "receipt_calculator__multi_line_receipt",
       "description": "Small local Python representative task for multi-line decimal receipt totals.",
+      "capabilities": [
+        "multi_file_change",
+        "python",
+        "failure_diagnosis",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
       "workspace": {
         "source": {
           "type": "local",
@@ -227,6 +241,15 @@
     {
       "task_id": "rust_node_calculator__multi_line_total",
       "description": "Local cross-language task proving host Cargo and Node execution in the strict Windows sandbox.",
+      "capabilities": [
+        "multi_file_change",
+        "rust",
+        "node",
+        "mixed_stack",
+        "failure_diagnosis",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
       "workspace": {
         "source": {
           "type": "local",

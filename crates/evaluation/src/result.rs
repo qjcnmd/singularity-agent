@@ -3,14 +3,14 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EvaluationError, RESULT_SCHEMA_VERSION, Result, RunId, TaskId, require_schema_version,
-    validation_error,
+    CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS, EvaluationCapability, EvaluationError,
+    RESULT_SCHEMA_VERSION, Result, RunId, TaskId, require_schema_version, validation_error,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvaluationResultSchemaVersion {
-    #[serde(rename = "evaluation.result/v3")]
-    V3,
+    #[serde(rename = "evaluation.result/v4")]
+    V4,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,9 +20,75 @@ pub struct EvaluationEvidenceSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_digest: Option<String>,
     pub tool_calls: u32,
+    pub model_turns: u32,
+    pub approval_count: u32,
+    pub invalid_tool_call_count: u32,
+    pub repeated_tool_call_count: u32,
+    pub repair_attempt_count: u32,
+    pub completion_rejection_count: u32,
+    pub compaction_count: u32,
+    pub provider_attempt_count: u32,
+    pub provider_retry_count: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+    pub provider_latency_ms: u64,
+    pub agent_duration_ms: u64,
     pub smoke_command_satisfied: bool,
     pub strict_sandbox_command_count: u32,
     pub local_process_fallback_count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationRunSummary {
+    pub task_count: u32,
+    pub scored_task_count: u32,
+    pub agent_completed_count: u32,
+    pub tests_passed_count: u32,
+    pub evaluation_passed_count: u32,
+    pub blocked_count: u32,
+    pub task_success_rate_basis_points: u32,
+    pub meets_core_task_success_threshold: bool,
+}
+
+impl EvaluationRunSummary {
+    pub fn from_tasks(tasks: &[EvaluationTaskResult]) -> Self {
+        let task_count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
+        let agent_completed_count = count_tasks(tasks, |task| task.agent_completed);
+        let tests_passed_count = count_tasks(tasks, |task| task.tests_passed);
+        let evaluation_passed_count = count_tasks(tasks, |task| task.evaluation_passed);
+        let blocked_count = count_tasks(tasks, |task| task.status == EvaluationStatus::Blocked);
+        let scored_task_count = task_count.saturating_sub(blocked_count);
+        let task_success_rate_basis_points = if scored_task_count == 0 {
+            0
+        } else {
+            evaluation_passed_count
+                .saturating_mul(10_000)
+                .checked_div(scored_task_count)
+                .unwrap_or(0)
+        };
+        Self {
+            task_count,
+            scored_task_count,
+            agent_completed_count,
+            tests_passed_count,
+            evaluation_passed_count,
+            blocked_count,
+            task_success_rate_basis_points,
+            meets_core_task_success_threshold: task_success_rate_basis_points
+                >= CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS,
+        }
+    }
+}
+
+fn count_tasks(
+    tasks: &[EvaluationTaskResult],
+    predicate: impl Fn(&EvaluationTaskResult) -> bool,
+) -> u32 {
+    u32::try_from(tasks.iter().filter(|task| predicate(task)).count()).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +182,7 @@ impl EvaluationStageResults {
 #[serde(deny_unknown_fields)]
 pub struct EvaluationTaskResult {
     pub task_id: TaskId,
+    pub capabilities: Vec<EvaluationCapability>,
     pub status: EvaluationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<EvaluationBlocker>,
@@ -129,6 +196,19 @@ pub struct EvaluationTaskResult {
 impl EvaluationTaskResult {
     fn validate(&self) -> Result<()> {
         let context = format!("evaluation task {}", self.task_id);
+        if self.capabilities.is_empty()
+            || self
+                .capabilities
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.capabilities.len()
+        {
+            return Err(validation_error(format!(
+                "{context} capabilities must be non-empty and unique"
+            )));
+        }
         validate_evaluation_blocker(self.status, self.blocker.as_ref(), &context)?;
         self.stages.validate(&self.task_id)?;
         if self.agent_completed != (self.stages.agent.status == StageStatus::Passed) {
@@ -169,6 +249,11 @@ impl EvaluationTaskResult {
                 "{context} evaluation_passed requires patch, smoke, and strict sandbox evidence"
             )));
         }
+        if self.evidence.provider_retry_count > self.evidence.provider_attempt_count {
+            return Err(validation_error(format!(
+                "{context} provider_retry_count cannot exceed provider_attempt_count"
+            )));
+        }
         Ok(())
     }
 }
@@ -182,6 +267,7 @@ pub struct EvaluationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<EvaluationBlocker>,
     pub evaluation_passed: bool,
+    pub summary: EvaluationRunSummary,
     pub tasks: Vec<EvaluationTaskResult>,
 }
 
@@ -206,6 +292,12 @@ impl EvaluationResult {
             if !task_ids.insert(task.task_id.clone()) {
                 return Err(EvaluationError::DuplicateTaskId(task.task_id.clone()));
             }
+        }
+        let expected_summary = EvaluationRunSummary::from_tasks(&self.tasks);
+        if self.summary != expected_summary {
+            return Err(validation_error(
+                "evaluation run summary must match the task results",
+            ));
         }
         let all_tasks_passed = self.tasks.iter().all(|task| task.evaluation_passed);
         if self.evaluation_passed != all_tasks_passed {

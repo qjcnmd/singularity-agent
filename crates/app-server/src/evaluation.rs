@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -13,10 +14,10 @@ use singularity_agent::{
 use singularity_core::{contains_sensitive_text, load_project_instructions_from_cwd};
 use singularity_evaluation::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
-    EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationResult,
-    EvaluationResultSchemaVersion, EvaluationStageResults, EvaluationStatus, EvaluationTaskResult,
-    PatchFormat, PlannedWorkspaceSource, RunId, StageResult, StageStatus, TaskId,
-    VerificationStagePlan, WorkspacePlan,
+    EvaluationBlocker, EvaluationCapability, EvaluationEvidenceSummary, EvaluationManifest,
+    EvaluationResult, EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationStageResults,
+    EvaluationStatus, EvaluationTaskResult, PatchFormat, PlannedWorkspaceSource, RunId,
+    StageResult, StageStatus, TaskId, VerificationStagePlan, WorkspacePlan,
 };
 use singularity_model::{
     ModelErrorCategory, OpenAiProvider, ProviderConfigSnapshot, ProviderDiagnostic, ProviderError,
@@ -80,6 +81,8 @@ struct StageDiagnostics {
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct TaskDiagnostics {
+    #[serde(skip)]
+    capabilities: Vec<EvaluationCapability>,
     source_commands: Vec<CommandDiagnostic>,
     baseline: StageDiagnostics,
     agent: StageDiagnostics,
@@ -94,6 +97,20 @@ struct TaskDiagnostics {
     model_turns: u32,
     tool_calls: u32,
     approval_count: u32,
+    invalid_tool_call_count: u32,
+    repeated_tool_call_count: u32,
+    repair_attempt_count: u32,
+    completion_rejection_count: u32,
+    compaction_count: u32,
+    provider_attempt_count: u32,
+    provider_retry_count: u32,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_tokens: u64,
+    total_tokens: u64,
+    provider_latency_ms: u64,
+    agent_duration_ms: u64,
     local_process_fallback_count: usize,
     trace_path: Option<String>,
     error: Option<String>,
@@ -160,6 +177,7 @@ struct AgentStageExecution {
     model_turns: u32,
     tool_calls: u32,
     approval_count: u32,
+    agent_duration_ms: u64,
     audit_events: Vec<Value>,
     trace_path: Option<String>,
     error: Option<String>,
@@ -223,11 +241,12 @@ pub(crate) fn run_evaluation(
         EvaluationStatus::Failed
     };
     let result = EvaluationResult {
-        schema_version: EvaluationResultSchemaVersion::V3,
+        schema_version: EvaluationResultSchemaVersion::V4,
         run_id: run_id.clone(),
         status,
         blocker,
         evaluation_passed,
+        summary: EvaluationRunSummary::from_tasks(&tasks),
         tasks,
     };
     result
@@ -279,6 +298,7 @@ fn run_task(
 ) -> TaskExecution {
     let task_dir = run_dir.join(plan.task_id.as_str());
     let mut diagnostics = TaskDiagnostics {
+        capabilities: plan.capabilities.clone(),
         smoke_command_satisfied: plan.agent.projection.smoke_commands.is_empty(),
         ..TaskDiagnostics::default()
     };
@@ -386,6 +406,7 @@ fn run_task(
     diagnostics.model_turns = agent_execution.model_turns;
     diagnostics.tool_calls = agent_execution.tool_calls;
     diagnostics.approval_count = agent_execution.approval_count;
+    diagnostics.agent_duration_ms = agent_execution.agent_duration_ms;
     diagnostics.trace_path = agent_execution.trace_path.clone();
     diagnostics.error = agent_execution.error.clone();
     diagnostics.provider_diagnostic = agent_execution.provider_diagnostic.clone();
@@ -394,6 +415,17 @@ fn run_task(
         .iter()
         .filter(|event| event.get("local_process_fallback").and_then(Value::as_bool) == Some(true))
         .count();
+    diagnostics.invalid_tool_call_count = u32::try_from(
+        agent_execution
+            .audit_events
+            .iter()
+            .filter(|event| {
+                event.get("argument_validation").and_then(Value::as_str) == Some("failed")
+            })
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    diagnostics.provider_attempt_count = diagnostics.model_turns;
 
     let Some(agent_workspace) = agent_execution.workspace.as_deref() else {
         let public =
@@ -511,6 +543,7 @@ fn finish_task(
     };
     let result = EvaluationTaskResult {
         task_id: task_id.clone(),
+        capabilities: diagnostics.capabilities.clone(),
         status,
         blocker,
         stages,
@@ -522,6 +555,22 @@ fn finish_task(
                 .unwrap_or(u32::MAX),
             patch_digest: diagnostics.patch_digest.clone(),
             tool_calls: diagnostics.tool_calls,
+            model_turns: diagnostics.model_turns,
+            approval_count: diagnostics.approval_count,
+            invalid_tool_call_count: diagnostics.invalid_tool_call_count,
+            repeated_tool_call_count: diagnostics.repeated_tool_call_count,
+            repair_attempt_count: diagnostics.repair_attempt_count,
+            completion_rejection_count: diagnostics.completion_rejection_count,
+            compaction_count: diagnostics.compaction_count,
+            provider_attempt_count: diagnostics.provider_attempt_count,
+            provider_retry_count: diagnostics.provider_retry_count,
+            input_tokens: diagnostics.input_tokens,
+            output_tokens: diagnostics.output_tokens,
+            cached_input_tokens: diagnostics.cached_input_tokens,
+            reasoning_tokens: diagnostics.reasoning_tokens,
+            total_tokens: diagnostics.total_tokens,
+            provider_latency_ms: diagnostics.provider_latency_ms,
+            agent_duration_ms: diagnostics.agent_duration_ms,
             smoke_command_satisfied: diagnostics.smoke_command_satisfied,
             strict_sandbox_command_count: u32::try_from(strict_sandbox_command_count)
                 .unwrap_or(u32::MAX),
@@ -1009,6 +1058,7 @@ fn run_agent_stage(
     if let Some(instructions) = project_instructions {
         input = input.with_project_instructions(instructions.content);
     }
+    let agent_started = Instant::now();
     let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
         .with_workspace_tools(
             WorkspaceTools::new(agent_dir)
@@ -1016,6 +1066,7 @@ fn run_agent_stage(
                 .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated),
         )
         .run(&input);
+    let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let run_status = result.to_run_status();
     let trace_path = task_dir.join(AGENT_TRACE_FILE);
     let trace = json!({
@@ -1063,6 +1114,7 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
+                agent_duration_ms,
                 audit_events: run_status.audit_events,
                 trace_path: None,
                 error: Some(safe_text(error)),
@@ -1086,6 +1138,7 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
+                agent_duration_ms,
                 audit_events: run_status.audit_events,
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
@@ -1115,6 +1168,7 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
+                agent_duration_ms,
                 audit_events: run_status.audit_events,
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
@@ -1192,6 +1246,7 @@ fn run_agent_stage(
         model_turns: result.model_turns,
         tool_calls: result.tool_calls,
         approval_count: result.approval_count,
+        agent_duration_ms,
         audit_events: run_status.audit_events,
         trace_path: trace_path_string,
         error,
@@ -1215,6 +1270,7 @@ fn blocked_agent_stage(
         model_turns: 0,
         tool_calls: 0,
         approval_count: 0,
+        agent_duration_ms: 0,
         audit_events: Vec::new(),
         trace_path: None,
         error: Some(blocker.message),

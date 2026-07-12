@@ -581,10 +581,11 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v3",
+  "schema_version": "evaluation.task_set/v4",
   "tasks": [{
     "task_id": "fixture_agent",
     "description": "Exercise the AgentLoop evaluation transport.",
+    "capabilities": ["single_file_fix", "required_verification"],
     "workspace": {"source": {"type": "local", "path": "."}},
     "agent": {
       "instructions": "Change solution.txt so value is 1.",

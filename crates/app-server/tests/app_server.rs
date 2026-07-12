@@ -543,11 +543,12 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v3",
+  "schema_version": "evaluation.task_set/v4",
   "tasks": [
     {
       "task_id": "fixture_eval",
       "description": "Exercise a blocked typed evaluation task.",
+      "capabilities": ["provider_failure_attribution"],
       "workspace": {
         "source": {"type": "local", "path": "missing-source"}
       },
@@ -607,7 +608,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
-    assert_eq!(payload["schema_version"], "evaluation.result/v3");
+    assert_eq!(payload["schema_version"], "evaluation.result/v4");
     assert_eq!(payload["status"], "blocked");
     assert_eq!(
         payload["tasks"][0]["blocker"]["kind"],
@@ -630,11 +631,12 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v3",
+  "schema_version": "evaluation.task_set/v4",
   "tasks": [
     {
       "task_id": "fixture_eval",
       "description": "Exercise a blocked typed evaluation smoke command.",
+      "capabilities": ["required_verification"],
       "workspace": {
         "source": {"type": "local", "path": "missing-source"}
       },
@@ -699,11 +701,12 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v3",
+  "schema_version": "evaluation.task_set/v4",
   "tasks": [
     {
       "task_id": "fixture_eval",
       "description": "Exercise a blocked typed evaluation task.",
+      "capabilities": ["sandbox_enforcement"],
       "workspace": {
         "source": {"type": "local", "path": "missing-source"}
       },

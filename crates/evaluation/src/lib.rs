@@ -8,20 +8,21 @@ use std::path::PathBuf;
 
 pub use manifest::{
     AgentStagePlan, AgentTaskProjection, AgentTaskSpec, BaselineStagePlan, CommandExpectation,
-    CommandSpec, EvaluationManifest, EvaluationStage, EvaluationTask, EvaluationTaskSet,
-    EvaluatorSpec, EvaluatorStageSpec, EvaluatorTestPatch, PatchFormat, PlannedWorkspaceSource,
-    TaskSetSchemaVersion, VerificationStagePlan, WorkspacePlan, WorkspaceSeed, WorkspaceSource,
-    WorkspaceSpec,
+    CommandSpec, EvaluationCapability, EvaluationManifest, EvaluationStage, EvaluationTask,
+    EvaluationTaskSet, EvaluatorSpec, EvaluatorStageSpec, EvaluatorTestPatch, PatchFormat,
+    PlannedWorkspaceSource, TaskSetSchemaVersion, VerificationStagePlan, WorkspacePlan,
+    WorkspaceSeed, WorkspaceSource, WorkspaceSpec,
 };
 pub use result::{
     BlockerKind, EvaluationBlocker, EvaluationEvidenceSummary, EvaluationResult,
-    EvaluationResultSchemaVersion, EvaluationStageResults, EvaluationStatus, EvaluationTaskResult,
-    StageResult, StageStatus,
+    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationStageResults, EvaluationStatus,
+    EvaluationTaskResult, StageResult, StageStatus,
 };
 pub use value::{Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId, ToolName};
 
-pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v3";
-pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v3";
+pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v4";
+pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v4";
+pub const CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EvaluationError {

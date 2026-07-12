@@ -30,7 +30,7 @@ Singularity 是 Windows 本地命令行编码代理，由四个 release binary �
 | `model` | provider 配置快照、模型对象、OpenAI-compatible HTTP adapter | `ProviderConfigSnapshot`、`ModelTurnRequest`、`OpenAiProvider` |
 | `agent` | 上下文组装、模型/工具循环、approval checkpoint resume 和 completion gate | `AgentLoop`、`AgentLoopInput`、`AgentLoopResult` |
 | `store` | SQLite thread/turn/item/trace/approval/artifact ledger | `SessionStore`、`StartedTurn`、`CommittedTurnOutcome` |
-| `evaluation` | `evaluation.task_set/v3` manifest、计划和 `evaluation.result/v3` result 数据模型 | `EvaluationManifest`、`WorkspacePlan`、`EvaluationResult` |
+| `evaluation` | `evaluation.task_set/v4` manifest、计划和 `evaluation.result/v4` result 数据模型 | `EvaluationManifest`、`WorkspacePlan`、`EvaluationResult` |
 | `app-server` | 协议调度、runtime 装配、并发 turn、持久化和 evaluation 执行 | `AppServer` |
 | `cli` | 最终用户命令和 app-server 子进程客户端 | `Command`、`AppServerClient` |
 
@@ -251,7 +251,7 @@ store 在写入 item、trace 和 artifact reference 前执行敏感文本检查�
 
 ## 12. Evaluation
 
-`sg eval run` 发送 `eval/run`，app-server 读取 `evaluation.task_set/v3` manifest 并执行 AgentLoop runner：
+`sg eval run` 发送 `eval/run`，app-server 读取 `evaluation.task_set/v4` manifest 并执行 AgentLoop runner。每个 task 必须声明非空且不重复的 `capabilities`；这些标签只用于任务集覆盖审计、`WorkspacePlan` 和 result，不进入 `AgentTaskProjection` 或模型 payload：
 
 ```text
 prepare source
@@ -266,9 +266,9 @@ prepare source
 
 模型提交结构无效的 command arguments 时，AgentLoop 在 policy 与 executor 前返回稳定的参数原因码，并从已经发送给模型的 `oneOf`/`const` schema 投影有界的结构化 `content.validation_code`、`content.retry_inputs` 与 schema 提示；`retry_inputs[*].argv` 保持 JSON string array，runtime 不把错误的字符串 argv 自动转换为数组。普通 trace 只记录原因码和未执行状态，不记录 raw arguments 或完整 content。该反馈保持 repairable，但不改变 exact smoke command、scope digest 或最后一次 mutation 后验证的完成条件。
 
-`EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。`result.json` 的 v3 evidence 记录 workspace change 数、canonical patch digest、tool-call 数、exact smoke、strict sandbox command 数和 `local_process_fallback_count`；`report.json` 另外保存逐文件 before/after SHA-256、allowlist 判定、patch evidence 路径、命令诊断和 agent trace 路径。Evaluation 直接从内存中的 `AgentLoopResult` 生成 `agent-trace.json`，其中 `tool_outcomes` 仅投影 tool call/name、`ok`、错误码和截断标记，`audit_events` 保存脱敏 command scope、approval、sandbox enforcement 和 fallback 摘要。这些产物都不持久化完整 `ToolResult`，也不保存 prompt、raw response、raw arguments、content、preview、artifact refs 或 result id。
+`EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。`result.json` 的 v4 evidence 在 workspace change、canonical patch digest、exact smoke、strict sandbox 和零 local fallback 之外，稳定记录 model/tool/approval 回合数、无效与重复调用、repair、completion rejection、compaction、provider attempt/retry、token 和延迟诊断。`EvaluationRunSummary` 从 task result 重新计算，不能由调用方伪造；它同时给出 task、blocked、实际评分 task 和各级通过数。80% 代表任务成功率只对非 blocked task 计算，typed Provider、网络、环境或 sandbox blocker 不伪装成 Agent 失败；该诊断不改变逐任务或整次运行的 `evaluation_passed` 语义。`report.json` 另外保存逐文件 before/after SHA-256、allowlist 判定、patch evidence 路径、命令诊断和 agent trace 路径。Evaluation 直接从内存中的 `AgentLoopResult` 生成 `agent-trace.json`，其中 `tool_outcomes` 仅投影 tool call/name、`ok`、错误码和截断标记，`audit_events` 保存脱敏 command scope、approval、sandbox enforcement 和 fallback 摘要。这些产物都不持久化完整 `ToolResult`，也不保存 prompt、raw response、raw arguments、content、preview、artifact refs 或 result id。
 
-默认产物目录为 `work/evaluations/<run-id>`；`result.json` 是稳定 v3 result，`report.json` 是诊断报告。任一产物原子发布失败时删除不完整 run 目录。
+默认产物目录为 `work/evaluations/<run-id>`；`result.json` 是稳定 v4 result，`report.json` 是诊断报告。任一产物原子发布失败时删除不完整 run 目录。
 
 ## 13. 失败与安全不变量
 

@@ -12,11 +12,12 @@ const HIDDEN_TEST_PATCH_MARKER: &str = "HIDDEN_EVALUATOR_ONLY_PATCH_MARKER";
 
 fn valid_manifest() -> Value {
     json!({
-        "schema_version": "evaluation.task_set/v3",
+        "schema_version": "evaluation.task_set/v4",
         "tasks": [
             {
                 "task_id": "sqlfluff__sqlfluff-2419",
                 "description": "Fix the public representative SQLFluff task.",
+                "capabilities": ["single_file_fix", "python", "required_verification"],
                 "workspace": {
                     "source": {
                         "type": "remote_git",
@@ -96,13 +97,24 @@ fn valid_manifest() -> Value {
 
 fn valid_result() -> Value {
     json!({
-        "schema_version": "evaluation.result/v3",
+        "schema_version": "evaluation.result/v4",
         "run_id": "public-representative-20260710",
         "status": "completed",
         "evaluation_passed": false,
+        "summary": {
+            "task_count": 1,
+            "scored_task_count": 1,
+            "agent_completed_count": 1,
+            "tests_passed_count": 0,
+            "evaluation_passed_count": 0,
+            "blocked_count": 0,
+            "task_success_rate_basis_points": 0,
+            "meets_core_task_success_threshold": false
+        },
         "tasks": [
             {
                 "task_id": "sqlfluff__sqlfluff-2419",
+                "capabilities": ["single_file_fix", "python", "required_verification"],
                 "status": "completed",
                 "stages": {
                     "baseline": {"status": "passed"},
@@ -117,6 +129,22 @@ fn valid_result() -> Value {
                     "workspace_change_count": 1,
                     "patch_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "tool_calls": 2,
+                    "model_turns": 2,
+                    "approval_count": 0,
+                    "invalid_tool_call_count": 0,
+                    "repeated_tool_call_count": 0,
+                    "repair_attempt_count": 0,
+                    "completion_rejection_count": 0,
+                    "compaction_count": 0,
+                    "provider_attempt_count": 2,
+                    "provider_retry_count": 0,
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cached_input_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "total_tokens": 120,
+                    "provider_latency_ms": 500,
+                    "agent_duration_ms": 700,
                     "smoke_command_satisfied": true,
                     "strict_sandbox_command_count": 3,
                     "local_process_fallback_count": 0
@@ -569,6 +597,9 @@ fn blocked_status_requires_a_typed_blocker() {
         "message": "restricted-token sandbox is unavailable"
     });
     blocked["tasks"][0]["agent_completed"] = json!(false);
+    blocked["summary"]["scored_task_count"] = json!(0);
+    blocked["summary"]["agent_completed_count"] = json!(0);
+    blocked["summary"]["blocked_count"] = json!(1);
 
     parse_result(&blocked).expect("typed blocker is valid");
 
@@ -659,6 +690,51 @@ fn public_representative_manifest_is_validated_by_the_crate() {
         projection.smoke_commands[1].argv.as_slice(),
         ["node", "smoke_test.mjs"]
     );
+}
+
+#[test]
+fn run_summary_reports_success_rate_without_weakening_evaluation_passed() {
+    let result = parse_result(&valid_result()).expect("parse result");
+
+    assert_eq!(result.summary.task_count, 1);
+    assert_eq!(result.summary.scored_task_count, 1);
+    assert_eq!(result.summary.agent_completed_count, 1);
+    assert_eq!(result.summary.tests_passed_count, 0);
+    assert_eq!(result.summary.evaluation_passed_count, 0);
+    assert_eq!(result.summary.task_success_rate_basis_points, 0);
+    assert!(!result.summary.meets_core_task_success_threshold);
+    assert!(!result.evaluation_passed);
+
+    let mut forged = valid_result();
+    forged["summary"]["task_success_rate_basis_points"] = json!(10_000);
+    forged["summary"]["meets_core_task_success_threshold"] = json!(true);
+    let error = parse_result(&forged).expect_err("summary must be derived from task results");
+    assert!(error.to_string().contains("summary"));
+}
+
+#[test]
+fn task_capabilities_are_required_unique_and_evaluator_owned() {
+    let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
+    assert!(
+        manifest.task_set().tasks[0]
+            .capabilities
+            .contains(&singularity_evaluation::EvaluationCapability::RequiredVerification)
+    );
+    let projection = serde_json::to_value(manifest.task_set().tasks[0].agent_projection())
+        .expect("serialize projection");
+    assert!(projection.get("capabilities").is_none());
+
+    let mut missing = valid_manifest();
+    missing["tasks"][0]
+        .as_object_mut()
+        .expect("task object")
+        .remove("capabilities");
+    assert!(parse_manifest(&missing).is_err());
+
+    let mut duplicate = valid_manifest();
+    duplicate["tasks"][0]["capabilities"] = json!(["python", "python"]);
+    let error = parse_manifest(&duplicate).expect_err("duplicate capabilities fail closed");
+    assert!(error.to_string().contains("duplicates"));
 }
 
 #[test]

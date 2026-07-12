@@ -15,8 +15,28 @@ const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskSetSchemaVersion {
-    #[serde(rename = "evaluation.task_set/v3")]
-    V3,
+    #[serde(rename = "evaluation.task_set/v4")]
+    V4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationCapability {
+    SingleFileFix,
+    MultiFileChange,
+    Rust,
+    Python,
+    Node,
+    MixedStack,
+    FeatureImplementation,
+    FailureDiagnosis,
+    ToolCallRecovery,
+    RepositoryContext,
+    ApprovalResume,
+    InterruptionResume,
+    RequiredVerification,
+    ProviderFailureAttribution,
+    SandboxEnforcement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +69,7 @@ impl EvaluationTaskSet {
 pub struct EvaluationTask {
     pub task_id: TaskId,
     pub description: String,
+    pub capabilities: Vec<EvaluationCapability>,
     pub workspace: WorkspaceSpec,
     pub agent: AgentTaskSpec,
     pub evaluator: EvaluatorSpec,
@@ -62,6 +83,7 @@ impl EvaluationTask {
                 self.task_id
             )));
         }
+        validate_nonempty_unique(&self.task_id, "capabilities", &self.capabilities)?;
         self.workspace.validate(&self.task_id)?;
         self.agent.validate(&self.task_id)?;
         self.evaluator.validate(&self.task_id)
@@ -107,6 +129,7 @@ impl EvaluationTask {
         let public_test_patch = self.evaluator.public_test_patch.clone();
         Ok(WorkspacePlan {
             task_id: self.task_id.clone(),
+            capabilities: self.capabilities.clone(),
             source,
             baseline: BaselineStagePlan {
                 stage: EvaluationStage::Baseline,
@@ -425,6 +448,7 @@ pub enum PlannedWorkspaceSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspacePlan {
     pub task_id: TaskId,
+    pub capabilities: Vec<EvaluationCapability>,
     pub source: PlannedWorkspaceSource,
     pub baseline: BaselineStagePlan,
     pub agent: AgentStagePlan,
