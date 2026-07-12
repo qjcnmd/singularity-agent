@@ -4,14 +4,14 @@ use singularity_model::{
     ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
     ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
     ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
-    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
-    ProviderProtocolContract, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
-    classify_model_error, resolve_provider_config, validate_model_request,
-    validate_model_request_with_capabilities, validate_model_response,
+    ProviderAttemptMetadata, ProviderConfigSnapshot, ProviderConfigSource,
+    ProviderConfigurationStatus, ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode,
+    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, resolve_provider_config,
+    validate_model_request, validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
     Mutex,
@@ -137,6 +137,57 @@ fn captured_request_server(
         .expect("write provider response");
     });
     (format!("http://{addr}"), rx)
+}
+
+fn sequence_response_server(
+    responses: Vec<(&'static str, &'static str)>,
+) -> (String, Receiver<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind sequence provider");
+    let addr = listener.local_addr().expect("sequence provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for (attempt, (status_line, body)) in responses.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().expect("accept sequence provider request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            consume_provider_request(&mut reader);
+            tx.send(attempt + 1).expect("send provider attempt");
+            write!(
+                stream,
+                "{status_line}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write sequence provider response");
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn consume_provider_request(reader: &mut BufReader<TcpStream>) {
+    let mut first_line = String::new();
+    reader
+        .read_line(&mut first_line)
+        .expect("read request line");
+    let mut headers = String::new();
+    let mut content_length = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read request header");
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().unwrap_or(0);
+        }
+        headers.push_str(&line);
+    }
+    assert!(first_line.contains("/v1/chat/completions"));
+    assert!(headers.contains("authorization: Bearer sk-secret-value"));
+    let mut request_body = vec![0; content_length];
+    reader
+        .read_exact(&mut request_body)
+        .expect("read request body");
 }
 
 #[test]
@@ -302,6 +353,12 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
         decode_error.error.stage,
         Some(ProviderErrorStage::ResponseJsonDecode)
     );
+    let decode_metadata = decode_error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("decode attempt metadata");
+    assert_eq!(decode_metadata.attempt_count, 1);
+    assert_eq!(decode_metadata.retry_count, 0);
 
     let missing_choices_url = single_response_server("HTTP/1.1 200 OK", r#"{"id":"response_1"}"#);
     let missing_choices = OpenAiProvider::new(provider_test_config(missing_choices_url))
@@ -659,6 +716,129 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
 }
 
 #[test]
+fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
+    let success_body = r#"{
+        "id": "resp_retry",
+        "choices": [{
+            "message": {"role": "assistant", "content": "done"},
+            "finish_reason": "stop"
+        }]
+    }"#;
+    let (base_url, attempts) = sequence_response_server(vec![
+        ("HTTP/1.1 429 Too Many Requests", "{}"),
+        ("HTTP/1.1 503 Service Unavailable", "{}"),
+        ("HTTP/1.1 200 OK", success_body),
+    ]);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_retry",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("provider response after bounded retries");
+    let metadata = response
+        .provider_attempt_metadata
+        .expect("attempt metadata");
+
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(metadata.attempt_count, 3);
+    assert_eq!(metadata.retry_count, 2);
+    assert!(metadata.latency_ms >= 100);
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+}
+
+#[test]
+fn openai_provider_retries_transport_failures_only_to_the_attempt_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused provider address");
+    let address = listener.local_addr().expect("unused provider address");
+    drop(listener);
+    let provider =
+        OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_transport_retry",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect_err("transport failure");
+    let metadata = error.provider_attempt_metadata.expect("attempt metadata");
+
+    assert_eq!(error.error.kind, ModelErrorKind::NetworkError);
+    assert_eq!(error.error.stage, Some(ProviderErrorStage::RequestSend));
+    assert_eq!(metadata.attempt_count, 3);
+    assert_eq!(metadata.retry_count, 2);
+    assert!(metadata.latency_ms >= 100);
+}
+
+#[test]
+fn openai_provider_cancels_during_retry_backoff() {
+    let (base_url, attempts) =
+        sequence_response_server(vec![("HTTP/1.1 429 Too Many Requests", "{}")]);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_retry_cancel",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let cancellation = singularity_core::CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        result_tx
+            .send(provider.complete(&request, &worker_cancellation))
+            .expect("send provider result");
+    });
+
+    assert_eq!(attempts.recv_timeout(Duration::from_secs(1)), Ok(1));
+    cancellation.cancel();
+    let error = result_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("provider cancellation during backoff was bounded")
+        .expect_err("provider request cancelled");
+    let metadata = error.provider_attempt_metadata.expect("attempt metadata");
+
+    assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 1);
+}
+
+#[test]
+fn openai_provider_rejects_multiple_choices_without_retrying_or_selecting_one() {
+    let body = r#"{
+        "id": "resp_multiple_choices",
+        "choices": [
+            {"message": {"role": "assistant", "content": "first"}},
+            {"message": {"role": "assistant", "content": "second"}}
+        ]
+    }"#;
+    let base_url = single_response_server("HTTP/1.1 200 OK", body);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_multiple_choices",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+
+    let error = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect_err("multiple choices must be rejected");
+    let metadata = error.provider_attempt_metadata.expect("attempt metadata");
+
+    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert_eq!(
+        error.error.validation_errors,
+        vec!["response_choices_count_invalid"]
+    );
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
+}
+
+#[test]
 fn openai_provider_cancels_an_inflight_http_request() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging provider");
     let address = listener.local_addr().expect("provider address");
@@ -896,6 +1076,12 @@ fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
     assert_eq!(error.error.kind, ModelErrorKind::AuthError);
     assert_eq!(error.error.category(), ModelErrorCategory::Authentication);
     assert!(error.error.message.contains("HTTP 401"));
+    let metadata = error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("auth attempt metadata");
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
     assert!(!serialized.contains("bad key"));
     assert!(!serialized.contains("sk-secret-value"));
 }
@@ -919,10 +1105,14 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
             ModelErrorCategory::ProviderUnavailable,
         ),
     ] {
-        let base_url = single_response_server(
-            status_line,
-            r#"{"error":{"message":"provider body must not leak"}}"#,
-        );
+        let body = r#"{"error":{"message":"provider body must not leak"}}"#;
+        let responses =
+            if status_line.starts_with("HTTP/1.1 4") && !status_line.starts_with("HTTP/1.1 429") {
+                vec![(status_line, body)]
+            } else {
+                vec![(status_line, body); 3]
+            };
+        let (base_url, attempts) = sequence_response_server(responses);
         let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
         let request = ModelTurnRequest::new(
             "request_1",
@@ -936,7 +1126,19 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
 
         assert_eq!(error.error.kind, expected_kind);
         assert_eq!(error.error.category(), expected_category);
+        let metadata = error
+            .provider_attempt_metadata
+            .as_ref()
+            .expect("http attempt metadata");
+        if status_line.starts_with("HTTP/1.1 429") || status_line.starts_with("HTTP/1.1 5") {
+            assert_eq!(metadata.attempt_count, 3);
+            assert_eq!(metadata.retry_count, 2);
+        } else {
+            assert_eq!(metadata.attempt_count, 1);
+            assert_eq!(metadata.retry_count, 0);
+        }
         assert!(!serialized.contains("provider body must not leak"));
+        assert!(attempts.try_iter().count() >= 1);
     }
 }
 
@@ -1154,16 +1356,24 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
     let model_error = ModelError::new(ModelErrorKind::Timeout, "provider timed out")
         .with_provider("openai_compatible")
         .with_model("gpt-test");
+    let attempt_metadata = ProviderAttemptMetadata {
+        attempt_count: 3,
+        retry_count: 2,
+        latency_ms: 150,
+    };
     let restored_schema: ModelToolSchema =
         serde_json::from_value(serde_json::to_value(&tool_schema).unwrap()).unwrap();
     let restored_config: ModelProviderConfig =
         serde_json::from_value(serde_json::to_value(&provider_config).unwrap()).unwrap();
     let restored_error: ModelError =
         serde_json::from_value(serde_json::to_value(&model_error).unwrap()).unwrap();
+    let restored_attempt_metadata: ProviderAttemptMetadata =
+        serde_json::from_value(serde_json::to_value(&attempt_metadata).unwrap()).unwrap();
 
     assert_eq!(restored_schema, tool_schema);
     assert_eq!(restored_config, provider_config);
     assert_eq!(restored_error, model_error);
+    assert_eq!(restored_attempt_metadata, attempt_metadata);
     assert_eq!(schema_title::<ModelToolSchema>(), "ModelToolSchema");
     assert_eq!(schema_title::<ModelToolCall>(), "ModelToolCall");
     assert_eq!(
@@ -1172,6 +1382,10 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
     );
     assert_eq!(schema_title::<ModelProviderConfig>(), "ModelProviderConfig");
     assert_eq!(schema_title::<ModelUsage>(), "ModelUsage");
+    assert_eq!(
+        schema_title::<ProviderAttemptMetadata>(),
+        "ProviderAttemptMetadata"
+    );
     assert_eq!(schema_title::<ModelTurnRequest>(), "ModelTurnRequest");
     assert_eq!(schema_title::<ModelTurnResponse>(), "ModelTurnResponse");
 }

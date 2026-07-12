@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,8 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
+const MAX_PROVIDER_ATTEMPTS: u32 = 3;
+const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
@@ -587,6 +589,8 @@ pub struct ModelTurnResponse {
     pub error: Option<ModelError>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
 }
 
 impl ModelTurnResponse {
@@ -607,6 +611,24 @@ impl ModelTurnResponse {
             error: None,
             provider_name: None,
             model_name: None,
+            provider_attempt_metadata: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderAttemptMetadata {
+    pub attempt_count: u32,
+    pub retry_count: u32,
+    pub latency_ms: u64,
+}
+
+impl ProviderAttemptMetadata {
+    fn zero() -> Self {
+        Self {
+            attempt_count: 0,
+            retry_count: 0,
+            latency_ms: 0,
         }
     }
 }
@@ -792,7 +814,8 @@ impl Provider for OpenAiProvider {
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError> {
         if cancellation.is_cancelled() {
-            return Err(provider_cancelled_error());
+            return Err(provider_cancelled_error()
+                .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
         let capabilities = self.protocol_contract();
         let request_validation =
@@ -809,47 +832,141 @@ impl Provider for OpenAiProvider {
             .with_model(self.config.model_name.clone())
             .with_provider_diagnostic("provider_request_invalid", ProviderErrorStage::RequestSend);
             error.validation_errors = request_validation.errors;
-            return Err(ProviderError::from_model_error(error));
+            return Err(ProviderError::from_model_error(error)
+                .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(provider_runtime_error)?;
-        let response = block_on_provider_future(
-            &runtime,
-            cancellation,
-            "provider_request_send_failed",
-            ProviderErrorStage::RequestSend,
-            self.request_timeout_seconds,
-            || {
-                self.client
-                    .post(self.config.endpoint())
-                    .bearer_auth(&self.config.api_key)
-                    .json(&openai_request_payload(request, &self.config.model_name))
-                    .send()
-            },
-        )?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ProviderError::from_model_error(
-                model_error_from_http_status(
+        let started_at = Instant::now();
+        let mut metadata = ProviderAttemptMetadata::zero();
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(provider_cancelled_error().with_provider_attempt_metadata(
+                    provider_attempt_metadata(&metadata, started_at),
+                ));
+            }
+            metadata.attempt_count += 1;
+            let response =
+                match block_on_provider_future(
+                    &runtime,
+                    cancellation,
+                    "provider_request_send_failed",
+                    ProviderErrorStage::RequestSend,
+                    self.request_timeout_seconds,
+                    || {
+                        self.client
+                            .post(self.config.endpoint())
+                            .bearer_auth(&self.config.api_key)
+                            .json(&openai_request_payload(request, &self.config.model_name))
+                            .send()
+                    },
+                ) {
+                    Ok(response) => response,
+                    Err(error)
+                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                            && provider_error_is_retryable(&error) =>
+                    {
+                        metadata.retry_count += 1;
+                        wait_provider_backoff(
+                            &runtime,
+                            cancellation,
+                            provider_retry_backoff(metadata.retry_count),
+                        )
+                        .map_err(|cancelled| {
+                            cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
+                                &metadata, started_at,
+                            ))
+                        })?;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error.with_provider_attempt_metadata(
+                            provider_attempt_metadata(&metadata, started_at),
+                        ));
+                    }
+                };
+            let status = response.status();
+            if !status.is_success() {
+                let error = ProviderError::from_model_error(model_error_from_http_status(
                     status.as_u16(),
                     &self.config.provider_name,
                     &self.config.model_name,
-                ),
-            ));
+                ));
+                if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                    && http_status_is_retryable(status.as_u16())
+                {
+                    metadata.retry_count += 1;
+                    wait_provider_backoff(
+                        &runtime,
+                        cancellation,
+                        provider_retry_backoff(metadata.retry_count),
+                    )
+                    .map_err(|cancelled| {
+                        cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
+                            &metadata, started_at,
+                        ))
+                    })?;
+                    continue;
+                }
+                return Err(
+                    error.with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    )),
+                );
+            }
+            let body =
+                match block_on_provider_future(
+                    &runtime,
+                    cancellation,
+                    "provider_response_body_read_failed",
+                    ProviderErrorStage::ResponseBodyRead,
+                    self.request_timeout_seconds,
+                    || response.bytes(),
+                ) {
+                    Ok(body) => body,
+                    Err(error)
+                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                            && provider_error_is_retryable(&error) =>
+                    {
+                        metadata.retry_count += 1;
+                        wait_provider_backoff(
+                            &runtime,
+                            cancellation,
+                            provider_retry_backoff(metadata.retry_count),
+                        )
+                        .map_err(|cancelled| {
+                            cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
+                                &metadata, started_at,
+                            ))
+                        })?;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error.with_provider_attempt_metadata(
+                            provider_attempt_metadata(&metadata, started_at),
+                        ));
+                    }
+                };
+            let payload = serde_json::from_slice::<Value>(&body).map_err(|_| {
+                ProviderError::from_model_error(provider_response_json_error())
+                    .with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    ))
+            })?;
+            return parse_openai_response(request, &self.config, payload)
+                .map(|mut response| {
+                    response.provider_attempt_metadata =
+                        Some(provider_attempt_metadata(&metadata, started_at));
+                    response
+                })
+                .map_err(|error| {
+                    error.with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    ))
+                });
         }
-        let body = block_on_provider_future(
-            &runtime,
-            cancellation,
-            "provider_response_body_read_failed",
-            ProviderErrorStage::ResponseBodyRead,
-            self.request_timeout_seconds,
-            || response.bytes(),
-        )?;
-        let payload = serde_json::from_slice::<Value>(&body)
-            .map_err(|_| ProviderError::from_model_error(provider_response_json_error()))?;
-        parse_openai_response(request, &self.config, payload)
     }
 }
 
@@ -858,6 +975,7 @@ impl Provider for OpenAiProvider {
 pub struct ProviderError {
     pub message: String,
     pub error: Box<ModelError>,
+    pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
 }
 
 impl ProviderError {
@@ -865,7 +983,13 @@ impl ProviderError {
         Self {
             message: error.message.clone(),
             error: Box::new(error),
+            provider_attempt_metadata: None,
         }
+    }
+
+    pub fn with_provider_attempt_metadata(mut self, metadata: ProviderAttemptMetadata) -> Self {
+        self.provider_attempt_metadata = Some(metadata);
+        self
     }
 }
 
@@ -884,6 +1008,7 @@ pub fn provider_error_response(
     request: &ModelTurnRequest,
     error: ProviderError,
 ) -> ModelTurnResponse {
+    let provider_attempt_metadata = error.provider_attempt_metadata.clone();
     ModelTurnResponse {
         request_id: request.request_id.clone(),
         response_id: format!("{}_provider_error", request.request_id),
@@ -896,6 +1021,7 @@ pub fn provider_error_response(
         error: Some(*error.error),
         provider_name: None,
         model_name: request.model_preferences.model_name.clone(),
+        provider_attempt_metadata,
     }
 }
 
@@ -1040,6 +1166,22 @@ fn openai_wire_tool_name(name: &str) -> String {
     }
 }
 
+fn provider_response_validation_error(
+    config: &OpenAiProviderConfig,
+    message: &str,
+    validation_errors: Vec<String>,
+) -> ProviderError {
+    let mut error = ModelError::new(ModelErrorKind::JsonSchemaViolation, message)
+        .with_provider(config.provider_name.clone())
+        .with_model(config.model_name.clone())
+        .with_provider_diagnostic(
+            "provider_response_invalid",
+            ProviderErrorStage::ResponseValidation,
+        );
+    error.validation_errors = validation_errors;
+    ProviderError::from_model_error(error)
+}
+
 fn parse_openai_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
@@ -1050,24 +1192,31 @@ fn parse_openai_response(
         .and_then(Value::as_str)
         .unwrap_or("response")
         .to_string();
-    let choice = payload
+    let choices = payload
         .get("choices")
         .and_then(Value::as_array)
-        .and_then(|choices| choices.first())
         .ok_or_else(|| {
-            let mut error = ModelError::new(
-                ModelErrorKind::JsonSchemaViolation,
+            provider_response_validation_error(
+                config,
                 "provider response missing choices",
+                vec!["response_choices_missing".to_string()],
             )
-            .with_provider(config.provider_name.clone())
-            .with_model(config.model_name.clone())
-            .with_provider_diagnostic(
-                "provider_response_invalid",
-                ProviderErrorStage::ResponseValidation,
-            );
-            error.validation_errors = vec!["response_choices_missing".to_string()];
-            ProviderError::from_model_error(error)
         })?;
+    if choices.is_empty() {
+        return Err(provider_response_validation_error(
+            config,
+            "provider response missing choices",
+            vec!["response_choices_missing".to_string()],
+        ));
+    }
+    if choices.len() != 1 {
+        return Err(provider_response_validation_error(
+            config,
+            "provider response must contain exactly one choice",
+            vec!["response_choices_count_invalid".to_string()],
+        ));
+    }
+    let choice = &choices[0];
     let message = choice.get("message").unwrap_or(&Value::Null);
     let content = parse_openai_content(message.get("content"));
     let tool_calls = parse_openai_tool_calls(request, message);
@@ -1091,6 +1240,7 @@ fn parse_openai_response(
         error: None,
         provider_name: Some(config.provider_name.clone()),
         model_name: Some(config.model_name.clone()),
+        provider_attempt_metadata: None,
     };
     let allowed_tool_names = request
         .tools
@@ -1403,6 +1553,58 @@ fn provider_cancelled_error() -> ProviderError {
         ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled")
             .with_provider_diagnostic("provider_request_cancelled", ProviderErrorStage::Cancelled),
     )
+}
+
+fn provider_attempt_metadata(
+    metadata: &ProviderAttemptMetadata,
+    started_at: Instant,
+) -> ProviderAttemptMetadata {
+    ProviderAttemptMetadata {
+        attempt_count: metadata.attempt_count,
+        retry_count: metadata.retry_count,
+        latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+fn provider_error_is_retryable(error: &ProviderError) -> bool {
+    matches!(
+        error.error.kind,
+        ModelErrorKind::NetworkError | ModelErrorKind::Timeout
+    ) && !matches!(
+        error.error.transport_category,
+        Some(ProviderTransportCategory::Request)
+    )
+}
+
+fn http_status_is_retryable(status: u16) -> bool {
+    status == HTTP_STATUS_RATE_LIMITED || status >= HTTP_STATUS_INTERNAL_SERVER_ERROR
+}
+
+fn provider_retry_backoff(retry_count: u32) -> Duration {
+    let shift = retry_count.saturating_sub(1).min(10);
+    let multiplier = 1_u64 << shift;
+    Duration::from_millis(PROVIDER_RETRY_BASE_BACKOFF_MS.saturating_mul(multiplier))
+}
+
+fn wait_provider_backoff(
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &CancellationToken,
+    duration: Duration,
+) -> Result<(), ProviderError> {
+    let deadline = Instant::now() + duration;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let poll = remaining.min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
+        runtime.block_on(async {
+            tokio::time::sleep(poll).await;
+        });
+    }
 }
 
 fn block_on_provider_future<C, F, T>(
@@ -1918,10 +2120,14 @@ mod transport_tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging provider");
         let address = listener.local_addr().expect("provider address");
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept provider request");
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read request line");
+            let mut streams = Vec::new();
+            for _ in 0..MAX_PROVIDER_ATTEMPTS {
+                let (stream, _) = listener.accept().expect("accept provider request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request line");
+                streams.push(stream);
+            }
             thread::sleep(Duration::from_secs(2));
         });
         let provider = OpenAiProvider::new_with_request_timeout(
@@ -1957,6 +2163,12 @@ mod transport_tests {
             Some(ProviderTransportCategory::Timeout)
         );
         assert_eq!(error.error.timeout_seconds, Some(1));
+        let metadata = error
+            .provider_attempt_metadata
+            .as_ref()
+            .expect("timeout attempt metadata");
+        assert_eq!(metadata.attempt_count, MAX_PROVIDER_ATTEMPTS);
+        assert_eq!(metadata.retry_count, MAX_PROVIDER_ATTEMPTS - 1);
         let serialized = serde_json::to_string(&error.error).expect("serialize timeout");
         for secret in ["sk-secret-value", &address.to_string(), "authorization"] {
             assert!(
