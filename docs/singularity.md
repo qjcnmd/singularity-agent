@@ -170,9 +170,15 @@ builtin.command
 
 默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。`WorkspaceTools` 对所有路径执行 lexical normalize、canonicalize existing parent、workspace containment 和 protected component 检查；多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
 
-当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint。Turn Blocked、request、checkpoint 和 approval trace 在同一事务提交。allow/deny 是单次消费；defer 只写脱敏审计事件，不写 decision ledger、不消费 approval，也不删除 checkpoint。allow 在 decision ledger 同一事务把 `pending` 直接认领为 `executing`；工具返回后，脱敏 tool outcome、Turn outcome、terminal trace 和 checkpoint 删除在同一事务提交；若恢复后再次 ask，旧 execution 完成、下一 request/checkpoint 和 Turn Blocked 也在该事务内交接。deny 在 decision 同一事务终结 Turn 并删除 checkpoint。主进程启动时，遗留 `executing` 只会被归约为 `Interrupted` 和 `approval_execution_outcome_unknown`，绝不重放；当前保证是 at-most-once execution attempt，不宣称 exactly-once。客户端不能通过 `approval/request` 自行向 ledger 注入请求。
+当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint。Turn Blocked、request、checkpoint 和 approval trace 在同一事务提交。allow/deny 是单次消费；defer 只写脱敏审计事件，不写 decision ledger、不消费 approval，也不删除 checkpoint。只有 allow 需要 active thread 和当前可用的 workspace：workspace 在 claim 前检查，thread active 状态还会在 Store claim 事务内重检，条件不满足时不消费 request。deny 不执行工具，不依赖 thread 是否 archived 或 workspace 是否仍存在；它在 decision 同一事务终结 Turn 并删除 checkpoint。defer 同样不依赖这两个执行条件，保留 Blocked Turn、request 和 checkpoint。客户端不能通过 `approval/request` 自行向 ledger 注入请求。
 
-发送给模型的 tool result 只包含 `ok`、工具/调用标识、有界且脱敏的 `preview`、可用的 artifact references、错误码和截断标记；内部 result id、raw arguments、approval id、policy id、audit metadata 和 secret-like 文本不投影。已有 artifact reference 时不重复发送 preview；只有内部 result id 而没有 artifact reference 时仍保留有界 preview。
+allow 在 decision ledger 同一事务把 `pending` 直接认领为 `executing`。AgentLoop 返回后，Turn outcome、terminal trace 和 checkpoint 删除在同一事务提交；若继续运行后再次 ask，旧 execution 完成、下一 request/checkpoint 和 Turn Blocked 也在该事务内交接。claim 之后的普通 AppServer continuation 错误会在当前进程归约为 Failed Turn 并原子删除 executing checkpoint；只有 Store 本身持续不可写时才可能无法立即提交该终态。
+
+主进程启动恢复先验证所有 Approval、checkpoint、Turn 和 decision binding，再执行任何修改。没有 successor 的遗留 `executing` 被归约为 `Interrupted` 和 `approval_execution_outcome_unknown`；历史版本留下的较早 `executing` 加一个较晚且合法的 `pending` 被视为半交接，只删除旧 execution，并保留下一 Approval、checkpoint 和 Blocked Turn。歧义拓扑或损坏 checkpoint 使整个恢复事务失败且不修改数据库。两种可恢复路径都记录 `tool_replayed=false`，当前保证是 at-most-once execution attempt，不宣称 exactly-once。
+
+pending Approval 等待期间没有运行中的工具；此时 `turn/interrupt` 在一个事务内把 Turn 终结为 Interrupted、删除 unresolved Approval 和 checkpoint，并记录 `pending_approval_cancelled=true` 的 cancellation trace，不生成 decision ledger。若 Allow 已 claim 为 `executing`，interrupt 只请求取消；最终 Approval outcome 提交会让 Interrupted 覆盖本地晚到结果，并拒绝把下一 Approval handoff 到 terminal Turn。
+
+发送给模型的 tool result 只包含 `ok`、工具/调用标识、有界且脱敏的 `preview`、可用的 artifact references、错误码和截断标记；内部 result id、raw arguments、approval id、policy id、audit metadata 和 secret-like 文本不投影。已有 artifact reference 时不重复发送 preview；只有内部 result id 而没有 artifact reference 时仍保留有界 preview。完整 `ToolResult` 只存在于当前 `AgentLoopResult`，并可在等待下一 Approval 时作为内部 checkpoint 的一部分暂存。普通 runtime 的终态 SessionStore 不建立 ToolResult ledger：Turn/assistant item 保存终态，Trace 只保存状态、计数、verification、provider diagnostic 和从 ToolResult 提取的脱敏 audit 摘要。
 
 ## 9. Windows sandbox
 
@@ -258,7 +264,7 @@ prepare source
 
 每个 stage 都通过同一个 `SandboxBackend` 执行 command。baseline 和 public 使用 `public_test_patch`，hidden 只使用 `hidden_test_patch`；两者以及 baseline/public/hidden 命令都不进入 `AgentTaskProjection` 或模型 payload。public 与 hidden 必须具有不同的 patch 内容或命令 `argv`/`cwd` 证据；timeout 和 network 等执行设置不算独立证据。Evaluation 暴露的 command schema 只接受 manifest 声明的 smoke 输入，完成门使用规范化后的实际 cwd 计算同一 command scope，避免模型看到的能力与策略或验收口径分叉。
 
-`EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。v3 evidence 记录 workspace change 数、canonical patch digest、tool-call 数、exact smoke、strict sandbox command 数和 `local_process_fallback_count`。report 另外保存逐文件 before/after SHA-256、allowlist 判定、patch evidence 路径、命令诊断和 trace 路径；Agent trace 只保存脱敏 tool outcome，不保存 prompt、raw response 或 raw arguments。
+`EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。`result.json` 的 v3 evidence 记录 workspace change 数、canonical patch digest、tool-call 数、exact smoke、strict sandbox command 数和 `local_process_fallback_count`；`report.json` 另外保存逐文件 before/after SHA-256、allowlist 判定、patch evidence 路径、命令诊断和 agent trace 路径。Evaluation 直接从内存中的 `AgentLoopResult` 生成 `agent-trace.json`，其中 `tool_outcomes` 仅投影 tool call/name、`ok`、错误码和截断标记，`audit_events` 保存脱敏 command scope、approval、sandbox enforcement 和 fallback 摘要。这些产物都不持久化完整 `ToolResult`，也不保存 prompt、raw response、raw arguments、preview、artifact refs 或 result id。
 
 默认产物目录为 `work/evaluations/<run-id>`；`result.json` 是稳定 v3 result，`report.json` 是诊断报告。任一产物原子发布失败时删除不完整 run 目录。
 

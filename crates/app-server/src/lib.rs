@@ -757,8 +757,17 @@ impl AppServer {
             ))
             .with_cancellation_token(cancellation.clone())
             .resume_pending_tool_call(&loop_input, &pending, &pending_tool_call);
-        let next_approvals = approval_checkpoints(&result)?;
         let mut run_status = result.to_run_status();
+        let next_approvals = match approval_checkpoints(&result) {
+            Ok(next_approvals) => next_approvals,
+            Err(error) => {
+                run_status.status = AgentStatus::Failed;
+                run_status.completed = false;
+                run_status.final_answer = None;
+                run_status.error = Some(format!("approval continuation failed: {error}"));
+                Vec::new()
+            }
+        };
         if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
             let audit_status = approval_terminal_status(
                 decision,
@@ -799,8 +808,28 @@ impl AppServer {
             ))
             .with_cancellation_token(cancellation.clone())
             .run(&loop_input);
-        self.persist_agent_approval_requests(&result)?;
-        Ok(result.to_run_status())
+        let mut run_status = result.to_run_status();
+        if cancellation.is_cancelled() {
+            mark_run_cancelled(&mut run_status);
+            return Ok(run_status);
+        }
+        match self.persist_agent_approval_requests(&result) {
+            Ok(()) => Ok(run_status),
+            Err(AppServerError::Store(StoreError::InvalidState(message)))
+                if message == "pending approval requires a running or blocked turn" =>
+            {
+                let turn = self.store.get_turn(turn_id)?;
+                if turn.agent_loop_status == AgentStatus::CancelRequested.as_str()
+                    || turn.status == TurnStatus::Interrupted
+                {
+                    mark_run_cancelled(&mut run_status);
+                    Ok(run_status)
+                } else {
+                    Err(StoreError::InvalidState(message).into())
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn persist_agent_approval_requests(&self, result: &AgentLoopResult) -> AppServerResult<()> {
@@ -838,6 +867,20 @@ impl AppServer {
                 self.commit_effective_turn_status(&turn, &effective_status)
                     .map_err(Into::into)
             }
+            Err(StoreError::InvalidState(message))
+                if message == "terminal turn status cannot be overwritten" =>
+            {
+                let current = self.store.get_turn(&turn.turn_id)?;
+                if current.status == TurnStatus::Interrupted
+                    && current.agent_loop_status == AgentStatus::Cancelled.as_str()
+                {
+                    mark_run_cancelled(&mut effective_status);
+                    self.commit_effective_turn_status(&turn, &effective_status)
+                        .map_err(Into::into)
+                } else {
+                    Err(StoreError::InvalidState(message).into())
+                }
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -865,17 +908,35 @@ impl AppServer {
         run_status: &AgentRunStatus,
         next_approvals: &[ApprovalCheckpoint],
     ) -> Result<CommittedTurnOutcome, StoreError> {
-        let assistant_delta = agent_completed_delta(run_status);
-        let event = agent_loop_trace(turn, run_status);
-        self.store
-            .commit_turn_outcome_and_resolve_pending_execution(
-                request_id,
-                turn_status_for_agent(&run_status.status),
-                run_status.status.as_str(),
-                assistant_delta.as_deref(),
-                &event,
-                next_approvals,
-            )
+        let mut effective_status = run_status.clone();
+        let commit = |status: &AgentRunStatus| {
+            let assistant_delta = agent_completed_delta(status);
+            let event = agent_loop_trace(turn, status);
+            let effective_next_approvals = if status.status == AgentStatus::Blocked {
+                next_approvals
+            } else {
+                &[]
+            };
+            self.store
+                .commit_turn_outcome_and_resolve_pending_execution(
+                    request_id,
+                    turn_status_for_agent(&status.status),
+                    status.status.as_str(),
+                    assistant_delta.as_deref(),
+                    &event,
+                    effective_next_approvals,
+                )
+        };
+        match commit(&effective_status) {
+            Ok(committed) => Ok(committed),
+            Err(StoreError::InvalidState(message))
+                if message == "cancel-requested turn can only finalize as interrupted" =>
+            {
+                mark_run_cancelled(&mut effective_status);
+                commit(&effective_status)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn turn_interrupt(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -924,7 +985,11 @@ impl AppServer {
                 } else {
                     turn_status_str(&turn.status)
                 };
-                Ok(vec![
+                let mut messages = Vec::new();
+                if is_terminal_turn_status(&turn.status) {
+                    messages.extend(self.event_notification(AppEvent::turn_completed(&turn)));
+                }
+                messages.push(
                     JsonRpcMessage::response(
                         message.id,
                         serde_json::to_value(TurnInterruptResult {
@@ -934,7 +999,8 @@ impl AppServer {
                         })?,
                     )
                     .to_wire_value(),
-                ])
+                );
+                Ok(messages)
             }
             Err(StoreError::NotFound(_)) => not_found_response(message.id, TURN_NOT_FOUND),
             Err(error) => Err(error.into()),
@@ -994,9 +1060,10 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let pending_thread = self.store.get_thread(&pending_request.thread_id)?;
-        if self
-            .store
-            .has_pending_tool_call(&pending_request.request_id)?
+        if matches!(decision.outcome, ApprovalOutcome::Allow)
+            && self
+                .store
+                .has_pending_tool_call(&pending_request.request_id)?
         {
             if pending_thread.status != singularity_protocol::ThreadStatus::Active {
                 return invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION);
@@ -1015,6 +1082,11 @@ impl AppServer {
                 return match error {
                     StoreError::NotFound(_) => {
                         not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND)
+                    }
+                    StoreError::InvalidState(state_message)
+                        if state_message == "pending approval allow requires an active thread" =>
+                    {
+                        invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION)
                     }
                     other => Err(other.into()),
                 };
@@ -1037,44 +1109,77 @@ impl AppServer {
             );
             return Ok(messages);
         }
-        let active_turn =
-            if matches!(decision.outcome, ApprovalOutcome::Allow) && pending_tool_call.is_some() {
+        let mut messages = Vec::new();
+        let continuation = (|| -> AppServerResult<_> {
+            let active_turn = if matches!(decision.outcome, ApprovalOutcome::Allow)
+                && pending_tool_call.is_some()
+            {
                 Some(self.activate_turn(&recorded.request.turn_id)?)
             } else {
                 None
             };
-        let cancellation = active_turn
-            .as_ref()
-            .map(|(cancellation, _guard)| cancellation.clone())
-            .unwrap_or_default();
-        let resumed = self.resume_agent_loop(
-            &recorded.request,
-            &decision,
-            pending_tool_call.clone(),
-            &cancellation,
-        )?;
-        let mut messages = Vec::new();
-        let terminal = if let Some(resumed) = resumed {
-            Some(resumed)
-        } else {
-            self.approval_no_resume_status(
+            let cancellation = active_turn
+                .as_ref()
+                .map(|(cancellation, _guard)| cancellation.clone())
+                .unwrap_or_default();
+            let resumed = self.resume_agent_loop(
                 &recorded.request,
                 &decision,
-                pending_tool_call.as_ref(),
-            )?
-            .map(|(turn, run_status)| (turn, run_status, Vec::new()))
+                pending_tool_call.clone(),
+                &cancellation,
+            )?;
+            let terminal = if let Some(resumed) = resumed {
+                Some(resumed)
+            } else {
+                self.approval_no_resume_status(
+                    &recorded.request,
+                    &decision,
+                    pending_tool_call.as_ref(),
+                )?
+                .map(|(turn, run_status)| (turn, run_status, Vec::new()))
+            };
+            Ok((terminal, cancellation))
+        })();
+        let (terminal, cancellation) = match continuation {
+            Ok(continuation) => continuation,
+            Err(error) => {
+                let committed = self.terminalize_claimed_approval_error(
+                    &recorded.request,
+                    &decision,
+                    pending_tool_call.as_ref(),
+                    None,
+                    &error,
+                )?;
+                messages
+                    .extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
+                messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
+                messages.push(
+                    JsonRpcMessage::response(message.id, json!({"decision": decision}))
+                        .to_wire_value(),
+                );
+                return Ok(messages);
+            }
         };
         if let Some((turn, run_status, next_approvals)) = terminal {
             let mut effective_status = run_status.clone();
             if cancellation.is_cancelled() {
                 mark_run_cancelled(&mut effective_status);
             }
-            let committed = self.commit_effective_turn_status_resolving_approval(
+            let committed = match self.commit_effective_turn_status_resolving_approval(
                 &decision.request_id,
                 &turn,
                 &effective_status,
                 &next_approvals,
-            )?;
+            ) {
+                Ok(committed) => committed,
+                Err(error) => self.terminalize_claimed_approval_error(
+                    &recorded.request,
+                    &decision,
+                    pending_tool_call.as_ref(),
+                    Some(&effective_status),
+                    &AppServerError::Store(error),
+                )?,
+            };
             messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
             messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
         }
@@ -1084,36 +1189,96 @@ impl AppServer {
         Ok(messages)
     }
 
+    fn terminalize_claimed_approval_error(
+        &self,
+        request: &ApprovalRequest,
+        decision: &ApprovalDecision,
+        pending_tool_call: Option<&Value>,
+        prior_status: Option<&AgentRunStatus>,
+        continuation_error: &AppServerError,
+    ) -> AppServerResult<CommittedTurnOutcome> {
+        let turn = self.store.get_turn(&request.turn_id).map_err(|error| {
+            AppServerError::Store(StoreError::InvalidState(format!(
+                "approval continuation failed: {continuation_error}; failed to load claimed turn for terminalization: {error}"
+            )))
+        })?;
+        let fallback_status = approval_terminal_status(
+            decision,
+            pending_tool_call,
+            AgentStatus::Failed,
+            "unavailable",
+            format!("approval continuation failed: {continuation_error}"),
+        );
+        let mut run_status = prior_status
+            .cloned()
+            .unwrap_or_else(|| fallback_status.clone());
+        run_status.status = AgentStatus::Failed;
+        run_status.completed = false;
+        run_status.final_answer = None;
+        run_status.error = fallback_status.error;
+        if run_status.audit_events.is_empty() {
+            run_status.audit_events = fallback_status.audit_events;
+        }
+        self.commit_effective_turn_status_resolving_approval(
+            &decision.request_id,
+            &turn,
+            &run_status,
+            &[],
+        )
+        .map_err(|error| {
+            AppServerError::Store(StoreError::InvalidState(format!(
+                "approval continuation failed: {continuation_error}; failed to persist claimed approval terminal state: {error}"
+            )))
+        })
+    }
+
     fn approval_no_resume_status(
         &self,
         request: &ApprovalRequest,
         decision: &ApprovalDecision,
         pending_tool_call: Option<&Value>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
-        let Ok(turn) = self.store.get_turn(&request.turn_id) else {
-            return Ok(None);
-        };
-        if turn.status != TurnStatus::Blocked
-            || turn.agent_loop_status != AgentStatus::Blocked.as_str()
-        {
-            return Ok(None);
-        }
+        let turn = self.store.get_turn(&request.turn_id)?;
         if pending_tool_call.is_none() {
             return Ok(None);
         }
-        let (status, audit_decision, message) = match decision.outcome {
-            ApprovalOutcome::Allow if pending_tool_call.is_some() => (
+        let (status, audit_decision, message) = if turn.agent_loop_status
+            == AgentStatus::CancelRequested.as_str()
+        {
+            (
+                AgentStatus::Cancelled,
+                "unavailable",
+                "approval continuation interrupted before resume",
+            )
+        } else if is_terminal_turn_status(&turn.status) {
+            (
+                AgentStatus::from(turn.agent_loop_status.as_str()),
+                "unavailable",
+                "approval continuation already reached a terminal turn",
+            )
+        } else if turn.status != TurnStatus::Blocked
+            || turn.agent_loop_status != AgentStatus::Blocked.as_str()
+        {
+            (
                 AgentStatus::Failed,
                 "unavailable",
-                "approval allowed but agent loop turn could not resume",
-            ),
-            ApprovalOutcome::Allow => (
-                AgentStatus::Failed,
-                "unavailable",
-                "approval allowed but pending tool call is unavailable",
-            ),
-            ApprovalOutcome::Deny => (AgentStatus::Failed, "denied", "approval denied"),
-            ApprovalOutcome::Defer => (AgentStatus::Blocked, "deferred", "approval deferred"),
+                "approval allowed but turn state changed before agent loop resume",
+            )
+        } else {
+            match decision.outcome {
+                ApprovalOutcome::Allow if pending_tool_call.is_some() => (
+                    AgentStatus::Failed,
+                    "unavailable",
+                    "approval allowed but agent loop turn could not resume",
+                ),
+                ApprovalOutcome::Allow => (
+                    AgentStatus::Failed,
+                    "unavailable",
+                    "approval allowed but pending tool call is unavailable",
+                ),
+                ApprovalOutcome::Deny => (AgentStatus::Failed, "denied", "approval denied"),
+                ApprovalOutcome::Defer => (AgentStatus::Blocked, "deferred", "approval deferred"),
+            }
         };
         let run_status =
             approval_terminal_status(decision, pending_tool_call, status, audit_decision, message);
@@ -1647,7 +1812,10 @@ where
 }
 
 fn is_terminal_turn_status(status: &TurnStatus) -> bool {
-    !matches!(status, TurnStatus::Running)
+    matches!(
+        status,
+        TurnStatus::Completed | TurnStatus::Failed | TurnStatus::Interrupted
+    )
 }
 
 fn turn_status_str(status: &TurnStatus) -> &'static str {
@@ -2279,6 +2447,212 @@ mod tests {
     }
 
     #[test]
+    fn approval_resolution_cancellation_wins_without_persisting_a_next_approval() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Blocked.as_str(),
+                json!([{"type": "text", "text": "edit"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("blocked turn");
+        let checkpoint = |request: &ApprovalRequest, tool_call_id: &str| {
+            json!({
+                "request_id": &request.request_id,
+                "thread_id": &request.thread_id,
+                "turn_id": &request.turn_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": &request.action,
+                "raw_arguments": "{}",
+                "resources": &request.resources,
+                "checkpoint_version": 1,
+                "messages": [],
+                "tool_results": [],
+                "used_approval_grants": [],
+                "approval_count": 1,
+                "model_turns": 1,
+                "completion": {}
+            })
+        };
+        let request = ApprovalRequest::new(
+            "approval_cancel_race",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_EDIT,
+        )
+        .with_tool_call_id("call_1");
+        let pending_payload = checkpoint(&request, "call_1");
+        store
+            .create_approval_with_pending_tool_call_and_trace(
+                &request,
+                Some(pending_payload.clone()),
+                "approval",
+                "approval requested",
+            )
+            .expect("approval");
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        store
+            .record_approval_decision(&decision, "approval", "approval decision recorded")
+            .expect("claim execution");
+        let cancellation_trace = TraceEvent {
+            payload: json!({"turn_id": &turn.turn_id, "agent_loop_status": "cancel_requested"}),
+            ..TraceEvent::new(
+                "trace_cancel_race",
+                thread.thread_id.clone(),
+                turn.turn_id.clone(),
+                "app_server",
+                "turn interrupt requested",
+            )
+        };
+        store
+            .request_turn_cancellation(&turn.turn_id, &cancellation_trace)
+            .expect("request cancellation");
+        let server = app_server(store);
+        let (_turn, no_resume_status) = server
+            .approval_no_resume_status(&request, &decision, Some(&pending_payload))
+            .expect("no-resume status")
+            .expect("terminal status");
+        assert_eq!(no_resume_status.status, AgentStatus::Cancelled);
+
+        let next = ApprovalRequest::new(
+            "approval_must_not_persist",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_EDIT,
+        )
+        .with_tool_call_id("call_2");
+        let stale_status = AgentRunStatus::failed("stale local result");
+        let committed = server
+            .commit_effective_turn_status_resolving_approval(
+                &request.request_id,
+                &turn,
+                &stale_status,
+                &[(next.clone(), checkpoint(&next, "call_2"))],
+            )
+            .expect("cancellation wins approval resolution");
+        assert_eq!(committed.turn.status, TurnStatus::Interrupted);
+        assert_eq!(committed.turn.agent_loop_status, "cancelled");
+        assert!(
+            !server
+                .store
+                .has_pending_tool_call(&request.request_id)
+                .expect("old execution")
+        );
+        assert!(matches!(
+            server.store.get_pending_approval(&next.request_id),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn initial_approval_handoff_interruption_is_an_idempotent_terminal_commit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "edit"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        let request = ApprovalRequest::new(
+            "approval_initial_interrupt",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_EDIT,
+        )
+        .with_tool_call_id("call_1");
+        let checkpoint = json!({
+            "request_id": &request.request_id,
+            "thread_id": &request.thread_id,
+            "turn_id": &request.turn_id,
+            "tool_call_id": "call_1",
+            "tool_name": TOOL_EDIT,
+            "raw_arguments": "{}",
+            "resources": [],
+            "checkpoint_version": 1,
+            "messages": [],
+            "tool_results": [],
+            "used_approval_grants": [],
+            "approval_count": 1,
+            "model_turns": 1,
+            "completion": {}
+        });
+        store
+            .create_approval_with_pending_tool_call_and_trace(
+                &request,
+                Some(checkpoint),
+                "approval",
+                "approval requested",
+            )
+            .expect("persist initial approval");
+        let interrupt_trace = TraceEvent {
+            payload: json!({"turn_id": &turn.turn_id, "agent_loop_status": "cancel_requested"}),
+            ..TraceEvent::new(
+                "trace_interrupt_initial_handoff",
+                thread.thread_id.clone(),
+                turn.turn_id.clone(),
+                "app_server",
+                "turn interrupt requested",
+            )
+        };
+        let interrupted = store
+            .request_turn_cancellation(&turn.turn_id, &interrupt_trace)
+            .expect("interrupt pending approval");
+        assert_eq!(interrupted.status, TurnStatus::Interrupted);
+        let server = app_server(store);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let stale_blocked =
+            AgentRunStatus::failed("stale blocked result").with_status(AgentStatus::Blocked);
+        let committed = server
+            .commit_turn_run_status(turn.clone(), &stale_blocked, &cancellation)
+            .expect("interrupted handoff is idempotent");
+        assert_eq!(committed.turn.status, TurnStatus::Interrupted);
+        assert_eq!(committed.turn.agent_loop_status, "cancelled");
+        assert!(
+            server
+                .store
+                .list_pending_approvals()
+                .expect("pending")
+                .is_empty()
+        );
+        assert!(
+            server
+                .store
+                .recover_incomplete_approval_executions()
+                .expect("recovery")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn agent_loop_approval_resume_failures_record_command_audit() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
@@ -2615,6 +2989,19 @@ mod tests {
             )
             .expect("commit resumed outcome");
         assert_eq!(committed.turn.status, TurnStatus::Completed);
+        let terminal_trace = server
+            .store
+            .list_trace(&thread.thread_id)
+            .expect("thread trace")
+            .into_iter()
+            .find(|trace| trace.component == "agent_loop" && trace.payload["status"] == "completed")
+            .expect("terminal agent trace");
+        assert!(terminal_trace.payload.get("tool_outcomes").is_none());
+        let terminal_trace_json =
+            serde_json::to_string(&terminal_trace.payload).expect("terminal trace json");
+        for full_result_field in ["preview", "artifact_refs", "result_id"] {
+            assert!(!terminal_trace_json.contains(full_result_field));
+        }
         assert!(
             !server
                 .store

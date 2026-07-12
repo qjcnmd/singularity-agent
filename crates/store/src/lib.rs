@@ -64,6 +64,8 @@ const APPROVAL_CHECKPOINT_REQUEST_MISMATCH: &str =
     "approval checkpoint request_id must match approval request";
 const APPROVAL_CHECKPOINT_TOOL_CALL_MISMATCH: &str =
     "approval checkpoint tool_call_id must match pending tool call";
+const PENDING_APPROVAL_ALLOW_REQUIRES_ACTIVE_THREAD: &str =
+    "pending approval allow requires an active thread";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -523,6 +525,9 @@ impl SessionStore {
             }
             (_, None) => {}
         }
+        if status == TurnStatus::Interrupted {
+            Self::delete_unresolved_pending_approvals(transaction, turn_id)?;
+        }
 
         transaction.execute(
             "update turns set status = ?1, agent_loop_status = ?2 where turn_id = ?3",
@@ -580,6 +585,36 @@ impl SessionStore {
                 "turn cancellation trace must be bound to the same thread and turn".to_string(),
             ));
         }
+        let pending_count: i64 = transaction.query_row(
+            "select count(*) from pending_tool_calls
+             where turn_id = ?1 and execution_state = 'pending'",
+            params![turn_id],
+            |row| row.get(0),
+        )?;
+        let has_executing = Self::exists_in_transaction(
+            &transaction,
+            "select 1 from pending_tool_calls where turn_id = ?1 and execution_state = 'executing'",
+            turn_id,
+        )?;
+        if pending_count > 0 && !has_executing {
+            Self::delete_unresolved_pending_approvals(&transaction, turn_id)?;
+            transaction.execute(
+                "update turns set status = ?1, agent_loop_status = 'cancelled' where turn_id = ?2",
+                params![serde_json::to_string(&TurnStatus::Interrupted)?, turn_id],
+            )?;
+            let mut terminal_trace = trace.clone();
+            terminal_trace.summary = "turn interrupted while approval pending".to_string();
+            terminal_trace.payload = serde_json::json!({
+                "turn_id": turn_id,
+                "agent_loop_status": "cancelled",
+                "pending_approval_cancelled": true,
+            });
+            Self::insert_trace(&transaction, &terminal_trace)?;
+            turn.status = TurnStatus::Interrupted;
+            turn.agent_loop_status = "cancelled".to_string();
+            transaction.commit()?;
+            return Ok(turn);
+        }
         transaction.execute(
             "update turns set agent_loop_status = 'cancel_requested' where turn_id = ?1",
             params![turn_id],
@@ -588,6 +623,36 @@ impl SessionStore {
         turn.agent_loop_status = "cancel_requested".to_string();
         transaction.commit()?;
         Ok(turn)
+    }
+
+    fn delete_unresolved_pending_approvals(
+        transaction: &Transaction<'_>,
+        turn_id: &str,
+    ) -> StoreResult<usize> {
+        let mut pending_statement = transaction.prepare(
+            "select request_id from pending_tool_calls
+             where turn_id = ?1 and execution_state = 'pending' order by rowid",
+        )?;
+        let pending_request_ids = pending_statement
+            .query_map(params![turn_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(pending_statement);
+        transaction.execute(
+            "delete from pending_tool_calls where turn_id = ?1 and execution_state = 'pending'",
+            params![turn_id],
+        )?;
+        for request_id in &pending_request_ids {
+            let deleted = transaction.execute(
+                "delete from approvals where request_id = ?1 and decision_outcome is null",
+                params![request_id],
+            )?;
+            if deleted != 1 {
+                return Err(StoreError::InvalidState(
+                    "pending turn cancellation requires an unresolved approval".to_string(),
+                ));
+            }
+        }
+        Ok(pending_request_ids.len())
     }
 
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
@@ -741,7 +806,9 @@ impl SessionStore {
                 ],
             )?;
             let changed = transaction.execute(
-                "update turns set status = ?1, agent_loop_status = 'blocked' where turn_id = ?2 and status in (?3, ?1)",
+                "update turns set status = ?1, agent_loop_status = 'blocked'
+                 where turn_id = ?2 and status in (?3, ?1)
+                   and agent_loop_status in ('running', 'blocked')",
                 params![
                     serde_json::to_string(&TurnStatus::Blocked)?,
                     request.turn_id,
@@ -903,6 +970,18 @@ impl SessionStore {
                 ));
             }
         }
+        if pending_tool_call.is_some() && decision.outcome == ApprovalOutcome::Allow {
+            let thread_status: String = transaction.query_row(
+                "select status from threads where thread_id = ?1",
+                params![request.thread_id],
+                |row| row.get(0),
+            )?;
+            if thread_status != serde_json::to_string(&ThreadStatus::Active)? {
+                return Err(StoreError::InvalidState(
+                    PENDING_APPROVAL_ALLOW_REQUIRES_ACTIVE_THREAD.to_string(),
+                ));
+            }
+        }
         if decision.outcome == ApprovalOutcome::Defer {
             let trace = TraceEvent {
                 task_id: Some(request.turn_id.clone()),
@@ -1037,6 +1116,13 @@ impl SessionStore {
     ) -> StoreResult<CommittedTurnOutcome> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        if !next_approvals.is_empty()
+            && (status != TurnStatus::Blocked || agent_loop_status != "blocked")
+        {
+            return Err(StoreError::InvalidState(
+                "next approval handoff requires a blocked turn outcome".to_string(),
+            ));
+        }
         let bound_turn_id: String = transaction
             .query_row(
                 "select turn_id from pending_tool_calls where request_id = ?1 and execution_state = 'executing'",
@@ -1107,35 +1193,71 @@ impl SessionStore {
     }
 
     pub fn recover_incomplete_approval_executions(&self) -> StoreResult<Vec<String>> {
+        struct RecoveryRow {
+            approval_rowid: i64,
+            request: ApprovalRequest,
+            decision: Option<ApprovalOutcome>,
+            pending_rowid: Option<i64>,
+            pending_state: Option<String>,
+            turn_status: TurnStatus,
+            agent_loop_status: String,
+        }
+
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut approval_statement = transaction.prepare(
-            "select a.request_id, a.payload, a.decision_outcome,
-                    count(p.request_id), min(p.execution_state)
+        let mut statement = transaction.prepare(
+            "select a.rowid, a.request_id, a.payload, a.decision_outcome,
+                    a.decision_reason, p.rowid, p.thread_id, p.turn_id, p.tool_call_id, p.payload,
+                    p.execution_state
              from approvals a
              left join pending_tool_calls p on p.request_id = a.request_id
-             group by a.request_id, a.payload, a.decision_outcome
              order by a.rowid",
         )?;
-        let approvals = approval_statement
+        let persisted_rows = statement
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        drop(approval_statement);
-        for (request_id, payload, decision, pending_count, pending_state) in approvals {
-            let request: ApprovalRequest = serde_json::from_str(&payload)?;
-            let turn_status = transaction
+        drop(statement);
+
+        let mut rows = Vec::with_capacity(persisted_rows.len());
+        for (
+            approval_rowid,
+            request_id,
+            request_payload,
+            decision,
+            decision_reason,
+            pending_rowid,
+            pending_thread_id,
+            pending_turn_id,
+            pending_tool_call_id_value,
+            pending_payload,
+            pending_state,
+        ) in persisted_rows
+        {
+            let request: ApprovalRequest = serde_json::from_str(&request_payload)?;
+            if request.request_id != request_id {
+                return Err(StoreError::InvalidState(format!(
+                    "approval {request_id} payload request_id mismatch"
+                )));
+            }
+            let (turn_status, agent_loop_status) = transaction
                 .query_row(
-                    "select status from turns where turn_id = ?1 and thread_id = ?2",
+                    "select status, agent_loop_status from turns where turn_id = ?1 and thread_id = ?2",
                     params![request.turn_id, request.thread_id],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?
                 .ok_or_else(|| {
@@ -1148,105 +1270,225 @@ impl SessionStore {
                 .as_deref()
                 .map(serde_json::from_str::<ApprovalOutcome>)
                 .transpose()?;
-            let valid = match (
-                request.tool_call_id.is_some(),
-                decision,
-                is_terminal_turn_status(&status),
+            let mut decision_statement = transaction.prepare(
+                "select decision_id, request_id, outcome, reason, payload
+                 from approval_decisions where request_id = ?1 order by rowid",
+            )?;
+            let decision_rows = decision_statement
+                .query_map(params![request_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(decision_statement);
+            match decision {
+                None if !decision_rows.is_empty() => {
+                    return Err(StoreError::InvalidState(format!(
+                        "approval {request_id} has inconsistent decision ledger"
+                    )));
+                }
+                None => {}
+                Some(ApprovalOutcome::Defer) => {
+                    return Err(StoreError::InvalidState(format!(
+                        "approval {request_id} has inconsistent decision ledger"
+                    )));
+                }
+                Some(expected_outcome) => {
+                    let [(decision_id, ledger_request_id, outcome, reason, payload)] =
+                        decision_rows.as_slice()
+                    else {
+                        return Err(StoreError::InvalidState(format!(
+                            "approval {request_id} has inconsistent decision ledger"
+                        )));
+                    };
+                    let ledger_decision: ApprovalDecision = serde_json::from_str(payload)?;
+                    if ledger_request_id != &request_id
+                        || serde_json::from_str::<ApprovalOutcome>(outcome)? != expected_outcome
+                        || decision_reason.as_deref() != Some(reason.as_str())
+                        || ledger_decision.decision_id != *decision_id
+                        || ledger_decision.request_id != request_id
+                        || ledger_decision.outcome != expected_outcome
+                        || ledger_decision.reason != *reason
+                    {
+                        return Err(StoreError::InvalidState(format!(
+                            "approval {request_id} has inconsistent decision ledger"
+                        )));
+                    }
+                }
+            }
+
+            match (
+                pending_rowid,
+                pending_thread_id.as_deref(),
+                pending_turn_id.as_deref(),
+                pending_tool_call_id_value.as_deref(),
+                pending_payload.as_deref(),
+                pending_state.as_deref(),
             ) {
-                (false, _, _) => pending_count == 0,
-                (true, None, false) => {
-                    pending_count == 1 && pending_state.as_deref() == Some("pending")
+                (None, None, None, None, None, None) => {}
+                (
+                    Some(_),
+                    Some(thread_id),
+                    Some(turn_id),
+                    Some(tool_call_id),
+                    Some(payload),
+                    Some(_),
+                ) => {
+                    if thread_id != request.thread_id {
+                        return Err(StoreError::InvalidState(
+                            PENDING_TOOL_CALL_THREAD_MISMATCH.to_string(),
+                        ));
+                    }
+                    if turn_id != request.turn_id {
+                        return Err(StoreError::InvalidState(
+                            PENDING_TOOL_CALL_TURN_MISMATCH.to_string(),
+                        ));
+                    }
+                    if request.tool_call_id.as_deref() != Some(tool_call_id) {
+                        return Err(StoreError::InvalidState(
+                            PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
+                        ));
+                    }
+                    let payload = serde_json::from_str::<Value>(payload)?;
+                    let _ = pending_tool_call_id(&transaction, &request, &payload)?;
                 }
-                (true, Some(ApprovalOutcome::Allow), false) => {
-                    pending_count == 1 && pending_state.as_deref() == Some("executing")
+                _ => {
+                    return Err(StoreError::InvalidState(format!(
+                        "approval {request_id} has incomplete pending checkpoint metadata"
+                    )));
                 }
-                (true, Some(ApprovalOutcome::Allow), true) => {
-                    pending_count == 0
-                        || (pending_count == 1 && pending_state.as_deref() == Some("executing"))
-                }
-                (true, Some(ApprovalOutcome::Deny), true) => pending_count == 0,
-                (true, Some(ApprovalOutcome::Defer), _)
-                | (true, Some(ApprovalOutcome::Deny), false)
-                | (true, None, true) => false,
-            };
-            if !valid {
+            }
+
+            if request.tool_call_id.is_none() && pending_rowid.is_some() {
                 return Err(StoreError::InvalidState(format!(
                     "approval {request_id} has inconsistent checkpoint state"
                 )));
             }
+            rows.push(RecoveryRow {
+                approval_rowid,
+                request,
+                decision,
+                pending_rowid,
+                pending_state,
+                turn_status: status,
+                agent_loop_status,
+            });
         }
-        let mut statement = transaction.prepare(
-            "select p.request_id, p.turn_id, p.execution_state, a.decision_outcome, t.thread_id, t.status, t.agent_loop_status
-             from pending_tool_calls p
-             join approvals a on a.request_id = p.request_id
-             join turns t on t.turn_id = p.turn_id
-             order by p.rowid",
-        )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        let mut recovered = Vec::new();
-        let allow_decision = serde_json::to_string(&ApprovalOutcome::Allow)?;
-        for (request_id, turn_id, state, decision, thread_id, turn_status, agent_status) in rows {
-            if state == "pending" {
-                if decision.is_some()
-                    || turn_status != serde_json::to_string(&TurnStatus::Blocked)?
-                    || agent_status != "blocked"
-                {
+
+        let mut rows_by_turn = BTreeMap::<String, Vec<usize>>::new();
+        for (index, row) in rows.iter().enumerate() {
+            rows_by_turn
+                .entry(row.request.turn_id.clone())
+                .or_default()
+                .push(index);
+        }
+        let mut superseded_executions = BTreeSet::new();
+        for indexes in rows_by_turn.values() {
+            let pending = indexes
+                .iter()
+                .copied()
+                .filter(|index| rows[*index].pending_state.as_deref() == Some("pending"))
+                .collect::<Vec<_>>();
+            let executing = indexes
+                .iter()
+                .copied()
+                .filter(|index| rows[*index].pending_state.as_deref() == Some("executing"))
+                .collect::<Vec<_>>();
+            if pending.len() > 1 || executing.len() > 1 {
+                return Err(StoreError::InvalidState(
+                    "turn has ambiguous approval execution recovery state".to_string(),
+                ));
+            }
+            if let (Some(executing_index), Some(pending_index)) =
+                (executing.first(), pending.first())
+            {
+                if rows[*executing_index].approval_rowid >= rows[*pending_index].approval_rowid {
+                    return Err(StoreError::InvalidState(
+                        "pending approval does not follow executing approval".to_string(),
+                    ));
+                }
+                superseded_executions.insert(rows[*executing_index].request.request_id.clone());
+            }
+
+            for index in indexes {
+                let row = &rows[*index];
+                if row.request.tool_call_id.is_none() {
+                    continue;
+                }
+                let terminal = is_terminal_turn_status(&row.turn_status);
+                let has_later_active_approval = indexes.iter().any(|candidate| {
+                    rows[*candidate].approval_rowid > row.approval_rowid
+                        && rows[*candidate].pending_rowid.is_some()
+                });
+                let valid = match (row.decision, row.pending_state.as_deref(), terminal) {
+                    (None, Some("pending"), false) => {
+                        row.turn_status == TurnStatus::Blocked && row.agent_loop_status == "blocked"
+                    }
+                    (Some(ApprovalOutcome::Allow), Some("executing"), _) => true,
+                    (Some(ApprovalOutcome::Allow), None, true) => true,
+                    (Some(ApprovalOutcome::Allow), None, false) => has_later_active_approval,
+                    (Some(ApprovalOutcome::Deny), None, true) => true,
+                    _ => false,
+                };
+                if !valid {
                     return Err(StoreError::InvalidState(format!(
-                        "pending approval {request_id} has inconsistent durable state"
+                        "approval {} has inconsistent checkpoint state",
+                        row.request.request_id
                     )));
                 }
-                continue;
             }
-            if state != "executing" || decision.as_deref() != Some(allow_decision.as_str()) {
-                return Err(StoreError::InvalidState(format!(
-                    "approval execution {request_id} has inconsistent durable state"
-                )));
-            }
-            let status: TurnStatus = serde_json::from_str(&turn_status)?;
-            if !is_terminal_turn_status(&status) {
+        }
+
+        let mut recovered = Vec::new();
+        for row in rows
+            .iter()
+            .filter(|row| row.pending_state.as_deref() == Some("executing"))
+        {
+            let request_id = &row.request.request_id;
+            let turn_id = &row.request.turn_id;
+            let superseded = superseded_executions.contains(request_id);
+            if !superseded && !is_terminal_turn_status(&row.turn_status) {
                 transaction.execute(
                     "update turns set status = ?1, agent_loop_status = 'interrupted' where turn_id = ?2",
                     params![serde_json::to_string(&TurnStatus::Interrupted)?, turn_id],
                 )?;
-                let trace = TraceEvent {
-                    task_id: Some(turn_id.clone()),
-                    payload: serde_json::json!({
-                        "request_id": request_id,
-                        "recovery_reason": "approval_execution_outcome_unknown",
-                        "tool_replayed": false,
-                    }),
-                    ..TraceEvent::new(
-                        format!("trace_{request_id}_recovered"),
-                        thread_id,
-                        turn_id.clone(),
-                        "app_server",
-                        "approval execution interrupted during process recovery",
-                    )
-                };
-                Self::insert_trace(&transaction, &trace)?;
             }
+            let recovery_reason = if superseded {
+                "approval_execution_superseded_by_pending_handoff"
+            } else {
+                "approval_execution_outcome_unknown"
+            };
+            let summary = if superseded {
+                "stale approval execution reconciled during process recovery"
+            } else {
+                "approval execution interrupted during process recovery"
+            };
+            let trace = TraceEvent {
+                task_id: Some(turn_id.clone()),
+                payload: serde_json::json!({
+                    "request_id": request_id,
+                    "recovery_reason": recovery_reason,
+                    "tool_replayed": false,
+                }),
+                ..TraceEvent::new(
+                    format!("trace_{request_id}_recovered"),
+                    row.request.thread_id.clone(),
+                    turn_id.clone(),
+                    "app_server",
+                    summary,
+                )
+            };
+            Self::insert_trace(&transaction, &trace)?;
             transaction.execute(
                 "delete from pending_tool_calls where request_id = ?1",
                 params![request_id],
             )?;
-            transaction.execute(
-                "delete from pending_tool_calls where turn_id = ?1 and execution_state = 'pending'",
-                params![turn_id],
-            )?;
-            recovered.push(request_id);
+            recovered.push(request_id.clone());
         }
         transaction.commit()?;
         Ok(recovered)
