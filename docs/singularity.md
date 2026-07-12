@@ -149,7 +149,7 @@ completion gate 保持以下不变量：
 
 Provider 失败通过 `ProviderDiagnostic` 投影稳定的 `code`、`stage`、transport category、HTTP status 和 response validation codes。该对象不包含 API key、Authorization、endpoint、prompt、原始响应、provider/model 名称或底层 error source；AgentLoop、app-server trace 与 Evaluation result/report 只持久化这一安全投影。原始错误 message 仍经过公共边界脱敏，诊断字段不会因 message 被整体替换为 `[redacted]` 而丢失。
 
-`OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；配置/client/runtime 初始化、请求校验与发送、HTTP status、body read、JSON decode 和 response validation 使用稳定的结构化诊断。OpenAI-compatible 实现不一定遵守 `parallel_tool_calls=false`；若响应仍包含多个 tool calls，adapter 在任何工具执行前关闭失败，返回 `provider_single_tool_call_contract_violated` / `unsupported_capability`，Evaluation 将其归为运行时 `provider_response` blocker，而不是静态 `provider_configuration` blocker。它不会执行部分调用、静默丢弃其余调用或伪造兼容结果。`AgentLoopResult` 和 `AgentRunStatus` 在内部携带 typed `ModelErrorCategory`（不进入 serde、CLI 或普通 trace）；Evaluation 依据该类别映射 `BlockerKind`，不从 human-readable error 文本推断。
+`OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；配置/client/runtime 初始化、请求校验与发送、HTTP status、body read、JSON decode 和 response validation 使用稳定的结构化诊断。OpenAI-compatible 实现不一定遵守 `parallel_tool_calls=false`；若响应仍包含多个 tool calls，adapter 在任何工具执行前关闭失败，返回 `provider_single_tool_call_contract_violated` / `unsupported_capability`，Evaluation 依据 `response_*` diagnostic stage 将其归为运行时 `provider_response` blocker，而不是静态 `provider_configuration` blocker。请求发送前的本地 validation 即使使用 `InvalidRequest` category，也不会归因于 Provider response。adapter 不会执行部分调用、静默丢弃其余调用或伪造兼容结果。`AgentLoopResult` 和 `AgentRunStatus` 在内部携带 typed `ModelErrorCategory`（不进入 serde、CLI 或普通 trace）；Evaluation 同时依据类别和稳定 diagnostic stage 映射 `BlockerKind`，不从 human-readable error 文本推断。
 
 公共 `providerConfiguration` 只表示配置状态，包含来源、snapshot id、`configured`、`configurationBlocker` 和三个字段的 present/missing；它不声称网络或模型请求已经成功。Provider error 只投影稳定 code、阶段、可靠 transport 类别、HTTP status 和 response validation codes。API key、base URL 原值、Authorization header、原始 response 和原始 prompt 不进入 CLI、Evaluation 或 trace。
 
@@ -166,7 +166,7 @@ builtin.patch
 builtin.command
 ```
 
-产品运行时只向 `ToolBroker` 注册具有真实 workspace executor 的 `builtin.*` 工具，`ToolRegistry` 也拒绝非 builtin 命名空间。AgentLoop 在 Policy resource projection 之前按各 builtin input type 校验参数；非法参数作为可修复的 `invalid_tool_arguments` 返回模型，不产生虚假的 Policy deny，也不会调用 executor。真实 profile 越界和 Policy deny 仍关闭失败。当前没有 MCP 工具执行路径，也不会向模型暴露 MCP schema。
+产品运行时只向 `ToolBroker` 注册具有真实 workspace executor 的 `builtin.*` 工具，`ToolRegistry` 也拒绝非 builtin 命名空间。AgentLoop 在 Policy resource projection 之前按各 builtin input type 校验参数；非法参数直接构造可修复的 `invalid_tool_arguments`，不生成 `ToolBrokerDecision`、不调用 Policy、ToolBroker 或 executor。其脱敏 audit 明确记录 `policy_evaluated=false` 和 `executor_started=false`；真实 profile 越界和 Policy deny 仍关闭失败。当前没有 MCP 工具执行路径，也不会向模型暴露 MCP schema。
 
 默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。`WorkspaceTools` 对所有路径执行 lexical normalize、canonicalize existing parent、workspace containment 和 protected component 检查；多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
 

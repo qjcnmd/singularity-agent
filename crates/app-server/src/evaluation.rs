@@ -20,6 +20,7 @@ use singularity_evaluation::{
 };
 use singularity_model::{
     ModelErrorCategory, OpenAiProvider, ProviderConfigSnapshot, ProviderDiagnostic, ProviderError,
+    ProviderErrorStage,
 };
 use singularity_policy::{
     ApprovalPolicy, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
@@ -1130,7 +1131,10 @@ fn run_agent_stage(
     let sandbox_blocker = agent_sandbox_blocker(&run_status.audit_events);
     let stage = if let Some(blocker) = sandbox_blocker {
         StageExecution::blocked(blocker, command_diagnostics)
-    } else if let Some(kind) = agent_blocker_kind(result.error_category.as_ref()) {
+    } else if let Some(kind) = agent_blocker_kind(
+        result.error_category.as_ref(),
+        result.provider_diagnostic.as_ref(),
+    ) {
         StageExecution::blocked(
             evaluation_blocker(
                 kind,
@@ -1458,46 +1462,62 @@ fn agent_sandbox_blocker(audit_events: &[Value]) -> Option<EvaluationBlocker> {
 }
 
 fn provider_blocker(error: &ProviderError) -> EvaluationBlocker {
-    let kind = match error.error.category() {
+    let category = error.error.category();
+    let diagnostic = error.error.provider_diagnostic();
+    let kind = match category {
         ModelErrorCategory::Authentication => BlockerKind::ProviderAuthentication,
         ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {
             BlockerKind::Network
         }
         ModelErrorCategory::SandboxPermission => BlockerKind::Sandbox,
-        ModelErrorCategory::UnsupportedCapability
-        | ModelErrorCategory::InvalidRequest
-        | ModelErrorCategory::ToolCallParse
-        | ModelErrorCategory::JsonSchema
-        | ModelErrorCategory::ContentFilter
-        | ModelErrorCategory::UnknownProviderError => BlockerKind::ProviderResponse,
-        _ => BlockerKind::ProviderConfiguration,
+        ModelErrorCategory::ModelConfiguration => BlockerKind::ProviderConfiguration,
+        _ if provider_response_stage(&diagnostic) => BlockerKind::ProviderResponse,
+        _ => BlockerKind::AgentRuntime,
     };
     evaluation_blocker(kind, error.message.clone())
 }
 
-fn agent_blocker_kind(category: Option<&ModelErrorCategory>) -> Option<BlockerKind> {
+fn agent_blocker_kind(
+    category: Option<&ModelErrorCategory>,
+    diagnostic: Option<&ProviderDiagnostic>,
+) -> Option<BlockerKind> {
     match category {
         Some(ModelErrorCategory::Authentication) => Some(BlockerKind::ProviderAuthentication),
         Some(ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable) => {
             Some(BlockerKind::Network)
         }
         Some(ModelErrorCategory::SandboxPermission) => Some(BlockerKind::Sandbox),
-        Some(
-            ModelErrorCategory::InvalidRequest
-            | ModelErrorCategory::UnsupportedCapability
-            | ModelErrorCategory::ToolCallParse
-            | ModelErrorCategory::JsonSchema
-            | ModelErrorCategory::ContentFilter,
-        ) => Some(BlockerKind::ProviderResponse),
         Some(ModelErrorCategory::ModelConfiguration) => Some(BlockerKind::ProviderConfiguration),
+        Some(_) if diagnostic.is_some_and(provider_response_stage) => {
+            Some(BlockerKind::ProviderResponse)
+        }
         Some(
             ModelErrorCategory::Cancelled
+            | ModelErrorCategory::InvalidRequest
             | ModelErrorCategory::ContextLengthExceeded
             | ModelErrorCategory::BudgetExceeded,
         )
         | None => None,
-        Some(ModelErrorCategory::UnknownProviderError) => None,
+        Some(
+            ModelErrorCategory::UnsupportedCapability
+            | ModelErrorCategory::ToolCallParse
+            | ModelErrorCategory::JsonSchema
+            | ModelErrorCategory::ContentFilter
+            | ModelErrorCategory::UnknownProviderError,
+        ) => None,
     }
+}
+
+fn provider_response_stage(diagnostic: &ProviderDiagnostic) -> bool {
+    matches!(
+        diagnostic.stage,
+        Some(
+            ProviderErrorStage::ResponseStatus
+                | ProviderErrorStage::ResponseBodyRead
+                | ProviderErrorStage::ResponseJsonDecode
+                | ProviderErrorStage::ResponseValidation
+        )
+    )
 }
 
 fn evaluation_blocker(kind: BlockerKind, message: impl Into<String>) -> EvaluationBlocker {
@@ -1726,36 +1746,63 @@ mod tests {
 
     #[test]
     fn agent_blocker_kind_maps_typed_provider_categories() {
-        for (category, expected) in [
+        let response_validation = ProviderDiagnostic {
+            code: Some("provider_single_tool_call_contract_violated".to_string()),
+            stage: Some(ProviderErrorStage::ResponseValidation),
+            transport_category: None,
+            http_status: None,
+            validation_errors: vec!["max_tool_calls_exceeded".to_string()],
+        };
+        for (category, diagnostic, expected) in [
             (
                 ModelErrorCategory::Authentication,
+                None,
                 BlockerKind::ProviderAuthentication,
             ),
-            (ModelErrorCategory::Network, BlockerKind::Network),
+            (ModelErrorCategory::Network, None, BlockerKind::Network),
             (
                 ModelErrorCategory::ProviderUnavailable,
+                None,
                 BlockerKind::Network,
             ),
             (
                 ModelErrorCategory::ModelConfiguration,
+                None,
                 BlockerKind::ProviderConfiguration,
             ),
             (
                 ModelErrorCategory::UnsupportedCapability,
+                Some(&response_validation),
                 BlockerKind::ProviderResponse,
             ),
-            (ModelErrorCategory::SandboxPermission, BlockerKind::Sandbox),
+            (
+                ModelErrorCategory::SandboxPermission,
+                None,
+                BlockerKind::Sandbox,
+            ),
         ] {
-            assert_eq!(agent_blocker_kind(Some(&category)), Some(expected));
+            assert_eq!(
+                agent_blocker_kind(Some(&category), diagnostic),
+                Some(expected)
+            );
         }
-        assert_eq!(agent_blocker_kind(None), None);
+        assert_eq!(agent_blocker_kind(None, None), None);
         assert_eq!(
-            agent_blocker_kind(Some(&ModelErrorCategory::UnknownProviderError)),
+            agent_blocker_kind(Some(&ModelErrorCategory::UnknownProviderError), None),
             None
         );
         assert_eq!(
-            agent_blocker_kind(Some(&ModelErrorCategory::JsonSchema)),
-            Some(BlockerKind::ProviderResponse)
+            agent_blocker_kind(
+                Some(&ModelErrorCategory::InvalidRequest),
+                Some(&ProviderDiagnostic {
+                    code: Some("provider_request_invalid".to_string()),
+                    stage: Some(ProviderErrorStage::RequestSend),
+                    transport_category: None,
+                    http_status: None,
+                    validation_errors: vec!["request_id_missing".to_string()],
+                }),
+            ),
+            None
         );
     }
 

@@ -824,17 +824,18 @@ where
             }
             state.messages.push(assistant_tool_message);
             for provider_call in &response.tool_calls {
-                let (bound_call, forced_decision) =
+                let (bound_call, argument_error, forced_decision) =
                     match validate_tool_call_arguments(provider_call) {
-                        Err(_) => (provider_call.clone(), Some(ToolBrokerDecision::Allow)),
+                        Err(error) => (provider_call.clone(), Some(error), None),
                         Ok(()) => {
                             match bind_tool_call_to_profile(provider_call, &self.policy.profile) {
-                                Ok(call) => (call, None),
-                                Err(CommandBindingError::InvalidArguments) => {
-                                    (provider_call.clone(), Some(ToolBrokerDecision::Allow))
+                                Ok(call) => (call, None, None),
+                                Err(CommandBindingError::InvalidArguments(error)) => {
+                                    (provider_call.clone(), Some(error), None)
                                 }
                                 Err(CommandBindingError::ProfileViolation(reason)) => (
                                     provider_call.clone(),
+                                    None,
                                     Some(ToolBrokerDecision::deny(reason)),
                                 ),
                             }
@@ -844,35 +845,45 @@ where
                 if self.is_cancelled(input) {
                     return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
                 }
-                let decision = forced_decision.unwrap_or_else(|| {
-                    self.tool_decision(input, call, &mut state.used_approval_grants)
-                });
-                if let ToolBrokerDecision::Ask {
-                    approval_request_id,
-                    reason,
-                } = &decision
-                {
-                    state.approval_requests.push(approval_request(
-                        input,
+                let tool_result = if let Some(error) = argument_error {
+                    invalid_tool_arguments_result(call, error)
+                } else {
+                    let decision = forced_decision.unwrap_or_else(|| {
+                        self.tool_decision(input, call, &mut state.used_approval_grants)
+                    });
+                    if let ToolBrokerDecision::Ask {
                         approval_request_id,
-                        call,
                         reason,
-                    ));
-                    state
-                        .pending_tool_calls
-                        .push(PendingToolCall::new(input, call));
-                    let pending = state
-                        .pending_tool_calls
-                        .last()
-                        .expect("pending tool call was just inserted")
-                        .clone();
-                    let checkpoint = state.checkpoint(input, &pending, turn_index + 1);
-                    state.approval_checkpoints.push(checkpoint);
-                    let tool_result = self.execute_tool(call, decision);
-                    state.tool_results.push(tool_result);
-                    return state.finish(AgentStatus::Blocked, false, None, turn_index + 1, None);
-                }
-                let tool_result = self.execute_tool(call, decision);
+                    } = &decision
+                    {
+                        state.approval_requests.push(approval_request(
+                            input,
+                            approval_request_id,
+                            call,
+                            reason,
+                        ));
+                        state
+                            .pending_tool_calls
+                            .push(PendingToolCall::new(input, call));
+                        let pending = state
+                            .pending_tool_calls
+                            .last()
+                            .expect("pending tool call was just inserted")
+                            .clone();
+                        let checkpoint = state.checkpoint(input, &pending, turn_index + 1);
+                        state.approval_checkpoints.push(checkpoint);
+                        let tool_result = self.execute_tool(call, decision);
+                        state.tool_results.push(tool_result);
+                        return state.finish(
+                            AgentStatus::Blocked,
+                            false,
+                            None,
+                            turn_index + 1,
+                            None,
+                        );
+                    }
+                    self.execute_tool(call, decision)
+                };
                 let failed_tool_result = !tool_result.ok;
                 state.completion.observe(&tool_result);
                 state.tool_results.push(tool_result.clone());
@@ -1836,8 +1847,8 @@ fn approval_request_id_from_tool_call_id(turn_id: &str, tool_call_id: &str) -> S
 
 #[derive(Debug, Error)]
 enum CommandBindingError {
-    #[error("invalid command arguments")]
-    InvalidArguments,
+    #[error("{0}")]
+    InvalidArguments(AgentLoopToolError),
     #[error("{0}")]
     ProfileViolation(String),
 }
@@ -1850,7 +1861,7 @@ fn bind_tool_call_to_profile(
         return Ok(call.clone());
     }
     let mut input =
-        command_tool_input(&call.arguments).map_err(|_| CommandBindingError::InvalidArguments)?;
+        command_tool_input(&call.arguments).map_err(CommandBindingError::InvalidArguments)?;
     let cwd = input.effective_cwd().to_string();
     let timeout_seconds = input.effective_timeout_seconds();
     let (sandbox_mode, network_access) =
@@ -2005,6 +2016,25 @@ fn validate_tool_call_arguments(call: &ModelToolCall) -> Result<(), AgentLoopToo
         TOOL_COMMAND => command_tool_input(&call.arguments).map(|_| ()),
         _ => Ok(()),
     }
+}
+
+fn invalid_tool_arguments_result(call: &ModelToolCall, error: AgentLoopToolError) -> ToolResult {
+    let envelope = ToolCallRequest::new(
+        call.tool_call_id.clone(),
+        call.tool_name.clone(),
+        call.raw_arguments.clone(),
+    );
+    let mut audit = json!({
+        "argument_validation": "failed",
+        "policy_evaluated": false,
+        "executor_started": false,
+        "tool_provenance": "agent_requested",
+    });
+    if call.tool_name == TOOL_COMMAND {
+        audit["sandbox_backend"] = json!("not_executed");
+        audit["command_provenance"] = json!("agent_requested");
+    }
+    ToolResult::from_result(&envelope, &workspace_tool_failure(error)).with_audit(audit)
 }
 
 fn invalid_tool_arguments(error: serde_json::Error) -> AgentLoopToolError {

@@ -1211,6 +1211,8 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     let run_status = result.to_run_status();
     assert_eq!(run_status.audit_events.len(), 2);
     assert_eq!(run_status.audit_events[0]["argument_validation"], "failed");
+    assert_eq!(run_status.audit_events[0]["policy_evaluated"], false);
+    assert_eq!(run_status.audit_events[0]["executor_started"], false);
     assert!(
         run_status.audit_events[0]
             .get("approval_decision")
@@ -1253,6 +1255,16 @@ fn agent_loop_validates_patch_arguments_before_policy() {
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
         Some("invalid_tool_arguments")
+    );
+    let run_status = result.to_run_status();
+    assert_eq!(run_status.audit_events.len(), 1);
+    assert_eq!(run_status.audit_events[0]["argument_validation"], "failed");
+    assert_eq!(run_status.audit_events[0]["policy_evaluated"], false);
+    assert_eq!(run_status.audit_events[0]["executor_started"], false);
+    assert!(
+        run_status.audit_events[0]
+            .get("approval_decision")
+            .is_none()
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
