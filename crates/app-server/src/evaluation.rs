@@ -2458,7 +2458,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_path_budget_failure_is_blocked_before_expected_failure_gate() {
+    fn baseline_expected_failure_with_path_marker_passes_semantically() {
         let temp = tempfile::tempdir().expect("temp");
         let execution = run_verification_after_setup(
             temp.path(),
@@ -2469,15 +2469,9 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(execution.result.status, StageStatus::Blocked);
-        assert_eq!(
-            execution
-                .result
-                .blocker
-                .as_ref()
-                .map(|blocker| blocker.kind),
-            Some(BlockerKind::WorkspacePreparation)
-        );
+        assert_eq!(execution.result.status, StageStatus::Passed);
+        assert!(execution.result.blocker.is_none());
+        assert_eq!(execution.diagnostics.commands.len(), 1);
     }
 
     #[test]
