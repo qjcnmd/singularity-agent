@@ -673,9 +673,11 @@ fn prepare_source(
             }
             let checkout = run_raw_command(
                 task_dir,
-                source_dir,
+                task_dir,
                 vec![
                     "git".to_string(),
+                    "-C".to_string(),
+                    SOURCE_DIR.to_string(),
                     "checkout".to_string(),
                     "--quiet".to_string(),
                     "--detach".to_string(),
@@ -2432,6 +2434,12 @@ mod tests {
                 let source = Path::new(&request.cwd).join(SOURCE_DIR);
                 fs::create_dir(&source).expect("source directory");
                 fs::write(source.join("README.md"), "fixture").expect("source file");
+            } else {
+                assert_eq!(request.cwd, request.filesystem.workspace_root);
+                assert_eq!(
+                    request.argv.get(1..4),
+                    Some(["-C", SOURCE_DIR, "checkout"].map(String::from).as_slice())
+                );
             }
             CommandResult::completed(&request.command_id, "ok")
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
