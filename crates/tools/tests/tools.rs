@@ -6,6 +6,7 @@ use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
     ToolBrokerDecision, ToolCallRequest, ToolOutput, ToolRegistry, ToolResult, ToolSpec,
     WorkspacePatch, WorkspacePatchChange, WorkspaceToolError, WorkspaceTools, command_scope_digest,
+    workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -609,7 +610,8 @@ fn workspace_read_supports_line_ranges_pagination_and_strict_limits() {
     assert_eq!(bounded.content["preview"], "two\n");
     assert_eq!(bounded.content["truncated"], true);
     assert_eq!(bounded.content["line_end"], 2);
-    assert_eq!(bounded.content["next_line_start"], 2);
+    assert_eq!(bounded.content["partial_line"], false);
+    assert_eq!(bounded.content["next_line_start"], 3);
 
     std::fs::write(workspace.join("long.txt"), "abcdefghij\n").expect("write long line");
     let long_line = tools
@@ -623,6 +625,8 @@ fn workspace_read_supports_line_ranges_pagination_and_strict_limits() {
     assert_eq!(long_line.content["preview"], "abc");
     assert_eq!(long_line.content["truncated"], true);
     assert_eq!(long_line.content["total_lines"], 1);
+    assert_eq!(long_line.content["partial_line"], true);
+    assert!(long_line.content.get("next_line_start").is_none());
 
     for input in [
         ReadToolInput {
@@ -866,6 +870,72 @@ fn workspace_grep_supports_case_control_and_deterministic_order() {
 }
 
 #[test]
+fn workspace_grep_only_marks_truncated_after_an_extra_cross_file_match() {
+    let workspace = test_workspace("grep-exact-cross-file-limit");
+    std::fs::write(workspace.join("a.txt"), "needle\n").expect("write first file");
+    std::fs::write(workspace.join("b.txt"), "no match\n").expect("write second file");
+    let tools = WorkspaceTools::new(&workspace);
+
+    let exact = tools
+        .grep(GrepToolInput {
+            path: None,
+            pattern: "needle".to_string(),
+            max_matches: Some(1),
+            case_sensitive: true,
+        })
+        .expect("grep exact limit");
+    assert_eq!(exact.content["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(exact.content["truncated"], false);
+
+    std::fs::write(workspace.join("b.txt"), "needle again\n").expect("write extra match");
+    let truncated = tools
+        .grep(GrepToolInput {
+            path: None,
+            pattern: "needle".to_string(),
+            max_matches: Some(1),
+            case_sensitive: true,
+        })
+        .expect("grep above limit");
+    assert_eq!(truncated.content["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(truncated.content["truncated"], true);
+
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_tool_specs_share_the_runtime_navigation_contract() {
+    let specs = workspace_tool_specs();
+    let schema = |name: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("properties")
+    };
+
+    let read = schema("builtin.read");
+    assert!(read.contains_key("line_start"));
+    assert!(read.contains_key("line_end"));
+    assert_eq!(read["max_chars"]["maximum"], 1_000_000);
+
+    let list = schema("builtin.list");
+    assert!(list.contains_key("recursive"));
+    assert_eq!(list["max_depth"]["maximum"], 64);
+
+    let grep = schema("builtin.grep");
+    assert_eq!(grep["case_sensitive"]["default"], true);
+    assert_eq!(grep["max_matches"]["maximum"], 10_000);
+
+    let command = schema("builtin.command");
+    assert_eq!(command["timeout_seconds"]["maximum"], 3_600);
+    assert!(!command.contains_key("sandbox_mode"));
+    assert!(!command.contains_key("network_access"));
+}
+
+#[test]
 fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
     let cases = [
         serde_json::from_value::<ReadToolInput>(serde_json::json!({
@@ -920,6 +990,33 @@ fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
     let workspace = test_workspace("invalid-inputs");
     let tools = WorkspaceTools::new(&workspace);
     assert!(matches!(
+        tools.read(ReadToolInput {
+            path: " ".to_string(),
+            max_chars: None,
+            line_start: None,
+            line_end: None,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        tools.list(ListToolInput {
+            path: Some(String::new()),
+            max_entries: None,
+            recursive: false,
+            max_depth: None,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        tools.grep(GrepToolInput {
+            path: Some(String::new()),
+            pattern: "needle".to_string(),
+            max_matches: None,
+            case_sensitive: true,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+    assert!(matches!(
         tools.patch(
             WorkspacePatch {
                 changes: Vec::new()
@@ -929,9 +1026,42 @@ fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
         Err(WorkspaceToolError::InvalidInput(_))
     ));
     assert!(matches!(
+        tools.patch(
+            WorkspacePatch {
+                changes: vec![WorkspacePatchChange {
+                    path: String::new(),
+                    expected: None,
+                    replacement: "new".to_string(),
+                }],
+            },
+            &ToolBrokerDecision::Allow,
+        ),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+    assert!(matches!(
         tools.command(CommandToolInput {
             argv: Vec::new(),
             cwd: None,
+            timeout_seconds: None,
+            sandbox_mode: None,
+            network_access: None,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        tools.command(CommandToolInput {
+            argv: vec![String::new()],
+            cwd: None,
+            timeout_seconds: None,
+            sandbox_mode: None,
+            network_access: None,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        tools.command(CommandToolInput {
+            argv: vec!["git".to_string()],
+            cwd: Some(" ".to_string()),
             timeout_seconds: None,
             sandbox_mode: None,
             network_access: None,

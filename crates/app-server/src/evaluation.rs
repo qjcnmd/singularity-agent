@@ -31,11 +31,10 @@ use singularity_protocol::{EvalRunParams, EvalRunResult};
 use singularity_tools::{
     CommandEnvironmentPolicy, SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode,
     ToolBroker, ToolRegistry, WorkspaceTools, command_scope_digest, command_scope_resource,
+    workspace_tool_specs,
 };
 
-use super::{
-    TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ, workspace_tool_specs,
-};
+use super::{TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ};
 
 mod command;
 mod workspace;

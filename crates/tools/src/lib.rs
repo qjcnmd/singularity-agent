@@ -65,6 +65,12 @@ const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "reveal hidden",
     "system prompt",
 ];
+pub const BUILTIN_READ_TOOL: &str = "builtin.read";
+pub const BUILTIN_LIST_TOOL: &str = "builtin.list";
+pub const BUILTIN_GREP_TOOL: &str = "builtin.grep";
+pub const BUILTIN_EDIT_TOOL: &str = "builtin.edit";
+pub const BUILTIN_PATCH_TOOL: &str = "builtin.patch";
+pub const BUILTIN_COMMAND_TOOL: &str = "builtin.command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -95,6 +101,112 @@ impl ToolSpec {
             "input_schema": self.input_schema,
         })
     }
+}
+
+pub fn workspace_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec::new(
+            BUILTIN_READ_TOOL,
+            "Read a bounded range from a workspace text file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "max_chars": {"type": "integer", "minimum": 1, "maximum": MAX_READ_MAX_CHARS},
+                    "line_start": {"type": "integer", "minimum": 1},
+                    "line_end": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            BUILTIN_LIST_TOOL,
+            "List bounded workspace directory entries with optional recursion",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_ENTRIES},
+                    "recursive": {"type": "boolean", "default": false},
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_DEPTH}
+                },
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            BUILTIN_GREP_TOOL,
+            "Search bounded workspace text with deterministic ordering",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "pattern": {"type": "string", "minLength": 1},
+                    "max_matches": {"type": "integer", "minimum": 1, "maximum": MAX_GREP_MAX_MATCHES},
+                    "case_sensitive": {"type": "boolean", "default": true}
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            BUILTIN_EDIT_TOOL,
+            "Replace expected text in a workspace file",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "expected": {"type": "string"},
+                    "replacement": {"type": "string"}
+                },
+                "required": ["path", "expected", "replacement"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            BUILTIN_PATCH_TOOL,
+            "Apply explicit workspace file changes",
+            json!({
+                "type": "object",
+                "properties": {
+                    "changes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "minLength": 1},
+                                "expected": {"type": ["string", "null"]},
+                                "replacement": {"type": "string"}
+                            },
+                            "required": ["path", "replacement"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["changes"],
+                "additionalProperties": false
+            }),
+        ),
+        ToolSpec::new(
+            BUILTIN_COMMAND_TOOL,
+            "Run a bounded sandboxed command",
+            json!({
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1
+                    },
+                    "cwd": {"type": "string", "minLength": 1},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_COMMAND_TIMEOUT_SECONDS}
+                },
+                "required": ["argv"],
+                "additionalProperties": false
+            }),
+        ),
+    ]
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
@@ -598,6 +710,7 @@ impl WorkspaceTools {
     }
 
     pub fn read(&self, input: ReadToolInput) -> Result<ToolOutput, WorkspaceToolError> {
+        validate_nonempty_path("path", &input.path)?;
         let max_chars = validate_limit(
             "max_chars",
             input.max_chars,
@@ -618,7 +731,7 @@ impl WorkspaceTools {
         let mut actual_line_end = None;
         let mut total_lines = 0usize;
         let mut total_bytes = 0usize;
-        let mut partial_line = false;
+        let mut last_line_partial = false;
 
         loop {
             line.clear();
@@ -654,7 +767,6 @@ impl WorkspaceTools {
             let remaining = max_chars.saturating_sub(preview.chars().count());
             if remaining == 0 {
                 preview_truncated = true;
-                partial_line = true;
                 continue;
             }
             let (bounded, truncated) = bounded_text(&text, remaining);
@@ -662,13 +774,13 @@ impl WorkspaceTools {
             actual_line_end = Some(total_lines);
             if truncated {
                 preview_truncated = true;
-                partial_line = true;
+                last_line_partial = true;
             }
         }
 
         let next_line_start = actual_line_end.and_then(|line_end| {
-            if partial_line {
-                Some(line_end)
+            if last_line_partial {
+                None
             } else if line_end < total_lines {
                 line_end.checked_add(1)
             } else {
@@ -688,6 +800,7 @@ impl WorkspaceTools {
             "line_start": actual_line_start,
             "line_end": actual_line_end,
             "total_lines": total_lines,
+            "partial_line": last_line_partial,
             "artifact_ref": artifact,
         });
         if let Some(next_line_start) = next_line_start {
@@ -697,6 +810,9 @@ impl WorkspaceTools {
     }
 
     pub fn list(&self, input: ListToolInput) -> Result<ToolOutput, WorkspaceToolError> {
+        if let Some(path) = input.path.as_deref() {
+            validate_nonempty_path("path", path)?;
+        }
         let target = self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
         let max_entries = validate_limit(
             "max_entries",
@@ -744,6 +860,9 @@ impl WorkspaceTools {
                 "pattern must not be empty".to_string(),
             ));
         }
+        if let Some(path) = input.path.as_deref() {
+            validate_nonempty_path("path", path)?;
+        }
         let root = self
             .resolve_workspace_path(input.path.as_deref().unwrap_or("."), input.path.is_none())?;
         let max_matches = validate_limit(
@@ -753,13 +872,15 @@ impl WorkspaceTools {
             MAX_GREP_MAX_MATCHES,
         )?;
         let mut matches = Vec::new();
+        let collection_limit = max_matches.saturating_add(1);
         let truncated = self.grep_path(
             &root,
             &input.pattern,
             input.case_sensitive,
-            max_matches,
+            collection_limit,
             &mut matches,
         )?;
+        matches.truncate(max_matches);
         Ok(ToolOutput::success(json!({
             "matches": matches,
             "truncated": truncated,
@@ -801,6 +922,7 @@ impl WorkspaceTools {
         let mut prepared = Vec::new();
         let mut targets = BTreeSet::new();
         for change in &patch.changes {
+            validate_nonempty_path("changes[].path", &change.path)?;
             let target = self.resolve_workspace_path(&change.path, false)?;
             let relative = self.relative_path(&target);
             if !targets.insert(target.clone()) {
@@ -983,10 +1105,10 @@ impl WorkspaceTools {
         root: &Path,
         pattern: &str,
         case_sensitive: bool,
-        max_matches: usize,
+        collection_limit: usize,
         matches: &mut Vec<Value>,
     ) -> Result<bool, WorkspaceToolError> {
-        if matches.len() >= max_matches {
+        if matches.len() >= collection_limit {
             return Ok(true);
         }
         let metadata = std::fs::symlink_metadata(root).map_err(io_error)?;
@@ -1002,7 +1124,13 @@ impl WorkspaceTools {
                 if is_protected_path(&entry.relative) || entry.is_symlink_or_reparse {
                     continue;
                 }
-                if self.grep_path(&entry.path, pattern, case_sensitive, max_matches, matches)? {
+                if self.grep_path(
+                    &entry.path,
+                    pattern,
+                    case_sensitive,
+                    collection_limit,
+                    matches,
+                )? {
                     return Ok(true);
                 }
             }
@@ -1041,11 +1169,11 @@ impl WorkspaceTools {
                     "line": line_number,
                     "preview": preview,
                 }));
-                if matches.len().saturating_add(file_matches.len()) > max_matches {
+                if matches.len().saturating_add(file_matches.len()) >= collection_limit {
                     matches.extend(
                         file_matches
                             .into_iter()
-                            .take(max_matches.saturating_sub(matches.len())),
+                            .take(collection_limit.saturating_sub(matches.len())),
                     );
                     return Ok(true);
                 }
@@ -1162,6 +1290,15 @@ fn validate_line_range(line_start: usize, line_end: usize) -> Result<(), Workspa
     Ok(())
 }
 
+fn validate_nonempty_path(name: &str, path: &str) -> Result<(), WorkspaceToolError> {
+    if path.trim().is_empty() {
+        return Err(WorkspaceToolError::InvalidInput(format!(
+            "{name} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
 fn metadata_is_symlink_or_reparse(metadata: &Metadata) -> bool {
     metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata)
 }
@@ -1194,6 +1331,16 @@ impl CommandToolInput {
         if self.argv.is_empty() {
             return Err(WorkspaceToolError::InvalidInput(
                 "argv must contain at least one argument".to_string(),
+            ));
+        }
+        if self.argv[0].trim().is_empty() {
+            return Err(WorkspaceToolError::InvalidInput(
+                "argv[0] must not be empty".to_string(),
+            ));
+        }
+        if self.cwd.as_deref().is_some_and(|cwd| cwd.trim().is_empty()) {
+            return Err(WorkspaceToolError::InvalidInput(
+                "cwd must not be empty".to_string(),
             ));
         }
         if self.timeout_seconds == Some(0) {

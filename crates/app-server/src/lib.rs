@@ -36,8 +36,11 @@ use singularity_protocol::{
 };
 use singularity_store::{CommittedTurnOutcome, SessionStore, StoreError};
 use singularity_tools::{
-    CommandToolInput, SandboxBackend, ToolBroker, ToolRegistry, ToolSpec, WindowsSandboxBackend,
-    WorkspaceTools, command_scope_digest,
+    BUILTIN_COMMAND_TOOL as TOOL_COMMAND, BUILTIN_EDIT_TOOL as TOOL_EDIT,
+    BUILTIN_GREP_TOOL as TOOL_GREP, BUILTIN_LIST_TOOL as TOOL_LIST,
+    BUILTIN_PATCH_TOOL as TOOL_PATCH, BUILTIN_READ_TOOL as TOOL_READ, CommandToolInput,
+    SandboxBackend, ToolBroker, ToolRegistry, WindowsSandboxBackend, WorkspaceTools,
+    command_scope_digest, workspace_tool_specs,
 };
 use thiserror::Error;
 
@@ -55,12 +58,6 @@ const APPROVAL_REQUEST_INTERNAL_ONLY: &str =
     "approval/request is internal to the AgentLoop approval ledger";
 const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
-const TOOL_READ: &str = "builtin.read";
-const TOOL_LIST: &str = "builtin.list";
-const TOOL_GREP: &str = "builtin.grep";
-const TOOL_EDIT: &str = "builtin.edit";
-const TOOL_PATCH: &str = "builtin.patch";
-const TOOL_COMMAND: &str = "builtin.command";
 const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
 const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 const TURN_CANCELLATION_POLL_MS: u64 = 25;
@@ -1696,106 +1693,6 @@ fn sandbox_command_rule() -> PermissionRule {
         PermissionDecisionOutcome::Allow,
     )
     .for_operation(PermissionOperation::Execute)
-}
-
-fn workspace_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec::new(
-            TOOL_READ,
-            "Read a workspace file",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "max_chars": {"type": "integer", "minimum": 1}
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        ),
-        ToolSpec::new(
-            TOOL_LIST,
-            "List workspace directory entries",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "max_entries": {"type": "integer", "minimum": 1}
-                },
-                "additionalProperties": false
-            }),
-        ),
-        ToolSpec::new(
-            TOOL_GREP,
-            "Search workspace text files",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "pattern": {"type": "string"},
-                    "max_matches": {"type": "integer", "minimum": 1}
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-        ),
-        ToolSpec::new(
-            TOOL_EDIT,
-            "Replace expected text in a workspace file",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "expected": {"type": "string"},
-                    "replacement": {"type": "string"}
-                },
-                "required": ["path", "expected", "replacement"],
-                "additionalProperties": false
-            }),
-        ),
-        ToolSpec::new(
-            TOOL_PATCH,
-            "Apply explicit workspace file changes",
-            json!({
-                "type": "object",
-                "properties": {
-                    "changes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string"},
-                                "expected": {"type": ["string", "null"]},
-                                "replacement": {"type": "string"}
-                            },
-                            "required": ["path", "replacement"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["changes"],
-                "additionalProperties": false
-            }),
-        ),
-        ToolSpec::new(
-            TOOL_COMMAND,
-            "Run a sandboxed command",
-            json!({
-                "type": "object",
-                "properties": {
-                    "argv": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1
-                    },
-                    "cwd": {"type": "string"},
-                    "timeout_seconds": {"type": "integer", "minimum": 1}
-                },
-                "required": ["argv"],
-                "additionalProperties": false
-            }),
-        ),
-    ]
 }
 
 fn json_error(id: Option<Value>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
