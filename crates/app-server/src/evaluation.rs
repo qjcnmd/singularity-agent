@@ -248,7 +248,7 @@ pub(crate) fn run_evaluation(
         task_executions.push(run_task(
             &run_id,
             &run_dir,
-            &plan,
+            plan,
             Arc::clone(&sandbox_backend),
             provider_snapshot,
         ));
