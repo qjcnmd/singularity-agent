@@ -627,10 +627,11 @@ fn public_representative_manifest_is_validated_by_the_crate() {
         .join("public-representative-task.json");
     let manifest = EvaluationManifest::load(&path).expect("load public manifest");
 
-    assert_eq!(manifest.task_set().tasks.len(), 3);
+    assert_eq!(manifest.task_set().tasks.len(), 5);
     for task in &manifest.task_set().tasks {
         let projection = task.agent_projection();
         let projection_json = serde_json::to_string(&projection).expect("serialize projection");
+        assert!(!projection_json.contains("capabilities"));
         assert!(!projection_json.contains("test_patch"));
         assert!(!projection_json.contains(PUBLIC_TEST_PATCH_MARKER));
         assert!(!projection_json.contains(HIDDEN_TEST_PATCH_MARKER));

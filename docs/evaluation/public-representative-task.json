@@ -69,7 +69,8 @@
           "builtin.grep",
           "builtin.edit",
           "builtin.patch",
-          "builtin.command"
+          "builtin.command",
+          "builtin.update_plan"
         ],
         "smoke_commands": [
           {
@@ -160,7 +161,8 @@
           "builtin.grep",
           "builtin.edit",
           "builtin.patch",
-          "builtin.command"
+          "builtin.command",
+          "builtin.update_plan"
         ],
         "smoke_commands": [
           {
@@ -267,7 +269,8 @@
           "builtin.grep",
           "builtin.edit",
           "builtin.patch",
-          "builtin.command"
+          "builtin.command",
+          "builtin.update_plan"
         ],
         "smoke_commands": [
           {
@@ -305,6 +308,198 @@
           "commands": [
             {"argv": ["cargo", "test", "--locked", "--test", "hidden"], "timeout_seconds": 120},
             {"argv": ["node", "hidden_test.mjs"], "timeout_seconds": 30}
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "node_inventory__summary",
+      "description": "Local Node.js representative task for multi-file inventory summaries.",
+      "capabilities": [
+        "node",
+        "feature_implementation",
+        "multi_file_change",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "local",
+          "path": "fixtures/node-inventory"
+        }
+      },
+      "agent": {
+        "instructions": "Implement the seeded inventory summary feature in catalog.mjs and inventory.mjs. Only modify those two source files, do not modify smoke_test.mjs or add dependencies. Use builtin.command with exactly [\"node\", \"smoke_test.mjs\"] after your focused edits; continue until it succeeds and report the verification result.",
+        "allowed_paths": [
+          "catalog.mjs",
+          "inventory.mjs"
+        ],
+        "allowed_tools": [
+          "builtin.read",
+          "builtin.grep",
+          "builtin.edit",
+          "builtin.patch",
+          "builtin.command",
+          "builtin.update_plan"
+        ],
+        "smoke_commands": [
+          {
+            "argv": [
+              "node",
+              "smoke_test.mjs"
+            ],
+            "timeout_seconds": 30
+          }
+        ]
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/public_inventory.mjs b/tests/public_inventory.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/public_inventory.mjs\n@@ -0,0 +1,13 @@\n+import assert from \"node:assert/strict\";\n+import { summarizeInventory } from \"../inventory.mjs\";\n+\n+const result = summarizeInventory([\n+  { sku: \"A-17\", unitPrice: 4.5, quantity: 2, reorderPoint: 3 },\n+  { sku: \"B-04\", unitPrice: 3, quantity: 5, reorderPoint: 4 },\n+]);\n+\n+assert.deepEqual(result, {\n+  totalUnits: 7,\n+  totalValue: 24,\n+  lowStockSkus: [\"A-17\"],\n+});\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/hidden_inventory.mjs b/tests/hidden_inventory.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/hidden_inventory.mjs\n@@ -0,0 +1,19 @@\n+import assert from \"node:assert/strict\";\n+import { summarizeInventory } from \"../inventory.mjs\";\n+\n+assert.deepEqual(summarizeInventory([]), {\n+  totalUnits: 0,\n+  totalValue: 0,\n+  lowStockSkus: [],\n+});\n+\n+const edgeCase = summarizeInventory([\n+  { sku: \"C-09\", unitPrice: 1.25, quantity: 0, reorderPoint: 0 },\n+  { sku: \"D-02\", unitPrice: 2.5, quantity: 4, reorderPoint: 5 },\n+]);\n+\n+assert.deepEqual(edgeCase, {\n+  totalUnits: 4,\n+  totalValue: 10,\n+  lowStockSkus: [\"C-09\", \"D-02\"],\n+});\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                "node",
+                "tests/public_inventory.mjs"
+              ],
+              "timeout_seconds": 30
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                "node",
+                "tests/public_inventory.mjs"
+              ],
+              "timeout_seconds": 30
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                "node",
+                "tests/hidden_inventory.mjs"
+              ],
+              "timeout_seconds": 30
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task_id": "repository_context__billing_report",
+      "description": "Local Python repository-context task for signed billing reports with service fees.",
+      "capabilities": [
+        "repository_context",
+        "multi_file_change",
+        "failure_diagnosis",
+        "python",
+        "required_verification",
+        "sandbox_enforcement"
+      ],
+      "workspace": {
+        "source": {
+          "type": "local",
+          "path": "fixtures/repository-context"
+        }
+      },
+      "agent": {
+        "instructions": "Fix the seeded billing report behavior in src/billing/ledger.py and src/billing/report.py. First use builtin.list, builtin.grep, and builtin.read to inspect the multi-directory repository and trace the billing rules; only modify those two source files, do not modify smoke_test.py or add dependencies. Use builtin.command with exactly [\"python\", \"-B\", \"smoke_test.py\"] after your focused edits; continue until it succeeds and report the verification result.",
+        "allowed_paths": [
+          "src/billing/ledger.py",
+          "src/billing/report.py"
+        ],
+        "allowed_tools": [
+          "builtin.read",
+          "builtin.list",
+          "builtin.grep",
+          "builtin.edit",
+          "builtin.patch",
+          "builtin.command",
+          "builtin.update_plan"
+        ],
+        "smoke_commands": [
+          {
+            "argv": [
+              "python",
+              "-B",
+              "smoke_test.py"
+            ],
+            "timeout_seconds": 30
+          }
+        ]
+      },
+      "evaluator": {
+        "public_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/test_public_billing.py b/tests/test_public_billing.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_public_billing.py\n@@ -0,0 +1,26 @@\n+import unittest\n+from decimal import Decimal\n+\n+from src.billing.ledger import net_amount\n+from src.billing.report import build_report\n+\n+\n+class PublicBillingTests(unittest.TestCase):\n+    def test_sales_and_refunds_are_aggregated_before_fee(self):\n+        entries = [\n+            {\"reference\": \"sale-100\", \"amount\": \"125.50\"},\n+            {\"reference\": \"refund-20\", \"amount\": \"-20.00\"},\n+        ]\n+        self.assertEqual(net_amount(entries), Decimal(\"105.50\"))\n+        self.assertEqual(\n+            build_report(entries, \"0.05\"),\n+            {\n+                \"net\": Decimal(\"105.50\"),\n+                \"service_fee\": Decimal(\"5.28\"),\n+                \"grand_total\": Decimal(\"110.78\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
+        },
+        "hidden_test_patch": {
+          "format": "unified_diff",
+          "content": "diff --git a/tests/test_hidden_billing.py b/tests/test_hidden_billing.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_hidden_billing.py\n@@ -0,0 +1,36 @@\n+import unittest\n+from decimal import Decimal\n+\n+from src.billing.ledger import net_amount\n+from src.billing.report import build_report\n+\n+\n+class HiddenBillingTests(unittest.TestCase):\n+    def test_empty_billing_report_is_zero(self):\n+        self.assertEqual(net_amount([]), Decimal(\"0.00\"))\n+        self.assertEqual(\n+            build_report([], \"0.10\"),\n+            {\n+                \"net\": Decimal(\"0.00\"),\n+                \"service_fee\": Decimal(\"0.00\"),\n+                \"grand_total\": Decimal(\"0.00\"),\n+            },\n+        )\n+\n+    def test_fractional_fee_is_rounded_after_all_entries(self):\n+        entries = [\n+            {\"reference\": \"sale-small-1\", \"amount\": \"0.01\"},\n+            {\"reference\": \"sale-small-2\", \"amount\": \"0.02\"},\n+        ]\n+        self.assertEqual(\n+            build_report(entries, \"0.075\"),\n+            {\n+                \"net\": Decimal(\"0.03\"),\n+                \"service_fee\": Decimal(\"0.00\"),\n+                \"grand_total\": Decimal(\"0.03\"),\n+            },\n+        )\n+\n+\n+if __name__ == \"__main__\":\n+    unittest.main()\n"
+        },
+        "baseline": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_public_billing.py"
+              ],
+              "timeout_seconds": 60
+            }
+          ]
+        },
+        "public": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_public_billing.py"
+              ],
+              "timeout_seconds": 60
+            }
+          ]
+        },
+        "hidden": {
+          "commands": [
+            {
+              "argv": [
+                "python",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_hidden_billing.py"
+              ],
+              "timeout_seconds": 60
+            }
           ]
         }
       }

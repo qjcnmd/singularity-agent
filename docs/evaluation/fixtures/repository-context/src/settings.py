@@ -1,0 +1,2 @@
+DEFAULT_PAGE_SIZE = 50
+SUPPORTED_LOCALES = ("en-US", "en-GB", "zh-CN")
