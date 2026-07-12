@@ -459,6 +459,8 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         .read(ReadToolInput {
             path: "README.md".to_string(),
             max_chars: Some(5),
+            line_start: None,
+            line_end: None,
         })
         .expect("read");
     assert_eq!(read.content["preview"], "alpha");
@@ -474,6 +476,8 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         .read(ReadToolInput {
             path: "binary.bin".to_string(),
             max_chars: None,
+            line_start: None,
+            line_end: None,
         })
         .expect("binary read");
     assert_eq!(binary.content["binary"], true);
@@ -483,6 +487,8 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         tools.read(ReadToolInput {
             path: ".env".to_string(),
             max_chars: None,
+            line_start: None,
+            line_end: None,
         }),
         Err(WorkspaceToolError::ProtectedPath(_))
     ));
@@ -491,6 +497,7 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
             path: Some(".env".to_string()),
             pattern: "TOKEN".to_string(),
             max_matches: Some(10),
+            case_sensitive: true,
         }),
         Err(WorkspaceToolError::ProtectedPath(_))
     ));
@@ -498,6 +505,8 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         tools.read(ReadToolInput {
             path: "nested/.env".to_string(),
             max_chars: None,
+            line_start: None,
+            line_end: None,
         }),
         Err(WorkspaceToolError::ProtectedPath(_))
     ));
@@ -505,6 +514,8 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         tools.read(ReadToolInput {
             path: path_str(&outside).to_string(),
             max_chars: None,
+            line_start: None,
+            line_end: None,
         }),
         Err(WorkspaceToolError::OutsideWorkspace(_))
     ));
@@ -513,6 +524,8 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         .list(ListToolInput {
             path: None,
             max_entries: Some(10),
+            recursive: false,
+            max_depth: None,
         })
         .expect("list");
     let entries = listed.content["entries"].as_array().expect("entries");
@@ -525,6 +538,7 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
             path: None,
             pattern: "beta".to_string(),
             max_matches: Some(1),
+            case_sensitive: true,
         })
         .expect("grep");
     assert_eq!(matches.content["matches"].as_array().unwrap().len(), 1);
@@ -535,6 +549,405 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
             .contains("TOKEN=secret")
     );
 
+    let binary_matches = tools
+        .grep(GrepToolInput {
+            path: None,
+            pattern: "def".to_string(),
+            max_matches: Some(10),
+            case_sensitive: true,
+        })
+        .expect("grep binary");
+    assert!(
+        binary_matches.content["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_read_supports_line_ranges_pagination_and_strict_limits() {
+    let workspace = test_workspace("read-lines");
+    std::fs::write(workspace.join("lines.txt"), "one\ntwo\nthree\nfour\n").expect("write lines");
+    let tools = WorkspaceTools::new(&workspace);
+
+    let page = tools
+        .read(ReadToolInput {
+            path: "lines.txt".to_string(),
+            max_chars: None,
+            line_start: Some(2),
+            line_end: Some(3),
+        })
+        .expect("read page");
+    assert_eq!(page.content["preview"], "two\nthree\n");
+    assert_eq!(page.content["line_start"], 2);
+    assert_eq!(page.content["line_end"], 3);
+    assert_eq!(page.content["total_lines"], 4);
+    assert_eq!(page.content["next_line_start"], 4);
+    assert_eq!(page.content["truncated"], false);
+
+    let complete = tools
+        .read(ReadToolInput {
+            path: "lines.txt".to_string(),
+            max_chars: None,
+            line_start: None,
+            line_end: None,
+        })
+        .expect("complete read");
+    assert!(complete.content.get("next_line_start").is_none());
+
+    let bounded = tools
+        .read(ReadToolInput {
+            path: "lines.txt".to_string(),
+            max_chars: Some(4),
+            line_start: Some(2),
+            line_end: Some(3),
+        })
+        .expect("bounded page");
+    assert_eq!(bounded.content["preview"], "two\n");
+    assert_eq!(bounded.content["truncated"], true);
+    assert_eq!(bounded.content["line_end"], 2);
+    assert_eq!(bounded.content["next_line_start"], 2);
+
+    std::fs::write(workspace.join("long.txt"), "abcdefghij\n").expect("write long line");
+    let long_line = tools
+        .read(ReadToolInput {
+            path: "long.txt".to_string(),
+            max_chars: Some(3),
+            line_start: None,
+            line_end: None,
+        })
+        .expect("read long line");
+    assert_eq!(long_line.content["preview"], "abc");
+    assert_eq!(long_line.content["truncated"], true);
+    assert_eq!(long_line.content["total_lines"], 1);
+
+    for input in [
+        ReadToolInput {
+            path: "lines.txt".to_string(),
+            max_chars: None,
+            line_start: Some(0),
+            line_end: None,
+        },
+        ReadToolInput {
+            path: "lines.txt".to_string(),
+            max_chars: None,
+            line_start: Some(3),
+            line_end: Some(2),
+        },
+        ReadToolInput {
+            path: "lines.txt".to_string(),
+            max_chars: Some(0),
+            line_start: None,
+            line_end: None,
+        },
+    ] {
+        assert!(matches!(
+            tools.read(input),
+            Err(WorkspaceToolError::InvalidInput(_))
+        ));
+    }
+    assert!(matches!(
+        tools.read(ReadToolInput {
+            path: "lines.txt".to_string(),
+            max_chars: Some(1_000_001),
+            line_start: None,
+            line_end: None,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_list_is_sorted_recursive_depth_bounded_and_truncated_correctly() {
+    let workspace = test_workspace("list-recursive");
+    std::fs::write(workspace.join("z.txt"), "z").expect("write z");
+    std::fs::write(workspace.join("a.txt"), "a").expect("write a");
+    std::fs::create_dir_all(workspace.join("dir").join("nested")).expect("create tree");
+    std::fs::write(workspace.join("dir").join("b.txt"), "b").expect("write b");
+    std::fs::write(workspace.join("dir").join("a.txt"), "a").expect("write nested a");
+    std::fs::write(
+        workspace.join("dir").join("nested").join("deep.txt"),
+        "deep",
+    )
+    .expect("write deep");
+    std::fs::write(workspace.join(".env"), "TOKEN=secret").expect("write env");
+    let tools = WorkspaceTools::new(&workspace);
+
+    let direct = tools
+        .list(ListToolInput {
+            path: None,
+            max_entries: None,
+            recursive: false,
+            max_depth: None,
+        })
+        .expect("direct list");
+    let direct_paths = direct.content["entries"]
+        .as_array()
+        .expect("direct entries")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path"))
+        .collect::<Vec<_>>();
+    assert_eq!(direct_paths, vec!["a.txt", "dir", "z.txt"]);
+    assert_eq!(direct.content["truncated"], false);
+    assert_eq!(direct.content["redacted_entries"], 1);
+
+    let bounded = tools
+        .list(ListToolInput {
+            path: None,
+            max_entries: None,
+            recursive: true,
+            max_depth: Some(1),
+        })
+        .expect("bounded recursive list");
+    let bounded_paths = bounded.content["entries"]
+        .as_array()
+        .expect("bounded entries")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bounded_paths,
+        vec![
+            "a.txt",
+            "dir",
+            "dir/a.txt",
+            "dir/b.txt",
+            "dir/nested",
+            "z.txt"
+        ]
+    );
+    assert_eq!(bounded.content["truncated"], true);
+
+    let limited = tools
+        .list(ListToolInput {
+            path: None,
+            max_entries: Some(2),
+            recursive: true,
+            max_depth: Some(4),
+        })
+        .expect("limited list");
+    let limited_paths = limited.content["entries"]
+        .as_array()
+        .expect("limited entries")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path"))
+        .collect::<Vec<_>>();
+    assert_eq!(limited_paths, vec!["a.txt", "dir"]);
+    assert_eq!(limited.content["truncated"], true);
+
+    for input in [
+        ListToolInput {
+            path: None,
+            max_entries: Some(0),
+            recursive: false,
+            max_depth: None,
+        },
+        ListToolInput {
+            path: None,
+            max_entries: None,
+            recursive: true,
+            max_depth: Some(0),
+        },
+        ListToolInput {
+            path: None,
+            max_entries: Some(10_001),
+            recursive: false,
+            max_depth: None,
+        },
+    ] {
+        assert!(matches!(
+            tools.list(input),
+            Err(WorkspaceToolError::InvalidInput(_))
+        ));
+    }
+
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_list_skips_symlinks_and_protected_paths() {
+    let workspace = test_workspace("list-symlink-protected");
+    let outside = workspace.parent().unwrap().join("list-outside");
+    std::fs::create_dir_all(&outside).expect("create outside");
+    std::fs::write(outside.join("secret.txt"), "outside").expect("write outside");
+    std::fs::write(workspace.join(".env"), "TOKEN=secret").expect("write env");
+    let link = workspace.join("linked");
+    if let Err(error) = create_dir_symlink(&outside, &link) {
+        if symlink_is_not_available(&error) {
+            remove_workspace(&workspace);
+            remove_workspace(&outside);
+            return;
+        }
+        panic!("create symlink: {error}");
+    }
+
+    let tools = WorkspaceTools::new(&workspace);
+    let listed = tools
+        .list(ListToolInput {
+            path: None,
+            max_entries: None,
+            recursive: true,
+            max_depth: None,
+        })
+        .expect("list");
+    let serialized = serde_json::to_string(&listed.content).expect("serialize list");
+    assert!(!serialized.contains("linked"));
+    assert!(!serialized.contains("secret.txt"));
+    assert_eq!(listed.content["redacted_entries"], 1);
+
+    remove_workspace(&workspace);
+    remove_workspace(&outside);
+}
+
+#[test]
+fn workspace_grep_supports_case_control_and_deterministic_order() {
+    let workspace = test_workspace("grep-case");
+    std::fs::write(workspace.join("b.txt"), "Needle\n").expect("write b");
+    std::fs::write(workspace.join("a.txt"), "needle\nNEEDLE\n").expect("write a");
+    let tools = WorkspaceTools::new(&workspace);
+
+    let sensitive = tools
+        .grep(GrepToolInput {
+            path: None,
+            pattern: "needle".to_string(),
+            max_matches: None,
+            case_sensitive: true,
+        })
+        .expect("case-sensitive grep");
+    assert_eq!(
+        sensitive.content["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .map(|item| (item["path"].clone(), item["line"].clone()))
+            .collect::<Vec<_>>(),
+        vec![(serde_json::json!("a.txt"), serde_json::json!(1))]
+    );
+
+    let insensitive = tools
+        .grep(GrepToolInput {
+            path: None,
+            pattern: "needle".to_string(),
+            max_matches: None,
+            case_sensitive: false,
+        })
+        .expect("case-insensitive grep");
+    assert_eq!(
+        insensitive.content["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .map(|item| (item["path"].clone(), item["line"].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (serde_json::json!("a.txt"), serde_json::json!(1)),
+            (serde_json::json!("a.txt"), serde_json::json!(2)),
+            (serde_json::json!("b.txt"), serde_json::json!(1)),
+        ]
+    );
+    assert_eq!(insensitive.content["truncated"], false);
+
+    assert!(matches!(
+        tools.grep(GrepToolInput {
+            path: None,
+            pattern: "needle".to_string(),
+            max_matches: Some(0),
+            case_sensitive: true,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
+    let cases = [
+        serde_json::from_value::<ReadToolInput>(serde_json::json!({
+            "path": "file.txt",
+            "unknown": true
+        }))
+        .is_err(),
+        serde_json::from_value::<ListToolInput>(serde_json::json!({
+            "unknown": true
+        }))
+        .is_err(),
+        serde_json::from_value::<GrepToolInput>(serde_json::json!({
+            "pattern": "needle",
+            "unknown": true
+        }))
+        .is_err(),
+        serde_json::from_value::<EditToolInput>(serde_json::json!({
+            "path": "file.txt",
+            "expected": "old",
+            "replacement": "new",
+            "unknown": true
+        }))
+        .is_err(),
+        serde_json::from_value::<WorkspacePatch>(serde_json::json!({
+            "changes": [],
+            "unknown": true
+        }))
+        .is_err(),
+        serde_json::from_value::<WorkspacePatchChange>(serde_json::json!({
+            "path": "file.txt",
+            "replacement": "new",
+            "unknown": true
+        }))
+        .is_err(),
+        serde_json::from_value::<CommandToolInput>(serde_json::json!({
+            "argv": ["git", "status"],
+            "unknown": true
+        }))
+        .is_err(),
+    ];
+    assert!(cases.into_iter().all(|rejected| rejected));
+
+    let default_list: ListToolInput =
+        serde_json::from_value(serde_json::json!({})).expect("list defaults");
+    assert!(!default_list.recursive);
+    let default_grep: GrepToolInput = serde_json::from_value(serde_json::json!({
+        "pattern": "needle"
+    }))
+    .expect("grep defaults");
+    assert!(default_grep.case_sensitive);
+
+    let workspace = test_workspace("invalid-inputs");
+    let tools = WorkspaceTools::new(&workspace);
+    assert!(matches!(
+        tools.patch(
+            WorkspacePatch {
+                changes: Vec::new()
+            },
+            &ToolBrokerDecision::Allow,
+        ),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        tools.command(CommandToolInput {
+            argv: Vec::new(),
+            cwd: None,
+            timeout_seconds: None,
+            sandbox_mode: None,
+            network_access: None,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        tools.command(CommandToolInput {
+            argv: vec!["git".to_string()],
+            cwd: None,
+            timeout_seconds: Some(3_601),
+            sandbox_mode: None,
+            network_access: None,
+        }),
+        Err(WorkspaceToolError::InvalidInput(_))
+    ));
     remove_workspace(&workspace);
 }
 
@@ -558,6 +971,8 @@ fn workspace_tools_reject_symlink_escape() {
         tools.read(ReadToolInput {
             path: "linked-secret.txt".to_string(),
             max_chars: None,
+            line_start: None,
+            line_end: None,
         }),
         Err(WorkspaceToolError::OutsideWorkspace(_))
     ));
@@ -604,6 +1019,7 @@ fn workspace_grep_skips_symlinked_directories() {
             path: None,
             pattern: "secret".to_string(),
             max_matches: Some(10),
+            case_sensitive: true,
         })
         .expect("grep");
 

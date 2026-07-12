@@ -2,8 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,8 +29,14 @@ const WORKSPACE_MUTATION_NOT_APPROVED: &str = "workspace mutation requires allow
 const DUPLICATE_PATCH_TARGET: &str = "patch contains duplicate canonical target";
 const MUTATION_TEMP_FILE_ATTEMPTS: usize = 64;
 const DEFAULT_READ_MAX_CHARS: usize = 8_192;
+const MAX_READ_MAX_CHARS: usize = 1_000_000;
 const DEFAULT_LIST_MAX_ENTRIES: usize = 200;
+const MAX_LIST_MAX_ENTRIES: usize = 10_000;
+const DEFAULT_LIST_MAX_DEPTH: usize = 16;
+const MAX_LIST_MAX_DEPTH: usize = 64;
 const DEFAULT_GREP_MAX_MATCHES: usize = 200;
+const MAX_GREP_MAX_MATCHES: usize = 10_000;
+const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 const LARGE_OUTPUT_ARTIFACT_THRESHOLD: usize = 4_096;
 const DEFAULT_RESULT_PREVIEW_MAX_CHARS: usize = 4_096;
 const BINARY_CONTENT_PREVIEW: &str = "[binary content omitted]";
@@ -492,25 +498,36 @@ impl fmt::Display for WorkspaceToolError {
 impl std::error::Error for WorkspaceToolError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadToolInput {
     pub path: String,
     pub max_chars: Option<usize>,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListToolInput {
     pub path: Option<String>,
     pub max_entries: Option<usize>,
+    #[serde(default)]
+    pub recursive: bool,
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GrepToolInput {
     pub path: Option<String>,
     pub pattern: String,
     pub max_matches: Option<usize>,
+    #[serde(default = "default_case_sensitive")]
+    pub case_sensitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EditToolInput {
     pub path: String,
     pub expected: String,
@@ -518,11 +535,13 @@ pub struct EditToolInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspacePatch {
     pub changes: Vec<WorkspacePatchChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspacePatchChange {
     pub path: String,
     pub expected: Option<String>,
@@ -579,61 +598,143 @@ impl WorkspaceTools {
     }
 
     pub fn read(&self, input: ReadToolInput) -> Result<ToolOutput, WorkspaceToolError> {
+        let max_chars = validate_limit(
+            "max_chars",
+            input.max_chars,
+            DEFAULT_READ_MAX_CHARS,
+            MAX_READ_MAX_CHARS,
+        )?;
+        let line_start = input.line_start.unwrap_or(1);
+        let line_end = input.line_end.unwrap_or(usize::MAX);
+        validate_line_range(line_start, line_end)?;
         let target = self.resolve_workspace_path(&input.path, false)?;
-        let bytes = std::fs::read(&target).map_err(io_error)?;
         let relative = self.relative_path(&target);
-        if is_binary(&bytes) {
-            return Ok(ToolOutput::success(json!({
-                "path": relative,
-                "binary": true,
-                "preview": BINARY_CONTENT_PREVIEW,
-                "truncated": true,
-                "artifact_ref": artifact_ref(RESULT_ARTIFACT_PREFIX, &relative),
-            })));
+        let file = File::open(&target).map_err(io_error)?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut preview = String::new();
+        let mut preview_truncated = false;
+        let mut actual_line_start = None;
+        let mut actual_line_end = None;
+        let mut total_lines = 0usize;
+        let mut total_bytes = 0usize;
+        let mut partial_line = false;
+
+        loop {
+            line.clear();
+            let bytes_read = reader.read_until(b'\n', &mut line).map_err(io_error)?;
+            if bytes_read == 0 {
+                break;
+            }
+            total_lines = total_lines.saturating_add(1);
+            total_bytes = total_bytes.saturating_add(bytes_read);
+            if is_binary(&line) {
+                return Ok(ToolOutput::success(json!({
+                    "path": relative,
+                    "binary": true,
+                    "preview": BINARY_CONTENT_PREVIEW,
+                    "truncated": true,
+                    "line_start": Value::Null,
+                    "line_end": Value::Null,
+                    "total_lines": total_lines,
+                    "artifact_ref": artifact_ref(RESULT_ARTIFACT_PREFIX, &relative),
+                })));
+            }
+            let text = std::str::from_utf8(&line)
+                .map(str::to_string)
+                .map_err(|error| {
+                    WorkspaceToolError::ReadFailed(format!(
+                        "invalid utf-8 after binary check: {error}"
+                    ))
+                })?;
+            if total_lines < line_start || total_lines > line_end {
+                continue;
+            }
+            actual_line_start.get_or_insert(total_lines);
+            let remaining = max_chars.saturating_sub(preview.chars().count());
+            if remaining == 0 {
+                preview_truncated = true;
+                partial_line = true;
+                continue;
+            }
+            let (bounded, truncated) = bounded_text(&text, remaining);
+            preview.push_str(&bounded);
+            actual_line_end = Some(total_lines);
+            if truncated {
+                preview_truncated = true;
+                partial_line = true;
+            }
         }
-        let content = String::from_utf8(bytes).map_err(|error| {
-            WorkspaceToolError::ReadFailed(format!("invalid utf-8 after binary check: {error}"))
-        })?;
-        let max_chars = input.max_chars.unwrap_or(DEFAULT_READ_MAX_CHARS);
-        let (preview, truncated) = bounded_text(&content, max_chars);
-        Ok(ToolOutput::success(json!({
+
+        let next_line_start = actual_line_end.and_then(|line_end| {
+            if partial_line {
+                Some(line_end)
+            } else if line_end < total_lines {
+                line_end.checked_add(1)
+            } else {
+                None
+            }
+        });
+        let artifact = if preview_truncated || total_bytes > LARGE_OUTPUT_ARTIFACT_THRESHOLD {
+            Value::String(artifact_ref(RESULT_ARTIFACT_PREFIX, &relative))
+        } else {
+            Value::Null
+        };
+        let mut output = json!({
             "path": relative,
             "binary": false,
             "preview": preview,
-            "truncated": truncated,
-            "artifact_ref": if truncated || content.len() > LARGE_OUTPUT_ARTIFACT_THRESHOLD {
-                Value::String(artifact_ref(RESULT_ARTIFACT_PREFIX, &relative))
-            } else {
-                Value::Null
-            },
-        })))
+            "truncated": preview_truncated,
+            "line_start": actual_line_start,
+            "line_end": actual_line_end,
+            "total_lines": total_lines,
+            "artifact_ref": artifact,
+        });
+        if let Some(next_line_start) = next_line_start {
+            output["next_line_start"] = json!(next_line_start);
+        }
+        Ok(ToolOutput::success(output))
     }
 
     pub fn list(&self, input: ListToolInput) -> Result<ToolOutput, WorkspaceToolError> {
-        let target = self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), true)?;
-        let mut entries = Vec::new();
-        let mut redacted_entries = 0usize;
-        let max_entries = input.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
-        for entry in std::fs::read_dir(&target).map_err(io_error)? {
-            let entry = entry.map_err(io_error)?;
-            let path = entry.path();
-            let relative = self.relative_path(&path);
-            if is_protected_path(&relative) {
-                redacted_entries += 1;
-                continue;
-            }
-            entries.push(json!({
-                "path": relative,
-                "kind": if path.is_dir() { "directory" } else { "file" },
-            }));
-            if entries.len() >= max_entries {
-                break;
-            }
-        }
+        let target = self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
+        let max_entries = validate_limit(
+            "max_entries",
+            input.max_entries,
+            DEFAULT_LIST_MAX_ENTRIES,
+            MAX_LIST_MAX_ENTRIES,
+        )?;
+        let max_depth = validate_limit(
+            "max_depth",
+            input.max_depth,
+            DEFAULT_LIST_MAX_DEPTH,
+            MAX_LIST_MAX_DEPTH,
+        )?;
+        let mut state = ListState {
+            entries: Vec::new(),
+            redacted_entries: 0,
+            truncated: false,
+            collection_limit: max_entries.saturating_add(1),
+            recursive: input.recursive,
+            max_depth,
+        };
+        self.collect_list_entries(&target, 0, &mut state)?;
+        state
+            .entries
+            .sort_by(|left, right| left.relative.cmp(&right.relative));
+        let truncated_by_count = state.entries.len() > max_entries;
+        state.entries.truncate(max_entries);
         Ok(ToolOutput::success(json!({
-            "entries": entries,
-            "redacted_entries": redacted_entries,
-            "truncated": entries.len() >= max_entries,
+            "entries": state
+                .entries
+                .into_iter()
+                .map(|entry| json!({
+                    "path": entry.relative,
+                    "kind": if entry.is_dir { "directory" } else { "file" },
+                }))
+                .collect::<Vec<_>>(),
+            "redacted_entries": state.redacted_entries,
+            "truncated": state.truncated || truncated_by_count,
         })))
     }
 
@@ -645,10 +746,20 @@ impl WorkspaceTools {
         }
         let root = self
             .resolve_workspace_path(input.path.as_deref().unwrap_or("."), input.path.is_none())?;
-        let max_matches = input.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
+        let max_matches = validate_limit(
+            "max_matches",
+            input.max_matches,
+            DEFAULT_GREP_MAX_MATCHES,
+            MAX_GREP_MAX_MATCHES,
+        )?;
         let mut matches = Vec::new();
-        self.grep_path(&root, &input.pattern, max_matches, &mut matches)?;
-        let truncated = matches.len() >= max_matches;
+        let truncated = self.grep_path(
+            &root,
+            &input.pattern,
+            input.case_sensitive,
+            max_matches,
+            &mut matches,
+        )?;
         Ok(ToolOutput::success(json!({
             "matches": matches,
             "truncated": truncated,
@@ -749,6 +860,7 @@ impl WorkspaceTools {
         input: CommandToolInput,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput, WorkspaceToolError> {
+        input.validate()?;
         let Some(backend) = &self.sandbox_backend else {
             return Err(WorkspaceToolError::SandboxUnavailable);
         };
@@ -797,59 +909,150 @@ impl WorkspaceTools {
         Ok(output)
     }
 
-    fn grep_path(
+    fn collect_list_entries(
         &self,
-        root: &Path,
-        pattern: &str,
-        max_matches: usize,
-        matches: &mut Vec<Value>,
+        directory: &Path,
+        depth: usize,
+        state: &mut ListState,
     ) -> Result<(), WorkspaceToolError> {
-        if matches.len() >= max_matches {
+        if state.entries.len() >= state.collection_limit {
+            state.truncated = true;
             return Ok(());
         }
-        let workspace = std::fs::canonicalize(&self.workspace_root).map_err(io_error)?;
-        let resolved = std::fs::canonicalize(root).map_err(io_error)?;
-        if !resolved.starts_with(&workspace) {
-            return Ok(());
-        }
-        let root = resolved.as_path();
-        let relative = self.relative_path(root);
-        if is_protected_path(&relative) {
-            return Ok(());
-        }
-        if root.is_dir() {
-            for entry in std::fs::read_dir(root).map_err(io_error)? {
-                let entry = entry.map_err(io_error)?;
-                if entry.file_type().map_err(io_error)?.is_symlink() {
-                    continue;
-                }
-                self.grep_path(&entry.path(), pattern, max_matches, matches)?;
-                if matches.len() >= max_matches {
-                    break;
-                }
+        for entry in self.sorted_directory_entries(directory)? {
+            if is_protected_path(&entry.relative) {
+                state.redacted_entries = state.redacted_entries.saturating_add(1);
+                continue;
             }
-            return Ok(());
-        }
-        let bytes = std::fs::read(root).map_err(io_error)?;
-        if is_binary(&bytes) {
-            return Ok(());
-        }
-        let content =
-            String::from_utf8(bytes).map_err(|_error| WorkspaceToolError::BinaryPattern)?;
-        for (line_index, line) in content.lines().enumerate() {
-            if line.contains(pattern) {
-                let line_number = line_index + 1;
-                matches.push(json!({
-                    "path": relative,
-                    "line": line_number,
-                    "preview": line,
-                }));
-                if matches.len() >= max_matches {
-                    break;
+            if entry.is_symlink_or_reparse {
+                continue;
+            }
+            state.entries.push(entry.clone());
+            if state.entries.len() >= state.collection_limit {
+                state.truncated = true;
+                return Ok(());
+            }
+            if state.recursive && entry.is_dir {
+                if depth < state.max_depth {
+                    self.collect_list_entries(&entry.path, depth + 1, state)?;
+                } else {
+                    self.mark_depth_boundary(&entry.path, state)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn mark_depth_boundary(
+        &self,
+        directory: &Path,
+        state: &mut ListState,
+    ) -> Result<(), WorkspaceToolError> {
+        for entry in self.sorted_directory_entries(directory)? {
+            if is_protected_path(&entry.relative) {
+                state.redacted_entries = state.redacted_entries.saturating_add(1);
+            } else if !entry.is_symlink_or_reparse {
+                state.truncated = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn sorted_directory_entries(
+        &self,
+        directory: &Path,
+    ) -> Result<Vec<DirectoryEntry>, WorkspaceToolError> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(io_error)?;
+            entries.push(DirectoryEntry {
+                relative: self.relative_path(&path),
+                is_dir: metadata.is_dir(),
+                is_symlink_or_reparse: metadata_is_symlink_or_reparse(&metadata),
+                path,
+            });
+        }
+        entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+        Ok(entries)
+    }
+
+    fn grep_path(
+        &self,
+        root: &Path,
+        pattern: &str,
+        case_sensitive: bool,
+        max_matches: usize,
+        matches: &mut Vec<Value>,
+    ) -> Result<bool, WorkspaceToolError> {
+        if matches.len() >= max_matches {
+            return Ok(true);
+        }
+        let metadata = std::fs::symlink_metadata(root).map_err(io_error)?;
+        if metadata_is_symlink_or_reparse(&metadata) {
+            return Ok(false);
+        }
+        let relative = self.relative_path(root);
+        if is_protected_path(&relative) {
+            return Ok(false);
+        }
+        if metadata.is_dir() {
+            for entry in self.sorted_directory_entries(root)? {
+                if is_protected_path(&entry.relative) || entry.is_symlink_or_reparse {
+                    continue;
+                }
+                if self.grep_path(&entry.path, pattern, case_sensitive, max_matches, matches)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        if !metadata.is_file() {
+            return Ok(false);
+        }
+        let file = File::open(root).map_err(io_error)?;
+        let mut reader = BufReader::new(file);
+        let mut raw_line = Vec::new();
+        let mut file_matches = Vec::new();
+        let folded_pattern = (!case_sensitive).then(|| pattern.to_lowercase());
+        let mut line_number = 0usize;
+        loop {
+            raw_line.clear();
+            let bytes_read = reader.read_until(b'\n', &mut raw_line).map_err(io_error)?;
+            if bytes_read == 0 {
+                break;
+            }
+            if is_binary(&raw_line) {
+                return Ok(false);
+            }
+            let line = std::str::from_utf8(&raw_line)
+                .map_err(|_error| WorkspaceToolError::BinaryPattern)?;
+            line_number = line_number.saturating_add(1);
+            let matches_pattern = folded_pattern.as_ref().map_or_else(
+                || line.contains(pattern),
+                |folded| line.to_lowercase().contains(folded),
+            );
+            if matches_pattern {
+                let line = line.trim_end_matches(['\n', '\r']);
+                let (preview, _) = bounded_text(line, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
+                file_matches.push(json!({
+                    "path": relative,
+                    "line": line_number,
+                    "preview": preview,
+                }));
+                if matches.len().saturating_add(file_matches.len()) > max_matches {
+                    matches.extend(
+                        file_matches
+                            .into_iter()
+                            .take(max_matches.saturating_sub(matches.len())),
+                    );
+                    return Ok(true);
+                }
+            }
+        }
+        matches.extend(file_matches);
+        Ok(false)
     }
 
     fn resolve_workspace_path(
@@ -899,7 +1102,85 @@ impl WorkspaceTools {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DirectoryEntry {
+    path: PathBuf,
+    relative: String,
+    is_dir: bool,
+    is_symlink_or_reparse: bool,
+}
+
+struct ListState {
+    entries: Vec<DirectoryEntry>,
+    redacted_entries: usize,
+    truncated: bool,
+    collection_limit: usize,
+    recursive: bool,
+    max_depth: usize,
+}
+
+fn default_case_sensitive() -> bool {
+    true
+}
+
+fn validate_limit(
+    name: &str,
+    value: Option<usize>,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, WorkspaceToolError> {
+    let value = value.unwrap_or(default);
+    if value == 0 {
+        return Err(WorkspaceToolError::InvalidInput(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    if value > maximum {
+        return Err(WorkspaceToolError::InvalidInput(format!(
+            "{name} must not exceed {maximum}"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_line_range(line_start: usize, line_end: usize) -> Result<(), WorkspaceToolError> {
+    if line_start == 0 {
+        return Err(WorkspaceToolError::InvalidInput(
+            "line_start must be greater than zero".to_string(),
+        ));
+    }
+    if line_end == 0 {
+        return Err(WorkspaceToolError::InvalidInput(
+            "line_end must be greater than zero".to_string(),
+        ));
+    }
+    if line_end < line_start {
+        return Err(WorkspaceToolError::InvalidInput(
+            "line_end must be greater than or equal to line_start".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn metadata_is_symlink_or_reparse(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &Metadata) -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CommandToolInput {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
@@ -909,6 +1190,28 @@ pub struct CommandToolInput {
 }
 
 impl CommandToolInput {
+    fn validate(&self) -> Result<(), WorkspaceToolError> {
+        if self.argv.is_empty() {
+            return Err(WorkspaceToolError::InvalidInput(
+                "argv must contain at least one argument".to_string(),
+            ));
+        }
+        if self.timeout_seconds == Some(0) {
+            return Err(WorkspaceToolError::InvalidInput(
+                "timeout_seconds must be greater than zero".to_string(),
+            ));
+        }
+        if self
+            .timeout_seconds
+            .is_some_and(|timeout| timeout > MAX_COMMAND_TIMEOUT_SECONDS)
+        {
+            return Err(WorkspaceToolError::InvalidInput(format!(
+                "timeout_seconds must not exceed {MAX_COMMAND_TIMEOUT_SECONDS}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn effective_cwd(&self) -> &str {
         self.cwd.as_deref().unwrap_or(".")
     }
