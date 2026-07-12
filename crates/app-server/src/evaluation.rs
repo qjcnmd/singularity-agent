@@ -68,6 +68,9 @@ const REPORT_FILE: &str = "report.json";
 const AGENT_TRACE_FILE: &str = "agent-trace.json";
 const PATCH_EVIDENCE_FILE: &str = "patch-evidence.json";
 const ARTIFACT_TEMP_FILE_ATTEMPTS: usize = 64;
+const WINDOWS_MAX_PATH_CHARS: usize = 260;
+const GIT_PACK_HEX: &str = "0123456789012345678901234567890123456789";
+const CARGO_DEP_HEX: &str = "0123456789012345678901234567890123456789012345678901234567890123";
 
 static ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -211,6 +214,21 @@ pub(crate) fn run_evaluation(
     let run_id = RunId::new(params.run_id.clone())
         .map_err(|error| format!("invalid eval run id: {error}"))?;
     let output_root = evaluation_output_root(params.output_root.as_deref());
+    let plans = manifest
+        .task_set()
+        .tasks
+        .iter()
+        .map(|task| {
+            manifest
+                .workspace_plan(&task.task_id)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let task_ids = plans
+        .iter()
+        .map(|plan| plan.task_id.clone())
+        .collect::<Vec<_>>();
+    preflight_evaluation_path_budget(&output_root, &run_id, &task_ids)?;
     fs::create_dir_all(&output_root).map_err(|error| {
         format!(
             "failed to create evaluation output root {}: {error}",
@@ -226,10 +244,7 @@ pub(crate) fn run_evaluation(
     })?;
 
     let mut task_executions = Vec::new();
-    for task in &manifest.task_set().tasks {
-        let plan = manifest
-            .workspace_plan(&task.task_id)
-            .map_err(|error| error.to_string())?;
+    for plan in &plans {
         task_executions.push(run_task(
             &run_id,
             &run_dir,
@@ -1729,6 +1744,117 @@ fn evaluation_output_root(explicit: Option<&str>) -> PathBuf {
         .unwrap_or_else(|| DEFAULT_OUTPUT_ROOT.iter().collect())
 }
 
+fn preflight_evaluation_path_budget(
+    output_root: &Path,
+    run_id: &RunId,
+    task_ids: &[TaskId],
+) -> Result<(), String> {
+    if cfg!(windows) {
+        preflight_evaluation_path_budget_with_limit(
+            output_root,
+            run_id,
+            task_ids,
+            WINDOWS_MAX_PATH_CHARS,
+        )
+    } else {
+        Ok(())
+    }
+}
+
+fn preflight_evaluation_path_budget_with_limit(
+    output_root: &Path,
+    run_id: &RunId,
+    task_ids: &[TaskId],
+    max_path_chars: usize,
+) -> Result<(), String> {
+    let output_root = absolute_path_for_path_budget(output_root)?;
+    let run_dir = output_root.join(run_id.as_str());
+    for (context, path) in [
+        ("evaluation result artifact", run_dir.join(RESULT_FILE)),
+        ("evaluation report artifact", run_dir.join(REPORT_FILE)),
+        (
+            "evaluation report temporary artifact",
+            run_dir.join(format!(
+                ".{REPORT_FILE}.4294967295.18446744073709551615.tmp"
+            )),
+        ),
+    ] {
+        check_path_budget(context, &path, max_path_chars)?;
+    }
+
+    for task_id in task_ids {
+        let task_dir = run_dir.join(task_id.as_str());
+        for (context, path) in [
+            (
+                "remote git pack keep file",
+                task_dir
+                    .join(SOURCE_DIR)
+                    .join(".git")
+                    .join("objects")
+                    .join("pack")
+                    .join(format!("pack-{GIT_PACK_HEX}.keep")),
+            ),
+            ("agent trace artifact", task_dir.join(AGENT_TRACE_FILE)),
+            (
+                "patch evidence artifact",
+                task_dir.join(PATCH_EVIDENCE_FILE),
+            ),
+        ] {
+            check_path_budget(context, &path, max_path_chars)?;
+        }
+
+        for stage in [BASELINE_DIR, AGENT_DIR, PUBLIC_DIR, HIDDEN_DIR] {
+            let stage_dir = task_dir.join(stage);
+            check_path_budget(
+                "Cargo target dependency artifact",
+                &stage_dir
+                    .join("target")
+                    .join("debug")
+                    .join("deps")
+                    .join(format!("singularity_evaluation-{CARGO_DEP_HEX}.rlib")),
+                max_path_chars,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn absolute_path_for_path_budget(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .map_err(|error| format!("failed to resolve evaluation output root: {error}"))
+    }
+}
+
+fn check_path_budget(context: &str, path: &Path, max_path_chars: usize) -> Result<(), String> {
+    let length = path_length_for_path_budget(path);
+    if length >= max_path_chars {
+        return Err(format!(
+            "evaluation path budget exceeded for {context}: {} is {length} UTF-16 units; Windows legacy MAX_PATH is {max_path_chars}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn path_length_for_path_budget(path: &Path) -> usize {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        path.as_os_str().encode_wide().count()
+    }
+
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().chars().count()
+    }
+}
+
 fn publish_evaluation_artifacts(
     result_path: &Path,
     result: &impl Serialize,
@@ -2157,6 +2283,94 @@ mod tests {
     }
 
     #[test]
+    fn windows_path_budget_rejects_long_full_sha_projection_before_creation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let output_root = temp.path().join("r".repeat(40));
+        let long_run_id = RunId::new("a".repeat(40)).expect("git full-SHA run id");
+        let long_task_id = TaskId::new("b".repeat(40)).expect("git full-SHA task id");
+        let run_dir = output_root.join(long_run_id.as_str());
+
+        let error = preflight_evaluation_path_budget_with_limit(
+            &output_root,
+            &long_run_id,
+            std::slice::from_ref(&long_task_id),
+            WINDOWS_MAX_PATH_CHARS,
+        )
+        .expect_err("full-SHA evaluation paths must exceed the conservative budget");
+
+        assert!(error.contains("evaluation path budget exceeded"));
+        assert!(!run_dir.exists());
+    }
+
+    #[test]
+    fn windows_path_budget_accepts_short_projection() {
+        let temp = tempfile::tempdir().expect("temp");
+        let output_root = temp.path().join("short");
+        let run_id = RunId::new("run").expect("run id");
+        let task_id = TaskId::new("task").expect("task id");
+
+        preflight_evaluation_path_budget_with_limit(
+            &output_root,
+            &run_id,
+            std::slice::from_ref(&task_id),
+            WINDOWS_MAX_PATH_CHARS,
+        )
+        .expect("short evaluation paths must fit the conservative budget");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_evaluation_rejects_long_paths_before_creating_run_directory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manifest_path = temp.path().join("manifest.json");
+        let run_id = "a".repeat(40);
+        let task_id = "b".repeat(40);
+        let manifest = json!({
+            "schema_version": "evaluation.task_set/v4",
+            "tasks": [{
+                "task_id": task_id,
+                "description": "path budget preflight",
+                "capabilities": ["rust"],
+                "workspace": {
+                    "source": {"type": "local", "path": "missing-source"}
+                },
+                "agent": {
+                    "instructions": "inspect",
+                    "allowed_paths": ["README.md"],
+                    "allowed_tools": ["builtin.read"]
+                },
+                "evaluator": {
+                    "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
+                    "public": {"commands": [{"argv": ["cargo", "test"]}]},
+                    "hidden": {"commands": [{"argv": ["cargo", "test", "--hidden"]}]}
+                }
+            }]
+        });
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+        )
+        .expect("manifest");
+        let output_root = temp.path().join("r".repeat(40));
+        let run_dir = output_root.join(&run_id);
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id,
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+
+        let error = run_evaluation(
+            &params,
+            Arc::new(SourceSandboxBackend),
+            &ProviderConfigSnapshot::capture(|_| None),
+        )
+        .expect_err("long evaluation paths must fail before execution");
+
+        assert!(error.contains("evaluation path budget exceeded"));
+        assert!(!run_dir.exists());
+    }
+
+    #[test]
     fn workspace_snapshot_detects_add_modify_and_delete() {
         let temp = tempfile::tempdir().expect("temp");
         fs::write(temp.path().join("a.txt"), "before").expect("write a");
@@ -2222,6 +2436,46 @@ mod tests {
             CommandResult::completed(&request.command_id, "ok")
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
+    }
+
+    struct PathBudgetSandboxBackend;
+
+    impl SandboxBackend for PathBudgetSandboxBackend {
+        fn name(&self) -> &'static str {
+            "path_budget_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            CommandResult::executed(&request.command_id, 101, 0, "", "Filename too long", false)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    #[test]
+    fn baseline_path_budget_failure_is_blocked_before_expected_failure_gate() {
+        let temp = tempfile::tempdir().expect("temp");
+        let execution = run_verification_after_setup(
+            temp.path(),
+            None,
+            &[command(&["cargo", "test"])],
+            CommandExpectation::Failure,
+            Arc::new(PathBudgetSandboxBackend),
+            Vec::new(),
+        );
+
+        assert_eq!(execution.result.status, StageStatus::Blocked);
+        assert_eq!(
+            execution
+                .result
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.kind),
+            Some(BlockerKind::WorkspacePreparation)
+        );
     }
 
     #[test]

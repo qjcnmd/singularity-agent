@@ -143,6 +143,12 @@ pub(super) fn infrastructure_blocker(
             format!("{context}: sandbox enforcement is unavailable"),
         ));
     }
+    if let Some(evidence) = completed_nonzero_path_budget_error(result) {
+        return Some(evaluation_blocker(
+            BlockerKind::WorkspacePreparation,
+            format!("{context}: {evidence}"),
+        ));
+    }
     match result.execution_status {
         CommandExecutionStatus::Completed => None,
         CommandExecutionStatus::BackendError
@@ -171,6 +177,25 @@ pub(super) fn command_blocker(
             default_kind,
             format!("{context}: {}", result.stderr_preview),
         )
+    })
+}
+
+fn completed_nonzero_path_budget_error(result: &CommandResult) -> Option<&str> {
+    if result.execution_status != CommandExecutionStatus::Completed
+        || result.exit_code.is_none_or(|exit_code| exit_code == 0)
+    {
+        return None;
+    }
+    [
+        result.stderr_preview.as_str(),
+        result.stdout_preview.as_str(),
+    ]
+    .into_iter()
+    .find(|output| {
+        let lower = output.to_ascii_lowercase();
+        lower.contains("filename too long")
+            || lower.contains("the filename or extension is too long")
+            || lower.contains("os error 206")
     })
 }
 
@@ -243,5 +268,39 @@ mod tests {
         assert_eq!(blocker.kind, BlockerKind::Environment);
         assert!(blocker.message.contains("'python'"));
         assert!(!blocker.message.contains("C:\\"));
+    }
+
+    #[test]
+    fn completed_path_budget_errors_are_workspace_preparation_blockers() {
+        for (stdout, stderr, evidence) in [
+            ("", "Filename too long", "filename too long"),
+            (
+                "THE FILENAME OR EXTENSION IS TOO LONG",
+                "",
+                "filename or extension",
+            ),
+            ("os error 206", "", "os error 206"),
+        ] {
+            let result = CommandResult::executed("path_error", 101, 0, stdout, stderr, false)
+                .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict);
+            let blocker = infrastructure_blocker(&result, "verification command failed")
+                .expect("path-budget failure must block");
+
+            assert_eq!(blocker.kind, BlockerKind::WorkspacePreparation);
+            assert!(blocker.message.to_ascii_lowercase().contains(evidence));
+        }
+    }
+
+    #[test]
+    fn ordinary_completed_nonzero_remains_a_semantic_failure() {
+        for stderr in [
+            "assertion failed: expected 1, got 2",
+            "fatal error LNK1104: cannot open file 'missing.obj'",
+        ] {
+            let result = CommandResult::executed("test_failure", 101, 0, "", stderr, false)
+                .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict);
+
+            assert!(infrastructure_blocker(&result, "verification command failed").is_none());
+        }
     }
 }
