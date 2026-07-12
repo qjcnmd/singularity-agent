@@ -14,10 +14,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use singularity_core::{CancellationToken, contains_sensitive_text};
 pub use singularity_sandbox::{
-    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus,
-    DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend, SandboxBackendEnforcement,
-    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, WindowsSandboxBackend,
-    command_permission_resource,
+    CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
+    CommandSemanticStatus, DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend,
+    SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
+    WindowsSandboxBackend, command_permission_resource,
 };
 
 const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";
@@ -513,6 +513,7 @@ pub struct WorkspacePatchChange {
 pub struct WorkspaceTools {
     workspace_root: PathBuf,
     sandbox_backend: Option<Arc<dyn SandboxBackend + Send + Sync>>,
+    command_environment: CommandEnvironmentPolicy,
 }
 
 impl fmt::Debug for WorkspaceTools {
@@ -533,6 +534,7 @@ impl WorkspaceTools {
         Self {
             workspace_root: workspace_root.into(),
             sandbox_backend: None,
+            command_environment: CommandEnvironmentPolicy::default(),
         }
     }
 
@@ -548,6 +550,11 @@ impl WorkspaceTools {
         sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
     ) -> Self {
         self.sandbox_backend = Some(sandbox_backend);
+        self
+    }
+
+    pub fn with_command_environment(mut self, environment: CommandEnvironmentPolicy) -> Self {
+        self.command_environment = environment;
         self
     }
 
@@ -741,6 +748,7 @@ impl WorkspaceTools {
         );
         request.filesystem.mode = filesystem_mode.clone();
         request.network.mode = network_mode.clone();
+        request.environment = self.command_environment.clone();
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }

@@ -134,11 +134,27 @@ fn agent_loop_with_capabilities(
             serde_json::json!({"type": "object"}),
         ))
         .expect("register builtin patch");
+    let command_schemas = ["success", "second-success"]
+        .into_iter()
+        .map(|argument| {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "argv": {"const": test_command(argument)},
+                    "cwd": {"const": "."},
+                    "timeout_seconds": {"const": 5},
+                    "sandbox_mode": {"const": "workspace_write"},
+                    "network_access": {"const": "denied"}
+                },
+                "required": ["argv", "cwd", "timeout_seconds", "sandbox_mode", "network_access"]
+            })
+        })
+        .collect::<Vec<_>>();
     registry
         .register(ToolSpec::new(
             "builtin.command",
             "Run command",
-            serde_json::json!({"type": "object"}),
+            serde_json::json!({"oneOf": command_schemas}),
         ))
         .expect("register builtin command");
     AgentLoop::new(
@@ -1163,7 +1179,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
 fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     let dir = tempfile::tempdir().expect("temp dir");
     let input = AgentLoopInput {
-        max_turns: 3,
+        max_turns: 4,
         ..AgentLoopInput::new("thread_1", "turn_1", "run verification")
     };
     let mut malformed_response =
@@ -1180,8 +1196,15 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
         "builtin.command",
         serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
     ));
+    let mut second_repaired_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    second_repaired_response.tool_calls.push(tool_call(
+        "call_3",
+        "builtin.command",
+        serde_json::json!({"argv": test_command("second-success"), "timeout_seconds": 5}),
+    ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
     let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
         PermissionRule::new(
             "allow_execute",
@@ -1191,28 +1214,47 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
         .for_operation(PermissionOperation::Execute),
     );
 
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let result = agent_loop_with_responses_and_requests(
-        vec![malformed_response, repaired_response, final_response],
+        vec![
+            malformed_response,
+            repaired_response,
+            second_repaired_response,
+            final_response,
+        ],
         policy,
-        Arc::new(Mutex::new(Vec::new())),
+        Arc::clone(&seen_requests),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
-    assert_eq!(result.model_turns, 3);
-    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(result.model_turns, 4);
+    assert_eq!(result.tool_results.len(), 3);
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
         Some("invalid_tool_arguments")
     );
     assert!(result.tool_results[1].ok);
+    assert!(result.tool_results[2].ok);
     assert_eq!(result.final_answer.as_deref(), Some("done"));
     let run_status = result.to_run_status();
-    assert_eq!(run_status.audit_events.len(), 2);
+    assert_eq!(run_status.audit_events.len(), 3);
     assert_eq!(run_status.audit_events[0]["argument_validation"], "failed");
+    assert_eq!(
+        run_status.audit_events[0]["argument_validation_code"],
+        "argv_not_array"
+    );
     assert_eq!(run_status.audit_events[0]["policy_evaluated"], false);
     assert_eq!(run_status.audit_events[0]["executor_started"], false);
+    let requests = seen_requests.lock().expect("seen requests");
+    let feedback = requests[1].messages.last().expect("tool feedback");
+    assert_eq!(feedback.role, ModelRole::Tool);
+    assert!(feedback.content.contains("argv_not_array"));
+    assert!(feedback.content.contains("second-success"));
+    assert!(feedback.content.contains("retry_inputs"));
+    assert!(feedback.content.contains(r#"\"argv\":"#));
+    assert!(!feedback.content.contains("raw_arguments"));
     assert!(
         run_status.audit_events[0]
             .get("approval_decision")

@@ -28,8 +28,8 @@ use singularity_policy::{
 };
 use singularity_protocol::{EvalRunParams, EvalRunResult};
 use singularity_tools::{
-    SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolRegistry,
-    WorkspaceTools, command_scope_digest, command_scope_resource,
+    CommandEnvironmentPolicy, SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode,
+    ToolBroker, ToolRegistry, WorkspaceTools, command_scope_digest, command_scope_resource,
 };
 
 use super::{
@@ -1011,7 +1011,9 @@ fn run_agent_stage(
     }
     let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
         .with_workspace_tools(
-            WorkspaceTools::new(agent_dir).with_shared_sandbox_backend(sandbox_backend),
+            WorkspaceTools::new(agent_dir)
+                .with_shared_sandbox_backend(sandbox_backend)
+                .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated),
         )
         .run(&input);
     let run_status = result.to_run_status();

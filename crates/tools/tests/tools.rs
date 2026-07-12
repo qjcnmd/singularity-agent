@@ -1,6 +1,6 @@
 use singularity_sandbox::{
-    CommandExecutionStatus, CommandRequest, CommandResult, SandboxBackend, SandboxCapabilities,
-    SandboxFilesystemMode, SandboxNetworkMode,
+    CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
+    SandboxBackend, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
 };
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
@@ -1035,6 +1035,27 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
 }
 
 #[test]
+fn workspace_command_tool_propagates_evaluation_environment_policy() {
+    let workspace = test_workspace("command-evaluation-environment");
+    let tools = WorkspaceTools::new(&workspace)
+        .with_sandbox_backend(EvaluationEnvironmentBackend)
+        .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated);
+
+    let result = tools
+        .command(CommandToolInput {
+            argv: test_command("success"),
+            cwd: None,
+            timeout_seconds: Some(5),
+            sandbox_mode: None,
+            network_access: None,
+        })
+        .expect("command");
+
+    assert!(result.ok);
+    remove_workspace(&workspace);
+}
+
+#[test]
 fn workspace_command_tool_records_audit_for_explicit_danger_full_access() {
     let workspace = test_workspace("command-danger-audit");
     let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(DangerAuditSandboxBackend);
@@ -1178,6 +1199,29 @@ impl SandboxBackend for RecordingSandboxBackend {
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
         assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
+        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
+            self.name(),
+            singularity_tools::SandboxBackendEnforcement::Strict,
+        )
+    }
+}
+
+struct EvaluationEnvironmentBackend;
+
+impl SandboxBackend for EvaluationEnvironmentBackend {
+    fn name(&self) -> &'static str {
+        "evaluation_environment"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        assert_eq!(
+            request.environment,
+            CommandEnvironmentPolicy::EvaluationIsolated
+        );
         CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
             self.name(),
             singularity_tools::SandboxBackendEnforcement::Strict,

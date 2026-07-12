@@ -740,6 +740,7 @@ impl OpenAiProviderConfig {
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     client: reqwest::Client,
+    request_timeout_seconds: u64,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -754,11 +755,22 @@ impl fmt::Debug for OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(config: OpenAiProviderConfig) -> Result<Self, ProviderError> {
+        Self::new_with_request_timeout(config, PROVIDER_TIMEOUT_SECONDS)
+    }
+
+    fn new_with_request_timeout(
+        config: OpenAiProviderConfig,
+        request_timeout_seconds: u64,
+    ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(PROVIDER_TIMEOUT_SECONDS))
+            .timeout(Duration::from_secs(request_timeout_seconds))
             .build()
             .map_err(provider_client_initialization_error)?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            request_timeout_seconds,
+        })
     }
 
     pub fn from_env<F>(get_env: F) -> Result<Self, ProviderError>
@@ -808,6 +820,7 @@ impl Provider for OpenAiProvider {
             cancellation,
             "provider_request_send_failed",
             ProviderErrorStage::RequestSend,
+            self.request_timeout_seconds,
             || {
                 self.client
                     .post(self.config.endpoint())
@@ -831,6 +844,7 @@ impl Provider for OpenAiProvider {
             cancellation,
             "provider_response_body_read_failed",
             ProviderErrorStage::ResponseBodyRead,
+            self.request_timeout_seconds,
             || response.bytes(),
         )?;
         let payload = serde_json::from_slice::<Value>(&body)
@@ -1335,6 +1349,7 @@ fn provider_transport_error(
     error: reqwest::Error,
     code: &'static str,
     stage: ProviderErrorStage,
+    request_timeout_seconds: Option<u64>,
 ) -> ProviderError {
     let kind = if error.is_timeout() {
         ModelErrorKind::Timeout
@@ -1356,7 +1371,7 @@ fn provider_transport_error(
         ModelError::new(kind, "provider transport failed").with_provider_diagnostic(code, stage);
     model_error.transport_category = Some(category);
     if error.is_timeout() {
-        model_error.timeout_seconds = Some(PROVIDER_TIMEOUT_SECONDS);
+        model_error.timeout_seconds = request_timeout_seconds;
     }
     ProviderError::from_model_error(model_error)
 }
@@ -1379,6 +1394,7 @@ fn provider_client_initialization_error(error: reqwest::Error) -> ProviderError 
         error,
         "provider_client_initialization_failed",
         ProviderErrorStage::ClientInitialization,
+        None,
     )
 }
 
@@ -1394,6 +1410,7 @@ fn block_on_provider_future<C, F, T>(
     cancellation: &CancellationToken,
     error_code: &'static str,
     error_stage: ProviderErrorStage,
+    request_timeout_seconds: u64,
     create_future: C,
 ) -> Result<T, ProviderError>
 where
@@ -1417,7 +1434,12 @@ where
         }) {
             Ok(result) => {
                 return result.map_err(|error| {
-                    provider_transport_error(error, error_code, error_stage.clone())
+                    provider_transport_error(
+                        error,
+                        error_code,
+                        error_stage.clone(),
+                        Some(request_timeout_seconds),
+                    )
                 });
             }
             Err(_) => continue,
@@ -1880,4 +1902,69 @@ fn looks_like_model_config_error(message: &str) -> bool {
 fn contains_any_marker(message: &str, markers: &[&str]) -> bool {
     let lowered = message.to_ascii_lowercase();
     markers.iter().any(|marker| lowered.contains(marker))
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn configured_deadline_is_reported_from_a_real_transport_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging provider");
+        let address = listener.local_addr().expect("provider address");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept provider request");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read request line");
+            thread::sleep(Duration::from_secs(2));
+        });
+        let provider = OpenAiProvider::new_with_request_timeout(
+            OpenAiProviderConfig {
+                provider_name: "openai_compatible".to_string(),
+                model_name: "gpt-test".to_string(),
+                base_url: format!("http://{address}"),
+                api_key: "sk-secret-value".to_string(),
+                source: ProviderConfigSource::ProcessEnvironment,
+                max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+                max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            },
+            1,
+        )
+        .expect("provider");
+        let request = ModelTurnRequest::new(
+            "request_timeout",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+
+        let error = provider
+            .complete(&request, &CancellationToken::new())
+            .expect_err("provider request must time out");
+
+        assert_eq!(error.error.kind, ModelErrorKind::Timeout);
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_request_send_failed")
+        );
+        assert_eq!(error.error.stage, Some(ProviderErrorStage::RequestSend));
+        assert_eq!(
+            error.error.transport_category,
+            Some(ProviderTransportCategory::Timeout)
+        );
+        assert_eq!(error.error.timeout_seconds, Some(1));
+        let serialized = serde_json::to_string(&error.error).expect("serialize timeout");
+        for secret in ["sk-secret-value", &address.to_string(), "authorization"] {
+            assert!(
+                !serialized
+                    .to_ascii_lowercase()
+                    .contains(&secret.to_ascii_lowercase())
+            );
+        }
+        server.join().expect("provider server");
+    }
 }

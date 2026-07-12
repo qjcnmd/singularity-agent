@@ -846,7 +846,13 @@ where
                     return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
                 }
                 let tool_result = if let Some(error) = argument_error {
-                    invalid_tool_arguments_result(call, error)
+                    invalid_tool_arguments_result(
+                        call,
+                        error,
+                        self.tool_broker
+                            .get(&call.tool_name)
+                            .map(|spec| &spec.input_schema),
+                    )
                 } else {
                     let decision = forced_decision.unwrap_or_else(|| {
                         self.tool_decision(input, call, &mut state.used_approval_grants)
@@ -2018,7 +2024,11 @@ fn validate_tool_call_arguments(call: &ModelToolCall) -> Result<(), AgentLoopToo
     }
 }
 
-fn invalid_tool_arguments_result(call: &ModelToolCall, error: AgentLoopToolError) -> ToolResult {
+fn invalid_tool_arguments_result(
+    call: &ModelToolCall,
+    error: AgentLoopToolError,
+    expected_schema: Option<&Value>,
+) -> ToolResult {
     let envelope = ToolCallRequest::new(
         call.tool_call_id.clone(),
         call.tool_name.clone(),
@@ -2033,8 +2043,81 @@ fn invalid_tool_arguments_result(call: &ModelToolCall, error: AgentLoopToolError
     if call.tool_name == TOOL_COMMAND {
         audit["sandbox_backend"] = json!("not_executed");
         audit["command_provenance"] = json!("agent_requested");
+        audit["argument_validation_code"] = json!(command_argument_validation_code(call));
     }
-    ToolResult::from_result(&envelope, &workspace_tool_failure(error)).with_audit(audit)
+    let output = if call.tool_name == TOOL_COMMAND {
+        invalid_command_arguments_output(call, error, expected_schema)
+    } else {
+        workspace_tool_failure(error)
+    };
+    ToolResult::from_result(&envelope, &output).with_audit(audit)
+}
+
+fn command_argument_validation_code(call: &ModelToolCall) -> &'static str {
+    match call.arguments.get("argv") {
+        None => "missing_argv",
+        Some(Value::Array(_)) => "invalid_command_arguments",
+        Some(_) => "argv_not_array",
+    }
+}
+
+fn invalid_command_arguments_output(
+    call: &ModelToolCall,
+    error: AgentLoopToolError,
+    expected_schema: Option<&Value>,
+) -> ToolOutput {
+    const MAX_SCHEMA_HINT_CHARS: usize = 2_048;
+    let validation_code = command_argument_validation_code(call);
+    let mut summary = format!("invalid command arguments ({validation_code}): {error}");
+    let retry_inputs = expected_schema
+        .map(exact_command_retry_inputs)
+        .unwrap_or_default();
+    if !retry_inputs.is_empty() {
+        summary.push_str(
+            ". The argv field must be a JSON array of strings. Copy one complete retry_inputs object exactly",
+        );
+    }
+    if let Some(schema) = expected_schema {
+        let schema = schema.to_string();
+        let mut hint = schema
+            .chars()
+            .take(MAX_SCHEMA_HINT_CHARS)
+            .collect::<String>();
+        if schema.chars().count() > hint.chars().count() {
+            hint.push_str("...");
+        }
+        summary.push_str(". Retry with one exact JSON input allowed by this schema: ");
+        summary.push_str(&hint);
+    }
+    ToolOutput::failure(
+        "invalid_tool_arguments",
+        json!({
+            "summary": summary,
+            "validation_code": validation_code,
+            "retry_inputs": retry_inputs,
+        }),
+    )
+}
+
+fn exact_command_retry_inputs(schema: &Value) -> Vec<Value> {
+    let branches = schema
+        .get("oneOf")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(schema));
+    branches
+        .iter()
+        .filter_map(|branch| {
+            let properties = branch.get("properties")?.as_object()?;
+            let required = branch.get("required")?.as_array()?;
+            let mut input = serde_json::Map::new();
+            for name in required.iter().filter_map(Value::as_str) {
+                let value = properties.get(name)?.get("const")?.clone();
+                input.insert(name.to_string(), value);
+            }
+            Some(Value::Object(input))
+        })
+        .collect()
 }
 
 fn invalid_tool_arguments(error: serde_json::Error) -> AgentLoopToolError {

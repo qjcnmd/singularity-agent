@@ -114,6 +114,14 @@ pub enum CommandSemanticStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandEnvironmentPolicy {
+    #[default]
+    HostSanitized,
+    EvaluationIsolated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandRequest {
     pub command_id: String,
@@ -122,6 +130,8 @@ pub struct CommandRequest {
     pub timeout_seconds: u64,
     pub network: SandboxNetworkPolicy,
     pub filesystem: SandboxFilesystemPolicy,
+    #[serde(default)]
+    pub environment: CommandEnvironmentPolicy,
 }
 
 impl CommandRequest {
@@ -143,6 +153,7 @@ impl CommandRequest {
                 mode: SandboxFilesystemMode::WorkspaceWrite,
                 workspace_root: workspace_root.into(),
             },
+            environment: CommandEnvironmentPolicy::default(),
         }
     }
 
@@ -894,10 +905,11 @@ mod windows_backend {
     };
 
     use super::{
-        COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandExecutionStatus,
-        CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-        SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-        command_request_denial, is_secret_env_name, path_has_sensitive_component,
+        COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
+        CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus,
+        SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode,
+        SandboxNetworkMode, command_request_denial, is_secret_env_name,
+        path_has_sensitive_component,
     };
 
     const BACKEND_NAME: &str = "windows";
@@ -997,7 +1009,7 @@ mod windows_backend {
                 .map_err(PrepareCommandError::Backend)?;
             let cwd = canonical_directory(Path::new(&request.cwd))
                 .map_err(PrepareCommandError::Backend)?;
-            let env_map = child_environment();
+            let env_map = child_environment(&request.environment);
             let resolved = resolve_executable(&request.argv, &cwd, &env_map)
                 .map_err(PrepareCommandError::Environment)?;
             let workspace_root = AbsolutePathBuf::from_absolute_path_checked(&workspace_root)
@@ -1422,10 +1434,8 @@ mod windows_backend {
         Ok(home)
     }
 
-    fn child_environment() -> HashMap<String, String> {
-        let mut env_map = std::env::vars()
-            .filter(|(name, _)| !is_secret_env_name(name))
-            .collect::<HashMap<_, _>>();
+    fn child_environment(policy: &CommandEnvironmentPolicy) -> HashMap<String, String> {
+        let mut env_map = filtered_child_environment(std::env::vars(), policy);
         if let Some(temp) = env_value(&env_map, "TEMP")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
@@ -1443,6 +1453,42 @@ mod windows_backend {
         env_map
     }
 
+    fn filtered_child_environment(
+        environment: impl IntoIterator<Item = (String, String)>,
+        policy: &CommandEnvironmentPolicy,
+    ) -> HashMap<String, String> {
+        environment
+            .into_iter()
+            .filter(|(name, _)| !is_secret_env_name(name))
+            .filter(|(name, _)| {
+                policy != &CommandEnvironmentPolicy::EvaluationIsolated
+                    || !is_evaluation_host_environment(name)
+            })
+            .collect()
+    }
+
+    fn is_evaluation_host_environment(name: &str) -> bool {
+        let name = name.to_ascii_uppercase();
+        name.starts_with("SINGULARITY_")
+            || matches!(
+                name.as_str(),
+                "CARGO_TARGET_DIR"
+                    | "CARGO_BUILD_TARGET"
+                    | "CARGO_ENCODED_RUSTFLAGS"
+                    | "RUSTFLAGS"
+                    | "RUSTDOCFLAGS"
+                    | "RUSTC_WRAPPER"
+                    | "RUSTC_WORKSPACE_WRAPPER"
+                    | "NODE_OPTIONS"
+                    | "NODE_PATH"
+                    | "PYTHONHOME"
+                    | "PYTHONPATH"
+                    | "VIRTUAL_ENV"
+                    | "GOFLAGS"
+                    | "GOWORK"
+            )
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1454,6 +1500,57 @@ mod windows_backend {
             let mut file = fs::File::create(path).expect("create test file");
             file.write_all(contents.as_bytes())
                 .expect("write test file");
+        }
+
+        #[test]
+        fn evaluation_environment_removes_host_build_overrides_but_keeps_tool_discovery() {
+            let environment = [
+                ("PATH".to_string(), "C:\\tools".to_string()),
+                ("Pathext".to_string(), ".EXE;.CMD".to_string()),
+                (
+                    "cargo_target_dir".to_string(),
+                    "D:\\host-target".to_string(),
+                ),
+                ("RUSTFLAGS".to_string(), "-C target-cpu=native".to_string()),
+                ("NODE_OPTIONS".to_string(), "--require host.js".to_string()),
+                ("PYTHONPATH".to_string(), "C:\\host-python".to_string()),
+                ("GOFLAGS".to_string(), "-mod=vendor".to_string()),
+                (
+                    "SINGULARITY_MODEL".to_string(),
+                    "provider-model".to_string(),
+                ),
+                ("SERVICE_API_KEY".to_string(), "secret".to_string()),
+            ];
+
+            let isolated = filtered_child_environment(
+                environment.clone(),
+                &CommandEnvironmentPolicy::EvaluationIsolated,
+            );
+            assert_eq!(env_value(&isolated, "PATH"), Some("C:\\tools"));
+            assert_eq!(env_value(&isolated, "PATHEXT"), Some(".EXE;.CMD"));
+            for removed in [
+                "CARGO_TARGET_DIR",
+                "RUSTFLAGS",
+                "NODE_OPTIONS",
+                "PYTHONPATH",
+                "GOFLAGS",
+                "SINGULARITY_MODEL",
+                "SERVICE_API_KEY",
+            ] {
+                assert!(env_value(&isolated, removed).is_none(), "{removed} leaked");
+            }
+
+            let ordinary =
+                filtered_child_environment(environment, &CommandEnvironmentPolicy::HostSanitized);
+            assert_eq!(
+                env_value(&ordinary, "CARGO_TARGET_DIR"),
+                Some("D:\\host-target")
+            );
+            assert_eq!(
+                env_value(&ordinary, "RUSTFLAGS"),
+                Some("-C target-cpu=native")
+            );
+            assert!(env_value(&ordinary, "SERVICE_API_KEY").is_none());
         }
 
         #[test]

@@ -6,8 +6,8 @@ use serde::Serialize;
 use singularity_evaluation::{BlockerKind, CommandSpec, EvaluationBlocker};
 use singularity_policy::NetworkAccess;
 use singularity_tools::{
-    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus,
-    SandboxFilesystemMode, SandboxNetworkMode,
+    CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
+    CommandSemanticStatus, SandboxFilesystemMode, SandboxNetworkMode,
 };
 
 use super::workspace::canonical_or_original;
@@ -91,6 +91,7 @@ pub(super) fn run_raw_command(
     request.timeout_seconds = timeout_seconds;
     request.network.mode = network;
     request.filesystem.mode = SandboxFilesystemMode::WorkspaceWrite;
+    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
     sandbox_backend.execute(&request)
 }
 
@@ -187,8 +188,46 @@ fn next_command_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use singularity_tools::SandboxBackendEnforcement;
+    use singularity_tools::{SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities};
+
+    struct EnvironmentCaptureBackend;
+
+    impl SandboxBackend for EnvironmentCaptureBackend {
+        fn name(&self) -> &'static str {
+            "environment_capture"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            assert_eq!(
+                request.environment,
+                CommandEnvironmentPolicy::EvaluationIsolated
+            );
+            CommandResult::completed(&request.command_id, "ok")
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    #[test]
+    fn evaluation_raw_commands_use_isolated_environment() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = run_raw_command(
+            workspace.path(),
+            workspace.path(),
+            vec!["test-command".to_string()],
+            30,
+            SandboxNetworkMode::Denied,
+            Arc::new(EnvironmentCaptureBackend),
+        );
+
+        assert!(command_succeeded(&result));
+    }
 
     #[test]
     fn missing_host_executable_is_an_environment_blocker() {
