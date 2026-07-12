@@ -531,26 +531,9 @@ impl AppServer {
             &cancellation,
         )?;
         let committed = self.commit_turn_run_status(turn, &status, &cancellation)?;
+        let terminal_events = self.committed_turn_events(&committed)?;
         let turn = committed.turn;
-        emit_messages(
-            &mut emit,
-            self.agent_terminal_item_events(committed.plan_item.as_ref())?,
-        );
-        if let Some(plan) = status.plan.as_ref()
-            && let Some(event) = self.event_notification(AppEvent::turn_plan_updated(
-                &turn.turn_id,
-                serde_json::to_value(plan)?,
-            ))
-        {
-            emit(event);
-        }
-        emit_messages(
-            &mut emit,
-            self.agent_terminal_item_events(committed.assistant_item.as_ref())?,
-        );
-        if let Some(event) = self.event_notification(AppEvent::turn_completed(&turn)) {
-            emit(event);
-        }
+        emit_messages(&mut emit, terminal_events);
         emit(
             JsonRpcMessage::response(message.id, serde_json::to_value(TurnStartResult { turn })?)
                 .to_wire_value(),
@@ -1171,10 +1154,7 @@ impl AppServer {
                     None,
                     &error,
                 )?;
-                messages.extend(self.agent_terminal_item_events(committed.plan_item.as_ref())?);
-                messages
-                    .extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
-                messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
+                messages.extend(self.committed_turn_events(&committed)?);
                 messages.push(
                     JsonRpcMessage::response(message.id, json!({"decision": decision}))
                         .to_wire_value(),
@@ -1202,15 +1182,7 @@ impl AppServer {
                     &AppServerError::Store(error),
                 )?,
             };
-            if let Some(plan) = effective_status.plan.as_ref() {
-                messages.extend(self.event_notification(AppEvent::turn_plan_updated(
-                    &committed.turn.turn_id,
-                    serde_json::to_value(plan)?,
-                )));
-            }
-            messages.extend(self.agent_terminal_item_events(committed.plan_item.as_ref())?);
-            messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
-            messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
+            messages.extend(self.committed_turn_events(&committed)?);
         }
         messages.push(
             JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
@@ -1346,30 +1318,59 @@ impl AppServer {
         Some(event.to_notification().to_wire_value())
     }
 
-    fn agent_terminal_item_events(
+    fn committed_turn_events(
         &self,
-        assistant_item: Option<&Item>,
+        committed: &CommittedTurnOutcome,
     ) -> AppServerResult<Vec<Value>> {
-        let Some(agent_item) = assistant_item else {
+        let mut messages = self.agent_terminal_item_events(committed.plan_item.as_ref())?;
+        if let Some(plan_item) = committed.plan_item.as_ref()
+            && let Some(event) = self.event_notification(AppEvent::turn_plan_updated(
+                &committed.turn.turn_id,
+                plan_item.payload.clone(),
+            ))
+        {
+            messages.push(event);
+        }
+        messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
+        messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
+        Ok(messages)
+    }
+
+    fn agent_terminal_item_events(&self, item: Option<&Item>) -> AppServerResult<Vec<Value>> {
+        let Some(agent_item) = item else {
             return Ok(Vec::new());
         };
-        let agent_delta = agent_item
-            .payload
-            .get("delta")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                StoreError::InvalidState(
-                    "committed assistant item is missing its string delta".to_string(),
-                )
-            })?;
-        Ok([
-            AppEvent::item_started(agent_item.item_id.clone()),
-            AppEvent::item_agent_message_delta(agent_item.item_id.clone(), agent_delta),
-            AppEvent::item_completed(agent_item.item_id.clone()),
-        ]
-        .into_iter()
-        .filter_map(|event| self.event_notification(event))
-        .collect())
+        let mut events = vec![AppEvent::item_started(agent_item.item_id.clone())];
+        match &agent_item.kind {
+            singularity_protocol::ItemKind::Plan => {}
+            singularity_protocol::ItemKind::AgentMessage => {
+                let agent_delta = agent_item
+                    .payload
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "committed assistant item is missing its string delta".to_string(),
+                        )
+                    })?;
+                events.push(AppEvent::item_agent_message_delta(
+                    agent_item.item_id.clone(),
+                    agent_delta,
+                ));
+            }
+            _ => {
+                return Err(StoreError::InvalidState(format!(
+                    "unsupported committed terminal item kind: {:?}",
+                    agent_item.kind
+                ))
+                .into());
+            }
+        }
+        events.push(AppEvent::item_completed(agent_item.item_id.clone()));
+        Ok(events
+            .into_iter()
+            .filter_map(|event| self.event_notification(event))
+            .collect())
     }
 
     fn trace_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -2246,6 +2247,93 @@ mod tests {
 
         assert_eq!(plan.input_schema["properties"]["steps"]["maxItems"], 64);
         assert_eq!(plan.input_schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn committed_plan_terminal_path_emits_independent_item_events() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+        let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "inspect the workspace"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "inspect the workspace".to_string(),
+            }],
+        };
+        let plan_arguments = json!({
+            "steps": [{"step": "inspect the workspace", "status": "completed"}]
+        });
+        let mut plan_response =
+            ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+        plan_response.tool_calls.push(ModelToolCall {
+            tool_call_id: "plan_call_1".to_string(),
+            tool_name: "builtin.update_plan".to_string(),
+            raw_arguments: plan_arguments.to_string(),
+            arguments: plan_arguments,
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+        let final_response =
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+        let server = app_server(store);
+        let status = server
+            .run_agent_loop_with_provider(
+                StaticProvider {
+                    responses: vec![plan_response, final_response],
+                    seen_requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                &thread,
+                &params,
+                &turn.turn_id,
+                &[],
+                &CancellationToken::new(),
+            )
+            .expect("agent loop");
+        assert_eq!(status.status, AgentStatus::Completed);
+        assert!(status.plan.is_some());
+
+        let committed = server
+            .commit_turn_run_status(turn, &status, &CancellationToken::new())
+            .expect("commit terminal outcome");
+        let plan_item = committed.plan_item.as_ref().expect("plan item");
+        assert_eq!(plan_item.kind, ItemKind::Plan);
+        let events = server
+            .committed_turn_events(&committed)
+            .expect("terminal events");
+        let methods = events
+            .iter()
+            .map(|event| event["method"].as_str().expect("event method"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "item/started",
+                "item/completed",
+                "turn/plan/updated",
+                "item/started",
+                "item/agentMessage/delta",
+                "item/completed",
+                "turn/completed",
+            ]
+        );
+        assert_eq!(events[0]["params"]["item"]["item_id"], plan_item.item_id);
+        assert_eq!(events[1]["params"]["item"]["item_id"], plan_item.item_id);
+        assert_eq!(events[2]["params"]["plan"], plan_item.payload);
+        assert!(events[0]["params"].get("delta").is_none());
+        assert!(events[1]["params"].get("delta").is_none());
     }
 
     #[cfg(windows)]
