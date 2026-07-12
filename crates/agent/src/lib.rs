@@ -5,7 +5,8 @@ use std::collections::{BTreeSet, HashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use singularity_core::CancellationToken;
+use sha2::{Digest, Sha256};
+use singularity_core::{CancellationToken, contains_sensitive_text};
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
     ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
@@ -69,6 +70,9 @@ const TOOL_GREP: &str = "builtin.grep";
 const TOOL_EDIT: &str = "builtin.edit";
 const TOOL_PATCH: &str = "builtin.patch";
 const TOOL_COMMAND: &str = "builtin.command";
+const TOOL_UPDATE_PLAN: &str = "builtin.update_plan";
+const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
+const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call builtin.update_plan with all steps marked completed before providing the final answer.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +120,81 @@ pub struct AgentVerification {
     pub unresolved_failures: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPlanStep {
+    pub step: String,
+    pub status: AgentPlanStepStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPlan {
+    pub steps: Vec<AgentPlanStep>,
+}
+
+impl AgentPlan {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.steps.is_empty() {
+            return Err("plan must contain at least one step".to_string());
+        }
+        let mut unique_steps = BTreeSet::new();
+        let mut in_progress_count = 0usize;
+        for plan_step in &self.steps {
+            let normalized_step = plan_step.step.trim();
+            if normalized_step.is_empty() {
+                return Err("plan steps must not be empty".to_string());
+            }
+            if !unique_steps.insert(normalized_step.to_string()) {
+                return Err("plan steps must be unique".to_string());
+            }
+            if plan_step.status == AgentPlanStepStatus::InProgress {
+                in_progress_count += 1;
+            }
+        }
+        if in_progress_count > 1 {
+            return Err("plan may have at most one in_progress step".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.steps
+            .iter()
+            .all(|plan_step| plan_step.status == AgentPlanStepStatus::Completed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPlanUpdateInput {
+    pub steps: Vec<AgentPlanStep>,
+}
+
+impl AgentPlanUpdateInput {
+    pub fn into_plan(self) -> Result<AgentPlan, String> {
+        let plan = AgentPlan { steps: self.steps };
+        plan.validate()?;
+        Ok(plan)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentRecoveryMetrics {
+    pub invalid_tool_call_count: u32,
+    pub repeated_tool_call_count: u32,
+    pub repair_attempt_count: u32,
+    pub completion_rejection_count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunStatus {
     pub status: AgentStatus,
@@ -126,6 +205,9 @@ pub struct AgentRunStatus {
     pub approval_count: u32,
     pub audit_events: Vec<Value>,
     pub verification: AgentVerification,
+    pub plan: Option<AgentPlan>,
+    pub plan_update_count: u32,
+    pub recovery_metrics: AgentRecoveryMetrics,
     pub error: Option<String>,
     #[serde(skip)]
     #[schemars(skip)]
@@ -152,6 +234,9 @@ impl AgentRunStatus {
             approval_count: 0,
             audit_events: Vec::new(),
             verification: AgentVerification::default(),
+            plan: None,
+            plan_update_count: 0,
+            recovery_metrics: AgentRecoveryMetrics::default(),
             error: Some(message.into()),
             model_turn_limit: 0,
             context_trace: None,
@@ -316,6 +401,9 @@ pub struct AgentLoopResult {
     pub approval_checkpoints: Vec<Value>,
     pub tool_results: Vec<ToolResult>,
     pub verification: AgentVerification,
+    pub plan: Option<AgentPlan>,
+    pub plan_update_count: u32,
+    pub recovery_metrics: AgentRecoveryMetrics,
     pub error: Option<String>,
     #[serde(skip)]
     #[schemars(skip)]
@@ -354,6 +442,9 @@ impl AgentLoopResult {
             approval_count: self.approval_count,
             audit_events: audit_events_from_tool_results(&self.tool_results),
             verification: self.verification.clone(),
+            plan: self.plan.clone(),
+            plan_update_count: self.plan_update_count,
+            recovery_metrics: self.recovery_metrics.clone(),
             error: self.error.clone(),
             model_turn_limit: self.model_turn_limit,
             context_trace: self.context_trace.clone(),
@@ -479,6 +570,12 @@ impl CompletionTracker {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RepairFailureState {
+    signature: String,
+    consecutive_count: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CheckpointToolResult {
     result: ToolResult,
@@ -515,6 +612,16 @@ struct AgentLoopCheckpoint {
     model_turns: u32,
     completion: CompletionTracker,
     last_completion_error: Option<String>,
+    #[serde(default)]
+    plan: Option<AgentPlan>,
+    #[serde(default)]
+    plan_update_count: u32,
+    #[serde(default)]
+    recovery_metrics: AgentRecoveryMetrics,
+    #[serde(default)]
+    seen_tool_call_fingerprints: Vec<String>,
+    #[serde(default)]
+    last_repair_failure: Option<RepairFailureState>,
 }
 
 struct AgentLoopState {
@@ -527,6 +634,11 @@ struct AgentLoopState {
     prior_approval_count: u32,
     completion: CompletionTracker,
     last_completion_error: Option<String>,
+    plan: Option<AgentPlan>,
+    plan_update_count: u32,
+    recovery_metrics: AgentRecoveryMetrics,
+    seen_tool_call_fingerprints: BTreeSet<String>,
+    last_repair_failure: Option<RepairFailureState>,
     model_turn_limit: u32,
     context_trace: Option<AgentContextTrace>,
 }
@@ -547,6 +659,11 @@ impl AgentLoopState {
             prior_approval_count: 0,
             completion: CompletionTracker::default(),
             last_completion_error: None,
+            plan: None,
+            plan_update_count: 0,
+            recovery_metrics: AgentRecoveryMetrics::default(),
+            seen_tool_call_fingerprints: BTreeSet::new(),
+            last_repair_failure: None,
             model_turn_limit,
             context_trace,
         }
@@ -587,6 +704,9 @@ impl AgentLoopState {
             approval_checkpoints: self.approval_checkpoints,
             tool_results: self.tool_results,
             verification: self.completion.summary(),
+            plan: self.plan,
+            plan_update_count: self.plan_update_count,
+            recovery_metrics: self.recovery_metrics,
             error,
             model_turn_limit: self.model_turn_limit,
             context_trace: self.context_trace,
@@ -622,8 +742,97 @@ impl AgentLoopState {
             model_turns,
             completion: self.completion.clone(),
             last_completion_error: self.last_completion_error.clone(),
+            plan: self.plan.clone(),
+            plan_update_count: self.plan_update_count,
+            recovery_metrics: self.recovery_metrics.clone(),
+            seen_tool_call_fingerprints: self.seen_tool_call_fingerprints.iter().cloned().collect(),
+            last_repair_failure: self.last_repair_failure.clone(),
         };
         serde_json::to_value(checkpoint).expect("AgentLoop checkpoint serializes")
+    }
+
+    fn allows_final(&self) -> bool {
+        self.completion.allows_final() && self.plan.as_ref().is_none_or(AgentPlan::is_completed)
+    }
+
+    fn completion_rejection_reason(&self) -> String {
+        if !self.completion.allows_final() {
+            return self.completion.rejection_reason();
+        }
+        "completion gate rejected final answer: plan has incomplete steps".to_string()
+    }
+
+    fn completion_feedback(&self) -> String {
+        if !self.completion.allows_final() {
+            return self.completion.feedback();
+        }
+        PLAN_COMPLETION_REQUIRED.to_string()
+    }
+
+    fn observe_model_tool_call(
+        &mut self,
+        call: &ModelToolCall,
+        allowed_tool_names: &[String],
+    ) -> (String, bool) {
+        let fingerprint = tool_call_fingerprint(call);
+        if !self.seen_tool_call_fingerprints.insert(fingerprint.clone()) {
+            self.recovery_metrics.repeated_tool_call_count = self
+                .recovery_metrics
+                .repeated_tool_call_count
+                .saturating_add(1);
+        }
+        let invalid = call.parse_status != ModelToolParseStatus::Valid
+            || !call.arguments.is_object()
+            || call.tool_name.trim().is_empty()
+            || !allowed_tool_names
+                .iter()
+                .any(|tool_name| tool_name == &call.tool_name);
+        if invalid {
+            self.recovery_metrics.invalid_tool_call_count = self
+                .recovery_metrics
+                .invalid_tool_call_count
+                .saturating_add(1);
+        }
+        (fingerprint, invalid)
+    }
+
+    fn observe_tool_result(
+        &mut self,
+        tool_result: &ToolResult,
+        tool_call_fingerprint: &str,
+    ) -> Option<String> {
+        self.completion.observe(tool_result);
+        if tool_result.ok {
+            self.last_repair_failure = None;
+            return None;
+        }
+        if !is_repairable_tool_result(tool_result) {
+            self.last_repair_failure = None;
+            return None;
+        }
+        self.recovery_metrics.repair_attempt_count =
+            self.recovery_metrics.repair_attempt_count.saturating_add(1);
+        let error_code = tool_result
+            .error_code
+            .as_deref()
+            .unwrap_or("tool_execution_failed");
+        let signature = repair_failure_signature(tool_call_fingerprint, error_code);
+        let consecutive_count = if self
+            .last_repair_failure
+            .as_ref()
+            .is_some_and(|failure| failure.signature == signature)
+        {
+            self.last_repair_failure
+                .as_ref()
+                .map_or(1, |failure| failure.consecutive_count.saturating_add(1))
+        } else {
+            1
+        };
+        self.last_repair_failure = Some(RepairFailureState {
+            signature,
+            consecutive_count,
+        });
+        (consecutive_count >= 2).then_some(REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string())
     }
 }
 
@@ -752,6 +961,11 @@ where
                 );
             }
             let allowed_tool_names = model_tool_names(&self.tool_broker);
+            let observed_tool_calls = response
+                .tool_calls
+                .iter()
+                .map(|call| state.observe_model_tool_call(call, &allowed_tool_names))
+                .collect::<Vec<_>>();
             let validation = validate_model_turn_response(
                 &request,
                 &response,
@@ -786,6 +1000,10 @@ where
             if response.tool_calls.is_empty() {
                 let final_answer = assistant_message_text(response.assistant_message.as_ref());
                 if final_answer.trim().is_empty() {
+                    state.recovery_metrics.completion_rejection_count = state
+                        .recovery_metrics
+                        .completion_rejection_count
+                        .saturating_add(1);
                     return state.finish(
                         AgentStatus::Failed,
                         false,
@@ -794,7 +1012,7 @@ where
                         Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
                     );
                 }
-                if state.completion.allows_final() {
+                if state.allows_final() {
                     return state.finish(
                         AgentStatus::Completed,
                         true,
@@ -803,7 +1021,11 @@ where
                         None,
                     );
                 }
-                state.last_completion_error = Some(state.completion.rejection_reason());
+                state.recovery_metrics.completion_rejection_count = state
+                    .recovery_metrics
+                    .completion_rejection_count
+                    .saturating_add(1);
+                state.last_completion_error = Some(state.completion_rejection_reason());
                 state.messages.push(
                     response
                         .assistant_message
@@ -811,7 +1033,7 @@ where
                 );
                 state.messages.push(ModelMessage::text(
                     ModelRole::Developer,
-                    state.completion.feedback(),
+                    state.completion_feedback(),
                 ));
                 continue;
             }
@@ -823,7 +1045,9 @@ where
                 assistant_tool_message.tool_calls = response.tool_calls.clone();
             }
             state.messages.push(assistant_tool_message);
-            for provider_call in &response.tool_calls {
+            for (provider_call, (tool_call_fingerprint, invalid_was_observed)) in
+                response.tool_calls.iter().zip(observed_tool_calls.iter())
+            {
                 let (bound_call, argument_error, forced_decision) =
                     match validate_tool_call_arguments(provider_call) {
                         Err(error) => (provider_call.clone(), Some(error), None),
@@ -846,6 +1070,12 @@ where
                     return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
                 }
                 let tool_result = if let Some(error) = argument_error {
+                    if !*invalid_was_observed {
+                        state.recovery_metrics.invalid_tool_call_count = state
+                            .recovery_metrics
+                            .invalid_tool_call_count
+                            .saturating_add(1);
+                    }
                     invalid_tool_arguments_result(
                         call,
                         error,
@@ -878,7 +1108,7 @@ where
                             .clone();
                         let checkpoint = state.checkpoint(input, &pending, turn_index + 1);
                         state.approval_checkpoints.push(checkpoint);
-                        let tool_result = self.execute_tool(call, decision);
+                        let tool_result = self.execute_tool(call, decision, &mut state);
                         state.tool_results.push(tool_result);
                         return state.finish(
                             AgentStatus::Blocked,
@@ -888,12 +1118,18 @@ where
                             None,
                         );
                     }
-                    self.execute_tool(call, decision)
+                    self.execute_tool(call, decision, &mut state)
                 };
                 let failed_tool_result = !tool_result.ok;
-                state.completion.observe(&tool_result);
+                let recovery_feedback =
+                    state.observe_tool_result(&tool_result, tool_call_fingerprint);
                 state.tool_results.push(tool_result.clone());
                 state.messages.push(tool_result_message(&tool_result));
+                if let Some(feedback) = recovery_feedback {
+                    state
+                        .messages
+                        .push(ModelMessage::text(ModelRole::Developer, feedback));
+                }
                 if self.is_cancelled(input) {
                     return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
                 }
@@ -996,11 +1232,17 @@ where
                 Some("pending tool call approval did not match".to_string()),
             );
         }
-        let tool_result = self.execute_tool(&call, decision);
+        let tool_call_fingerprint = tool_call_fingerprint(&call);
+        let tool_result = self.execute_tool(&call, decision, &mut state);
         let failed_tool_result = !tool_result.ok;
-        state.completion.observe(&tool_result);
+        let recovery_feedback = state.observe_tool_result(&tool_result, &tool_call_fingerprint);
         state.messages.push(tool_result_message(&tool_result));
         state.tool_results.push(tool_result.clone());
+        if let Some(feedback) = recovery_feedback {
+            state
+                .messages
+                .push(ModelMessage::text(ModelRole::Developer, feedback));
+        }
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
         }
@@ -1095,7 +1337,12 @@ where
         })
     }
 
-    fn execute_tool(&self, call: &ModelToolCall, decision: ToolBrokerDecision) -> ToolResult {
+    fn execute_tool(
+        &self,
+        call: &ModelToolCall,
+        decision: ToolBrokerDecision,
+        state: &mut AgentLoopState,
+    ) -> ToolResult {
         let envelope = ToolCallRequest::new(
             call.tool_call_id.clone(),
             call.tool_name.clone(),
@@ -1105,7 +1352,11 @@ where
         let mut result = self
             .tool_broker
             .execute(&envelope, decision.clone(), |_envelope| {
-                self.execute_workspace_tool(call, &executor_decision)
+                if call.tool_name == TOOL_UPDATE_PLAN {
+                    self.execute_plan_update(call, state)
+                } else {
+                    self.execute_workspace_tool(call, &executor_decision)
+                }
             });
         if call.tool_name == TOOL_COMMAND {
             let existing_audit = result.audit_metadata().cloned();
@@ -1117,6 +1368,24 @@ where
             ));
         }
         result
+    }
+
+    fn execute_plan_update(&self, call: &ModelToolCall, state: &mut AgentLoopState) -> ToolOutput {
+        let plan = match update_plan_tool_input(&call.arguments) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return ToolOutput::failure(
+                    "invalid_tool_arguments",
+                    json!({"summary": error.to_string()}),
+                );
+            }
+        };
+        state.plan_update_count = state.plan_update_count.saturating_add(1);
+        state.plan = Some(plan.clone());
+        ToolOutput::success(json!({
+            "plan": safe_plan_summary(&plan),
+            "plan_update_count": state.plan_update_count,
+        }))
     }
 
     fn execute_workspace_tool(
@@ -1570,6 +1839,36 @@ fn restore_checkpoint(
     if used_approval_grants.contains(&pending.request_id) {
         return Err("approval checkpoint consumed the pending grant".to_string());
     }
+    if let Some(plan) = &checkpoint.plan {
+        plan.validate()
+            .map_err(|error| format!("approval checkpoint plan is invalid: {error}"))?;
+        if checkpoint.plan_update_count == 0 {
+            return Err("approval checkpoint plan update count is invalid".to_string());
+        }
+    } else if checkpoint.plan_update_count != 0 {
+        return Err("approval checkpoint plan update count is invalid".to_string());
+    }
+    let seen_tool_call_fingerprints = checkpoint
+        .seen_tool_call_fingerprints
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if seen_tool_call_fingerprints.len() != checkpoint.seen_tool_call_fingerprints.len()
+        || seen_tool_call_fingerprints
+            .iter()
+            .any(|fingerprint| !is_sha256_fingerprint(fingerprint))
+    {
+        return Err("approval checkpoint tool-call fingerprint state is invalid".to_string());
+    }
+    if checkpoint
+        .last_repair_failure
+        .as_ref()
+        .is_some_and(|failure| {
+            failure.consecutive_count == 0 || !is_sha256_fingerprint(&failure.signature)
+        })
+    {
+        return Err("approval checkpoint repair state is invalid".to_string());
+    }
     let tool_results = checkpoint
         .tool_results
         .into_iter()
@@ -1582,12 +1881,24 @@ fn restore_checkpoint(
     if derived_completion != checkpoint.completion {
         return Err("approval checkpoint completion state mismatch".to_string());
     }
+    let derived_plan_update_count = tool_results
+        .iter()
+        .filter(|tool_result| tool_result.tool_name == TOOL_UPDATE_PLAN && tool_result.ok)
+        .count() as u32;
+    if derived_plan_update_count != checkpoint.plan_update_count {
+        return Err("approval checkpoint plan update count mismatch".to_string());
+    }
     let mut state = AgentLoopState::new(checkpoint.messages, input.max_turns.max(1), None);
     state.tool_results = tool_results;
     state.used_approval_grants = used_approval_grants;
     state.prior_approval_count = checkpoint.approval_count;
     state.completion = derived_completion;
     state.last_completion_error = checkpoint.last_completion_error;
+    state.plan = checkpoint.plan;
+    state.plan_update_count = checkpoint.plan_update_count;
+    state.recovery_metrics = checkpoint.recovery_metrics;
+    state.seen_tool_call_fingerprints = seen_tool_call_fingerprints;
+    state.last_repair_failure = checkpoint.last_repair_failure;
     Ok((state, checkpoint.model_turns))
 }
 
@@ -1604,6 +1915,9 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         approval_checkpoints: Vec::new(),
         tool_results: Vec::new(),
         verification: AgentVerification::default(),
+        plan: None,
+        plan_update_count: 0,
+        recovery_metrics: AgentRecoveryMetrics::default(),
         error: Some(error.into()),
         model_turn_limit: 0,
         context_trace: None,
@@ -1825,6 +2139,61 @@ fn is_repairable_tool_result(tool_result: &ToolResult) -> bool {
         .is_some_and(|error_code| REPAIRABLE_TOOL_ERROR_CODES.contains(&error_code))
 }
 
+fn safe_plan_summary(plan: &AgentPlan) -> Value {
+    json!({
+        "steps": plan
+            .steps
+            .iter()
+            .map(|plan_step| json!({
+                "step": safe_plan_step_text(&plan_step.step),
+                "status": plan_step.status,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn safe_plan_step_text(step: &str) -> String {
+    if contains_sensitive_text(step) {
+        return "[redacted plan step]".to_string();
+    }
+    step.chars().take(512).collect()
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key.clone(), canonical_json(value));
+            }
+            Value::Object(canonical)
+        }
+        value => value.clone(),
+    }
+}
+
+fn tool_call_fingerprint(call: &ModelToolCall) -> String {
+    let canonical_arguments = canonical_json(&call.arguments);
+    let encoded = serde_json::to_vec(&(call.tool_name.as_str(), canonical_arguments))
+        .expect("tool call fingerprint payload serializes");
+    format!("sha256:{:x}", Sha256::digest(encoded))
+}
+
+fn repair_failure_signature(tool_call_fingerprint: &str, error_code: &str) -> String {
+    let encoded = format!("{tool_call_fingerprint}\0{error_code}");
+    format!("sha256:{:x}", Sha256::digest(encoded.as_bytes()))
+}
+
+fn is_sha256_fingerprint(value: &str) -> bool {
+    let Some(value) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
 fn approval_request(
     input: &AgentLoopInput,
     approval_request_id: &str,
@@ -2012,6 +2381,14 @@ fn command_tool_input(arguments: &Value) -> Result<CommandToolInput, AgentLoopTo
     serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
 }
 
+fn update_plan_tool_input(arguments: &Value) -> Result<AgentPlan, AgentLoopToolError> {
+    let input: AgentPlanUpdateInput =
+        serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)?;
+    input
+        .into_plan()
+        .map_err(AgentLoopToolError::InvalidArguments)
+}
+
 fn validate_tool_call_arguments(call: &ModelToolCall) -> Result<(), AgentLoopToolError> {
     match call.tool_name.as_str() {
         TOOL_READ => read_tool_input(&call.arguments).map(|_| ()),
@@ -2020,6 +2397,7 @@ fn validate_tool_call_arguments(call: &ModelToolCall) -> Result<(), AgentLoopToo
         TOOL_EDIT => edit_tool_input(&call.arguments).map(|_| ()),
         TOOL_PATCH => patch_tool_input(&call.arguments).map(|_| ()),
         TOOL_COMMAND => command_tool_input(&call.arguments).map(|_| ()),
+        TOOL_UPDATE_PLAN => update_plan_tool_input(&call.arguments).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -2063,12 +2441,15 @@ fn command_argument_validation_code(call: &ModelToolCall) -> &'static str {
 
 fn invalid_command_arguments_output(
     call: &ModelToolCall,
-    error: AgentLoopToolError,
+    _error: AgentLoopToolError,
     expected_schema: Option<&Value>,
 ) -> ToolOutput {
     const MAX_SCHEMA_HINT_CHARS: usize = 2_048;
     let validation_code = command_argument_validation_code(call);
-    let mut summary = format!("invalid command arguments ({validation_code}): {error}");
+    // Serde's error text can include the offending scalar value. Keep the
+    // validation code and schema hints useful to the model, but never echo
+    // the raw argument payload through a public tool result.
+    let mut summary = format!("invalid command arguments ({validation_code})");
     let retry_inputs = expected_schema
         .map(exact_command_retry_inputs)
         .unwrap_or_default();
@@ -2144,7 +2525,15 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         }
         AgentLoopToolError::Workspace(WorkspaceToolError::InvalidInput(_)) => "invalid_tool_input",
     };
-    ToolOutput::failure(error_code, json!({"summary": error.to_string()}))
+    let summary = match error {
+        // Serde's error text may contain a value copied from the model's raw
+        // arguments. The model still receives the stable error code and can
+        // consult the registered schema; it must not receive that payload
+        // echoed back through the public result.
+        AgentLoopToolError::InvalidArguments(_) => "tool arguments failed schema validation",
+        _ => return ToolOutput::failure(error_code, json!({"summary": error.to_string()})),
+    };
+    ToolOutput::failure(error_code, json!({"summary": summary}))
 }
 
 fn command_workspace_tool_failure(

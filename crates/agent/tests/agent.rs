@@ -1,5 +1,6 @@
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopCapability, AgentLoopInput,
+    AgentPlan, AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics,
     AgentStatus, ApprovalGrant, assemble_context_items,
 };
 use singularity_core::CancellationToken;
@@ -112,6 +113,25 @@ fn agent_loop_with_capabilities(
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
     capabilities: ProviderProtocolContract,
 ) -> AgentLoop<StaticProvider> {
+    agent_loop_with_capabilities_and_plan(responses, policy, seen_requests, capabilities, false)
+}
+
+fn agent_loop_with_plan_capabilities(
+    responses: Vec<ModelTurnResponse>,
+    policy: PolicyEngine,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    capabilities: ProviderProtocolContract,
+) -> AgentLoop<StaticProvider> {
+    agent_loop_with_capabilities_and_plan(responses, policy, seen_requests, capabilities, true)
+}
+
+fn agent_loop_with_capabilities_and_plan(
+    responses: Vec<ModelTurnResponse>,
+    policy: PolicyEngine,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    capabilities: ProviderProtocolContract,
+    include_plan: bool,
+) -> AgentLoop<StaticProvider> {
     let mut registry = ToolRegistry::default();
     registry
         .register(ToolSpec::new(
@@ -157,6 +177,34 @@ fn agent_loop_with_capabilities(
             serde_json::json!({"oneOf": command_schemas}),
         ))
         .expect("register builtin command");
+    if include_plan {
+        registry
+            .register(ToolSpec::new(
+                "builtin.update_plan",
+                "Update the current plan",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "steps": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step": {"type": "string"},
+                                    "status": {"enum": ["pending", "in_progress", "completed"]}
+                                },
+                                "required": ["step", "status"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["steps"],
+                    "additionalProperties": false
+                }),
+            ))
+            .expect("register builtin update plan");
+    }
     AgentLoop::new(
         StaticProvider {
             responses,
@@ -176,6 +224,17 @@ fn allow_read_policy() -> PolicyEngine {
             PermissionDecisionOutcome::Allow,
         )
         .for_operation(PermissionOperation::Read),
+    )
+}
+
+fn allow_read_execute_policy() -> PolicyEngine {
+    allow_read_policy().with_rule(
+        PermissionRule::new(
+            "allow_execute",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute),
     )
 }
 
@@ -244,6 +303,14 @@ fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ModelToolCal
 
 fn test_command(argument: &str) -> Vec<String> {
     vec!["test-program".to_string(), argument.to_string()]
+}
+
+fn plan_tool_call(id: &str, steps: serde_json::Value) -> ModelToolCall {
+    tool_call(
+        id,
+        "builtin.update_plan",
+        serde_json::json!({"steps": steps}),
+    )
 }
 
 #[cfg(windows)]
@@ -2533,4 +2600,272 @@ fn agent_status_mapping_preserves_blocked_and_cancelled() {
     assert_eq!(AgentStatus::from("blocked"), AgentStatus::Blocked);
     assert_eq!(AgentStatus::from("cancelled"), AgentStatus::Cancelled);
     assert_eq!(AgentStatus::from("max_turns_exceeded"), AgentStatus::Failed);
+}
+
+#[test]
+fn plan_update_is_brokered_and_returns_safe_summary() {
+    let mut plan_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    plan_response.tool_calls.push(plan_tool_call(
+        "plan_call_1",
+        serde_json::json!([{"step": "inspect the workspace", "status": "completed"}]),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_plan_capabilities(
+        vec![plan_response, final_response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract::default(),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.plan_update_count, 1);
+    assert_eq!(
+        result.plan,
+        Some(AgentPlan {
+            steps: vec![AgentPlanStep {
+                step: "inspect the workspace".to_string(),
+                status: AgentPlanStepStatus::Completed,
+            }],
+        })
+    );
+    assert_eq!(result.recovery_metrics, AgentRecoveryMetrics::default());
+    let payload = result.tool_results[0].to_message_payload();
+    assert_eq!(payload["tool_name"], "builtin.update_plan");
+    assert_eq!(
+        payload["content"]["plan"]["steps"][0]["step"],
+        "inspect the workspace"
+    );
+    assert_eq!(
+        payload["content"]["plan"]["steps"][0]["status"],
+        "completed"
+    );
+    assert_eq!(
+        seen_requests.lock().expect("seen requests")[0].tools.len(),
+        5
+    );
+}
+
+#[test]
+fn plan_update_rejects_empty_duplicate_and_multiple_in_progress_steps() {
+    for steps in [
+        serde_json::json!([]),
+        serde_json::json!([
+            {"step": "same", "status": "pending"},
+            {"step": "same", "status": "completed"}
+        ]),
+        serde_json::json!([
+            {"step": "first", "status": "in_progress"},
+            {"step": "second", "status": "in_progress"}
+        ]),
+    ] {
+        let input: AgentPlanUpdateInput =
+            serde_json::from_value(serde_json::json!({"steps": steps})).expect("plan input shape");
+        assert!(input.into_plan().is_err());
+    }
+
+    let unknown_field = serde_json::from_value::<AgentPlanUpdateInput>(serde_json::json!({
+        "steps": [{"step": "valid", "status": "pending"}],
+        "unexpected": true
+    }));
+    assert!(unknown_field.is_err());
+}
+
+#[test]
+fn incomplete_plan_rejects_final_until_every_step_is_completed() {
+    let mut initial_plan = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    initial_plan.tool_calls.push(plan_tool_call(
+        "plan_call_1",
+        serde_json::json!([
+            {"step": "inspect", "status": "in_progress"},
+            {"step": "verify", "status": "pending"}
+        ]),
+    ));
+    let premature_final =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "not yet");
+    let mut completed_plan =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    completed_plan.tool_calls.push(plan_tool_call(
+        "plan_call_2",
+        serde_json::json!([
+            {"step": "inspect", "status": "completed"},
+            {"step": "verify", "status": "completed"}
+        ]),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_plan_capabilities(
+        vec![
+            initial_plan,
+            premature_final,
+            completed_plan,
+            final_response,
+        ],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract::default(),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "finish the plan").with_max_turns(4));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(result.plan_update_count, 2);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
+    assert!(result.plan.as_ref().is_some_and(|plan| plan.is_completed()));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert!(requests[2].messages.iter().any(|message| {
+        message.role == ModelRole::Developer && message.content.contains("Complete every plan step")
+    }));
+}
+
+#[test]
+fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments() {
+    let invalid_arguments = serde_json::json!({
+        "argv": "not-an-array",
+        "timeout_seconds": 5
+    });
+    let mut first_invalid =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    first_invalid.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.command",
+        invalid_arguments.clone(),
+    ));
+    let mut second_invalid =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    second_invalid
+        .tool_calls
+        .push(tool_call("call_2", "builtin.command", invalid_arguments));
+    let mut successful_command =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    successful_command.tool_calls.push(tool_call(
+        "call_3",
+        "builtin.command",
+        serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let workspace = tempfile::tempdir().expect("workspace");
+    let result = agent_loop_with_capabilities(
+        vec![
+            first_invalid,
+            second_invalid,
+            successful_command,
+            final_response,
+        ],
+        allow_read_execute_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract::default(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "verify").with_max_turns(4));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 2);
+    assert_eq!(result.recovery_metrics.repeated_tool_call_count, 1);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 2);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 0);
+    let requests = seen_requests.lock().expect("seen requests");
+    assert!(requests[2].messages.iter().any(|message| {
+        message.role == ModelRole::Developer
+            && message
+                .content
+                .contains("same repairable tool failure recurred")
+    }));
+    let serialized = serde_json::to_string(&result).expect("serialize public result");
+    assert!(!serialized.contains("raw_arguments"));
+    assert!(!serialized.contains("sha256:"));
+    assert!(!serialized.contains("not-an-array"));
+}
+
+#[test]
+fn approval_resume_preserves_plan_and_recovery_metrics() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let file_path = workspace.path().join("README.md");
+    std::fs::write(&file_path, "before").expect("write file");
+    let mut plan_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    plan_response.tool_calls.push(plan_tool_call(
+        "plan_call_1",
+        serde_json::json!([{"step": "edit", "status": "completed"}]),
+    ));
+    let mut edit_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    edit_response.tool_calls.push(tool_call(
+        "edit_call_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut verify_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    verify_response.tool_calls.push(tool_call(
+        "verify_call_1",
+        "builtin.command",
+        serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = agent_loop_with_plan_capabilities(
+        vec![
+            plan_response,
+            edit_response,
+            verify_response,
+            final_response,
+        ],
+        allow_read_execute_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract::default(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(4);
+    let blocked = agent_loop.run(&input);
+
+    assert_eq!(blocked.status, AgentStatus::Blocked);
+    assert_eq!(blocked.plan_update_count, 1);
+    assert_eq!(blocked.recovery_metrics, AgentRecoveryMetrics::default());
+    let pending = blocked.pending_tool_calls[0].clone();
+    let checkpoint = blocked
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    assert_eq!(checkpoint["plan"]["steps"][0]["status"], "completed");
+    assert_eq!(checkpoint["plan_update_count"], 1);
+    assert_eq!(checkpoint["recovery_metrics"]["repair_attempt_count"], 0);
+    assert!(checkpoint["seen_tool_call_fingerprints"].is_array());
+    assert!(checkpoint["last_repair_failure"].is_null());
+
+    let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
+        pending.request_id.clone(),
+        pending.tool_name.clone(),
+        pending.resources.clone(),
+    ));
+    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Completed);
+    assert_eq!(resumed.plan_update_count, 1);
+    assert_eq!(resumed.recovery_metrics, AgentRecoveryMetrics::default());
+    assert!(
+        resumed
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.is_completed())
+    );
+    assert_eq!(
+        std::fs::read_to_string(file_path).expect("read file"),
+        "after"
+    );
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 4);
 }
