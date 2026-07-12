@@ -718,6 +718,9 @@ fn agent_loop_sends_project_instructions_as_developer_message_without_serializin
     assert_eq!(requests[0].messages[1].role, ModelRole::User);
     let developer = &requests[0].messages[0].content;
     assert!(developer.contains("You are a coding agent working in the current workspace."));
+    assert!(developer.contains(
+        "Issue at most one tool call in each assistant response, then wait for its result before continuing."
+    ));
     assert!(developer.ends_with(project_instructions));
     assert_eq!(requests[0].messages[1].content, "user goal");
     assert!(

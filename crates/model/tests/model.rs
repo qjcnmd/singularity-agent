@@ -792,8 +792,70 @@ fn openai_provider_maps_internal_tool_names_to_wire_names_and_back() {
     .expect("parse captured provider request body");
 
     assert_eq!(captured["tools"][0]["function"]["name"], "read");
+    assert_eq!(captured["tool_choice"], "auto");
+    assert_eq!(captured["parallel_tool_calls"], false);
     assert_eq!(response.tool_calls[0].tool_name, "builtin.read");
     assert_eq!(response.status, ModelTurnStatus::Success);
+}
+
+#[test]
+fn openai_provider_classifies_multiple_tool_calls_as_single_call_contract_violation() {
+    let body = r#"{
+        "id": "resp_1",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{\"path\":\"Cargo.toml\"}"}
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    }"#;
+    let base_url = single_response_server("HTTP/1.1 200 OK", body);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let mut request = ModelTurnRequest::new(
+        "request_1",
+        vec![ModelMessage::text(ModelRole::User, "read a file")],
+    );
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "Read a file".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+    });
+    request.tool_choice.max_tool_calls = 1;
+
+    let response = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect("provider response envelope");
+
+    assert_eq!(response.status, ModelTurnStatus::Invalid);
+    assert_eq!(response.tool_calls.len(), 2);
+    let error = response.error.expect("contract violation error");
+    assert_eq!(error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.message,
+        "provider returned multiple tool calls for a request that permits at most one"
+    );
+    assert_eq!(
+        error.code.as_deref(),
+        Some("provider_single_tool_call_contract_violated")
+    );
+    assert_eq!(error.stage, Some(ProviderErrorStage::ResponseValidation));
+    assert_eq!(
+        error.validation_errors,
+        vec!["max_tool_calls_exceeded", "parallel_tool_calls_not_allowed"]
+    );
 }
 
 #[test]
@@ -1014,10 +1076,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
 
     assert_eq!(
         duplicate_result.errors,
-        vec![
-            "duplicate_tool_call_id",
-            "provider_does_not_support_parallel_tool_calls"
-        ]
+        vec!["duplicate_tool_call_id", "parallel_tool_calls_not_allowed"]
     );
 }
 

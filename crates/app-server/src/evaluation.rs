@@ -1734,6 +1734,10 @@ mod tests {
                 ModelErrorCategory::ModelConfiguration,
                 BlockerKind::ProviderConfiguration,
             ),
+            (
+                ModelErrorCategory::UnsupportedCapability,
+                BlockerKind::ProviderConfiguration,
+            ),
             (ModelErrorCategory::SandboxPermission, BlockerKind::Sandbox),
         ] {
             assert_eq!(agent_blocker_kind(Some(&category)), Some(expected));

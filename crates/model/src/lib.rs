@@ -1082,17 +1082,27 @@ fn parse_openai_response(
         validate_model_turn_response(request, &response, &allowed_tool_names, Some(&capabilities));
     if !validation.valid {
         response.status = ModelTurnStatus::Invalid;
-        response.error = Some(
-            ModelError::new(
+        let single_tool_call_contract_violated = request.tool_choice.max_tool_calls == 1
+            && response.tool_calls.len() > request.tool_choice.max_tool_calls as usize;
+        let (kind, message, diagnostic_code) = if single_tool_call_contract_violated {
+            (
+                ModelErrorKind::UnsupportedCapability,
+                "provider returned multiple tool calls for a request that permits at most one"
+                    .to_string(),
+                "provider_single_tool_call_contract_violated",
+            )
+        } else {
+            (
                 ModelErrorKind::JsonSchemaViolation,
                 format!("provider_response_invalid: {}", validation.errors.join(",")),
-            )
-            .with_provider(config.provider_name.clone())
-            .with_model(config.model_name.clone())
-            .with_provider_diagnostic(
                 "provider_response_invalid",
-                ProviderErrorStage::ResponseValidation,
-            ),
+            )
+        };
+        response.error = Some(
+            ModelError::new(kind, message)
+                .with_provider(config.provider_name.clone())
+                .with_model(config.model_name.clone())
+                .with_provider_diagnostic(diagnostic_code, ProviderErrorStage::ResponseValidation),
         );
         if let Some(error) = response.error.as_mut() {
             error.validation_errors = validation.errors.clone();
@@ -1558,7 +1568,7 @@ pub fn validate_model_response(
             errors.push("provider_does_not_support_tools".to_string());
         }
         if tool_calls.len() > 1 && !capabilities.supports_parallel_tool_calls {
-            errors.push("provider_does_not_support_parallel_tool_calls".to_string());
+            errors.push("parallel_tool_calls_not_allowed".to_string());
         }
     }
 
