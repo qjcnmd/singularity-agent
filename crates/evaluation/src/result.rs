@@ -51,6 +51,7 @@ pub enum BlockerKind {
     Environment,
     WorkspacePreparation,
     ProviderConfiguration,
+    ProviderResponse,
     ProviderAuthentication,
     Network,
     Sandbox,

@@ -825,12 +825,20 @@ where
             state.messages.push(assistant_tool_message);
             for provider_call in &response.tool_calls {
                 let (bound_call, forced_decision) =
-                    match bind_tool_call_to_profile(provider_call, &self.policy.profile) {
-                        Ok(call) => (call, None),
-                        Err(reason) => (
-                            provider_call.clone(),
-                            Some(ToolBrokerDecision::deny(reason)),
-                        ),
+                    match validate_tool_call_arguments(provider_call) {
+                        Err(_) => (provider_call.clone(), Some(ToolBrokerDecision::Allow)),
+                        Ok(()) => {
+                            match bind_tool_call_to_profile(provider_call, &self.policy.profile) {
+                                Ok(call) => (call, None),
+                                Err(CommandBindingError::InvalidArguments) => {
+                                    (provider_call.clone(), Some(ToolBrokerDecision::Allow))
+                                }
+                                Err(CommandBindingError::ProfileViolation(reason)) => (
+                                    provider_call.clone(),
+                                    Some(ToolBrokerDecision::deny(reason)),
+                                ),
+                            }
+                        }
                     };
                 let call = &bound_call;
                 if self.is_cancelled(input) {
@@ -906,8 +914,10 @@ where
         let call = match pending
             .to_model_tool_call()
             .map_err(|error| format!("invalid pending tool call arguments: {error}"))
-            .and_then(|call| bind_tool_call_to_profile(&call, &self.policy.profile))
-        {
+            .and_then(|call| {
+                bind_tool_call_to_profile(&call, &self.policy.profile)
+                    .map_err(|error| error.to_string())
+            }) {
             Ok(call) => call,
             Err(error) => {
                 return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
@@ -1754,27 +1764,32 @@ fn command_audit_metadata(
                 &input.network_access(),
             ));
         }
+        audit["approval_policy"] =
+            serde_json::to_value(approval_policy).unwrap_or(json!("unknown"));
+    } else {
+        audit["argument_validation"] = json!("failed");
     }
-    audit["approval_policy"] = serde_json::to_value(approval_policy).unwrap_or(json!("unknown"));
-    match decision {
-        ToolBrokerDecision::Allow => {
-            audit["approval_decision"] = json!("allowed_by_policy");
-        }
-        ToolBrokerDecision::Approved { approval_grant_id } => {
-            audit["approval_decision"] = json!("approved");
-            audit["approval_grant_id"] = json!(approval_grant_id);
-        }
-        ToolBrokerDecision::Deny { reason } => {
-            audit["approval_decision"] = json!("denied");
-            audit["approval_denial_reason"] = json!(reason);
-        }
-        ToolBrokerDecision::Ask {
-            approval_request_id,
-            reason,
-        } => {
-            audit["approval_decision"] = json!("approval_required");
-            audit["approval_request_id"] = json!(approval_request_id);
-            audit["approval_reason"] = json!(reason);
+    if audit.get("argument_validation").is_none() {
+        match decision {
+            ToolBrokerDecision::Allow => {
+                audit["approval_decision"] = json!("allowed_by_policy");
+            }
+            ToolBrokerDecision::Approved { approval_grant_id } => {
+                audit["approval_decision"] = json!("approved");
+                audit["approval_grant_id"] = json!(approval_grant_id);
+            }
+            ToolBrokerDecision::Deny { reason } => {
+                audit["approval_decision"] = json!("denied");
+                audit["approval_denial_reason"] = json!(reason);
+            }
+            ToolBrokerDecision::Ask {
+                approval_request_id,
+                reason,
+            } => {
+                audit["approval_decision"] = json!("approval_required");
+                audit["approval_request_id"] = json!(approval_request_id);
+                audit["approval_reason"] = json!(reason);
+            }
         }
     }
     if audit.get("command_provenance").is_none() {
@@ -1819,22 +1834,33 @@ fn approval_request_id_from_tool_call_id(turn_id: &str, tool_call_id: &str) -> S
     format!("approval_{}_{}", turn_id, tool_call_id)
 }
 
+#[derive(Debug, Error)]
+enum CommandBindingError {
+    #[error("invalid command arguments")]
+    InvalidArguments,
+    #[error("{0}")]
+    ProfileViolation(String),
+}
+
 fn bind_tool_call_to_profile(
     call: &ModelToolCall,
     profile: &PermissionProfile,
-) -> Result<ModelToolCall, String> {
+) -> Result<ModelToolCall, CommandBindingError> {
     if call.tool_name != TOOL_COMMAND {
         return Ok(call.clone());
     }
-    let mut input = command_tool_input(&call.arguments).map_err(|error| error.to_string())?;
+    let mut input =
+        command_tool_input(&call.arguments).map_err(|_| CommandBindingError::InvalidArguments)?;
     let cwd = input.effective_cwd().to_string();
     let timeout_seconds = input.effective_timeout_seconds();
-    let (sandbox_mode, network_access) = effective_command_policy(profile, &input)?;
+    let (sandbox_mode, network_access) =
+        effective_command_policy(profile, &input).map_err(CommandBindingError::ProfileViolation)?;
     input.cwd = Some(cwd);
     input.timeout_seconds = Some(timeout_seconds);
     input.sandbox_mode = Some(sandbox_mode);
     input.network_access = Some(network_access);
-    let arguments = serde_json::to_value(input).map_err(|error| error.to_string())?;
+    let arguments = serde_json::to_value(input)
+        .map_err(|error| CommandBindingError::ProfileViolation(error.to_string()))?;
     let mut bound = call.clone();
     bound.raw_arguments = arguments.to_string();
     bound.arguments = arguments;
@@ -1967,6 +1993,18 @@ fn patch_tool_input(arguments: &Value) -> Result<WorkspacePatch, AgentLoopToolEr
 
 fn command_tool_input(arguments: &Value) -> Result<CommandToolInput, AgentLoopToolError> {
     serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)
+}
+
+fn validate_tool_call_arguments(call: &ModelToolCall) -> Result<(), AgentLoopToolError> {
+    match call.tool_name.as_str() {
+        TOOL_READ => read_tool_input(&call.arguments).map(|_| ()),
+        TOOL_LIST => list_tool_input(&call.arguments).map(|_| ()),
+        TOOL_GREP => grep_tool_input(&call.arguments).map(|_| ()),
+        TOOL_EDIT => edit_tool_input(&call.arguments).map(|_| ()),
+        TOOL_PATCH => patch_tool_input(&call.arguments).map(|_| ()),
+        TOOL_COMMAND => command_tool_input(&call.arguments).map(|_| ()),
+        _ => Ok(()),
+    }
 }
 
 fn invalid_tool_arguments(error: serde_json::Error) -> AgentLoopToolError {

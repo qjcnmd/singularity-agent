@@ -1464,6 +1464,12 @@ fn provider_blocker(error: &ProviderError) -> EvaluationBlocker {
             BlockerKind::Network
         }
         ModelErrorCategory::SandboxPermission => BlockerKind::Sandbox,
+        ModelErrorCategory::UnsupportedCapability
+        | ModelErrorCategory::InvalidRequest
+        | ModelErrorCategory::ToolCallParse
+        | ModelErrorCategory::JsonSchema
+        | ModelErrorCategory::ContentFilter
+        | ModelErrorCategory::UnknownProviderError => BlockerKind::ProviderResponse,
         _ => BlockerKind::ProviderConfiguration,
     };
     evaluation_blocker(kind, error.message.clone())
@@ -1477,17 +1483,17 @@ fn agent_blocker_kind(category: Option<&ModelErrorCategory>) -> Option<BlockerKi
         }
         Some(ModelErrorCategory::SandboxPermission) => Some(BlockerKind::Sandbox),
         Some(
-            ModelErrorCategory::ModelConfiguration
-            | ModelErrorCategory::InvalidRequest
-            | ModelErrorCategory::UnsupportedCapability,
-        ) => Some(BlockerKind::ProviderConfiguration),
-        Some(
-            ModelErrorCategory::Cancelled
-            | ModelErrorCategory::ContextLengthExceeded
-            | ModelErrorCategory::BudgetExceeded
+            ModelErrorCategory::InvalidRequest
+            | ModelErrorCategory::UnsupportedCapability
             | ModelErrorCategory::ToolCallParse
             | ModelErrorCategory::JsonSchema
             | ModelErrorCategory::ContentFilter,
+        ) => Some(BlockerKind::ProviderResponse),
+        Some(ModelErrorCategory::ModelConfiguration) => Some(BlockerKind::ProviderConfiguration),
+        Some(
+            ModelErrorCategory::Cancelled
+            | ModelErrorCategory::ContextLengthExceeded
+            | ModelErrorCategory::BudgetExceeded,
         )
         | None => None,
         Some(ModelErrorCategory::UnknownProviderError) => None,
@@ -1736,7 +1742,7 @@ mod tests {
             ),
             (
                 ModelErrorCategory::UnsupportedCapability,
-                BlockerKind::ProviderConfiguration,
+                BlockerKind::ProviderResponse,
             ),
             (ModelErrorCategory::SandboxPermission, BlockerKind::Sandbox),
         ] {
@@ -1749,7 +1755,7 @@ mod tests {
         );
         assert_eq!(
             agent_blocker_kind(Some(&ModelErrorCategory::JsonSchema)),
-            None
+            Some(BlockerKind::ProviderResponse)
         );
     }
 

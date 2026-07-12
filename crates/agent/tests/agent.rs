@@ -1160,6 +1160,107 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
 }
 
 #[test]
+fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = AgentLoopInput {
+        max_turns: 3,
+        ..AgentLoopInput::new("thread_1", "turn_1", "run verification")
+    };
+    let mut malformed_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    malformed_response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.command",
+        serde_json::json!({"argv": "[\"cargo\",\"test\"]", "timeout_seconds": 5}),
+    ));
+    let mut repaired_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    repaired_response.tool_calls.push(tool_call(
+        "call_2",
+        "builtin.command",
+        serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+        PermissionRule::new(
+            "allow_execute",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute),
+    );
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![malformed_response, repaired_response, final_response],
+        policy,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.model_turns, 3);
+    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("invalid_tool_arguments")
+    );
+    assert!(result.tool_results[1].ok);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    let run_status = result.to_run_status();
+    assert_eq!(run_status.audit_events.len(), 2);
+    assert_eq!(run_status.audit_events[0]["argument_validation"], "failed");
+    assert!(
+        run_status.audit_events[0]
+            .get("approval_decision")
+            .is_none()
+    );
+    assert_eq!(
+        run_status.audit_events[0]["sandbox_backend"],
+        "not_executed"
+    );
+    assert_eq!(
+        run_status.audit_events[1]["approval_decision"],
+        "allowed_by_policy"
+    );
+}
+
+#[test]
+fn agent_loop_validates_patch_arguments_before_policy() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "content").expect("write file");
+    let input = AgentLoopInput {
+        max_turns: 1,
+        ..AgentLoopInput::new("thread_1", "turn_1", "inspect the workspace")
+    };
+    let mut malformed_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    malformed_response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.patch",
+        serde_json::json!({"changes": "README.md"}),
+    ));
+    let result = agent_loop_with_response(
+        malformed_response,
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("invalid_tool_arguments")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
+        "content"
+    );
+}
+
+#[test]
 fn agent_loop_command_fails_closed_without_sandbox_backend() {
     let dir = tempfile::tempdir().expect("temp dir");
     let input = AgentLoopInput {
