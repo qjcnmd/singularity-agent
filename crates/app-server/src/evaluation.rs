@@ -9,7 +9,8 @@ use std::time::Instant;
 use serde::Serialize;
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult, AgentStatus,
+    AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics,
+    AgentStatus, AgentVerificationRequirement, BUILTIN_UPDATE_PLAN_TOOL, agent_control_tool_specs,
 };
 use singularity_core::{contains_sensitive_text, load_project_instructions_from_cwd};
 use singularity_evaluation::{
@@ -20,8 +21,8 @@ use singularity_evaluation::{
     StageResult, StageStatus, TaskId, VerificationStagePlan, WorkspacePlan,
 };
 use singularity_model::{
-    ModelErrorCategory, OpenAiProvider, ProviderConfigSnapshot, ProviderDiagnostic, ProviderError,
-    ProviderErrorStage,
+    ModelErrorCategory, ModelUsage, OpenAiProvider, ProviderAttemptMetadata,
+    ProviderConfigSnapshot, ProviderDiagnostic, ProviderError, ProviderErrorStage,
 };
 use singularity_policy::{
     ApprovalPolicy, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
@@ -96,11 +97,15 @@ struct TaskDiagnostics {
     model_turns: u32,
     tool_calls: u32,
     approval_count: u32,
+    plan_update_count: u32,
+    plan_completed: bool,
     invalid_tool_call_count: u32,
     repeated_tool_call_count: u32,
     repair_attempt_count: u32,
     completion_rejection_count: u32,
     compaction_count: u32,
+    verification_required_command_count: u32,
+    verification_satisfied_command_count: u32,
     provider_attempt_count: u32,
     provider_retry_count: u32,
     input_tokens: u64,
@@ -176,6 +181,14 @@ struct AgentStageExecution {
     model_turns: u32,
     tool_calls: u32,
     approval_count: u32,
+    plan_update_count: u32,
+    plan_completed: bool,
+    recovery_metrics: AgentRecoveryMetrics,
+    compaction_count: u32,
+    verification_required_command_count: u32,
+    verification_satisfied_command_count: u32,
+    model_usage: ModelUsage,
+    provider_attempts: ProviderAttemptMetadata,
     agent_duration_ms: u64,
     audit_events: Vec<Value>,
     trace_path: Option<String>,
@@ -405,6 +418,27 @@ fn run_task(
     diagnostics.model_turns = agent_execution.model_turns;
     diagnostics.tool_calls = agent_execution.tool_calls;
     diagnostics.approval_count = agent_execution.approval_count;
+    diagnostics.plan_update_count = agent_execution.plan_update_count;
+    diagnostics.plan_completed = agent_execution.plan_completed;
+    diagnostics.invalid_tool_call_count = agent_execution.recovery_metrics.invalid_tool_call_count;
+    diagnostics.repeated_tool_call_count =
+        agent_execution.recovery_metrics.repeated_tool_call_count;
+    diagnostics.repair_attempt_count = agent_execution.recovery_metrics.repair_attempt_count;
+    diagnostics.completion_rejection_count =
+        agent_execution.recovery_metrics.completion_rejection_count;
+    diagnostics.compaction_count = agent_execution.compaction_count;
+    diagnostics.verification_required_command_count =
+        agent_execution.verification_required_command_count;
+    diagnostics.verification_satisfied_command_count =
+        agent_execution.verification_satisfied_command_count;
+    diagnostics.input_tokens = agent_execution.model_usage.input_tokens;
+    diagnostics.output_tokens = agent_execution.model_usage.output_tokens;
+    diagnostics.cached_input_tokens = agent_execution.model_usage.cached_input_tokens;
+    diagnostics.reasoning_tokens = agent_execution.model_usage.reasoning_tokens;
+    diagnostics.total_tokens = agent_execution.model_usage.total_tokens;
+    diagnostics.provider_attempt_count = agent_execution.provider_attempts.attempt_count;
+    diagnostics.provider_retry_count = agent_execution.provider_attempts.retry_count;
+    diagnostics.provider_latency_ms = agent_execution.provider_attempts.latency_ms;
     diagnostics.agent_duration_ms = agent_execution.agent_duration_ms;
     diagnostics.trace_path = agent_execution.trace_path.clone();
     diagnostics.error = agent_execution.error.clone();
@@ -414,17 +448,6 @@ fn run_task(
         .iter()
         .filter(|event| event.get("local_process_fallback").and_then(Value::as_bool) == Some(true))
         .count();
-    diagnostics.invalid_tool_call_count = u32::try_from(
-        agent_execution
-            .audit_events
-            .iter()
-            .filter(|event| {
-                event.get("argument_validation").and_then(Value::as_str) == Some("failed")
-            })
-            .count(),
-    )
-    .unwrap_or(u32::MAX);
-    diagnostics.provider_attempt_count = diagnostics.model_turns;
 
     let Some(agent_workspace) = agent_execution.workspace.as_deref() else {
         let public =
@@ -556,11 +579,15 @@ fn finish_task(
             tool_calls: diagnostics.tool_calls,
             model_turns: diagnostics.model_turns,
             approval_count: diagnostics.approval_count,
+            plan_update_count: diagnostics.plan_update_count,
+            plan_completed: diagnostics.plan_completed,
             invalid_tool_call_count: diagnostics.invalid_tool_call_count,
             repeated_tool_call_count: diagnostics.repeated_tool_call_count,
             repair_attempt_count: diagnostics.repair_attempt_count,
             completion_rejection_count: diagnostics.completion_rejection_count,
             compaction_count: diagnostics.compaction_count,
+            verification_required_command_count: diagnostics.verification_required_command_count,
+            verification_satisfied_command_count: diagnostics.verification_satisfied_command_count,
             provider_attempt_count: diagnostics.provider_attempt_count,
             provider_retry_count: diagnostics.provider_retry_count,
             input_tokens: diagnostics.input_tokens,
@@ -1048,12 +1075,22 @@ fn run_agent_stage(
         }
     };
     let policy = evaluation_policy(agent_dir, projection);
+    let verification_requirements = match agent_verification_requirements(agent_dir, projection) {
+        Ok(requirements) => requirements,
+        Err(error) => {
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                command_diagnostics,
+            );
+        }
+    };
     let mut input = AgentLoopInput::new(
         projection.task_id.as_str(),
         format!("eval_{}_{}", run_id.as_str(), projection.task_id.as_str()),
         agent_prompt(projection),
     )
-    .with_max_turns(DEFAULT_AGENT_MAX_TURNS);
+    .with_max_turns(DEFAULT_AGENT_MAX_TURNS)
+    .with_verification_requirements(verification_requirements);
     if let Some(instructions) = project_instructions {
         input = input.with_project_instructions(instructions.content);
     }
@@ -1081,8 +1118,17 @@ fn run_agent_stage(
             "included_item_ids": context.included_item_ids.iter().map(safe_text).collect::<Vec<_>>(),
             "excluded_item_ids": context.excluded_item_ids.iter().map(safe_text).collect::<Vec<_>>(),
             "budget": &context.budget,
+            "compaction_count": context.compaction_count,
+            "compacted_message_count": context.compacted_message_count,
+            "last_compaction_before_tokens": context.last_compaction_before_tokens,
+            "last_compaction_after_tokens": context.last_compaction_after_tokens,
         })),
         "tool_calls": run_status.tool_calls,
+        "plan": run_status.plan,
+        "plan_update_count": run_status.plan_update_count,
+        "recovery_metrics": run_status.recovery_metrics,
+        "model_usage": run_status.model_usage,
+        "provider_attempts": run_status.provider_attempts,
         "tool_outcomes": result.tool_results.iter().map(|tool_result| json!({
             "tool_call_id": safe_text(&tool_result.tool_call_id),
             "tool_name": safe_text(&tool_result.tool_name),
@@ -1091,6 +1137,7 @@ fn run_agent_stage(
             "truncated": tool_result.truncated,
         })).collect::<Vec<_>>(),
         "approval_count": run_status.approval_count,
+        "verification": run_status.verification,
         "audit_events": run_status.audit_events,
         "error": run_status.error.as_deref().map(safe_text),
         "provider_diagnostic": run_status.provider_diagnostic,
@@ -1113,6 +1160,17 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
+                plan_update_count: result.plan_update_count,
+                plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
+                recovery_metrics: result.recovery_metrics.clone(),
+                compaction_count: result
+                    .context_trace
+                    .as_ref()
+                    .map_or(0, |trace| trace.compaction_count),
+                verification_required_command_count: result.verification.required_command_count,
+                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                model_usage: result.model_usage.clone(),
+                provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
                 trace_path: None,
@@ -1137,6 +1195,17 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
+                plan_update_count: result.plan_update_count,
+                plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
+                recovery_metrics: result.recovery_metrics.clone(),
+                compaction_count: result
+                    .context_trace
+                    .as_ref()
+                    .map_or(0, |trace| trace.compaction_count),
+                verification_required_command_count: result.verification.required_command_count,
+                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                model_usage: result.model_usage.clone(),
+                provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
                 trace_path: trace_path_string,
@@ -1167,6 +1236,17 @@ fn run_agent_stage(
                 model_turns: result.model_turns,
                 tool_calls: result.tool_calls,
                 approval_count: result.approval_count,
+                plan_update_count: result.plan_update_count,
+                plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
+                recovery_metrics: result.recovery_metrics.clone(),
+                compaction_count: result
+                    .context_trace
+                    .as_ref()
+                    .map_or(0, |trace| trace.compaction_count),
+                verification_required_command_count: result.verification.required_command_count,
+                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                model_usage: result.model_usage.clone(),
+                provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
                 trace_path: trace_path_string,
@@ -1245,6 +1325,17 @@ fn run_agent_stage(
         model_turns: result.model_turns,
         tool_calls: result.tool_calls,
         approval_count: result.approval_count,
+        plan_update_count: result.plan_update_count,
+        plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
+        recovery_metrics: result.recovery_metrics.clone(),
+        compaction_count: result
+            .context_trace
+            .as_ref()
+            .map_or(0, |trace| trace.compaction_count),
+        verification_required_command_count: result.verification.required_command_count,
+        verification_satisfied_command_count: result.verification.satisfied_command_count,
+        model_usage: result.model_usage.clone(),
+        provider_attempts: result.provider_attempts.clone(),
         agent_duration_ms,
         audit_events: run_status.audit_events,
         trace_path: trace_path_string,
@@ -1269,6 +1360,14 @@ fn blocked_agent_stage(
         model_turns: 0,
         tool_calls: 0,
         approval_count: 0,
+        plan_update_count: 0,
+        plan_completed: false,
+        recovery_metrics: AgentRecoveryMetrics::default(),
+        compaction_count: 0,
+        verification_required_command_count: 0,
+        verification_satisfied_command_count: 0,
+        model_usage: ModelUsage::default(),
+        provider_attempts: ProviderAttemptMetadata::default(),
         agent_duration_ms: 0,
         audit_events: Vec::new(),
         trace_path: None,
@@ -1284,7 +1383,10 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
         .map(|tool| tool.as_str())
         .collect::<BTreeSet<_>>();
     let mut registry = ToolRegistry::default();
-    for mut spec in workspace_tool_specs() {
+    for mut spec in workspace_tool_specs()
+        .into_iter()
+        .chain(agent_control_tool_specs())
+    {
         if !allowed.contains(spec.name.as_str()) {
             continue;
         }
@@ -1321,7 +1423,7 @@ fn evaluation_policy(workspace: &Path, projection: &AgentTaskProjection) -> Poli
         .map(|tool| tool.as_str())
         .collect::<BTreeSet<_>>();
     let mut policy = PolicyEngine::new(profile);
-    if [TOOL_READ, TOOL_LIST, TOOL_GREP]
+    if [TOOL_READ, TOOL_LIST, TOOL_GREP, BUILTIN_UPDATE_PLAN_TOOL]
         .iter()
         .any(|tool| allowed.contains(tool))
     {
@@ -1443,6 +1545,38 @@ fn smoke_command_input_schema(command: &CommandSpec) -> Value {
         "required": ["argv", "cwd", "timeout_seconds", "sandbox_mode", "network_access"],
         "additionalProperties": false
     })
+}
+
+fn agent_verification_requirements(
+    workspace: &Path,
+    projection: &AgentTaskProjection,
+) -> Result<Vec<AgentVerificationRequirement>, String> {
+    projection
+        .smoke_commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let cwd = resolved_smoke_cwd(workspace, command).ok_or_else(|| {
+                format!(
+                    "evaluation smoke command {} cwd could not be resolved inside the prepared workspace",
+                    index + 1
+                )
+            })?;
+            let network = sandbox_network_mode(command.network_access);
+            Ok(AgentVerificationRequirement::new(
+                command_scope_digest(
+                    command.argv.as_slice(),
+                    &cwd,
+                    command
+                        .timeout_seconds
+                        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
+                    &SandboxFilesystemMode::WorkspaceWrite,
+                    &network,
+                ),
+                1,
+            ))
+        })
+        .collect()
 }
 
 fn smoke_commands_satisfied(
@@ -1772,6 +1906,11 @@ mod tests {
             tool_results,
             approval_checkpoints: Vec::new(),
             verification: singularity_agent::AgentVerification::default(),
+            plan: None,
+            plan_update_count: 0,
+            recovery_metrics: AgentRecoveryMetrics::default(),
+            model_usage: ModelUsage::default(),
+            provider_attempts: ProviderAttemptMetadata::default(),
             error: None,
             model_turn_limit: 0,
             context_trace: None,

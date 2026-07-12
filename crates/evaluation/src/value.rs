@@ -5,13 +5,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 const IDENTIFIER_MAX_BYTES: usize = 128;
 const SHA1_HEX_LENGTH: usize = 40;
 const SHA256_HEX_LENGTH: usize = 64;
-const BUILTIN_TOOL_NAMES: [&str; 6] = [
+const BUILTIN_TOOL_NAMES: [&str; 7] = [
     "builtin.read",
     "builtin.list",
     "builtin.grep",
     "builtin.edit",
     "builtin.patch",
     "builtin.command",
+    "builtin.update_plan",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

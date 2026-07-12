@@ -653,6 +653,7 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
             TurnStatus::Completed,
             "completed",
             Some("too late"),
+            None,
             &TraceEvent::new(
                 "trace_too_late",
                 &thread.thread_id,
@@ -669,6 +670,7 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
             &turn.turn_id,
             TurnStatus::Interrupted,
             "cancelled",
+            None,
             None,
             &TraceEvent::new(
                 "trace_cancelled",
@@ -1292,6 +1294,7 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
             TurnStatus::Interrupted,
             "interrupted",
             None,
+            None,
             &trace,
             &[(next.clone(), checkpoint("approval_next", "call_2"))],
         ),
@@ -1313,6 +1316,7 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
             &first.request_id,
             TurnStatus::Blocked,
             "blocked",
+            None,
             None,
             &trace,
             &[(next.clone(), checkpoint("approval_next", "call_2"))],
@@ -1646,6 +1650,9 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
         "agent_loop",
         "terminal result",
     );
+    let plan = serde_json::json!({
+        "steps": [{"step": "verify", "status": "completed"}]
+    });
 
     let committed = store
         .commit_turn_outcome(
@@ -1653,11 +1660,23 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
             TurnStatus::Completed,
             "completed",
             Some("assistant"),
+            Some(&plan),
             &trace,
         )
         .expect("commit terminal outcome");
 
     assert_eq!(committed.turn.status, TurnStatus::Completed);
+    assert_eq!(
+        committed.plan_item.as_ref().map(|item| &item.kind),
+        Some(&singularity_protocol::ItemKind::Plan)
+    );
+    assert_eq!(
+        committed
+            .plan_item
+            .as_ref()
+            .map(|item| item.payload.clone()),
+        Some(plan)
+    );
     assert_eq!(
         committed
             .assistant_item
@@ -1721,6 +1740,7 @@ fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
         TurnStatus::Completed,
         "completed",
         Some("assistant"),
+        None,
         &trace,
     );
 

@@ -1,13 +1,14 @@
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopCapability, AgentLoopInput,
     AgentPlan, AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics,
-    AgentStatus, ApprovalGrant, assemble_context_items,
+    AgentStatus, AgentVerificationRequirement, ApprovalGrant, agent_control_tool_specs,
+    assemble_context_items,
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelRole,
     ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-    Provider, ProviderError, ProviderProtocolContract,
+    ModelUsage, Provider, ProviderAttemptMetadata, ProviderError, ProviderProtocolContract,
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
@@ -1067,6 +1068,306 @@ fn agent_loop_rechecks_context_budget_before_each_model_request() {
 }
 
 #[test]
+fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    command_response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin.command",
+        serde_json::json!({
+            "argv": test_command("success"),
+            "cwd": ".",
+            "timeout_seconds": 5,
+            "sandbox_mode": "workspace_write",
+            "network_access": "denied"
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let capabilities = ProviderProtocolContract {
+        max_context_tokens: 1_200,
+        max_output_tokens: 128,
+        ..ProviderProtocolContract::default()
+    };
+
+    let result = agent_loop_with_capabilities(
+        vec![command_response, final_response],
+        allow_read_execute_policy(),
+        Arc::clone(&seen_requests),
+        capabilities,
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(LargeOutputBackend))
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "run the command").with_max_turns(2));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    let context_trace = result.context_trace.as_ref().expect("context trace");
+    assert_eq!(context_trace.compaction_count, 1);
+    assert_eq!(context_trace.compacted_message_count, 1);
+    assert!(
+        context_trace.last_compaction_before_tokens > context_trace.last_compaction_after_tokens
+    );
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == ModelRole::Developer && message.content.contains("agent_context_compaction")
+    }));
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == ModelRole::Tool && message.content.contains("\"compacted\":true")
+    }));
+    assert!(
+        !requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("large-safe-output"))
+    );
+}
+
+#[test]
+fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicates() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let canonical_cwd = std::fs::canonicalize(dir.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let required_digest = command_scope_digest(
+        &test_command("success"),
+        &canonical_cwd,
+        5,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Denied,
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit and verify")
+        .with_max_turns(7)
+        .with_verification_requirements([AgentVerificationRequirement::new(required_digest, 2)]);
+
+    let command_response = |turn_index: u32, call_id: &str, argument: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_1_{turn_index}"),
+            format!("response_{turn_index}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "builtin.command",
+            serde_json::json!({
+                "argv": test_command(argument),
+                "cwd": ".",
+                "timeout_seconds": 5,
+                "sandbox_mode": "workspace_write",
+                "network_access": "denied"
+            }),
+        ));
+        response
+    };
+    let pre_mutation_verification = command_response(0, "command_0", "success");
+    let mut edit = ModelTurnResponse::completed("model_request_turn_1_1", "response_1", "");
+    edit.tool_calls.push(tool_call(
+        "edit_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let wrong_verification = command_response(2, "command_2", "second-success");
+    let first_required_verification = command_response(3, "command_3", "success");
+    let premature_final =
+        ModelTurnResponse::completed("model_request_turn_1_4", "response_4", "not done");
+    let second_required_verification = command_response(5, "command_5", "success");
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_6", "response_6", "done");
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![
+            pre_mutation_verification,
+            edit,
+            wrong_verification,
+            first_required_verification,
+            premature_final,
+            second_required_verification,
+            final_response,
+        ],
+        policy,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert!(result.verification.required);
+    assert!(result.verification.passed);
+    assert_eq!(result.verification.required_command_count, 2);
+    assert_eq!(result.verification.satisfied_command_count, 2);
+    assert_eq!(result.verification.successful_command_count, 4);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("README.md")).expect("read file"),
+        "after"
+    );
+}
+
+#[test]
+fn approval_resume_preserves_exact_verification_and_compaction_state() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let canonical_cwd = std::fs::canonicalize(dir.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let sandbox_mode = SandboxFilesystemMode::WorkspaceWrite;
+    let network_access = SandboxNetworkMode::Denied;
+    let first_argv = test_command("success");
+    let second_argv = test_command("second-success");
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit and verify twice")
+        .with_max_turns(4)
+        .with_verification_requirements([
+            AgentVerificationRequirement::new(
+                command_scope_digest(
+                    &first_argv,
+                    &canonical_cwd,
+                    5,
+                    &sandbox_mode,
+                    &network_access,
+                ),
+                1,
+            ),
+            AgentVerificationRequirement::new(
+                command_scope_digest(
+                    &second_argv,
+                    &canonical_cwd,
+                    5,
+                    &sandbox_mode,
+                    &network_access,
+                ),
+                1,
+            ),
+        ]);
+
+    let mut edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_0", "");
+    edit.tool_calls.push(tool_call(
+        "edit_0",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let command_response = |turn_index: u32, call_id: &str, argv: &[String]| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_1_{turn_index}"),
+            format!("response_{turn_index}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "builtin.command",
+            serde_json::json!({
+                "argv": argv,
+                "cwd": ".",
+                "timeout_seconds": 5,
+                "sandbox_mode": "workspace_write",
+                "network_access": "denied"
+            }),
+        ));
+        response
+    };
+    let first_verification = command_response(1, "verify_1", &first_argv);
+    let pending_verification = command_response(2, "verify_2", &second_argv);
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_3", "done");
+    let first_command_resource =
+        command_scope_resource(&first_argv, ".", 5, &sandbox_mode, &network_access);
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write(
+        dir.path().to_string_lossy().into_owned(),
+    ))
+    .with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    )
+    .with_rule(
+        PermissionRule::new(
+            "allow_first_verification",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute)
+        .for_resource(first_command_resource),
+    );
+    let capabilities = ProviderProtocolContract {
+        max_context_tokens: 1_200,
+        max_output_tokens: 128,
+        ..ProviderProtocolContract::default()
+    };
+    let agent_loop = agent_loop_with_capabilities(
+        vec![
+            edit,
+            first_verification,
+            pending_verification,
+            final_response,
+        ],
+        policy,
+        Arc::new(Mutex::new(Vec::new())),
+        capabilities,
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(LargeOutputBackend));
+
+    let blocked = agent_loop.run(&input);
+    assert_eq!(blocked.status, AgentStatus::Blocked);
+    assert_eq!(blocked.verification.required_command_count, 2);
+    assert_eq!(blocked.verification.satisfied_command_count, 1);
+    let pending = blocked.pending_tool_calls[0].clone();
+    let checkpoint = blocked
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    assert_eq!(checkpoint["context_trace"]["compaction_count"], 1);
+    assert_eq!(
+        checkpoint["completion"]["satisfied_command_counts"]
+            .as_object()
+            .expect("satisfied command map")
+            .values()
+            .filter(|value| value.as_u64() == Some(1))
+            .count(),
+        1
+    );
+
+    let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
+        pending.request_id.clone(),
+        pending.tool_name.clone(),
+        pending.resources.clone(),
+    ));
+    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Completed);
+    assert!(resumed.verification.passed);
+    assert_eq!(resumed.verification.required_command_count, 2);
+    assert_eq!(resumed.verification.satisfied_command_count, 2);
+    assert!(
+        resumed
+            .context_trace
+            .as_ref()
+            .is_some_and(|trace| trace.compaction_count >= 1)
+    );
+}
+
+#[test]
 fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file_path = dir.path().join("README.md");
@@ -1860,6 +2161,26 @@ impl SandboxBackend for AgentStrictBackend {
             self.name(),
             singularity_tools::SandboxBackendEnforcement::Strict,
         )
+    }
+}
+
+struct LargeOutputBackend;
+
+impl SandboxBackend for LargeOutputBackend {
+    fn name(&self) -> &'static str {
+        "large_output_strict_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, "large-safe-output\n".repeat(2_000))
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 }
 
@@ -2672,6 +2993,130 @@ fn plan_update_rejects_empty_duplicate_and_multiple_in_progress_steps() {
         "unexpected": true
     }));
     assert!(unknown_field.is_err());
+
+    let too_many = AgentPlanUpdateInput {
+        steps: (0..65)
+            .map(|index| AgentPlanStep {
+                step: format!("step {index}"),
+                status: AgentPlanStepStatus::Pending,
+            })
+            .collect(),
+    };
+    assert!(too_many.into_plan().is_err());
+    let too_long = AgentPlanUpdateInput {
+        steps: vec![AgentPlanStep {
+            step: "x".repeat(513),
+            status: AgentPlanStepStatus::Pending,
+        }],
+    };
+    assert!(too_long.into_plan().is_err());
+}
+
+#[test]
+fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
+    let mut plan_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    plan_response.tool_calls.push(plan_tool_call(
+        "plan_call_1",
+        serde_json::json!([{"step": "inspect", "status": "completed"}]),
+    ));
+    plan_response.usage = ModelUsage {
+        input_tokens: 100,
+        output_tokens: 20,
+        total_tokens: 120,
+        cached_input_tokens: 30,
+        reasoning_tokens: 5,
+        cost_estimate: None,
+    };
+    plan_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 2,
+        retry_count: 1,
+        latency_ms: 80,
+    });
+    let mut final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+    final_response.usage = ModelUsage {
+        input_tokens: 140,
+        output_tokens: 10,
+        total_tokens: 150,
+        cached_input_tokens: 40,
+        reasoning_tokens: 2,
+        cost_estimate: None,
+    };
+    final_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        retry_count: 0,
+        latency_ms: 25,
+    });
+
+    let result = agent_loop_with_plan_capabilities(
+        vec![plan_response, final_response],
+        allow_read_policy(),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract::default(),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.model_usage.input_tokens, 240);
+    assert_eq!(result.model_usage.output_tokens, 30);
+    assert_eq!(result.model_usage.total_tokens, 270);
+    assert_eq!(result.model_usage.cached_input_tokens, 70);
+    assert_eq!(result.model_usage.reasoning_tokens, 7);
+    assert_eq!(result.provider_attempts.attempt_count, 3);
+    assert_eq!(result.provider_attempts.retry_count, 1);
+    assert_eq!(result.provider_attempts.latency_ms, 105);
+    let status = result.to_run_status();
+    assert_eq!(status.model_usage, result.model_usage);
+    assert_eq!(status.provider_attempts, result.provider_attempts);
+}
+
+#[test]
+fn plan_tool_schema_matches_runtime_bounds() {
+    let spec = agent_control_tool_specs()
+        .into_iter()
+        .next()
+        .expect("plan tool spec");
+    assert_eq!(spec.name, "builtin.update_plan");
+    assert_eq!(spec.input_schema["properties"]["steps"]["minItems"], 1);
+    assert_eq!(spec.input_schema["properties"]["steps"]["maxItems"], 64);
+    assert_eq!(
+        spec.input_schema["properties"]["steps"]["items"]["properties"]["step"]["maxLength"],
+        512
+    );
+    assert_eq!(spec.input_schema["additionalProperties"], false);
+}
+
+#[test]
+fn public_plan_and_tool_result_redact_sensitive_step_text() {
+    let sensitive = "Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz123456";
+    let mut plan_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    plan_response.tool_calls.push(plan_tool_call(
+        "plan_call_1",
+        serde_json::json!([{"step": sensitive, "status": "completed"}]),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+    let result = agent_loop_with_plan_capabilities(
+        vec![plan_response, final_response],
+        allow_read_policy(),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract::default(),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(
+        result.plan.as_ref().unwrap().steps[0].step,
+        "[redacted plan step]"
+    );
+    let serialized = serde_json::to_string(&result).expect("serialize result");
+    assert!(!serialized.contains(sensitive));
+    assert_eq!(
+        result.tool_results[0].to_message_payload()["content"]["plan"]["steps"][0]["step"],
+        "[redacted plan step]"
+    );
 }
 
 #[test]
@@ -2796,6 +3241,17 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         "plan_call_1",
         serde_json::json!([{"step": "edit", "status": "completed"}]),
     ));
+    plan_response.usage = ModelUsage {
+        input_tokens: 10,
+        output_tokens: 1,
+        total_tokens: 11,
+        ..ModelUsage::default()
+    };
+    plan_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        retry_count: 0,
+        latency_ms: 10,
+    });
     let mut edit_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     edit_response.tool_calls.push(tool_call(
@@ -2807,6 +3263,17 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
             "replacement": "after"
         }),
     ));
+    edit_response.usage = ModelUsage {
+        input_tokens: 20,
+        output_tokens: 2,
+        total_tokens: 22,
+        ..ModelUsage::default()
+    };
+    edit_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 2,
+        retry_count: 1,
+        latency_ms: 20,
+    });
     let mut verify_response =
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
     verify_response.tool_calls.push(tool_call(
@@ -2814,8 +3281,30 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         "builtin.command",
         serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
     ));
-    let final_response =
+    verify_response.usage = ModelUsage {
+        input_tokens: 30,
+        output_tokens: 3,
+        total_tokens: 33,
+        ..ModelUsage::default()
+    };
+    verify_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        retry_count: 0,
+        latency_ms: 30,
+    });
+    let mut final_response =
         ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+    final_response.usage = ModelUsage {
+        input_tokens: 40,
+        output_tokens: 4,
+        total_tokens: 44,
+        ..ModelUsage::default()
+    };
+    final_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        retry_count: 0,
+        latency_ms: 40,
+    });
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let agent_loop = agent_loop_with_plan_capabilities(
         vec![
@@ -2844,6 +3333,9 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     assert_eq!(checkpoint["plan"]["steps"][0]["status"], "completed");
     assert_eq!(checkpoint["plan_update_count"], 1);
     assert_eq!(checkpoint["recovery_metrics"]["repair_attempt_count"], 0);
+    assert_eq!(checkpoint["model_usage"]["total_tokens"], 33);
+    assert_eq!(checkpoint["provider_attempts"]["attempt_count"], 3);
+    assert_eq!(checkpoint["provider_attempts"]["retry_count"], 1);
     assert!(checkpoint["seen_tool_call_fingerprints"].is_array());
     assert!(checkpoint["last_repair_failure"].is_null());
 
@@ -2857,6 +3349,12 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     assert_eq!(resumed.status, AgentStatus::Completed);
     assert_eq!(resumed.plan_update_count, 1);
     assert_eq!(resumed.recovery_metrics, AgentRecoveryMetrics::default());
+    assert_eq!(resumed.model_usage.input_tokens, 100);
+    assert_eq!(resumed.model_usage.output_tokens, 10);
+    assert_eq!(resumed.model_usage.total_tokens, 110);
+    assert_eq!(resumed.provider_attempts.attempt_count, 5);
+    assert_eq!(resumed.provider_attempts.retry_count, 1);
+    assert_eq!(resumed.provider_attempts.latency_ms, 100);
     assert!(
         resumed
             .plan

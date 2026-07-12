@@ -616,7 +616,7 @@ impl ModelTurnResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderAttemptMetadata {
     pub attempt_count: u32,
     pub retry_count: u32,

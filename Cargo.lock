@@ -1382,6 +1382,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "singularity_core",
  "singularity_model",
  "singularity_policy",

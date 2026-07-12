@@ -113,6 +113,7 @@ pub struct StartedTurn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTurnOutcome {
     pub turn: Turn,
+    pub plan_item: Option<Item>,
     pub assistant_item: Option<Item>,
     pub trace: TraceEvent,
 }
@@ -468,6 +469,7 @@ impl SessionStore {
         status: TurnStatus,
         agent_loop_status: &str,
         assistant_delta: Option<&str>,
+        plan: Option<&Value>,
         trace: &TraceEvent,
     ) -> StoreResult<CommittedTurnOutcome> {
         let transaction =
@@ -478,6 +480,7 @@ impl SessionStore {
             status,
             agent_loop_status,
             assistant_delta,
+            plan,
             trace,
         )?;
         transaction.commit()?;
@@ -491,6 +494,7 @@ impl SessionStore {
         status: TurnStatus,
         agent_loop_status: &str,
         assistant_delta: Option<&str>,
+        plan: Option<&Value>,
         trace: &TraceEvent,
     ) -> StoreResult<CommittedTurnOutcome> {
         let current = transaction
@@ -538,6 +542,16 @@ impl SessionStore {
             agent_loop_status: agent_loop_status.to_string(),
             ..current
         };
+        let plan_item = plan
+            .map(|plan| -> StoreResult<Item> {
+                let kind = ItemKind::Plan;
+                let (payload, redacted) = sanitize_item_payload(&kind, plan.clone())?;
+                let item = Self::new_item(turn_id, kind, payload);
+                let item_sequence = Self::next_item_sequence(transaction, turn_id)?;
+                Self::insert_item(transaction, &item, item_sequence, redacted)?;
+                Ok(item)
+            })
+            .transpose()?;
         let assistant_item = assistant_delta
             .map(|delta| -> StoreResult<Item> {
                 let kind = ItemKind::AgentMessage;
@@ -552,6 +566,7 @@ impl SessionStore {
         let trace = Self::insert_trace(transaction, trace)?;
         Ok(CommittedTurnOutcome {
             turn,
+            plan_item,
             assistant_item,
             trace,
         })
@@ -1111,6 +1126,7 @@ impl SessionStore {
         status: TurnStatus,
         agent_loop_status: &str,
         assistant_delta: Option<&str>,
+        plan: Option<&Value>,
         trace: &TraceEvent,
         next_approvals: &[(ApprovalRequest, Value)],
     ) -> StoreResult<CommittedTurnOutcome> {
@@ -1141,6 +1157,7 @@ impl SessionStore {
             status,
             agent_loop_status,
             assistant_delta,
+            plan,
             trace,
         )?;
         let deleted = transaction.execute(

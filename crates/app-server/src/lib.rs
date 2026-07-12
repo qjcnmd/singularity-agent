@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult,
-    AgentRunStatus, AgentStatus, ApprovalGrant, PendingToolCall,
+    AgentRunStatus, AgentStatus, ApprovalGrant, PendingToolCall, agent_control_tool_specs,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
@@ -534,6 +534,18 @@ impl AppServer {
         let turn = committed.turn;
         emit_messages(
             &mut emit,
+            self.agent_terminal_item_events(committed.plan_item.as_ref())?,
+        );
+        if let Some(plan) = status.plan.as_ref()
+            && let Some(event) = self.event_notification(AppEvent::turn_plan_updated(
+                &turn.turn_id,
+                serde_json::to_value(plan)?,
+            ))
+        {
+            emit(event);
+        }
+        emit_messages(
+            &mut emit,
             self.agent_terminal_item_events(committed.assistant_item.as_ref())?,
         );
         if let Some(event) = self.event_notification(AppEvent::turn_completed(&turn)) {
@@ -888,12 +900,18 @@ impl AppServer {
         run_status: &AgentRunStatus,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         let assistant_delta = agent_completed_delta(run_status);
+        let plan = run_status
+            .plan
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
         let event = agent_loop_trace(turn, run_status);
         self.store.commit_turn_outcome(
             &turn.turn_id,
             turn_status_for_agent(&run_status.status),
             run_status.status.as_str(),
             assistant_delta.as_deref(),
+            plan.as_ref(),
             &event,
         )
     }
@@ -908,6 +926,7 @@ impl AppServer {
         let mut effective_status = run_status.clone();
         let commit = |status: &AgentRunStatus| {
             let assistant_delta = agent_completed_delta(status);
+            let plan = status.plan.as_ref().map(serde_json::to_value).transpose()?;
             let event = agent_loop_trace(turn, status);
             let effective_next_approvals = if status.status == AgentStatus::Blocked {
                 next_approvals
@@ -920,6 +939,7 @@ impl AppServer {
                     turn_status_for_agent(&status.status),
                     status.status.as_str(),
                     assistant_delta.as_deref(),
+                    plan.as_ref(),
                     &event,
                     effective_next_approvals,
                 )
@@ -1147,6 +1167,7 @@ impl AppServer {
                     None,
                     &error,
                 )?;
+                messages.extend(self.agent_terminal_item_events(committed.plan_item.as_ref())?);
                 messages
                     .extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
                 messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
@@ -1177,6 +1198,13 @@ impl AppServer {
                     &AppServerError::Store(error),
                 )?,
             };
+            if let Some(plan) = effective_status.plan.as_ref() {
+                messages.extend(self.event_notification(AppEvent::turn_plan_updated(
+                    &committed.turn.turn_id,
+                    serde_json::to_value(plan)?,
+                )));
+            }
+            messages.extend(self.agent_terminal_item_events(committed.plan_item.as_ref())?);
             messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
             messages.extend(self.event_notification(AppEvent::turn_completed(&committed.turn)));
         }
@@ -1541,8 +1569,11 @@ fn approval_checkpoints(result: &AgentLoopResult) -> AppServerResult<Vec<Approva
 
 fn workspace_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::default();
-    for spec in workspace_tool_specs() {
-        registry.register(spec).expect("valid workspace tool");
+    for spec in workspace_tool_specs()
+        .into_iter()
+        .chain(agent_control_tool_specs())
+    {
+        registry.register(spec).expect("valid builtin tool");
     }
     registry
 }
@@ -1774,9 +1805,18 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
                 .map(|item_id| redact_app_server_text(item_id))
                 .collect::<Vec<_>>(),
             "budget": &context.budget,
+            "compaction_count": context.compaction_count,
+            "compacted_message_count": context.compacted_message_count,
+            "last_compaction_before_tokens": context.last_compaction_before_tokens,
+            "last_compaction_after_tokens": context.last_compaction_after_tokens,
         })),
         "tool_calls": status.tool_calls,
         "approval_count": status.approval_count,
+        "plan": &status.plan,
+        "plan_update_count": status.plan_update_count,
+        "recovery_metrics": &status.recovery_metrics,
+        "model_usage": &status.model_usage,
+        "provider_attempts": &status.provider_attempts,
         "audit_events": &status.audit_events,
         "verification": &status.verification,
         "error": status.error.as_deref().map(redact_app_server_text),
@@ -2191,6 +2231,17 @@ mod tests {
 
         assert!(!properties.contains_key("sandbox_mode"));
         assert!(!properties.contains_key("network_access"));
+    }
+
+    #[test]
+    fn app_server_registers_the_agent_plan_control_tool() {
+        let registry = workspace_tool_registry();
+        let plan = registry
+            .get("builtin.update_plan")
+            .expect("plan tool registered");
+
+        assert_eq!(plan.input_schema["properties"]["steps"]["maxItems"], 64);
+        assert_eq!(plan.input_schema["additionalProperties"], false);
     }
 
     #[cfg(windows)]

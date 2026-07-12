@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -131,11 +133,15 @@ fn valid_result() -> Value {
                     "tool_calls": 2,
                     "model_turns": 2,
                     "approval_count": 0,
+                    "plan_update_count": 1,
+                    "plan_completed": true,
                     "invalid_tool_call_count": 0,
                     "repeated_tool_call_count": 0,
                     "repair_attempt_count": 0,
                     "completion_rejection_count": 0,
                     "compaction_count": 0,
+                    "verification_required_command_count": 1,
+                    "verification_satisfied_command_count": 1,
                     "provider_attempt_count": 2,
                     "provider_retry_count": 0,
                     "input_tokens": 100,
