@@ -33,6 +33,10 @@ const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 const MAX_PROVIDER_ATTEMPTS: u32 = 3;
 const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
+const PROVIDER_SINGLE_TOOL_CALL_CONTRACT_VIOLATED_CODE: &str =
+    "provider_single_tool_call_contract_violated";
+const MAX_TOOL_CALLS_EXCEEDED_VALIDATION_ERROR: &str = "max_tool_calls_exceeded";
+const PARALLEL_TOOL_CALLS_NOT_ALLOWED_VALIDATION_ERROR: &str = "parallel_tool_calls_not_allowed";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
 const HTTP_STATUS_NOT_FOUND: u16 = 404;
@@ -545,6 +549,24 @@ impl ModelError {
 
 pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
     model_error_category(error)
+}
+
+pub fn is_single_tool_call_contract_violation(error: &ModelError) -> bool {
+    if error.kind != ModelErrorKind::UnsupportedCapability
+        || error.code.as_deref() != Some(PROVIDER_SINGLE_TOOL_CALL_CONTRACT_VIOLATED_CODE)
+        || error.stage != Some(ProviderErrorStage::ResponseValidation)
+        || error.validation_errors.len() != 2
+    {
+        return false;
+    }
+    error
+        .validation_errors
+        .iter()
+        .any(|value| value == MAX_TOOL_CALLS_EXCEEDED_VALIDATION_ERROR)
+        && error
+            .validation_errors
+            .iter()
+            .any(|value| value == PARALLEL_TOOL_CALLS_NOT_ALLOWED_VALIDATION_ERROR)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1259,7 +1281,7 @@ fn parse_openai_response(
                 ModelErrorKind::UnsupportedCapability,
                 "provider returned multiple tool calls for a request that permits at most one"
                     .to_string(),
-                "provider_single_tool_call_contract_violated",
+                PROVIDER_SINGLE_TOOL_CALL_CONTRACT_VIOLATED_CODE,
             )
         } else {
             (

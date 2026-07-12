@@ -6,9 +6,10 @@ use singularity_agent::{
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelRole,
-    ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-    ModelUsage, Provider, ProviderAttemptMetadata, ProviderError, ProviderProtocolContract,
+    DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage,
+    ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
+    ModelTurnStatus, ModelUsage, Provider, ProviderAttemptMetadata, ProviderError,
+    ProviderProtocolContract,
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
@@ -247,6 +248,46 @@ fn failed_model_response(error: ModelError) -> ModelTurnResponse {
     response
 }
 
+fn single_call_contract_violation_response(
+    turn_index: u32,
+    response_id: &str,
+) -> ModelTurnResponse {
+    let rejected_calls = vec![
+        tool_call(
+            "raw-invalid-call-1",
+            "builtin.read",
+            serde_json::json!({"path": "raw-invalid-args-one"}),
+        ),
+        tool_call(
+            "raw-invalid-call-2",
+            "builtin.read",
+            serde_json::json!({"path": "raw-invalid-args-two"}),
+        ),
+    ];
+    let mut response = ModelTurnResponse::completed(
+        format!("model_request_turn_1_{turn_index}"),
+        response_id,
+        "",
+    );
+    response.status = ModelTurnStatus::Invalid;
+    response.assistant_message = Some(ModelMessage::assistant_tool_calls(rejected_calls.clone()));
+    response.tool_calls = rejected_calls;
+    let mut error = ModelError::new(
+        ModelErrorKind::UnsupportedCapability,
+        "provider returned multiple tool calls for a request that permits at most one",
+    )
+    .with_provider_diagnostic(
+        "provider_single_tool_call_contract_violated",
+        singularity_model::ProviderErrorStage::ResponseValidation,
+    );
+    error.validation_errors = vec![
+        "max_tool_calls_exceeded".to_string(),
+        "parallel_tool_calls_not_allowed".to_string(),
+    ];
+    response.error = Some(error);
+    response
+}
+
 #[test]
 fn agent_loop_preserves_typed_provider_failure_category() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "provider failure");
@@ -289,6 +330,207 @@ fn agent_loop_preserves_safe_provider_diagnostic() {
     );
     assert_eq!(diagnostic.validation_errors, ["missing_tool_call_id"]);
     assert_eq!(result.to_run_status().provider_diagnostic, Some(diagnostic));
+}
+
+#[test]
+fn agent_loop_recovers_once_from_single_call_contract_violation_without_leaking_or_executing() {
+    let mut invalid = single_call_contract_violation_response(0, "response_invalid");
+    invalid.usage = ModelUsage {
+        input_tokens: 10,
+        output_tokens: 4,
+        total_tokens: 14,
+        cached_input_tokens: 2,
+        reasoning_tokens: 1,
+        cost_estimate: None,
+    };
+    invalid.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        retry_count: 0,
+        latency_ms: 11,
+    });
+    let mut final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_final", "done");
+    final_response.usage = ModelUsage {
+        input_tokens: 20,
+        output_tokens: 6,
+        total_tokens: 26,
+        cached_input_tokens: 3,
+        reasoning_tokens: 2,
+        cost_estimate: None,
+    };
+    final_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        retry_count: 0,
+        latency_ms: 17,
+    });
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![invalid, final_response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read a file"));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(result.completed);
+    assert_eq!(result.model_turns, 2);
+    assert_eq!(result.tool_calls, 0);
+    assert!(result.tool_results.is_empty());
+    assert_eq!(
+        result
+            .recovery_metrics
+            .provider_contract_recovery_attempt_count,
+        1
+    );
+    assert_eq!(result.model_usage.input_tokens, 30);
+    assert_eq!(result.model_usage.output_tokens, 10);
+    assert_eq!(result.model_usage.total_tokens, 40);
+    assert_eq!(result.model_usage.cached_input_tokens, 5);
+    assert_eq!(result.model_usage.reasoning_tokens, 3);
+    assert_eq!(result.provider_attempts.attempt_count, 2);
+    assert_eq!(result.provider_attempts.retry_count, 0);
+    assert_eq!(result.provider_attempts.latency_ms, 28);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 2);
+    let second_request = &requests[1];
+    assert_eq!(second_request.tool_choice.max_tool_calls, 1);
+    assert!(second_request.messages.iter().any(|message| {
+        message.role == ModelRole::Developer
+            && message
+                .content
+                .contains("previous model response was rejected")
+    }));
+    assert!(
+        second_request
+            .messages
+            .iter()
+            .all(|message| message.tool_calls.is_empty())
+    );
+    let serialized_request = serde_json::to_string(second_request).expect("serialize request");
+    assert!(!serialized_request.contains("raw-invalid-args-one"));
+    assert!(!serialized_request.contains("raw-invalid-args-two"));
+}
+
+#[test]
+fn agent_loop_stops_after_one_single_call_contract_recovery_and_preserves_diagnostic() {
+    let first = single_call_contract_violation_response(0, "response_invalid_1");
+    let second = single_call_contract_violation_response(1, "response_invalid_2");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![first, second],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read a file"));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(!result.completed);
+    assert_eq!(result.model_turns, 2);
+    assert_eq!(result.tool_calls, 0);
+    assert!(result.tool_results.is_empty());
+    assert_eq!(
+        result
+            .recovery_metrics
+            .provider_contract_recovery_attempt_count,
+        1
+    );
+    assert_eq!(
+        result.error_category,
+        Some(ModelErrorCategory::UnsupportedCapability)
+    );
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.code.as_deref()),
+        Some("provider_single_tool_call_contract_violated")
+    );
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 2);
+}
+
+#[test]
+fn agent_loop_does_not_recover_when_no_model_turn_budget_remains() {
+    let invalid = single_call_contract_violation_response(0, "response_invalid");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![invalid],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read a file").with_max_turns(1));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.model_turns, 1);
+    assert_eq!(
+        result
+            .recovery_metrics
+            .provider_contract_recovery_attempt_count,
+        0
+    );
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 1);
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.code.as_deref()),
+        Some("provider_single_tool_call_contract_violated")
+    );
+}
+
+#[test]
+fn agent_loop_checkpoint_preserves_provider_contract_recovery_metric() {
+    let invalid = single_call_contract_violation_response(0, "response_invalid");
+    let mut approval_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_approval", "");
+    approval_response.tool_calls.push(tool_call(
+        "approval-call-1",
+        "builtin.read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+
+    let input = AgentLoopInput::new("thread_1", "turn_1", "read a file");
+    let agent_loop = agent_loop_with_responses_and_requests(
+        vec![invalid, approval_response],
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let result = agent_loop.run(&input);
+
+    assert_eq!(result.status, AgentStatus::Blocked);
+    assert_eq!(result.model_turns, 2);
+    assert_eq!(
+        result
+            .recovery_metrics
+            .provider_contract_recovery_attempt_count,
+        1
+    );
+    let pending = result
+        .pending_tool_calls
+        .first()
+        .expect("pending tool call");
+    let checkpoint = result
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    assert_eq!(
+        checkpoint["recovery_metrics"]["provider_contract_recovery_attempt_count"],
+        1
+    );
+    let serialized_checkpoint = serde_json::to_string(&checkpoint).expect("serialize checkpoint");
+    assert!(!serialized_checkpoint.contains("raw-invalid-args-one"));
+    assert!(!serialized_checkpoint.contains("raw-invalid-args-two"));
+    let mut tampered_checkpoint = checkpoint;
+    tampered_checkpoint["recovery_metrics"]["provider_contract_recovery_attempt_count"] =
+        serde_json::json!(2);
+    let resumed = agent_loop.resume_pending_tool_call(&input, pending, &tampered_checkpoint);
+    assert_eq!(
+        resumed.error.as_deref(),
+        Some("approval checkpoint provider contract recovery state is invalid")
+    );
 }
 
 fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ModelToolCall {

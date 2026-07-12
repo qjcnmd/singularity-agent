@@ -11,7 +11,8 @@ use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
     ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
-    ProviderAttemptMetadata, ProviderDiagnostic, ProviderProtocolContract, provider_error_response,
+    ProviderAttemptMetadata, ProviderDiagnostic, ProviderProtocolContract,
+    is_single_tool_call_contract_violation, provider_error_response,
     validate_model_request_with_capabilities, validate_model_turn_response,
 };
 use singularity_policy::{
@@ -37,6 +38,7 @@ const AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
     "AgentLoop requires the Windows restricted-token command sandbox";
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_TOOL_CALLS_PER_TURN: u32 = 1;
+const MAX_PROVIDER_CONTRACT_RECOVERY_ATTEMPTS: u32 = 1;
 const APPROVAL_CHECKPOINT_VERSION: u32 = 1;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Use the available tools to inspect real files before making claims. Issue at most one tool call in each assistant response, then wait for its result before continuing. Make requested changes through tools, keep all writes inside the workspace, and run a relevant verification command after the last workspace mutation. Report only work and verification that actually completed. Read-only questions may be answered without changing files or running verification.";
 const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
@@ -48,6 +50,7 @@ const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
 const CURRENT_TURN_CONTEXT_OVERFLOW_ERROR: &str = "current turn exceeds the model context budget";
 const MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR: &str = "model request exceeds the model context budget";
 const MODEL_RESPONSE_VALIDATION_ERROR: &str = "model response validation failed";
+const PROVIDER_CONTRACT_RECOVERY_FEEDBACK: &str = "The previous model response was rejected because it used more than one tool call. Continue with at most one valid tool call, or provide a final answer. Do not repeat the rejected calls.";
 const POST_MUTATION_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: verification required after workspace mutation";
 const COMMAND_SANDBOX_PROFILE_DENIED: &str =
@@ -262,6 +265,8 @@ pub struct AgentRecoveryMetrics {
     pub repeated_tool_call_count: u32,
     pub repair_attempt_count: u32,
     pub completion_rejection_count: u32,
+    #[serde(default)]
+    pub provider_contract_recovery_attempt_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1217,6 +1222,35 @@ where
             }
             if response.status != ModelTurnStatus::Success {
                 let model_error = response.error.as_ref();
+                if response.status == ModelTurnStatus::Invalid
+                    && model_error.is_some_and(is_single_tool_call_contract_violation)
+                    && state
+                        .recovery_metrics
+                        .provider_contract_recovery_attempt_count
+                        < MAX_PROVIDER_CONTRACT_RECOVERY_ATTEMPTS
+                    && turn_index + 1 < max_turns
+                {
+                    if self.is_cancelled(input) {
+                        return state.finish(
+                            AgentStatus::Cancelled,
+                            false,
+                            None,
+                            turn_index + 1,
+                            None,
+                        );
+                    }
+                    state
+                        .recovery_metrics
+                        .provider_contract_recovery_attempt_count = state
+                        .recovery_metrics
+                        .provider_contract_recovery_attempt_count
+                        .saturating_add(1);
+                    state.messages.push(ModelMessage::text(
+                        ModelRole::Developer,
+                        PROVIDER_CONTRACT_RECOVERY_FEEDBACK,
+                    ));
+                    continue;
+                }
                 return state.finish_with_model_error(
                     AgentStatus::Failed,
                     false,
@@ -2348,6 +2382,13 @@ fn restore_checkpoint(
     }
     if checkpoint.provider_attempts.retry_count > checkpoint.provider_attempts.attempt_count {
         return Err("approval checkpoint provider attempt state is invalid".to_string());
+    }
+    if checkpoint
+        .recovery_metrics
+        .provider_contract_recovery_attempt_count
+        > MAX_PROVIDER_CONTRACT_RECOVERY_ATTEMPTS
+    {
+        return Err("approval checkpoint provider contract recovery state is invalid".to_string());
     }
     if checkpoint.context_trace.as_ref().is_some_and(|trace| {
         if trace.compaction_count == 0 {

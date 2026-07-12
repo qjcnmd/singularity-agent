@@ -6,8 +6,9 @@ use singularity_model::{
     ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderAttemptMetadata, ProviderConfigSnapshot, ProviderConfigSource,
     ProviderConfigurationStatus, ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode,
-    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, resolve_provider_config,
-    validate_model_request, validate_model_request_with_capabilities, validate_model_response,
+    ToolChoicePolicy, chat_completions_endpoint, classify_model_error,
+    is_single_tool_call_contract_violation, resolve_provider_config, validate_model_request,
+    validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
@@ -1039,8 +1040,15 @@ fn openai_provider_classifies_multiple_tool_calls_as_single_call_contract_violat
 
     assert_eq!(response.status, ModelTurnStatus::Invalid);
     assert_eq!(response.tool_calls.len(), 2);
+    let metadata = response
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("contract violation attempt metadata");
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
     let error = response.error.expect("contract violation error");
     assert_eq!(error.kind, ModelErrorKind::UnsupportedCapability);
+    assert!(is_single_tool_call_contract_violation(&error));
     assert_eq!(
         error.message,
         "provider returned multiple tool calls for a request that permits at most one"
@@ -1054,6 +1062,33 @@ fn openai_provider_classifies_multiple_tool_calls_as_single_call_contract_violat
         error.validation_errors,
         vec!["max_tool_calls_exceeded", "parallel_tool_calls_not_allowed"]
     );
+}
+
+#[test]
+fn single_tool_call_contract_predicate_rejects_other_diagnostics() {
+    let mut error = ModelError::new(
+        ModelErrorKind::UnsupportedCapability,
+        "provider returned multiple tool calls",
+    )
+    .with_provider_diagnostic(
+        "provider_single_tool_call_contract_violated",
+        ProviderErrorStage::ResponseValidation,
+    );
+    error.validation_errors = vec![
+        "max_tool_calls_exceeded".to_string(),
+        "parallel_tool_calls_not_allowed".to_string(),
+    ];
+
+    assert!(is_single_tool_call_contract_violation(&error));
+
+    error.validation_errors.push("unknown_tool".to_string());
+    assert!(!is_single_tool_call_contract_violation(&error));
+    error.validation_errors.pop();
+    error.stage = Some(ProviderErrorStage::ResponseBodyRead);
+    assert!(!is_single_tool_call_contract_violation(&error));
+    error.stage = Some(ProviderErrorStage::ResponseValidation);
+    error.kind = ModelErrorKind::JsonSchemaViolation;
+    assert!(!is_single_tool_call_contract_violation(&error));
 }
 
 #[test]
