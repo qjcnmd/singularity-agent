@@ -2,7 +2,7 @@
 
 ## 事实入口与范围
 
-1. 先读取 `.codex/repo-map.json` 定位最小相关 Rust crate、符号和测试；该文件不存在或明显过期时，使用本地 `repo-mapping` skill 刷新，但不要提交。
+1. `.codex/repo-map.json` 存在且与当前 HEAD 一致时，可用其定位最小相关 Rust crate、符号和测试；否则以当前源码为准。
 2. 先读实现、调用方、配置和相邻测试，再修改。不要把报告、旧文档或历史提交当作当前事实。
 3. 默认不读取 `.git/`、`.singularity/`、`target/`、`work/` 或其他运行产物，除非任务明确涉及 Git、缓存、产物或环境诊断。
 4. 不读取、输出或提交 `.env` 中的敏感值；环境检查只报告脱敏的 present/missing 状态。
