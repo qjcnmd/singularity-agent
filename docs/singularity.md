@@ -135,13 +135,18 @@ sg run <goal>
 
 checkpoint、pending tool call、原始 prompt、provider payload 和内部 audit metadata 不序列化到 `AgentLoopResult`、CLI response 或普通 trace payload。allow-resume 只接受当前 active blocked turn 的一次性 decision，校验 checkpoint 的完整绑定后恢复原 messages、tool results、已消费 grants、approval count 和 model-turn offset，再执行 pending tool 并继续模型循环；取消、失败和 max-turn 返回都保留恢复前的回合计数。
 
+当下一次 model request 超出 context budget 时，AgentLoop 使用确定性的 `compact_model_messages`：保留 system/developer 权威消息、最新 user 消息和最近完整的 assistant/tool 配对，把较早消息和原始 tool output 换成包含 `agent_context_compaction`、压缩数量、失败数量、plan 当前摘要、verification 摘要和 recovery 计数的 developer 摘要；保留的 tool 消息只带 `ok`、错误码、截断标记和重新读取提示。只有压缩后 token 数严格下降且仍在窗口内才应用，否则返回 context overflow。`AgentContextTrace` 记录 `compaction_count`、`compacted_message_count`、压缩前后 token 数，并进入普通 agent trace；approval checkpoint 同时保存该 trace、plan、completion tracker、model usage、provider attempts、repair 和 tool-call fingerprint 状态。resume 会校验 checkpoint 的绑定、plan/completion、provider attempt 和 compaction 单调性，再从同一状态继续，损坏或不一致时 fail closed。
+
 completion gate 保持以下不变量：
 
 - final answer 不能为空。
-- edit/patch 之后必须至少观察到一个成功 command。
-- 最后一次 workspace mutation 之后必须有成功 command。
+- 没有 manifest 指定的 typed verification 时，edit/patch 之后以及最后一次 workspace mutation 之后必须观察到成功 command。
+- typed verification requirement 使用 canonical command scope 的 SHA-256 digest 和大于零的成功次数；所有要求的 digest/count 都必须由独立成功 command result 满足，mutation 会清空此前的满足计数。
 - 存在未解决的可修复 tool failure 时不能完成。
+- 若已建立 plan，所有 plan step 必须为 `completed`；否则 final answer 被拒绝并要求再次调用 `builtin.update_plan`。
 - 达到 turn 上限、provider error 或 context overflow 返回 failed，不改写为 completed。
+
+`builtin.update_plan` 是 AgentLoop 的控制工具，不执行 workspace 操作。公开输入只有 `steps`：至少 1、最多 64 个 step；每个 step 的 `step` 非空且最多 512 个字符，`status` 只能是 `pending`、`in_progress` 或 `completed`，step 文本去空白后必须唯一且最多一个 `in_progress`。输入和嵌套 step 都拒绝 unknown fields。成功调用更新内存中的 plan 并递增 `plan_update_count`，结果只返回脱敏的 plan summary；plan 的最后完成状态由 completion gate 强制检查。
 
 ## 7. Model 与 provider
 
@@ -150,6 +155,8 @@ completion gate 保持以下不变量：
 Provider 失败通过 `ProviderDiagnostic` 投影稳定的 `code`、`stage`、transport category、命中 timeout 时的配置 deadline 秒数、HTTP status 和 response validation codes。该对象不包含 API key、Authorization、endpoint、prompt、原始响应、provider/model 名称或底层 error source；AgentLoop、app-server trace 与 Evaluation result/report 只持久化这一安全投影。原始错误 message 仍经过公共边界脱敏，诊断字段不会因 message 被整体替换为 `[redacted]` 而丢失。timeout deadline 通过本地 hanging HTTP transport 回归测试验证，不用字段序列化代替真实 reqwest 超时路径。
 
 `OpenAiProvider` 把 `ModelTurnRequest` 投影到 OpenAI-compatible `/chat/completions`，使用 reqwest rustls 客户端。每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；配置/client/runtime 初始化、请求校验与发送、HTTP status、body read、JSON decode 和 response validation 使用稳定的结构化诊断。OpenAI-compatible 实现不一定遵守 `parallel_tool_calls=false`；若响应仍包含多个 tool calls，adapter 在任何工具执行前关闭失败，返回 `provider_single_tool_call_contract_violated` / `unsupported_capability`，Evaluation 依据 `response_*` diagnostic stage 将其归为运行时 `provider_response` blocker，而不是静态 `provider_configuration` blocker。请求发送前的本地 validation 即使使用 `InvalidRequest` category，也不会归因于 Provider response。adapter 不会执行部分调用、静默丢弃其余调用或伪造兼容结果。`AgentLoopResult` 和 `AgentRunStatus` 在内部携带 typed `ModelErrorCategory`（不进入 serde、CLI 或普通 trace）；Evaluation 同时依据类别和稳定 diagnostic stage 映射 `BlockerKind`，不从 human-readable error 文本推断。
+
+一次 provider complete 最多执行 3 次 attempt，重试只覆盖可重试的网络/timeout 或 response body read 错误，以及 HTTP 429 和 5xx；请求本地校验、JSON decode 和 response validation 不通过时不重试。重试 backoff 以 50 ms 为基数并逐次翻倍（在最多 3 次 attempt 下实际等待 50 ms、100 ms），且每次等待都检查 cancellation。每次响应或错误携带 `ProviderAttemptMetadata` 的 `attempt_count`、`retry_count` 和总 `latency_ms`；AgentLoop 按 model turn 累加这些字段。`ModelUsage` 同时累计 input/output/total、cached input、reasoning token 和可选 cost；这些是诊断和 evaluation 投影，不改变 completion 或 blocker 语义。
 
 公共 `providerConfiguration` 只表示配置状态，包含来源、snapshot id、`configured`、`configurationBlocker` 和三个字段的 present/missing；它不声称网络或模型请求已经成功。Provider error 只投影稳定 code、阶段、可靠 transport 类别、HTTP status 和 response validation codes。API key、base URL 原值、Authorization header、原始 response 和原始 prompt 不进入 CLI、Evaluation 或 trace。
 
@@ -164,9 +171,12 @@ builtin.grep
 builtin.edit
 builtin.patch
 builtin.command
+builtin.update_plan
 ```
 
-产品运行时只向 `ToolBroker` 注册具有真实 workspace executor 的 `builtin.*` 工具，`ToolRegistry` 也拒绝非 builtin 命名空间。模型 schema 与 workspace input 类型由 `crates/tools` 的同一份 `workspace_tool_specs()` 合同提供，普通 AppServer 与 Evaluation 只做筛选或对 exact smoke command 收窄，不再各自维护字段副本。所有 input 都拒绝 unknown fields；read 支持 1-based 行范围和有界字符输出，list 支持默认关闭的有界递归与深度，grep 支持大小写控制、确定性遍历和精确 truncation。长单行被字符上限截断时不返回无法推进的 `next_line_start`。AgentLoop 在 Policy resource projection 之前按各 builtin input type 校验参数；非法参数直接构造可修复的 `invalid_tool_arguments`，不生成 `ToolBrokerDecision`、不调用 Policy、ToolBroker 或 executor。其脱敏 audit 明确记录 `policy_evaluated=false` 和 `executor_started=false`；真实 profile 越界和 Policy deny 仍关闭失败。当前没有 MCP 工具执行路径，也不会向模型暴露 MCP schema。
+产品运行时向 `ToolBroker` 注册具有真实 executor 的 workspace `builtin.*` 工具和 `builtin.update_plan` 控制工具，`ToolRegistry` 也拒绝非 builtin 命名空间。workspace 模型 schema 与 input type 由 `crates/tools` 的 `workspace_tool_specs()` 共用同一份公开合同；`builtin.update_plan` 由 agent control schema 注册。普通 runtime 注册全部 builtin，Evaluation 再按 manifest 的 `allowed_tools` 筛选，并对 `builtin.command` 收窄为 manifest smoke command 的 exact `const` schema。所有 input 都拒绝 unknown fields；read 支持 1-based 行范围和有界字符输出，list 支持默认关闭的有界递归与深度，grep 支持大小写控制、确定性遍历和精确 truncation。长单行被字符上限截断时不返回无法推进的 `next_line_start`。AgentLoop 在 Policy resource projection 之前按各 builtin input type 校验参数；非法参数直接构造可修复的 `invalid_tool_arguments`，不生成 `ToolBrokerDecision`、不调用 Policy、ToolBroker 或 executor。其脱敏 audit 明确记录 `policy_evaluated=false` 和 `executor_started=false`；真实 profile 越界和 Policy deny 仍关闭失败。当前没有 MCP 工具执行路径，也不会向模型暴露 MCP schema。
+
+Evaluation 中存在两套独立的 exact verification 合同：AgentLoop 内部的 typed verification completion gate 只依据 canonical command-scope digest/count 判断 final answer 是否可接受；Agent stage 完成后，app-server 再从 `AgentLoopResult.tool_results` 独立检查 manifest 的 post-agent smoke，限定为最后一次 edit/patch 之后的成功 `builtin.command`，按同一 canonical cwd、timeout、sandbox/network scope 计算 digest，并为重复 smoke 要求不同的成功 result。前者阻止过早 final，后者决定 `agent` stage 是否 passed；两者都不能用相似命令、旧 mutation 前结果或 timeout/network 设置差异冒充 exact 证据。
 
 默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。`WorkspaceTools` 对所有路径执行 lexical normalize、canonicalize existing parent、workspace containment 和 protected component 检查；多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
 
@@ -245,7 +255,7 @@ artifact_refs
 schema_meta / schema_migrations
 ```
 
-turn 创建、输入 item、history page 和 started trace 在一个事务内生成；终态 turn、可选 assistant item 和 terminal trace 也在一个事务内提交。turn sequence 和 item sequence 是每个父级内的严格正整数，用于恢复稳定顺序。
+turn 创建、输入 item、history page 和 started trace 在一个事务内生成；终态 turn、可选 `ItemKind::Plan` plan item、assistant item 和 terminal trace 也在一个事务内提交。`commit_turn_outcome` 返回 `CommittedTurnOutcome.plan_item`，app-server 只有在事务成功提交后才发送 `turn/plan/updated`（随后发送 assistant item events 和 `turn/completed`）；plan item 本身使用该 turn 的 item sequence 持久化。Approval continuation 的 `commit_turn_outcome_and_resolve_pending_execution` 还在同一事务内完成 executing request 的 outcome、plan/assistant/trace 写入、旧 checkpoint 删除和下一 approval/checkpoint handoff。turn sequence 和 item sequence 是每个父级内的严格正整数，用于恢复稳定顺序。
 
 store 在写入 item、trace 和 artifact reference 前执行敏感文本检查。检测到 secret-like 内容时保存固定 redacted 文本；trace 保存 SHA-256 payload hash，并在读取时验证完整性。`artifact/fetch` 当前只返回已经登记且脱敏的 `ArtifactRef`，不直接提供任意文件读取。
 
@@ -266,8 +276,9 @@ prepare source
 
 模型提交结构无效的 command arguments 时，AgentLoop 在 policy 与 executor 前返回稳定的参数原因码，并从已经发送给模型的 `oneOf`/`const` schema 投影有界的结构化 `content.validation_code`、`content.retry_inputs` 与 schema 提示；`retry_inputs[*].argv` 保持 JSON string array，runtime 不把错误的字符串 argv 自动转换为数组。普通 trace 只记录原因码和未执行状态，不记录 raw arguments 或完整 content。该反馈保持 repairable，但不改变 exact smoke command、scope digest 或最后一次 mutation 后验证的完成条件。
 
-`EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。`result.json` 的 v4 evidence 在 workspace change、canonical patch digest、exact smoke、strict sandbox 和零 local fallback 之外，稳定记录 model/tool/approval 回合数、无效与重复调用、repair、completion rejection、compaction、provider attempt/retry、token 和延迟诊断。`EvaluationRunSummary` 从 task result 重新计算，不能由调用方伪造；它同时给出 task、blocked、实际评分 task 和各级通过数。80% 代表任务成功率只对非 blocked task 计算，typed Provider、网络、环境或 sandbox blocker 不伪装成 Agent 失败；该诊断不改变逐任务或整次运行的 `evaluation_passed` 语义。`report.json` 另外保存逐文件 before/after SHA-256、allowlist 判定、patch evidence 路径、命令诊断和 agent trace 路径。Evaluation 直接从内存中的 `AgentLoopResult` 生成 `agent-trace.json`，其中 `tool_outcomes` 仅投影 tool call/name、`ok`、错误码和截断标记，`audit_events` 保存脱敏 command scope、approval、sandbox enforcement 和 fallback 摘要。这些产物都不持久化完整 `ToolResult`，也不保存 prompt、raw response、raw arguments、content、preview、artifact refs 或 result id。
+`EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。`result.json` 使用 `evaluation.result/v4`；每个 task 的稳定 `evidence` 包含 workspace change 数、canonical patch digest、tool-call/model-turn/approval 计数、plan update/completion、invalid/repeated tool call、repair、completion rejection、compaction、typed verification required/satisfied、provider attempt/retry、input/output/cached/reasoning/total token、provider latency、agent duration、post-agent smoke、strict sandbox command 和 `local_process_fallback_count`。`EvaluationRunSummary` 从 task result 重算 task/scored/blocked、agent completed、tests passed、evaluation passed、basis-points success rate 和 80% core threshold，不能由调用方伪造；blocked task 不进入 scored denominator，且 typed Provider、网络、环境或 sandbox blocker 不伪装成 Agent 失败。该汇总不改变逐任务或整次运行的 `evaluation_passed` 语义。
 
+`report.json` 另保存 source/baseline/agent/public/hidden 命令诊断、逐文件 before/after SHA-256、allowlist 判定、patch evidence 与 agent trace 路径，并可包含脱敏 `provider_diagnostic` 和本地诊断字段；这些 report-only 字段不改变稳定 result evidence 或 gate。Evaluation 直接从内存中的 `AgentLoopResult` 生成 `agent-trace.json`，记录脱敏 context/compaction trace、plan、recovery、model usage、provider attempts、verification、tool outcomes 和 audit events；`tool_outcomes` 仅投影 tool call/name、`ok`、错误码和截断标记，`audit_events` 只保留脱敏 command scope、approval、sandbox enforcement 和 fallback 摘要。result、report 和 trace 都不持久化完整 `ToolResult`，也不保存 prompt、raw response、raw arguments、content、preview、artifact refs 或 result id。
 默认产物目录为 `work/evaluations/<run-id>`；`result.json` 是稳定 v4 result，`report.json` 是诊断报告。任一产物原子发布失败时删除不完整 run 目录。
 
 ## 13. 失败与安全不变量
