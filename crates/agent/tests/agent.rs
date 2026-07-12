@@ -1503,6 +1503,101 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
 }
 
 #[test]
+fn denied_extra_command_after_exact_verification_gets_one_completion_turn() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let canonical_cwd = std::fs::canonicalize(workspace.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let required_argv = test_command("success");
+    let required_resource = command_scope_resource(
+        &required_argv,
+        ".",
+        5,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Denied,
+    );
+    let required_digest = command_scope_digest(
+        &required_argv,
+        &canonical_cwd,
+        5,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Denied,
+    );
+    let command_response = |turn_index: u32, call_id: &str, argv: Vec<String>| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_1_{turn_index}"),
+            format!("response_{turn_index}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "builtin.command",
+            serde_json::json!({
+                "argv": argv,
+                "cwd": ".",
+                "timeout_seconds": 5,
+                "sandbox_mode": "workspace_write",
+                "network_access": "denied"
+            }),
+        ));
+        response
+    };
+    let required = command_response(0, "required", required_argv);
+    let denied = command_response(1, "denied", test_command("second-success"));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_2", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut profile =
+        PermissionProfile::workspace_write(workspace.path().to_string_lossy().into_owned());
+    profile.approval_policy = singularity_policy::ApprovalPolicy::Never;
+    let policy = PolicyEngine::new(profile).with_rule(
+        PermissionRule::new(
+            "allow_required_verification",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute)
+        .for_resource(required_resource),
+    );
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![required, denied, final_response],
+        policy,
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new("thread_1", "turn_1", "verify once")
+            .with_max_turns(3)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                required_digest,
+                1,
+            )]),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(
+        result.tool_results[1].error_code.as_deref(),
+        Some("tool_denied")
+    );
+    assert!(result.verification.passed);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+    let requests = seen_requests.lock().expect("seen requests");
+    assert!(requests[2].messages.iter().any(|message| {
+        message.role == ModelRole::Developer
+            && message.content.contains("command was denied")
+            && message
+                .content
+                .contains("verification commands already passed")
+    }));
+}
+
+#[test]
 fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "before").expect("write file");

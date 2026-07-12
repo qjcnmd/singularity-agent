@@ -82,6 +82,7 @@ const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool f
 const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call builtin.update_plan with all steps marked completed before providing the final answer.";
 const EXACT_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: required verification commands are incomplete";
+const POST_VERIFICATION_COMMAND_DENIED_FEEDBACK: &str = "The requested command was denied and was not executed. All declared verification commands already passed. Do not request undeclared commands; provide the final answer.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -668,6 +669,10 @@ impl CompletionTracker {
         self.unresolved_failures.is_empty() && self.verification_satisfied()
     }
 
+    fn declared_verification_satisfied(&self) -> bool {
+        !self.required_command_counts.is_empty() && self.verification_satisfied()
+    }
+
     fn rejection_reason(&self) -> String {
         if !self.unresolved_failures.is_empty() {
             return format!(
@@ -828,6 +833,8 @@ struct AgentLoopCheckpoint {
     seen_tool_call_fingerprints: Vec<String>,
     #[serde(default)]
     last_repair_failure: Option<RepairFailureState>,
+    #[serde(default)]
+    post_verification_command_denial_recovered: bool,
 }
 
 struct AgentLoopState {
@@ -847,6 +854,7 @@ struct AgentLoopState {
     provider_attempts: ProviderAttemptMetadata,
     seen_tool_call_fingerprints: BTreeSet<String>,
     last_repair_failure: Option<RepairFailureState>,
+    post_verification_command_denial_recovered: bool,
     model_turn_limit: u32,
     context_trace: Option<AgentContextTrace>,
 }
@@ -874,6 +882,7 @@ impl AgentLoopState {
             provider_attempts: ProviderAttemptMetadata::default(),
             seen_tool_call_fingerprints: BTreeSet::new(),
             last_repair_failure: None,
+            post_verification_command_denial_recovered: false,
             model_turn_limit,
             context_trace,
         }
@@ -1004,6 +1013,8 @@ impl AgentLoopState {
             context_trace: self.context_trace.clone(),
             seen_tool_call_fingerprints: self.seen_tool_call_fingerprints.iter().cloned().collect(),
             last_repair_failure: self.last_repair_failure.clone(),
+            post_verification_command_denial_recovered: self
+                .post_verification_command_denial_recovered,
         };
         serde_json::to_value(checkpoint).expect("AgentLoop checkpoint serializes")
     }
@@ -1369,6 +1380,7 @@ where
                 if self.is_cancelled(input) {
                     return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
                 }
+                let profile_violation = forced_decision.is_some();
                 let tool_result = if let Some(error) = argument_error {
                     if !*invalid_was_observed {
                         state.recovery_metrics.invalid_tool_call_count = state
@@ -1435,6 +1447,25 @@ where
                 }
                 if failed_tool_result {
                     if is_repairable_tool_result(&tool_result) {
+                        continue;
+                    }
+                    if call.tool_name == TOOL_COMMAND
+                        && tool_result.error_code.as_deref() == Some("tool_denied")
+                        && !profile_violation
+                        && state.completion.declared_verification_satisfied()
+                        && state.allows_final()
+                        && !state.post_verification_command_denial_recovered
+                        && turn_index + 1 < max_turns
+                    {
+                        state.post_verification_command_denial_recovered = true;
+                        state.recovery_metrics.repair_attempt_count = state
+                            .recovery_metrics
+                            .repair_attempt_count
+                            .saturating_add(1);
+                        state.messages.push(ModelMessage::text(
+                            ModelRole::Developer,
+                            POST_VERIFICATION_COMMAND_DENIED_FEEDBACK,
+                        ));
                         continue;
                     }
                     let error_code = tool_result
@@ -2437,6 +2468,8 @@ fn restore_checkpoint(
     state.context_trace = checkpoint.context_trace;
     state.seen_tool_call_fingerprints = seen_tool_call_fingerprints;
     state.last_repair_failure = checkpoint.last_repair_failure;
+    state.post_verification_command_denial_recovered =
+        checkpoint.post_verification_command_denial_recovered;
     Ok((state, checkpoint.model_turns))
 }
 
