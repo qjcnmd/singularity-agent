@@ -2731,6 +2731,9 @@ pub fn validate_model_response(
         ToolChoiceMode::Required if tool_calls.is_empty() => {
             errors.push("tool_choice_required".to_string());
         }
+        ToolChoiceMode::SpecificTool if tool_calls.is_empty() => {
+            errors.push("specific_tool_required".to_string());
+        }
         _ => {}
     }
     if tool_calls.len() > tool_choice.max_tool_calls as usize {

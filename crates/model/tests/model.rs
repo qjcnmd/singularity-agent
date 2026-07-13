@@ -1895,10 +1895,21 @@ fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
 }
 
 #[test]
-fn openai_provider_retries_transport_failures_only_to_the_attempt_limit() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused provider address");
-    let address = listener.local_addr().expect("unused provider address");
-    drop(listener);
+fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated provider");
+    let address = listener.local_addr().expect("truncated provider address");
+    let server = thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept provider retry");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+            read_provider_request(&mut reader);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{}",
+                )
+                .expect("write truncated provider response");
+        }
+    });
     let provider =
         OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
     let request = ModelTurnRequest::new(
@@ -1912,10 +1923,14 @@ fn openai_provider_retries_transport_failures_only_to_the_attempt_limit() {
     let metadata = error.provider_attempt_metadata.expect("attempt metadata");
 
     assert_eq!(error.error.kind, ModelErrorKind::NetworkError);
-    assert_eq!(error.error.stage, Some(ProviderErrorStage::RequestSend));
+    assert_eq!(
+        error.error.stage,
+        Some(ProviderErrorStage::ResponseBodyRead)
+    );
     assert_eq!(metadata.attempt_count, 3);
     assert_eq!(metadata.retry_count, 2);
     assert!(metadata.latency_ms >= 100);
+    server.join().expect("join truncated provider");
 }
 
 #[test]
@@ -2461,6 +2476,20 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
 
     assert!(!none_result.valid);
     assert_eq!(none_result.errors, vec!["tool_choice_none"]);
+
+    let specific_without_call = validate_model_response(
+        Some(&ModelMessage::text(ModelRole::Assistant, "not a tool call")),
+        &[],
+        &ToolChoicePolicy {
+            mode: ToolChoiceMode::SpecificTool,
+            tool_name: Some("builtin.read_file".to_string()),
+            ..Default::default()
+        },
+        &["builtin.read_file".to_string()],
+        None,
+    );
+
+    assert_eq!(specific_without_call.errors, vec!["specific_tool_required"]);
 
     let duplicate_result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
