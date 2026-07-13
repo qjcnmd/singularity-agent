@@ -2,12 +2,21 @@ use singularity_app_server::AppServer;
 use singularity_model::ProviderConfigSnapshot;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_store::SessionStore;
+#[cfg(windows)]
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+#[cfg(windows)]
+use std::io::{BufRead, BufReader};
+#[cfg(windows)]
 use std::net::TcpListener;
-use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(windows)]
+use std::process::{Child, ChildStdin};
+use std::process::{Command, Stdio};
+#[cfg(windows)]
 use std::sync::mpsc::{self, Receiver};
+#[cfg(windows)]
 use std::thread;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 fn workspace_root() -> std::path::PathBuf {
@@ -32,6 +41,22 @@ fn configured_app_server(store: SessionStore) -> AppServer {
             _ => None,
         }),
     )
+}
+
+fn expected_eval_blocker_kind() -> &'static str {
+    if cfg!(windows) {
+        "workspace_preparation"
+    } else {
+        "environment"
+    }
+}
+
+fn expected_pre_agent_blocked_stage_statuses() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("blocked", "skipped")
+    } else {
+        ("skipped", "blocked")
+    }
 }
 
 fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_json::Value {
@@ -589,7 +614,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
 
     assert_eq!(result["runner"], "agent_loop");
     assert_eq!(result["status"], "blocked");
-    assert_eq!(result["blocker"], "workspace_preparation");
+    assert_eq!(result["blocker"], expected_eval_blocker_kind());
     assert_eq!(result["evaluation_passed"], false);
     assert_eq!(result["tasks"][0]["agent_completed"], false);
     assert_eq!(result["tasks"][0]["tests_passed"], false);
@@ -605,6 +630,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     let report_path = result["report_path"].as_str().expect("report path");
     assert!(std::path::Path::new(result_path).exists());
     assert!(std::path::Path::new(report_path).exists());
+    let (expected_baseline_status, _) = expected_pre_agent_blocked_stage_statuses();
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
@@ -612,11 +638,11 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     assert_eq!(payload["status"], "blocked");
     assert_eq!(
         payload["tasks"][0]["blocker"]["kind"],
-        "workspace_preparation"
+        expected_eval_blocker_kind()
     );
     assert_eq!(
         payload["tasks"][0]["stages"]["baseline"]["status"],
-        "blocked"
+        expected_baseline_status
     );
     assert_eq!(payload["tasks"][0]["stages"]["public"]["status"], "skipped");
 }
@@ -681,13 +707,17 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     assert_eq!(result["status"], "blocked");
     assert_eq!(
         result["tasks"][0]["blocker"]["kind"],
-        "workspace_preparation"
+        expected_eval_blocker_kind()
     );
     assert_eq!(
         result["tasks"][0]["diagnostics"]["smoke_command_satisfied"],
         false
     );
-    assert_eq!(result["tasks"][0]["stages"]["agent"]["status"], "skipped");
+    let (_, expected_agent_status) = expected_pre_agent_blocked_stage_statuses();
+    assert_eq!(
+        result["tasks"][0]["stages"]["agent"]["status"],
+        expected_agent_status
+    );
 }
 
 #[cfg(not(windows))]
@@ -1161,7 +1191,7 @@ fn archived_thread_rejects_approval_decision_without_consuming_it() {
 }
 
 #[test]
-fn allow_resume_error_is_terminalized_in_the_current_process_without_replay() {
+fn allow_resume_precondition_failure_is_terminalized_without_replay() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
@@ -1181,8 +1211,9 @@ fn allow_resume_error_is_terminalized_in_the_current_process_without_replay() {
     let thread = store
         .create_thread(Some("test-model"), Some(&workspace.to_string_lossy()))
         .expect("thread");
-    // Deliberately omit the durable user-input item. The Allow is claimed first, then
-    // resume encounters this ordinary runtime inconsistency before any tool executes.
+    // Deliberately omit the durable user-input item. On Windows the Allow is claimed first,
+    // then resume reaches this ordinary runtime inconsistency before any tool executes. On
+    // unsupported platforms, the capability gate fails closed before that seam is reached.
     let turn = store
         .create_turn(&thread.thread_id, "blocked")
         .expect("turn");
@@ -1251,10 +1282,15 @@ fn allow_resume_error_is_terminalized_in_the_current_process_without_replay() {
         .into_iter()
         .find(|trace| trace.component == "agent_loop" && trace.payload["status"] == "failed")
         .expect("terminal trace");
+    let error = terminal_trace.payload["error"]
+        .as_str()
+        .expect("terminal trace error");
+    #[cfg(windows)]
+    assert!(error.contains("user input"), "error={error}");
+    #[cfg(not(windows))]
     assert!(
-        terminal_trace.payload["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("user input"))
+        error.contains("agent loop turn could not resume"),
+        "error={error}"
     );
     assert_eq!(
         std::fs::read_to_string(file_path).expect("readme"),
@@ -1725,6 +1761,10 @@ fn turn_lifecycle_interrupt_on_terminal_turn_is_idempotent() {
     assert_eq!(status_result["turn"]["agent_loop_status"], "completed");
 }
 
+// These real stdio tests require the production strict Windows sandbox
+// capability. Non-Windows keeps the fail-closed capability response and uses
+// the in-process interruption coverage above for platform-independent state.
+#[cfg(windows)]
 #[test]
 fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_stdio() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1796,6 +1836,7 @@ fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_s
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn app_server_worker_observes_interrupt_written_by_another_process() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1903,11 +1944,13 @@ fn app_server_reports_startup_errors_without_panicking() {
     assert!(!stderr.contains("panicked at"), "stderr={stderr}");
 }
 
+#[cfg(windows)]
 struct JsonOutput {
     receiver: Receiver<serde_json::Value>,
     buffered: VecDeque<serde_json::Value>,
 }
 
+#[cfg(windows)]
 impl JsonOutput {
     fn recv_id(&mut self, id: i64, timeout: Duration) -> serde_json::Value {
         self.recv_where(timeout, |message| message["id"] == id)
@@ -1942,6 +1985,7 @@ impl JsonOutput {
     }
 }
 
+#[cfg(windows)]
 fn spawn_app_server(
     db_path: &std::path::Path,
     workspace: &std::path::Path,
@@ -1979,6 +2023,7 @@ fn spawn_app_server(
     )
 }
 
+#[cfg(windows)]
 fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
     send_json(
         input,
@@ -1996,6 +2041,7 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
     );
 }
 
+#[cfg(windows)]
 fn start_process_thread(
     input: &mut ChildStdin,
     output: &mut JsonOutput,
@@ -2016,11 +2062,13 @@ fn start_process_thread(
         .to_string()
 }
 
+#[cfg(windows)]
 fn send_json(input: &mut impl Write, message: serde_json::Value) {
     writeln!(input, "{message}").expect("write app-server request");
     input.flush().expect("flush app-server request");
 }
 
+#[cfg(windows)]
 fn shutdown_process(child: &mut Child, input: &mut ChildStdin, output: &mut JsonOutput, id: i64) {
     send_json(
         input,
@@ -2045,6 +2093,7 @@ fn shutdown_process(child: &mut Child, input: &mut ChildStdin, output: &mut Json
     }
 }
 
+#[cfg(windows)]
 fn hanging_provider() -> (
     String,
     Receiver<()>,

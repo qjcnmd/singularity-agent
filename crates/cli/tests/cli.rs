@@ -1000,15 +1000,30 @@ fn cli_continue_resumes_thread_and_does_not_upload_history() {
 fn cli_continue_rejects_invalid_thread_id_through_app_server() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
-    let app_server_bin = app_server_bin();
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .error(
+                "thread/resume",
+                JSON_RPC_SERVER_ERROR_CODE,
+                "Thread not found",
+            )
+            .shutdown(),
+    );
 
-    let output = cli_with_app_server(&app_server_bin, &db_path)
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
         .args(["continue", "thread_missing", "add docs"])
         .output()
         .expect("continue cli");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("Thread not found"));
+    assert!(
+        stderr(&output).contains("Thread not found"),
+        "stderr={}",
+        stderr(&output)
+    );
 }
 
 #[test]

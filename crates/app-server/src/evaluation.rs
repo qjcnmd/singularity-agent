@@ -2355,7 +2355,7 @@ mod tests {
     #[test]
     fn windows_path_budget_rejects_long_full_sha_projection_before_creation() {
         let temp = tempfile::tempdir().expect("temp");
-        let output_root = temp.path().join("r".repeat(40));
+        let output_root = temp.path().join("r".repeat(220));
         let long_run_id = RunId::new("a".repeat(40)).expect("git full-SHA run id");
         let long_task_id = TaskId::new("b".repeat(40)).expect("git full-SHA task id");
         let run_dir = output_root.join(long_run_id.as_str());
