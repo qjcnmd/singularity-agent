@@ -1479,6 +1479,11 @@ impl WorkspaceTools {
             } else {
                 change.replacement.clone()
             };
+            if updated == original {
+                return Err(WorkspaceToolError::InvalidInput(format!(
+                    "workspace mutation made no change: {relative}"
+                )));
+            }
             prepared.push((target, relative, original, updated));
         }
         let originals = prepared

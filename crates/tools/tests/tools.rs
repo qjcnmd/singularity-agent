@@ -1391,6 +1391,20 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
             .starts_with("artifact://")
     );
 
+    assert!(matches!(
+        tools.edit(
+            EditToolInput {
+                path: "app.txt".to_string(),
+                expected: "new".to_string(),
+                replacement: "new".to_string(),
+            },
+            &ToolBrokerDecision::Allow,
+        ),
+        Err(WorkspaceToolError::InvalidInput(message))
+            if message == "workspace mutation made no change: app.txt"
+    ));
+    assert_eq!(std::fs::read_to_string(&app).unwrap(), "status = new\n");
+
     let failed_patch = tools.patch(
         WorkspacePatch {
             changes: vec![
