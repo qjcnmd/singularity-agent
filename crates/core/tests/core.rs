@@ -35,6 +35,9 @@ fn sensitive_text_detects_common_secret_label_formats() {
     assert!(!contains_sensitive_text(
         "token count is 42 and token budget is 100"
     ));
+    assert!(!contains_sensitive_text(
+        "at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:661:26)"
+    ));
 }
 
 #[test]

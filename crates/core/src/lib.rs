@@ -306,6 +306,7 @@ fn is_secret_like_token_fragment(fragment: &str) -> bool {
 fn is_jwt_like_token(token: &str) -> bool {
     let parts = token.split('.').collect::<Vec<_>>();
     parts.len() >= JWT_MIN_PARTS
+        && parts[0].starts_with("eyJ")
         && parts
             .iter()
             .take(JWT_MIN_PARTS)
