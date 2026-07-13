@@ -32,6 +32,7 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
+const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_ATTEMPTS: u32 = 3;
 const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
@@ -50,7 +51,10 @@ const CAPABILITY_PROBE_REQUEST_ID: &str = "singularity_capability_probe";
 const CAPABILITY_PROBE_TOOL_A: &str = "singularity_capability_probe_a";
 const CAPABILITY_PROBE_TOOL_B: &str = "singularity_capability_probe_b";
 const CAPABILITY_PROBE_EXPECTED_LABEL: &str = "schema_sentinel_alpha";
+const CAPABILITY_PROBE_ALTERNATE_LABEL: &str = "schema_sentinel_beta";
 const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
+const CAPABILITY_PROBE_DEVELOPER_INSTRUCTION: &str =
+    "Follow the fixed capability probe request using native structured tool calls.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -806,9 +810,9 @@ impl OpenAiProviderConfig {
             supports_strict_tool_schema: false,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
-            supports_json_mode: true,
-            supports_system_message: true,
-            supports_developer_message: true,
+            supports_json_mode: false,
+            supports_system_message: false,
+            supports_developer_message: false,
             max_context_tokens: self.max_context_tokens,
             max_output_tokens: self.max_output_tokens,
         }
@@ -1269,13 +1273,11 @@ impl OpenAiProvider {
                 );
             }
             let body =
-                match block_on_provider_future(
+                match read_bounded_provider_response_body(
                     &runtime,
                     cancellation,
-                    "provider_response_body_read_failed",
-                    ProviderErrorStage::ResponseBodyRead,
                     self.request_timeout_seconds,
-                    || response.bytes(),
+                    response,
                 ) {
                     Ok(body) => body,
                     Err(error)
@@ -1606,7 +1608,7 @@ struct CapabilityProbeProfile {
 #[derive(Debug, Clone)]
 struct CapabilityProbeExpectedCall {
     tool_name: &'static str,
-    arguments: Option<Value>,
+    allowed_arguments: Vec<Value>,
 }
 
 fn capability_probe_profiles(
@@ -1614,35 +1616,41 @@ fn capability_probe_profiles(
     model_name: &str,
 ) -> Vec<CapabilityProbeProfile> {
     let base = config.protocol_contract();
-    let strict_schema = json!({
-        "type": "object",
-        "properties": {
-            "probe": {
-                "type": "string",
-                "const": CAPABILITY_PROBE_EXPECTED_LABEL
-            },
-            "values": {
-                "type": "array",
-                "minItems": 2,
-                "maxItems": 2,
-                "items": {
-                    "type": "integer",
-                    "const": CAPABILITY_PROBE_EXPECTED_VALUE
+    let schema_branch = |label: &str| {
+        json!({
+            "type": "object",
+            "properties": {
+                "probe": {
+                    "type": "string",
+                    "const": label
+                },
+                "values": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {
+                        "type": "integer",
+                        "const": CAPABILITY_PROBE_EXPECTED_VALUE
+                    }
                 }
-            }
-        },
-        "required": ["probe", "values"],
-        "additionalProperties": false
+            },
+            "required": ["probe", "values"],
+            "additionalProperties": false
+        })
+    };
+    let tool_schema = json!({
+        "oneOf": [
+            schema_branch(CAPABILITY_PROBE_EXPECTED_LABEL),
+            schema_branch(CAPABILITY_PROBE_ALTERNATE_LABEL)
+        ]
     });
     let strict_arguments = json!({
         "probe": CAPABILITY_PROBE_EXPECTED_LABEL,
         "values": [CAPABILITY_PROBE_EXPECTED_VALUE, CAPABILITY_PROBE_EXPECTED_VALUE]
     });
-    let native_schema = json!({
-        "type": "object",
-        "properties": {},
-        "required": [],
-        "additionalProperties": false
+    let alternate_strict_arguments = json!({
+        "probe": CAPABILITY_PROBE_ALTERNATE_LABEL,
+        "values": [CAPABILITY_PROBE_EXPECTED_VALUE, CAPABILITY_PROBE_EXPECTED_VALUE]
     });
     let tool = |name: String, parameters_schema: Value| ModelToolSchema {
         name,
@@ -1666,7 +1674,10 @@ fn capability_probe_profiles(
                         instruction: &str| {
         let mut request = ModelTurnRequest::new(
             CAPABILITY_PROBE_REQUEST_ID,
-            vec![ModelMessage::text(ModelRole::User, instruction)],
+            vec![
+                ModelMessage::text(ModelRole::Developer, CAPABILITY_PROBE_DEVELOPER_INSTRUCTION),
+                ModelMessage::text(ModelRole::User, instruction),
+            ],
         );
         request.model_preferences.model_name = Some(model_name.to_string());
         request.tools = tools;
@@ -1684,18 +1695,21 @@ fn capability_probe_profiles(
             supports_strict_tool_schema: strict,
             max_tool_calls_per_turn,
             max_tools_per_request,
+            supports_json_mode: false,
+            supports_system_message: false,
+            supports_developer_message: true,
             ..base.clone()
         }
     };
-    let parallel_expected = |arguments: Option<Value>| {
+    let parallel_expected = |allowed_arguments: Vec<Value>| {
         vec![
             CapabilityProbeExpectedCall {
                 tool_name: CAPABILITY_PROBE_TOOL_A,
-                arguments: arguments.clone(),
+                allowed_arguments: allowed_arguments.clone(),
             },
             CapabilityProbeExpectedCall {
                 tool_name: CAPABILITY_PROBE_TOOL_B,
-                arguments,
+                allowed_arguments,
             },
         ]
     };
@@ -1704,26 +1718,29 @@ fn capability_probe_profiles(
         profile: ProviderCapabilityProfile::StrictParallel,
         contract: make_contract(true, 2, 2),
         request: make_request(
-            probe_tools(2, &strict_schema),
+            probe_tools(2, &tool_schema),
             ToolChoiceMode::Required,
             2,
             true,
             "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
         ),
-        expected_calls: parallel_expected(Some(strict_arguments.clone())),
+        expected_calls: parallel_expected(vec![
+            strict_arguments.clone(),
+            alternate_strict_arguments.clone(),
+        ]),
         single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
     });
     profiles.push(CapabilityProbeProfile {
         profile: ProviderCapabilityProfile::NonStrictParallel,
         contract: make_contract(false, 2, 2),
         request: make_request(
-            probe_tools(2, &native_schema),
+            probe_tools(2, &tool_schema),
             ToolChoiceMode::Required,
             2,
             false,
             "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
         ),
-        expected_calls: parallel_expected(None),
+        expected_calls: parallel_expected(Vec::new()),
         single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
     });
     for tool_count in [2, 1] {
@@ -1731,7 +1748,7 @@ fn capability_probe_profiles(
             profile: ProviderCapabilityProfile::NonStrictSingle,
             contract: make_contract(false, 1, tool_count),
             request: make_request(
-                probe_tools(tool_count, &native_schema),
+                probe_tools(tool_count, &tool_schema),
                 ToolChoiceMode::Required,
                 1,
                 false,
@@ -1739,7 +1756,7 @@ fn capability_probe_profiles(
             ),
             expected_calls: vec![CapabilityProbeExpectedCall {
                 tool_name: CAPABILITY_PROBE_TOOL_A,
-                arguments: None,
+                allowed_arguments: Vec::new(),
             }],
             single_call_fallback: None,
         });
@@ -1768,10 +1785,8 @@ fn capability_probe_response_matches(
             .find_map(|(index, expected)| {
                 (!matched[index]
                     && call.tool_name == expected.tool_name
-                    && expected
-                        .arguments
-                        .as_ref()
-                        .is_none_or(|arguments| call.arguments == *arguments))
+                    && (expected.allowed_arguments.is_empty()
+                        || expected.allowed_arguments.contains(&call.arguments)))
                 .then_some(index)
             })
         else {
@@ -1794,10 +1809,8 @@ fn capability_probe_single_call_matches(
         && call.parse_status == ModelToolParseStatus::Valid
         && expected_calls.iter().any(|expected| {
             call.tool_name == expected.tool_name
-                && expected
-                    .arguments
-                    .as_ref()
-                    .is_none_or(|arguments| call.arguments == *arguments)
+                && (expected.allowed_arguments.is_empty()
+                    || expected.allowed_arguments.contains(&call.arguments))
         })
 }
 
@@ -2508,6 +2521,56 @@ where
     }
 }
 
+fn read_bounded_provider_response_body(
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &CancellationToken,
+    request_timeout_seconds: u64,
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, ProviderError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(provider_response_body_too_large_error());
+    }
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(MAX_PROVIDER_RESPONSE_BODY_BYTES);
+    let mut body = Vec::with_capacity(initial_capacity);
+    loop {
+        let chunk = block_on_provider_future(
+            runtime,
+            cancellation,
+            "provider_response_body_read_failed",
+            ProviderErrorStage::ResponseBodyRead,
+            request_timeout_seconds,
+            || response.chunk(),
+        )?;
+        let Some(chunk) = chunk else {
+            return Ok(body);
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BODY_BYTES {
+            return Err(provider_response_body_too_large_error());
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
+fn provider_response_body_too_large_error() -> ProviderError {
+    let mut error = ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider response body exceeded the fixed safety limit",
+    )
+    .with_provider_diagnostic(
+        "provider_response_body_too_large",
+        ProviderErrorStage::ResponseBodyRead,
+    );
+    error.validation_errors = vec!["provider_response_body_too_large".to_string()];
+    ProviderError::from_model_error(error)
+}
+
 fn provider_response_json_error() -> ModelError {
     ModelError::new(
         ModelErrorKind::JsonSchemaViolation,
@@ -3036,7 +3099,7 @@ fn redacted_presence(present: bool) -> String {
 
 #[cfg(test)]
 mod transport_tests {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
@@ -3105,6 +3168,69 @@ mod transport_tests {
                     .contains(&secret.to_ascii_lowercase())
             );
         }
+        server.join().expect("provider server");
+    }
+
+    #[test]
+    fn oversized_success_body_is_rejected_before_buffering() {
+        const OVERSIZED_RESPONSE_BYTES: usize = 8 * 1024 * 1024 + 1;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind oversized provider");
+        let address = listener.local_addr().expect("provider address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {OVERSIZED_RESPONSE_BYTES}\r\nconnection: close\r\n\r\n"
+            )
+            .expect("write oversized response headers");
+        });
+        let provider = OpenAiProvider::new(OpenAiProviderConfig {
+            provider_name: "openai_compatible".to_string(),
+            model_name: "gpt-test".to_string(),
+            base_url: format!("http://{address}"),
+            api_key: "sk-secret-value".to_string(),
+            source: ProviderConfigSource::ProcessEnvironment,
+            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        })
+        .expect("provider");
+        let request = ModelTurnRequest::new(
+            "request_oversized",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+
+        let error = provider
+            .complete(&request, &CancellationToken::new())
+            .expect_err("oversized provider response must fail closed");
+
+        assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_response_body_too_large")
+        );
+        assert_eq!(
+            error.error.stage,
+            Some(ProviderErrorStage::ResponseBodyRead)
+        );
+        assert_eq!(
+            error.error.validation_errors,
+            ["provider_response_body_too_large"]
+        );
+        let metadata = error
+            .provider_attempt_metadata
+            .as_ref()
+            .expect("oversized response attempt metadata");
+        assert_eq!(metadata.attempt_count, 1);
+        assert_eq!(metadata.retry_count, 0);
         server.join().expect("provider server");
     }
 }

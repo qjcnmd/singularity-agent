@@ -20,6 +20,7 @@ singularity_evaluation = { path = "../evaluation" }
 singularity_model = { path = "../model" }
 singularity_policy = { path = "../policy" }
 singularity_protocol = { path = "../protocol" }
+singularity_sandbox = { path = "../sandbox" }
 singularity_store = { path = "../store" }
 singularity_tools = { path = "../tools" }
 thiserror.workspace = true

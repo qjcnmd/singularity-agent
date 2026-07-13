@@ -459,12 +459,12 @@ impl SandboxCapabilities {
 
     pub fn supports_command_execution(&self) -> bool {
         self.env_isolation
-            && self.restricted_token
-            && self.job_object
             && self.path_admission
             && self.process_tree_kill
             && self.timeout
             && self.output_limit
+            && ((self.filesystem_isolation && self.network_isolation)
+                || (self.restricted_token && self.job_object))
     }
 
     pub fn enforcement(&self) -> SandboxBackendEnforcement {

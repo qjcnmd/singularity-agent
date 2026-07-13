@@ -1405,6 +1405,7 @@ dependencies = [
  "singularity_model",
  "singularity_policy",
  "singularity_protocol",
+ "singularity_sandbox",
  "singularity_store",
  "singularity_tools",
  "tempfile",

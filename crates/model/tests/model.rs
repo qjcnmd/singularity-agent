@@ -199,12 +199,18 @@ fn strict_probe_server() -> (String, Receiver<String>) {
         let parameters = request
             .pointer("/tools/0/function/parameters")
             .expect("strict probe parameters");
-        let valid_schema = parameters["type"] == "object"
-            && parameters["required"] == serde_json::json!(["probe", "values"])
-            && parameters["additionalProperties"] == false
-            && parameters["properties"]["probe"]["const"] == "schema_sentinel_alpha"
-            && parameters["properties"]["values"]["type"] == "array";
-        if valid_schema {
+        let branch = parameters
+            .pointer("/oneOf/0")
+            .unwrap_or(&serde_json::Value::Null);
+        let valid_schema = parameters["oneOf"].as_array().map(Vec::len) == Some(2)
+            && branch["type"] == "object"
+            && branch["required"] == serde_json::json!(["probe", "values"])
+            && branch["additionalProperties"] == false
+            && branch["properties"]["probe"]["const"] == "schema_sentinel_alpha"
+            && branch["properties"]["values"]["type"] == "array";
+        let valid_roles = request["messages"][0]["role"] == "developer"
+            && request["messages"][1]["role"] == "user";
+        if valid_schema && valid_roles {
             write_provider_response(
                 &mut stream,
                 "HTTP/1.1 200 OK",
@@ -380,7 +386,7 @@ const PROBE_STRICT_PARALLEL_RESPONSE: &str = r#"{
                     "type": "function",
                     "function": {
                         "name": "singularity_capability_probe_b",
-                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
+                        "arguments": "{\"probe\":\"schema_sentinel_beta\",\"values\":[7,7]}"
                     }
                 }
             ]
@@ -927,11 +933,12 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
         DEFAULT_MAX_OUTPUT_TOKENS
     );
     assert!(
-        default_config
+        !default_config
             .protocol_contract()
             .supports_developer_message
     );
-    assert!(default_config.protocol_contract().supports_json_mode);
+    assert!(!default_config.protocol_contract().supports_system_message);
+    assert!(!default_config.protocol_contract().supports_json_mode);
     assert_eq!(
         default_config.protocol_contract().max_tool_calls_per_turn,
         1
@@ -977,6 +984,9 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
         ProviderCapabilityProfile::StrictParallel
     );
     assert!(negotiation.contract.supports_strict_tool_schema);
+    assert!(negotiation.contract.supports_developer_message);
+    assert!(!negotiation.contract.supports_system_message);
+    assert!(!negotiation.contract.supports_json_mode);
     assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
     assert_eq!(negotiation.contract.max_tools_per_request, 2);
 
@@ -988,6 +998,13 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     .expect("strict capability request JSON");
     assert_eq!(request["tools"].as_array().map(Vec::len), Some(2));
     let parameters = &request["tools"][0]["function"]["parameters"];
+    assert_eq!(request["messages"][0]["role"], "developer");
+    assert_eq!(request["messages"][1]["role"], "user");
+    let branches = parameters["oneOf"]
+        .as_array()
+        .expect("strict probe top-level oneOf branches");
+    assert_eq!(branches.len(), 2);
+    let parameters = &branches[0];
     assert_eq!(
         parameters["required"],
         serde_json::json!(["probe", "values"])
@@ -1000,7 +1017,7 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     assert_eq!(parameters["properties"]["values"]["type"], "array");
     assert_eq!(parameters["properties"]["values"]["minItems"], 2);
     assert_eq!(parameters["properties"]["values"]["maxItems"], 2);
-    let instruction = request["messages"][0]["content"]
+    let instruction = request["messages"][1]["content"]
         .as_str()
         .expect("strict probe instruction");
     assert_eq!(

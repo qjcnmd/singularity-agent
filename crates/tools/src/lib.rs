@@ -17,7 +17,7 @@ pub use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandSemanticStatus, DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    WindowsSandboxBackend, command_permission_resource,
+    command_permission_resource,
 };
 
 const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";

@@ -51,7 +51,7 @@ impl CommandDiagnostic {
 
     pub(super) fn is_strictly_sandboxed(&self) -> bool {
         !self.local_process_fallback
-            && self.sandbox_enforcement != singularity_tools::SandboxBackendEnforcement::Unavailable
+            && self.sandbox_enforcement == singularity_tools::SandboxBackendEnforcement::Strict
     }
 }
 
@@ -257,6 +257,23 @@ mod tests {
                 .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict);
 
             assert!(infrastructure_blocker(&result, "verification command failed").is_none());
+        }
+    }
+
+    #[test]
+    fn strict_command_evidence_requires_strict_enforcement() {
+        for (enforcement, expected) in [
+            (SandboxBackendEnforcement::Strict, true),
+            (SandboxBackendEnforcement::RestrictedToken, false),
+            (SandboxBackendEnforcement::Unavailable, false),
+        ] {
+            let result = CommandResult::completed("command", "ok")
+                .with_sandbox_execution("test", enforcement);
+
+            assert_eq!(
+                CommandDiagnostic::new("verification", &result).is_strictly_sandboxed(),
+                expected
+            );
         }
     }
 }

@@ -146,6 +146,15 @@ fn sandbox_capabilities_report_actual_enforcement_strength() {
         SandboxCapabilities::unavailable().enforcement(),
         SandboxBackendEnforcement::Unavailable
     );
+
+    let mut portable_strict = SandboxCapabilities::strict();
+    portable_strict.restricted_token = false;
+    portable_strict.job_object = false;
+    assert!(portable_strict.supports_command_execution());
+    assert_eq!(
+        portable_strict.enforcement(),
+        SandboxBackendEnforcement::Strict
+    );
 }
 
 #[test]

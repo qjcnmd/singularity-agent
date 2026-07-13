@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 use singularity_core::{CancellationToken, contains_sensitive_text};
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
-    ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
+    ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
     ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderProtocolContract, ToolChoiceMode, is_strict_tool_schema_compatible,
+    ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode, is_strict_tool_schema_compatible,
     provider_error_response, validate_model_request_with_capabilities,
     validate_model_turn_response,
 };
@@ -1348,28 +1348,29 @@ where
                 for call in &response.tool_calls {
                     state.observe_model_tool_call(call, &provider_tool_names);
                 }
-                return state.finish(
+                let model_error = model_response_validation_error(validation.errors);
+                return state.finish_with_model_error(
                     AgentStatus::Failed,
                     false,
                     None,
                     turn_index + 1,
-                    Some(format!(
-                        "{MODEL_RESPONSE_VALIDATION_ERROR}: {}",
-                        validation.errors.join(", ")
-                    )),
+                    Some(model_error.message.clone()),
+                    Some(&model_error),
                 );
             }
             if response.assistant_message.as_ref().is_some_and(|message| {
                 !message.tool_calls.is_empty() && message.tool_calls != response.tool_calls
             }) {
-                return state.finish(
+                let model_error = model_response_validation_error(vec![
+                    "assistant_tool_calls_mismatch".to_string(),
+                ]);
+                return state.finish_with_model_error(
                     AgentStatus::Failed,
                     false,
                     None,
                     turn_index + 1,
-                    Some(format!(
-                        "{MODEL_RESPONSE_VALIDATION_ERROR}: assistant_tool_calls_mismatch"
-                    )),
+                    Some(model_error.message.clone()),
+                    Some(&model_error),
                 );
             }
             if response.tool_calls.is_empty() {
@@ -3063,6 +3064,22 @@ fn restore_checkpoint(
     state.seen_tool_call_fingerprints = seen_tool_call_fingerprints;
     state.last_repair_failure = checkpoint.last_repair_failure;
     Ok((state, checkpoint.model_turns, model_visible_tool_name))
+}
+
+fn model_response_validation_error(validation_errors: Vec<String>) -> ModelError {
+    let mut error = ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        format!(
+            "{MODEL_RESPONSE_VALIDATION_ERROR}: {}",
+            validation_errors.join(", ")
+        ),
+    )
+    .with_provider_diagnostic(
+        "provider_response_invalid",
+        ProviderErrorStage::ResponseValidation,
+    );
+    error.validation_errors = validation_errors;
+    error
 }
 
 fn failed_result(error: impl Into<String>) -> AgentLoopResult {

@@ -714,6 +714,20 @@ fn agent_loop_rejects_unknown_tool_response_before_execution() {
         result.error.as_deref(),
         Some("model response validation failed: unknown_tool")
     );
+    assert_eq!(result.error_category, Some(ModelErrorCategory::JsonSchema));
+    let diagnostic = result
+        .provider_diagnostic
+        .as_ref()
+        .expect("typed response validation diagnostic");
+    assert_eq!(
+        diagnostic.code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert_eq!(
+        diagnostic.stage,
+        Some(singularity_model::ProviderErrorStage::ResponseValidation)
+    );
+    assert_eq!(diagnostic.validation_errors, ["unknown_tool"]);
     assert!(result.tool_results.is_empty());
 }
 
@@ -1037,6 +1051,14 @@ fn agent_loop_fails_closed_on_mismatched_assistant_tool_calls() {
     assert_eq!(
         result.error.as_deref(),
         Some("model response validation failed: assistant_tool_calls_mismatch")
+    );
+    assert_eq!(result.error_category, Some(ModelErrorCategory::JsonSchema));
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.stage.clone()),
+        Some(singularity_model::ProviderErrorStage::ResponseValidation)
     );
     assert!(result.tool_results.is_empty());
 }

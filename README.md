@@ -46,7 +46,7 @@ SINGULARITY_MODEL=your-model-name
 
 只要进程环境中出现任一 provider 变量，Singularity 就只使用该环境层；否则从当前目录向父目录查找最近的 `.env`。`SINGULARITY_MODEL_PROVIDER` 可选，默认值为 `openai_compatible`。密钥不会通过 CLI 参数接收，doctor 只显示脱敏的 present/missing 状态。
 
-可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。工具能力不是用户配置项：每次 run/resume 都调用 capability negotiation；同一 `ProviderConfigSnapshot` 与 effective model 已有成功结果时命中 snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 probe。strict、parallel、single 是明确协商出的 contract。HTTP 200 但返回文本伪工具调用时 fail closed；本地完整 `ToolSpec` validation 始终开启，不会被关闭。
+可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。工具能力不是用户配置项：每次 run/resume 都调用 capability negotiation；同一 `ProviderConfigSnapshot` 与 effective model 已有成功结果时命中 snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 probe。probe 覆盖实际 developer/user 消息角色与 router `oneOf/const` schema 形态；strict、parallel、single 是明确协商出的 contract，未验证的 system message 和 JSON mode 保持关闭。HTTP 200 但返回文本伪工具调用时 fail closed；本地完整 `ToolSpec` validation 始终开启，不会被关闭。
 
 检查配置：
 
