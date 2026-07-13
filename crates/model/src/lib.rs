@@ -1785,7 +1785,7 @@ fn capability_probe_profiles(
             false,
             "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each. Use exactly {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]} as each arguments object.",
         ),
-        expected_calls: parallel_expected(vec![strict_arguments.clone()]),
+        expected_calls: parallel_expected(Vec::new()),
         single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
     });
     profiles.push(CapabilityProbeProfile {
@@ -1798,10 +1798,7 @@ fn capability_probe_profiles(
             false,
             "Call singularity_capability_probe_a exactly once with arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}.",
         ),
-        expected_calls: single_expected(
-            CAPABILITY_PROBE_TOOL_A,
-            vec![strict_arguments.clone()],
-        ),
+        expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, Vec::new()),
         single_call_fallback: None,
     });
     profiles.push(CapabilityProbeProfile {

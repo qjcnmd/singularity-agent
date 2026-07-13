@@ -264,7 +264,7 @@ fn strict_constraint_mismatch_probe_server(bad_arguments: &'static str) -> (Stri
         for (status_line, body) in [
             ("HTTP/1.1 200 OK", bad_response.as_str()),
             ("HTTP/1.1 200 OK", PROBE_BAD_ARGUMENTS_RESPONSE),
-            ("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE),
+            ("HTTP/1.1 200 OK", bad_response.as_str()),
         ] {
             let (mut stream, _) = listener
                 .accept()
@@ -395,6 +395,25 @@ const PROBE_STRICT_SINGLE_RESPONSE: &str = r#"{
                 }
             }
             ]
+        },
+        "finish_reason": "tool_calls"
+    }]
+}"#;
+
+const PROBE_NON_STRICT_SINGLE_RESPONSE: &str = r#"{
+    "id": "probe_non_strict_single",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "probe_call_a",
+                "type": "function",
+                "function": {
+                    "name": "singularity_capability_probe_a",
+                    "arguments": "{}"
+                }
+            }]
         },
         "finish_reason": "tool_calls"
     }]
@@ -1134,7 +1153,7 @@ fn openai_capability_probe_non_strict_single_uses_required_tool_choice() {
         vec![
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE),
+            ("HTTP/1.1 200 OK", PROBE_NON_STRICT_SINGLE_RESPONSE),
         ],
         Duration::ZERO,
     );
