@@ -2248,14 +2248,17 @@ mod tests {
         let plan = registry
             .get(singularity_agent::BUILTIN_UPDATE_PLAN_TOOL)
             .expect("plan tool registered");
-        let selector = registry
-            .get(singularity_agent::BUILTIN_SELECT_TOOL)
-            .expect("tool selector registered");
+        let router = registry
+            .get(singularity_agent::BUILTIN_INVOKE_TOOL)
+            .expect("tool router registered");
 
         assert_eq!(plan.input_schema["properties"]["steps"]["maxItems"], 64);
         assert_eq!(plan.input_schema["additionalProperties"], false);
-        assert_eq!(selector.input_schema["required"], json!(["tool_name"]));
-        assert_eq!(selector.input_schema["additionalProperties"], false);
+        assert_eq!(
+            router.input_schema["required"],
+            json!(["tool_name", "arguments"])
+        );
+        assert_eq!(router.input_schema["additionalProperties"], false);
     }
 
     #[test]
