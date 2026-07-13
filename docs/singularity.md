@@ -118,7 +118,7 @@ sg run <goal>
 - symlink/junction 解析到 workspace 外、I/O 失败、非法 UTF-8 或超限都关闭失败。
 - 指令作为 developer message 注入，不修改 user goal。
 
-`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求只保留本次 provider 调用所需的 `request_id`，工具请求只保留 tool call 标识、名称和原始参数；运行状态不再复制 run/session/task/phase/action 占位字段。AgentLoop 在每次 run 和 approval resume 前调用 `Provider::negotiate_tool_capabilities`，按 effective model 返回的 contract 建立 request，并使用该 contract 的 strict tool schema、每回合最大 tool call 数、消息角色、JSON mode 和 context/output 上限。provider 使用固定、无用户数据的 capability probe，并按 effective-model snapshot 缓存结果；strict、parallel、single 是明确协商出的能力。当前保守估算按每 4 个 ASCII 字符约 1 token、每个非 ASCII 字符 1 token，并另计消息 framing、工具 schema、developer 指令、固定开销和输出预算；它用于关闭失败的容量门禁，不声称等同 provider tokenizer。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算；最终 AgentLoop trace 记录脱敏后的包含/排除 item ID、预算明细和模型回合上限，不记录消息内容。
+`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求只保留本次 provider 调用所需的 `request_id`，工具请求只保留 tool call 标识、名称和原始参数；运行状态不再复制 run/session/task/phase/action 占位字段。AgentLoop 在每次 run 和 approval resume 前调用 `Provider::negotiate_tool_capabilities`，按 effective model 返回的 contract 建立 request，并使用该 contract 的 strict tool schema、每回合最大 tool call 数、消息角色、JSON mode 和 context/output 上限。对同一 `ProviderConfigSnapshot` 与 effective model，已有成功 negotiation 时命中 snapshot cache，不发网络 probe；只有 cache miss 才执行固定、无用户数据的 capability probe。strict、parallel、single 是明确协商出的能力。当前保守估算按每 4 个 ASCII 字符约 1 token、每个非 ASCII 字符 1 token，并另计消息 framing、工具 schema、developer 指令、固定开销和输出预算；它用于关闭失败的容量门禁，不声称等同 provider tokenizer。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算；最终 AgentLoop trace 记录脱敏后的包含/排除 item ID、预算明细和模型回合上限，不记录消息内容。
 
 ## 6. AgentLoop
 
@@ -153,7 +153,7 @@ completion gate 保持以下不变量：
 
 ## 7. Model 与 provider
 
-`ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY` 和 token limits 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。context window 默认 128000，output limit 默认 4096；用户不配置 tool-call 或 strict 能力。每次 run/resume 按 effective model 执行固定、无用户数据的 capability probe，并使用 per-effective-model snapshot cache；返回 contract 明确区分 strict、parallel、single，非法或超出协商 contract 的请求在发送前失败。
+`ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY` 和 token limits 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。context window 默认 128000，output limit 默认 4096；用户不配置 tool-call 或 strict 能力。每次 run/resume 都调用 capability negotiation；对同一 `ProviderConfigSnapshot` 与 effective model，已有成功结果时命中 per-effective-model snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 capability probe。返回 contract 明确区分 strict、parallel、single，非法或超出协商 contract 的请求在发送前失败。
 
 Provider 失败通过 `ProviderDiagnostic` 投影稳定的 `code`、`stage`、transport category、命中 timeout 时的配置 deadline 秒数、HTTP status 和 response validation codes。该对象不包含 API key、Authorization、endpoint、prompt、原始响应、provider/model 名称或底层 error source；AgentLoop、app-server trace 与 Evaluation result/report 只持久化这一安全投影。原始错误 message 仍经过公共边界脱敏，诊断字段不会因 message 被整体替换为 `[redacted]` 而丢失。timeout deadline 通过本地 hanging HTTP transport 回归测试验证，不用字段序列化代替真实 reqwest 超时路径。
 
