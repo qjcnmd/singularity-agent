@@ -118,20 +118,20 @@ sg run <goal>
 - symlink/junction 解析到 workspace 外、I/O 失败、非法 UTF-8 或超限都关闭失败。
 - 指令作为 developer message 注入，不修改 user goal。
 
-`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求只保留本次 provider 调用所需的 `request_id`，工具请求只保留 tool call 标识、名称和原始参数；运行状态不再复制 run/session/task/phase/action 占位字段。AgentLoop 在每次 run 和 approval resume 前调用 `Provider::negotiate_tool_capabilities`，按 effective model 返回的 contract 建立 request，并使用该 contract 的 strict tool schema、每回合最大 tool call 数、消息角色、JSON mode 和 context/output 上限。对同一 `ProviderConfigSnapshot` 与 effective model，已有成功 negotiation 时命中 snapshot cache，不发网络 probe；只有 cache miss 才执行固定、无用户数据的 capability probe。strict、parallel、single 是明确协商出的能力。当前保守估算按每 4 个 ASCII 字符约 1 token、每个非 ASCII 字符 1 token，并另计消息 framing、工具 schema、developer 指令、固定开销和输出预算；它用于关闭失败的容量门禁，不声称等同 provider tokenizer。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算；最终 AgentLoop trace 记录脱敏后的包含/排除 item ID、预算明细和模型回合上限，不记录消息内容。
+`AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求只保留本次 provider 调用所需的 `request_id`，工具请求只保留 tool call 标识、名称和原始参数；运行状态不再复制 run/session/task/phase/action 占位字段。AgentLoop 在每次 run 和 approval resume 前调用 `Provider::negotiate_tool_capabilities`，按 effective model 返回的 contract 建立 request，并使用该 contract 的 strict tool schema、每回合最大 tool call 数、每请求最大工具定义数、消息角色、JSON mode 和 context/output 上限。对同一 `ProviderConfigSnapshot` 与 effective model，已有成功 negotiation 时命中 snapshot cache，不发网络 probe；只有 cache miss 才执行固定、无用户数据的 capability probe。strict、parallel、single 和工具定义容量都是明确协商出的能力。当前保守估算按每 4 个 ASCII 字符约 1 token、每个非 ASCII 字符 1 token，并另计消息 framing、当回合实际可见工具 schema、developer 指令、固定开销和输出预算；有界工具视图预留 selector 与任一单工具中较大的定义。它用于关闭失败的容量门禁，不声称等同 provider tokenizer。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算；最终 AgentLoop trace 记录脱敏后的包含/排除 item ID、预算明细和模型回合上限，不记录消息内容。
 
 ## 6. AgentLoop
 
 `AgentLoop::run` 的真实步骤为：
 
 1. 组装 developer、history 和当前 user message。
-2. 协商 provider tool capabilities，按返回 contract 构造 `ModelTurnRequest` 和 builtin tool schema；单调用 provider 要求每个 response 最多一个调用。显式协商多调用能力时，developer instruction 只允许同一 response 放入彼此独立的只读调用，mutation、command、plan、approval-sensitive 或依赖前序结果的调用必须单独提交。
+2. 协商 provider tool capabilities，按返回 contract 构造 `ModelTurnRequest` 和 builtin tool schema。全部普通工具能放入协商的工具定义容量时直接投影且不暴露 selector；超限时先只暴露 exclusive、无 workspace 副作用的 `builtin.select_tool`，其本地生成的 `oneOf/const` schema 列出真实已注册工具，选择成功后的下一回合只暴露该工具的完整 schema。模型不能让 Agent 猜测或静默裁剪工具集合。有界视图和单调用 provider 每个 response 最多一个调用；显式协商多调用能力时，developer instruction 只允许同一 response 放入彼此独立的只读调用，mutation、command、plan、approval-sensitive 或依赖前序结果的调用必须单独提交。
 3. 调用 provider，并在协商前、等待期间和返回后检查 `CancellationToken`；typed cancellation 与 token cancellation 都归约为 `Cancelled`。
-4. adapter 先按协商上限验证完整 response；超出请求上限、名称/ID/JSON envelope 非法时不选择、不规范化也不执行任何调用。AgentLoop 不针对 provider 错误码重试；typed provider failure 保留原始因果并结束当前 run。
-5. AgentLoop 对 response 中所有调用执行整批 preflight：验证工具可见性、`ToolSpec` executable input contract、profile binding、workspace/protected-path 边界和 `PolicyEngine` 的 allow/deny/ask。approval grant 先在临时集合中匹配，只有整批获准执行后才提交消费；任一成员非法时不执行合法子集。
+4. adapter 先按协商上限和本次 `request.tools` 的实际名称验证完整 response；超出请求上限、隐藏工具、名称/ID/JSON envelope 非法时不选择、不规范化也不执行任何调用。AgentLoop 不针对 provider 错误码重试；typed provider failure 保留原始因果并结束当前 run。
+5. AgentLoop 对 response 中所有调用执行整批 preflight：验证工具可见性、`ToolSpec` executable input contract、profile binding、workspace/protected-path 边界和 `PolicyEngine` 的 allow/deny/ask。selector 只验证本地注册表并改变私有编排状态，不进入 workspace、Policy 或 Approval；其他工具的 approval grant 先在临时集合中匹配，只有整批获准执行后才提交消费。任一成员非法时不执行合法子集。
 6. 多调用批次只有在全部工具的 execution mode 都是 `parallel_read` 且全部 allow/approved 时才并发执行；结果按原调用顺序回传。任何 exclusive 或 ask 成员使整批零执行，并要求模型把 mutation、command、plan 或 approval-sensitive 调用单独提交。只读批次允许部分执行失败，但全部结果仍按序返回；取消发生后丢弃晚到批次结果。
 7. 单个 ask 生成绑定 request/thread/turn/tool call 的内部 checkpoint；checkpoint 与 pending approval 在 store 的同一事务中写入，包含继续运行所需的 messages、既有 tool results、已消费 grants、approval count、completion tracker 和 model-turn offset。
-8. 执行允许的工具，把 `ToolResult::to_message_payload()` 按原顺序作为 tool message 送回下一模型回合；typed repairable failure 由 completion tracker 和下一回合反馈处理，sandbox/backend/infrastructure/timeout/cancelled 不伪装成普通输入修复。
+8. 执行允许的工具，把 `ToolResult::to_message_payload()` 按原顺序作为 tool message 送回下一模型回合；有界视图在一次实际工具结果后清除选择并回到 selector，pending Approval 已保存合法工具调用，因此 checkpoint 不复制 selector 状态。typed repairable failure 由 completion tracker 和下一回合反馈处理，sandbox/backend/infrastructure/timeout/cancelled 不伪装成普通输入修复。
 9. 没有 tool call 时应用 completion gate，接受或拒绝 final answer；如果 repairable failure 或 completion/plan rejection 使状态仍不可 final，下一 `ModelTurnRequest` 使用 `ToolChoiceMode::Required`，完成条件满足后恢复 `Auto`。普通文本不会替代 required structured tool call。
 
 checkpoint、pending tool call、原始 prompt、provider payload 和内部 audit metadata 不序列化到 `AgentLoopResult`、CLI response 或普通 trace payload。checkpoint 保存 model usage、provider attempts、completion/plan、context compaction、recovery metrics 和 tool-call fingerprints，但不作为 provider capability 真值。allow-resume 只接受当前 active blocked turn 的一次性 decision，校验 checkpoint 的完整绑定后恢复原 messages、tool results、已消费 grants、approval count 和 model-turn offset，重新协商当前 effective model 的 capabilities，再执行 pending tool 并继续模型循环；取消、失败和 max-turn 返回都保留恢复前的回合计数。
@@ -149,11 +149,13 @@ completion gate 保持以下不变量：
 
 `builtin.update_plan` 是 AgentLoop 的控制工具，不执行 workspace 操作。公开输入只有 `steps`：至少 1、最多 64 个 step；每个 step 的 `step` 非空且最多 512 个字符，`status` 只能是 `pending`、`in_progress` 或 `completed`，step 文本去空白后必须唯一且最多一个 `in_progress`。输入和嵌套 step 都拒绝 unknown fields。成功调用更新内存中的 plan 并递增 `plan_update_count`，结果只返回脱敏的 plan summary；plan 的最后完成状态由 completion gate 强制检查。
 
+`builtin.select_tool` 是只在工具定义容量不足时投影给模型的 AgentLoop 控制工具。它只接受一个非空 `tool_name`，动态 schema 的候选来自当前 `ToolRegistry`；执行时再次拒绝 selector 自身或未注册名称。它是 exclusive、无 workspace/Policy/Approval 副作用，不持久化成第二份能力或授权状态。
+
 `AGENT_DEVELOPER_INSTRUCTIONS` 要求多步骤工作使用 `builtin.update_plan` 保持简洁计划，在证据或失败改变路径时更新，并在 final answer 前完成；简单只读或单步工作跳过计划。
 
 ## 7. Model 与 provider
 
-`ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY` 和 token limits 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。context window 默认 128000，output limit 默认 4096；用户不配置 tool-call 或 strict 能力。每次 run/resume 都调用 capability negotiation；对同一 `ProviderConfigSnapshot` 与 effective model，已有成功结果时命中 per-effective-model snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 capability probe。返回 contract 明确区分 strict、parallel、single，非法或超出协商 contract 的请求在发送前失败。
+`ProviderConfigSnapshot` 在 app-server 启动时只捕获一次配置。进程环境层优先；如果该层完全没有 provider 变量，则从当前目录向上查找最近 `.env`。`SINGULARITY_MODEL`、`SINGULARITY_BASE_URL`、`SINGULARITY_API_KEY` 和 token limits 必须来自同一层，`SINGULARITY_MODEL_PROVIDER` 缺失时使用 `openai_compatible`。context window 默认 128000，output limit 默认 4096；用户不配置 tool-call、tool-definition 或 strict 能力。每次 run/resume 都调用 capability negotiation；对同一 `ProviderConfigSnapshot` 与 effective model，已有成功结果时命中 per-effective-model snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 capability probe。probe 以 8、4、2 个固定工具定义验证 strict/parallel 和 non-strict/parallel，再以 8、4、2、1 验证 non-strict/single；候选总数有界，失败与 usage/attempt metadata 通过既有 single-flight 共享。返回 contract 明确区分 strict、parallel、single 和每请求工具定义容量，非法或超出协商 contract 的请求在发送前失败。
 
 Provider 失败通过 `ProviderDiagnostic` 投影稳定的 `code`、`stage`、transport category、命中 timeout 时的配置 deadline 秒数、HTTP status 和 response validation codes。该对象不包含 API key、Authorization、endpoint、prompt、原始响应、provider/model 名称或底层 error source；AgentLoop、app-server trace 与 Evaluation result/report 只持久化这一安全投影。原始错误 message 仍经过公共边界脱敏，诊断字段不会因 message 被整体替换为 `[redacted]` 而丢失。timeout deadline 通过本地 hanging HTTP transport 回归测试验证，不用字段序列化代替真实 reqwest 超时路径。
 
@@ -165,7 +167,7 @@ Provider 失败通过 `ProviderDiagnostic` 投影稳定的 `code`、`stage`、tr
 
 ## 8. Tool、Policy 与 Approval
 
-模型可见工具固定为：
+产品注册的工具为：
 
 ```text
 builtin.read
@@ -175,9 +177,10 @@ builtin.edit
 builtin.patch
 builtin.command
 builtin.update_plan
+builtin.select_tool
 ```
 
-产品运行时向 `ToolBroker` 注册具有真实 executor 的 workspace `builtin.*` 工具和 `builtin.update_plan` 控制工具，`ToolRegistry` 也拒绝非 builtin 命名空间。每个 `ToolSpec` 同时拥有模型 schema、execution mode、model-input validator 和 execution-input validator；普通工具默认共享同一 validator，只有信任边界不同的工具才显式分离。`builtin.command` 的模型合同只接受 `argv`、`cwd` 和 `timeout_seconds`，模型不能提交 `sandbox_mode`、`network_access` 或其他内部策略字段。Evaluation 用一对一 exact binding 把每个公开 smoke model input 映射到包含逐命令 sandbox/network 的 execution input；schema、prompt 和 `retry_inputs` 只投影 model side。AgentLoop 先对一个响应的全部调用完成 model validation、唯一 binding、profile 约束和 workspace preflight，任一失败时不对该批其他成员执行 Policy、Approval 或 executor；随后才统一求 Policy decision。ToolBroker 在 Allow/Approved 的执行闸门再次验证 execution contract 和 exact execution allowlist，直接调用方也不能绕过。所有 input 都拒绝 unknown fields；read 支持 1-based 行范围和有界字符输出，list 支持默认关闭的有界递归与深度，grep 支持大小写控制、确定性遍历和精确 truncation。长单行被字符上限截断时不返回无法推进的 `next_line_start`。非法参数直接构造可修复的 `invalid_tool_arguments`，不猜测或改写 argv；其脱敏 audit 明确记录 `policy_evaluated=false` 和 `executor_started=false`。当前没有 MCP 工具执行路径，也不会向模型暴露 MCP schema。
+产品运行时向 `ToolBroker` 注册具有真实 executor 的 workspace `builtin.*` 工具和两个 AgentLoop 控制工具；注册不等于同一回合全部模型可见，实际投影由协商后的工具定义容量决定。`ToolRegistry` 拒绝非 builtin 命名空间。每个 `ToolSpec` 同时拥有模型 schema、execution mode、model-input validator 和 execution-input validator；普通工具默认共享同一 validator，只有信任边界不同的工具才显式分离。`builtin.command` 的模型合同只接受 `argv`、`cwd` 和 `timeout_seconds`，模型不能提交 `sandbox_mode`、`network_access` 或其他内部策略字段。Evaluation 用一对一 exact binding 把每个公开 smoke model input 映射到包含逐命令 sandbox/network 的 execution input；schema、prompt 和 `retry_inputs` 只投影 model side。AgentLoop 先对一个响应的全部调用完成 model validation、唯一 binding、profile 约束和 workspace preflight，任一失败时不对该批其他成员执行 Policy、Approval 或 executor；随后才统一求 Policy decision。ToolBroker 在 Allow/Approved 的执行闸门再次验证 execution contract 和 exact execution allowlist，直接调用方也不能绕过。所有 input 都拒绝 unknown fields；read 支持 1-based 行范围和有界字符输出，list 支持默认关闭的有界递归与深度，grep 支持大小写控制、确定性遍历和精确 truncation。长单行被字符上限截断时不返回无法推进的 `next_line_start`。非法参数直接构造可修复的 `invalid_tool_arguments`，不猜测或改写 argv；其脱敏 audit 明确记录 `policy_evaluated=false` 和 `executor_started=false`。当前没有 MCP 工具执行路径，也不会向模型暴露 MCP schema。
 
 Evaluation 中存在两套独立的 exact verification 合同：AgentLoop 内部的 typed verification completion gate 只依据 canonical command-scope digest/count 判断 final answer 是否可接受；Agent stage 完成后，app-server 再从 `AgentLoopResult.tool_results` 独立检查 manifest 的 post-agent smoke，限定为最后一次 edit/patch 之后的成功 `builtin.command`，按同一 canonical cwd、timeout、sandbox/network scope 计算 digest，并为重复 smoke 要求不同的成功 result。前者阻止过早 final，后者决定 `agent` stage 是否 passed；两者都不能用相似命令、旧 mutation 前结果或 timeout/network 设置差异冒充 exact 证据。
 

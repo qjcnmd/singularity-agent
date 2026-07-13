@@ -1,8 +1,8 @@
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopCapability, AgentLoopInput,
     AgentPlan, AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics,
-    AgentStatus, AgentVerificationRequirement, ApprovalGrant, agent_control_tool_specs,
-    assemble_context_items,
+    AgentStatus, AgentVerificationRequirement, ApprovalGrant, BUILTIN_SELECT_TOOL,
+    agent_control_tool_specs, assemble_context_items,
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -18,8 +18,8 @@ use singularity_policy::{
 };
 use singularity_tools::{
     CommandRequest, CommandResult, SandboxBackend, SandboxCapabilities, SandboxFilesystemMode,
-    SandboxNetworkMode, ToolBroker, ToolRegistry, WorkspaceTools, command_scope_digest,
-    command_scope_resource, workspace_tool_specs,
+    SandboxNetworkMode, ToolBroker, ToolFailureKind, ToolRegistry, WorkspaceTools,
+    command_scope_digest, command_scope_resource, workspace_tool_specs,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -209,11 +209,11 @@ fn agent_loop_with_capabilities_and_plan(
     }) {
         registry.register(spec).expect("register workspace tool");
     }
-    if include_plan {
-        for spec in agent_control_tool_specs() {
+    for spec in agent_control_tool_specs() {
+        if include_plan || spec.name == BUILTIN_SELECT_TOOL {
             registry
                 .register(spec)
-                .expect("register builtin update plan");
+                .expect("register agent control tool");
         }
     }
     AgentLoop::new(
@@ -261,6 +261,12 @@ fn workspace_tool_broker_for_test() -> ToolBroker {
         .contains(&spec.name.as_str())
     }) {
         registry.register(spec).expect("register workspace tool");
+    }
+    for spec in agent_control_tool_specs()
+        .into_iter()
+        .filter(|spec| spec.name == BUILTIN_SELECT_TOOL)
+    {
+        registry.register(spec).expect("register tool selector");
     }
     ToolBroker::new(registry)
 }
@@ -559,6 +565,14 @@ fn plan_tool_call(id: &str, steps: serde_json::Value) -> ModelToolCall {
         id,
         "builtin.update_plan",
         serde_json::json!({"steps": steps}),
+    )
+}
+
+fn select_tool_call(id: &str, tool_name: &str) -> ModelToolCall {
+    tool_call(
+        id,
+        BUILTIN_SELECT_TOOL,
+        serde_json::json!({"tool_name": tool_name}),
     )
 }
 
@@ -1381,6 +1395,12 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
             .iter()
             .any(|tool| tool.name == "builtin.read")
     );
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == BUILTIN_SELECT_TOOL)
+    );
     assert_eq!(
         requests[0].model_preferences.model_name.as_deref(),
         Some("gpt-test")
@@ -1390,6 +1410,144 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
     assert_eq!(
         context_trace.budget["model_context_window"],
         serde_json::json!(DEFAULT_MAX_CONTEXT_TOKENS)
+    );
+}
+
+#[test]
+fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("README.md"), "hello").expect("write file");
+    let mut select_read = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    select_read
+        .tool_calls
+        .push(select_tool_call("select_1", "builtin.read"));
+    let mut read = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    read.tool_calls.push(tool_call(
+        "read_1",
+        "builtin.read",
+        serde_json::json!({
+            "path": "README.md",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_plan_capabilities(
+        vec![select_read, read, final_response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract {
+            max_tool_calls_per_turn: 2,
+            max_tools_per_request: 2,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .with_workspace_tools(WorkspaceTools::new(workspace.path()))
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read the file").with_max_turns(3));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.tool_calls, 2);
+    assert!(result.tool_results.iter().all(|tool_result| tool_result.ok));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec![BUILTIN_SELECT_TOOL]
+    );
+    let selectable_names =
+        requests[0].tools[0].parameters_schema["properties"]["tool_name"]["oneOf"]
+            .as_array()
+            .expect("selector choices")
+            .iter()
+            .filter_map(|choice| choice["const"].as_str())
+            .collect::<Vec<_>>();
+    assert!(selectable_names.contains(&"builtin.read"));
+    assert!(selectable_names.contains(&"builtin.command"));
+    assert!(selectable_names.contains(&"builtin.update_plan"));
+    assert!(!selectable_names.contains(&BUILTIN_SELECT_TOOL));
+    assert_eq!(requests[0].tool_choice.max_tool_calls, 1);
+    assert_eq!(
+        requests[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["builtin.read"]
+    );
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[1].tool_choice.max_tool_calls, 1);
+    assert_eq!(requests[2].tools[0].name, BUILTIN_SELECT_TOOL);
+    assert!(
+        requests[0].messages[0]
+            .content
+            .contains(BUILTIN_SELECT_TOOL)
+    );
+}
+
+#[test]
+fn agent_loop_rejects_registered_tool_hidden_by_the_current_view() {
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "read_1",
+        "builtin.read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_plan_capabilities(
+        vec![response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract {
+            max_tools_per_request: 2,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read").with_max_turns(1));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("model response validation failed: unknown_tool")
+    );
+    assert!(result.tool_results.is_empty());
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests[0].tools[0].name, BUILTIN_SELECT_TOOL);
+}
+
+#[test]
+fn invalid_tool_selection_is_typed_and_never_enters_policy_or_workspace_execution() {
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response
+        .tool_calls
+        .push(select_tool_call("select_1", "builtin.missing"));
+    let result = agent_loop_with_plan_capabilities(
+        vec![response],
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract {
+            max_tools_per_request: 2,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "select").with_max_turns(1));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(result.approval_requests.is_empty());
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(
+        result.tool_results[0].failure_kind,
+        Some(ToolFailureKind::Visibility)
+    );
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("tool_not_visible")
     );
 }
 
@@ -1424,6 +1582,40 @@ fn agent_loop_uses_provider_capabilities_for_budget_metadata() {
             >= budget["reserved_output_tokens"].as_u64().unwrap()
     );
     assert!(budget["input_token_budget"].as_u64().unwrap() < u64::from(DEFAULT_MAX_CONTEXT_TOKENS));
+}
+
+#[test]
+fn deferred_tool_view_budgets_only_the_largest_possible_request_view() {
+    let run_with_capacity = |max_tools_per_request| {
+        agent_loop_with_plan_capabilities(
+            vec![ModelTurnResponse::completed(
+                "model_request_turn_1_0",
+                "response_1",
+                "done",
+            )],
+            allow_read_policy(),
+            Arc::new(Mutex::new(Vec::new())),
+            ProviderProtocolContract {
+                max_tools_per_request,
+                ..ProviderProtocolContract::default()
+            },
+        )
+        .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"))
+    };
+
+    let full = run_with_capacity(8);
+    let deferred = run_with_capacity(2);
+
+    assert_eq!(full.status, AgentStatus::Completed);
+    assert_eq!(deferred.status, AgentStatus::Completed);
+    let full_tool_tokens = full.context_trace.expect("full context").budget["tool_tokens"]
+        .as_u64()
+        .expect("full tool tokens");
+    let deferred_tool_tokens =
+        deferred.context_trace.expect("deferred context").budget["tool_tokens"]
+            .as_u64()
+            .expect("deferred tool tokens");
+    assert!(deferred_tool_tokens < full_tool_tokens);
 }
 
 #[test]
@@ -1482,6 +1674,33 @@ fn agent_loop_rejects_unsupported_tool_capability_before_provider() {
         Some("model request validation failed: provider_does_not_support_tools")
     );
     assert!(result.tool_results.is_empty());
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
+}
+
+#[test]
+fn agent_loop_rejects_zero_tool_definition_capacity_before_provider() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_capabilities(
+        vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "must not be used",
+        )],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract {
+            max_tools_per_request: 0,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "hello"));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.model_turns, 0);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("provider tool-definition limit must be greater than zero")
+    );
     assert!(seen_requests.lock().expect("seen requests").is_empty());
 }
 
