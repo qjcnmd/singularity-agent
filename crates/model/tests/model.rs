@@ -1654,7 +1654,7 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
         (
             "HTTP/1.1 404 Not Found",
             ModelErrorKind::InvalidRequest,
-            ModelErrorCategory::ModelConfiguration,
+            ModelErrorCategory::InvalidRequest,
         ),
         (
             "HTTP/1.1 429 Too Many Requests",
@@ -1688,6 +1688,9 @@ fn openai_provider_classifies_model_rate_limit_and_overload_http_errors() {
 
         assert_eq!(error.error.kind, expected_kind);
         assert_eq!(error.error.category(), expected_category);
+        if status_line.starts_with("HTTP/1.1 404") {
+            assert_eq!(error.error.message, "Provider returned HTTP 404.");
+        }
         let metadata = error
             .provider_attempt_metadata
             .as_ref()
@@ -1766,7 +1769,7 @@ fn provider_status_reports_required_env_missing_blocker() {
 }
 
 #[test]
-fn model_errors_classify_provider_failures_without_transport_calls() {
+fn model_errors_classify_provider_failures_by_typed_cause_without_transport_calls() {
     let auth = ModelError::new(ModelErrorKind::AuthError, "Provider returned HTTP 401.")
         .with_provider("openai_compatible")
         .with_model("gpt-test");
@@ -1780,20 +1783,30 @@ fn model_errors_classify_provider_failures_without_transport_calls() {
         "[WinError 10013] socket access denied",
     );
 
-    assert_eq!(
-        permission_denied.category(),
-        ModelErrorCategory::SandboxPermission
-    );
+    assert_eq!(permission_denied.category(), ModelErrorCategory::Network);
 
     let model_missing = ModelError::new(
         ModelErrorKind::InvalidRequest,
         "model gpt-missing does not exist",
     );
 
-    assert_eq!(
-        model_missing.category(),
-        ModelErrorCategory::ModelConfiguration
-    );
+    assert_eq!(model_missing.category(), ModelErrorCategory::InvalidRequest);
+
+    for code in [
+        "provider_configuration_missing",
+        "provider_configuration_invalid",
+    ] {
+        let typed_configuration = ModelError::new(
+            ModelErrorKind::InvalidRequest,
+            "an unrelated provider configuration message",
+        )
+        .with_provider_diagnostic(code, ProviderErrorStage::ClientInitialization);
+
+        assert_eq!(
+            typed_configuration.category(),
+            ModelErrorCategory::ModelConfiguration
+        );
+    }
 }
 
 #[test]

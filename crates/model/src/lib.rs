@@ -49,21 +49,6 @@ const CAPABILITY_PROBE_REQUEST_ID: &str = "singularity_capability_probe";
 const CAPABILITY_PROBE_TOOL_A: &str = "singularity_capability_probe_a";
 const CAPABILITY_PROBE_TOOL_B: &str = "singularity_capability_probe_b";
 
-const PERMISSION_DENIED_MARKERS: [&str; 4] = [
-    "winerror 10013",
-    "permission denied",
-    "operation not permitted",
-    "access is denied",
-];
-const MODEL_CONFIG_MARKERS: [&str; 6] = [
-    "model",
-    "not found",
-    "does not exist",
-    "invalid model",
-    "unknown model",
-    "unsupported model",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRole {
@@ -2007,11 +1992,7 @@ fn model_error_from_http_status(status: u16, provider_name: &str, model_name: &s
         status if status >= HTTP_STATUS_INTERNAL_SERVER_ERROR => ModelErrorKind::ProviderOverloaded,
         _ => ModelErrorKind::UnknownProviderError,
     };
-    let message = if status == HTTP_STATUS_NOT_FOUND {
-        format!("Provider returned HTTP {status}; model not found.")
-    } else {
-        format!("Provider returned HTTP {status}.")
-    };
+    let message = format!("Provider returned HTTP {status}.");
     let mut error = ModelError::new(kind, message)
         .with_provider(provider_name.to_string())
         .with_model(model_name.to_string())
@@ -2628,15 +2609,13 @@ fn model_error_category(error: &ModelError) -> ModelErrorCategory {
     match error.kind {
         ModelErrorKind::Cancelled => ModelErrorCategory::Cancelled,
         ModelErrorKind::AuthError => ModelErrorCategory::Authentication,
-        ModelErrorKind::NetworkError | ModelErrorKind::Timeout => {
-            if contains_any_marker(&error.message, &PERMISSION_DENIED_MARKERS) {
-                ModelErrorCategory::SandboxPermission
-            } else {
-                ModelErrorCategory::Network
-            }
-        }
-        ModelErrorKind::InvalidRequest | ModelErrorKind::UnsupportedCapability
-            if looks_like_model_config_error(&error.message) =>
+        ModelErrorKind::NetworkError | ModelErrorKind::Timeout => ModelErrorCategory::Network,
+        ModelErrorKind::InvalidRequest
+            if error.stage == Some(ProviderErrorStage::ClientInitialization)
+                && matches!(
+                    error.code.as_deref(),
+                    Some("provider_configuration_missing" | "provider_configuration_invalid")
+                ) =>
         {
             ModelErrorCategory::ModelConfiguration
         }
@@ -2855,19 +2834,6 @@ fn redacted_presence(present: bool) -> String {
     } else {
         "missing".to_string()
     }
-}
-
-fn looks_like_model_config_error(message: &str) -> bool {
-    let lowered = message.to_ascii_lowercase();
-    lowered.contains(MODEL_CONFIG_MARKERS[0])
-        && MODEL_CONFIG_MARKERS[1..]
-            .iter()
-            .any(|marker| lowered.contains(marker))
-}
-
-fn contains_any_marker(message: &str, markers: &[&str]) -> bool {
-    let lowered = message.to_ascii_lowercase();
-    markers.iter().any(|marker| lowered.contains(marker))
 }
 
 #[cfg(test)]
