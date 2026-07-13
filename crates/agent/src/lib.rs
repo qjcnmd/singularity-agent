@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ops::ControlFlow;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1190,8 +1191,8 @@ where
             };
         state.completion = completion;
         let (capabilities, mut state) = match self.negotiate_tool_capabilities(input, state, 0) {
-            Ok(result) => result,
-            Err(result) => return result,
+            ControlFlow::Continue(result) => result,
+            ControlFlow::Break(result) => return result,
         };
         let max_tool_calls = match effective_max_tool_calls(&capabilities) {
             Ok(max_tool_calls) => max_tool_calls,
@@ -1473,8 +1474,8 @@ where
         }
         let (capabilities, mut state) =
             match self.negotiate_tool_capabilities(input, state, model_turn_offset) {
-                Ok(result) => result,
-                Err(result) => return result,
+                ControlFlow::Continue(result) => result,
+                ControlFlow::Break(result) => return result,
             };
         let max_tool_calls = match effective_max_tool_calls(&capabilities) {
             Ok(max_tool_calls) => max_tool_calls,
@@ -1567,9 +1568,15 @@ where
         input: &AgentLoopInput,
         mut state: AgentLoopState,
         model_turns: u32,
-    ) -> Result<(ProviderProtocolContract, AgentLoopState), AgentLoopResult> {
+    ) -> ControlFlow<AgentLoopResult, (ProviderProtocolContract, AgentLoopState)> {
         if self.is_cancelled(input) {
-            return Err(state.finish(AgentStatus::Cancelled, false, None, model_turns, None));
+            return ControlFlow::Break(state.finish(
+                AgentStatus::Cancelled,
+                false,
+                None,
+                model_turns,
+                None,
+            ));
         }
         match self
             .provider
@@ -1578,7 +1585,7 @@ where
             Ok(negotiation) => {
                 state.record_provider_negotiation(&negotiation.contract, &negotiation.metadata);
                 if self.is_cancelled(input) {
-                    return Err(state.finish(
+                    return ControlFlow::Break(state.finish(
                         AgentStatus::Cancelled,
                         false,
                         None,
@@ -1586,14 +1593,14 @@ where
                         None,
                     ));
                 }
-                Ok((negotiation.contract, state))
+                ControlFlow::Continue((negotiation.contract, state))
             }
             Err(error) => {
                 state.record_provider_negotiation_error(&error);
                 if self.is_cancelled(input)
                     || error.error.category() == ModelErrorCategory::Cancelled
                 {
-                    return Err(state.finish(
+                    return ControlFlow::Break(state.finish(
                         AgentStatus::Cancelled,
                         false,
                         None,
@@ -1601,7 +1608,7 @@ where
                         None,
                     ));
                 }
-                Err(state.finish_with_model_error(
+                ControlFlow::Break(state.finish_with_model_error(
                     AgentStatus::Failed,
                     false,
                     None,

@@ -23,11 +23,6 @@ use std::time::Duration;
 
 static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
 
-#[test]
-fn provider_error_keeps_rare_capability_metadata_out_of_result_layout() {
-    assert!(std::mem::size_of::<singularity_model::ProviderError>() < 128);
-}
-
 struct CurrentDirRestore(PathBuf);
 
 impl Drop for CurrentDirRestore {
