@@ -47,7 +47,7 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 2. 否则从启动目录向父目录查找最近的 `.env`。
 3. 三个必需值必须来自同一层，缺失时关闭失败。
 
-可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。`SINGULARITY_MODEL_MAX_TOOL_CALLS` 显式声明 provider 每回合支持的最大工具调用数，默认 `1`、范围 `1..=8`；`SINGULARITY_MODEL_STRICT_TOOL_SCHEMA` 显式声明是否支持 strict function schema，默认 `false`。这些值不会从 provider 名称推断，并且必须与其他 provider 配置来自同一层。
+可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。工具能力不是用户配置项：AgentLoop 按 effective model 触发固定、无用户数据的 capability probe，并使用按 effective-model snapshot 缓存的结果；strict、parallel、single 是明确协商出的 contract。HTTP 200 但返回文本伪工具调用时 fail closed；本地完整 `ToolSpec` validation 始终开启，不会被关闭。
 
 修改配置后，新启动一次 `sg` 命令即可取得新快照。不要把 `.env` 提交到 Git。
 

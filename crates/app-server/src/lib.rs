@@ -1822,6 +1822,10 @@ fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
         "recovery_metrics": &status.recovery_metrics,
         "model_usage": &status.model_usage,
         "provider_attempts": &status.provider_attempts,
+        "provider_protocol": {
+            "contract": &status.provider_protocol_contract,
+            "capability_metadata": &status.provider_capability_metadata,
+        },
         "audit_events": &status.audit_events,
         "verification": &status.verification,
         "error": status.error.as_deref().map(redact_app_server_text),

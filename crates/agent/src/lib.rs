@@ -11,8 +11,8 @@ use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
     ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
-    ProviderAttemptMetadata, ProviderDiagnostic, ProviderProtocolContract,
-    is_strict_tool_schema_compatible, provider_error_response,
+    ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
+    ProviderProtocolContract, is_strict_tool_schema_compatible, provider_error_response,
     validate_model_request_with_capabilities, validate_model_turn_response,
 };
 use singularity_policy::{
@@ -296,6 +296,12 @@ pub struct AgentRunStatus {
     #[serde(skip)]
     #[schemars(skip)]
     pub provider_diagnostic: Option<ProviderDiagnostic>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub provider_protocol_contract: Option<ProviderProtocolContract>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub provider_capability_metadata: Option<ProviderCapabilityMetadata>,
 }
 
 impl AgentRunStatus {
@@ -319,6 +325,8 @@ impl AgentRunStatus {
             context_trace: None,
             error_category: None,
             provider_diagnostic: None,
+            provider_protocol_contract: None,
+            provider_capability_metadata: None,
         }
     }
 
@@ -508,6 +516,12 @@ pub struct AgentLoopResult {
     #[serde(skip)]
     #[schemars(skip)]
     pub provider_diagnostic: Option<ProviderDiagnostic>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub provider_protocol_contract: Option<ProviderProtocolContract>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub provider_capability_metadata: Option<ProviderCapabilityMetadata>,
 }
 
 impl AgentLoopResult {
@@ -543,6 +557,8 @@ impl AgentLoopResult {
             context_trace: self.context_trace.clone(),
             error_category: self.error_category.clone(),
             provider_diagnostic: self.provider_diagnostic.clone(),
+            provider_protocol_contract: self.provider_protocol_contract.clone(),
+            provider_capability_metadata: self.provider_capability_metadata.clone(),
         }
     }
 }
@@ -848,6 +864,8 @@ struct AgentLoopState {
     last_repair_failure: Option<RepairFailureState>,
     model_turn_limit: u32,
     context_trace: Option<AgentContextTrace>,
+    provider_protocol_contract: Option<ProviderProtocolContract>,
+    provider_capability_metadata: Option<ProviderCapabilityMetadata>,
 }
 
 impl AgentLoopState {
@@ -875,6 +893,8 @@ impl AgentLoopState {
             last_repair_failure: None,
             model_turn_limit,
             context_trace,
+            provider_protocol_contract: None,
+            provider_capability_metadata: None,
         }
     }
 
@@ -924,7 +944,23 @@ impl AgentLoopState {
             context_trace: self.context_trace,
             error_category: model_error.map(ModelError::category),
             provider_diagnostic: model_error.map(ModelError::provider_diagnostic),
+            provider_protocol_contract: self.provider_protocol_contract,
+            provider_capability_metadata: self.provider_capability_metadata,
         }
+    }
+
+    fn record_provider_negotiation(
+        &mut self,
+        contract: &ProviderProtocolContract,
+        metadata: &ProviderCapabilityMetadata,
+    ) {
+        self.provider_protocol_contract = Some(contract.clone());
+        self.provider_capability_metadata = Some(metadata.clone());
+    }
+
+    fn record_provider_negotiation_error(&mut self, error: &ProviderError) {
+        self.provider_protocol_contract = None;
+        self.provider_capability_metadata = error.capability_metadata.clone();
     }
 
     fn approval_count(&self) -> u32 {
@@ -1141,33 +1177,46 @@ where
     }
 
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
-        let completion =
-            match CompletionTracker::from_requirements(&input.verification_requirements) {
-                Ok(completion) => completion,
-                Err(error) => return failed_result(error),
-            };
-        let capabilities = self.provider.protocol_contract();
-        let max_tool_calls = match effective_max_tool_calls(&capabilities) {
-            Ok(max_tool_calls) => max_tool_calls,
-            Err(error) => return failed_result(error),
-        };
-        let budget = match context_budget(input, &self.tool_broker, &capabilities, max_tool_calls) {
-            Ok(budget) => budget,
-            Err(error) => return failed_result(error),
-        };
-        let context = assemble_context_items_with_budget(&input.input, &budget);
-        if current_turn_excluded(input, &context) {
-            return context_overflow_result();
-        }
-        let mut state = AgentLoopState::new(
-            model_messages_from_input(input, &context, max_tool_calls),
-            input.max_turns.max(1),
-            Some(AgentContextTrace::from(&context)),
-        );
-        state.completion = completion;
+        let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, 0, None);
         }
+        let completion =
+            match CompletionTracker::from_requirements(&input.verification_requirements) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    return state.finish(AgentStatus::Failed, false, None, 0, Some(error));
+                }
+            };
+        state.completion = completion;
+        let (capabilities, mut state) = match self.negotiate_tool_capabilities(input, state, 0) {
+            Ok(result) => result,
+            Err(result) => return result,
+        };
+        let max_tool_calls = match effective_max_tool_calls(&capabilities) {
+            Ok(max_tool_calls) => max_tool_calls,
+            Err(error) => {
+                return state.finish(AgentStatus::Failed, false, None, 0, Some(error));
+            }
+        };
+        let budget = match context_budget(input, &self.tool_broker, &capabilities, max_tool_calls) {
+            Ok(budget) => budget,
+            Err(error) => {
+                return state.finish(AgentStatus::Failed, false, None, 0, Some(error));
+            }
+        };
+        let context = assemble_context_items_with_budget(&input.input, &budget);
+        if current_turn_excluded(input, &context) {
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                0,
+                Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
+            );
+        }
+        state.messages = model_messages_from_input(input, &context, max_tool_calls);
+        state.context_trace = Some(AgentContextTrace::from(&context));
         self.continue_run(input, &budget, &capabilities, max_tool_calls, state, 0)
     }
 
@@ -1376,6 +1425,15 @@ where
         pending: &PendingToolCall,
         checkpoint_payload: &Value,
     ) -> AgentLoopResult {
+        if self.is_cancelled(input) {
+            return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
+                AgentStatus::Cancelled,
+                false,
+                None,
+                0,
+                None,
+            );
+        }
         if let Err(error) = CompletionTracker::from_requirements(&input.verification_requirements) {
             return failed_result(error);
         }
@@ -1397,7 +1455,7 @@ where
                 );
             }
         };
-        let (mut state, model_turn_offset) =
+        let (state, model_turn_offset) =
             match restore_checkpoint(input, pending, checkpoint_payload) {
                 Ok(restored) => restored,
                 Err(error) => {
@@ -1413,7 +1471,11 @@ where
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
         }
-        let capabilities = self.provider.protocol_contract();
+        let (capabilities, mut state) =
+            match self.negotiate_tool_capabilities(input, state, model_turn_offset) {
+                Ok(result) => result,
+                Err(result) => return result,
+            };
         let max_tool_calls = match effective_max_tool_calls(&capabilities) {
             Ok(max_tool_calls) => max_tool_calls,
             Err(error) => {
@@ -1498,6 +1560,57 @@ where
             state,
             model_turn_offset,
         )
+    }
+
+    fn negotiate_tool_capabilities(
+        &self,
+        input: &AgentLoopInput,
+        mut state: AgentLoopState,
+        model_turns: u32,
+    ) -> Result<(ProviderProtocolContract, AgentLoopState), AgentLoopResult> {
+        if self.is_cancelled(input) {
+            return Err(state.finish(AgentStatus::Cancelled, false, None, model_turns, None));
+        }
+        match self
+            .provider
+            .negotiate_tool_capabilities(&input.model_preferences, &self.cancellation)
+        {
+            Ok(negotiation) => {
+                state.record_provider_negotiation(&negotiation.contract, &negotiation.metadata);
+                if self.is_cancelled(input) {
+                    return Err(state.finish(
+                        AgentStatus::Cancelled,
+                        false,
+                        None,
+                        model_turns,
+                        None,
+                    ));
+                }
+                Ok((negotiation.contract, state))
+            }
+            Err(error) => {
+                state.record_provider_negotiation_error(&error);
+                if self.is_cancelled(input)
+                    || error.error.category() == ModelErrorCategory::Cancelled
+                {
+                    return Err(state.finish(
+                        AgentStatus::Cancelled,
+                        false,
+                        None,
+                        model_turns,
+                        None,
+                    ));
+                }
+                Err(state.finish_with_model_error(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    model_turns,
+                    Some(error.message),
+                    Some(&error.error),
+                ))
+            }
+        }
     }
 
     fn is_cancelled(&self, input: &AgentLoopInput) -> bool {
@@ -2777,12 +2890,11 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         context_trace: None,
         error_category: None,
         provider_diagnostic: None,
+        provider_protocol_contract: None,
+        provider_capability_metadata: None,
     }
 }
 
-fn context_overflow_result() -> AgentLoopResult {
-    failed_result(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR)
-}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ContextBundle {
     pub messages: Vec<Value>,

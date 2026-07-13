@@ -6,9 +6,11 @@ use singularity_agent::{
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelRole,
-    ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
-    ModelUsage, Provider, ProviderAttemptMetadata, ProviderError, ProviderProtocolContract,
+    DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelPreferences,
+    ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
+    ModelTurnStatus, ModelUsage, Provider, ProviderAttemptMetadata, ProviderCapabilityMetadata,
+    ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
+    ProviderProtocolNegotiation,
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
@@ -49,6 +51,68 @@ impl Provider for StaticProvider {
             .get(response_index)
             .unwrap_or_else(|| self.responses.last().expect("static provider response"))
             .clone())
+    }
+}
+
+struct NegotiatingProvider {
+    responses: Vec<ModelTurnResponse>,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    negotiation_calls: Arc<AtomicUsize>,
+    static_capabilities: ProviderProtocolContract,
+    negotiated_capabilities: Result<ProviderProtocolNegotiation, ProviderError>,
+}
+
+impl Provider for NegotiatingProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.static_capabilities.clone()
+    }
+
+    fn negotiate_tool_capabilities(
+        &self,
+        _model_preferences: &ModelPreferences,
+        _cancellation: &CancellationToken,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        self.negotiation_calls.fetch_add(1, Ordering::SeqCst);
+        self.negotiated_capabilities.clone()
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
+        let response_index = seen_requests.len();
+        seen_requests.push(request.clone());
+        Ok(self
+            .responses
+            .get(response_index)
+            .unwrap_or_else(|| {
+                self.responses
+                    .last()
+                    .expect("negotiating provider response")
+            })
+            .clone())
+    }
+}
+
+fn negotiated_capability_metadata() -> ProviderCapabilityMetadata {
+    ProviderCapabilityMetadata {
+        profile: ProviderCapabilityProfile::StrictParallel,
+        cache_hit: false,
+        profile_attempts: 2,
+        fallback_count: 1,
+        probe_usage: ModelUsage {
+            input_tokens: 3,
+            output_tokens: 2,
+            total_tokens: 5,
+            ..ModelUsage::default()
+        },
+        probe_attempt_metadata: ProviderAttemptMetadata {
+            attempt_count: 2,
+            retry_count: 1,
+            latency_ms: 7,
+        },
     }
 }
 
@@ -185,6 +249,22 @@ fn allow_read_execute_policy() -> PolicyEngine {
     )
 }
 
+fn workspace_tool_broker_for_test() -> ToolBroker {
+    let mut registry = ToolRegistry::default();
+    for spec in workspace_tool_specs().into_iter().filter(|spec| {
+        [
+            "builtin.read",
+            "builtin.edit",
+            "builtin.patch",
+            "builtin.command",
+        ]
+        .contains(&spec.name.as_str())
+    }) {
+        registry.register(spec).expect("register workspace tool");
+    }
+    ToolBroker::new(registry)
+}
+
 fn allow_read_write_policy() -> PolicyEngine {
     allow_read_policy().with_rule(
         PermissionRule::new(
@@ -205,6 +285,215 @@ fn failed_model_response(error: ModelError) -> ModelTurnResponse {
 }
 
 #[test]
+fn agent_loop_uses_negotiated_contract_for_strict_parallel_request() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let negotiation_calls = Arc::new(AtomicUsize::new(0));
+    let static_capabilities = ProviderProtocolContract {
+        supports_strict_tool_schema: false,
+        max_tool_calls_per_turn: 1,
+        ..ProviderProtocolContract::default()
+    };
+    let negotiated_contract = ProviderProtocolContract {
+        supports_strict_tool_schema: true,
+        max_tool_calls_per_turn: 2,
+        ..ProviderProtocolContract::default()
+    };
+    let metadata = negotiated_capability_metadata();
+    let agent_loop = AgentLoop::new(
+        NegotiatingProvider {
+            responses: vec![ModelTurnResponse::completed(
+                "model_request_turn_1_0",
+                "response_1",
+                "done",
+            )],
+            seen_requests: Arc::clone(&seen_requests),
+            negotiation_calls: Arc::clone(&negotiation_calls),
+            static_capabilities,
+            negotiated_capabilities: Ok(ProviderProtocolNegotiation {
+                contract: negotiated_contract.clone(),
+                metadata: metadata.clone(),
+            }),
+        },
+        workspace_tool_broker_for_test(),
+        allow_read_policy(),
+    );
+
+    let result = agent_loop.run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(negotiation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.provider_protocol_contract, Some(negotiated_contract));
+    assert_eq!(result.provider_capability_metadata, Some(metadata));
+    let requests = seen_requests.lock().expect("seen requests lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tool_choice.max_tool_calls, 2);
+    assert!(requests[0].tool_choice.strict_tool_schema);
+    let serialized = serde_json::to_value(&result).expect("serialize result");
+    assert!(serialized.get("provider_protocol_contract").is_none());
+    assert!(serialized.get("provider_capability_metadata").is_none());
+    let serialized_status =
+        serde_json::to_value(result.to_run_status()).expect("serialize run status");
+    assert!(
+        serialized_status
+            .get("provider_protocol_contract")
+            .is_none()
+    );
+    assert!(
+        serialized_status
+            .get("provider_capability_metadata")
+            .is_none()
+    );
+}
+
+#[test]
+fn capability_negotiation_failure_and_typed_cancel_skip_model_and_tool_execution() {
+    for (kind, expected_status) in [
+        (ModelErrorKind::UnsupportedCapability, AgentStatus::Failed),
+        (ModelErrorKind::Cancelled, AgentStatus::Cancelled),
+    ] {
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let negotiation_calls = Arc::new(AtomicUsize::new(0));
+        let metadata = negotiated_capability_metadata();
+        let error = ProviderError::from_model_error(
+            ModelError::new(kind.clone(), "capability negotiation failed")
+                .with_provider_diagnostic(
+                    "capability_negotiation_failed",
+                    singularity_model::ProviderErrorStage::ResponseValidation,
+                ),
+        )
+        .with_capability_metadata(metadata.clone());
+        let agent_loop = AgentLoop::new(
+            NegotiatingProvider {
+                responses: vec![ModelTurnResponse::completed(
+                    "request_1",
+                    "response_1",
+                    "must not be used",
+                )],
+                seen_requests: Arc::clone(&seen_requests),
+                negotiation_calls: Arc::clone(&negotiation_calls),
+                static_capabilities: ProviderProtocolContract::default(),
+                negotiated_capabilities: Err(error),
+            },
+            workspace_tool_broker_for_test(),
+            allow_read_policy(),
+        );
+
+        let result = agent_loop.run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+
+        assert_eq!(result.status, expected_status);
+        assert_eq!(result.model_turns, 0);
+        assert_eq!(result.tool_calls, 0);
+        assert_eq!(negotiation_calls.load(Ordering::SeqCst), 1);
+        assert!(seen_requests.lock().expect("seen requests lock").is_empty());
+        assert_eq!(result.provider_capability_metadata, Some(metadata));
+        if expected_status == AgentStatus::Failed {
+            assert_eq!(
+                result.error_category,
+                Some(ModelErrorCategory::UnsupportedCapability)
+            );
+            assert!(result.provider_diagnostic.is_some());
+        }
+    }
+}
+
+#[test]
+fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let file_path = workspace.path().join("README.md");
+    std::fs::write(&file_path, "before").expect("write file");
+    let mut edit_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    edit_response.tool_calls.push(tool_call(
+        "edit_call_1",
+        "builtin.edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut verify_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    verify_response.tool_calls.push(tool_call(
+        "verify_call_1",
+        "builtin.command",
+        serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let negotiation_calls = Arc::new(AtomicUsize::new(0));
+    let negotiated_contract = ProviderProtocolContract {
+        supports_strict_tool_schema: true,
+        max_tool_calls_per_turn: 2,
+        ..ProviderProtocolContract::default()
+    };
+    let metadata = negotiated_capability_metadata();
+    let agent_loop = AgentLoop::new(
+        NegotiatingProvider {
+            responses: vec![
+                edit_response,
+                verify_response,
+                ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done"),
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            negotiation_calls: Arc::clone(&negotiation_calls),
+            static_capabilities: ProviderProtocolContract {
+                supports_strict_tool_schema: false,
+                max_tool_calls_per_turn: 1,
+                ..ProviderProtocolContract::default()
+            },
+            negotiated_capabilities: Ok(ProviderProtocolNegotiation {
+                contract: negotiated_contract.clone(),
+                metadata,
+            }),
+        },
+        workspace_tool_broker_for_test(),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(3);
+    let blocked = agent_loop.run(&input);
+
+    assert_eq!(blocked.status, AgentStatus::Blocked);
+    assert_eq!(negotiation_calls.load(Ordering::SeqCst), 1);
+    let pending = blocked.pending_tool_calls[0].clone();
+    let mut checkpoint = blocked
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    checkpoint["provider_protocol_contract"] = serde_json::json!({
+        "supports_strict_tool_schema": false,
+        "max_tool_calls_per_turn": 1
+    });
+    checkpoint["provider_capability_metadata"] = serde_json::json!({
+        "profile": "declared",
+        "cache_hit": true
+    });
+
+    let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
+        pending.request_id.clone(),
+        pending.tool_name.clone(),
+        pending.resources.clone(),
+    ));
+    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Completed);
+    assert_eq!(negotiation_calls.load(Ordering::SeqCst), 2);
+    let requests = seen_requests.lock().expect("seen requests lock");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].tool_choice.max_tool_calls, 2);
+    assert!(requests[1].tool_choice.strict_tool_schema);
+    assert_eq!(
+        resumed.provider_protocol_contract,
+        Some(negotiated_contract)
+    );
+    assert_eq!(
+        std::fs::read_to_string(file_path).expect("read file"),
+        "after"
+    );
+}
+
+#[test]
 fn agent_loop_preserves_typed_provider_failure_category() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "provider failure");
     let error = ModelError::new(
@@ -219,6 +508,8 @@ fn agent_loop_preserves_typed_provider_failure_category() {
         result.error_category,
         Some(ModelErrorCategory::Authentication)
     );
+    assert!(result.provider_protocol_contract.is_some());
+    assert!(result.provider_capability_metadata.is_some());
     let status = result.to_run_status();
     assert_eq!(
         status.error_category,
@@ -3185,6 +3476,8 @@ fn agent_loop_fails_closed_before_provider_when_current_turn_exceeds_context_bud
         result.error.as_deref(),
         Some("current turn exceeds the model context budget")
     );
+    assert!(result.provider_protocol_contract.is_some());
+    assert!(result.provider_capability_metadata.is_some());
     assert_eq!(result.model_turns, 0);
     assert!(seen_requests.lock().expect("seen requests").is_empty());
 }

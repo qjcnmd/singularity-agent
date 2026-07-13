@@ -1146,6 +1146,10 @@ fn run_agent_stage(
         "recovery_metrics": run_status.recovery_metrics,
         "model_usage": run_status.model_usage,
         "provider_attempts": run_status.provider_attempts,
+        "provider_protocol": {
+            "contract": run_status.provider_protocol_contract,
+            "capability_metadata": run_status.provider_capability_metadata,
+        },
         "tool_outcomes": result.tool_results.iter().map(|tool_result| json!({
             "tool_call_id": safe_text(&tool_result.tool_call_id),
             "tool_name": safe_text(&tool_result.tool_name),
@@ -2024,6 +2028,8 @@ mod tests {
             context_trace: None,
             error_category: None,
             provider_diagnostic: None,
+            provider_protocol_contract: None,
+            provider_capability_metadata: None,
         }
     }
 
