@@ -120,6 +120,8 @@ sg run <goal>
 
 `AgentLoopInput` 包含 thread/turn 标识、user input、model preference、turn 上限、项目指令、历史、interrupt 标志和 approval grants；默认最大模型回合数为 16，调用方仍可逐 turn 配置。模型请求只保留本次 provider 调用所需的 `request_id`，工具请求只保留 tool call 标识、名称和原始参数；运行状态不再复制 run/session/task/phase/action 占位字段。AgentLoop 在每次 run 和 approval resume 前调用 `Provider::negotiate_tool_capabilities`，按 effective model 返回的 contract 建立 request，并使用该 contract 的 strict tool schema、每回合最大 tool call 数、每请求最大工具定义数和 context/output 上限。对同一 `ProviderConfigSnapshot` 与 effective model，已有成功 negotiation 时命中 snapshot cache，不发网络 probe；只有 cache miss 才执行固定、无用户数据的 capability probe。OpenAI-compatible probe 先验证产品上限内的 direct tool definitions 和 Agent 实际发送的 developer/user 角色；strict profile 另以未写入指令的 sentinel 验证 schema 约束，non-strict direct profile 只证明原生结构化调用、合法工具名、对象参数和调用数。只有 direct capacity 不成立时才验证与真实 router 同形、同上限分支数的 `oneOf/const` envelope；低容量 router fallback 仍要求完整 outer envelope 精确匹配。真实业务参数始终在本地信任边界接受完整 `ToolSpec` validation，未验证的 system message 与 JSON mode 保持关闭。当前保守估算按每 4 个 ASCII 字符约 1 token、每个非 ASCII 字符 1 token，并另计消息 framing、当回合实际可见工具 schema、developer 指令、固定开销和输出预算；有界工具视图按本次实际发送的直接工具集合或单个 router schema 计入预算。它用于关闭失败的容量门禁，不声称等同 provider tokenizer。当前输入不能容纳时直接返回 context overflow，而不是截断任务含义；历史只按完整的 user/assistant 对保留，并保持原始对话顺序。`ContextBundle` 只保留消息、包含/排除项和真实预算；最终 AgentLoop trace 记录脱敏后的包含/排除 item ID、预算明细和模型回合上限，不记录消息内容。
 
+`ProviderProtocolContract` 不声明 required tool-choice 保证，因此 capability probe 和 Agent 请求都使用 `auto`；提前 final、非法响应和工具结果仍由本地状态机关闭失败。
+
 ## 6. AgentLoop
 
 `AgentLoop::run` 的真实步骤为：
@@ -132,7 +134,7 @@ sg run <goal>
 6. 多调用批次只有在全部工具的 execution mode 都是 `parallel_read` 且全部 allow/approved 时才并发执行；结果按原调用顺序回传。任何 exclusive 或 ask 成员使整批零执行，并要求模型把 mutation、command、plan 或 approval-sensitive 调用单独提交。只读批次允许部分执行失败，但全部结果仍按序返回；取消发生后丢弃晚到批次结果。
 7. 单个 ask 生成绑定 request/thread/turn/tool call 的内部 checkpoint；checkpoint 与 pending approval 在 store 的同一事务中写入，包含继续运行所需的 messages、既有 tool results、已消费 grants、approval count、completion tracker 和 model-turn offset。
 8. 执行允许的工具，把 `ToolResult::to_message_payload()` 按原顺序作为 tool message 送回下一模型回合；router 调用在 provider-facing assistant/tool history 中保持实际暴露的 router 名称和 outer envelope，payload、内部 `ToolResult`、Policy、Approval、pending call 和执行状态使用唯一解包后的真实工具名称与参数。pending Approval checkpoint 会从保存的 provider-facing envelope 重新经过同一真实 `ToolSpec` 和 profile binding，再与 canonical pending call 比较，拒绝名称或参数篡改。typed repairable failure 由 completion tracker 和下一回合反馈处理，sandbox/backend/infrastructure/timeout/cancelled 不伪装成普通输入修复。
-9. 没有 tool call 时应用 completion gate，接受或拒绝 final answer；如果 repairable failure 或 completion/plan rejection 使状态仍不可 final，下一 `ModelTurnRequest` 使用 `ToolChoiceMode::Required`，完成条件满足后恢复 `Auto`。普通文本不会替代 required structured tool call。
+9. 没有 tool call 时应用 completion gate，接受或拒绝 final answer；repairable failure 或 completion/plan rejection 使状态仍不可 final 时，下一 `ModelTurnRequest` 保持 `Auto` 并携带 typed tool result 或固定 developer feedback。普通文本不能绕过本地 completion gate。
 
 checkpoint、pending tool call、原始 prompt、provider payload 和内部 audit metadata 不序列化到 `AgentLoopResult`、CLI response 或普通 trace payload。checkpoint 保存 model usage、provider attempts、completion/plan、context compaction、recovery metrics 和 tool-call fingerprints，但不作为 provider capability 真值。allow-resume 只接受当前 active blocked turn 的一次性 decision，校验 checkpoint 的完整绑定后恢复原 messages、tool results、已消费 grants、approval count 和 model-turn offset，重新协商当前 effective model 的 capabilities，再执行 pending tool 并继续模型循环；取消、失败和 max-turn 返回都保留恢复前的回合计数。
 

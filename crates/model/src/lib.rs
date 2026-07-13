@@ -104,7 +104,6 @@ impl ModelMessage {
 pub enum ToolChoiceMode {
     Auto,
     None,
-    Required,
     SpecificTool,
     AllowedTools,
 }
@@ -1587,7 +1586,6 @@ fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> Valu
 fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
     match request.tool_choice.mode {
         ToolChoiceMode::None => json!("none"),
-        ToolChoiceMode::Required => json!("required"),
         ToolChoiceMode::SpecificTool => match &request.tool_choice.tool_name {
             Some(name) => {
                 json!({"type": "function", "function": {"name": openai_wire_tool_name(name)}})
@@ -1754,7 +1752,7 @@ fn capability_probe_profiles(
         contract: make_contract(true, 2, direct_tool_count),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
-            ToolChoiceMode::Required,
+            ToolChoiceMode::Auto,
             2,
             true,
             "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
@@ -1767,7 +1765,7 @@ fn capability_probe_profiles(
         contract: make_contract(true, 1, direct_tool_count),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
-            ToolChoiceMode::Required,
+            ToolChoiceMode::Auto,
             1,
             true,
             "Call singularity_capability_probe_a exactly once.",
@@ -1780,7 +1778,7 @@ fn capability_probe_profiles(
         contract: make_contract(false, 2, direct_tool_count),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
-            ToolChoiceMode::Required,
+            ToolChoiceMode::Auto,
             2,
             false,
             "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each. Use exactly {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]} as each arguments object.",
@@ -1793,7 +1791,7 @@ fn capability_probe_profiles(
         contract: make_contract(false, 1, direct_tool_count),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
-            ToolChoiceMode::Required,
+            ToolChoiceMode::Auto,
             1,
             false,
             "Call singularity_capability_probe_a exactly once with arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}.",
@@ -1806,7 +1804,7 @@ fn capability_probe_profiles(
         contract: make_contract(false, 1, 1),
         request: make_request(
             vec![router_tool],
-            ToolChoiceMode::Required,
+            ToolChoiceMode::Auto,
             1,
             false,
             "Call singularity_capability_router exactly once with tool_name singularity_capability_probe_a and arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}.",
@@ -2443,7 +2441,6 @@ fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderErro
                     | "requested_tool_calls_exceed_provider_limit"
                     | "max_tool_calls_exceeded"
                     | "specific_tool_required"
-                    | "tool_choice_required"
             )
         });
     if !response.tool_calls.is_empty() && !explicit_capability_violation {
@@ -2849,9 +2846,6 @@ pub fn validate_model_response(
     match tool_choice.mode {
         ToolChoiceMode::None if !tool_calls.is_empty() => {
             errors.push("tool_choice_none".to_string());
-        }
-        ToolChoiceMode::Required if tool_calls.is_empty() => {
-            errors.push("tool_choice_required".to_string());
         }
         ToolChoiceMode::SpecificTool if tool_calls.is_empty() => {
             errors.push("specific_tool_required".to_string());

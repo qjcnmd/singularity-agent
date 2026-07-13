@@ -1669,7 +1669,7 @@ fn routed_input_failure_is_repaired_on_the_next_router_call() {
         .iter()
         .all(|request| request.tools.len() == 1
             && request.tools[0].name == BUILTIN_INVOKE_TOOL));
-    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
     assert!(
         requests[1].tools[0].parameters_schema["oneOf"]
             .as_array()
@@ -2620,7 +2620,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
-    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
     let feedback = requests[1].messages.last().expect("tool feedback");
     assert_eq!(feedback.role, ModelRole::Tool);
     let payload: serde_json::Value =
@@ -2708,7 +2708,7 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     assert_eq!(run_status.audit_events[0]["executor_started"], false);
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
-    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::Auto);
     let feedback = requests[1].messages.last().expect("tool feedback");
@@ -4404,7 +4404,7 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
-    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::Auto);
     assert!(requests[2].messages.iter().any(|message| {
         message.role == ModelRole::Developer && message.content.contains("Complete every plan step")
@@ -4412,7 +4412,7 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
 }
 
 #[test]
-fn agent_loop_fails_closed_when_required_action_returns_plain_text() {
+fn agent_loop_keeps_completion_gate_local_when_model_returns_plain_text() {
     let mut initial_plan = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     initial_plan.tool_calls.push(plan_tool_call(
         "plan_call_1",
@@ -4433,14 +4433,15 @@ fn agent_loop_fails_closed_when_required_action_returns_plain_text() {
 
     assert_eq!(result.status, AgentStatus::Failed);
     assert_eq!(result.model_turns, 3);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 2);
     assert_eq!(
         result.error.as_deref(),
-        Some("model response validation failed: tool_choice_required")
+        Some("completion gate rejected final answer: plan has incomplete steps")
     );
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
-    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Auto);
 }
 
 #[test]

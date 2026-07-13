@@ -13,7 +13,7 @@ use singularity_model::{
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
     ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode, is_strict_tool_schema_compatible,
+    ProviderErrorStage, ProviderProtocolContract, is_strict_tool_schema_compatible,
     provider_error_response, validate_model_request_with_capabilities,
     validate_model_turn_response,
 };
@@ -1075,16 +1075,6 @@ impl AgentLoopState {
             return self.completion.feedback();
         }
         PLAN_COMPLETION_REQUIRED.to_string()
-    }
-
-    fn tool_choice_mode(&self) -> ToolChoiceMode {
-        if self.allows_final() {
-            return ToolChoiceMode::Auto;
-        }
-        if self.last_completion_error.is_some() || self.last_repair_failure.is_some() {
-            return ToolChoiceMode::Required;
-        }
-        ToolChoiceMode::Auto
     }
 
     fn observe_model_tool_call(
@@ -3167,7 +3157,6 @@ impl AgentContextTrace {
 struct ModelToolView {
     tools: Vec<ModelToolSchema>,
     max_tool_calls: u32,
-    router: bool,
 }
 
 fn model_turn_request(
@@ -3192,11 +3181,6 @@ fn model_turn_request(
             max_output_tokens: Some(budget.reserved_output_tokens),
             ..input.model_preferences.clone()
         },
-    };
-    request.tool_choice.mode = if tool_view.router && !state.allows_final() {
-        ToolChoiceMode::Required
-    } else {
-        state.tool_choice_mode()
     };
     request.tool_choice.max_tool_calls = tool_view.max_tool_calls;
     request.tool_choice.strict_tool_schema = strict_tool_schema;
@@ -3277,14 +3261,12 @@ fn model_tool_view(
         return Ok(ModelToolView {
             tools: visible_tools,
             max_tool_calls,
-            router: false,
         });
     }
     let router = router_model_tool_schema(loop_tools, &visible_tools)?;
     Ok(ModelToolView {
         tools: vec![router],
         max_tool_calls: 1,
-        router: true,
     })
 }
 

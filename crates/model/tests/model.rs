@@ -1148,7 +1148,7 @@ fn openai_capability_probe_strict_constraint_mismatch_falls_back_to_non_strict()
 }
 
 #[test]
-fn openai_capability_probe_non_strict_single_uses_required_tool_choice() {
+fn openai_capability_probe_non_strict_single_uses_auto_tool_choice() {
     let (base_url, requests, _started) = delayed_probe_server(
         vec![
             ("HTTP/1.1 400 Bad Request", "{}"),
@@ -1177,7 +1177,7 @@ fn openai_capability_probe_non_strict_single_uses_required_tool_choice() {
     let single_request: serde_json::Value =
         serde_json::from_str(captured.last().expect("single probe request"))
             .expect("single probe JSON");
-    assert_eq!(single_request["tool_choice"], "required");
+    assert_eq!(single_request["tool_choice"], "auto");
     assert_eq!(single_request["tools"].as_array().map(Vec::len), Some(8));
     assert_eq!(single_request["tools"][0]["function"].get("strict"), None);
 }
