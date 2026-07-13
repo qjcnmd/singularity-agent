@@ -202,7 +202,7 @@ fn strict_probe_server() -> (String, Receiver<String>) {
         let valid_schema = parameters["type"] == "object"
             && parameters["required"] == serde_json::json!(["probe", "values"])
             && parameters["additionalProperties"] == false
-            && parameters["properties"]["probe"]["const"] == "singularity_capability_probe"
+            && parameters["properties"]["probe"]["const"] == "schema_sentinel_alpha"
             && parameters["properties"]["values"]["type"] == "array";
         if valid_schema {
             write_provider_response(
@@ -372,7 +372,7 @@ const PROBE_STRICT_PARALLEL_RESPONSE: &str = r#"{
                     "type": "function",
                     "function": {
                         "name": "singularity_capability_probe_a",
-                        "arguments": "{\"probe\":\"singularity_capability_probe\",\"values\":[7,7]}"
+                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
                     }
                 },
                 {
@@ -380,7 +380,7 @@ const PROBE_STRICT_PARALLEL_RESPONSE: &str = r#"{
                     "type": "function",
                     "function": {
                         "name": "singularity_capability_probe_b",
-                        "arguments": "{\"probe\":\"singularity_capability_probe\",\"values\":[7,7]}"
+                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
                     }
                 }
             ]
@@ -400,7 +400,7 @@ const PROBE_STRICT_SINGLE_RESPONSE: &str = r#"{
                 "type": "function",
                 "function": {
                     "name": "singularity_capability_probe_a",
-                    "arguments": "{\"probe\":\"singularity_capability_probe\",\"values\":[7,7]}"
+                    "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
                 }
             }
             ]
@@ -993,32 +993,31 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     assert_eq!(parameters["additionalProperties"], false);
     assert_eq!(
         parameters["properties"]["probe"]["const"],
-        "singularity_capability_probe"
+        "schema_sentinel_alpha"
     );
     assert_eq!(parameters["properties"]["values"]["type"], "array");
     assert_eq!(parameters["properties"]["values"]["minItems"], 2);
     assert_eq!(parameters["properties"]["values"]["maxItems"], 2);
+    let instruction = request["messages"][0]["content"]
+        .as_str()
+        .expect("strict probe instruction");
     assert_eq!(
-        request["messages"][0]["content"],
+        instruction,
         "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each."
     );
-    assert!(
-        !request["messages"][0]["content"]
-            .as_str()
-            .expect("strict probe instruction")
-            .contains("values")
-    );
+    assert!(!instruction.contains("schema_sentinel_alpha"));
+    assert!(!instruction.contains("7"));
+    assert!(!instruction.contains("values"));
     for tool in request["tools"].as_array().expect("strict probe tools") {
+        let description = tool["function"]["description"]
+            .as_str()
+            .expect("strict probe description");
         assert_eq!(
-            tool["function"]["description"],
+            description,
             "Fixed capability probe tool; no external side effect."
         );
-        assert!(
-            !tool["function"]["description"]
-                .as_str()
-                .expect("strict probe description")
-                .contains('7')
-        );
+        assert!(!description.contains("schema_sentinel_alpha"));
+        assert!(!description.contains("7"));
     }
     assert_eq!(request["tools"][0]["function"]["strict"], true);
 }
@@ -1029,7 +1028,7 @@ fn openai_capability_probe_strict_constraint_mismatch_falls_back_to_non_strict()
         ("const", r#"{"probe":"wrong_probe","values":[7,7]}"#),
         (
             "array",
-            r#"{"probe":"singularity_capability_probe","values":{"value":7}}"#,
+            r#"{"probe":"schema_sentinel_alpha","values":{"value":7}}"#,
         ),
     ] {
         let (base_url, done) = strict_constraint_mismatch_probe_server(bad_arguments);

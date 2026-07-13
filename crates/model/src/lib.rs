@@ -48,7 +48,7 @@ const TOOL_NAME_FALLBACK: &str = "tool";
 const CAPABILITY_PROBE_REQUEST_ID: &str = "singularity_capability_probe";
 const CAPABILITY_PROBE_TOOL_A: &str = "singularity_capability_probe_a";
 const CAPABILITY_PROBE_TOOL_B: &str = "singularity_capability_probe_b";
-const CAPABILITY_PROBE_EXPECTED_LABEL: &str = "singularity_capability_probe";
+const CAPABILITY_PROBE_EXPECTED_LABEL: &str = "schema_sentinel_alpha";
 const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
