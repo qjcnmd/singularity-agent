@@ -1601,6 +1601,89 @@ fn routed_tool_call_preserves_model_history_and_resumes_the_approved_tool() {
 }
 
 #[test]
+fn routed_input_failure_reuses_the_selected_schema_until_a_valid_call_succeeds() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("README.md"), "hello").expect("write fixture");
+    let mut select_read = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    select_read
+        .tool_calls
+        .push(select_tool_call("select_1", "builtin.read"));
+    let mut invalid_read = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    invalid_read.tool_calls.push(tool_call(
+        "read_invalid",
+        BUILTIN_SELECT_TOOL,
+        serde_json::json!({
+            "path": "",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
+    let mut corrected_read =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    corrected_read.tool_calls.push(tool_call(
+        "read_valid",
+        BUILTIN_SELECT_TOOL,
+        serde_json::json!({
+            "path": "README.md",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_plan_capabilities(
+        vec![
+            select_read,
+            invalid_read,
+            corrected_read,
+            ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done"),
+        ],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract {
+            max_tools_per_request: 2,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .with_workspace_tools(WorkspaceTools::new(workspace.path()))
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read").with_max_turns(4));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.tool_results.len(), 3);
+    assert_eq!(
+        result.tool_results[1].failure_kind,
+        Some(ToolFailureKind::Input)
+    );
+    assert_eq!(result.tool_results[2].tool_name, "builtin.read");
+    assert!(result.tool_results[2].ok);
+    assert_eq!(
+        result.to_run_status().audit_events[0]["argument_validation_code"],
+        "read_input_invalid"
+    );
+    let requests = seen_requests.lock().expect("seen requests lock");
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2].tools[0].name, BUILTIN_SELECT_TOOL);
+    assert!(requests[2].tools[0].description.contains("builtin.read"));
+    assert!(
+        requests[2].tools[0].parameters_schema["properties"]
+            .get("path")
+            .is_some()
+    );
+    assert!(
+        requests[2].tools[0].parameters_schema["properties"]
+            .get("tool_name")
+            .is_none()
+    );
+    assert_eq!(requests[3].tools[0].name, BUILTIN_SELECT_TOOL);
+    assert!(
+        requests[3].tools[0].parameters_schema["properties"]
+            .get("tool_name")
+            .is_some()
+    );
+}
+
+#[test]
 fn agent_loop_rejects_registered_tool_hidden_by_the_current_view() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(

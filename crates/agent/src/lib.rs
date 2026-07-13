@@ -2140,6 +2140,9 @@ where
         let mut failure = None;
         let mut repairable_failure = None;
         for (prepared, result) in results {
+            let retain_selected_route = !result.ok
+                && result.failure_kind == Some(ToolFailureKind::Input)
+                && state.selected_tool.as_deref() == Some(prepared.call.tool_name.as_str());
             let recoverable = is_repairable_tool_result(&result)
                 || (approval_is_recoverable
                     && result.failure_kind == Some(ToolFailureKind::Approval));
@@ -2158,7 +2161,7 @@ where
                 &prepared.model_visible_tool_name,
             ));
             state.tool_results.push(result);
-            if prepared.call.tool_name != BUILTIN_SELECT_TOOL {
+            if prepared.call.tool_name != BUILTIN_SELECT_TOOL && !retain_selected_route {
                 state.selected_tool = None;
             }
             if let Some(feedback) = recovery_feedback {
@@ -3808,6 +3811,7 @@ fn invalid_tool_arguments_result(
     let envelope = tool_call_request(call);
     let mut audit = json!({
         "argument_validation": "failed",
+        "argument_validation_code": &error.code,
         "policy_evaluated": false,
         "executor_started": false,
         "tool_provenance": "agent_requested",
@@ -3815,7 +3819,6 @@ fn invalid_tool_arguments_result(
     if call.tool_name == TOOL_COMMAND {
         audit["sandbox_backend"] = json!("not_executed");
         audit["command_provenance"] = json!("agent_requested");
-        audit["argument_validation_code"] = json!(&error.code);
     }
     let output = if call.tool_name == TOOL_COMMAND {
         invalid_command_arguments_output(&error.code, spec)
