@@ -23,6 +23,11 @@ use std::time::Duration;
 
 static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn provider_error_keeps_rare_capability_metadata_out_of_result_layout() {
+    assert!(std::mem::size_of::<singularity_model::ProviderError>() < 128);
+}
+
 struct CurrentDirRestore(PathBuf);
 
 impl Drop for CurrentDirRestore {
@@ -381,16 +386,10 @@ fn capability_probe_response(request_body: &str) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
         })
         .collect::<Vec<_>>();
-    if !names
-        .iter()
-        .any(|name| *name == "singularity_capability_probe_a")
-    {
+    if !names.contains(&"singularity_capability_probe_a") {
         return None;
     }
-    let tool_calls = if names
-        .iter()
-        .any(|name| *name == "singularity_capability_probe_b")
-    {
+    let tool_calls = if names.contains(&"singularity_capability_probe_b") {
         vec![
             serde_json::json!({
                 "id": "probe_call_a",

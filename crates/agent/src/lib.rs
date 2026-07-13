@@ -960,7 +960,7 @@ impl AgentLoopState {
 
     fn record_provider_negotiation_error(&mut self, error: &ProviderError) {
         self.provider_protocol_contract = None;
-        self.provider_capability_metadata = error.capability_metadata.clone();
+        self.provider_capability_metadata = error.capability_metadata.as_deref().cloned();
     }
 
     fn approval_count(&self) -> u32 {

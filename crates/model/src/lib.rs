@@ -1405,7 +1405,7 @@ pub struct ProviderError {
     pub message: String,
     pub error: Box<ModelError>,
     pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
-    pub capability_metadata: Option<ProviderCapabilityMetadata>,
+    pub capability_metadata: Option<Box<ProviderCapabilityMetadata>>,
 }
 
 impl ProviderError {
@@ -1424,7 +1424,7 @@ impl ProviderError {
     }
 
     pub fn with_capability_metadata(mut self, metadata: ProviderCapabilityMetadata) -> Self {
-        self.capability_metadata = Some(metadata);
+        self.capability_metadata = Some(Box::new(metadata));
         self
     }
 }
@@ -1434,7 +1434,7 @@ fn attach_capability_metadata(
     metadata: &Option<ProviderCapabilityMetadata>,
 ) -> ProviderError {
     if let Some(metadata) = metadata {
-        error.capability_metadata = Some(metadata.clone());
+        error.capability_metadata = Some(Box::new(metadata.clone()));
     }
     error
 }
