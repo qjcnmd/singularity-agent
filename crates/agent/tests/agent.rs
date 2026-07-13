@@ -1,7 +1,7 @@
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopCapability, AgentLoopInput,
     AgentPlan, AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics,
-    AgentStatus, AgentVerificationRequirement, ApprovalGrant, BUILTIN_SELECT_TOOL,
+    AgentStatus, AgentVerificationRequirement, ApprovalGrant, BUILTIN_INVOKE_TOOL,
     agent_control_tool_specs, assemble_context_items,
 };
 use singularity_core::CancellationToken;
@@ -210,7 +210,7 @@ fn agent_loop_with_capabilities_and_plan(
         registry.register(spec).expect("register workspace tool");
     }
     for spec in agent_control_tool_specs() {
-        if include_plan || spec.name == BUILTIN_SELECT_TOOL {
+        if include_plan || spec.name == BUILTIN_INVOKE_TOOL {
             registry
                 .register(spec)
                 .expect("register agent control tool");
@@ -264,9 +264,9 @@ fn workspace_tool_broker_for_test() -> ToolBroker {
     }
     for spec in agent_control_tool_specs()
         .into_iter()
-        .filter(|spec| spec.name == BUILTIN_SELECT_TOOL)
+        .filter(|spec| spec.name == BUILTIN_INVOKE_TOOL)
     {
-        registry.register(spec).expect("register tool selector");
+        registry.register(spec).expect("register tool router");
     }
     ToolBroker::new(registry)
 }
@@ -568,11 +568,11 @@ fn plan_tool_call(id: &str, steps: serde_json::Value) -> ModelToolCall {
     )
 }
 
-fn select_tool_call(id: &str, tool_name: &str) -> ModelToolCall {
+fn invoke_tool_call(id: &str, tool_name: &str, arguments: serde_json::Value) -> ModelToolCall {
     tool_call(
         id,
-        BUILTIN_SELECT_TOOL,
-        serde_json::json!({"tool_name": tool_name}),
+        BUILTIN_INVOKE_TOOL,
+        serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
     )
 }
 
@@ -1399,7 +1399,7 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
         !requests[0]
             .tools
             .iter()
-            .any(|tool| tool.name == BUILTIN_SELECT_TOOL)
+            .any(|tool| tool.name == BUILTIN_INVOKE_TOOL)
     );
     assert_eq!(
         requests[0].model_preferences.model_name.as_deref(),
@@ -1414,29 +1414,26 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
 }
 
 #[test]
-fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
+fn agent_loop_routes_one_invocation_directly_and_keeps_router_history() {
     let workspace = tempfile::tempdir().expect("workspace");
     std::fs::write(workspace.path().join("README.md"), "hello").expect("write file");
-    let mut select_read = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
-    select_read
-        .tool_calls
-        .push(select_tool_call("select_1", "builtin.read"));
-    let mut read = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
-    read.tool_calls.push(tool_call(
+    let read_arguments = serde_json::json!({
+        "path": "README.md",
+        "max_chars": null,
+        "line_start": null,
+        "line_end": null
+    });
+    let mut routed_read = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    routed_read.tool_calls.push(invoke_tool_call(
         "read_1",
-        BUILTIN_SELECT_TOOL,
-        serde_json::json!({
-            "path": "README.md",
-            "max_chars": null,
-            "line_start": null,
-            "line_end": null
-        }),
+        "builtin.read",
+        read_arguments.clone(),
     ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let result = agent_loop_with_plan_capabilities(
-        vec![select_read, read, final_response],
+        vec![routed_read, final_response],
         allow_read_policy(),
         Arc::clone(&seen_requests),
         ProviderProtocolContract {
@@ -1446,56 +1443,42 @@ fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
         },
     )
     .with_workspace_tools(WorkspaceTools::new(workspace.path()))
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "read the file").with_max_turns(3));
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read the file").with_max_turns(2));
 
     assert_eq!(result.status, AgentStatus::Completed);
-    assert_eq!(result.tool_calls, 2);
+    assert_eq!(result.tool_calls, 1);
     assert!(result.tool_results.iter().all(|tool_result| tool_result.ok));
+    assert_eq!(result.tool_results[0].tool_name, "builtin.read");
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 2);
     assert_eq!(
         requests[0]
             .tools
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec![BUILTIN_SELECT_TOOL]
+        vec![BUILTIN_INVOKE_TOOL]
     );
-    let selectable_names =
-        requests[0].tools[0].parameters_schema["properties"]["tool_name"]["oneOf"]
-            .as_array()
-            .expect("selector choices")
-            .iter()
-            .filter_map(|choice| choice["const"].as_str())
-            .collect::<Vec<_>>();
-    assert!(selectable_names.contains(&"builtin.read"));
-    assert!(selectable_names.contains(&"builtin.command"));
-    assert!(selectable_names.contains(&"builtin.update_plan"));
-    assert!(!selectable_names.contains(&BUILTIN_SELECT_TOOL));
-    assert_eq!(requests[0].tool_choice.max_tool_calls, 1);
-    assert_eq!(
-        requests[1]
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>(),
-        vec![BUILTIN_SELECT_TOOL]
-    );
-    assert!(requests[1].tools[0].description.contains("builtin.read"));
+    let branches = requests[0].tools[0].parameters_schema["oneOf"]
+        .as_array()
+        .expect("router branches");
+    let read_branch = branches
+        .iter()
+        .find(|branch| branch["properties"]["tool_name"]["const"] == "builtin.read")
+        .expect("read router branch");
+    assert_eq!(read_branch["properties"]["arguments"]["type"], "object");
     assert!(
-        requests[1].tools[0].parameters_schema["properties"]
-            .get("path")
-            .is_some()
+        branches
+            .iter()
+            .any(|branch| branch["properties"]["tool_name"]["const"] == "builtin.update_plan")
     );
-    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::SpecificTool);
-    assert_eq!(
-        requests[1].tool_choice.tool_name.as_deref(),
-        Some(BUILTIN_SELECT_TOOL)
+    assert!(
+        !branches
+            .iter()
+            .any(|branch| { branch["properties"]["tool_name"]["const"] == BUILTIN_INVOKE_TOOL })
     );
-    assert_eq!(requests[1].tool_choice.max_tool_calls, 1);
-    assert_eq!(requests[2].tools[0].name, BUILTIN_SELECT_TOOL);
-    assert_eq!(result.tool_results[1].tool_name, "builtin.read");
-    let routed_assistant = requests[2]
+    assert_eq!(requests[0].tool_choice.max_tool_calls, 1);
+    let routed_assistant = requests[1]
         .messages
         .iter()
         .find(|message| {
@@ -1507,14 +1490,20 @@ fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
         .expect("routed assistant history");
     assert_eq!(
         routed_assistant.tool_calls[0].tool_name,
-        BUILTIN_SELECT_TOOL
+        BUILTIN_INVOKE_TOOL
     );
-    let routed_result = requests[2]
+    let routed_outer = &routed_assistant.tool_calls[0];
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&routed_outer.raw_arguments)
+            .expect("router outer payload")["arguments"],
+        read_arguments
+    );
+    let routed_result = requests[1]
         .messages
         .iter()
         .find(|message| message.tool_call_id.as_deref() == Some("read_1"))
         .expect("routed tool result history");
-    assert_eq!(routed_result.name.as_deref(), Some(BUILTIN_SELECT_TOOL));
+    assert_eq!(routed_result.name.as_deref(), Some(BUILTIN_INVOKE_TOOL));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&routed_result.content)
             .expect("routed tool result payload")["tool_name"],
@@ -1523,31 +1512,28 @@ fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
     assert!(
         requests[0].messages[0]
             .content
-            .contains(BUILTIN_SELECT_TOOL)
+            .contains(BUILTIN_INVOKE_TOOL)
     );
 }
 
 #[test]
-fn routed_tool_call_preserves_model_history_and_resumes_the_approved_tool() {
+fn routed_edit_enters_approval_and_resume_executes_canonical_edit() {
     let workspace = tempfile::tempdir().expect("workspace");
     let readme = workspace.path().join("README.md");
     std::fs::write(&readme, "before").expect("write fixture");
-    let mut select_edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
-    select_edit
-        .tool_calls
-        .push(select_tool_call("select_1", "builtin.edit"));
-    let mut routed_edit = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
-    routed_edit.tool_calls.push(tool_call(
+    let edit_arguments = serde_json::json!({
+        "path": "README.md",
+        "expected": "before",
+        "replacement": "after"
+    });
+    let mut routed_edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    routed_edit.tool_calls.push(invoke_tool_call(
         "edit_1",
-        BUILTIN_SELECT_TOOL,
-        serde_json::json!({
-            "path": "README.md",
-            "expected": "before",
-            "replacement": "after"
-        }),
+        "builtin.edit",
+        edit_arguments.clone(),
     ));
     let agent_loop = agent_loop_with_plan_capabilities(
-        vec![select_edit, routed_edit],
+        vec![routed_edit],
         PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
@@ -1556,7 +1542,7 @@ fn routed_tool_call_preserves_model_history_and_resumes_the_approved_tool() {
         },
     )
     .with_workspace_tools(WorkspaceTools::new(workspace.path()));
-    let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(2);
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(1);
     let blocked = agent_loop.run(&input);
 
     assert_eq!(blocked.status, AgentStatus::Blocked);
@@ -1567,26 +1553,47 @@ fn routed_tool_call_preserves_model_history_and_resumes_the_approved_tool() {
     assert_eq!(blocked.pending_tool_calls.len(), 1);
     let pending = blocked.pending_tool_calls[0].clone();
     assert_eq!(pending.tool_name, "builtin.edit");
+    assert_eq!(pending.raw_arguments, edit_arguments.to_string());
     assert_eq!(
-        blocked.tool_results[1].failure_kind,
+        blocked.tool_results[0].failure_kind,
         Some(ToolFailureKind::Approval)
     );
     let checkpoint = blocked
         .approval_checkpoint(&pending.request_id)
         .expect("routed approval checkpoint");
-    assert_eq!(
-        checkpoint["messages"]
-            .as_array()
-            .and_then(|messages| messages.last())
-            .and_then(|message| message["tool_calls"][0]["tool_name"].as_str()),
-        Some(BUILTIN_SELECT_TOOL)
-    );
+    let checkpoint_call = &checkpoint["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .expect("checkpoint assistant message")["tool_calls"][0];
+    assert_eq!(checkpoint_call["tool_name"], BUILTIN_INVOKE_TOOL);
+    assert_eq!(checkpoint_call["arguments"]["tool_name"], "builtin.edit");
+    assert_eq!(checkpoint_call["arguments"]["arguments"], edit_arguments);
 
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
         pending.request_id.clone(),
         pending.tool_name.clone(),
         pending.resources.clone(),
     ));
+    let mut tampered_checkpoint = checkpoint.clone();
+    tampered_checkpoint["messages"]
+        .as_array_mut()
+        .expect("checkpoint messages")
+        .last_mut()
+        .expect("checkpoint assistant message")["tool_calls"][0]["arguments"]["arguments"]["replacement"] =
+        serde_json::json!("tampered");
+    let tampered =
+        agent_loop.resume_pending_tool_call(&resumed_input, &pending, &tampered_checkpoint);
+    assert_eq!(tampered.status, AgentStatus::Failed);
+    assert!(
+        tampered
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("approval checkpoint"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&readme).expect("read fixture after rejected resume"),
+        "before"
+    );
     let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
 
     assert_eq!(resumed.status, AgentStatus::Failed);
@@ -1604,17 +1611,13 @@ fn routed_tool_call_preserves_model_history_and_resumes_the_approved_tool() {
 }
 
 #[test]
-fn routed_input_failure_reuses_the_selected_schema_until_a_valid_call_succeeds() {
+fn routed_input_failure_is_repaired_on_the_next_router_call() {
     let workspace = tempfile::tempdir().expect("workspace");
     std::fs::write(workspace.path().join("README.md"), "hello").expect("write fixture");
-    let mut select_read = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
-    select_read
-        .tool_calls
-        .push(select_tool_call("select_1", "builtin.read"));
-    let mut invalid_read = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
-    invalid_read.tool_calls.push(tool_call(
+    let mut invalid_read = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    invalid_read.tool_calls.push(invoke_tool_call(
         "read_invalid",
-        BUILTIN_SELECT_TOOL,
+        "builtin.read",
         serde_json::json!({
             "path": "",
             "max_chars": null,
@@ -1623,10 +1626,10 @@ fn routed_input_failure_reuses_the_selected_schema_until_a_valid_call_succeeds()
         }),
     ));
     let mut corrected_read =
-        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
-    corrected_read.tool_calls.push(tool_call(
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    corrected_read.tool_calls.push(invoke_tool_call(
         "read_valid",
-        BUILTIN_SELECT_TOOL,
+        "builtin.read",
         serde_json::json!({
             "path": "README.md",
             "max_chars": null,
@@ -1637,10 +1640,9 @@ fn routed_input_failure_reuses_the_selected_schema_until_a_valid_call_succeeds()
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let result = agent_loop_with_plan_capabilities(
         vec![
-            select_read,
             invalid_read,
             corrected_read,
-            ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done"),
+            ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done"),
         ],
         allow_read_policy(),
         Arc::clone(&seen_requests),
@@ -1650,44 +1652,38 @@ fn routed_input_failure_reuses_the_selected_schema_until_a_valid_call_succeeds()
         },
     )
     .with_workspace_tools(WorkspaceTools::new(workspace.path()))
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "read").with_max_turns(4));
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read").with_max_turns(3));
 
     assert_eq!(result.status, AgentStatus::Completed);
-    assert_eq!(result.tool_results.len(), 3);
+    assert_eq!(result.tool_results.len(), 2);
     assert_eq!(
-        result.tool_results[1].failure_kind,
+        result.tool_results[0].failure_kind,
         Some(ToolFailureKind::Input)
     );
-    assert_eq!(result.tool_results[2].tool_name, "builtin.read");
-    assert!(result.tool_results[2].ok);
+    assert_eq!(result.tool_results[1].tool_name, "builtin.read");
+    assert!(result.tool_results[1].ok);
     assert_eq!(
         result.to_run_status().audit_events[0]["argument_validation_code"],
         "read_input_invalid"
     );
     let requests = seen_requests.lock().expect("seen requests lock");
-    assert_eq!(requests.len(), 4);
-    assert_eq!(requests[2].tools[0].name, BUILTIN_SELECT_TOOL);
-    assert!(requests[2].tools[0].description.contains("builtin.read"));
-    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::SpecificTool);
-    assert_eq!(
-        requests[2].tool_choice.tool_name.as_deref(),
-        Some(BUILTIN_SELECT_TOOL)
-    );
+    assert_eq!(requests.len(), 3);
+    assert!(requests
+        .iter()
+        .all(|request| request.tools.len() == 1
+            && request.tools[0].name == BUILTIN_INVOKE_TOOL));
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
     assert!(
-        requests[2].tools[0].parameters_schema["properties"]
-            .get("path")
-            .is_some()
-    );
-    assert!(
-        requests[2].tools[0].parameters_schema["properties"]
-            .get("tool_name")
-            .is_none()
-    );
-    assert_eq!(requests[3].tools[0].name, BUILTIN_SELECT_TOOL);
-    assert!(
-        requests[3].tools[0].parameters_schema["properties"]
-            .get("tool_name")
-            .is_some()
+        requests[1].tools[0].parameters_schema["oneOf"]
+            .as_array()
+            .is_some_and(|branches| {
+                branches.iter().any(|branch| {
+                    branch["properties"]["tool_name"]["const"] == "builtin.read"
+                        && branch["properties"]["arguments"]["properties"]
+                            .get("path")
+                            .is_some()
+                })
+            })
     );
 }
 
@@ -1718,15 +1714,17 @@ fn agent_loop_rejects_registered_tool_hidden_by_the_current_view() {
     );
     assert!(result.tool_results.is_empty());
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests[0].tools[0].name, BUILTIN_SELECT_TOOL);
+    assert_eq!(requests[0].tools[0].name, BUILTIN_INVOKE_TOOL);
 }
 
 #[test]
-fn invalid_tool_selection_is_typed_and_never_enters_policy_or_workspace_execution() {
+fn invalid_routed_tool_is_typed_and_never_enters_policy_or_workspace_execution() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
-    response
-        .tool_calls
-        .push(select_tool_call("select_1", "builtin.missing"));
+    response.tool_calls.push(invoke_tool_call(
+        "invoke_1",
+        "builtin.missing",
+        serde_json::json!({}),
+    ));
     let result = agent_loop_with_plan_capabilities(
         vec![response],
         PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
@@ -1749,6 +1747,92 @@ fn invalid_tool_selection_is_typed_and_never_enters_policy_or_workspace_executio
         result.tool_results[0].error_code.as_deref(),
         Some("tool_not_visible")
     );
+    assert_eq!(
+        result.to_run_status().audit_events[0]["policy_evaluated"],
+        false
+    );
+    assert_eq!(
+        result.to_run_status().audit_events[0]["executor_started"],
+        false
+    );
+}
+
+#[test]
+fn router_rejects_self_invocation_as_a_visibility_failure() {
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(invoke_tool_call(
+        "invoke_1",
+        BUILTIN_INVOKE_TOOL,
+        serde_json::json!({}),
+    ));
+    let result = agent_loop_with_plan_capabilities(
+        vec![response],
+        allow_read_policy(),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract {
+            max_tools_per_request: 2,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "route").with_max_turns(1));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(
+        result.tool_results[0].failure_kind,
+        Some(ToolFailureKind::Visibility)
+    );
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("tool_not_visible")
+    );
+    assert!(result.approval_requests.is_empty());
+}
+
+#[test]
+fn malformed_router_outer_envelope_is_repairable_input_without_policy_or_execution() {
+    let malformed_inputs = [
+        serde_json::json!({"tool_name": "builtin.read"}),
+        serde_json::json!({
+            "tool_name": "builtin.read",
+            "arguments": {"path": "README.md"},
+            "extra": true
+        }),
+        serde_json::json!({"tool_name": "builtin.read", "arguments": "not an object"}),
+    ];
+
+    for (index, arguments) in malformed_inputs.into_iter().enumerate() {
+        let mut response =
+            ModelTurnResponse::completed("model_request_turn_1_0", format!("response_{index}"), "");
+        response
+            .tool_calls
+            .push(tool_call("invoke_1", BUILTIN_INVOKE_TOOL, arguments));
+        let result = agent_loop_with_plan_capabilities(
+            vec![response],
+            allow_read_policy(),
+            Arc::new(Mutex::new(Vec::new())),
+            ProviderProtocolContract {
+                max_tools_per_request: 2,
+                ..ProviderProtocolContract::default()
+            },
+        )
+        .run(&AgentLoopInput::new("thread_1", "turn_1", "route").with_max_turns(1));
+
+        assert_eq!(result.status, AgentStatus::Failed);
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(
+            result.tool_results[0].failure_kind,
+            Some(ToolFailureKind::Input)
+        );
+        assert_eq!(
+            result.tool_results[0].error_code.as_deref(),
+            Some("invalid_tool_arguments")
+        );
+        assert!(result.approval_requests.is_empty());
+        let audit = &result.to_run_status().audit_events[0];
+        assert_eq!(audit["policy_evaluated"], false);
+        assert_eq!(audit["executor_started"], false);
+    }
 }
 
 #[test]
@@ -1785,37 +1869,43 @@ fn agent_loop_uses_provider_capabilities_for_budget_metadata() {
 }
 
 #[test]
-fn deferred_tool_view_budgets_only_the_largest_possible_request_view() {
+fn router_tool_view_reserves_the_router_schema_in_context_budget() {
     let run_with_capacity = |max_tools_per_request| {
-        agent_loop_with_plan_capabilities(
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let result = agent_loop_with_plan_capabilities(
             vec![ModelTurnResponse::completed(
                 "model_request_turn_1_0",
                 "response_1",
                 "done",
             )],
             allow_read_policy(),
-            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&seen_requests),
             ProviderProtocolContract {
                 max_tools_per_request,
                 ..ProviderProtocolContract::default()
             },
         )
-        .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"))
+        .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+        (result, seen_requests)
     };
 
-    let full = run_with_capacity(8);
-    let deferred = run_with_capacity(2);
+    let (full, _) = run_with_capacity(8);
+    let (routed, routed_requests) = run_with_capacity(2);
 
     assert_eq!(full.status, AgentStatus::Completed);
-    assert_eq!(deferred.status, AgentStatus::Completed);
-    let full_tool_tokens = full.context_trace.expect("full context").budget["tool_tokens"]
+    assert_eq!(routed.status, AgentStatus::Completed);
+    let routed_tool_tokens = routed.context_trace.expect("router context").budget["tool_tokens"]
         .as_u64()
-        .expect("full tool tokens");
-    let deferred_tool_tokens =
-        deferred.context_trace.expect("deferred context").budget["tool_tokens"]
-            .as_u64()
-            .expect("deferred tool tokens");
-    assert!(deferred_tool_tokens < full_tool_tokens);
+        .expect("router tool tokens");
+    assert!(routed_tool_tokens > 0);
+    let requests = routed_requests.lock().expect("routed requests");
+    assert_eq!(requests[0].tools.len(), 1);
+    assert_eq!(requests[0].tools[0].name, BUILTIN_INVOKE_TOOL);
+    assert!(
+        requests[0].tools[0].parameters_schema["oneOf"]
+            .as_array()
+            .is_some_and(|branches| !branches.is_empty())
+    );
 }
 
 #[test]

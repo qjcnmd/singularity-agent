@@ -75,7 +75,7 @@ const TOOL_EDIT: &str = "builtin.edit";
 const TOOL_PATCH: &str = "builtin.patch";
 const TOOL_COMMAND: &str = "builtin.command";
 pub const BUILTIN_UPDATE_PLAN_TOOL: &str = "builtin.update_plan";
-pub const BUILTIN_SELECT_TOOL: &str = "builtin.select_tool";
+pub const BUILTIN_INVOKE_TOOL: &str = "builtin.invoke_tool";
 const MAX_PLAN_STEPS: usize = 64;
 const MAX_PLAN_STEP_CHARS: usize = 512;
 const MAX_VERIFICATION_REQUIREMENTS: usize = 64;
@@ -249,18 +249,19 @@ pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
             validate_plan_tool_input_contract,
         ),
         ToolSpec::new(
-            BUILTIN_SELECT_TOOL,
-            "Select one registered tool to expose on the next model turn",
+            BUILTIN_INVOKE_TOOL,
+            "Invoke one registered tool through a bounded model-facing router",
             json!({
                 "type": "object",
                 "properties": {
-                    "tool_name": {"type": "string", "minLength": 1}
+                    "tool_name": {"type": "string", "minLength": 1},
+                    "arguments": {"type": "object"}
                 },
-                "required": ["tool_name"],
+                "required": ["tool_name", "arguments"],
                 "additionalProperties": false
             }),
             ToolExecutionMode::Exclusive,
-            validate_select_tool_input_contract,
+            validate_invoke_tool_input_contract,
         ),
     ]
 }
@@ -273,8 +274,9 @@ pub struct AgentPlanUpdateInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentToolSelectionInput {
+struct AgentToolInvocationInput {
     tool_name: String,
+    arguments: Value,
 }
 
 impl AgentPlanUpdateInput {
@@ -891,7 +893,6 @@ struct AgentLoopState {
     context_trace: Option<AgentContextTrace>,
     provider_protocol_contract: Option<ProviderProtocolContract>,
     provider_capability_metadata: Option<ProviderCapabilityMetadata>,
-    selected_tool: Option<String>,
 }
 
 impl AgentLoopState {
@@ -921,7 +922,6 @@ impl AgentLoopState {
             context_trace,
             provider_protocol_contract: None,
             provider_capability_metadata: None,
-            selected_tool: None,
         }
     }
 
@@ -1257,7 +1257,7 @@ where
             input,
             &context,
             max_tool_calls,
-            uses_deferred_tool_view(&self.tool_broker, &capabilities),
+            uses_tool_router(&self.tool_broker, &capabilities),
         );
         state.context_trace = Some(AgentContextTrace::from(&context));
         self.continue_run(input, &budget, &capabilities, max_tool_calls, state, 0)
@@ -1287,19 +1287,12 @@ where
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
             }
-            let tool_view =
-                match model_tool_view(&self.tool_broker, &state, capabilities, max_tool_calls) {
-                    Ok(tool_view) => tool_view,
-                    Err(error) => {
-                        return state.finish(
-                            AgentStatus::Failed,
-                            false,
-                            None,
-                            turn_index,
-                            Some(error),
-                        );
-                    }
-                };
+            let tool_view = match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
+                Ok(tool_view) => tool_view,
+                Err(error) => {
+                    return state.finish(AgentStatus::Failed, false, None, turn_index, Some(error));
+                }
+            };
             if !model_request_fits_context(&tool_view.tools, &state.messages, budget) {
                 let Some(compaction) = compact_model_messages(&tool_view.tools, &state, budget)
                 else {
@@ -1430,13 +1423,13 @@ where
                 ));
                 continue;
             }
+            let routed = provider_tool_names.as_slice() == [BUILTIN_INVOKE_TOOL];
             let execution_tool_calls =
-                resolve_routed_tool_calls(&response.tool_calls, state.selected_tool.as_deref());
-            let execution_tool_names = state
-                .selected_tool
-                .as_ref()
-                .map(|selected| vec![selected.clone()])
-                .unwrap_or_else(|| provider_tool_names.clone());
+                resolve_routed_tool_calls(&response.tool_calls, routed, &self.tool_broker);
+            let execution_tool_names = execution_tool_calls
+                .iter()
+                .map(|call| call.tool_name.clone())
+                .collect::<Vec<_>>();
             let observed_tool_calls = execution_tool_calls
                 .iter()
                 .map(|call| state.observe_model_tool_call(call, &execution_tool_names))
@@ -1525,19 +1518,24 @@ where
                 );
             }
         };
-        let (state, model_turn_offset, model_visible_tool_name) =
-            match restore_checkpoint(input, pending, checkpoint_payload) {
-                Ok(restored) => restored,
-                Err(error) => {
-                    return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        0,
-                        Some(error),
-                    );
-                }
-            };
+        let (state, model_turn_offset, model_visible_tool_name) = match restore_checkpoint(
+            input,
+            pending,
+            checkpoint_payload,
+            &self.tool_broker,
+            &self.policy.profile,
+        ) {
+            Ok(restored) => restored,
+            Err(error) => {
+                return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    0,
+                    Some(error),
+                );
+            }
+        };
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
         }
@@ -1574,7 +1572,7 @@ where
             &mut state.messages,
             input,
             max_tool_calls,
-            uses_deferred_tool_view(&self.tool_broker, &capabilities),
+            uses_tool_router(&self.tool_broker, &capabilities),
         );
         let context = assemble_context_items_with_budget(&input.input, &budget);
         if let Some(context_trace) = &mut state.context_trace {
@@ -1712,9 +1710,6 @@ where
                 ToolFailureKind::Input,
                 "invalid tool call arguments",
             );
-        }
-        if call.tool_name == BUILTIN_SELECT_TOOL {
-            return ToolBrokerDecision::Allow;
         }
         let request_id = approval_request_id(input, call);
         let resources = permission_resources_for_tool(call);
@@ -1905,6 +1900,32 @@ where
         invalid_was_observed: bool,
         state: &mut AgentLoopState,
     ) -> PreparedToolCall {
+        if execution_call.parse_status != ModelToolParseStatus::Valid {
+            if !invalid_was_observed {
+                state.recovery_metrics.invalid_tool_call_count = state
+                    .recovery_metrics
+                    .invalid_tool_call_count
+                    .saturating_add(1);
+            }
+            let validation_code = match execution_call.parse_status {
+                ModelToolParseStatus::InvalidJson => "invalid_json_arguments",
+                ModelToolParseStatus::SchemaMismatch => "tool_schema_mismatch",
+                ModelToolParseStatus::UnknownTool => "tool_not_visible",
+                ModelToolParseStatus::Valid => unreachable!("validated tool call"),
+            };
+            return PreparedToolCall {
+                call: execution_call.clone(),
+                model_visible_tool_name: model_visible_tool_name.to_string(),
+                fingerprint: fingerprint.to_string(),
+                execution_mode: None,
+                decision: None,
+                rejection: Some(invalid_tool_arguments_result(
+                    execution_call,
+                    ToolInputValidationError::new(validation_code),
+                    self.tool_broker.get(&execution_call.tool_name),
+                )),
+            };
+        }
         let (execution_mode, execution_arguments) = match self
             .tool_broker
             .prepare_model_input(&execution_call.tool_name, &execution_call.arguments)
@@ -2016,10 +2037,7 @@ where
     }
 
     fn workspace_preflight_rejection(&self, call: &ModelToolCall) -> Option<ToolResult> {
-        if matches!(
-            call.tool_name.as_str(),
-            BUILTIN_UPDATE_PLAN_TOOL | BUILTIN_SELECT_TOOL
-        ) {
+        if call.tool_name == BUILTIN_UPDATE_PLAN_TOOL {
             return None;
         }
         let envelope = tool_call_request(call);
@@ -2140,9 +2158,6 @@ where
         let mut failure = None;
         let mut repairable_failure = None;
         for (prepared, result) in results {
-            let retain_selected_route = !result.ok
-                && result.failure_kind == Some(ToolFailureKind::Input)
-                && state.selected_tool.as_deref() == Some(prepared.call.tool_name.as_str());
             let recoverable = is_repairable_tool_result(&result)
                 || (approval_is_recoverable
                     && result.failure_kind == Some(ToolFailureKind::Approval));
@@ -2161,9 +2176,6 @@ where
                 &prepared.model_visible_tool_name,
             ));
             state.tool_results.push(result);
-            if prepared.call.tool_name != BUILTIN_SELECT_TOOL && !retain_selected_route {
-                state.selected_tool = None;
-            }
             if let Some(feedback) = recovery_feedback {
                 state
                     .messages
@@ -2198,8 +2210,6 @@ where
             .execute(&envelope, decision.clone(), |_envelope| {
                 if call.tool_name == BUILTIN_UPDATE_PLAN_TOOL {
                     self.execute_plan_update(call, state)
-                } else if call.tool_name == BUILTIN_SELECT_TOOL {
-                    self.execute_tool_selection(call, state)
                 } else {
                     self.execute_workspace_tool(call, &executor_decision)
                 }
@@ -2232,34 +2242,6 @@ where
             "plan": safe_plan_summary(&plan),
             "plan_update_count": state.plan_update_count,
         }))
-    }
-
-    fn execute_tool_selection(
-        &self,
-        call: &ModelToolCall,
-        state: &mut AgentLoopState,
-    ) -> ToolOutput {
-        let selection = match select_tool_input(&call.arguments) {
-            Ok(selection) => selection,
-            Err(_) => {
-                return ToolOutput::failure_with_kind(
-                    ToolFailureKind::Input,
-                    "invalid_tool_arguments",
-                    json!({"summary": "tool selection failed input validation"}),
-                );
-            }
-        };
-        if selection.tool_name == BUILTIN_SELECT_TOOL
-            || self.tool_broker.get(&selection.tool_name).is_none()
-        {
-            return ToolOutput::failure_with_kind(
-                ToolFailureKind::Visibility,
-                "tool_not_visible",
-                json!({"summary": "selected tool is not registered"}),
-            );
-        }
-        state.selected_tool = Some(selection.tool_name.clone());
-        ToolOutput::success(json!({"selected_tool": selection.tool_name}))
     }
 
     fn execute_workspace_tool(
@@ -2529,7 +2511,7 @@ fn context_budget(
     let developer_instruction_tokens = approximate_token_count(&developer_instructions(
         input,
         max_tool_calls,
-        uses_deferred_tool_view(loop_tools, capabilities),
+        uses_tool_router(loop_tools, capabilities),
     ));
     let tool_tokens = reserved_model_tool_tokens(loop_tools, capabilities)?;
     let message_count = u32::try_from(input.input.len().saturating_add(1)).unwrap_or(u32::MAX);
@@ -2916,6 +2898,8 @@ fn restore_checkpoint(
     input: &AgentLoopInput,
     pending: &PendingToolCall,
     payload: &Value,
+    tool_broker: &ToolBroker,
+    permission_profile: &PermissionProfile,
 ) -> Result<(AgentLoopState, u32, String), String> {
     let checkpoint: AgentLoopCheckpoint = serde_json::from_value(payload.clone())
         .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
@@ -2957,11 +2941,46 @@ fn restore_checkpoint(
     {
         return Err("approval checkpoint assistant tool-call ordering is invalid".to_string());
     }
-    let model_visible_tool_name = last_message.tool_calls[0].tool_name.clone();
-    if model_visible_tool_name != pending.tool_name
-        && model_visible_tool_name != BUILTIN_SELECT_TOOL
-    {
+    let model_visible_call = &last_message.tool_calls[0];
+    let model_visible_tool_name = model_visible_call.tool_name.clone();
+    if model_visible_call.parse_status != ModelToolParseStatus::Valid {
         return Err("approval checkpoint assistant tool-call name is invalid".to_string());
+    }
+    let pending_call = pending
+        .to_model_tool_call()
+        .map_err(|error| format!("invalid pending checkpoint tool call arguments: {error}"))?;
+    if pending.tool_name == BUILTIN_INVOKE_TOOL {
+        return Err("approval checkpoint cannot persist the model-facing router".to_string());
+    }
+    let canonical_model_call = if model_visible_tool_name == BUILTIN_INVOKE_TOOL {
+        let invocation = invoke_tool_input(&model_visible_call.arguments)
+            .map_err(|_| "approval checkpoint router invocation is invalid".to_string())?;
+        ModelToolCall {
+            tool_call_id: model_visible_call.tool_call_id.clone(),
+            tool_name: invocation.tool_name,
+            raw_arguments: serde_json::to_string(&invocation.arguments)
+                .expect("model tool arguments serialize"),
+            arguments: invocation.arguments,
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        }
+    } else {
+        if model_visible_tool_name != pending.tool_name {
+            return Err("approval checkpoint assistant tool-call name is invalid".to_string());
+        }
+        model_visible_call.clone()
+    };
+    let canonical_model_call =
+        canonicalize_model_tool_call(tool_broker, &canonical_model_call, permission_profile)
+            .map_err(|error| format!("approval checkpoint tool call is invalid: {error}"))?;
+    if canonical_model_call.tool_call_id != pending_call.tool_call_id
+        || canonical_model_call.tool_name != pending_call.tool_name
+        || canonical_model_call.arguments != pending_call.arguments
+    {
+        return Err(
+            "approval checkpoint assistant tool-call arguments do not match pending call"
+                .to_string(),
+        );
     }
     let used_approval_grants = checkpoint
         .used_approval_grants
@@ -3142,7 +3161,7 @@ impl AgentContextTrace {
 struct ModelToolView {
     tools: Vec<ModelToolSchema>,
     max_tool_calls: u32,
-    deferred: bool,
+    router: bool,
 }
 
 fn model_turn_request(
@@ -3168,10 +3187,7 @@ fn model_turn_request(
             ..input.model_preferences.clone()
         },
     };
-    request.tool_choice.mode = if tool_view.deferred && state.selected_tool.is_some() {
-        request.tool_choice.tool_name = Some(BUILTIN_SELECT_TOOL.to_string());
-        ToolChoiceMode::SpecificTool
-    } else if tool_view.deferred && !state.allows_final() {
+    request.tool_choice.mode = if tool_view.router && !state.allows_final() {
         ToolChoiceMode::Required
     } else {
         state.tool_choice_mode()
@@ -3202,98 +3218,102 @@ fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
         .collect()
 }
 
-fn regular_model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
+fn visible_model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
     model_tool_schemas(loop_tools)
         .into_iter()
-        .filter(|tool| tool.name != BUILTIN_SELECT_TOOL)
+        .filter(|tool| tool.name != BUILTIN_INVOKE_TOOL)
         .collect()
 }
 
-fn uses_deferred_tool_view(
-    loop_tools: &ToolBroker,
-    capabilities: &ProviderProtocolContract,
-) -> bool {
-    regular_model_tool_schemas(loop_tools).len() > capabilities.max_tools_per_request as usize
+fn uses_tool_router(loop_tools: &ToolBroker, capabilities: &ProviderProtocolContract) -> bool {
+    visible_model_tool_schemas(loop_tools).len() > capabilities.max_tools_per_request as usize
 }
 
-fn selector_model_tool_schema(
+fn router_model_tool_schema(
     loop_tools: &ToolBroker,
-    selectable_tools: &[ModelToolSchema],
+    visible_tools: &[ModelToolSchema],
 ) -> Result<ModelToolSchema, String> {
-    let mut selector = model_tool_schemas(loop_tools)
+    let mut router = model_tool_schemas(loop_tools)
         .into_iter()
-        .find(|tool| tool.name == BUILTIN_SELECT_TOOL)
-        .ok_or_else(|| "deferred tool selector is not registered".to_string())?;
-    let choices = selectable_tools
+        .find(|tool| tool.name == BUILTIN_INVOKE_TOOL)
+        .ok_or_else(|| "tool router is not registered".to_string())?;
+    let branches = visible_tools
         .iter()
         .map(|tool| {
             json!({
-                "const": &tool.name,
-                "description": &tool.description,
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "const": &tool.name,
+                        "description": &tool.description,
+                    },
+                    "arguments": &tool.parameters_schema,
+                },
+                "required": ["tool_name", "arguments"],
+                "additionalProperties": false,
             })
         })
         .collect::<Vec<_>>();
-    selector.parameters_schema = json!({
-        "type": "object",
-        "properties": {
-            "tool_name": {"oneOf": choices}
-        },
-        "required": ["tool_name"],
-        "additionalProperties": false
-    });
-    Ok(selector)
+    router.parameters_schema = json!({"oneOf": branches});
+    Ok(router)
 }
 
 fn model_tool_view(
     loop_tools: &ToolBroker,
-    state: &AgentLoopState,
     capabilities: &ProviderProtocolContract,
     max_tool_calls: u32,
 ) -> Result<ModelToolView, String> {
     if capabilities.max_tools_per_request == 0 {
         return Err("provider tool-definition limit must be greater than zero".to_string());
     }
-    let selectable_tools = regular_model_tool_schemas(loop_tools);
-    if selectable_tools.len() <= capabilities.max_tools_per_request as usize {
+    let visible_tools = visible_model_tool_schemas(loop_tools);
+    if visible_tools.len() <= capabilities.max_tools_per_request as usize {
         return Ok(ModelToolView {
-            tools: selectable_tools,
+            tools: visible_tools,
             max_tool_calls,
-            deferred: false,
+            router: false,
         });
     }
-    let tools = match state.selected_tool.as_deref() {
-        Some(selected_tool) => {
-            let mut routed = selectable_tools
-                .iter()
-                .find(|tool| tool.name == selected_tool)
-                .cloned()
-                .ok_or_else(|| "selected tool is no longer registered".to_string())?;
-            routed.name = BUILTIN_SELECT_TOOL.to_string();
-            routed.description = format!(
-                "Invoke the selected tool {selected_tool} using its complete input schema. {}",
-                routed.description
-            );
-            vec![routed]
-        }
-        None => vec![selector_model_tool_schema(loop_tools, &selectable_tools)?],
-    };
+    let router = router_model_tool_schema(loop_tools, &visible_tools)?;
     Ok(ModelToolView {
-        tools,
+        tools: vec![router],
         max_tool_calls: 1,
-        deferred: true,
+        router: true,
     })
 }
 
 fn resolve_routed_tool_calls(
     provider_calls: &[ModelToolCall],
-    selected_tool: Option<&str>,
+    router_enabled: bool,
+    loop_tools: &ToolBroker,
 ) -> Vec<ModelToolCall> {
+    if !router_enabled {
+        return provider_calls.to_vec();
+    }
+    let visible_tool_names = visible_model_tool_schemas(loop_tools)
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<BTreeSet<_>>();
     provider_calls
         .iter()
         .map(|call| {
+            if call.tool_name != BUILTIN_INVOKE_TOOL
+                || call.parse_status != ModelToolParseStatus::Valid
+            {
+                return call.clone();
+            }
+            let Ok(invocation) = invoke_tool_input(&call.arguments) else {
+                return call.clone();
+            };
             let mut resolved = call.clone();
-            if let Some(selected_tool) = selected_tool {
-                resolved.tool_name = selected_tool.to_string();
+            resolved.tool_name = invocation.tool_name;
+            resolved.raw_arguments = serde_json::to_string(&invocation.arguments)
+                .expect("model tool arguments serialize");
+            resolved.arguments = invocation.arguments;
+            if resolved.tool_name == BUILTIN_INVOKE_TOOL
+                || !visible_tool_names.contains(&resolved.tool_name)
+            {
+                resolved.parse_status = ModelToolParseStatus::UnknownTool;
             }
             resolved
         })
@@ -3308,28 +3328,23 @@ fn reserved_model_tool_tokens(
     loop_tools: &ToolBroker,
     capabilities: &ProviderProtocolContract,
 ) -> Result<u32, String> {
-    let selectable_tools = regular_model_tool_schemas(loop_tools);
-    if selectable_tools.len() <= capabilities.max_tools_per_request as usize {
-        return Ok(model_tool_payload_tokens(&selectable_tools));
+    let visible_tools = visible_model_tool_schemas(loop_tools);
+    if visible_tools.len() <= capabilities.max_tools_per_request as usize {
+        return Ok(model_tool_payload_tokens(&visible_tools));
     }
-    let selector = selector_model_tool_schema(loop_tools, &selectable_tools)?;
-    Ok(selectable_tools
-        .iter()
-        .map(|tool| model_tool_payload_tokens(std::slice::from_ref(tool)))
-        .chain(std::iter::once(model_tool_payload_tokens(&[selector])))
-        .max()
-        .unwrap_or_default())
+    let router = router_model_tool_schema(loop_tools, &visible_tools)?;
+    Ok(model_tool_payload_tokens(&[router]))
 }
 
 fn model_messages_from_input(
     input: &AgentLoopInput,
     context: &ContextBundle,
     max_tool_calls: u32,
-    deferred_tool_view: bool,
+    router_tool_view: bool,
 ) -> Vec<ModelMessage> {
     let mut messages = vec![ModelMessage::text(
         ModelRole::Developer,
-        developer_instructions(input, max_tool_calls, deferred_tool_view),
+        developer_instructions(input, max_tool_calls, router_tool_view),
     )];
     messages.extend(model_messages_from_context(context));
     messages
@@ -3338,22 +3353,22 @@ fn model_messages_from_input(
 fn developer_instructions(
     input: &AgentLoopInput,
     max_tool_calls: u32,
-    deferred_tool_view: bool,
+    router_tool_view: bool,
 ) -> String {
-    let tool_call_instruction = if deferred_tool_view || max_tool_calls == 1 {
+    let tool_call_instruction = if router_tool_view || max_tool_calls == 1 {
         "Issue at most one tool call per assistant response and wait for its result.".to_string()
     } else {
         format!(
             "Issue up to {max_tool_calls} tool calls in one response only when every call is an independent read-only operation. Issue mutations, commands, plan updates, approval-sensitive calls, and calls that depend on earlier results one at a time and wait for each result."
         )
     };
-    let selection_instruction = if deferred_tool_view {
-        " When builtin.select_tool first lists tool names, select the next tool only. On the following turn, call the same visible router with the complete arguments required by the selected tool schema."
+    let router_instruction = if router_tool_view {
+        " The visible builtin.invoke_tool is a single-turn router: provide one exact visible tool_name and its complete arguments object in the same call. Do not invoke the router recursively."
     } else {
         ""
     };
     let instructions =
-        format!("{AGENT_DEVELOPER_INSTRUCTIONS} {tool_call_instruction}{selection_instruction}");
+        format!("{AGENT_DEVELOPER_INSTRUCTIONS} {tool_call_instruction}{router_instruction}");
     match input.project_instructions.as_deref() {
         Some(project) => {
             format!("{instructions}\n\nProject instructions:\n{project}")
@@ -3366,13 +3381,13 @@ fn refresh_developer_instructions(
     messages: &mut [ModelMessage],
     input: &AgentLoopInput,
     max_tool_calls: u32,
-    deferred_tool_view: bool,
+    router_tool_view: bool,
 ) {
     if let Some(message) = messages
         .iter_mut()
         .find(|message| message.role == ModelRole::Developer)
     {
-        message.content = developer_instructions(input, max_tool_calls, deferred_tool_view);
+        message.content = developer_instructions(input, max_tool_calls, router_tool_view);
     }
 }
 
@@ -3609,6 +3624,25 @@ enum CommandBindingError {
     ProfileViolation(String),
 }
 
+fn canonicalize_model_tool_call(
+    tool_broker: &ToolBroker,
+    model_call: &ModelToolCall,
+    permission_profile: &PermissionProfile,
+) -> Result<ModelToolCall, String> {
+    let (_, execution_arguments) = tool_broker
+        .prepare_model_input(&model_call.tool_name, &model_call.arguments)
+        .map_err(|error| error.code)?;
+    let mut bound_call = model_call.clone();
+    bound_call.raw_arguments = execution_arguments.to_string();
+    bound_call.arguments = execution_arguments;
+    let bound_call = bind_tool_call_to_profile(&bound_call, permission_profile)
+        .map_err(|error| error.to_string())?;
+    tool_broker
+        .validate_execution_input(&bound_call.tool_name, &bound_call.arguments)
+        .map_err(|error| error.code)?;
+    Ok(bound_call)
+}
+
 fn bind_tool_call_to_profile(
     call: &ModelToolCall,
     profile: &PermissionProfile,
@@ -3770,12 +3804,17 @@ fn update_plan_tool_input(arguments: &Value) -> Result<AgentPlan, AgentLoopToolE
         .map_err(AgentLoopToolError::InvalidArguments)
 }
 
-fn select_tool_input(arguments: &Value) -> Result<AgentToolSelectionInput, AgentLoopToolError> {
-    let input: AgentToolSelectionInput =
+fn invoke_tool_input(arguments: &Value) -> Result<AgentToolInvocationInput, AgentLoopToolError> {
+    let input: AgentToolInvocationInput =
         serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)?;
     if input.tool_name.trim().is_empty() {
         return Err(AgentLoopToolError::InvalidArguments(
             "tool_name must not be empty".to_string(),
+        ));
+    }
+    if !input.arguments.is_object() {
+        return Err(AgentLoopToolError::InvalidArguments(
+            "arguments must be an object".to_string(),
         ));
     }
     Ok(input)
@@ -3799,10 +3838,10 @@ fn validate_plan_tool_input_contract(input: &Value) -> Result<(), ToolInputValid
         .map_err(|_| ToolInputValidationError::new("plan_input_invalid"))
 }
 
-fn validate_select_tool_input_contract(input: &Value) -> Result<(), ToolInputValidationError> {
-    select_tool_input(input)
+fn validate_invoke_tool_input_contract(input: &Value) -> Result<(), ToolInputValidationError> {
+    invoke_tool_input(input)
         .map(|_| ())
-        .map_err(|_| ToolInputValidationError::new("tool_selection_input_invalid"))
+        .map_err(|_| ToolInputValidationError::new("tool_invocation_input_invalid"))
 }
 
 fn invalid_tool_arguments_result(
@@ -3822,7 +3861,16 @@ fn invalid_tool_arguments_result(
         audit["sandbox_backend"] = json!("not_executed");
         audit["command_provenance"] = json!("agent_requested");
     }
-    let output = if call.tool_name == TOOL_COMMAND {
+    let output = if error.code == "tool_not_visible" {
+        ToolOutput::failure_with_kind(
+            ToolFailureKind::Visibility,
+            "tool_not_visible",
+            json!({
+                "summary": "tool is not visible in the current model tool view",
+                "validation_code": error.code,
+            }),
+        )
+    } else if call.tool_name == TOOL_COMMAND {
         invalid_command_arguments_output(&error.code, spec)
     } else {
         ToolOutput::failure_with_kind(
