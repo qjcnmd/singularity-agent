@@ -94,14 +94,17 @@ impl ResolvedWindowsSandboxPermissions {
         self.network.is_enabled() && self.has_full_disk_read_access()
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn should_apply_network_block(&self) -> bool {
         !self.network.is_enabled()
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn network_policy(&self) -> NetworkSandboxPolicy {
         self.network
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn is_enforceable_by_windows_sandbox(&self) -> bool {
         matches!(self.file_system.kind, FileSystemSandboxKind::Restricted)
     }
@@ -110,10 +113,12 @@ impl ResolvedWindowsSandboxPermissions {
         self.file_system.has_full_disk_read_access()
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn include_platform_defaults(&self) -> bool {
         self.file_system.include_platform_defaults()
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn readable_roots_for_cwd(&self, cwd: &Path) -> Vec<PathBuf> {
         self.file_system
             .get_readable_roots_with_cwd(cwd)
@@ -122,6 +127,7 @@ impl ResolvedWindowsSandboxPermissions {
             .collect()
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn uses_write_capabilities_for_cwd(
         &self,
         cwd: &Path,

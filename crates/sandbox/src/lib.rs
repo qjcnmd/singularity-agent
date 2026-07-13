@@ -1,6 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::{Component, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,15 +14,23 @@ const SANDBOX_BACKEND_UNAVAILABLE: &str = "sandbox-required command has no sandb
 const COMMAND_SPAWN_FAILED: &str = "sandbox command spawn failed";
 const COMMAND_TIMED_OUT: &str = "sandbox command timed out";
 const COMMAND_CANCELLED: &str = "sandbox command cancelled";
+#[cfg(windows)]
 const COMMAND_EMPTY_ARGV: &str = "sandbox command argv is empty";
+#[cfg(windows)]
 const COMMAND_CWD_OUTSIDE_WORKSPACE: &str = "sandbox command cwd is outside workspace";
+#[cfg(windows)]
 const COMMAND_CWD_UNAVAILABLE: &str = "sandbox command cwd is unavailable";
+#[cfg(windows)]
 const COMMAND_PATH_OUTSIDE_WORKSPACE: &str = "sandbox command path is outside workspace";
+#[cfg(windows)]
 const COMMAND_READ_ONLY_WRITE_DENIED: &str = "sandbox command write denied in read-only mode";
+#[cfg(windows)]
 const COMMAND_SENSITIVE_PATH_DENIED: &str = "sandbox command path denied";
+#[cfg(windows)]
 const COMMAND_ENV_PATH_UNSUPPORTED: &str = "sandbox command env-expanded path is unsupported";
 const COMMAND_UNSUPPORTED: &str = "sandbox command mode unsupported";
 const SHELL_COMMAND_FLAGS: [&str; 3] = ["/c", "-c", "-command"];
+#[cfg(windows)]
 const WRITE_COMMAND_WORDS: [&str; 13] = [
     "copy",
     "cp",
@@ -37,6 +47,7 @@ const WRITE_COMMAND_WORDS: [&str; 13] = [
     "set-content",
 ];
 const REDACTED_COMMAND_OUTPUT: &str = "[redacted sensitive command output]";
+#[cfg(windows)]
 const SECRET_ENV_MARKERS: [&str; 6] = [
     "API_KEY",
     "AUTH",
@@ -45,6 +56,7 @@ const SECRET_ENV_MARKERS: [&str; 6] = [
     "SECRET",
     "TOKEN",
 ];
+#[cfg(windows)]
 const SENSITIVE_PATH_EXACT_MARKERS: [&str; 12] = [
     ".aws",
     ".azure",
@@ -59,7 +71,9 @@ const SENSITIVE_PATH_EXACT_MARKERS: [&str; 12] = [
     "id_rsa",
     "secrets",
 ];
+#[cfg(windows)]
 const SENSITIVE_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"];
+#[cfg(windows)]
 const SENSITIVE_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -559,6 +573,7 @@ fn command_executable_name(value: &str) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+#[cfg(windows)]
 fn command_reference_tokens(request: &CommandRequest) -> Vec<String> {
     let mut tokens = Vec::new();
     for part in request.argv.iter().skip(1) {
@@ -574,6 +589,7 @@ fn command_reference_tokens(request: &CommandRequest) -> Vec<String> {
     tokens
 }
 
+#[cfg(windows)]
 fn is_shell_executable(value: &str) -> bool {
     matches!(
         command_executable_name(&value.replace('\\', "/").to_ascii_lowercase()).as_str(),
@@ -581,6 +597,7 @@ fn is_shell_executable(value: &str) -> bool {
     )
 }
 
+#[cfg(windows)]
 fn collect_command_tokens(value: &str, tokens: &mut Vec<String>) {
     tokens.extend(
         value
@@ -590,10 +607,12 @@ fn collect_command_tokens(value: &str, tokens: &mut Vec<String>) {
     );
 }
 
+#[cfg(windows)]
 fn command_token_separator(ch: char) -> bool {
     ch.is_whitespace() || matches!(ch, '&' | '|' | ';' | '<' | '>')
 }
 
+#[cfg(windows)]
 fn clean_command_token(value: &str) -> String {
     value
         .trim_matches(|ch| {
@@ -605,6 +624,7 @@ fn clean_command_token(value: &str) -> String {
         .to_string()
 }
 
+#[cfg(windows)]
 fn command_token_references_path(cwd: &Path, token: &str) -> bool {
     let lower = token.to_ascii_lowercase();
     if SHELL_COMMAND_FLAGS.contains(&lower.as_str()) {
@@ -623,6 +643,7 @@ fn command_token_references_path(cwd: &Path, token: &str) -> bool {
         || cwd.join(token).exists()
 }
 
+#[cfg(windows)]
 fn command_token_has_env_reference(token: &str) -> bool {
     let lower = token.to_ascii_lowercase();
     token.contains('%')
@@ -632,6 +653,7 @@ fn command_token_has_env_reference(token: &str) -> bool {
         || lower.contains("$userprofile")
 }
 
+#[cfg(windows)]
 fn command_token_has_sensitive_path_marker(token: &str) -> bool {
     token
         .replace('\\', "/")
@@ -649,6 +671,7 @@ fn command_token_has_sensitive_path_marker(token: &str) -> bool {
         .any(|component| sensitive_path_component(&component))
 }
 
+#[cfg(windows)]
 fn command_has_read_only_write_intent(request: &CommandRequest) -> bool {
     let resource = command_permission_resource(&request.argv);
     request.argv.first().is_some_and(|executable| {
@@ -663,6 +686,7 @@ fn command_has_read_only_write_intent(request: &CommandRequest) -> bool {
         })
 }
 
+#[cfg(windows)]
 fn command_has_file_redirection(value: &str) -> bool {
     let chars = value.chars().collect::<Vec<_>>();
     let mut index = 0;
@@ -679,6 +703,7 @@ fn command_has_file_redirection(value: &str) -> bool {
     false
 }
 
+#[cfg(windows)]
 fn redirection_target(chars: &[char], mut index: usize) -> String {
     while index < chars.len() && chars[index] == '>' {
         index += 1;
@@ -705,11 +730,13 @@ fn redirection_target(chars: &[char], mut index: usize) -> String {
     clean_command_token(&target)
 }
 
+#[cfg(windows)]
 fn redirection_target_is_non_file(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
     matches!(lower.as_str(), "nul" | "nul:" | "/dev/null" | "&1" | "&2")
 }
 
+#[cfg(windows)]
 fn is_secret_env_name(name: &str) -> bool {
     let upper_name = name.to_ascii_uppercase();
     SECRET_ENV_MARKERS
@@ -717,6 +744,7 @@ fn is_secret_env_name(name: &str) -> bool {
         .any(|marker| upper_name.contains(marker))
 }
 
+#[cfg(windows)]
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -731,6 +759,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+#[cfg(windows)]
 fn command_request_denial(request: &CommandRequest) -> Option<CommandResult> {
     if request.argv.is_empty() {
         return Some(CommandResult::policy_denied(
@@ -827,6 +856,7 @@ fn command_request_denial(request: &CommandRequest) -> Option<CommandResult> {
     None
 }
 
+#[cfg(windows)]
 fn resolve_command_path(workspace: &Path, path: &str) -> PathBuf {
     let candidate = Path::new(path);
     let joined = if candidate.is_absolute() {
@@ -837,6 +867,7 @@ fn resolve_command_path(workspace: &Path, path: &str) -> PathBuf {
     normalize_path(&joined)
 }
 
+#[cfg(windows)]
 fn resolve_existing_command_path(workspace: &Path, path: &str) -> Option<PathBuf> {
     let resolved = resolve_command_path(workspace, path);
     std::fs::canonicalize(&resolved)
@@ -844,6 +875,7 @@ fn resolve_existing_command_path(workspace: &Path, path: &str) -> Option<PathBuf
         .ok()
 }
 
+#[cfg(windows)]
 fn resolve_existing_or_parent_command_path(workspace: &Path, path: &str) -> PathBuf {
     let resolved = resolve_command_path(workspace, path);
     let mut missing = Vec::new();
@@ -867,6 +899,7 @@ fn resolve_existing_or_parent_command_path(workspace: &Path, path: &str) -> Path
     normalize_path(&canonical)
 }
 
+#[cfg(windows)]
 fn path_has_sensitive_component(path: &Path) -> bool {
     path.components()
         .filter_map(|component| match component {
@@ -876,6 +909,7 @@ fn path_has_sensitive_component(path: &Path) -> bool {
         .any(|component| sensitive_path_component(&component))
 }
 
+#[cfg(windows)]
 fn sensitive_path_component(component: &str) -> bool {
     SENSITIVE_PATH_EXACT_MARKERS.contains(&component)
         || SENSITIVE_PATH_PREFIXES.iter().any(|prefix| {

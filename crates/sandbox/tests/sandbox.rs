@@ -1,9 +1,10 @@
 use schemars::schema_for;
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-    SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    WindowsSandboxBackend, bound_command_output,
+    SandboxBackendEnforcement, SandboxCapabilities, WindowsSandboxBackend, bound_command_output,
 };
+#[cfg(windows)]
+use singularity_sandbox::{SandboxFilesystemMode, SandboxNetworkMode};
 use std::path::Path;
 
 const SANDBOX_SRC: &str = include_str!("../src/lib.rs");

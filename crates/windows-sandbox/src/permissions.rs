@@ -515,14 +515,14 @@ impl ReadDenyMatcher {
     }
 
     pub fn is_read_denied(&self, path: &Path) -> bool {
-        let path = canonical_or_path_buf(path);
+        let canonical_path = canonical_or_path_buf(path);
         self.denied_roots
             .iter()
-            .any(|root| path.starts_with(root.as_path()))
+            .any(|root| canonical_path.starts_with(root.as_path()))
             || self
                 .denied_globs
                 .iter()
-                .any(|pattern| pattern.is_match(&path))
+                .any(|pattern| pattern.is_match(path))
     }
 }
 

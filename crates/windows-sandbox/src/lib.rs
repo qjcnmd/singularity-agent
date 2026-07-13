@@ -5,6 +5,7 @@
 mod absolute_path;
 mod permissions;
 pub mod product_identity;
+#[cfg(target_os = "windows")]
 mod string_utils;
 
 pub use absolute_path::AbsolutePathBuf;
@@ -48,8 +49,10 @@ impl fmt::Debug for WindowsSandboxCancellationToken {
     }
 }
 
+#[cfg(target_os = "windows")]
 const DEFAULT_MAX_CAPTURE_BYTES_PER_STREAM: usize = 256 * 1024;
 
+#[cfg(any(target_os = "windows", test))]
 #[derive(Debug)]
 struct BoundedCapture {
     bytes: Vec<u8>,
@@ -57,6 +60,7 @@ struct BoundedCapture {
     truncated: bool,
 }
 
+#[cfg(any(target_os = "windows", test))]
 impl BoundedCapture {
     fn new(limit: usize) -> Self {
         Self {
