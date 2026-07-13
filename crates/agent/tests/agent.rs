@@ -4412,7 +4412,7 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
 }
 
 #[test]
-fn agent_loop_keeps_completion_gate_local_when_model_returns_plain_text() {
+fn agent_loop_reports_all_unsatisfied_completion_invariants() {
     let mut initial_plan = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     initial_plan.tool_calls.push(plan_tool_call(
         "plan_call_1",
@@ -4423,25 +4423,40 @@ fn agent_loop_keeps_completion_gate_local_when_model_returns_plain_text() {
     let plain_text =
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "still working");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let input = AgentLoopInput::new("thread_1", "turn_1", "finish the plan")
+        .with_max_turns(3)
+        .with_verification_requirements([AgentVerificationRequirement::new(
+            format!("sha256:{}", "0".repeat(64)),
+            1,
+        )]);
     let result = agent_loop_with_plan_capabilities(
         vec![initial_plan, premature_final, plain_text],
         allow_read_policy(),
         Arc::clone(&seen_requests),
         ProviderProtocolContract::default(),
     )
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "finish the plan").with_max_turns(3));
+    .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
     assert_eq!(result.model_turns, 3);
     assert_eq!(result.recovery_metrics.completion_rejection_count, 2);
     assert_eq!(
         result.error.as_deref(),
-        Some("completion gate rejected final answer: plan has incomplete steps")
+        Some(
+            "completion gate rejected final answer: plan has incomplete steps; completion gate rejected final answer: required verification commands are incomplete"
+        )
     );
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Auto);
+    let feedback = requests[2]
+        .messages
+        .last()
+        .expect("combined completion feedback");
+    assert_eq!(feedback.role, ModelRole::Developer);
+    assert!(feedback.content.contains("Complete every plan step"));
+    assert!(feedback.content.contains("exact verification command"));
 }
 
 #[test]

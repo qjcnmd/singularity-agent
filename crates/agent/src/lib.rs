@@ -1064,17 +1064,27 @@ impl AgentLoopState {
     }
 
     fn completion_rejection_reason(&self) -> String {
-        if !self.completion.allows_final() {
-            return self.completion.rejection_reason();
+        let mut reasons = Vec::new();
+        if self.plan.as_ref().is_some_and(|plan| !plan.is_completed()) {
+            reasons.push(
+                "completion gate rejected final answer: plan has incomplete steps".to_string(),
+            );
         }
-        "completion gate rejected final answer: plan has incomplete steps".to_string()
+        if !self.completion.allows_final() {
+            reasons.push(self.completion.rejection_reason());
+        }
+        reasons.join("; ")
     }
 
     fn completion_feedback(&self) -> String {
-        if !self.completion.allows_final() {
-            return self.completion.feedback();
+        let mut feedback = Vec::new();
+        if self.plan.as_ref().is_some_and(|plan| !plan.is_completed()) {
+            feedback.push(PLAN_COMPLETION_REQUIRED.to_string());
         }
-        PLAN_COMPLETION_REQUIRED.to_string()
+        if !self.completion.allows_final() {
+            feedback.push(self.completion.feedback());
+        }
+        feedback.join(" ")
     }
 
     fn observe_model_tool_call(
