@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
@@ -820,7 +820,7 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     request_timeout_seconds: u64,
     tool_capability_cache: Arc<Mutex<HashMap<String, ProviderProtocolNegotiation>>>,
-    tool_capability_probe_in_progress: Arc<Mutex<HashSet<String>>>,
+    tool_capability_probe_in_flight: Arc<Mutex<HashMap<String, Arc<CapabilityProbeState>>>>,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -830,20 +830,114 @@ impl fmt::Debug for OpenAiProvider {
             .field("config", &self.config)
             .field("client", &"[redacted]")
             .field("tool_capability_cache", &"[redacted]")
-            .field("tool_capability_probe_in_progress", &"[redacted]")
+            .field("tool_capability_probe_in_flight", &"[redacted]")
             .finish()
     }
 }
 
-struct CapabilityProbeGate {
-    in_progress: Arc<Mutex<HashSet<String>>>,
-    model_name: String,
+#[derive(Clone)]
+enum CapabilityProbeCompletion {
+    Result(Result<ProviderProtocolNegotiation, ProviderError>),
+    OwnerCancelled,
 }
 
-impl Drop for CapabilityProbeGate {
+struct CapabilityProbeState {
+    completion: Mutex<Option<CapabilityProbeCompletion>>,
+    wake: Condvar,
+}
+
+impl CapabilityProbeState {
+    fn new() -> Self {
+        Self {
+            completion: Mutex::new(None),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn wait(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<CapabilityProbeCompletion, ProviderError> {
+        let mut completion = self
+            .completion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(completion) = completion.as_ref() {
+                return Ok(completion.clone());
+            }
+            if cancellation.is_cancelled() {
+                return Err(capability_probe_cancelled_error());
+            }
+            completion = match self.wake.wait_timeout(
+                completion,
+                Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS),
+            ) {
+                Ok((completion, _)) => completion,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+
+    fn complete(&self, completion: CapabilityProbeCompletion) {
+        let mut current = self
+            .completion
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.is_none() {
+            *current = Some(completion);
+        }
+        self.wake.notify_all();
+    }
+}
+
+struct CapabilityProbeOwnerGuard {
+    in_flight: Arc<Mutex<HashMap<String, Arc<CapabilityProbeState>>>>,
+    model_name: String,
+    state: Arc<CapabilityProbeState>,
+    armed: bool,
+}
+
+impl CapabilityProbeOwnerGuard {
+    fn new(
+        in_flight: Arc<Mutex<HashMap<String, Arc<CapabilityProbeState>>>>,
+        model_name: String,
+        state: Arc<CapabilityProbeState>,
+    ) -> Self {
+        Self {
+            in_flight,
+            model_name,
+            state,
+            armed: true,
+        }
+    }
+
+    fn finish(mut self, completion: CapabilityProbeCompletion) {
+        self.state.complete(completion);
+        self.remove_state();
+        self.armed = false;
+    }
+
+    fn remove_state(&self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if in_flight
+            .get(&self.model_name)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.state))
+        {
+            in_flight.remove(&self.model_name);
+        }
+    }
+}
+
+impl Drop for CapabilityProbeOwnerGuard {
     fn drop(&mut self) {
-        if let Ok(mut in_progress) = self.in_progress.lock() {
-            in_progress.remove(&self.model_name);
+        if self.armed {
+            self.state
+                .complete(CapabilityProbeCompletion::OwnerCancelled);
+            self.remove_state();
         }
     }
 }
@@ -866,7 +960,7 @@ impl OpenAiProvider {
             client,
             request_timeout_seconds,
             tool_capability_cache: Arc::new(Mutex::new(HashMap::new())),
-            tool_capability_probe_in_progress: Arc::new(Mutex::new(HashSet::new())),
+            tool_capability_probe_in_flight: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -897,40 +991,56 @@ impl OpenAiProvider {
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         loop {
             if cancellation.is_cancelled() {
-                return Err(provider_cancelled_error().with_capability_metadata(
-                    capability_probe_metadata(
-                        ProviderCapabilityProfile::Declared,
-                        0,
-                        0,
-                        &ModelUsage::default(),
-                        &ProviderAttemptMetadata::zero(),
-                    ),
-                ));
+                return Err(capability_probe_cancelled_error());
             }
             let cached = self.cached_tool_capability_negotiation(model_name)?;
             if let Some(cached) = cached {
                 return Ok(cached);
             }
-            let mut in_progress = self
-                .tool_capability_probe_in_progress
+            let mut in_flight = self
+                .tool_capability_probe_in_flight
                 .lock()
                 .map_err(|_| provider_capability_cache_error())?;
-            if in_progress.insert(model_name.to_string()) {
-                break;
+            let (probe_state, owner) = if let Some(probe_state) = in_flight.get(model_name) {
+                (Arc::clone(probe_state), false)
+            } else {
+                let probe_state = Arc::new(CapabilityProbeState::new());
+                in_flight.insert(model_name.to_string(), Arc::clone(&probe_state));
+                (probe_state, true)
+            };
+            drop(in_flight);
+
+            if owner {
+                let owner_guard = CapabilityProbeOwnerGuard::new(
+                    Arc::clone(&self.tool_capability_probe_in_flight),
+                    model_name.to_string(),
+                    Arc::clone(&probe_state),
+                );
+                let result = self.probe_tool_capabilities(model_name, cancellation);
+                let completion = if result
+                    .as_ref()
+                    .is_err_and(|error| error.error.kind == ModelErrorKind::Cancelled)
+                {
+                    CapabilityProbeCompletion::OwnerCancelled
+                } else {
+                    CapabilityProbeCompletion::Result(result.clone())
+                };
+                owner_guard.finish(completion);
+                return result;
             }
-            drop(in_progress);
-            std::thread::sleep(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
-        }
-        let _probe_gate = CapabilityProbeGate {
-            in_progress: Arc::clone(&self.tool_capability_probe_in_progress),
-            model_name: model_name.to_string(),
-        };
 
-        let cached = self.cached_tool_capability_negotiation(model_name)?;
-        if let Some(cached) = cached {
-            return Ok(cached);
+            match probe_state.wait(cancellation)? {
+                CapabilityProbeCompletion::Result(result) => return result,
+                CapabilityProbeCompletion::OwnerCancelled => continue,
+            }
         }
+    }
 
+    fn probe_tool_capabilities(
+        &self,
+        model_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         let mut probe_usage = ModelUsage::default();
         let mut probe_attempt_metadata = ProviderAttemptMetadata::zero();
         let profiles = capability_probe_profiles(&self.config, model_name);
@@ -2059,6 +2169,16 @@ fn provider_cancelled_error() -> ProviderError {
         ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled")
             .with_provider_diagnostic("provider_request_cancelled", ProviderErrorStage::Cancelled),
     )
+}
+
+fn capability_probe_cancelled_error() -> ProviderError {
+    provider_cancelled_error().with_capability_metadata(capability_probe_metadata(
+        ProviderCapabilityProfile::Declared,
+        0,
+        0,
+        &ModelUsage::default(),
+        &ProviderAttemptMetadata::zero(),
+    ))
 }
 
 fn provider_capability_cache_error() -> ProviderError {

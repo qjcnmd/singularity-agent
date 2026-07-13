@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
-    Mutex,
+    Arc, Barrier, Mutex,
     mpsc::{self, Receiver},
 };
 use std::thread;
@@ -178,6 +178,41 @@ fn configurable_probe_server(
     (format!("http://{addr}"), rx)
 }
 
+fn delayed_probe_server(
+    probe_responses: Vec<(&'static str, &'static str)>,
+    response_delay: Duration,
+) -> (String, Receiver<Vec<String>>, Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind delayed capability provider");
+    let addr = listener
+        .local_addr()
+        .expect("delayed capability provider address");
+    let (request_tx, request_rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut seen_requests = Vec::new();
+        for (status_line, body) in probe_responses {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept delayed capability request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone capability stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            assert!(request_body.contains("singularity_capability_probe"));
+            started_tx
+                .send(())
+                .expect("send capability request started");
+            thread::sleep(response_delay);
+            seen_requests.push(request_body);
+            write_provider_response_best_effort(&mut stream, status_line, body, true);
+        }
+        request_tx
+            .send(seen_requests)
+            .expect("send delayed capability requests");
+    });
+    (format!("http://{addr}"), request_rx, started_rx)
+}
+
 fn multi_model_probe_server(actual_count: usize) -> (String, Receiver<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind multi-model provider");
     let addr = listener.local_addr().expect("multi-model provider address");
@@ -320,6 +355,20 @@ fn write_provider_response(stream: &mut TcpStream, status_line: &str, body: &str
         body.len()
     )
     .expect("write provider response");
+}
+
+fn write_provider_response_best_effort(
+    stream: &mut TcpStream,
+    status_line: &str,
+    body: &str,
+    close: bool,
+) {
+    let connection = if close { "connection: close\r\n" } else { "" };
+    let _ = write!(
+        stream,
+        "{status_line}\r\n{connection}content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    );
 }
 
 fn capability_probe_response(request_body: &str) -> Option<String> {
@@ -791,6 +840,185 @@ fn openai_capability_probe_preserves_strict_when_parallel_is_unproven() {
     assert_eq!(actual["model"], "gpt-test");
     assert_eq!(actual["parallel_tool_calls"], false);
     assert_eq!(actual["tools"][0]["function"]["strict"], true);
+}
+
+#[test]
+fn openai_capability_probe_failed_single_flight_shares_typed_outcome() {
+    let (base_url, requests, _started) = delayed_probe_server(
+        vec![
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 422 Unprocessable Entity", "{}"),
+        ],
+        Duration::from_millis(100),
+    );
+    let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
+    let start = Arc::new(Barrier::new(4));
+    let handles = (0..4)
+        .map(|_| {
+            let provider = Arc::clone(&provider);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                Provider::negotiate_tool_capabilities(
+                    provider.as_ref(),
+                    &ModelPreferences::default(),
+                    &singularity_core::CancellationToken::new(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join capability caller"))
+        .collect::<Vec<_>>();
+
+    let first_error = results[0].as_ref().expect_err("probe must fail");
+    for result in results.iter().skip(1) {
+        assert_eq!(result.as_ref().expect_err("probe must fail"), first_error);
+    }
+    assert_eq!(first_error.error.kind, ModelErrorKind::UnknownProviderError);
+    assert_eq!(first_error.error.http_status, Some(422));
+    assert_eq!(
+        first_error
+            .capability_metadata
+            .as_ref()
+            .expect("capability metadata")
+            .profile_attempts,
+        3
+    );
+
+    let captured = requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("captured capability probes");
+    assert_eq!(captured.len(), 3, "one shared profile round is required");
+}
+
+#[test]
+fn openai_capability_probe_waiter_cancellation_is_caller_local() {
+    let (base_url, requests, started) = delayed_probe_server(
+        vec![("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE)],
+        Duration::from_millis(250),
+    );
+    let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
+    let owner_provider = Arc::clone(&provider);
+    let (owner_tx, owner_rx) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        owner_tx
+            .send(Provider::negotiate_tool_capabilities(
+                owner_provider.as_ref(),
+                &ModelPreferences::default(),
+                &singularity_core::CancellationToken::new(),
+            ))
+            .expect("send owner result");
+    });
+    started
+        .recv_timeout(Duration::from_secs(1))
+        .expect("owner probe started");
+
+    let waiter_cancellation = singularity_core::CancellationToken::new();
+    let waiter_provider = Arc::clone(&provider);
+    let waiter_token = waiter_cancellation.clone();
+    let (waiter_tx, waiter_rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        waiter_tx
+            .send(Provider::negotiate_tool_capabilities(
+                waiter_provider.as_ref(),
+                &ModelPreferences::default(),
+                &waiter_token,
+            ))
+            .expect("send waiter result");
+    });
+    thread::sleep(Duration::from_millis(50));
+    waiter_cancellation.cancel();
+
+    let waiter_error = waiter_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("waiter cancellation was bounded")
+        .expect_err("waiter must be cancelled locally");
+    assert_eq!(waiter_error.error.kind, ModelErrorKind::Cancelled);
+    assert!(
+        owner_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("owner result")
+            .is_ok()
+    );
+    owner.join().expect("join owner");
+    waiter.join().expect("join waiter");
+
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured owner capability probe");
+    assert_eq!(
+        captured.len(),
+        1,
+        "waiter cancellation must not cancel owner"
+    );
+}
+
+#[test]
+fn openai_capability_probe_owner_cancellation_allows_waiter_takeover() {
+    let (base_url, requests, started) = delayed_probe_server(
+        vec![
+            ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
+            ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
+        ],
+        Duration::from_millis(250),
+    );
+    let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
+    let owner_cancellation = singularity_core::CancellationToken::new();
+    let owner_token = owner_cancellation.clone();
+    let owner_provider = Arc::clone(&provider);
+    let (owner_tx, owner_rx) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        owner_tx
+            .send(Provider::negotiate_tool_capabilities(
+                owner_provider.as_ref(),
+                &ModelPreferences::default(),
+                &owner_token,
+            ))
+            .expect("send owner result");
+    });
+    started
+        .recv_timeout(Duration::from_secs(1))
+        .expect("owner probe started");
+
+    let waiter_provider = Arc::clone(&provider);
+    let (waiter_tx, waiter_rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        waiter_tx
+            .send(Provider::negotiate_tool_capabilities(
+                waiter_provider.as_ref(),
+                &ModelPreferences::default(),
+                &singularity_core::CancellationToken::new(),
+            ))
+            .expect("send waiter result");
+    });
+    thread::sleep(Duration::from_millis(50));
+    owner_cancellation.cancel();
+
+    let owner_error = owner_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("owner cancellation was bounded")
+        .expect_err("owner must be cancelled");
+    assert_eq!(owner_error.error.kind, ModelErrorKind::Cancelled);
+    assert!(
+        waiter_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter takeover result")
+            .is_ok()
+    );
+    owner.join().expect("join owner");
+    waiter.join().expect("join waiter");
+
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured owner and takeover probes");
+    assert_eq!(
+        captured.len(),
+        2,
+        "waiter must take over after owner cancellation"
+    );
 }
 
 #[test]
