@@ -218,6 +218,13 @@ pub(super) fn snapshot_workspace(root: &Path) -> Result<WorkspaceSnapshot, Strin
     Ok(snapshot)
 }
 
+pub(super) fn workspace_tree_digest(root: &Path) -> Result<String, String> {
+    let snapshot = snapshot_workspace(root)?;
+    let canonical = serde_json::to_vec(&snapshot)
+        .map_err(|error| format!("failed to serialize workspace snapshot: {error}"))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
 fn snapshot_entries(
     root: &Path,
     directory: &Path,

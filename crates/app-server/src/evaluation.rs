@@ -47,7 +47,7 @@ use command::{
 use workspace::{
     WorkspaceChangeEvidence, apply_agent_changes, changed_paths, copy_tree_checked,
     patch_evidence_digest, path_is_allowed, snapshot_workspace, validate_tree,
-    workspace_change_evidence,
+    workspace_change_evidence, workspace_tree_digest,
 };
 
 const RUNNER_NAME: &str = "agent_loop";
@@ -86,6 +86,7 @@ struct StageDiagnostics {
 struct TaskDiagnostics {
     #[serde(skip)]
     capabilities: Vec<EvaluationCapability>,
+    source: Option<SourceProvenance>,
     source_commands: Vec<CommandDiagnostic>,
     baseline: StageDiagnostics,
     agent: StageDiagnostics,
@@ -122,6 +123,22 @@ struct TaskDiagnostics {
     trace_path: Option<String>,
     error: Option<String>,
     provider_diagnostic: Option<ProviderDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SourceProvenance {
+    #[serde(rename = "type")]
+    source_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree_digest_error: Option<String>,
 }
 
 struct StageExecution {
@@ -248,6 +265,7 @@ pub(crate) fn run_evaluation(
         task_executions.push(run_task(
             &run_id,
             &run_dir,
+            manifest.manifest_dir(),
             plan,
             Arc::clone(&sandbox_backend),
             provider_snapshot,
@@ -319,13 +337,16 @@ pub(crate) fn run_evaluation(
 fn run_task(
     run_id: &RunId,
     run_dir: &Path,
+    manifest_dir: &Path,
     plan: &WorkspacePlan,
     sandbox_backend: SharedSandboxBackend,
     provider_snapshot: &ProviderConfigSnapshot,
 ) -> TaskExecution {
     let task_dir = run_dir.join(plan.task_id.as_str());
+    let source_dir = task_dir.join(SOURCE_DIR);
     let mut diagnostics = TaskDiagnostics {
         capabilities: plan.capabilities.clone(),
+        source: Some(source_provenance(&plan.source, &source_dir, manifest_dir)),
         smoke_command_satisfied: plan.agent.projection.smoke_commands.is_empty(),
         ..TaskDiagnostics::default()
     };
@@ -362,14 +383,16 @@ fn run_task(
         None
     };
 
-    let source_dir = task_dir.join(SOURCE_DIR);
     match prepare_source(
         &plan.source,
         &task_dir,
         &source_dir,
         Arc::clone(&sandbox_backend),
     ) {
-        Ok(commands) => diagnostics.source_commands = commands,
+        Ok(commands) => {
+            diagnostics.source_commands = commands;
+            diagnostics.source = Some(source_provenance(&plan.source, &source_dir, manifest_dir));
+        }
         Err((blocker, commands)) => {
             diagnostics.source_commands = commands;
             let baseline = StageExecution::blocked(blocker, Vec::new());
@@ -505,6 +528,58 @@ fn run_task(
         hidden,
         diagnostics,
     )
+}
+
+fn source_provenance(
+    source: &PlannedWorkspaceSource,
+    materialized_path: &Path,
+    manifest_dir: &Path,
+) -> SourceProvenance {
+    let (source_type, path, repository, commit) = match source {
+        PlannedWorkspaceSource::Local { path } => (
+            "local",
+            Some(
+                path.strip_prefix(manifest_dir)
+                    .map(|path| safe_text(path.to_string_lossy()))
+                    .unwrap_or_else(|_| "[redacted]".to_string()),
+            ),
+            None,
+            None,
+        ),
+        PlannedWorkspaceSource::RemoteGit { repository, commit } => (
+            "remote_git",
+            None,
+            Some(redacted_remote_repository(repository.as_str())),
+            Some(commit.as_str().to_string()),
+        ),
+    };
+    let (tree_digest, tree_digest_error) = if materialized_path.is_dir() {
+        match workspace_tree_digest(materialized_path) {
+            Ok(digest) => (Some(digest), None),
+            Err(_error) => (None, Some("source tree digest unavailable".to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    SourceProvenance {
+        source_type,
+        path,
+        repository,
+        commit,
+        tree_digest,
+        tree_digest_error,
+    }
+}
+
+fn redacted_remote_repository(repository: &str) -> String {
+    let Some((scheme, remainder)) = repository.split_once("://") else {
+        return "[redacted]".to_string();
+    };
+    let without_query = remainder.split(['?', '#']).next().unwrap_or(remainder);
+    let without_userinfo = without_query
+        .rsplit_once('@')
+        .map_or(without_query, |(_, host_and_path)| host_and_path);
+    safe_text(format!("{scheme}://{without_userinfo}"))
 }
 
 fn blocked_task_before_workspace(
@@ -2497,6 +2572,59 @@ mod tests {
         assert_eq!(diagnostics[0].phase, "source.git_clone");
         assert_eq!(diagnostics[1].phase, "source.git_checkout");
         assert!(source_dir.join("README.md").is_file());
+    }
+
+    #[test]
+    fn report_source_provenance_records_tree_identity_without_remote_credentials() {
+        let temp = tempfile::tempdir().expect("temp");
+        let local_source = temp.path().join("local-source");
+        let local_materialized = temp.path().join("local-materialized");
+        fs::create_dir_all(local_source.join(".git")).expect("local git marker");
+        fs::write(local_source.join("README.md"), "fixture").expect("local fixture");
+        copy_tree_checked(&local_source, &local_materialized).expect("materialize local source");
+
+        let local = source_provenance(
+            &PlannedWorkspaceSource::Local {
+                path: local_source.clone(),
+            },
+            &local_materialized,
+            temp.path(),
+        );
+        assert_eq!(local.source_type, "local");
+        assert_eq!(local.path, Some("local-source".to_string()));
+        assert!(
+            local
+                .tree_digest
+                .as_deref()
+                .is_some_and(|digest| { digest.starts_with("sha256:") })
+        );
+        assert!(local.tree_digest_error.is_none());
+        let local_serialized = serde_json::to_string(&local).expect("local source provenance");
+        assert!(!local_serialized.contains(&temp.path().to_string_lossy().to_string()));
+
+        let remote = source_provenance(
+            &PlannedWorkspaceSource::RemoteGit {
+                repository: RemoteRepository::new(
+                    "https://operator:remote-secret@example.com/repo.git?token=private",
+                )
+                .expect("remote repository"),
+                commit: GitCommit::new("0123456789abcdef0123456789abcdef01234567").expect("commit"),
+            },
+            &local_materialized,
+            temp.path(),
+        );
+        assert_eq!(remote.source_type, "remote_git");
+        assert_eq!(
+            remote.repository.as_deref(),
+            Some("https://example.com/repo.git")
+        );
+        assert_eq!(
+            remote.commit.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        let serialized = serde_json::to_string(&remote).expect("source provenance");
+        assert!(!serialized.contains("remote-secret"));
+        assert!(!serialized.contains("token=private"));
     }
 
     struct SerializationFailure;
