@@ -637,7 +637,7 @@ fn configure_offline_sandbox_network(
             format!("ensure offline outbound block failed: {err}"),
         )));
     }
-    install_wfp_filters(&payload.offline_username, &payload.real_user, |message| {
+    install_wfp_filters(&payload.offline_username, |message| {
         let _ = log_line(log, message);
     })?;
     Ok(())

@@ -9,11 +9,9 @@ use crate::product_identity::{
 use crate::to_wide;
 use anyhow::Result;
 use std::ffi::OsStr;
-use std::ffi::c_void;
 use std::mem::zeroed;
 use std::ptr::null;
 use std::ptr::null_mut;
-use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::Foundation::FWP_E_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND;
 use windows_sys::Win32::Foundation::FWP_E_NOT_FOUND;
@@ -33,7 +31,6 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT16;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0_0;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTRL_READ;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_ALE_USER_ID;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_PROTOCOL;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_REMOTE_PORT;
@@ -51,31 +48,15 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineC
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineOpen0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDeleteByKey0;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterGetByKey0;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterGetSecurityInfoByKey0;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterSetSecurityInfoByKey0;
-use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFreeMemory0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderAdd0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerAdd0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionAbort0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionBegin0;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0;
-use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
-use windows_sys::Win32::Security::ACL;
-use windows_sys::Win32::Security::ACL_SIZE_INFORMATION;
-use windows_sys::Win32::Security::AclSizeInformation;
 use windows_sys::Win32::Security::Authorization::BuildExplicitAccessWithNameW;
 use windows_sys::Win32::Security::Authorization::BuildSecurityDescriptorW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
-use windows_sys::Win32::Security::Authorization::SET_ACCESS;
-use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
-use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
-use windows_sys::Win32::Security::EqualSid;
-use windows_sys::Win32::Security::GetAce;
-use windows_sys::Win32::Security::GetAclInformation;
-use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
-use windows_sys::Win32::Security::IsValidSecurityDescriptor;
 use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows_sys::Win32::System::Threading::INFINITE;
@@ -87,23 +68,18 @@ use filter_specs::FilterSpec;
 
 const PROVIDER_KEY: GUID = GUID::from_u128(WFP_PROVIDER_KEY);
 const SUBLAYER_KEY: GUID = GUID::from_u128(WFP_SUBLAYER_KEY);
-const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
-/// Installs the persistent Singularity WFP filters for `offline_account` and
-/// grants `reader_account` exact read-only access to their metadata.
+/// Installs the persistent Singularity WFP filters for `account`.
 ///
 /// This is intended to run from the already-elevated setup helper. Callers
 /// must treat any returned error as a fail-closed setup failure.
-pub(crate) fn install_wfp_filters_for_account(
-    offline_account: &str,
-    reader_account: &str,
-) -> Result<usize> {
+pub fn install_wfp_filters_for_account(account: &str) -> Result<usize> {
     let engine = Engine::open()?;
     let mut transaction = engine.begin_transaction()?;
     ensure_provider(engine.handle)?;
     ensure_sublayer(engine.handle)?;
 
-    let user_condition = UserMatchCondition::for_account(offline_account)?;
+    let user_condition = UserMatchCondition::for_account(account)?;
     let mut installed_filter_count = 0;
     for spec in FILTER_SPECS {
         delete_filter_if_present(engine.handle, &spec.key)?;
@@ -112,248 +88,7 @@ pub(crate) fn install_wfp_filters_for_account(
     }
 
     transaction.commit()?;
-    drop(transaction);
-    for spec in FILTER_SPECS {
-        grant_filter_read_access(engine.handle, &spec.key, reader_account)?;
-    }
     Ok(installed_filter_count)
-}
-
-/// Verifies that every product-owned persistent WFP filter is still present
-/// with the enforcement metadata established by setup.
-///
-/// The query is read-only and is used before selecting the offline sandbox
-/// identity. Missing or altered filters return `Ok(false)`. Access denied is
-/// also stale so an installation created before read-only ACLs can migrate via
-/// elevated setup; other query failures remain errors and fail closed.
-pub(crate) fn installed_filter_set_is_current(offline_sid: &[u8]) -> Result<bool> {
-    let engine = Engine::open()?;
-    for spec in FILTER_SPECS {
-        let Some(filter) = get_filter(engine.handle, &spec.key)? else {
-            return Ok(false);
-        };
-        if !filter_matches_spec(filter.as_ref(), spec, offline_sid) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-struct OwnedFilter(*mut FWPM_FILTER0);
-
-impl OwnedFilter {
-    fn as_ref(&self) -> &FWPM_FILTER0 {
-        // SAFETY: `FwpmFilterGetByKey0` returned a non-null filter owned by this wrapper.
-        unsafe { &*self.0 }
-    }
-}
-
-impl Drop for OwnedFilter {
-    fn drop(&mut self) {
-        let mut allocation = self.0.cast::<c_void>();
-        // SAFETY: WFP allocated this object and requires `FwpmFreeMemory0` to release it.
-        unsafe { FwpmFreeMemory0(&mut allocation) };
-    }
-}
-
-fn get_filter(engine: HANDLE, key: &GUID) -> Result<Option<OwnedFilter>> {
-    let mut filter = null_mut();
-    let result = unsafe { FwpmFilterGetByKey0(engine, key, &mut filter) };
-    if matches!(result, value if value == FWP_E_FILTER_NOT_FOUND as u32
-        || value == FWP_E_NOT_FOUND as u32
-        || value == ERROR_ACCESS_DENIED)
-    {
-        return Ok(None);
-    }
-    ensure_success(result, "FwpmFilterGetByKey0")?;
-    if filter.is_null() {
-        anyhow::bail!("FwpmFilterGetByKey0 returned a null filter");
-    }
-    Ok(Some(OwnedFilter(filter)))
-}
-
-fn grant_filter_read_access(engine: HANDLE, key: &GUID, reader_account: &str) -> Result<()> {
-    let mut current_dacl: *mut ACL = null_mut();
-    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
-    let get_result = unsafe {
-        FwpmFilterGetSecurityInfoByKey0(
-            engine,
-            key,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            &mut current_dacl,
-            null_mut(),
-            &mut security_descriptor,
-        )
-    };
-    ensure_success(get_result, "FwpmFilterGetSecurityInfoByKey0")?;
-    if security_descriptor.is_null() {
-        anyhow::bail!("FwpmFilterGetSecurityInfoByKey0 returned a null security descriptor");
-    }
-
-    let reader_account = to_wide(OsStr::new(reader_account));
-    let mut access: EXPLICIT_ACCESS_W = unsafe { zeroed() };
-    unsafe {
-        BuildExplicitAccessWithNameW(
-            &mut access,
-            reader_account.as_ptr(),
-            FWPM_ACTRL_READ,
-            SET_ACCESS,
-            0,
-        );
-    }
-    let mut updated_dacl: *mut ACL = null_mut();
-    let result = (|| -> Result<()> {
-        let set_entries_result =
-            unsafe { SetEntriesInAclW(1, &access, current_dacl, &mut updated_dacl) };
-        ensure_success(set_entries_result, "SetEntriesInAclW(WFP filter)")?;
-        let set_result = unsafe {
-            FwpmFilterSetSecurityInfoByKey0(
-                engine,
-                key,
-                DACL_SECURITY_INFORMATION,
-                null(),
-                null(),
-                updated_dacl,
-                null(),
-            )
-        };
-        ensure_success(set_result, "FwpmFilterSetSecurityInfoByKey0")
-    })();
-
-    if !updated_dacl.is_null() {
-        unsafe { LocalFree(updated_dacl as HLOCAL) };
-    }
-    let mut allocation = security_descriptor;
-    unsafe { FwpmFreeMemory0(&mut allocation) };
-    result
-}
-
-fn filter_matches_spec(filter: &FWPM_FILTER0, spec: &FilterSpec, offline_sid: &[u8]) -> bool {
-    guid_eq(&filter.filterKey, &spec.key)
-        && filter.flags & FWPM_FILTER_FLAG_PERSISTENT != 0
-        && !filter.providerKey.is_null()
-        // SAFETY: a non-null `providerKey` belongs to the returned WFP filter allocation.
-        && unsafe { guid_eq(&*filter.providerKey, &PROVIDER_KEY) }
-        && guid_eq(&filter.layerKey, &spec.layer_key)
-        && guid_eq(&filter.subLayerKey, &SUBLAYER_KEY)
-        && filter.action.r#type == FWP_ACTION_BLOCK
-        && filter_conditions_match(filter, spec.conditions, offline_sid)
-}
-
-fn filter_conditions_match(
-    filter: &FWPM_FILTER0,
-    expected: &[ConditionSpec],
-    offline_sid: &[u8],
-) -> bool {
-    if filter.numFilterConditions != expected.len() as u32
-        || (filter.numFilterConditions != 0 && filter.filterCondition.is_null())
-    {
-        return false;
-    }
-    let actual = unsafe {
-        std::slice::from_raw_parts(filter.filterCondition, filter.numFilterConditions as usize)
-    };
-    expected.iter().all(|expected| {
-        actual
-            .iter()
-            .any(|actual| condition_matches(actual, expected, offline_sid))
-    })
-}
-
-fn condition_matches(
-    actual: &FWPM_FILTER_CONDITION0,
-    expected: &ConditionSpec,
-    offline_sid: &[u8],
-) -> bool {
-    if actual.matchType != FWP_MATCH_EQUAL {
-        return false;
-    }
-    match expected {
-        ConditionSpec::User => {
-            guid_eq(&actual.fieldKey, &FWPM_CONDITION_ALE_USER_ID)
-                && actual.conditionValue.r#type == FWP_SECURITY_DESCRIPTOR_TYPE
-                && user_condition_matches(actual.conditionValue, offline_sid)
-        }
-        ConditionSpec::Protocol(protocol) => {
-            guid_eq(&actual.fieldKey, &FWPM_CONDITION_IP_PROTOCOL)
-                && actual.conditionValue.r#type == FWP_UINT8
-                && unsafe { actual.conditionValue.Anonymous.uint8 == *protocol }
-        }
-        ConditionSpec::RemotePort(port) => {
-            guid_eq(&actual.fieldKey, &FWPM_CONDITION_IP_REMOTE_PORT)
-                && actual.conditionValue.r#type == FWP_UINT16
-                && unsafe { actual.conditionValue.Anonymous.uint16 == *port }
-        }
-    }
-}
-
-fn user_condition_matches(value: FWP_CONDITION_VALUE0, offline_sid: &[u8]) -> bool {
-    let blob = unsafe { value.Anonymous.sd };
-    if blob.is_null() || offline_sid.is_empty() {
-        return false;
-    }
-    let blob = unsafe { &*blob };
-    if blob.data.is_null()
-        || blob.size == 0
-        || unsafe { IsValidSecurityDescriptor(blob.data.cast()) } == 0
-    {
-        return false;
-    }
-
-    let mut dacl_present = 0;
-    let mut dacl_defaulted = 0;
-    let mut dacl: *mut ACL = null_mut();
-    if unsafe {
-        GetSecurityDescriptorDacl(
-            blob.data.cast(),
-            &mut dacl_present,
-            &mut dacl,
-            &mut dacl_defaulted,
-        )
-    } == 0
-        || dacl_present == 0
-        || dacl.is_null()
-    {
-        return false;
-    }
-
-    let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
-    if unsafe {
-        GetAclInformation(
-            dacl,
-            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )
-    } == 0
-        || info.AceCount != 1
-    {
-        return false;
-    }
-
-    let mut ace = null_mut();
-    if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
-        return false;
-    }
-    let ace = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
-    ace.Header.AceType == ACCESS_ALLOWED_ACE_TYPE
-        && ace.Header.AceFlags == 0
-        && ace.Mask == FWP_ACTRL_MATCH_FILTER
-        && unsafe {
-            EqualSid(
-                (&ace.SidStart as *const u32).cast_mut().cast(),
-                offline_sid.as_ptr().cast_mut().cast(),
-            ) != 0
-        }
-}
-
-fn guid_eq(left: &GUID, right: &GUID) -> bool {
-    left.data1 == right.data1
-        && left.data2 == right.data2
-        && left.data3 == right.data3
-        && left.data4 == right.data4
 }
 
 /// Owns an open WFP engine handle and closes it on drop.
@@ -654,24 +389,8 @@ fn zero_guid() -> GUID {
 #[cfg(test)]
 mod tests {
     use super::FILTER_SPECS;
-    use super::PROVIDER_KEY;
-    use super::SUBLAYER_KEY;
-    use super::UserMatchCondition;
-    use super::build_conditions;
-    use super::filter_matches_spec;
-    use super::installed_filter_set_is_current;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeSet;
-    use std::ptr::null_mut;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTION_BLOCK;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_EMPTY;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0_0;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_FLAG_PERSISTENT;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER0;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER0_0;
-    use windows_sys::core::GUID;
 
     #[test]
     fn filter_keys_are_unique() {
@@ -696,50 +415,5 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<BTreeSet<_>>();
         assert_eq!(names.len(), FILTER_SPECS.len());
-    }
-
-    #[test]
-    fn filter_readiness_requires_product_enforcement_metadata() {
-        let spec = &FILTER_SPECS[0];
-        let mut provider_key = PROVIDER_KEY;
-        let mut filter: FWPM_FILTER0 = unsafe { std::mem::zeroed() };
-        filter.filterKey = spec.key;
-        filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
-        filter.providerKey = &mut provider_key;
-        filter.layerKey = spec.layer_key;
-        filter.subLayerKey = SUBLAYER_KEY;
-        filter.numFilterConditions = spec.conditions.len() as u32;
-        let user_condition = UserMatchCondition::for_account("Everyone")
-            .expect("build deterministic user condition");
-        let offline_sid =
-            crate::winutil::resolve_sid("Everyone").expect("resolve deterministic SID");
-        let mut conditions = build_conditions(spec.conditions, &user_condition);
-        filter.filterCondition = conditions.as_mut_ptr();
-        filter.action = FWPM_ACTION0 {
-            r#type: FWP_ACTION_BLOCK,
-            Anonymous: FWPM_ACTION0_0 {
-                filterType: GUID::from_u128(0),
-            },
-        };
-        filter.Anonymous = FWPM_FILTER0_0 { rawContext: 0 };
-        filter.effectiveWeight = FWP_VALUE0 {
-            r#type: FWP_EMPTY,
-            Anonymous: unsafe { std::mem::zeroed() },
-        };
-
-        assert!(filter_matches_spec(&filter, spec, &offline_sid));
-        let original_field_key = conditions[1].fieldKey;
-        conditions[1].fieldKey = GUID::from_u128(0);
-        assert!(!filter_matches_spec(&filter, spec, &offline_sid));
-        conditions[1].fieldKey = original_field_key;
-        filter.providerKey = null_mut();
-        assert!(!filter_matches_spec(&filter, spec, &offline_sid));
-    }
-
-    #[test]
-    fn filter_readiness_query_is_non_mutating() {
-        let offline_sid =
-            crate::winutil::resolve_sid("Everyone").expect("resolve deterministic SID");
-        installed_filter_set_is_current(&offline_sid).expect("query WFP filter readiness");
     }
 }

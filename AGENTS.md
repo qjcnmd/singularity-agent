@@ -29,6 +29,13 @@
 4. 取消必须传播到 provider 和在途 sandbox command；取消请求之后的晚到 completion、assistant item 或 terminal trace 不得覆盖 interrupted 状态。
 5. provider 原始响应、prompt、tool raw arguments、环境变量、密钥和内部 audit metadata 不得进入公共 CLI、model tool payload 或未脱敏 trace。
 
+## Sandbox 架构路线
+
+1. Sandbox 设计以 Codex 当前公开架构、威胁模型和平台边界作为首要参考，参考的是可验证的设计原则而不是照抄代码；外部实现只作为决策依据，当前仓库源码和本项目合同仍是实现事实。
+2. 核心层只表达跨平台的权限策略、能力、请求、结果和失败语义；Windows、Linux、macOS 的强制执行必须隔离在小型 OS adapter 中，平台对象、系统 API 和持久状态不得泄漏到 Agent、Tool、Protocol 或 Evaluation 语义。
+3. 优先使用操作系统原生、边界清晰、可替换且 fail-closed 的最小执行机制。除非已有明确威胁模型、跨平台合同和不可替代的产品需求，不得自建复杂的 Windows Firewall/WFP 持久状态管理、持续巡检或自动修复框架，也不得把单个平台的实现复杂度包装成通用 sandbox 能力。
+4. 轻量和可移植是 sandbox 的验收条件。新增平台专用机制前必须说明通用边界为何不足、支持与不支持的平台行为、代码和维护成本以及移除条件；无法提供严格实现的平台应明确报告 unsupported，不得通过放宽权限或本地进程 fallback 伪装支持。
+
 ## 根因、抽象边界与验收原则
 
 1. 测试、Evaluation、benchmark、监控指标和验收分数是观察产品行为的证据，不是反向定义产品语义的控制信号。不得为了改善某次结果而增加与真实领域合同无关的特判、放宽门禁或改变安全边界。

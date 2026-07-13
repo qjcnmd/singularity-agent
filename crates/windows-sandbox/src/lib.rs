@@ -145,8 +145,6 @@ mod identity;
 #[cfg(target_os = "windows")]
 mod logging;
 #[cfg(target_os = "windows")]
-mod network_controls;
-#[cfg(target_os = "windows")]
 mod path_normalization;
 #[cfg(target_os = "windows")]
 mod process;
@@ -291,11 +289,6 @@ pub use logging::log_note;
 #[cfg(target_os = "windows")]
 pub use logging::log_writer;
 #[cfg(target_os = "windows")]
-#[doc(hidden)]
-pub use network_controls::{
-    LOOPBACK_REMOTE_ADDRESSES, NON_LOOPBACK_REMOTE_ADDRESSES, blocked_loopback_tcp_remote_ports,
-};
-#[cfg(target_os = "windows")]
 pub use path_normalization::canonicalize_path;
 #[cfg(target_os = "windows")]
 pub use process::JobObject;
@@ -365,6 +358,8 @@ pub use token::create_workspace_write_token_with_caps_and_user_from;
 pub use token::create_workspace_write_token_with_caps_from;
 #[cfg(target_os = "windows")]
 pub use token::get_current_token_for_restriction;
+#[cfg(target_os = "windows")]
+pub use wfp::install_wfp_filters_for_account;
 #[cfg(target_os = "windows")]
 pub use wfp_setup::install_wfp_filters;
 #[cfg(target_os = "windows")]
