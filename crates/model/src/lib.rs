@@ -299,7 +299,6 @@ pub enum ModelBlockerKind {
     AuthenticationProviderError,
     BaseUrlNetworkError,
     ModelNameConfigError,
-    SandboxPermissionError,
 }
 
 impl ModelBlockerKind {
@@ -309,7 +308,6 @@ impl ModelBlockerKind {
             Self::AuthenticationProviderError => "authentication_provider_error",
             Self::BaseUrlNetworkError => "base_url_network_error",
             Self::ModelNameConfigError => "model_name_config_error",
-            Self::SandboxPermissionError => "sandbox_permission_error",
         }
     }
 
@@ -319,7 +317,6 @@ impl ModelBlockerKind {
             Self::AuthenticationProviderError => "authentication/provider error",
             Self::BaseUrlNetworkError => "base_url/network error",
             Self::ModelNameConfigError => "model name/config error",
-            Self::SandboxPermissionError => "sandbox/permission error",
         }
     }
 }
@@ -330,7 +327,6 @@ fn provider_initialization_blocker(category: &ModelErrorCategory) -> Option<Mode
         ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {
             Some(ModelBlockerKind::BaseUrlNetworkError)
         }
-        ModelErrorCategory::SandboxPermission => Some(ModelBlockerKind::SandboxPermissionError),
         ModelErrorCategory::ModelConfiguration
         | ModelErrorCategory::InvalidRequest
         | ModelErrorCategory::UnsupportedCapability => Some(ModelBlockerKind::ModelNameConfigError),
@@ -448,7 +444,6 @@ pub enum ModelErrorCategory {
     Cancelled,
     Authentication,
     Network,
-    SandboxPermission,
     ModelConfiguration,
     InvalidRequest,
     ContextLengthExceeded,

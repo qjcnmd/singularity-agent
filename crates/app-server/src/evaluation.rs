@@ -1661,7 +1661,6 @@ fn provider_blocker(error: &ProviderError) -> EvaluationBlocker {
         ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {
             BlockerKind::Network
         }
-        ModelErrorCategory::SandboxPermission => BlockerKind::Sandbox,
         ModelErrorCategory::ModelConfiguration => BlockerKind::ProviderConfiguration,
         _ if provider_response_stage(&diagnostic) => BlockerKind::ProviderResponse,
         _ => BlockerKind::AgentRuntime,
@@ -1678,7 +1677,6 @@ fn agent_blocker_kind(
         Some(ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable) => {
             Some(BlockerKind::Network)
         }
-        Some(ModelErrorCategory::SandboxPermission) => Some(BlockerKind::Sandbox),
         Some(ModelErrorCategory::ModelConfiguration) => Some(BlockerKind::ProviderConfiguration),
         Some(_) if diagnostic.is_some_and(provider_response_stage) => {
             Some(BlockerKind::ProviderResponse)
@@ -2085,11 +2083,6 @@ mod tests {
                 ModelErrorCategory::UnsupportedCapability,
                 Some(&response_validation),
                 BlockerKind::ProviderResponse,
-            ),
-            (
-                ModelErrorCategory::SandboxPermission,
-                None,
-                BlockerKind::Sandbox,
             ),
         ] {
             assert_eq!(
