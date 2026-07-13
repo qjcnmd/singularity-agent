@@ -41,7 +41,7 @@ pub const PIPE_ACCESS_OUTBOUND: u32 = 0x0000_0002;
 
 /// Resolves the elevated command runner path, preferring the copied helper under
 /// `.sandbox-bin` and using the bundled sibling lookup when needed.
-pub fn find_runner_exe(sandbox_home: &Path, log_dir: Option<&Path>) -> PathBuf {
+pub fn find_runner_exe(sandbox_home: &Path, log_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
     resolve_helper_for_launch(HelperExecutable::CommandRunner, sandbox_home, log_dir)
 }
 

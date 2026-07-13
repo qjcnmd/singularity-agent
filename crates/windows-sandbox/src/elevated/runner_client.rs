@@ -7,7 +7,7 @@ use crate::ipc_framed::Message;
 use crate::ipc_framed::SpawnRequest;
 use crate::ipc_framed::read_frame;
 use crate::ipc_framed::write_frame;
-use crate::product_identity::{COMMAND_RUNNER_BINARY_NAME, RUNNER_CONNECT_THREAD_PREFIX};
+use crate::product_identity::RUNNER_CONNECT_THREAD_PREFIX;
 use crate::runner_pipe::PIPE_ACCESS_INBOUND;
 use crate::runner_pipe::PIPE_ACCESS_OUTBOUND;
 use crate::runner_pipe::connect_pipe;
@@ -333,11 +333,8 @@ pub(crate) fn spawn_runner_transport(
         )? as _)
     };
 
-    let runner_exe = find_runner_exe(sandbox_home, log_dir);
-    let runner_cmdline = runner_exe
-        .to_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| COMMAND_RUNNER_BINARY_NAME.to_string());
+    let runner_exe = find_runner_exe(sandbox_home, log_dir)?;
+    let runner_cmdline = runner_exe.to_string_lossy();
     let runner_full_cmd = format!(
         "{} {} {}",
         quote_windows_arg(&runner_cmdline),
@@ -345,7 +342,7 @@ pub(crate) fn spawn_runner_transport(
         quote_windows_arg(&format!("--pipe-out={pipe_out_name}"))
     );
     let mut cmdline_vec = to_wide(&runner_full_cmd);
-    let exe_w = to_wide(&runner_cmdline);
+    let exe_w = to_wide(&runner_exe);
     let cwd_w = to_wide(cwd);
     let user_w = to_wide(&sandbox_creds.username);
     let domain_w = to_wide(".");

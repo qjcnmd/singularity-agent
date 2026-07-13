@@ -13,6 +13,7 @@ use std::process::Stdio;
 use crate::absolute_path::AbsolutePathBuf;
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
+use crate::helper_materialization::RESOURCES_DIRNAME;
 use crate::helper_materialization::bundled_executable_path_for_exe;
 use crate::helper_materialization::helper_bin_dir;
 use crate::identity::sandbox_setup_is_complete;
@@ -216,7 +217,7 @@ fn run_setup_refresh_inner(
     };
     let json = serde_json::to_vec(&payload)?;
     let b64 = BASE64_STANDARD.encode(json);
-    let exe = find_setup_exe();
+    let exe = find_setup_exe()?;
     let sbx_dir = sandbox_dir(request.sandbox_home);
     let log_path = current_log_file_path(&sbx_dir);
     let cleared_report = match clear_setup_error_report(request.sandbox_home) {
@@ -686,13 +687,15 @@ fn quote_arg(arg: &str) -> String {
     out
 }
 
-fn find_setup_exe() -> PathBuf {
+fn find_setup_exe() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(setup_exe) = find_setup_exe_for_current_exe(&exe)
     {
-        return setup_exe;
+        return Ok(setup_exe);
     }
-    PathBuf::from(SETUP_EXE_FILENAME)
+    Err(anyhow!(
+        "setup helper was not found next to the current executable or under {RESOURCES_DIRNAME}"
+    ))
 }
 
 fn find_setup_exe_for_current_exe(exe: &Path) -> Option<PathBuf> {
@@ -740,7 +743,7 @@ fn run_setup_exe(
     use windows_sys::Win32::UI::Shell::SEE_MASK_NOCLOSEPROCESS;
     use windows_sys::Win32::UI::Shell::SHELLEXECUTEINFOW;
     use windows_sys::Win32::UI::Shell::ShellExecuteExW;
-    let exe = find_setup_exe();
+    let exe = find_setup_exe()?;
     let payload_json = serde_json::to_string(payload).map_err(|err| {
         failure(
             SetupErrorCode::OrchestratorPayloadSerializeFailed,

@@ -54,20 +54,21 @@ pub(crate) fn helper_bin_dir(sandbox_home: &Path) -> PathBuf {
     sandbox_bin_dir(sandbox_home)
 }
 
-pub(crate) fn direct_helper_lookup(kind: HelperExecutable) -> PathBuf {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(candidate) = bundled_executable_path_for_exe(&exe, kind.file_name())
-    {
-        return candidate;
-    }
-    PathBuf::from(kind.file_name())
+pub(crate) fn direct_helper_lookup(kind: HelperExecutable) -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| direct_helper_lookup_for_exe(&exe, kind))
+}
+
+fn direct_helper_lookup_for_exe(exe: &Path, kind: HelperExecutable) -> Option<PathBuf> {
+    bundled_executable_path_for_exe(exe, kind.file_name())
 }
 
 pub(crate) fn resolve_helper_for_launch(
     kind: HelperExecutable,
     sandbox_home: &Path,
     log_dir: Option<&Path>,
-) -> PathBuf {
+) -> Result<PathBuf> {
     match copy_helper_if_needed(kind, sandbox_home, log_dir) {
         Ok(path) => {
             log_note(
@@ -78,19 +79,24 @@ pub(crate) fn resolve_helper_for_launch(
                 ),
                 log_dir,
             );
-            path
+            Ok(path)
         }
         Err(err) => {
-            let fallback = direct_helper_lookup(kind);
+            let Some(fallback) = direct_helper_lookup(kind) else {
+                return Err(err).context(format!(
+                    "helper copy failed for {} and no bundled helper was found",
+                    kind.label()
+                ));
+            };
             log_note(
                 &format!(
-                    "helper copy failed for {}: {err:#}; using direct helper path {}",
+                    "helper copy failed for {}: {err:#}; using bundled helper path {}",
                     kind.label(),
                     fallback.display()
                 ),
                 log_dir,
             );
-            fallback
+            Ok(fallback)
         }
     }
 }
@@ -383,6 +389,7 @@ mod tests {
     use super::copy_from_source_if_needed;
     use super::destination_is_fresh;
     use super::dev_build_suffix;
+    use super::direct_helper_lookup_for_exe;
     use super::helper_bin_dir;
     use super::helper_version_suffix;
     use super::materialized_file_name;
@@ -493,6 +500,18 @@ mod tests {
                 .expect("helper path");
 
         assert_eq!(resolved, helper);
+    }
+
+    #[test]
+    fn direct_helper_lookup_does_not_return_a_bare_file_name() {
+        let tmp = TempDir::new().expect("tempdir");
+        let exe = tmp.path().join("sg.exe");
+        fs::write(&exe, b"singularity").expect("write exe");
+
+        assert_eq!(
+            direct_helper_lookup_for_exe(&exe, HelperExecutable::CommandRunner),
+            None
+        );
     }
 
     #[test]
