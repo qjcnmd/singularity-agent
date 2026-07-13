@@ -1,13 +1,14 @@
 use schemars::schema_for;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelError,
-    ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
-    ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse,
-    ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
-    ProviderAttemptMetadata, ProviderConfigSnapshot, ProviderConfigSource,
-    ProviderConfigurationStatus, ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode,
-    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, resolve_provider_config,
-    validate_model_request, validate_model_request_with_capabilities, validate_model_response,
+    ModelErrorCategory, ModelErrorKind, ModelMessage, ModelPreferences, ModelProviderConfig,
+    ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest,
+    ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
+    ProviderAttemptMetadata, ProviderCapabilityProfile, ProviderConfigSnapshot,
+    ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
+    ProviderProtocolContract, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
+    classify_model_error, resolve_provider_config, validate_model_request,
+    validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
@@ -58,38 +59,53 @@ fn provider_test_config(base_url: String) -> OpenAiProviderConfig {
         source: ProviderConfigSource::ProcessEnvironment,
         max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
         max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-        max_tool_calls_per_turn: 1,
-        supports_strict_tool_schema: false,
     }
+}
+
+fn capability_test_request(
+    model_name: Option<&str>,
+    strict: bool,
+    max_tool_calls: u32,
+) -> ModelTurnRequest {
+    let mut request = ModelTurnRequest::new(
+        "request_capability_test",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    if let Some(model_name) = model_name {
+        request.model_preferences.model_name = Some(model_name.to_string());
+    }
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "Read a file".to_string(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    });
+    request.tool_choice.max_tool_calls = max_tool_calls;
+    request.tool_choice.strict_tool_schema = strict;
+    request
 }
 
 fn single_response_server(status_line: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test provider");
     let addr = listener.local_addr().expect("test provider address");
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept test provider request");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut first_line = String::new();
-        reader
-            .read_line(&mut first_line)
-            .expect("read request line");
-        let mut headers = String::new();
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read header");
-            if line == "\r\n" || line.is_empty() {
-                break;
+            let (mut stream, _) = listener.accept().expect("accept test provider request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if let Some(probe_body) = capability_probe_response(&request_body) {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, false);
+                continue;
             }
-            headers.push_str(&line);
+            write_provider_response(&mut stream, status_line, body, false);
+            break;
         }
-        assert!(first_line.contains("/v1/chat/completions"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
-        write!(
-            stream,
-            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .expect("write provider response");
     });
     format!("http://{addr}")
 }
@@ -102,44 +118,143 @@ fn captured_request_server(
     let addr = listener.local_addr().expect("test provider address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept test provider request");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-        let mut first_line = String::new();
-        reader
-            .read_line(&mut first_line)
-            .expect("read request line");
-        let mut headers = String::new();
-        let mut content_length = 0;
         loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read header");
-            if line == "\r\n" || line.is_empty() {
-                break;
+            let (mut stream, _) = listener.accept().expect("accept test provider request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if let Some(probe_body) = capability_probe_response(&request_body) {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, false);
+                continue;
             }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                content_length = value.trim().parse::<usize>().unwrap_or(0);
-            }
-            headers.push_str(&line);
+            tx.send(request_body).expect("send request body");
+            write_provider_response(&mut stream, status_line, body, false);
+            break;
         }
-        assert!(first_line.contains("/v1/chat/completions"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
-        let mut request_body = vec![0; content_length];
-        reader
-            .read_exact(&mut request_body)
-            .expect("read request body");
-        tx.send(String::from_utf8(request_body).expect("utf8 request body"))
-            .expect("send request body");
-        write!(
-            stream,
-            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .expect("write provider response");
     });
     (format!("http://{addr}"), rx)
 }
+
+fn configurable_probe_server(
+    probe_responses: Vec<(&'static str, &'static str)>,
+    actual_body: &'static str,
+    actual_count: usize,
+) -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capability provider");
+    let addr = listener.local_addr().expect("capability provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut probe_index = 0;
+        let mut seen_requests = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept capability request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone capability stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if request_body.contains("singularity_capability_probe") {
+                let (status_line, body) = probe_responses
+                    .get(probe_index)
+                    .copied()
+                    .expect("capability probe response configured");
+                probe_index += 1;
+                write_provider_response(&mut stream, status_line, body, true);
+                if actual_count == 0 && probe_index == probe_responses.len() {
+                    tx.send(seen_requests).expect("send probe-only requests");
+                    break;
+                }
+                continue;
+            }
+            seen_requests.push(request_body);
+            write_provider_response(&mut stream, "HTTP/1.1 200 OK", actual_body, true);
+            if seen_requests.len() == actual_count {
+                tx.send(seen_requests)
+                    .expect("send captured actual request");
+                break;
+            }
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn multi_model_probe_server(actual_count: usize) -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind multi-model provider");
+    let addr = listener.local_addr().expect("multi-model provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut actual_requests = Vec::new();
+        let mut all_requests = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept multi-model request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone multi-model stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            all_requests.push(request_body.clone());
+            if let Some(probe_body) = capability_probe_response(&request_body) {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
+                continue;
+            }
+            actual_requests.push(request_body);
+            write_provider_response(&mut stream, "HTTP/1.1 200 OK", ACTUAL_DONE_RESPONSE, true);
+            if actual_requests.len() == actual_count {
+                tx.send(all_requests).expect("send multi-model requests");
+                break;
+            }
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+const PROBE_SINGLE_RESPONSE: &str = r#"{
+    "id": "probe_single",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "probe_call_a",
+                "type": "function",
+                "function": {"name": "singularity_capability_probe_a", "arguments": "{}"}
+            }]
+        },
+        "finish_reason": "tool_calls"
+    }],
+    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+}"#;
+
+const PROBE_TEXT_RESPONSE: &str = r#"{
+    "id": "probe_text",
+    "choices": [{
+        "message": {"role": "assistant", "content": "call singularity_capability_probe_a"},
+        "finish_reason": "stop"
+    }]
+}"#;
+
+const PROBE_BAD_ARGUMENTS_RESPONSE: &str = r#"{
+    "id": "probe_bad_arguments",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "probe_call_a",
+                "type": "function",
+                "function": {"name": "singularity_capability_probe_a", "arguments": "[]"}
+            }]
+        },
+        "finish_reason": "tool_calls"
+    }]
+}"#;
+
+const ACTUAL_DONE_RESPONSE: &str = r#"{
+    "id": "actual_response",
+    "choices": [{
+        "message": {"role": "assistant", "content": "done"},
+        "finish_reason": "stop"
+    }]
+}"#;
 
 fn sequence_response_server(
     responses: Vec<(&'static str, &'static str)>,
@@ -149,22 +264,24 @@ fn sequence_response_server(
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         for (attempt, (status_line, body)) in responses.into_iter().enumerate() {
-            let (mut stream, _) = listener.accept().expect("accept sequence provider request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            consume_provider_request(&mut reader);
-            tx.send(attempt + 1).expect("send provider attempt");
-            write!(
-                stream,
-                "{status_line}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .expect("write sequence provider response");
+            loop {
+                let (mut stream, _) = listener.accept().expect("accept sequence provider request");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let (_, _, request_body) = read_provider_request(&mut reader);
+                if let Some(probe_body) = capability_probe_response(&request_body) {
+                    write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
+                    continue;
+                }
+                tx.send(attempt + 1).expect("send provider attempt");
+                write_provider_response(&mut stream, status_line, body, true);
+                break;
+            }
         }
     });
     (format!("http://{addr}"), rx)
 }
 
-fn consume_provider_request(reader: &mut BufReader<TcpStream>) {
+fn read_provider_request(reader: &mut BufReader<TcpStream>) -> (String, String, String) {
     let mut first_line = String::new();
     reader
         .read_line(&mut first_line)
@@ -184,12 +301,77 @@ fn consume_provider_request(reader: &mut BufReader<TcpStream>) {
         }
         headers.push_str(&line);
     }
-    assert!(first_line.contains("/v1/chat/completions"));
-    assert!(headers.contains("authorization: Bearer sk-secret-value"));
     let mut request_body = vec![0; content_length];
     reader
         .read_exact(&mut request_body)
         .expect("read request body");
+    (
+        first_line,
+        headers,
+        String::from_utf8(request_body).expect("utf8 request body"),
+    )
+}
+
+fn write_provider_response(stream: &mut TcpStream, status_line: &str, body: &str, close: bool) {
+    let connection = if close { "connection: close\r\n" } else { "" };
+    write!(
+        stream,
+        "{status_line}\r\n{connection}content-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("write provider response");
+}
+
+fn capability_probe_response(request_body: &str) -> Option<String> {
+    let request: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let tools = request.get("tools")?.as_array()?;
+    let names = tools
+        .iter()
+        .filter_map(|tool| {
+            tool.pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    if !names
+        .iter()
+        .any(|name| *name == "singularity_capability_probe_a")
+    {
+        return None;
+    }
+    let tool_calls = if names
+        .iter()
+        .any(|name| *name == "singularity_capability_probe_b")
+    {
+        vec![
+            serde_json::json!({
+                "id": "probe_call_a",
+                "type": "function",
+                "function": {"name": "singularity_capability_probe_a", "arguments": "{}"}
+            }),
+            serde_json::json!({
+                "id": "probe_call_b",
+                "type": "function",
+                "function": {"name": "singularity_capability_probe_b", "arguments": "{}"}
+            }),
+        ]
+    } else {
+        vec![serde_json::json!({
+            "id": "probe_call_a",
+            "type": "function",
+            "function": {"name": "singularity_capability_probe_a", "arguments": "{}"}
+        })]
+    };
+    Some(
+        serde_json::json!({
+            "id": "capability_probe_response",
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": tool_calls},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+        })
+        .to_string(),
+    )
 }
 
 #[test]
@@ -558,19 +740,290 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
         "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
         "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some(" 131072 ".to_string()),
         "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS" => Some("8192".to_string()),
-        "SINGULARITY_MODEL_MAX_TOOL_CALLS" => Some("4".to_string()),
-        "SINGULARITY_MODEL_STRICT_TOOL_SCHEMA" => Some("true".to_string()),
         _ => None,
     })
     .expect("configured provider");
     let capabilities = configured.protocol_contract();
     assert_eq!(capabilities.max_context_tokens, 131_072);
     assert_eq!(capabilities.max_output_tokens, 8_192);
-    assert_eq!(capabilities.max_tool_calls_per_turn, 4);
-    assert!(capabilities.supports_strict_tool_schema);
+    assert_eq!(capabilities.max_tool_calls_per_turn, 1);
+    assert!(!capabilities.supports_strict_tool_schema);
 
     let provider = OpenAiProvider::new(configured).expect("provider");
     assert_eq!(Provider::protocol_contract(&provider), capabilities);
+}
+
+#[test]
+fn openai_capability_probe_preserves_strict_when_parallel_is_unproven() {
+    let (base_url, requests) = configurable_probe_server(
+        vec![("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE)],
+        ACTUAL_DONE_RESPONSE,
+        1,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("strict single negotiation");
+
+    assert_eq!(
+        negotiation.metadata.profile,
+        ProviderCapabilityProfile::StrictSingle
+    );
+    assert!(negotiation.contract.supports_strict_tool_schema);
+    assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
+    assert_eq!(negotiation.metadata.profile_attempts, 1);
+    assert_eq!(negotiation.metadata.fallback_count, 0);
+
+    let response = provider
+        .complete(
+            &capability_test_request(None, true, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("actual completion after cached negotiation");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured actual request");
+    let actual: serde_json::Value = serde_json::from_str(&captured[0]).expect("actual JSON");
+    assert_eq!(actual["model"], "gpt-test");
+    assert_eq!(actual["parallel_tool_calls"], false);
+    assert_eq!(actual["tools"][0]["function"]["strict"], true);
+}
+
+#[test]
+fn openai_capability_probe_fallback_keeps_usage_attempts_and_cache_metadata_separate() {
+    let (base_url, requests) = configurable_probe_server(
+        vec![
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
+        ],
+        ACTUAL_DONE_RESPONSE,
+        1,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("non-strict single negotiation");
+
+    assert_eq!(
+        negotiation.metadata.profile,
+        ProviderCapabilityProfile::NonStrictSingle
+    );
+    assert!(!negotiation.contract.supports_strict_tool_schema);
+    assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
+    assert_eq!(negotiation.metadata.profile_attempts, 2);
+    assert_eq!(negotiation.metadata.fallback_count, 1);
+    assert_eq!(negotiation.metadata.probe_usage.total_tokens, 3);
+    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
+    assert_eq!(negotiation.metadata.probe_attempt_metadata.retry_count, 0);
+
+    provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("actual completion after cache hit");
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured actual request");
+    assert_eq!(captured.len(), 1, "cache hit must avoid a second probe");
+    let actual: serde_json::Value = serde_json::from_str(&captured[0]).expect("actual JSON");
+    assert_eq!(actual["tools"][0]["function"].get("strict"), None);
+}
+
+#[test]
+fn openai_capability_probe_final_text_response_is_typed_and_preserves_probe_metadata() {
+    let (base_url, requests) = configurable_probe_server(
+        vec![
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE),
+        ],
+        ACTUAL_DONE_RESPONSE,
+        0,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let error = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect_err("text pseudo-call must not prove native tools");
+
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"capability_probe_native_tool_calls_missing".to_string())
+    );
+    let metadata = error.capability_metadata.expect("probe metadata");
+    assert_eq!(metadata.profile, ProviderCapabilityProfile::NonStrictSingle);
+    assert_eq!(metadata.profile_attempts, 3);
+    assert_eq!(metadata.fallback_count, 2);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 3);
+    assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+}
+
+#[test]
+fn openai_capability_probe_auth_failure_does_not_fallback() {
+    let (base_url, requests) = configurable_probe_server(
+        vec![("HTTP/1.1 401 Unauthorized", "{}")],
+        ACTUAL_DONE_RESPONSE,
+        0,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let error = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect_err("auth failure must be preserved");
+
+    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
+    assert_eq!(error.error.http_status, Some(401));
+    let metadata = error.capability_metadata.expect("probe metadata");
+    assert_eq!(metadata.profile_attempts, 1);
+    assert_eq!(metadata.fallback_count, 0);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 1);
+    assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+}
+
+#[test]
+fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
+    let (base_url, requests) = configurable_probe_server(
+        vec![
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 422 Unprocessable Entity", "{}"),
+        ],
+        ACTUAL_DONE_RESPONSE,
+        0,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let error = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect_err("profile rejection cause must be preserved");
+
+    assert_eq!(error.error.kind, ModelErrorKind::UnknownProviderError);
+    assert_eq!(error.error.http_status, Some(422));
+    assert_eq!(error.error.stage, Some(ProviderErrorStage::ResponseStatus));
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"capability_profiles_exhausted".to_string())
+    );
+    let metadata = error.capability_metadata.expect("probe metadata");
+    assert_eq!(metadata.profile_attempts, 3);
+    assert_eq!(metadata.fallback_count, 2);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 3);
+    assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+}
+
+#[test]
+fn openai_capability_probe_preserves_final_validation_errors() {
+    let (base_url, _requests) = configurable_probe_server(
+        vec![
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 200 OK", PROBE_BAD_ARGUMENTS_RESPONSE),
+        ],
+        ACTUAL_DONE_RESPONSE,
+        0,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let error = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect_err("invalid structured arguments must not prove tools");
+
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"schema_mismatch".to_string())
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"tool_call_arguments_must_be_object".to_string())
+    );
+}
+
+#[test]
+fn openai_capability_cache_is_partitioned_by_effective_model_and_shared_by_clones() {
+    let (base_url, requests) = multi_model_probe_server(3);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    provider
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("default model completion");
+    provider
+        .complete(
+            &capability_test_request(Some("model-b"), false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("override model completion");
+    let clone = provider.clone();
+    clone
+        .complete(
+            &capability_test_request(Some("model-b"), false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("same override model cache hit");
+    let cache_hit = Provider::negotiate_tool_capabilities(
+        &clone,
+        &ModelPreferences {
+            model_name: Some("model-b".to_string()),
+            ..ModelPreferences::default()
+        },
+        &singularity_core::CancellationToken::new(),
+    );
+    assert!(
+        cache_hit
+            .expect("same model cache metadata")
+            .metadata
+            .cache_hit
+    );
+
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured model requests");
+    let probe_count = captured
+        .iter()
+        .filter(|request| request.contains("singularity_capability_probe"))
+        .count();
+    assert_eq!(
+        probe_count, 2,
+        "different models probe independently; clone shares cache"
+    );
+    let models = captured
+        .iter()
+        .filter(|request| !request.contains("singularity_capability_probe"))
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(request).expect("actual JSON")["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(models, vec!["gpt-test", "model-b", "model-b"]);
 }
 
 #[test]
@@ -580,7 +1033,6 @@ fn provider_limit_validation_has_bounded_secret_free_errors() {
         ("SINGULARITY_MODEL_CONTEXT_TOKENS", "2000001"),
         ("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS", "256001"),
         ("SINGULARITY_MODEL_MAX_OUTPUT_TOKENS", "not-a-token-limit"),
-        ("SINGULARITY_MODEL_MAX_TOOL_CALLS", "9"),
     ] {
         let result = OpenAiProviderConfig::from_env(|candidate| match candidate {
             "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
@@ -598,23 +1050,23 @@ fn provider_limit_validation_has_bounded_secret_free_errors() {
 }
 
 #[test]
-fn provider_strict_schema_capability_rejects_ambiguous_configuration() {
-    let error = OpenAiProviderConfig::from_env(|name| match name {
-        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
-        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
-        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
-        "SINGULARITY_MODEL_STRICT_TOOL_SCHEMA" => Some("sometimes".to_string()),
-        _ => None,
+fn removed_tool_capability_envs_are_not_read_or_parsed() {
+    let config = OpenAiProviderConfig::from_env(|name| {
+        assert!(!matches!(
+            name,
+            "SINGULARITY_MODEL_MAX_TOOL_CALLS" | "SINGULARITY_MODEL_STRICT_TOOL_SCHEMA"
+        ));
+        match name {
+            "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+            "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+            "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+            _ => None,
+        }
     })
-    .expect_err("ambiguous capability must be rejected");
+    .expect("provider configuration");
 
-    assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
-    assert!(
-        error
-            .message
-            .contains("SINGULARITY_MODEL_STRICT_TOOL_SCHEMA")
-    );
-    assert!(!error.message.contains("sometimes"));
+    assert_eq!(config.protocol_contract().max_tool_calls_per_turn, 1);
+    assert!(!config.protocol_contract().supports_strict_tool_schema);
 }
 
 #[test]
@@ -1059,10 +1511,7 @@ fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
         }]
     }"#;
     let (base_url, captured_request) = captured_request_server("HTTP/1.1 200 OK", body);
-    let mut config = provider_test_config(base_url);
-    config.max_tool_calls_per_turn = 2;
-    config.supports_strict_tool_schema = true;
-    let provider = OpenAiProvider::new(config).expect("provider");
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
     let mut request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -1158,13 +1607,7 @@ fn openai_provider_classifies_calls_above_the_negotiated_limit() {
         Some("provider_tool_call_limit_exceeded")
     );
     assert_eq!(error.stage, Some(ProviderErrorStage::ResponseValidation));
-    assert_eq!(
-        error.validation_errors,
-        vec![
-            "max_tool_calls_exceeded",
-            "provider_tool_call_limit_exceeded"
-        ]
-    );
+    assert_eq!(error.validation_errors, vec!["max_tool_calls_exceeded"]);
 }
 
 #[test]
