@@ -257,9 +257,7 @@ fn strict_constraint_mismatch_probe_server(bad_arguments: &'static str) -> (Stri
     thread::spawn(move || {
         for (status_line, body) in [
             ("HTTP/1.1 200 OK", bad_response.as_str()),
-            ("HTTP/1.1 200 OK", bad_response.as_str()),
-            ("HTTP/1.1 200 OK", bad_response.as_str()),
-            ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
+            ("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE),
         ] {
             let (mut stream, _) = listener
                 .accept()
@@ -980,6 +978,7 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     );
     assert!(negotiation.contract.supports_strict_tool_schema);
     assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
+    assert_eq!(negotiation.contract.max_tools_per_request, 2);
 
     let request: serde_json::Value = serde_json::from_str(
         &request_rx
@@ -987,6 +986,7 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
             .expect("captured strict capability request"),
     )
     .expect("strict capability request JSON");
+    assert_eq!(request["tools"].as_array().map(Vec::len), Some(2));
     let parameters = &request["tools"][0]["function"]["parameters"];
     assert_eq!(
         parameters["required"],
@@ -1027,11 +1027,7 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
 #[test]
 fn openai_capability_probe_negotiates_tool_definition_capacity_and_caches_it() {
     let (base_url, requests, _started) = delayed_probe_server(
-        vec![
-            ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE),
-            ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE),
-            ("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE),
-        ],
+        vec![("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE)],
         Duration::ZERO,
     );
     let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
@@ -1056,8 +1052,8 @@ fn openai_capability_probe_negotiates_tool_definition_capacity_and_caches_it() {
     );
     assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
     assert_eq!(negotiation.contract.max_tools_per_request, 2);
-    assert_eq!(negotiation.metadata.profile_attempts, 3);
-    assert_eq!(negotiation.metadata.fallback_count, 2);
+    assert_eq!(negotiation.metadata.profile_attempts, 1);
+    assert_eq!(negotiation.metadata.fallback_count, 0);
     assert!(cached.metadata.cache_hit);
     assert_eq!(cached.contract, negotiation.contract);
     let captured = requests
@@ -1072,7 +1068,7 @@ fn openai_capability_probe_negotiates_tool_definition_capacity_and_caches_it() {
                 .expect("probe tools")
         })
         .collect::<Vec<_>>();
-    assert_eq!(tool_counts, vec![8, 4, 2]);
+    assert_eq!(tool_counts, vec![2]);
 }
 
 #[test]
@@ -1095,13 +1091,13 @@ fn openai_capability_probe_strict_constraint_mismatch_falls_back_to_non_strict()
 
         assert_eq!(
             negotiation.metadata.profile,
-            ProviderCapabilityProfile::NonStrictSingle
+            ProviderCapabilityProfile::NonStrictParallel
         );
         assert!(!negotiation.contract.supports_strict_tool_schema);
-        assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
-        assert_eq!(negotiation.contract.max_tools_per_request, 8);
-        assert_eq!(negotiation.metadata.profile_attempts, 4);
-        assert_eq!(negotiation.metadata.fallback_count, 3);
+        assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
+        assert_eq!(negotiation.contract.max_tools_per_request, 2);
+        assert_eq!(negotiation.metadata.profile_attempts, 2);
+        assert_eq!(negotiation.metadata.fallback_count, 1);
         done.recv_timeout(Duration::from_secs(1))
             .expect("strict constraint probe fallback completed");
     }
@@ -1111,10 +1107,6 @@ fn openai_capability_probe_strict_constraint_mismatch_falls_back_to_non_strict()
 fn openai_capability_probe_non_strict_single_uses_required_tool_choice() {
     let (base_url, requests, _started) = delayed_probe_server(
         vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
@@ -1134,7 +1126,7 @@ fn openai_capability_probe_non_strict_single_uses_required_tool_choice() {
         ProviderCapabilityProfile::NonStrictSingle
     );
     assert!(!negotiation.contract.supports_strict_tool_schema);
-    assert_eq!(negotiation.contract.max_tools_per_request, 8);
+    assert_eq!(negotiation.contract.max_tools_per_request, 2);
     let captured = requests
         .recv_timeout(Duration::from_secs(1))
         .expect("captured non-strict probe requests");
@@ -1142,7 +1134,7 @@ fn openai_capability_probe_non_strict_single_uses_required_tool_choice() {
         serde_json::from_str(captured.last().expect("single probe request"))
             .expect("single probe JSON");
     assert_eq!(single_request["tool_choice"], "required");
-    assert_eq!(single_request["tools"].as_array().map(Vec::len), Some(8));
+    assert_eq!(single_request["tools"].as_array().map(Vec::len), Some(2));
     assert_eq!(single_request["tools"][0]["function"].get("strict"), None);
 }
 
@@ -1193,12 +1185,6 @@ fn openai_capability_probe_failed_single_flight_shares_typed_outcome() {
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 422 Unprocessable Entity", "{}"),
         ],
         Duration::from_millis(100),
@@ -1236,13 +1222,13 @@ fn openai_capability_probe_failed_single_flight_shares_typed_outcome() {
             .as_ref()
             .expect("capability metadata")
             .profile_attempts,
-        10
+        4
     );
 
     let captured = requests
         .recv_timeout(Duration::from_secs(2))
         .expect("captured capability probes");
-    assert_eq!(captured.len(), 10, "one shared probe round is required");
+    assert_eq!(captured.len(), 4, "one shared probe round is required");
 }
 
 #[test]
@@ -1398,7 +1384,7 @@ fn openai_capability_probe_fallback_keeps_usage_attempts_and_cache_metadata_sepa
     );
     assert!(!negotiation.contract.supports_strict_tool_schema);
     assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
-    assert_eq!(negotiation.contract.max_tools_per_request, 8);
+    assert_eq!(negotiation.contract.max_tools_per_request, 1);
     assert_eq!(negotiation.metadata.profile_attempts, 4);
     assert_eq!(negotiation.metadata.fallback_count, 3);
     assert_eq!(negotiation.metadata.probe_usage.total_tokens, 3);
@@ -1426,12 +1412,6 @@ fn openai_capability_probe_final_text_response_is_typed_and_preserves_probe_meta
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE),
         ],
         ACTUAL_DONE_RESPONSE,
@@ -1454,9 +1434,9 @@ fn openai_capability_probe_final_text_response_is_typed_and_preserves_probe_meta
     );
     let metadata = error.capability_metadata.expect("probe metadata");
     assert_eq!(metadata.profile, ProviderCapabilityProfile::NonStrictSingle);
-    assert_eq!(metadata.profile_attempts, 10);
-    assert_eq!(metadata.fallback_count, 9);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 10);
+    assert_eq!(metadata.profile_attempts, 4);
+    assert_eq!(metadata.fallback_count, 3);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 4);
     assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
 }
 
@@ -1491,12 +1471,6 @@ fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 422 Unprocessable Entity", "{}"),
         ],
         ACTUAL_DONE_RESPONSE,
@@ -1520,9 +1494,9 @@ fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
             .contains(&"capability_profiles_exhausted".to_string())
     );
     let metadata = error.capability_metadata.expect("probe metadata");
-    assert_eq!(metadata.profile_attempts, 10);
-    assert_eq!(metadata.fallback_count, 9);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 10);
+    assert_eq!(metadata.profile_attempts, 4);
+    assert_eq!(metadata.fallback_count, 3);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 4);
     assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
 }
 
@@ -1530,12 +1504,6 @@ fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
 fn openai_capability_probe_preserves_structured_validation_errors() {
     let (base_url, _requests) = configurable_probe_server(
         vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),

@@ -1700,37 +1700,33 @@ fn capability_probe_profiles(
         ]
     };
     let mut profiles = Vec::new();
-    for tool_count in [8, 4, 2] {
-        profiles.push(CapabilityProbeProfile {
-            profile: ProviderCapabilityProfile::StrictParallel,
-            contract: make_contract(true, 2, tool_count),
-            request: make_request(
-                probe_tools(tool_count, &strict_schema),
-                ToolChoiceMode::Required,
-                2,
-                true,
-                "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
-            ),
-            expected_calls: parallel_expected(Some(strict_arguments.clone())),
-            single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
-        });
-    }
-    for tool_count in [8, 4, 2] {
-        profiles.push(CapabilityProbeProfile {
-            profile: ProviderCapabilityProfile::NonStrictParallel,
-            contract: make_contract(false, 2, tool_count),
-            request: make_request(
-                probe_tools(tool_count, &native_schema),
-                ToolChoiceMode::Required,
-                2,
-                false,
-                "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
-            ),
-            expected_calls: parallel_expected(None),
-            single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
-        });
-    }
-    for tool_count in [8, 4, 2, 1] {
+    profiles.push(CapabilityProbeProfile {
+        profile: ProviderCapabilityProfile::StrictParallel,
+        contract: make_contract(true, 2, 2),
+        request: make_request(
+            probe_tools(2, &strict_schema),
+            ToolChoiceMode::Required,
+            2,
+            true,
+            "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
+        ),
+        expected_calls: parallel_expected(Some(strict_arguments.clone())),
+        single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
+    });
+    profiles.push(CapabilityProbeProfile {
+        profile: ProviderCapabilityProfile::NonStrictParallel,
+        contract: make_contract(false, 2, 2),
+        request: make_request(
+            probe_tools(2, &native_schema),
+            ToolChoiceMode::Required,
+            2,
+            false,
+            "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
+        ),
+        expected_calls: parallel_expected(None),
+        single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
+    });
+    for tool_count in [2, 1] {
         profiles.push(CapabilityProbeProfile {
             profile: ProviderCapabilityProfile::NonStrictSingle,
             contract: make_contract(false, 1, tool_count),
