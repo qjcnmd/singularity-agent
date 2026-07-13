@@ -10,7 +10,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics,
-    AgentStatus, AgentVerificationRequirement, BUILTIN_UPDATE_PLAN_TOOL, agent_control_tool_specs,
+    AgentStatus, AgentVerificationRequirement, BUILTIN_SELECT_TOOL, BUILTIN_UPDATE_PLAN_TOOL,
+    agent_control_tool_specs,
 };
 use singularity_core::{contains_sensitive_text, load_project_instructions_from_cwd};
 use singularity_evaluation::{
@@ -1483,7 +1484,7 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
         .into_iter()
         .chain(agent_control_tool_specs())
     {
-        if !allowed.contains(spec.name.as_str()) {
+        if spec.name != BUILTIN_SELECT_TOOL && !allowed.contains(spec.name.as_str()) {
             continue;
         }
         if spec.name == TOOL_COMMAND {
@@ -2280,7 +2281,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_exposes_only_manifest_allowed_tools() {
+    fn registry_exposes_manifest_tools_and_the_internal_selector() {
         let projection = AgentTaskProjection {
             task_id: TaskId::new("task-1").expect("task id"),
             description: "description".to_string(),
@@ -2291,6 +2292,7 @@ mod tests {
         };
         let registry = evaluation_registry(&projection).expect("registry");
         assert!(registry.get(TOOL_READ).is_some());
+        assert!(registry.get(BUILTIN_SELECT_TOOL).is_some());
         assert!(registry.get(TOOL_COMMAND).is_none());
         assert!(registry.get(TOOL_EDIT).is_none());
     }
