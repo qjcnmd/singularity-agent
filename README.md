@@ -1,6 +1,6 @@
 # Singularity
 
-Singularity 是一个面向 Windows 的本地命令行编码代理。核心产品运行时、协议、模型调用、工具、评估和发布二进制均由 Rust 实现；职责明确的辅助工具可以使用其他主流语言，但不得形成第二套产品运行时或绕过 Rust 主链路与安全协议。命令执行采用源自 OpenAI Codex CLI 的 Windows 原生沙箱，并在不能满足请求权限时关闭失败（fail closed）。
+Singularity 是一个由 Rust 实现的本地命令行编码代理。核心产品运行时、协议、模型调用、工具和评估保持平台无关；职责明确的辅助工具可以使用其他主流语言，但不得形成第二套产品运行时或绕过 Rust 主链路与安全协议。当前发行包绑定源自 OpenAI Codex CLI 的 Windows 原生 sandbox adapter，并在不能满足请求权限时关闭失败（fail closed）。
 
 当前支持 Windows x86-64。其他平台可以编译和运行确定性测试，但由于没有严格命令沙箱，AgentLoop 不会声明可用。
 

@@ -1,8 +1,8 @@
 use singularity_agent::{
-    AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopCapability, AgentLoopInput,
-    AgentPlan, AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics,
-    AgentStatus, AgentVerificationRequirement, ApprovalGrant, BUILTIN_INVOKE_TOOL,
-    agent_control_tool_specs, assemble_context_items,
+    AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopInput, AgentPlan,
+    AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentStatus,
+    AgentVerificationRequirement, ApprovalGrant, BUILTIN_INVOKE_TOOL, agent_control_tool_specs,
+    assemble_context_items,
 };
 use singularity_core::CancellationToken;
 use singularity_model::{
@@ -574,31 +574,6 @@ fn invoke_tool_call(id: &str, tool_name: &str, arguments: serde_json::Value) -> 
         BUILTIN_INVOKE_TOOL,
         serde_json::json!({"tool_name": tool_name, "arguments": arguments}),
     )
-}
-
-#[cfg(windows)]
-#[test]
-fn agent_loop_capability_is_available_without_remaining_blockers() {
-    let capability = AgentLoopCapability::current();
-
-    assert!(capability.available);
-    assert_eq!(capability.status, AgentStatus::Completed);
-    assert!(capability.reason.contains("AgentLoop"));
-    assert!(capability.blockers.is_empty());
-}
-
-#[cfg(not(windows))]
-#[test]
-fn agent_loop_capability_reports_unsupported_platform_blocker() {
-    let capability = AgentLoopCapability::current();
-
-    assert!(!capability.available);
-    assert_eq!(capability.status, AgentStatus::Blocked);
-    assert!(
-        capability
-            .blockers
-            .contains(&"strict_command_sandbox_unsupported_platform".to_string())
-    );
 }
 
 #[test]

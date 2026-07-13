@@ -39,8 +39,8 @@ use singularity_tools::{
     BUILTIN_COMMAND_TOOL as TOOL_COMMAND, BUILTIN_EDIT_TOOL as TOOL_EDIT,
     BUILTIN_GREP_TOOL as TOOL_GREP, BUILTIN_LIST_TOOL as TOOL_LIST,
     BUILTIN_PATCH_TOOL as TOOL_PATCH, BUILTIN_READ_TOOL as TOOL_READ, CommandToolInput,
-    SandboxBackend, ToolBroker, ToolRegistry, WindowsSandboxBackend, WorkspaceTools,
-    command_scope_digest, workspace_tool_specs,
+    SandboxBackend, SandboxBackendEnforcement, ToolBroker, ToolRegistry, WindowsSandboxBackend,
+    WorkspaceTools, command_scope_digest, workspace_tool_specs,
 };
 use thiserror::Error;
 
@@ -61,6 +61,7 @@ const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
 const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 const TURN_CANCELLATION_POLL_MS: u64 = 25;
+const STRICT_COMMAND_SANDBOX_UNAVAILABLE: &str = "strict_command_sandbox_unavailable";
 
 #[derive(Debug, Error)]
 pub enum AppServerError {
@@ -494,7 +495,7 @@ impl AppServer {
             emit_messages(&mut emit, invalid_request_response(message.id, error)?);
             return Ok(());
         }
-        let capability = AgentLoopCapability::current();
+        let capability = agent_loop_capability(self.sandbox_backend.as_ref());
         if !agent_loop_capability_ready(&capability) {
             emit_messages(
                 &mut emit,
@@ -545,7 +546,9 @@ impl AppServer {
         json_response(
             message.id,
             AgentCapabilityResult {
-                agent_loop: serde_json::to_value(AgentLoopCapability::current())?,
+                agent_loop: serde_json::to_value(agent_loop_capability(
+                    self.sandbox_backend.as_ref(),
+                ))?,
                 provider_configuration: provider_configuration(&self.provider_snapshot),
             },
         )
@@ -606,7 +609,7 @@ impl AppServer {
         pending_tool_call: Option<Value>,
         cancellation: &CancellationToken,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<ApprovalCheckpoint>)>> {
-        if !agent_loop_ready() {
+        if !agent_loop_ready(self.sandbox_backend.as_ref()) {
             return Ok(None);
         }
         if !matches!(decision.outcome, ApprovalOutcome::Allow) {
@@ -1668,8 +1671,25 @@ fn agent_loop_input(
     Ok(input)
 }
 
-fn agent_loop_ready() -> bool {
-    let capability = AgentLoopCapability::current();
+fn agent_loop_capability(sandbox_backend: &dyn SandboxBackend) -> AgentLoopCapability {
+    if sandbox_backend.capabilities().enforcement() == SandboxBackendEnforcement::Strict {
+        AgentLoopCapability::available(format!(
+            "AgentLoop uses the {} strict sandbox backend",
+            sandbox_backend.name()
+        ))
+    } else {
+        AgentLoopCapability::unavailable(
+            format!(
+                "AgentLoop requires a strict command sandbox; backend {} is unavailable",
+                sandbox_backend.name()
+            ),
+            STRICT_COMMAND_SANDBOX_UNAVAILABLE,
+        )
+    }
+}
+
+fn agent_loop_ready(sandbox_backend: &dyn SandboxBackend) -> bool {
+    let capability = agent_loop_capability(sandbox_backend);
     agent_loop_capability_ready(&capability)
 }
 
@@ -3190,6 +3210,38 @@ mod tests {
                     singularity_tools::SandboxBackendEnforcement::Strict,
                 )
         }
+    }
+
+    struct UnavailableSandboxBackend;
+
+    impl SandboxBackend for UnavailableSandboxBackend {
+        fn name(&self) -> &'static str {
+            "unavailable_test"
+        }
+
+        fn capabilities(&self) -> singularity_tools::SandboxCapabilities {
+            singularity_tools::SandboxCapabilities::unavailable()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            CommandResult::sandbox_backend_unavailable(&request.command_id)
+        }
+    }
+
+    #[test]
+    fn agent_loop_capability_is_projected_from_the_bound_sandbox_backend() {
+        let available = agent_loop_capability(&CompletedSandboxBackend);
+        assert!(available.available);
+        assert!(available.blockers.is_empty());
+        assert!(available.reason.contains("completed_test"));
+
+        let unavailable = agent_loop_capability(&UnavailableSandboxBackend);
+        assert!(!unavailable.available);
+        assert_eq!(
+            unavailable.blockers,
+            vec![STRICT_COMMAND_SANDBOX_UNAVAILABLE]
+        );
+        assert!(unavailable.reason.contains("unavailable_test"));
     }
 
     #[test]

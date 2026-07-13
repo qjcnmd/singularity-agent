@@ -532,7 +532,7 @@ fn app_server_reports_agent_loop_capability_as_available() {
 
 #[cfg(not(windows))]
 #[test]
-fn app_server_reports_agent_loop_capability_as_unsupported_off_windows() {
+fn app_server_reports_default_agent_loop_backend_as_unavailable_off_windows() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
@@ -554,7 +554,7 @@ fn app_server_reports_agent_loop_capability_as_unsupported_off_windows() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|blocker| blocker == "strict_command_sandbox_unsupported_platform")
+            .any(|blocker| blocker == "strict_command_sandbox_unavailable")
     );
 }
 

@@ -4,7 +4,7 @@
 
 ## 1. 系统边界
 
-Singularity 是 Windows 本地命令行编码代理，由四个 release binary 组成：
+Singularity 是本地命令行编码代理；核心合同保持平台无关，当前 Windows 发行包由四个 release binary 组成：
 
 | Binary | 所属 crate | 职责 |
 | --- | --- | --- |
@@ -15,7 +15,7 @@ Singularity 是 Windows 本地命令行编码代理，由四个 release binary �
 
 四个文件在 release 中同目录部署。`sg` 只发现同目录的 app-server；sandbox helper 也从当前 executable 的同目录或资源目录解析。缺失 helper 时关闭失败，不搜索或调用另一个 agent runtime。
 
-生产 AgentLoop 只在 Windows 宣告可用。非 Windows 构建保留协议、数据模型和确定性测试能力，但 `AgentLoopCapability::current()` 返回 blocked，因为没有严格命令 sandbox。
+生产 AgentLoop 只在当前绑定的 backend 声明 strict command sandbox 能力时可用。发行包目前绑定 Windows adapter；非 Windows 构建保留协议、数据模型和确定性测试能力，默认 backend 明确返回 unavailable，后续原生 adapter 可在不修改 Agent 核心语义的情况下接入。
 
 ## 2. Crate 边界
 
@@ -231,7 +231,7 @@ CommandToolInput
 - 父进程正常退出、timeout 或 cancel 都会在 join stdout/stderr capture reader 前关闭或终止 Job Object；elevated runner 的 control transport EOF/read error 也会终止其中的进程树。
 - `local_process_fallback` 始终为 false；没有无沙箱 executor。
 
-`AgentLoopCapability::current()` 在 Windows 表示该实现可用，并不提前触发 UAC probe。真正 setup 和权限检查发生在第一条 command 上；任何失败通过 tool/evaluation blocker 暴露。
+AppServer 从当前绑定的 `SandboxBackend::capabilities()` 投影 AgentLoop 可用性；Agent 核心不判断宿主平台。默认 Windows adapter 声明 strict 能力时不会提前触发 UAC probe，真正 setup 和权限检查发生在第一条 command 上；其他平台只有绑定同一合同下的 strict adapter 才会声明可用，否则明确返回 `strict_command_sandbox_unavailable`。任何运行失败通过 tool/evaluation blocker 暴露。
 
 ## 10. Cancel 与 Shutdown
 

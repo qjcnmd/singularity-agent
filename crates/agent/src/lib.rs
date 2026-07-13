@@ -31,14 +31,6 @@ use singularity_tools::{
 };
 use thiserror::Error;
 
-#[cfg(not(windows))]
-const STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM: &str =
-    "strict_command_sandbox_unsupported_platform";
-#[cfg(windows)]
-const AGENT_LOOP_READY_REASON: &str = "AgentLoop uses automatic Windows elevated sandbox setup with restricted-token fallback only for network-enabled profiles";
-#[cfg(not(windows))]
-const AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
-    "AgentLoop requires the Windows restricted-token command sandbox";
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
 const APPROVAL_CHECKPOINT_VERSION: u32 = 1;
@@ -382,24 +374,21 @@ pub struct AgentLoopCapability {
 }
 
 impl AgentLoopCapability {
-    pub fn current() -> Self {
-        #[cfg(windows)]
-        {
-            Self {
-                available: true,
-                status: AgentStatus::Completed,
-                reason: AGENT_LOOP_READY_REASON.to_string(),
-                blockers: Vec::new(),
-            }
+    pub fn available(reason: impl Into<String>) -> Self {
+        Self {
+            available: true,
+            status: AgentStatus::Completed,
+            reason: reason.into(),
+            blockers: Vec::new(),
         }
-        #[cfg(not(windows))]
-        {
-            Self {
-                available: false,
-                status: AgentStatus::Blocked,
-                reason: AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON.to_string(),
-                blockers: vec![STRICT_COMMAND_SANDBOX_UNSUPPORTED_PLATFORM.to_string()],
-            }
+    }
+
+    pub fn unavailable(reason: impl Into<String>, blocker: impl Into<String>) -> Self {
+        Self {
+            available: false,
+            status: AgentStatus::Blocked,
+            reason: reason.into(),
+            blockers: vec![blocker.into()],
         }
     }
 }

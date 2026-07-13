@@ -9,8 +9,8 @@ use std::time::Instant;
 use serde::Serialize;
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics,
-    AgentStatus, AgentVerificationRequirement, BUILTIN_INVOKE_TOOL, BUILTIN_UPDATE_PLAN_TOOL,
+    AgentLoop, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics, AgentStatus,
+    AgentVerificationRequirement, BUILTIN_INVOKE_TOOL, BUILTIN_UPDATE_PLAN_TOOL,
     agent_control_tool_specs,
 };
 use singularity_core::{contains_sensitive_text, load_project_instructions_from_cwd};
@@ -362,7 +362,7 @@ fn run_task(
         return blocked_task_before_workspace(&plan.task_id, blocker, diagnostics);
     }
 
-    let capability = AgentLoopCapability::current();
+    let capability = super::agent_loop_capability(sandbox_backend.as_ref());
     if !capability.available {
         let blocker = evaluation_blocker(
             BlockerKind::Environment,
