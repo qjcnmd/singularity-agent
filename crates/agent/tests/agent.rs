@@ -1424,7 +1424,7 @@ fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
     let mut read = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     read.tool_calls.push(tool_call(
         "read_1",
-        "builtin.read",
+        BUILTIN_SELECT_TOOL,
         serde_json::json!({
             "path": "README.md",
             "max_chars": null,
@@ -1479,19 +1479,124 @@ fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["builtin.read"]
+        vec![BUILTIN_SELECT_TOOL]
     );
-    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::SpecificTool);
-    assert_eq!(
-        requests[1].tool_choice.tool_name.as_deref(),
-        Some("builtin.read")
+    assert!(requests[1].tools[0].description.contains("builtin.read"));
+    assert!(
+        requests[1].tools[0].parameters_schema["properties"]
+            .get("path")
+            .is_some()
     );
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[1].tool_choice.tool_name, None);
     assert_eq!(requests[1].tool_choice.max_tool_calls, 1);
     assert_eq!(requests[2].tools[0].name, BUILTIN_SELECT_TOOL);
+    assert_eq!(result.tool_results[1].tool_name, "builtin.read");
+    let routed_assistant = requests[2]
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_call_id == "read_1")
+        })
+        .expect("routed assistant history");
+    assert_eq!(
+        routed_assistant.tool_calls[0].tool_name,
+        BUILTIN_SELECT_TOOL
+    );
+    let routed_result = requests[2]
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("read_1"))
+        .expect("routed tool result history");
+    assert_eq!(routed_result.name.as_deref(), Some(BUILTIN_SELECT_TOOL));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&routed_result.content)
+            .expect("routed tool result payload")["tool_name"],
+        "builtin.read"
+    );
     assert!(
         requests[0].messages[0]
             .content
             .contains(BUILTIN_SELECT_TOOL)
+    );
+}
+
+#[test]
+fn routed_tool_call_preserves_model_history_and_resumes_the_approved_tool() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let readme = workspace.path().join("README.md");
+    std::fs::write(&readme, "before").expect("write fixture");
+    let mut select_edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    select_edit
+        .tool_calls
+        .push(select_tool_call("select_1", "builtin.edit"));
+    let mut routed_edit = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    routed_edit.tool_calls.push(tool_call(
+        "edit_1",
+        BUILTIN_SELECT_TOOL,
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let agent_loop = agent_loop_with_plan_capabilities(
+        vec![select_edit, routed_edit],
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract {
+            max_tools_per_request: 2,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .with_workspace_tools(WorkspaceTools::new(workspace.path()));
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(2);
+    let blocked = agent_loop.run(&input);
+
+    assert_eq!(blocked.status, AgentStatus::Blocked);
+    assert_eq!(
+        std::fs::read_to_string(&readme).expect("read fixture"),
+        "before"
+    );
+    assert_eq!(blocked.pending_tool_calls.len(), 1);
+    let pending = blocked.pending_tool_calls[0].clone();
+    assert_eq!(pending.tool_name, "builtin.edit");
+    assert_eq!(
+        blocked.tool_results[1].failure_kind,
+        Some(ToolFailureKind::Approval)
+    );
+    let checkpoint = blocked
+        .approval_checkpoint(&pending.request_id)
+        .expect("routed approval checkpoint");
+    assert_eq!(
+        checkpoint["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["tool_calls"][0]["tool_name"].as_str()),
+        Some(BUILTIN_SELECT_TOOL)
+    );
+
+    let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
+        pending.request_id.clone(),
+        pending.tool_name.clone(),
+        pending.resources.clone(),
+    ));
+    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Failed);
+    assert_eq!(resumed.error.as_deref(), Some("max turns exceeded"));
+    assert_eq!(
+        std::fs::read_to_string(readme).expect("read fixture"),
+        "after"
+    );
+    assert!(
+        resumed
+            .tool_results
+            .last()
+            .is_some_and(|result| { result.tool_name == "builtin.edit" && result.ok })
     );
 }
 
