@@ -47,7 +47,7 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 2. 否则从启动目录向父目录查找最近的 `.env`。
 3. 三个必需值必须来自同一层，缺失时关闭失败。
 
-可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。工具能力不是用户配置项：每次 run/resume 都调用 capability negotiation；同一 `ProviderConfigSnapshot` 与 effective model 已有成功结果时命中 snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 probe。probe 覆盖实际 developer/user 消息角色与 router `oneOf/const` schema 形态；strict、parallel、single 是明确协商出的 contract，未验证的 system message 和 JSON mode 保持关闭。HTTP 200 但返回文本伪工具调用时 fail closed；本地完整 `ToolSpec` validation 始终开启，不会被关闭。
+可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。工具能力不是用户配置项：每次 run/resume 都调用 capability negotiation；同一 `ProviderConfigSnapshot` 与 effective model 已有成功结果时命中 snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 probe。probe 先验证产品上限内的直接工具定义、实际 developer/user 消息角色和 schema 形态；只有 direct capacity 不成立时才验证与真实 router 同形的 `oneOf/const` envelope。strict、parallel、single 是明确协商出的 contract，未验证的 system message 和 JSON mode 保持关闭。HTTP 200 但返回文本伪工具调用时 fail closed；本地完整 `ToolSpec` validation 始终开启，不会被关闭。
 
 修改配置后，新启动一次 `sg` 命令即可取得新快照。不要把 `.env` 提交到 Git。
 

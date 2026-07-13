@@ -48,6 +48,7 @@ const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 const BUILTIN_TOOL_PREFIX: &str = "builtin.";
 const TOOL_NAME_FALLBACK: &str = "tool";
 const CAPABILITY_PROBE_REQUEST_ID: &str = "singularity_capability_probe";
+const CAPABILITY_PROBE_ROUTER: &str = "singularity_capability_router";
 const CAPABILITY_PROBE_TOOL_A: &str = "singularity_capability_probe_a";
 const CAPABILITY_PROBE_TOOL_B: &str = "singularity_capability_probe_b";
 const CAPABILITY_PROBE_EXPECTED_LABEL: &str = "schema_sentinel_alpha";
@@ -1667,6 +1668,31 @@ fn capability_probe_profiles(
             .map(|index| tool(probe_tool_name(index), parameters_schema.clone()))
             .collect::<Vec<_>>()
     };
+    let router_schema = json!({
+        "oneOf": (0..DEFAULT_MAX_TOOLS_PER_REQUEST)
+            .map(|index| {
+                let target = probe_tool_name(index);
+                let label = if index % 2 == 0 {
+                    CAPABILITY_PROBE_EXPECTED_LABEL
+                } else {
+                    CAPABILITY_PROBE_ALTERNATE_LABEL
+                };
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {
+                            "type": "string",
+                            "const": target
+                        },
+                        "arguments": schema_branch(label)
+                    },
+                    "required": ["tool_name", "arguments"],
+                    "additionalProperties": false
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let router_tool = tool(CAPABILITY_PROBE_ROUTER.to_string(), router_schema);
     let make_request = |tools: Vec<ModelToolSchema>,
                         mode: ToolChoiceMode,
                         max_tool_calls: u32,
@@ -1713,54 +1739,90 @@ fn capability_probe_profiles(
             },
         ]
     };
+    let single_expected = |tool_name, allowed_arguments| {
+        vec![CapabilityProbeExpectedCall {
+            tool_name,
+            allowed_arguments,
+        }]
+    };
+    let direct_tool_count = DEFAULT_MAX_TOOLS_PER_REQUEST;
+    let strict_allowed_arguments =
+        vec![strict_arguments.clone(), alternate_strict_arguments.clone()];
     let mut profiles = Vec::new();
     profiles.push(CapabilityProbeProfile {
         profile: ProviderCapabilityProfile::StrictParallel,
-        contract: make_contract(true, 2, 2),
+        contract: make_contract(true, 2, direct_tool_count),
         request: make_request(
-            probe_tools(2, &tool_schema),
+            probe_tools(direct_tool_count, &tool_schema),
             ToolChoiceMode::Required,
             2,
             true,
             "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
         ),
-        expected_calls: parallel_expected(vec![
-            strict_arguments.clone(),
-            alternate_strict_arguments.clone(),
-        ]),
+        expected_calls: parallel_expected(strict_allowed_arguments.clone()),
         single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
     });
     profiles.push(CapabilityProbeProfile {
-        profile: ProviderCapabilityProfile::NonStrictParallel,
-        contract: make_contract(false, 2, 2),
+        profile: ProviderCapabilityProfile::StrictSingle,
+        contract: make_contract(true, 1, direct_tool_count),
         request: make_request(
-            probe_tools(2, &tool_schema),
+            probe_tools(direct_tool_count, &tool_schema),
+            ToolChoiceMode::Required,
+            1,
+            true,
+            "Call singularity_capability_probe_a exactly once.",
+        ),
+        expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, strict_allowed_arguments),
+        single_call_fallback: None,
+    });
+    profiles.push(CapabilityProbeProfile {
+        profile: ProviderCapabilityProfile::NonStrictParallel,
+        contract: make_contract(false, 2, direct_tool_count),
+        request: make_request(
+            probe_tools(direct_tool_count, &tool_schema),
             ToolChoiceMode::Required,
             2,
             false,
-            "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
+            "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each. Use exactly {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]} as each arguments object.",
         ),
-        expected_calls: parallel_expected(Vec::new()),
+        expected_calls: parallel_expected(vec![strict_arguments.clone()]),
         single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
     });
-    for tool_count in [2, 1] {
-        profiles.push(CapabilityProbeProfile {
-            profile: ProviderCapabilityProfile::NonStrictSingle,
-            contract: make_contract(false, 1, tool_count),
-            request: make_request(
-                probe_tools(tool_count, &tool_schema),
-                ToolChoiceMode::Required,
-                1,
-                false,
-                "Call singularity_capability_probe_a exactly once.",
-            ),
-            expected_calls: vec![CapabilityProbeExpectedCall {
-                tool_name: CAPABILITY_PROBE_TOOL_A,
-                allowed_arguments: Vec::new(),
-            }],
-            single_call_fallback: None,
-        });
-    }
+    profiles.push(CapabilityProbeProfile {
+        profile: ProviderCapabilityProfile::NonStrictSingle,
+        contract: make_contract(false, 1, direct_tool_count),
+        request: make_request(
+            probe_tools(direct_tool_count, &tool_schema),
+            ToolChoiceMode::Required,
+            1,
+            false,
+            "Call singularity_capability_probe_a exactly once with arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}.",
+        ),
+        expected_calls: single_expected(
+            CAPABILITY_PROBE_TOOL_A,
+            vec![strict_arguments.clone()],
+        ),
+        single_call_fallback: None,
+    });
+    profiles.push(CapabilityProbeProfile {
+        profile: ProviderCapabilityProfile::NonStrictSingle,
+        contract: make_contract(false, 1, 1),
+        request: make_request(
+            vec![router_tool],
+            ToolChoiceMode::Required,
+            1,
+            false,
+            "Call singularity_capability_router exactly once with tool_name singularity_capability_probe_a and arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}.",
+        ),
+        expected_calls: single_expected(
+            CAPABILITY_PROBE_ROUTER,
+            vec![json!({
+                "tool_name": CAPABILITY_PROBE_TOOL_A,
+                "arguments": strict_arguments
+            })],
+        ),
+        single_call_fallback: None,
+    });
     profiles
 }
 
