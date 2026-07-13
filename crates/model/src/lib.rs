@@ -15,6 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const DEFAULT_MAX_TOOL_CALLS: u32 = 1;
+pub const DEFAULT_MAX_TOOLS_PER_REQUEST: u32 = 8;
 pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;
@@ -155,6 +156,7 @@ pub struct ProviderProtocolContract {
     pub supports_tools: bool,
     pub supports_strict_tool_schema: bool,
     pub max_tool_calls_per_turn: u32,
+    pub max_tools_per_request: u32,
     pub supports_json_mode: bool,
     pub supports_system_message: bool,
     pub supports_developer_message: bool,
@@ -168,6 +170,7 @@ impl Default for ProviderProtocolContract {
             supports_tools: true,
             supports_strict_tool_schema: false,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
+            max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: false,
             supports_system_message: true,
             supports_developer_message: true,
@@ -802,6 +805,7 @@ impl OpenAiProviderConfig {
             supports_tools: true,
             supports_strict_tool_schema: false,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
+            max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: true,
             supports_system_message: true,
             supports_developer_message: true,
@@ -1640,16 +1644,25 @@ fn capability_probe_profiles(
         "required": [],
         "additionalProperties": false
     });
-    let tool = |name: &str, parameters_schema: Value| ModelToolSchema {
-        name: name.to_string(),
+    let tool = |name: String, parameters_schema: Value| ModelToolSchema {
+        name,
         description: "Fixed capability probe tool; no external side effect.".to_string(),
         parameters_schema,
+    };
+    let probe_tool_name = |index: u32| match index {
+        0 => CAPABILITY_PROBE_TOOL_A.to_string(),
+        1 => CAPABILITY_PROBE_TOOL_B.to_string(),
+        _ => format!("singularity_capability_probe_extra_{index}"),
+    };
+    let probe_tools = |count: u32, parameters_schema: &Value| {
+        (0..count)
+            .map(|index| tool(probe_tool_name(index), parameters_schema.clone()))
+            .collect::<Vec<_>>()
     };
     let make_request = |tools: Vec<ModelToolSchema>,
                         mode: ToolChoiceMode,
                         max_tool_calls: u32,
                         strict: bool,
-                        tool_name: Option<&str>,
                         instruction: &str| {
         let mut request = ModelTurnRequest::new(
             CAPABILITY_PROBE_REQUEST_ID,
@@ -1659,80 +1672,73 @@ fn capability_probe_profiles(
         request.tools = tools;
         request.tool_choice = ToolChoicePolicy {
             mode,
-            tool_name: tool_name.map(str::to_string),
+            tool_name: None,
             allowed_tool_names: Vec::new(),
             max_tool_calls,
             strict_tool_schema: strict,
         };
         request
     };
-    let make_contract = |strict: bool, max_tool_calls_per_turn: u32| ProviderProtocolContract {
-        supports_strict_tool_schema: strict,
-        max_tool_calls_per_turn,
-        ..base.clone()
+    let make_contract = |strict: bool, max_tool_calls_per_turn: u32, max_tools_per_request: u32| {
+        ProviderProtocolContract {
+            supports_strict_tool_schema: strict,
+            max_tool_calls_per_turn,
+            max_tools_per_request,
+            ..base.clone()
+        }
     };
-    vec![
-        CapabilityProbeProfile {
+    let parallel_expected = |arguments: Option<Value>| {
+        vec![
+            CapabilityProbeExpectedCall {
+                tool_name: CAPABILITY_PROBE_TOOL_A,
+                arguments: arguments.clone(),
+            },
+            CapabilityProbeExpectedCall {
+                tool_name: CAPABILITY_PROBE_TOOL_B,
+                arguments,
+            },
+        ]
+    };
+    let mut profiles = Vec::new();
+    for tool_count in [8, 4, 2] {
+        profiles.push(CapabilityProbeProfile {
             profile: ProviderCapabilityProfile::StrictParallel,
-            contract: make_contract(true, 2),
+            contract: make_contract(true, 2, tool_count),
             request: make_request(
-                vec![
-                    tool(CAPABILITY_PROBE_TOOL_A, strict_schema.clone()),
-                    tool(CAPABILITY_PROBE_TOOL_B, strict_schema.clone()),
-                ],
+                probe_tools(tool_count, &strict_schema),
                 ToolChoiceMode::Required,
                 2,
                 true,
-                None,
                 "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
             ),
-            expected_calls: vec![
-                CapabilityProbeExpectedCall {
-                    tool_name: CAPABILITY_PROBE_TOOL_A,
-                    arguments: Some(strict_arguments.clone()),
-                },
-                CapabilityProbeExpectedCall {
-                    tool_name: CAPABILITY_PROBE_TOOL_B,
-                    arguments: Some(strict_arguments),
-                },
-            ],
+            expected_calls: parallel_expected(Some(strict_arguments.clone())),
             single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
-        },
-        CapabilityProbeProfile {
+        });
+    }
+    for tool_count in [8, 4, 2] {
+        profiles.push(CapabilityProbeProfile {
             profile: ProviderCapabilityProfile::NonStrictParallel,
-            contract: make_contract(false, 2),
+            contract: make_contract(false, 2, tool_count),
             request: make_request(
-                vec![
-                    tool(CAPABILITY_PROBE_TOOL_A, native_schema.clone()),
-                    tool(CAPABILITY_PROBE_TOOL_B, native_schema.clone()),
-                ],
+                probe_tools(tool_count, &native_schema),
                 ToolChoiceMode::Required,
                 2,
                 false,
-                None,
                 "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
             ),
-            expected_calls: vec![
-                CapabilityProbeExpectedCall {
-                    tool_name: CAPABILITY_PROBE_TOOL_A,
-                    arguments: None,
-                },
-                CapabilityProbeExpectedCall {
-                    tool_name: CAPABILITY_PROBE_TOOL_B,
-                    arguments: None,
-                },
-            ],
+            expected_calls: parallel_expected(None),
             single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
-        },
-        CapabilityProbeProfile {
+        });
+    }
+    for tool_count in [8, 4, 2, 1] {
+        profiles.push(CapabilityProbeProfile {
             profile: ProviderCapabilityProfile::NonStrictSingle,
-            contract: make_contract(false, 1),
+            contract: make_contract(false, 1, tool_count),
             request: make_request(
-                vec![tool(CAPABILITY_PROBE_TOOL_A, native_schema)],
+                probe_tools(tool_count, &native_schema),
                 ToolChoiceMode::Required,
                 1,
                 false,
-                None,
                 "Call singularity_capability_probe_a exactly once.",
             ),
             expected_calls: vec![CapabilityProbeExpectedCall {
@@ -1740,8 +1746,9 @@ fn capability_probe_profiles(
                 arguments: None,
             }],
             single_call_fallback: None,
-        },
-    ]
+        });
+    }
+    profiles
 }
 
 fn capability_probe_response_matches(
@@ -2591,6 +2598,9 @@ pub fn validate_model_request_with_capabilities(
             && request.tool_choice.max_tool_calls > capabilities.max_tool_calls_per_turn
         {
             errors.push("requested_tool_calls_exceed_provider_limit".to_string());
+        }
+        if request.tools.len() > capabilities.max_tools_per_request as usize {
+            errors.push("requested_tools_exceed_provider_limit".to_string());
         }
         if !request.tools.is_empty()
             && request.tool_choice.strict_tool_schema
