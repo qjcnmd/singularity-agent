@@ -96,13 +96,20 @@ impl ToolInputValidationError {
 pub type ToolInputValidator = fn(&Value) -> Result<(), ToolInputValidationError>;
 
 #[derive(Clone)]
+struct ToolInputBinding {
+    model_input: Value,
+    execution_input: Value,
+}
+
+#[derive(Clone)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
     pub execution_mode: ToolExecutionMode,
-    input_validator: ToolInputValidator,
-    exact_inputs: Option<Vec<Value>>,
+    model_input_validator: ToolInputValidator,
+    execution_input_validator: ToolInputValidator,
+    exact_input_bindings: Option<Vec<ToolInputBinding>>,
 }
 
 impl fmt::Debug for ToolSpec {
@@ -113,7 +120,7 @@ impl fmt::Debug for ToolSpec {
             .field("description", &self.description)
             .field("input_schema", &self.input_schema)
             .field("execution_mode", &self.execution_mode)
-            .field("exact_inputs", &self.exact_inputs)
+            .field("exact_model_inputs", &self.exact_model_inputs())
             .finish()
     }
 }
@@ -131,58 +138,131 @@ impl ToolSpec {
             description: description.into(),
             input_schema,
             execution_mode,
-            input_validator,
-            exact_inputs: None,
+            model_input_validator: input_validator,
+            execution_input_validator: input_validator,
+            exact_input_bindings: None,
         }
     }
 
-    pub fn validate_input(&self, input: &Value) -> Result<(), ToolInputValidationError> {
-        (self.input_validator)(input)?;
-        if self
-            .exact_inputs
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(input))
-        {
+    pub fn with_execution_input_validator(mut self, validator: ToolInputValidator) -> Self {
+        self.execution_input_validator = validator;
+        self
+    }
+
+    pub fn prepare_model_input(&self, input: &Value) -> Result<Value, ToolInputValidationError> {
+        (self.model_input_validator)(input)?;
+        match &self.exact_input_bindings {
+            Some(bindings) => bindings
+                .iter()
+                .find(|binding| binding.model_input == *input)
+                .map(|binding| binding.execution_input.clone())
+                .ok_or_else(|| ToolInputValidationError::new("input_not_allowed")),
+            None => Ok(input.clone()),
+        }
+    }
+
+    pub fn validate_execution_input(&self, input: &Value) -> Result<(), ToolInputValidationError> {
+        (self.execution_input_validator)(input)?;
+        if self.exact_input_bindings.as_ref().is_some_and(|bindings| {
+            !bindings
+                .iter()
+                .any(|binding| binding.execution_input == *input)
+        }) {
             return Err(ToolInputValidationError::new("input_not_allowed"));
         }
         Ok(())
     }
 
     pub fn restrict_to_exact_inputs(&mut self, inputs: Vec<Value>) -> Result<(), String> {
-        if self.exact_inputs.is_some() {
+        self.restrict_to_input_bindings(
+            inputs
+                .into_iter()
+                .map(|input| (input.clone(), input))
+                .collect(),
+        )
+    }
+
+    pub fn restrict_to_input_bindings(
+        &mut self,
+        bindings: Vec<(Value, Value)>,
+    ) -> Result<(), String> {
+        if self.exact_input_bindings.is_some() {
             return Err(format!(
                 "tool {} input contract is already restricted",
                 self.name
             ));
         }
-        if inputs.is_empty() {
+        if bindings.is_empty() {
             return Err(format!(
                 "tool {} exact input contract must not be empty",
                 self.name
             ));
         }
-        let mut unique_inputs = Vec::new();
-        for input in inputs {
-            if !input.is_object() {
-                return Err(format!("tool {} exact input must be an object", self.name));
+        let mut unique_bindings: Vec<ToolInputBinding> = Vec::new();
+        for (model_input, execution_input) in bindings {
+            if !model_input.is_object() || !execution_input.is_object() {
+                return Err(format!(
+                    "tool {} exact model and execution inputs must be objects",
+                    self.name
+                ));
             }
-            self.validate_input(&input).map_err(|error| {
+            (self.model_input_validator)(&model_input).map_err(|error| {
                 format!(
-                    "tool {} exact input violates its executable contract: {}",
+                    "tool {} exact model input violates its model contract: {}",
                     self.name, error.code
                 )
             })?;
-            if !unique_inputs.contains(&input) {
-                unique_inputs.push(input);
+            (self.execution_input_validator)(&execution_input).map_err(|error| {
+                format!(
+                    "tool {} exact execution input violates its executable contract: {}",
+                    self.name, error.code
+                )
+            })?;
+            if let Some(existing) = unique_bindings
+                .iter()
+                .find(|binding| binding.model_input == model_input)
+            {
+                if existing.execution_input != execution_input {
+                    return Err(format!(
+                        "tool {} exact model input maps to multiple execution inputs",
+                        self.name
+                    ));
+                }
+                continue;
             }
+            if unique_bindings
+                .iter()
+                .any(|binding| binding.execution_input == execution_input)
+            {
+                return Err(format!(
+                    "tool {} exact execution input maps from multiple model inputs",
+                    self.name
+                ));
+            }
+            unique_bindings.push(ToolInputBinding {
+                model_input,
+                execution_input,
+            });
         }
-        self.input_schema = exact_inputs_schema(&unique_inputs);
-        self.exact_inputs = Some(unique_inputs);
+        let model_inputs = unique_bindings
+            .iter()
+            .map(|binding| binding.model_input.clone())
+            .collect::<Vec<_>>();
+        self.input_schema = exact_inputs_schema(&model_inputs);
+        self.exact_input_bindings = Some(unique_bindings);
         Ok(())
     }
 
-    pub fn exact_inputs(&self) -> &[Value] {
-        self.exact_inputs.as_deref().unwrap_or_default()
+    pub fn exact_model_inputs(&self) -> Vec<Value> {
+        self.exact_input_bindings
+            .as_ref()
+            .map(|bindings| {
+                bindings
+                    .iter()
+                    .map(|binding| binding.model_input.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn to_schema_payload(&self) -> Value {
@@ -274,12 +354,25 @@ fn validate_patch_tool_input(input: &Value) -> Result<(), ToolInputValidationErr
         .map_err(|_| ToolInputValidationError::new("patch_input_invalid"))
 }
 
-fn validate_command_tool_input(input: &Value) -> Result<(), ToolInputValidationError> {
-    let validation_code = match input.get("argv") {
+fn command_input_validation_code(input: &Value) -> &'static str {
+    match input.get("argv") {
         None => "missing_argv",
         Some(Value::Array(_)) => "invalid_command_arguments",
         Some(_) => "argv_not_array",
-    };
+    }
+}
+
+fn validate_command_model_input(input: &Value) -> Result<(), ToolInputValidationError> {
+    let validation_code = command_input_validation_code(input);
+    let input: CommandModelInput = deserialize_tool_input(input, validation_code)?;
+    input
+        .into_execution_input()
+        .validate()
+        .map_err(|_| ToolInputValidationError::new(validation_code))
+}
+
+fn validate_command_execution_input(input: &Value) -> Result<(), ToolInputValidationError> {
+    let validation_code = command_input_validation_code(input);
     let input: CommandToolInput = deserialize_tool_input(input, validation_code)?;
     input
         .validate()
@@ -411,8 +504,9 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             ToolExecutionMode::Exclusive,
-            validate_command_tool_input,
-        ),
+            validate_command_model_input,
+        )
+        .with_execution_input_validator(validate_command_execution_input),
     ]
 }
 
@@ -442,7 +536,19 @@ impl ToolRegistry {
             .collect::<Vec<_>>()
     }
 
-    pub fn validate_input(
+    pub fn prepare_model_input(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Result<(ToolExecutionMode, Value), ToolInputValidationError> {
+        let spec = self
+            .get(name)
+            .ok_or_else(|| ToolInputValidationError::new("tool_not_visible"))?;
+        let execution_input = spec.prepare_model_input(input)?;
+        Ok((spec.execution_mode, execution_input))
+    }
+
+    pub fn validate_execution_input(
         &self,
         name: &str,
         input: &Value,
@@ -450,7 +556,7 @@ impl ToolRegistry {
         let spec = self
             .get(name)
             .ok_or_else(|| ToolInputValidationError::new("tool_not_visible"))?;
-        spec.validate_input(input)?;
+        spec.validate_execution_input(input)?;
         Ok(spec.execution_mode)
     }
 }
@@ -543,12 +649,20 @@ impl ToolBroker {
         self.registry.schema_payloads()
     }
 
-    pub fn validate_input(
+    pub fn prepare_model_input(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Result<(ToolExecutionMode, Value), ToolInputValidationError> {
+        self.registry.prepare_model_input(name, input)
+    }
+
+    pub fn validate_execution_input(
         &self,
         name: &str,
         input: &Value,
     ) -> Result<ToolExecutionMode, ToolInputValidationError> {
-        self.registry.validate_input(name, input)
+        self.registry.validate_execution_input(name, input)
     }
 
     pub fn execute<F>(
@@ -583,7 +697,10 @@ impl ToolBroker {
                     return ToolResult::from_result(envelope, &output);
                 }
             };
-            if let Err(error) = self.registry.validate_input(&envelope.tool_name, &input) {
+            if let Err(error) = self
+                .registry
+                .validate_execution_input(&envelope.tool_name, &input)
+            {
                 let output = ToolOutput::failure_with_kind(
                     ToolFailureKind::Input,
                     INVALID_TOOL_ARGUMENTS_ERROR,
@@ -1745,6 +1862,26 @@ fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
 #[cfg(not(windows))]
 fn metadata_is_reparse_point(_metadata: &Metadata) -> bool {
     false
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandModelInput {
+    argv: Vec<String>,
+    cwd: Option<String>,
+    timeout_seconds: Option<u64>,
+}
+
+impl CommandModelInput {
+    fn into_execution_input(self) -> CommandToolInput {
+        CommandToolInput {
+            argv: self.argv,
+            cwd: self.cwd,
+            timeout_seconds: self.timeout_seconds,
+            sandbox_mode: None,
+            network_access: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

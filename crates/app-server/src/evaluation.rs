@@ -1487,12 +1487,17 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
             continue;
         }
         if spec.name == TOOL_COMMAND {
-            let commands = projection
+            let bindings = projection
                 .smoke_commands
                 .iter()
-                .map(smoke_command_payload)
+                .map(|command| {
+                    (
+                        smoke_command_model_input(command),
+                        smoke_command_execution_input(command),
+                    )
+                })
                 .collect::<Vec<_>>();
-            spec.restrict_to_exact_inputs(commands)?;
+            spec.restrict_to_input_bindings(bindings)?;
         }
         registry.register(spec)?;
     }
@@ -1600,7 +1605,7 @@ fn agent_prompt(projection: &AgentTaskProjection) -> String {
         sections.push(format!(
             "Before the final answer, call {TOOL_COMMAND} for smoke command {} with exactly this JSON input: {}. The task is not agent-completed unless that exact tool result succeeds.",
             index + 1,
-            smoke_command_payload(command)
+            smoke_command_model_input(command)
         ));
     }
     sections.push(
@@ -1610,17 +1615,22 @@ fn agent_prompt(projection: &AgentTaskProjection) -> String {
     sections.join("\n\n")
 }
 
-fn smoke_command_payload(command: &CommandSpec) -> Value {
+fn smoke_command_model_input(command: &CommandSpec) -> Value {
     json!({
         "argv": command.argv.as_slice(),
         "cwd": command.cwd.as_ref().map(|cwd| cwd.as_str()).unwrap_or("."),
         "timeout_seconds": command.timeout_seconds.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-        "sandbox_mode": "workspace_write",
-        "network_access": match command.network_access {
-            NetworkAccess::Denied => "denied",
-            NetworkAccess::Allowed => "allowed",
-        },
     })
+}
+
+fn smoke_command_execution_input(command: &CommandSpec) -> Value {
+    let mut input = smoke_command_model_input(command);
+    input["sandbox_mode"] = json!("workspace_write");
+    input["network_access"] = json!(match command.network_access {
+        NetworkAccess::Denied => "denied",
+        NetworkAccess::Allowed => "allowed",
+    });
+    input
 }
 
 fn agent_verification_requirements(
@@ -2121,8 +2131,9 @@ mod tests {
         };
 
         let prompt = agent_prompt(&projection);
-        assert!(prompt.contains("\"sandbox_mode\":\"workspace_write\""));
-        assert!(prompt.contains("\"network_access\":\"denied\""));
+        assert!(prompt.contains("\"argv\":[\"cargo\",\"test\"]"));
+        assert!(!prompt.contains("sandbox_mode"));
+        assert!(!prompt.contains("network_access"));
         assert!(!prompt.contains("evaluator"));
         assert!(!prompt.contains("test_patch"));
     }
@@ -2298,7 +2309,7 @@ mod tests {
 
         let registry = evaluation_registry(&projection).expect("registry");
         let command = registry.get(TOOL_COMMAND).expect("command tool");
-        let payload = smoke_command_payload(&smoke);
+        let payload = smoke_command_model_input(&smoke);
 
         assert_eq!(
             command.input_schema["properties"]["argv"]["const"],
@@ -2307,12 +2318,23 @@ mod tests {
         assert!(singularity_model::is_strict_tool_schema_compatible(
             &command.input_schema
         ));
-        assert!(command.validate_input(&payload).is_ok());
+        assert!(command.input_schema.get("sandbox_mode").is_none());
+        assert!(!command.input_schema.to_string().contains("network_access"));
+        let (_, execution_input) = registry
+            .prepare_model_input(TOOL_COMMAND, &payload)
+            .expect("declared command model input");
+        assert_eq!(execution_input["sandbox_mode"], "workspace_write");
+        assert_eq!(execution_input["network_access"], "denied");
+        assert!(
+            registry
+                .validate_execution_input(TOOL_COMMAND, &execution_input)
+                .is_ok()
+        );
         let mut undeclared = payload;
         undeclared["argv"] = json!(["cargo", "check"]);
         assert_eq!(
-            command
-                .validate_input(&undeclared)
+            registry
+                .prepare_model_input(TOOL_COMMAND, &undeclared)
                 .expect_err("undeclared command must fail locally")
                 .code,
             "input_not_allowed"

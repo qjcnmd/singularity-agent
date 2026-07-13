@@ -830,9 +830,10 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
 }
 
 #[test]
-fn agent_loop_rejects_an_invalid_read_batch_before_any_member_executes() {
+fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "must not be returned").expect("write readme");
+    std::fs::write(dir.path().join("CHANGELOG.md"), "allowed recovery").expect("write changelog");
     std::fs::write(dir.path().join(".env"), "secret=value").expect("write protected file");
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
@@ -843,22 +844,29 @@ fn agent_loop_rejects_an_invalid_read_batch_before_any_member_executes() {
     response.tool_calls.push(tool_call(
         "call_2",
         "builtin.read",
-        serde_json::json!({"path": ".env"}),
+        serde_json::json!({"path": ".env", "unexpected": true}),
     ));
     let mut recovery = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     recovery.tool_calls.push(tool_call(
         "call_3",
         "builtin.read",
-        serde_json::json!({"path": "README.md"}),
+        serde_json::json!({"path": "CHANGELOG.md"}),
     ));
 
+    let ask_readme = PermissionRule::new(
+        "ask_readme",
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Ask,
+    )
+    .for_operation(PermissionOperation::Read)
+    .for_resource("README.md");
     let result = agent_loop_with_capabilities(
         vec![
             response,
             recovery,
             ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done"),
         ],
-        allow_read_policy(),
+        allow_read_policy().with_rule(ask_readme),
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
             max_tool_calls_per_turn: 2,
@@ -869,6 +877,8 @@ fn agent_loop_rejects_an_invalid_read_batch_before_any_member_executes() {
     .run(&AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3));
 
     assert_eq!(result.status, AgentStatus::Completed);
+    assert!(result.approval_requests.is_empty());
+    assert!(result.pending_tool_calls.is_empty());
     assert_eq!(result.tool_results.len(), 3);
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
@@ -876,7 +886,7 @@ fn agent_loop_rejects_an_invalid_read_batch_before_any_member_executes() {
     );
     assert_eq!(
         result.tool_results[1].failure_kind,
-        Some(singularity_tools::ToolFailureKind::ProtectedPath)
+        Some(singularity_tools::ToolFailureKind::Input)
     );
     assert!(
         !result.tool_results[0]
@@ -1572,9 +1582,7 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
         serde_json::json!({
             "argv": test_command("success"),
             "cwd": ".",
-            "timeout_seconds": 5,
-            "sandbox_mode": "workspace_write",
-            "network_access": "denied"
+            "timeout_seconds": 5
         }),
     ));
     let mut required_verification =
@@ -1585,9 +1593,7 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
         serde_json::json!({
             "argv": required_argv,
             "cwd": ".",
-            "timeout_seconds": 5,
-            "sandbox_mode": "workspace_write",
-            "network_access": "denied"
+            "timeout_seconds": 5
         }),
     ));
     let final_response =
@@ -1673,9 +1679,7 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
             serde_json::json!({
                 "argv": test_command(argument),
                 "cwd": ".",
-                "timeout_seconds": 5,
-                "sandbox_mode": "workspace_write",
-                "network_access": "denied"
+                "timeout_seconds": 5
             }),
         ));
         response
@@ -1857,9 +1861,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
             serde_json::json!({
                 "argv": argv,
                 "cwd": ".",
-                "timeout_seconds": 5,
-                "sandbox_mode": "workspace_write",
-                "network_access": "denied"
+                "timeout_seconds": 5
             }),
         ));
         response
@@ -2519,7 +2521,7 @@ fn agent_loop_cancels_a_running_sandbox_command() {
 }
 
 #[test]
-fn agent_loop_approval_grant_cannot_override_denied_profile_network() {
+fn agent_loop_rejects_model_selected_network_before_approval() {
     let dir = tempfile::tempdir().expect("temp dir");
     let argv = test_command("must-not-execute");
     let resource = command_scope_resource(
@@ -2579,13 +2581,96 @@ fn agent_loop_approval_grant_cannot_override_denied_profile_network() {
     assert_eq!(result.tool_results.len(), 1);
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
-        Some("tool_denied")
+        Some("invalid_tool_arguments")
     );
     assert_eq!(result.approval_count, 0);
+    assert_eq!(
+        result.to_run_status().audit_events[0]["policy_evaluated"],
+        false
+    );
+    assert_eq!(
+        result.to_run_status().audit_events[0]["executor_started"],
+        false
+    );
 }
 
 #[test]
-fn agent_loop_command_approval_grant_requires_exact_command_resource() {
+fn agent_loop_uses_exact_command_binding_without_exposing_execution_policy() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let model_input = serde_json::json!({
+        "argv": test_command("success"),
+        "cwd": ".",
+        "timeout_seconds": 5,
+    });
+    let execution_input = serde_json::json!({
+        "argv": test_command("success"),
+        "cwd": ".",
+        "timeout_seconds": 5,
+        "sandbox_mode": "workspace_write",
+        "network_access": "denied",
+    });
+    let mut registry = ToolRegistry::default();
+    let mut command = workspace_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "builtin.command")
+        .expect("command spec");
+    command
+        .restrict_to_input_bindings(vec![(model_input.clone(), execution_input)])
+        .expect("exact command binding");
+    registry.register(command).expect("register command");
+
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    command_response
+        .tool_calls
+        .push(tool_call("call_1", "builtin.command", model_input));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut profile = PermissionProfile::workspace_write("C:/repo");
+    profile.network_access = NetworkAccess::Allowed;
+    let policy = PolicyEngine::new(profile).with_rule(
+        PermissionRule::new(
+            "allow_execute",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute),
+    );
+    let agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![command_response, final_response],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        ToolBroker::new(registry),
+        policy,
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend));
+
+    let result = agent_loop
+        .run(&AgentLoopInput::new("thread_1", "turn_1", "run the exact command").with_max_turns(2));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    let requests = seen_requests.lock().expect("seen requests");
+    let command_schema = requests[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "builtin.command")
+        .expect("projected command schema")
+        .parameters_schema
+        .to_string();
+    assert!(!command_schema.contains("sandbox_mode"));
+    assert!(!command_schema.contains("network_access"));
+    let run_status = result.to_run_status();
+    let audit = &run_status.audit_events[0];
+    assert_eq!(audit["sandbox_mode"], "workspace_write");
+    assert_eq!(audit["network_access"], "denied");
+    assert_eq!(audit["local_process_fallback"], false);
+}
+
+#[test]
+fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let argv = test_command("success");
     let command_resource = command_scope_resource(
@@ -2614,21 +2699,45 @@ fn agent_loop_command_approval_grant_requires_exact_command_resource() {
     };
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
-    command_response.tool_calls.push(tool_call(
-        "call_1",
-        "builtin.command",
-        serde_json::json!({
-            "argv": argv,
-            "timeout_seconds": 5
-        }),
-    ));
-
-    let result = agent_loop_with_response(
-        command_response,
+    let model_input = serde_json::json!({
+        "argv": argv.clone(),
+        "cwd": ".",
+        "timeout_seconds": 5,
+    });
+    let execution_input = serde_json::json!({
+        "argv": argv,
+        "cwd": ".",
+        "timeout_seconds": 5,
+        "sandbox_mode": "workspace_write",
+        "network_access": "denied",
+    });
+    command_response
+        .tool_calls
+        .push(tool_call("call_1", "builtin.command", model_input.clone()));
+    let mut registry = ToolRegistry::default();
+    let mut command = workspace_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "builtin.command")
+        .expect("command spec");
+    command
+        .restrict_to_input_bindings(vec![(model_input, execution_input)])
+        .expect("exact command binding");
+    registry.register(command).expect("register command");
+    let agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                command_response,
+                ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done"),
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        ToolBroker::new(registry),
         PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
-    .run(&input);
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend));
+
+    let result = agent_loop.run(&input);
 
     assert_eq!(result.status, AgentStatus::Blocked);
     assert_eq!(result.approval_count, 1);
@@ -2640,13 +2749,39 @@ fn agent_loop_command_approval_grant_requires_exact_command_resource() {
         result.tool_results[0].error_code.as_deref(),
         Some("approval_required")
     );
-    let pending = result.pending_tool_calls.first().expect("pending command");
+    let pending = result
+        .pending_tool_calls
+        .first()
+        .expect("pending command")
+        .clone();
     let pending_arguments: serde_json::Value =
         serde_json::from_str(&pending.raw_arguments).expect("pending arguments");
     assert_eq!(pending_arguments["cwd"], ".");
     assert_eq!(pending_arguments["timeout_seconds"], 5);
     assert_eq!(pending_arguments["sandbox_mode"], "workspace_write");
     assert_eq!(pending_arguments["network_access"], "denied");
+
+    let mut tampered = pending.clone();
+    let mut tampered_arguments = pending_arguments;
+    tampered_arguments["sandbox_mode"] = serde_json::json!("read_only");
+    tampered.raw_arguments = tampered_arguments.to_string();
+    let mut checkpoint = result
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    checkpoint["raw_arguments"] = serde_json::json!(tampered.raw_arguments.clone());
+    let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
+        pending.request_id,
+        pending.tool_name,
+        pending.resources,
+    ));
+    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &tampered, &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Failed);
+    assert_eq!(
+        resumed.error.as_deref(),
+        Some("invalid pending execution input: input_not_allowed")
+    );
+    assert!(resumed.tool_results.is_empty());
 }
 
 #[test]
@@ -2663,8 +2798,6 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         "builtin.command",
         serde_json::json!({
             "argv": test_command("success"),
-            "sandbox_mode": "danger_full_access",
-            "network_access": "allowed",
             "timeout_seconds": 5
         }),
     ));

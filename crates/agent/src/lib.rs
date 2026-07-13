@@ -1277,9 +1277,8 @@ where
                 input,
                 budget,
                 turn_index,
-                state.messages.clone(),
+                &state,
                 max_tool_calls,
-                state.tool_choice_mode(),
                 capabilities,
             );
             let request_validation =
@@ -1454,8 +1453,15 @@ where
             .to_model_tool_call()
             .map_err(|error| format!("invalid pending tool call arguments: {error}"))
             .and_then(|call| {
-                bind_tool_call_to_profile(&call, &self.policy.profile)
-                    .map_err(|error| error.to_string())
+                self.tool_broker
+                    .validate_execution_input(&call.tool_name, &call.arguments)
+                    .map_err(|error| format!("invalid pending execution input: {}", error.code))?;
+                let call = bind_tool_call_to_profile(&call, &self.policy.profile)
+                    .map_err(|error| error.to_string())?;
+                self.tool_broker
+                    .validate_execution_input(&call.tool_name, &call.arguments)
+                    .map_err(|error| format!("invalid rebound execution input: {}", error.code))?;
+                Ok(call)
             }) {
             Ok(call) => call,
             Err(error) => {
@@ -1727,23 +1733,26 @@ where
         if self.is_cancelled(input) {
             return ToolBatchControl::Cancelled;
         }
-        let mut staged_approval_grants = state.used_approval_grants.clone();
         let mut prepared = calls
             .iter()
             .zip(observed)
             .map(|(call, (fingerprint, invalid_was_observed))| {
-                self.prepare_tool_call(
-                    input,
-                    call,
-                    fingerprint,
-                    *invalid_was_observed,
-                    &mut staged_approval_grants,
-                    state,
-                )
+                self.prepare_tool_call(call, fingerprint, *invalid_was_observed, state)
             })
             .collect::<Vec<_>>();
         if self.is_cancelled(input) {
             return ToolBatchControl::Cancelled;
+        }
+
+        let mut staged_approval_grants = state.used_approval_grants.clone();
+        if !prepared.iter().any(|call| call.rejection.is_some()) {
+            for prepared_call in &mut prepared {
+                let decision =
+                    self.tool_decision(input, &prepared_call.call, &mut staged_approval_grants);
+                prepared_call.rejection = matches!(decision, ToolBrokerDecision::Deny { .. })
+                    .then(|| self.decision_result(&prepared_call.call, &decision));
+                prepared_call.decision = Some(decision);
+            }
         }
 
         if prepared.len() > 1
@@ -1815,18 +1824,16 @@ where
 
     fn prepare_tool_call(
         &self,
-        input: &AgentLoopInput,
         provider_call: &ModelToolCall,
         fingerprint: &str,
         invalid_was_observed: bool,
-        staged_approval_grants: &mut BTreeSet<String>,
         state: &mut AgentLoopState,
     ) -> PreparedToolCall {
-        let execution_mode = match self
+        let (execution_mode, execution_arguments) = match self
             .tool_broker
-            .validate_input(&provider_call.tool_name, &provider_call.arguments)
+            .prepare_model_input(&provider_call.tool_name, &provider_call.arguments)
         {
-            Ok(mode) => mode,
+            Ok(prepared) => prepared,
             Err(error) => {
                 if !invalid_was_observed {
                     state.recovery_metrics.invalid_tool_call_count = state
@@ -1847,7 +1854,10 @@ where
                 };
             }
         };
-        let call = match bind_tool_call_to_profile(provider_call, &self.policy.profile) {
+        let mut execution_call = provider_call.clone();
+        execution_call.raw_arguments = execution_arguments.to_string();
+        execution_call.arguments = execution_arguments;
+        let call = match bind_tool_call_to_profile(&execution_call, &self.policy.profile) {
             Ok(call) => call,
             Err(CommandBindingError::InvalidArguments(_)) => {
                 if !invalid_was_observed {
@@ -1873,9 +1883,9 @@ where
             Err(CommandBindingError::ProfileViolation(reason)) => {
                 let decision =
                     ToolBrokerDecision::deny_with_kind(ToolFailureKind::PermissionProfile, reason);
-                let rejection = self.decision_result(provider_call, &decision);
+                let rejection = self.decision_result(&execution_call, &decision);
                 return PreparedToolCall {
-                    call: provider_call.clone(),
+                    call: execution_call,
                     fingerprint: fingerprint.to_string(),
                     execution_mode: Some(execution_mode),
                     decision: Some(decision),
@@ -1883,6 +1893,28 @@ where
                 };
             }
         };
+        if let Err(error) = self
+            .tool_broker
+            .validate_execution_input(&call.tool_name, &call.arguments)
+        {
+            if !invalid_was_observed {
+                state.recovery_metrics.invalid_tool_call_count = state
+                    .recovery_metrics
+                    .invalid_tool_call_count
+                    .saturating_add(1);
+            }
+            return PreparedToolCall {
+                call,
+                fingerprint: fingerprint.to_string(),
+                execution_mode: Some(execution_mode),
+                decision: None,
+                rejection: Some(invalid_tool_arguments_result(
+                    provider_call,
+                    error,
+                    self.tool_broker.get(&provider_call.tool_name),
+                )),
+            };
+        }
         if let Some(rejection) = self.workspace_preflight_rejection(&call) {
             return PreparedToolCall {
                 call,
@@ -1892,15 +1924,12 @@ where
                 rejection: Some(rejection),
             };
         }
-        let decision = self.tool_decision(input, &call, staged_approval_grants);
-        let rejection = matches!(decision, ToolBrokerDecision::Deny { .. })
-            .then(|| self.decision_result(&call, &decision));
         PreparedToolCall {
             call,
             fingerprint: fingerprint.to_string(),
             execution_mode: Some(execution_mode),
-            decision: Some(decision),
-            rejection,
+            decision: None,
+            rejection: None,
         }
     }
 
@@ -2980,9 +3009,8 @@ fn model_turn_request(
     input: &AgentLoopInput,
     budget: &ContextBudget,
     turn_index: u32,
-    messages: Vec<ModelMessage>,
+    state: &AgentLoopState,
     max_tool_calls: u32,
-    tool_choice_mode: ToolChoiceMode,
     capabilities: &ProviderProtocolContract,
 ) -> ModelTurnRequest {
     let tools = model_tool_schemas(loop_tools);
@@ -2992,7 +3020,7 @@ fn model_turn_request(
             .all(|tool| is_strict_tool_schema_compatible(&tool.parameters_schema));
     let mut request = ModelTurnRequest {
         request_id: format!("model_request_{}_{}", input.turn_id, turn_index),
-        messages,
+        messages: state.messages.clone(),
         tools,
         tool_choice: Default::default(),
         model_preferences: ModelPreferences {
@@ -3000,7 +3028,7 @@ fn model_turn_request(
             ..input.model_preferences.clone()
         },
     };
-    request.tool_choice.mode = tool_choice_mode;
+    request.tool_choice.mode = state.tool_choice_mode();
     request.tool_choice.max_tool_calls = max_tool_calls;
     request.tool_choice.strict_tool_schema = strict_tool_schema;
     request
@@ -3522,9 +3550,7 @@ fn invalid_command_arguments_output(validation_code: &str, spec: Option<&ToolSpe
     // validation code and schema hints useful to the model, but never echo
     // the raw argument payload through a public tool result.
     let mut summary = format!("invalid command arguments ({validation_code})");
-    let retry_inputs = spec
-        .map(|spec| spec.exact_inputs().to_vec())
-        .unwrap_or_default();
+    let retry_inputs = spec.map(ToolSpec::exact_model_inputs).unwrap_or_default();
     if !retry_inputs.is_empty() {
         summary.push_str(
             ". The argv field must be a JSON array of strings. Copy one complete retry_inputs object exactly",

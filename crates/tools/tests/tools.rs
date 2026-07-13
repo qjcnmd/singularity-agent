@@ -931,14 +931,126 @@ fn exact_tool_inputs_drive_both_projected_schema_and_local_admission() {
         spec.input_schema["properties"]["path"]["const"],
         "README.md"
     );
-    assert_eq!(spec.exact_inputs(), std::slice::from_ref(&allowed));
-    assert!(spec.validate_input(&allowed).is_ok());
+    assert_eq!(spec.exact_model_inputs(), vec![allowed.clone()]);
     assert_eq!(
-        spec.validate_input(&serde_json::json!({"path": "other.md"}))
+        spec.prepare_model_input(&allowed)
+            .expect("allowed model input"),
+        allowed
+    );
+    assert_eq!(
+        spec.prepare_model_input(&serde_json::json!({"path": "other.md"}))
             .expect_err("unadvertised input must be rejected")
             .code,
         "input_not_allowed"
     );
+}
+
+#[test]
+fn command_bindings_separate_model_and_execution_contracts() {
+    let model_input = serde_json::json!({
+        "argv": ["cargo", "test"],
+        "cwd": ".",
+        "timeout_seconds": 60,
+    });
+    let execution_input = serde_json::json!({
+        "argv": ["cargo", "test"],
+        "cwd": ".",
+        "timeout_seconds": 60,
+        "sandbox_mode": "workspace_write",
+        "network_access": "denied",
+    });
+    let mut command = workspace_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "builtin.command")
+        .expect("command spec");
+
+    assert_eq!(
+        command
+            .prepare_model_input(&serde_json::json!({
+                "argv": ["cargo", "test"],
+                "cwd": ".",
+                "timeout_seconds": 60,
+                "network_access": "denied",
+            }))
+            .expect_err("model cannot submit execution policy")
+            .code,
+        "invalid_command_arguments"
+    );
+    command
+        .restrict_to_input_bindings(vec![(model_input.clone(), execution_input.clone())])
+        .expect("restrict command binding");
+
+    assert_eq!(command.exact_model_inputs(), vec![model_input.clone()]);
+    assert_eq!(
+        command
+            .prepare_model_input(&model_input)
+            .expect("bound model input"),
+        execution_input
+    );
+    assert!(command.validate_execution_input(&execution_input).is_ok());
+    assert_eq!(
+        command
+            .validate_execution_input(&serde_json::json!({
+                "argv": ["cargo", "test"],
+                "cwd": ".",
+                "timeout_seconds": 60,
+                "sandbox_mode": "workspace_write",
+                "network_access": "allowed",
+            }))
+            .expect_err("tampered execution policy")
+            .code,
+        "input_not_allowed"
+    );
+    assert!(
+        !serde_json::to_string(&command.input_schema)
+            .expect("serialize command schema")
+            .contains("network_access")
+    );
+
+    let mut broker = ToolBroker::default();
+    broker.register(command).expect("register bound command");
+    let tampered = ToolCallRequest::new(
+        "call_1",
+        "builtin.command",
+        serde_json::json!({
+            "argv": ["cargo", "test"],
+            "cwd": ".",
+            "timeout_seconds": 60,
+            "sandbox_mode": "workspace_write",
+            "network_access": "allowed",
+        })
+        .to_string(),
+    );
+    let mut executed = false;
+    let result = broker.execute(&tampered, ToolBrokerDecision::Allow, |_| {
+        executed = true;
+        ToolOutput::success(serde_json::json!({"summary": "must not execute"}))
+    });
+    assert!(!executed);
+    assert_eq!(result.failure_kind, Some(ToolFailureKind::Input));
+    assert_eq!(result.error_code.as_deref(), Some("invalid_tool_arguments"));
+}
+
+#[test]
+fn exact_input_bindings_reject_ambiguous_mappings() {
+    let model_input = serde_json::json!({"path": "README.md"});
+    let mut spec = test_tool_spec(
+        "builtin.read",
+        "Read a file",
+        serde_json::json!({"type": "object"}),
+    );
+
+    let error = spec
+        .restrict_to_input_bindings(vec![
+            (
+                model_input.clone(),
+                serde_json::json!({"path": "README.md"}),
+            ),
+            (model_input, serde_json::json!({"path": "other.md"})),
+        ])
+        .expect_err("one model input cannot select multiple execution inputs");
+
+    assert!(error.contains("maps to multiple execution inputs"));
 }
 
 #[test]
