@@ -892,6 +892,19 @@ impl OpenAiProvider {
         Self::new(OpenAiProviderConfig::from_env(get_env)?)
     }
 
+    fn cached_tool_capability_negotiation(
+        &self,
+        model_name: &str,
+    ) -> Result<Option<ProviderProtocolNegotiation>, ProviderError> {
+        Ok(self
+            .tool_capability_cache
+            .lock()
+            .map_err(|_| provider_capability_cache_error())?
+            .get(model_name)
+            .cloned()
+            .map(cache_hit_negotiation))
+    }
+
     fn negotiate_openai_tool_capabilities(
         &self,
         model_name: &str,
@@ -909,15 +922,9 @@ impl OpenAiProvider {
                     ),
                 ));
             }
-            let cached = self
-                .tool_capability_cache
-                .lock()
-                .map_err(|_| provider_capability_cache_error())?
-                .as_ref()
-                .filter(|cached| cached.model_name == model_name)
-                .map(|cached| cached.negotiation.clone());
+            let cached = self.cached_tool_capability_negotiation(model_name)?;
             if let Some(cached) = cached {
-                return Ok(cache_hit_negotiation(cached));
+                return Ok(cached);
             }
             let mut in_progress = self
                 .tool_capability_probe_in_progress
@@ -934,15 +941,9 @@ impl OpenAiProvider {
             model_name: model_name.to_string(),
         };
 
-        let cached = self
-            .tool_capability_cache
-            .lock()
-            .map_err(|_| provider_capability_cache_error())?
-            .as_ref()
-            .filter(|cached| cached.model_name == model_name)
-            .map(|cached| cached.negotiation.clone());
+        let cached = self.cached_tool_capability_negotiation(model_name)?;
         if let Some(cached) = cached {
-            return Ok(cache_hit_negotiation(cached));
+            return Ok(cached);
         }
 
         let mut probe_usage = ModelUsage::default();
@@ -1293,11 +1294,10 @@ impl Provider for OpenAiProvider {
             error.validation_errors = request_validation.errors;
             let provider_error = ProviderError::from_model_error(error)
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero());
-            return Err(
-                capability_metadata.map_or(provider_error.clone(), |metadata| {
-                    provider_error.with_capability_metadata(metadata)
-                }),
-            );
+            return Err(attach_capability_metadata(
+                provider_error,
+                &capability_metadata,
+            ));
         }
         let effective_model_name = request
             .model_preferences
@@ -1305,11 +1305,7 @@ impl Provider for OpenAiProvider {
             .as_deref()
             .unwrap_or(&self.config.model_name);
         self.complete_with_contract(request, cancellation, &capabilities, effective_model_name)
-            .map_err(|error| {
-                capability_metadata.map_or(error.clone(), |metadata| {
-                    error.with_capability_metadata(metadata)
-                })
-            })
+            .map_err(|error| attach_capability_metadata(error, &capability_metadata))
     }
 }
 
@@ -1341,6 +1337,16 @@ impl ProviderError {
         self.capability_metadata = Some(metadata);
         self
     }
+}
+
+fn attach_capability_metadata(
+    mut error: ProviderError,
+    metadata: &Option<ProviderCapabilityMetadata>,
+) -> ProviderError {
+    if let Some(metadata) = metadata {
+        error.capability_metadata = Some(metadata.clone());
+    }
+    error
 }
 
 pub fn chat_completions_endpoint(base_url: &str) -> String {
@@ -2136,9 +2142,11 @@ fn capability_probe_failure(
         model_error.validation_errors.push(evidence.to_string());
     }
     let provider_error = ProviderError::from_model_error(model_error);
-    let provider_error = provider_attempt_metadata.map_or(provider_error.clone(), |metadata| {
+    let provider_error = if let Some(metadata) = provider_attempt_metadata {
         provider_error.with_provider_attempt_metadata(metadata)
-    });
+    } else {
+        provider_error
+    };
     provider_error.with_capability_metadata(capability_probe_metadata(
         profile,
         profile_attempts,
@@ -2184,6 +2192,22 @@ fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderErro
     });
     if let Some(validation) = &response.validation {
         error.validation_errors = validation.errors.clone();
+    }
+    let explicit_capability_violation = error.kind == ModelErrorKind::UnsupportedCapability
+        || error.validation_errors.iter().any(|validation_error| {
+            matches!(
+                validation_error.as_str(),
+                "provider_does_not_support_tools"
+                    | "provider_does_not_support_strict_tool_schema"
+                    | "provider_tool_call_limit_exceeded"
+                    | "requested_tool_calls_exceed_provider_limit"
+                    | "max_tool_calls_exceeded"
+                    | "specific_tool_required"
+                    | "tool_choice_required"
+            )
+        });
+    if !response.tool_calls.is_empty() && !explicit_capability_violation {
+        return ProviderError::from_model_error(error);
     }
     if error.validation_errors.is_empty() {
         error

@@ -931,7 +931,7 @@ fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
 }
 
 #[test]
-fn openai_capability_probe_preserves_final_validation_errors() {
+fn openai_capability_probe_preserves_structured_validation_errors() {
     let (base_url, _requests) = configurable_probe_server(
         vec![
             ("HTTP/1.1 400 Bad Request", "{}"),
@@ -949,7 +949,15 @@ fn openai_capability_probe_preserves_final_validation_errors() {
     )
     .expect_err("invalid structured arguments must not prove tools");
 
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert_eq!(
+        error.error.stage,
+        Some(ProviderErrorStage::ResponseValidation)
+    );
     assert!(
         error
             .error
