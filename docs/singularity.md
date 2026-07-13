@@ -222,6 +222,7 @@ CommandToolInput
 
 - `read-only` 和 `workspace-write` 可映射；`danger-full-access` 在 sandbox backend 中明确拒绝。
 - network denied 映射到 restricted network，必须使用 elevated offline identity；不能走 unelevated fallback。
+- 选择 offline identity 前会只读核对持久 Windows Firewall block rules 与产品 WFP filters 的存在和关键 enforcement metadata；缺失或不一致时重新进入 elevated setup，setup 后仍不完整或本地查询失败时关闭失败。elevated setup 只为实际操作用户追加读取产品 WFP filter metadata 所需的权限，不授予修改或删除权限；setup marker 只保存版本与期望配置，不能替代实际网络控制状态。
 - network allowed 可以在 elevated 路径失败且 restricted token 足够时走 unelevated 路径。
 - 产品层只表达单一 workspace root 与 `denied` / `allowed` 两种网络模式，不要求用户维护 allowlist 或额外读写根目录配置。
 - `argv[0]` 可以解析到 workspace 外的宿主机工具链；PATH 相对项、敏感目录、盘符根目录和整个用户目录不会成为动态读根。只有可执行文件享有该例外，其他参数中的外部数据路径仍在执行前拒绝。

@@ -24,8 +24,11 @@ use windows::Win32::System::Com::CoUninitialize;
 use windows::core::BSTR;
 use windows::core::Interface;
 
+use singularity_windows_sandbox::LOOPBACK_REMOTE_ADDRESSES;
+use singularity_windows_sandbox::NON_LOOPBACK_REMOTE_ADDRESSES;
 use singularity_windows_sandbox::SetupErrorCode;
 use singularity_windows_sandbox::SetupFailure;
+use singularity_windows_sandbox::blocked_loopback_tcp_remote_ports;
 use singularity_windows_sandbox::product_identity::{
     FIREWALL_OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY as OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
     FIREWALL_OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME as OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
@@ -35,9 +38,6 @@ use singularity_windows_sandbox::product_identity::{
     FIREWALL_OFFLINE_BLOCK_RULE_NAME as OFFLINE_BLOCK_RULE_NAME,
     FIREWALL_OFFLINE_PROXY_ALLOW_RULE_NAME as OFFLINE_PROXY_ALLOW_RULE_NAME,
 };
-
-const LOOPBACK_REMOTE_ADDRESSES: &str = "127.0.0.0/8,::/127";
-const NON_LOOPBACK_REMOTE_ADDRESSES: &str = "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,::,::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
 
 struct BlockRuleSpec<'a> {
     internal_name: &'a str,
@@ -402,7 +402,8 @@ fn configure_rule_network_scope(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) ->
                     format!("SetRemoteAddresses failed: {err:?}"),
                 ))
             })?;
-        if let Some(remote_ports) = spec.remote_ports {
+        if spec.protocol == NET_FW_IP_PROTOCOL_TCP.0 || spec.protocol == NET_FW_IP_PROTOCOL_UDP.0 {
+            let remote_ports = spec.remote_ports.unwrap_or("*");
             rule.SetRemotePorts(&BSTR::from(remote_ports))
                 .map_err(|err| {
                     anyhow::Error::new(SetupFailure::new(
@@ -414,47 +415,6 @@ fn configure_rule_network_scope(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) ->
     }
 
     Ok(())
-}
-
-fn blocked_loopback_tcp_remote_ports(proxy_ports: &[u16]) -> Option<String> {
-    let mut allowed_ports = proxy_ports
-        .iter()
-        .copied()
-        .filter(|port| *port != 0)
-        .collect::<Vec<_>>();
-    allowed_ports.sort_unstable();
-    allowed_ports.dedup();
-
-    let mut blocked_ranges = Vec::new();
-    let mut start = 1_u32;
-    for port in allowed_ports {
-        let port = u32::from(port);
-        if port < start {
-            continue;
-        }
-        if port > start {
-            blocked_ranges.push(port_range_string(start, port - 1));
-        }
-        start = port + 1;
-    }
-
-    if start <= u32::from(u16::MAX) {
-        blocked_ranges.push(port_range_string(start, u32::from(u16::MAX)));
-    }
-
-    if blocked_ranges.is_empty() {
-        None
-    } else {
-        Some(blocked_ranges.join(","))
-    }
-}
-
-fn port_range_string(start: u32, end: u32) -> String {
-    if start == end {
-        start.to_string()
-    } else {
-        format!("{start}-{end}")
-    }
 }
 
 fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {

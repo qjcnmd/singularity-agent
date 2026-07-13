@@ -37,8 +37,8 @@ pub struct SandboxCreds {
 /// Returns true when the on-disk setup artifacts exist and match the current
 /// setup version.
 ///
-/// This is a coarse readiness check; `require_logon_sandbox_creds` performs the
-/// additional runtime validation for offline firewall settings.
+/// Offline network controls are validated only when selecting the offline
+/// identity, so online launches do not depend on unrelated persistent state.
 pub fn sandbox_setup_is_complete(sandbox_home: &Path) -> bool {
     let marker_ok =
         matches!(load_marker(sandbox_home), Ok(Some(marker)) if marker.version_matches());
@@ -46,6 +46,20 @@ pub fn sandbox_setup_is_complete(sandbox_home: &Path) -> bool {
         return false;
     }
     matches!(load_users(sandbox_home), Ok(Some(users)) if users.version_matches())
+}
+
+fn offline_network_controls_are_current(marker: &SetupMarker) -> Result<bool> {
+    let offline_sid = crate::winutil::resolve_sid(&marker.offline_username)
+        .with_context(|| format!("resolve SID for {}", marker.offline_username))?;
+    let offline_sid_string = crate::winutil::string_from_sid_bytes(&offline_sid)
+        .map_err(anyhow::Error::msg)
+        .context("format offline sandbox SID")?;
+    crate::network_controls::offline_network_controls_are_current(
+        &offline_sid,
+        &offline_sid_string,
+        &marker.proxy_ports,
+        marker.allow_local_binding,
+    )
 }
 
 fn load_marker(sandbox_home: &Path) -> Result<Option<SetupMarker>> {
@@ -184,6 +198,13 @@ pub fn require_logon_sandbox_creds(
             {
                 setup_reason = Some(reason);
                 None
+            } else if network_identity.uses_offline_identity()
+                && !offline_network_controls_are_current(&marker)?
+            {
+                setup_reason = Some(
+                    "offline firewall or WFP enforcement is missing or inconsistent".to_string(),
+                );
+                None
             } else {
                 let selected = select_identity(network_identity, sandbox_home)?;
                 if selected.is_none() {
@@ -226,6 +247,16 @@ pub fn require_logon_sandbox_creds(
             },
             &desired_offline_proxy_settings,
         )?;
+        let marker = load_marker(sandbox_home)?
+            .filter(SetupMarker::version_matches)
+            .ok_or_else(|| anyhow!("sandbox setup marker is missing after elevated setup"))?;
+        if network_identity.uses_offline_identity()
+            && !offline_network_controls_are_current(&marker)?
+        {
+            return Err(anyhow!(
+                "offline firewall or WFP enforcement is incomplete after elevated setup"
+            ));
+        }
         identity = select_identity(network_identity, sandbox_home)?;
     }
     // Always refresh ACLs (non-elevated) for current roots via the setup binary.
