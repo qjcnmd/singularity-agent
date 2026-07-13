@@ -12,8 +12,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult,
-    AgentRunStatus, AgentStatus, ApprovalGrant, BUILTIN_SELECT_TOOL, BUILTIN_UPDATE_PLAN_TOOL,
-    PendingToolCall, agent_control_tool_specs,
+    AgentRunStatus, AgentStatus, ApprovalGrant, PendingToolCall, agent_control_tool_specs,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
@@ -2247,10 +2246,10 @@ mod tests {
     fn app_server_registers_the_agent_control_tools() {
         let registry = workspace_tool_registry();
         let plan = registry
-            .get(BUILTIN_UPDATE_PLAN_TOOL)
+            .get(singularity_agent::BUILTIN_UPDATE_PLAN_TOOL)
             .expect("plan tool registered");
         let selector = registry
-            .get(BUILTIN_SELECT_TOOL)
+            .get(singularity_agent::BUILTIN_SELECT_TOOL)
             .expect("tool selector registered");
 
         assert_eq!(plan.input_schema["properties"]["steps"]["maxItems"], 64);
