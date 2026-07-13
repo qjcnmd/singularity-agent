@@ -1481,7 +1481,11 @@ fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
             .collect::<Vec<_>>(),
         vec!["builtin.read"]
     );
-    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::SpecificTool);
+    assert_eq!(
+        requests[1].tool_choice.tool_name.as_deref(),
+        Some("builtin.read")
+    );
     assert_eq!(requests[1].tool_choice.max_tool_calls, 1);
     assert_eq!(requests[2].tools[0].name, BUILTIN_SELECT_TOOL);
     assert!(

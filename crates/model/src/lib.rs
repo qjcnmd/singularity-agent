@@ -1584,13 +1584,7 @@ fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> Valu
 fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
     match request.tool_choice.mode {
         ToolChoiceMode::None => json!("none"),
-        ToolChoiceMode::Required => match request.tools.as_slice() {
-            [tool] => json!({
-                "type": "function",
-                "function": {"name": openai_wire_tool_name(&tool.name)}
-            }),
-            _ => json!("required"),
-        },
+        ToolChoiceMode::Required => json!("required"),
         ToolChoiceMode::SpecificTool => match &request.tool_choice.tool_name {
             Some(name) => {
                 json!({"type": "function", "function": {"name": openai_wire_tool_name(name)}})

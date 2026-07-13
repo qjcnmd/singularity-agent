@@ -3123,12 +3123,14 @@ fn model_turn_request(
             ..input.model_preferences.clone()
         },
     };
-    request.tool_choice.mode =
-        if tool_view.deferred && (state.selected_tool.is_some() || !state.allows_final()) {
-            ToolChoiceMode::Required
-        } else {
-            state.tool_choice_mode()
-        };
+    request.tool_choice.mode = if tool_view.deferred && state.selected_tool.is_some() {
+        request.tool_choice.tool_name = state.selected_tool.clone();
+        ToolChoiceMode::SpecificTool
+    } else if tool_view.deferred && !state.allows_final() {
+        ToolChoiceMode::Required
+    } else {
+        state.tool_choice_mode()
+    };
     request.tool_choice.max_tool_calls = tool_view.max_tool_calls;
     request.tool_choice.strict_tool_schema = strict_tool_schema;
     request

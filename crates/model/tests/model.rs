@@ -2128,7 +2128,8 @@ fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
             "additionalProperties": false
         }),
     });
-    request.tool_choice.mode = ToolChoiceMode::Required;
+    request.tool_choice.mode = ToolChoiceMode::SpecificTool;
+    request.tool_choice.tool_name = Some("builtin.read".to_string());
     request.tool_choice.max_tool_calls = 2;
     request.tool_choice.strict_tool_schema = true;
 
