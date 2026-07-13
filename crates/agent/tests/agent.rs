@@ -1487,8 +1487,11 @@ fn agent_loop_defers_tool_schemas_to_negotiated_capacity_and_resets_the_view() {
             .get("path")
             .is_some()
     );
-    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
-    assert_eq!(requests[1].tool_choice.tool_name, None);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::SpecificTool);
+    assert_eq!(
+        requests[1].tool_choice.tool_name.as_deref(),
+        Some(BUILTIN_SELECT_TOOL)
+    );
     assert_eq!(requests[1].tool_choice.max_tool_calls, 1);
     assert_eq!(requests[2].tools[0].name, BUILTIN_SELECT_TOOL);
     assert_eq!(result.tool_results[1].tool_name, "builtin.read");
@@ -1665,6 +1668,11 @@ fn routed_input_failure_reuses_the_selected_schema_until_a_valid_call_succeeds()
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[2].tools[0].name, BUILTIN_SELECT_TOOL);
     assert!(requests[2].tools[0].description.contains("builtin.read"));
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::SpecificTool);
+    assert_eq!(
+        requests[2].tool_choice.tool_name.as_deref(),
+        Some(BUILTIN_SELECT_TOOL)
+    );
     assert!(
         requests[2].tools[0].parameters_schema["properties"]
             .get("path")
