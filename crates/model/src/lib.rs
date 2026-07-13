@@ -1619,6 +1619,8 @@ fn capability_probe_profiles(
             },
             "values": {
                 "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
                 "items": {
                     "type": "integer",
                     "const": CAPABILITY_PROBE_EXPECTED_VALUE

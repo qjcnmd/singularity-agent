@@ -996,6 +996,30 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
         "singularity_capability_probe"
     );
     assert_eq!(parameters["properties"]["values"]["type"], "array");
+    assert_eq!(parameters["properties"]["values"]["minItems"], 2);
+    assert_eq!(parameters["properties"]["values"]["maxItems"], 2);
+    assert_eq!(
+        request["messages"][0]["content"],
+        "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each."
+    );
+    assert!(
+        !request["messages"][0]["content"]
+            .as_str()
+            .expect("strict probe instruction")
+            .contains("values")
+    );
+    for tool in request["tools"].as_array().expect("strict probe tools") {
+        assert_eq!(
+            tool["function"]["description"],
+            "Fixed capability probe tool; no external side effect."
+        );
+        assert!(
+            !tool["function"]["description"]
+                .as_str()
+                .expect("strict probe description")
+                .contains('7')
+        );
+    }
     assert_eq!(request["tools"][0]["function"]["strict"], true);
 }
 
