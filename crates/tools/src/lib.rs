@@ -22,6 +22,7 @@ pub use singularity_sandbox::{
 
 const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";
 const UNKNOWN_TOOL_ERROR: &str = "unknown_tool";
+const INVALID_TOOL_ARGUMENTS_ERROR: &str = "invalid_tool_arguments";
 const TOOL_DENIED_ERROR: &str = "tool_denied";
 const TOOL_APPROVAL_REQUIRED_ERROR: &str = "approval_required";
 const TOOL_SANDBOX_UNAVAILABLE_ERROR: &str = "sandbox_unavailable";
@@ -566,6 +567,33 @@ impl ToolBroker {
                 UNKNOWN_TOOL_ERROR,
                 "tool is not registered",
             );
+        }
+        if decision.is_allowed() {
+            let input = match serde_json::from_str::<Value>(&envelope.raw_arguments) {
+                Ok(input) => input,
+                Err(_) => {
+                    let output = ToolOutput::failure_with_kind(
+                        ToolFailureKind::Input,
+                        INVALID_TOOL_ARGUMENTS_ERROR,
+                        json!({
+                            "summary": "tool arguments failed executable input validation",
+                            "validation_code": "invalid_json_arguments",
+                        }),
+                    );
+                    return ToolResult::from_result(envelope, &output);
+                }
+            };
+            if let Err(error) = self.registry.validate_input(&envelope.tool_name, &input) {
+                let output = ToolOutput::failure_with_kind(
+                    ToolFailureKind::Input,
+                    INVALID_TOOL_ARGUMENTS_ERROR,
+                    json!({
+                        "summary": "tool arguments failed executable input validation",
+                        "validation_code": error.code,
+                    }),
+                );
+                return ToolResult::from_result(envelope, &output);
+            }
         }
         if let ToolBrokerDecision::Deny {
             failure_kind,

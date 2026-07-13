@@ -3073,10 +3073,12 @@ fn tool_result_message(tool_result: &ToolResult) -> ModelMessage {
 }
 
 fn tool_call_request(call: &ModelToolCall) -> ToolCallRequest {
+    // The execution broker validates the parsed executable input; provider raw text remains in
+    // model messages and approval checkpoints rather than defining the executor payload.
     ToolCallRequest::new(
         call.tool_call_id.clone(),
         call.tool_name.clone(),
-        call.raw_arguments.clone(),
+        serde_json::to_string(&call.arguments).expect("model tool arguments serialize"),
     )
 }
 

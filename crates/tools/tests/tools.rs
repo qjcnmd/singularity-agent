@@ -4,9 +4,10 @@ use singularity_sandbox::{
 };
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
-    ToolBrokerDecision, ToolCallRequest, ToolExecutionMode, ToolInputValidationError, ToolOutput,
-    ToolRegistry, ToolResult, ToolSpec, WorkspacePatch, WorkspacePatchChange, WorkspaceToolError,
-    WorkspaceTools, command_scope_digest, workspace_tool_specs,
+    ToolBrokerDecision, ToolCallRequest, ToolExecutionMode, ToolFailureKind,
+    ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspacePatch,
+    WorkspacePatchChange, WorkspaceToolError, WorkspaceTools, command_scope_digest,
+    workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -284,6 +285,30 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
     });
 
     assert_eq!(unknown.error_code.as_deref(), Some("unknown_tool"));
+}
+
+#[test]
+fn broker_validates_known_tool_input_before_executing_an_allowed_tool() {
+    let mut broker = ToolBroker::default();
+    broker
+        .register(test_tool_spec(
+            "builtin.formatter",
+            "Format code",
+            serde_json::json!({"type": "object"}),
+        ))
+        .expect("register tool");
+    let envelope = ToolCallRequest::new("call_1", "builtin.formatter", "[]");
+    let mut executed = false;
+
+    let result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
+        executed = true;
+        ToolOutput::success(serde_json::json!({"summary": "must not execute"}))
+    });
+
+    assert!(!executed);
+    assert!(!result.ok);
+    assert_eq!(result.failure_kind, Some(ToolFailureKind::Input));
+    assert_eq!(result.error_code.as_deref(), Some("invalid_tool_arguments"));
 }
 
 #[test]
