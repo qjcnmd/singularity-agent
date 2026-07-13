@@ -2128,6 +2128,7 @@ fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
             "additionalProperties": false
         }),
     });
+    request.tool_choice.mode = ToolChoiceMode::Required;
     request.tool_choice.max_tool_calls = 2;
     request.tool_choice.strict_tool_schema = true;
 
@@ -2142,7 +2143,10 @@ fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
     .expect("parse captured provider request body");
 
     assert_eq!(captured["tools"][0]["function"]["name"], "read");
-    assert_eq!(captured["tool_choice"], "auto");
+    assert_eq!(
+        captured["tool_choice"],
+        serde_json::json!({"type": "function", "function": {"name": "read"}})
+    );
     assert_eq!(captured["parallel_tool_calls"], true);
     assert_eq!(captured["tools"][0]["function"]["strict"], true);
     assert_eq!(response.tool_calls[0].tool_name, "builtin.read");
