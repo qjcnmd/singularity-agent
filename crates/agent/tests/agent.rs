@@ -10,7 +10,7 @@ use singularity_model::{
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
     ModelTurnStatus, ModelUsage, Provider, ProviderAttemptMetadata, ProviderCapabilityMetadata,
     ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
-    ProviderProtocolNegotiation,
+    ProviderProtocolNegotiation, ToolChoiceMode,
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
@@ -590,9 +590,11 @@ fn agent_loop_capability_reports_unsupported_platform_blocker() {
 #[test]
 fn agent_loop_read_only_final_answer_completes_without_verification() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello");
-    let result = agent_loop_with_response(
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_response_and_requests(
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "done"),
         allow_read_policy(),
+        Arc::clone(&seen_requests),
     )
     .run(&input);
     let run_status = result.to_run_status();
@@ -608,6 +610,12 @@ fn agent_loop_read_only_final_answer_completes_without_verification() {
     assert_eq!(run_status.tool_calls, 0);
     assert!(!run_status.verification.required);
     assert!(!run_status.verification.passed);
+    assert_eq!(
+        seen_requests.lock().expect("seen requests")[0]
+            .tool_choice
+            .mode,
+        ToolChoiceMode::Auto
+    );
 }
 
 #[test]
@@ -2103,6 +2111,8 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     );
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
     let feedback = requests[1].messages.last().expect("tool feedback");
     assert_eq!(feedback.role, ModelRole::Tool);
     let payload: serde_json::Value =
@@ -2189,6 +2199,10 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     assert_eq!(run_status.audit_events[0]["policy_evaluated"], false);
     assert_eq!(run_status.audit_events[0]["executor_started"], false);
     let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Auto);
+    assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::Auto);
     let feedback = requests[1].messages.last().expect("tool feedback");
     assert_eq!(feedback.role, ModelRole::Tool);
     let payload: serde_json::Value =
@@ -3749,9 +3763,45 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
     assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
     assert!(result.plan.as_ref().is_some_and(|plan| plan.is_completed()));
     let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::Auto);
     assert!(requests[2].messages.iter().any(|message| {
         message.role == ModelRole::Developer && message.content.contains("Complete every plan step")
     }));
+}
+
+#[test]
+fn agent_loop_fails_closed_when_required_action_returns_plain_text() {
+    let mut initial_plan = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    initial_plan.tool_calls.push(plan_tool_call(
+        "plan_call_1",
+        serde_json::json!([{"step": "inspect", "status": "in_progress"}]),
+    ));
+    let premature_final =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "not yet");
+    let plain_text =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "still working");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_plan_capabilities(
+        vec![initial_plan, premature_final, plain_text],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract::default(),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "finish the plan").with_max_turns(3));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.model_turns, 3);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("model response validation failed: tool_choice_required")
+    );
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Required);
 }
 
 #[test]

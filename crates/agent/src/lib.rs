@@ -13,8 +13,9 @@ use singularity_model::{
     ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
     ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderProtocolContract, is_strict_tool_schema_compatible, provider_error_response,
-    validate_model_request_with_capabilities, validate_model_turn_response,
+    ProviderProtocolContract, ToolChoiceMode, is_strict_tool_schema_compatible,
+    provider_error_response, validate_model_request_with_capabilities,
+    validate_model_turn_response,
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
@@ -41,7 +42,7 @@ const AGENT_LOOP_UNSUPPORTED_PLATFORM_REASON: &str =
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
 const APPROVAL_CHECKPOINT_VERSION: u32 = 1;
-const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise builtin.update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work.";
+const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise builtin.update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -1062,6 +1063,16 @@ impl AgentLoopState {
         PLAN_COMPLETION_REQUIRED.to_string()
     }
 
+    fn tool_choice_mode(&self) -> ToolChoiceMode {
+        if self.allows_final() {
+            return ToolChoiceMode::Auto;
+        }
+        if self.last_completion_error.is_some() || self.last_repair_failure.is_some() {
+            return ToolChoiceMode::Required;
+        }
+        ToolChoiceMode::Auto
+    }
+
     fn observe_model_tool_call(
         &mut self,
         call: &ModelToolCall,
@@ -1268,6 +1279,7 @@ where
                 turn_index,
                 state.messages.clone(),
                 max_tool_calls,
+                state.tool_choice_mode(),
                 capabilities,
             );
             let request_validation =
@@ -2012,6 +2024,7 @@ where
         approval_is_recoverable: bool,
     ) -> ToolBatchControl {
         let mut failure = None;
+        let mut repairable_failure = None;
         for (prepared, result) in results {
             let recoverable = is_repairable_tool_result(&result)
                 || (approval_is_recoverable
@@ -2023,6 +2036,9 @@ where
                     .unwrap_or_else(|| "tool_execution_failed".to_string())
             });
             let recovery_feedback = state.observe_tool_result(&result, &prepared.fingerprint);
+            if !result.ok && is_repairable_tool_result(&result) {
+                repairable_failure = state.last_repair_failure.clone();
+            }
             state.messages.push(tool_result_message(&result));
             state.tool_results.push(result);
             if let Some(feedback) = recovery_feedback {
@@ -2033,6 +2049,9 @@ where
             if failure.is_none() {
                 failure = non_repairable_error;
             }
+        }
+        if let Some(repairable_failure) = repairable_failure {
+            state.last_repair_failure = Some(repairable_failure);
         }
         if self.is_cancelled(input) {
             ToolBatchControl::Cancelled
@@ -2963,6 +2982,7 @@ fn model_turn_request(
     turn_index: u32,
     messages: Vec<ModelMessage>,
     max_tool_calls: u32,
+    tool_choice_mode: ToolChoiceMode,
     capabilities: &ProviderProtocolContract,
 ) -> ModelTurnRequest {
     let tools = model_tool_schemas(loop_tools);
@@ -2980,6 +3000,7 @@ fn model_turn_request(
             ..input.model_preferences.clone()
         },
     };
+    request.tool_choice.mode = tool_choice_mode;
     request.tool_choice.max_tool_calls = max_tool_calls;
     request.tool_choice.strict_tool_schema = strict_tool_schema;
     request
