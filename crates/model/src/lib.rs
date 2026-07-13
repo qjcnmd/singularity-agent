@@ -48,6 +48,8 @@ const TOOL_NAME_FALLBACK: &str = "tool";
 const CAPABILITY_PROBE_REQUEST_ID: &str = "singularity_capability_probe";
 const CAPABILITY_PROBE_TOOL_A: &str = "singularity_capability_probe_a";
 const CAPABILITY_PROBE_TOOL_B: &str = "singularity_capability_probe_b";
+const CAPABILITY_PROBE_EXPECTED_LABEL: &str = "singularity_capability_probe";
+const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1124,23 +1126,16 @@ impl OpenAiProvider {
                     )));
                 }
             };
-            let single_call_fallback =
-                profile.expected_tool_calls == 2 && capability_probe_single_call_matches(&response);
-            if single_call_fallback
-                || capability_probe_response_matches(&response, profile.expected_tool_calls)
+            let single_call_fallback = profile.single_call_fallback.filter(|_| {
+                capability_probe_single_call_matches(&response, &profile.expected_calls)
+            });
+            if single_call_fallback.is_some()
+                || capability_probe_response_matches(&response, &profile.expected_calls)
             {
                 let mut contract = profile.contract;
-                let negotiated_profile = if single_call_fallback {
+                let negotiated_profile = if let Some(fallback_profile) = single_call_fallback {
                     contract.max_tool_calls_per_turn = 1;
-                    match profile.profile {
-                        ProviderCapabilityProfile::StrictParallel => {
-                            ProviderCapabilityProfile::StrictSingle
-                        }
-                        ProviderCapabilityProfile::NonStrictParallel => {
-                            ProviderCapabilityProfile::NonStrictSingle
-                        }
-                        profile => profile,
-                    }
+                    fallback_profile
                 } else {
                     profile.profile
                 };
@@ -1600,7 +1595,14 @@ struct CapabilityProbeProfile {
     profile: ProviderCapabilityProfile,
     contract: ProviderProtocolContract,
     request: ModelTurnRequest,
-    expected_tool_calls: usize,
+    expected_calls: Vec<CapabilityProbeExpectedCall>,
+    single_call_fallback: Option<ProviderCapabilityProfile>,
+}
+
+#[derive(Debug, Clone)]
+struct CapabilityProbeExpectedCall {
+    tool_name: &'static str,
+    arguments: Option<Value>,
 }
 
 fn capability_probe_profiles(
@@ -1610,19 +1612,36 @@ fn capability_probe_profiles(
     let base = config.protocol_contract();
     let strict_schema = json!({
         "type": "object",
+        "properties": {
+            "probe": {
+                "type": "string",
+                "const": CAPABILITY_PROBE_EXPECTED_LABEL
+            },
+            "values": {
+                "type": "array",
+                "items": {
+                    "type": "integer",
+                    "const": CAPABILITY_PROBE_EXPECTED_VALUE
+                }
+            }
+        },
+        "required": ["probe", "values"],
+        "additionalProperties": false
+    });
+    let strict_arguments = json!({
+        "probe": CAPABILITY_PROBE_EXPECTED_LABEL,
+        "values": [CAPABILITY_PROBE_EXPECTED_VALUE, CAPABILITY_PROBE_EXPECTED_VALUE]
+    });
+    let native_schema = json!({
+        "type": "object",
         "properties": {},
         "required": [],
         "additionalProperties": false
     });
-    let tool_a = ModelToolSchema {
-        name: CAPABILITY_PROBE_TOOL_A.to_string(),
-        description: "Fixed capability probe tool A; no external side effect.".to_string(),
-        parameters_schema: strict_schema.clone(),
-    };
-    let tool_b = ModelToolSchema {
-        name: CAPABILITY_PROBE_TOOL_B.to_string(),
-        description: "Fixed capability probe tool B; no external side effect.".to_string(),
-        parameters_schema: strict_schema,
+    let tool = |name: &str, parameters_schema: Value| ModelToolSchema {
+        name: name.to_string(),
+        description: "Fixed capability probe tool; no external side effect.".to_string(),
+        parameters_schema,
     };
     let make_request = |tools: Vec<ModelToolSchema>,
                         mode: ToolChoiceMode,
@@ -1655,78 +1674,126 @@ fn capability_probe_profiles(
             profile: ProviderCapabilityProfile::StrictParallel,
             contract: make_contract(true, 2),
             request: make_request(
-                vec![tool_a.clone(), tool_b.clone()],
+                vec![
+                    tool(CAPABILITY_PROBE_TOOL_A, strict_schema.clone()),
+                    tool(CAPABILITY_PROBE_TOOL_B, strict_schema.clone()),
+                ],
                 ToolChoiceMode::Required,
                 2,
                 true,
                 None,
-                "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each with arguments {}.",
+                "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
             ),
-            expected_tool_calls: 2,
+            expected_calls: vec![
+                CapabilityProbeExpectedCall {
+                    tool_name: CAPABILITY_PROBE_TOOL_A,
+                    arguments: Some(strict_arguments.clone()),
+                },
+                CapabilityProbeExpectedCall {
+                    tool_name: CAPABILITY_PROBE_TOOL_B,
+                    arguments: Some(strict_arguments),
+                },
+            ],
+            single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
         },
         CapabilityProbeProfile {
             profile: ProviderCapabilityProfile::NonStrictParallel,
             contract: make_contract(false, 2),
             request: make_request(
-                vec![tool_a.clone(), tool_b],
+                vec![
+                    tool(CAPABILITY_PROBE_TOOL_A, native_schema.clone()),
+                    tool(CAPABILITY_PROBE_TOOL_B, native_schema.clone()),
+                ],
                 ToolChoiceMode::Required,
                 2,
                 false,
                 None,
-                "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each with arguments {}.",
+                "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
             ),
-            expected_tool_calls: 2,
+            expected_calls: vec![
+                CapabilityProbeExpectedCall {
+                    tool_name: CAPABILITY_PROBE_TOOL_A,
+                    arguments: None,
+                },
+                CapabilityProbeExpectedCall {
+                    tool_name: CAPABILITY_PROBE_TOOL_B,
+                    arguments: None,
+                },
+            ],
+            single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
         },
         CapabilityProbeProfile {
             profile: ProviderCapabilityProfile::NonStrictSingle,
             contract: make_contract(false, 1),
             request: make_request(
-                vec![tool_a],
-                ToolChoiceMode::SpecificTool,
+                vec![tool(CAPABILITY_PROBE_TOOL_A, native_schema)],
+                ToolChoiceMode::Required,
                 1,
                 false,
-                Some(CAPABILITY_PROBE_TOOL_A),
-                "Call singularity_capability_probe_a exactly once with arguments {}.",
+                None,
+                "Call singularity_capability_probe_a exactly once.",
             ),
-            expected_tool_calls: 1,
+            expected_calls: vec![CapabilityProbeExpectedCall {
+                tool_name: CAPABILITY_PROBE_TOOL_A,
+                arguments: None,
+            }],
+            single_call_fallback: None,
         },
     ]
 }
 
 fn capability_probe_response_matches(
     response: &ModelTurnResponse,
-    expected_tool_calls: usize,
+    expected_calls: &[CapabilityProbeExpectedCall],
 ) -> bool {
     if response.status != ModelTurnStatus::Success
-        || response.tool_calls.len() != expected_tool_calls
+        || response.tool_calls.len() != expected_calls.len()
     {
         return false;
     }
-    if expected_tool_calls == 1 {
-        return response.tool_calls[0].tool_name == CAPABILITY_PROBE_TOOL_A
-            && response.tool_calls[0].parse_status == ModelToolParseStatus::Valid
-            && response.tool_calls[0].arguments == json!({});
+
+    let mut matched = vec![false; expected_calls.len()];
+    for call in &response.tool_calls {
+        if call.parse_status != ModelToolParseStatus::Valid {
+            return false;
+        }
+        let Some(index) = expected_calls
+            .iter()
+            .enumerate()
+            .find_map(|(index, expected)| {
+                (!matched[index]
+                    && call.tool_name == expected.tool_name
+                    && expected
+                        .arguments
+                        .as_ref()
+                        .is_none_or(|arguments| call.arguments == *arguments))
+                .then_some(index)
+            })
+        else {
+            return false;
+        };
+        matched[index] = true;
     }
-    let mut names = response
-        .tool_calls
-        .iter()
-        .filter(|call| call.parse_status == ModelToolParseStatus::Valid)
-        .filter(|call| call.arguments == json!({}))
-        .map(|call| call.tool_name.as_str())
-        .collect::<Vec<_>>();
-    names.sort_unstable();
-    names == [CAPABILITY_PROBE_TOOL_A, CAPABILITY_PROBE_TOOL_B]
+    true
 }
 
-fn capability_probe_single_call_matches(response: &ModelTurnResponse) -> bool {
+fn capability_probe_single_call_matches(
+    response: &ModelTurnResponse,
+    expected_calls: &[CapabilityProbeExpectedCall],
+) -> bool {
+    let Some(call) = response.tool_calls.first() else {
+        return false;
+    };
     response.status == ModelTurnStatus::Success
         && response.tool_calls.len() == 1
-        && response.tool_calls[0].parse_status == ModelToolParseStatus::Valid
-        && response.tool_calls[0].arguments == json!({})
-        && matches!(
-            response.tool_calls[0].tool_name.as_str(),
-            CAPABILITY_PROBE_TOOL_A | CAPABILITY_PROBE_TOOL_B
-        )
+        && call.parse_status == ModelToolParseStatus::Valid
+        && expected_calls.iter().any(|expected| {
+            call.tool_name == expected.tool_name
+                && expected
+                    .arguments
+                    .as_ref()
+                    .is_none_or(|arguments| call.arguments == *arguments)
+        })
 }
 
 fn add_model_usage(total: &mut ModelUsage, usage: &ModelUsage) {
@@ -2305,7 +2372,12 @@ fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderErro
     if !response.tool_calls.is_empty() && !explicit_capability_violation {
         return ProviderError::from_model_error(error);
     }
-    if error.validation_errors.is_empty() {
+    if response.tool_calls.is_empty()
+        && !error
+            .validation_errors
+            .iter()
+            .any(|error| error == "capability_probe_native_tool_calls_missing")
+    {
         error
             .validation_errors
             .push("capability_probe_native_tool_calls_missing".to_string());

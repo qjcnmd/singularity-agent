@@ -178,6 +178,107 @@ fn configurable_probe_server(
     (format!("http://{addr}"), rx)
 }
 
+fn strict_probe_server() -> (String, Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind strict capability provider");
+    let addr = listener
+        .local_addr()
+        .expect("strict capability provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept strict capability request");
+        let mut reader =
+            BufReader::new(stream.try_clone().expect("clone strict capability stream"));
+        let (first_line, headers, request_body) = read_provider_request(&mut reader);
+        assert!(first_line.contains("/v1/chat/completions"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        tx.send(request_body.clone())
+            .expect("send strict capability request");
+
+        let request: serde_json::Value =
+            serde_json::from_str(&request_body).expect("strict capability request JSON");
+        let parameters = request
+            .pointer("/tools/0/function/parameters")
+            .expect("strict probe parameters");
+        let valid_schema = parameters["type"] == "object"
+            && parameters["required"] == serde_json::json!(["probe", "values"])
+            && parameters["additionalProperties"] == false
+            && parameters["properties"]["probe"]["const"] == "singularity_capability_probe"
+            && parameters["properties"]["values"]["type"] == "array";
+        if valid_schema {
+            write_provider_response(
+                &mut stream,
+                "HTTP/1.1 200 OK",
+                PROBE_STRICT_PARALLEL_RESPONSE,
+                true,
+            );
+        } else {
+            write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn strict_constraint_mismatch_probe_server(bad_arguments: &'static str) -> (String, Receiver<()>) {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind strict constraint capability provider");
+    let addr = listener
+        .local_addr()
+        .expect("strict constraint capability provider address");
+    let (tx, rx) = mpsc::channel();
+    let bad_response = serde_json::json!({
+        "id": "probe_strict_constraint_mismatch",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "probe_call_a",
+                        "type": "function",
+                        "function": {
+                            "name": "singularity_capability_probe_a",
+                            "arguments": bad_arguments
+                        }
+                    },
+                    {
+                        "id": "probe_call_b",
+                        "type": "function",
+                        "function": {
+                            "name": "singularity_capability_probe_b",
+                            "arguments": bad_arguments
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })
+    .to_string();
+    thread::spawn(move || {
+        for (status_line, body) in [
+            ("HTTP/1.1 200 OK", bad_response.as_str()),
+            ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
+        ] {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept strict constraint capability request");
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone strict constraint capability stream"),
+            );
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            assert!(request_body.contains("singularity_capability_probe"));
+            write_provider_response(&mut stream, status_line, body, true);
+        }
+        tx.send(())
+            .expect("send strict constraint probe completion");
+    });
+    (format!("http://{addr}"), rx)
+}
+
 fn delayed_probe_server(
     probe_responses: Vec<(&'static str, &'static str)>,
     response_delay: Duration,
@@ -257,6 +358,55 @@ const PROBE_SINGLE_RESPONSE: &str = r#"{
         "finish_reason": "tool_calls"
     }],
     "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+}"#;
+
+const PROBE_STRICT_PARALLEL_RESPONSE: &str = r#"{
+    "id": "probe_strict_parallel",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "probe_call_a",
+                    "type": "function",
+                    "function": {
+                        "name": "singularity_capability_probe_a",
+                        "arguments": "{\"probe\":\"singularity_capability_probe\",\"values\":[7,7]}"
+                    }
+                },
+                {
+                    "id": "probe_call_b",
+                    "type": "function",
+                    "function": {
+                        "name": "singularity_capability_probe_b",
+                        "arguments": "{\"probe\":\"singularity_capability_probe\",\"values\":[7,7]}"
+                    }
+                }
+            ]
+        },
+        "finish_reason": "tool_calls"
+    }]
+}"#;
+
+const PROBE_STRICT_SINGLE_RESPONSE: &str = r#"{
+    "id": "probe_strict_single",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "probe_call_a",
+                "type": "function",
+                "function": {
+                    "name": "singularity_capability_probe_a",
+                    "arguments": "{\"probe\":\"singularity_capability_probe\",\"values\":[7,7]}"
+                }
+            }
+            ]
+        },
+        "finish_reason": "tool_calls"
+    }]
 }"#;
 
 const PROBE_TEXT_RESPONSE: &str = r#"{
@@ -383,6 +533,21 @@ fn capability_probe_response(request_body: &str) -> Option<String> {
         .collect::<Vec<_>>();
     if !names.contains(&"singularity_capability_probe_a") {
         return None;
+    }
+    let strict = tools.iter().any(|tool| {
+        tool.pointer("/function/strict")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    if strict {
+        return Some(
+            if names.contains(&"singularity_capability_probe_b") {
+                PROBE_STRICT_PARALLEL_RESPONSE
+            } else {
+                PROBE_STRICT_SINGLE_RESPONSE
+            }
+            .to_string(),
+        );
     }
     let tool_calls = if names.contains(&"singularity_capability_probe_b") {
         vec![
@@ -797,9 +962,112 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
 }
 
 #[test]
+fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments() {
+    let (base_url, request_rx) = strict_probe_server();
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("strict parallel negotiation");
+
+    assert_eq!(
+        negotiation.metadata.profile,
+        ProviderCapabilityProfile::StrictParallel
+    );
+    assert!(negotiation.contract.supports_strict_tool_schema);
+    assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
+
+    let request: serde_json::Value = serde_json::from_str(
+        &request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured strict capability request"),
+    )
+    .expect("strict capability request JSON");
+    let parameters = &request["tools"][0]["function"]["parameters"];
+    assert_eq!(
+        parameters["required"],
+        serde_json::json!(["probe", "values"])
+    );
+    assert_eq!(parameters["additionalProperties"], false);
+    assert_eq!(
+        parameters["properties"]["probe"]["const"],
+        "singularity_capability_probe"
+    );
+    assert_eq!(parameters["properties"]["values"]["type"], "array");
+    assert_eq!(request["tools"][0]["function"]["strict"], true);
+}
+
+#[test]
+fn openai_capability_probe_strict_constraint_mismatch_falls_back_to_non_strict() {
+    for (case_name, bad_arguments) in [
+        ("const", r#"{"probe":"wrong_probe","values":[7,7]}"#),
+        (
+            "array",
+            r#"{"probe":"singularity_capability_probe","values":{"value":7}}"#,
+        ),
+    ] {
+        let (base_url, done) = strict_constraint_mismatch_probe_server(bad_arguments);
+        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let negotiation = Provider::negotiate_tool_capabilities(
+            &provider,
+            &ModelPreferences::default(),
+            &singularity_core::CancellationToken::new(),
+        )
+        .unwrap_or_else(|error| panic!("{case_name} mismatch should fall back: {error:?}"));
+
+        assert_eq!(
+            negotiation.metadata.profile,
+            ProviderCapabilityProfile::NonStrictSingle
+        );
+        assert!(!negotiation.contract.supports_strict_tool_schema);
+        assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
+        assert_eq!(negotiation.metadata.profile_attempts, 2);
+        assert_eq!(negotiation.metadata.fallback_count, 1);
+        done.recv_timeout(Duration::from_secs(1))
+            .expect("strict constraint probe fallback completed");
+    }
+}
+
+#[test]
+fn openai_capability_probe_non_strict_single_uses_required_tool_choice() {
+    let (base_url, requests, _started) = delayed_probe_server(
+        vec![
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 400 Bad Request", "{}"),
+            ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
+        ],
+        Duration::ZERO,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("non-strict single negotiation");
+
+    assert_eq!(
+        negotiation.metadata.profile,
+        ProviderCapabilityProfile::NonStrictSingle
+    );
+    assert!(!negotiation.contract.supports_strict_tool_schema);
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured non-strict probe requests");
+    let single_request: serde_json::Value =
+        serde_json::from_str(captured.last().expect("single probe request"))
+            .expect("single probe JSON");
+    assert_eq!(single_request["tool_choice"], "required");
+    assert_eq!(single_request["tools"].as_array().map(Vec::len), Some(1));
+    assert_eq!(single_request["tools"][0]["function"].get("strict"), None);
+}
+
+#[test]
 fn openai_capability_probe_preserves_strict_when_parallel_is_unproven() {
     let (base_url, requests) = configurable_probe_server(
-        vec![("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE)],
+        vec![("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE)],
         ACTUAL_DONE_RESPONSE,
         1,
     );
@@ -891,7 +1159,7 @@ fn openai_capability_probe_failed_single_flight_shares_typed_outcome() {
 #[test]
 fn openai_capability_probe_waiter_cancellation_is_caller_local() {
     let (base_url, requests, started) = delayed_probe_server(
-        vec![("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE)],
+        vec![("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE)],
         Duration::from_millis(250),
     );
     let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
@@ -954,8 +1222,8 @@ fn openai_capability_probe_waiter_cancellation_is_caller_local() {
 fn openai_capability_probe_owner_cancellation_allows_waiter_takeover() {
     let (base_url, requests, started) = delayed_probe_server(
         vec![
-            ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
-            ("HTTP/1.1 200 OK", PROBE_SINGLE_RESPONSE),
+            ("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE),
+            ("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE),
         ],
         Duration::from_millis(250),
     );
