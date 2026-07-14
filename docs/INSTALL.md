@@ -49,9 +49,7 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 
 可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。
 
-工具能力不是用户配置项：每次 run/resume 都调用 capability negotiation；同一 `ProviderConfigSnapshot` 与 effective model 已有成功结果时命中 snapshot cache，只有 cache miss 才执行固定、无用户数据的 probe。未固定 API endpoint 的 OpenAI-compatible base URL 先验证 Responses typed-item 协议，只有明确的 capability unsupported 或 HTTP 400/404/422 才审计式降级到 Chat Completions；显式 `/responses` 或 `/chat/completions` endpoint 不跨协议，认证、网络、限流、服务端故障和畸形响应也不触发协议降级。选中的 API protocol 与工具 capability 分开记录。
-
-probe 分别验证直接工具定义容量、strict schema、并行/单调用、Agent 实际使用的 developer/user 角色，以及 assistant tool calls → tool results → 下一轮原生工具调用的完整历史；若响应暴露无法安全回传的 reasoning content，则必须证明 adapter 能关闭该模式，否则拒绝。真实 ToolSpec 的 direct definitions 是默认模式；只有 adapter 的单 router probe 也通过并明确协商 `tool_definition_mode=routed` 时才启用有能力损失的路由模式，单纯的容量数值不足不会隐式切换。普通 coding 回合始终使用 `auto`，completion、plan 和 verification 由本地状态机 fail closed；OpenAI-compatible adapter 不从一次 `auto` 响应推断 `required` 能力。工具名在 `ToolRegistry`、模型 schema、wire 和历史中使用同一 `builtin_*` canonical name，不做隐式别名转换。真实参数仍在本地接受完整 `ToolSpec` validation，文本伪工具调用只拒绝、不解析也不执行。
+工具能力由运行时自动协商，不是用户配置项；协议选择、能力缓存、工具 schema 与 fail-closed 边界以 [架构事实文档](singularity.md#7-model-与-provider) 为准。
 
 修改配置后，新启动一次 `sg` 命令即可取得新快照。不要把 `.env` 提交到 Git。
 
