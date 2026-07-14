@@ -10,7 +10,7 @@ use singularity_model::{
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
     ModelTurnStatus, ModelUsage, Provider, ProviderAttemptMetadata, ProviderCapabilityMetadata,
     ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
-    ProviderProtocolNegotiation, ToolChoiceMode,
+    ProviderProtocolNegotiation, ProviderToolDefinitionMode, ToolChoiceMode,
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
@@ -200,10 +200,10 @@ fn agent_loop_with_capabilities_and_plan(
     let mut registry = ToolRegistry::default();
     for spec in workspace_tool_specs().into_iter().filter(|spec| {
         [
-            "builtin.read",
-            "builtin.edit",
-            "builtin.patch",
-            "builtin.command",
+            "builtin_read",
+            "builtin_edit",
+            "builtin_patch",
+            "builtin_command",
         ]
         .contains(&spec.name.as_str())
     }) {
@@ -253,10 +253,10 @@ fn workspace_tool_broker_for_test() -> ToolBroker {
     let mut registry = ToolRegistry::default();
     for spec in workspace_tool_specs().into_iter().filter(|spec| {
         [
-            "builtin.read",
-            "builtin.edit",
-            "builtin.patch",
-            "builtin.command",
+            "builtin_read",
+            "builtin_edit",
+            "builtin_patch",
+            "builtin_command",
         ]
         .contains(&spec.name.as_str())
     }) {
@@ -411,7 +411,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     edit_response.tool_calls.push(tool_call(
         "edit_call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -422,7 +422,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     verify_response.tool_calls.push(tool_call(
         "verify_call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
     ));
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
@@ -563,7 +563,7 @@ fn test_command(argument: &str) -> Vec<String> {
 fn plan_tool_call(id: &str, steps: serde_json::Value) -> ModelToolCall {
     tool_call(
         id,
-        "builtin.update_plan",
+        "builtin_update_plan",
         serde_json::json!({"steps": steps}),
     )
 }
@@ -647,7 +647,7 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
     let mut edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     edit.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -703,7 +703,7 @@ fn agent_loop_rejects_unknown_tool_response_before_execution() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.missing",
+        "builtin_missing",
         serde_json::json!({}),
     ));
 
@@ -737,7 +737,7 @@ fn agent_loop_ask_decision_blocks_without_executing_tool() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({
             "path": "README.md",
             "max_chars": null,
@@ -769,7 +769,7 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({
             "path": "README.md",
             "max_chars": null,
@@ -779,7 +779,7 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
     ));
     response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({
             "path": "CHANGELOG.md",
             "max_chars": null,
@@ -841,18 +841,18 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md"}),
     ));
     response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": ".env", "unexpected": true}),
     ));
     let mut recovery = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     recovery.tool_calls.push(tool_call(
         "call_3",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "CHANGELOG.md"}),
     ));
 
@@ -913,7 +913,7 @@ fn agent_loop_rejects_a_mutating_batch_without_partial_write() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -922,13 +922,13 @@ fn agent_loop_rejects_a_mutating_batch_without_partial_write() {
     ));
     response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md"}),
     ));
     let mut recovery = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     recovery.tool_calls.push(tool_call(
         "call_3",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md"}),
     ));
 
@@ -979,18 +979,18 @@ fn agent_loop_does_not_create_partial_approval_for_a_batch() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md"}),
     ));
     response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "CHANGELOG.md"}),
     ));
     let mut recovery = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     recovery.tool_calls.push(tool_call(
         "call_3",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "CHANGELOG.md"}),
     ));
 
@@ -1030,7 +1030,7 @@ fn agent_loop_fails_closed_on_mismatched_assistant_tool_calls() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md"}),
     ));
     response
@@ -1040,7 +1040,7 @@ fn agent_loop_fails_closed_on_mismatched_assistant_tool_calls() {
         .tool_calls
         .push(tool_call(
             "call_2",
-            "builtin.read",
+            "builtin_read",
             serde_json::json!({"path": "CHANGELOG.md"}),
         ));
 
@@ -1070,7 +1070,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "before approval");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -1122,7 +1122,7 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -1163,9 +1163,9 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "one").expect("write file");
-    let first_grant = ApprovalGrant::allow("approval_turn_1_call_1", "builtin.edit", ["README.md"]);
+    let first_grant = ApprovalGrant::allow("approval_turn_1_call_1", "builtin_edit", ["README.md"]);
     let second_grant =
-        ApprovalGrant::allow("approval_turn_1_call_2", "builtin.edit", ["README.md"]);
+        ApprovalGrant::allow("approval_turn_1_call_2", "builtin_edit", ["README.md"]);
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice")
         .with_max_turns(4)
         .with_approval_grant(first_grant.clone());
@@ -1173,7 +1173,7 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     first_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "one",
@@ -1184,7 +1184,7 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     second_response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "two",
@@ -1195,7 +1195,7 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
     reused_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "three",
@@ -1245,7 +1245,7 @@ fn agent_loop_resume_rejects_tampered_completion_checkpoint() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -1306,7 +1306,7 @@ fn agent_loop_sends_project_instructions_as_developer_message_without_serializin
         )
     );
     assert!(developer.contains(
-        "For multi-step work, keep a concise builtin.update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work."
+        "For multi-step work, keep a concise builtin_update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work."
     ));
     assert!(developer.ends_with(project_instructions));
     assert_eq!(requests[0].messages[1].content, "user goal");
@@ -1390,7 +1390,7 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
         requests[0]
             .tools
             .iter()
-            .any(|tool| tool.name == "builtin.read")
+            .any(|tool| tool.name == "builtin_read")
     );
     assert!(
         !requests[0]
@@ -1411,7 +1411,34 @@ fn agent_loop_projects_registered_tools_to_provider_request() {
 }
 
 #[test]
-fn agent_loop_routes_one_invocation_directly_and_keeps_router_history() {
+fn direct_tool_mode_rejects_capacity_shortfall_without_implicit_routing() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_capabilities(
+        vec![ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            "response_1",
+            "unused",
+        )],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract {
+            max_tools_per_request: 2,
+            tool_definition_mode: ProviderToolDefinitionMode::Direct,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("provider direct tool-definition limit (2) is below the required tool count (4)")
+    );
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
+}
+
+#[test]
+fn agent_loop_uses_explicit_routed_tool_mode_and_keeps_router_history() {
     let workspace = tempfile::tempdir().expect("workspace");
     std::fs::write(workspace.path().join("README.md"), "hello").expect("write file");
     let read_arguments = serde_json::json!({
@@ -1423,7 +1450,7 @@ fn agent_loop_routes_one_invocation_directly_and_keeps_router_history() {
     let mut routed_read = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     routed_read.tool_calls.push(invoke_tool_call(
         "read_1",
-        "builtin.read",
+        "builtin_read",
         read_arguments.clone(),
     ));
     let final_response =
@@ -1436,6 +1463,7 @@ fn agent_loop_routes_one_invocation_directly_and_keeps_router_history() {
         ProviderProtocolContract {
             max_tool_calls_per_turn: 2,
             max_tools_per_request: 2,
+            tool_definition_mode: ProviderToolDefinitionMode::Routed,
             ..ProviderProtocolContract::default()
         },
     )
@@ -1445,7 +1473,7 @@ fn agent_loop_routes_one_invocation_directly_and_keeps_router_history() {
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.tool_calls, 1);
     assert!(result.tool_results.iter().all(|tool_result| tool_result.ok));
-    assert_eq!(result.tool_results[0].tool_name, "builtin.read");
+    assert_eq!(result.tool_results[0].tool_name, "builtin_read");
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 2);
     assert_eq!(
@@ -1461,13 +1489,13 @@ fn agent_loop_routes_one_invocation_directly_and_keeps_router_history() {
         .expect("router branches");
     let read_branch = branches
         .iter()
-        .find(|branch| branch["properties"]["tool_name"]["const"] == "builtin.read")
+        .find(|branch| branch["properties"]["tool_name"]["const"] == "builtin_read")
         .expect("read router branch");
     assert_eq!(read_branch["properties"]["arguments"]["type"], "object");
     assert!(
         branches
             .iter()
-            .any(|branch| branch["properties"]["tool_name"]["const"] == "builtin.update_plan")
+            .any(|branch| branch["properties"]["tool_name"]["const"] == "builtin_update_plan")
     );
     assert!(
         !branches
@@ -1500,11 +1528,14 @@ fn agent_loop_routes_one_invocation_directly_and_keeps_router_history() {
         .iter()
         .find(|message| message.tool_call_id.as_deref() == Some("read_1"))
         .expect("routed tool result history");
-    assert_eq!(routed_result.name.as_deref(), Some(BUILTIN_INVOKE_TOOL));
+    assert_eq!(
+        routed_result.tool_call_id.as_deref(),
+        Some(routed_outer.tool_call_id.as_str())
+    );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&routed_result.content)
             .expect("routed tool result payload")["tool_name"],
-        "builtin.read"
+        "builtin_read"
     );
     assert!(
         requests[0].messages[0]
@@ -1526,7 +1557,7 @@ fn routed_edit_enters_approval_and_resume_executes_canonical_edit() {
     let mut routed_edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     routed_edit.tool_calls.push(invoke_tool_call(
         "edit_1",
-        "builtin.edit",
+        "builtin_edit",
         edit_arguments.clone(),
     ));
     let agent_loop = agent_loop_with_plan_capabilities(
@@ -1535,6 +1566,7 @@ fn routed_edit_enters_approval_and_resume_executes_canonical_edit() {
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
             max_tools_per_request: 2,
+            tool_definition_mode: ProviderToolDefinitionMode::Routed,
             ..ProviderProtocolContract::default()
         },
     )
@@ -1549,7 +1581,7 @@ fn routed_edit_enters_approval_and_resume_executes_canonical_edit() {
     );
     assert_eq!(blocked.pending_tool_calls.len(), 1);
     let pending = blocked.pending_tool_calls[0].clone();
-    assert_eq!(pending.tool_name, "builtin.edit");
+    assert_eq!(pending.tool_name, "builtin_edit");
     assert_eq!(pending.raw_arguments, edit_arguments.to_string());
     assert_eq!(
         blocked.tool_results[0].failure_kind,
@@ -1563,7 +1595,7 @@ fn routed_edit_enters_approval_and_resume_executes_canonical_edit() {
         .and_then(|messages| messages.last())
         .expect("checkpoint assistant message")["tool_calls"][0];
     assert_eq!(checkpoint_call["tool_name"], BUILTIN_INVOKE_TOOL);
-    assert_eq!(checkpoint_call["arguments"]["tool_name"], "builtin.edit");
+    assert_eq!(checkpoint_call["arguments"]["tool_name"], "builtin_edit");
     assert_eq!(checkpoint_call["arguments"]["arguments"], edit_arguments);
 
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
@@ -1603,7 +1635,7 @@ fn routed_edit_enters_approval_and_resume_executes_canonical_edit() {
         resumed
             .tool_results
             .last()
-            .is_some_and(|result| { result.tool_name == "builtin.edit" && result.ok })
+            .is_some_and(|result| { result.tool_name == "builtin_edit" && result.ok })
     );
 }
 
@@ -1614,7 +1646,7 @@ fn routed_input_failure_is_repaired_on_the_next_router_call() {
     let mut invalid_read = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     invalid_read.tool_calls.push(invoke_tool_call(
         "read_invalid",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({
             "path": "",
             "max_chars": null,
@@ -1626,7 +1658,7 @@ fn routed_input_failure_is_repaired_on_the_next_router_call() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     corrected_read.tool_calls.push(invoke_tool_call(
         "read_valid",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({
             "path": "README.md",
             "max_chars": null,
@@ -1645,6 +1677,7 @@ fn routed_input_failure_is_repaired_on_the_next_router_call() {
         Arc::clone(&seen_requests),
         ProviderProtocolContract {
             max_tools_per_request: 2,
+            tool_definition_mode: ProviderToolDefinitionMode::Routed,
             ..ProviderProtocolContract::default()
         },
     )
@@ -1657,7 +1690,7 @@ fn routed_input_failure_is_repaired_on_the_next_router_call() {
         result.tool_results[0].failure_kind,
         Some(ToolFailureKind::Input)
     );
-    assert_eq!(result.tool_results[1].tool_name, "builtin.read");
+    assert_eq!(result.tool_results[1].tool_name, "builtin_read");
     assert!(result.tool_results[1].ok);
     assert_eq!(
         result.to_run_status().audit_events[0]["argument_validation_code"],
@@ -1675,7 +1708,7 @@ fn routed_input_failure_is_repaired_on_the_next_router_call() {
             .as_array()
             .is_some_and(|branches| {
                 branches.iter().any(|branch| {
-                    branch["properties"]["tool_name"]["const"] == "builtin.read"
+                    branch["properties"]["tool_name"]["const"] == "builtin_read"
                         && branch["properties"]["arguments"]["properties"]
                             .get("path")
                             .is_some()
@@ -1689,7 +1722,7 @@ fn agent_loop_rejects_registered_tool_hidden_by_the_current_view() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "read_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md"}),
     ));
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
@@ -1699,6 +1732,7 @@ fn agent_loop_rejects_registered_tool_hidden_by_the_current_view() {
         Arc::clone(&seen_requests),
         ProviderProtocolContract {
             max_tools_per_request: 2,
+            tool_definition_mode: ProviderToolDefinitionMode::Routed,
             ..ProviderProtocolContract::default()
         },
     )
@@ -1719,7 +1753,7 @@ fn invalid_routed_tool_is_typed_and_never_enters_policy_or_workspace_execution()
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(invoke_tool_call(
         "invoke_1",
-        "builtin.missing",
+        "builtin_missing",
         serde_json::json!({}),
     ));
     let result = agent_loop_with_plan_capabilities(
@@ -1728,6 +1762,7 @@ fn invalid_routed_tool_is_typed_and_never_enters_policy_or_workspace_execution()
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
             max_tools_per_request: 2,
+            tool_definition_mode: ProviderToolDefinitionMode::Routed,
             ..ProviderProtocolContract::default()
         },
     )
@@ -1768,6 +1803,7 @@ fn router_rejects_self_invocation_as_a_visibility_failure() {
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
             max_tools_per_request: 2,
+            tool_definition_mode: ProviderToolDefinitionMode::Routed,
             ..ProviderProtocolContract::default()
         },
     )
@@ -1789,13 +1825,13 @@ fn router_rejects_self_invocation_as_a_visibility_failure() {
 #[test]
 fn malformed_router_outer_envelope_is_repairable_input_without_policy_or_execution() {
     let malformed_inputs = [
-        serde_json::json!({"tool_name": "builtin.read"}),
+        serde_json::json!({"tool_name": "builtin_read"}),
         serde_json::json!({
-            "tool_name": "builtin.read",
+            "tool_name": "builtin_read",
             "arguments": {"path": "README.md"},
             "extra": true
         }),
-        serde_json::json!({"tool_name": "builtin.read", "arguments": "not an object"}),
+        serde_json::json!({"tool_name": "builtin_read", "arguments": "not an object"}),
     ];
 
     for (index, arguments) in malformed_inputs.into_iter().enumerate() {
@@ -1810,6 +1846,7 @@ fn malformed_router_outer_envelope_is_repairable_input_without_policy_or_executi
             Arc::new(Mutex::new(Vec::new())),
             ProviderProtocolContract {
                 max_tools_per_request: 2,
+                tool_definition_mode: ProviderToolDefinitionMode::Routed,
                 ..ProviderProtocolContract::default()
             },
         )
@@ -1867,7 +1904,7 @@ fn agent_loop_uses_provider_capabilities_for_budget_metadata() {
 
 #[test]
 fn router_tool_view_reserves_the_router_schema_in_context_budget() {
-    let run_with_capacity = |max_tools_per_request| {
+    let run_with_mode = |tool_definition_mode, max_tools_per_request| {
         let seen_requests = Arc::new(Mutex::new(Vec::new()));
         let result = agent_loop_with_plan_capabilities(
             vec![ModelTurnResponse::completed(
@@ -1879,6 +1916,7 @@ fn router_tool_view_reserves_the_router_schema_in_context_budget() {
             Arc::clone(&seen_requests),
             ProviderProtocolContract {
                 max_tools_per_request,
+                tool_definition_mode,
                 ..ProviderProtocolContract::default()
             },
         )
@@ -1886,8 +1924,8 @@ fn router_tool_view_reserves_the_router_schema_in_context_budget() {
         (result, seen_requests)
     };
 
-    let (full, _) = run_with_capacity(8);
-    let (routed, routed_requests) = run_with_capacity(2);
+    let (full, _) = run_with_mode(ProviderToolDefinitionMode::Direct, 8);
+    let (routed, routed_requests) = run_with_mode(ProviderToolDefinitionMode::Routed, 1);
 
     assert_eq!(full.status, AgentStatus::Completed);
     assert_eq!(routed.status, AgentStatus::Completed);
@@ -1940,7 +1978,7 @@ fn agent_loop_rejects_unsupported_tool_capability_before_provider() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md"}),
     ));
     let result = agent_loop_with_capabilities(
@@ -2002,7 +2040,7 @@ fn agent_loop_executes_workspace_read_tool_with_safe_tool_result() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md", "max_chars": 64}),
     ));
 
@@ -2031,7 +2069,7 @@ fn agent_loop_rechecks_context_budget_before_each_model_request() {
     };
     let mut oversized_call = tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md", "max_chars": 64}),
     );
     oversized_call.raw_arguments = serde_json::json!({
@@ -2084,7 +2122,7 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": test_command("success"),
             "cwd": ".",
@@ -2095,7 +2133,7 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     required_verification.tool_calls.push(tool_call(
         "call_2",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": required_argv,
             "cwd": ".",
@@ -2181,7 +2219,7 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
         );
         response.tool_calls.push(tool_call(
             call_id,
-            "builtin.command",
+            "builtin_command",
             serde_json::json!({
                 "argv": test_command(argument),
                 "cwd": ".",
@@ -2194,7 +2232,7 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
     let mut edit = ModelTurnResponse::completed("model_request_turn_1_1", "response_1", "");
     edit.tool_calls.push(tool_call(
         "edit_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -2255,13 +2293,13 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
     let mut denied = ModelTurnResponse::completed("model_request_turn_1_0", "response_0", "");
     denied.tool_calls.push(tool_call(
         "denied",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "README.md"}),
     ));
     let mut allowed = ModelTurnResponse::completed("model_request_turn_1_1", "response_1", "");
     allowed.tool_calls.push(tool_call(
         "allowed",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": "CHANGELOG.md"}),
     ));
     let final_response =
@@ -2348,7 +2386,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let mut edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_0", "");
     edit.tool_calls.push(tool_call(
         "edit_0",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -2363,7 +2401,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         );
         response.tool_calls.push(tool_call(
             call_id,
-            "builtin.command",
+            "builtin_command",
             serde_json::json!({
                 "argv": argv,
                 "cwd": ".",
@@ -2462,14 +2500,14 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     let input = AgentLoopInput {
         max_turns: 3,
         ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "builtin.edit", ["README.md"]),
+            ApprovalGrant::allow("approval_turn_1_call_1", "builtin_edit", ["README.md"]),
         )
     };
     let mut tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "before edit");
     tool_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -2480,7 +2518,7 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     verification_response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": ["cargo", "test"], "timeout_seconds": 5}),
     ));
     let final_response =
@@ -2543,7 +2581,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     failing_tool_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "missing",
@@ -2554,7 +2592,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     repaired_tool_response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -2565,7 +2603,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
     verification_response.tool_calls.push(tool_call(
         "call_3",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": ["cargo", "test"], "timeout_seconds": 5}),
     ));
     let final_response =
@@ -2645,21 +2683,21 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     malformed_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": "[\"cargo\",\"test\"]", "timeout_seconds": 5}),
     ));
     let mut repaired_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     repaired_response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
     ));
     let mut second_repaired_response =
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
     second_repaired_response.tool_calls.push(tool_call(
         "call_3",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": test_command("second-success"), "timeout_seconds": 5}),
     ));
     let final_response =
@@ -2755,7 +2793,7 @@ fn agent_loop_validates_patch_arguments_before_policy() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     malformed_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.patch",
+        "builtin_patch",
         serde_json::json!({"changes": "README.md"}),
     ));
     let result = agent_loop_with_response(
@@ -2798,7 +2836,7 @@ fn agent_loop_command_fails_closed_without_sandbox_backend() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": test_command("success"),
             "timeout_seconds": 5
@@ -2870,7 +2908,7 @@ fn agent_loop_command_uses_strict_sandbox_backend_when_injected() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": test_command("success"),
             "timeout_seconds": 5
@@ -2913,7 +2951,7 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": test_command("failure"),
             "timeout_seconds": 5
@@ -2923,7 +2961,7 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     repaired_command_response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": test_command("repaired"),
             "timeout_seconds": 5
@@ -2986,7 +3024,7 @@ fn agent_loop_cancels_a_running_sandbox_command() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": ["cargo", "test"], "timeout_seconds": 30}),
     ));
     let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
@@ -3042,7 +3080,7 @@ fn agent_loop_rejects_model_selected_network_before_approval() {
         ..AgentLoopInput::new("thread_1", "turn_1", "run network command").with_approval_grant(
             ApprovalGrant::allow(
                 "approval_turn_1_call_1",
-                "builtin.command",
+                "builtin_command",
                 [resource.clone()],
             ),
         )
@@ -3050,7 +3088,7 @@ fn agent_loop_rejects_model_selected_network_before_approval() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": argv,
             "network_access": "allowed",
@@ -3118,7 +3156,7 @@ fn agent_loop_uses_exact_command_binding_without_exposing_execution_policy() {
     let mut registry = ToolRegistry::default();
     let mut command = workspace_tool_specs()
         .into_iter()
-        .find(|spec| spec.name == "builtin.command")
+        .find(|spec| spec.name == "builtin_command")
         .expect("command spec");
     command
         .restrict_to_input_bindings(vec![(model_input.clone(), execution_input)])
@@ -3129,7 +3167,7 @@ fn agent_loop_uses_exact_command_binding_without_exposing_execution_policy() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response
         .tool_calls
-        .push(tool_call("call_1", "builtin.command", model_input));
+        .push(tool_call("call_1", "builtin_command", model_input));
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
@@ -3162,7 +3200,7 @@ fn agent_loop_uses_exact_command_binding_without_exposing_execution_policy() {
     let command_schema = requests[0]
         .tools
         .iter()
-        .find(|tool| tool.name == "builtin.command")
+        .find(|tool| tool.name == "builtin_command")
         .expect("projected command schema")
         .parameters_schema
         .to_string();
@@ -3198,7 +3236,7 @@ fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume(
         ..AgentLoopInput::new("thread_1", "turn_1", "run command").with_approval_grant(
             ApprovalGrant::allow(
                 "approval_turn_1_call_1",
-                "builtin.command",
+                "builtin_command",
                 [mismatched_resource],
             ),
         )
@@ -3219,11 +3257,11 @@ fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume(
     });
     command_response
         .tool_calls
-        .push(tool_call("call_1", "builtin.command", model_input.clone()));
+        .push(tool_call("call_1", "builtin_command", model_input.clone()));
     let mut registry = ToolRegistry::default();
     let mut command = workspace_tool_specs()
         .into_iter()
-        .find(|spec| spec.name == "builtin.command")
+        .find(|spec| spec.name == "builtin_command")
         .expect("command spec");
     command
         .restrict_to_input_bindings(vec![(model_input, execution_input)])
@@ -3301,7 +3339,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": test_command("success"),
             "timeout_seconds": 5
@@ -3489,14 +3527,14 @@ fn agent_loop_approval_grant_matches_request_id_and_is_single_use() {
     std::fs::write(&file_path, "one").expect("write file");
     let input = AgentLoopInput {
         ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "builtin.edit", ["README.md"]),
+            ApprovalGrant::allow("approval_turn_1_call_1", "builtin_edit", ["README.md"]),
         )
     };
     let mut first_tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     first_tool_response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "one",
@@ -3507,7 +3545,7 @@ fn agent_loop_approval_grant_matches_request_id_and_is_single_use() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     second_tool_response.tool_calls.push(tool_call(
         "call_2",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "two",
@@ -3551,13 +3589,13 @@ fn agent_loop_approval_grant_does_not_override_sensitive_resource_deny() {
         let input = AgentLoopInput {
             max_turns: 1,
             ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-                ApprovalGrant::allow("approval_turn_1_call_1", "builtin.edit", [sensitive_path]),
+                ApprovalGrant::allow("approval_turn_1_call_1", "builtin_edit", [sensitive_path]),
             )
         };
         let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
         response.tool_calls.push(tool_call(
             "call_1",
-            "builtin.edit",
+            "builtin_edit",
             serde_json::json!({
                 "path": sensitive_path,
                 "expected": "TOKEN=secret",
@@ -3598,13 +3636,13 @@ fn agent_loop_patch_grant_does_not_override_sensitive_resource_deny() {
     let input = AgentLoopInput {
         max_turns: 1,
         ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "builtin.patch", [".env"]),
+            ApprovalGrant::allow("approval_turn_1_call_1", "builtin_patch", [".env"]),
         )
     };
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.patch",
+        "builtin_patch",
         serde_json::json!({
             "changes": [{
                 "path": ".env",
@@ -3650,7 +3688,7 @@ fn agent_loop_patch_policy_checks_every_change_path_before_writing() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.patch",
+        "builtin_patch",
         serde_json::json!({
             "changes": [
                 {
@@ -3719,7 +3757,7 @@ fn agent_loop_patch_approval_request_covers_unapproved_change_path() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.patch",
+        "builtin_patch",
         serde_json::json!({
             "changes": [
                 {
@@ -3784,13 +3822,13 @@ fn agent_loop_approval_grant_requires_exact_resource_set() {
     let input = AgentLoopInput {
         max_turns: 1,
         ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "builtin.patch", ["first.md"]),
+            ApprovalGrant::allow("approval_turn_1_call_1", "builtin_patch", ["first.md"]),
         )
     };
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.patch",
+        "builtin_patch",
         serde_json::json!({
             "changes": [
                 {
@@ -3841,7 +3879,7 @@ fn agent_loop_denies_sensitive_workspace_tool_before_execution() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin.read",
+        "builtin_read",
         serde_json::json!({"path": ".env"}),
     ));
 
@@ -4195,7 +4233,7 @@ fn plan_update_is_brokered_and_returns_safe_summary() {
     );
     assert_eq!(result.recovery_metrics, AgentRecoveryMetrics::default());
     let payload = result.tool_results[0].to_message_payload();
-    assert_eq!(payload["tool_name"], "builtin.update_plan");
+    assert_eq!(payload["tool_name"], "builtin_update_plan");
     assert_eq!(
         payload["content"]["plan"]["steps"][0]["step"],
         "inspect the workspace"
@@ -4256,7 +4294,7 @@ fn plan_update_rejects_empty_duplicate_and_multiple_in_progress_steps() {
 fn plan_tool_contract_preserves_actionable_validation_causes() {
     let spec = agent_control_tool_specs()
         .into_iter()
-        .find(|spec| spec.name == "builtin.update_plan")
+        .find(|spec| spec.name == "builtin_update_plan")
         .expect("plan tool spec");
     let too_many = (0..65)
         .map(|index| serde_json::json!({"step": format!("step {index}"), "status": "pending"}))
@@ -4369,7 +4407,7 @@ fn plan_tool_schema_matches_runtime_bounds() {
         .into_iter()
         .next()
         .expect("plan tool spec");
-    assert_eq!(spec.name, "builtin.update_plan");
+    assert_eq!(spec.name, "builtin_update_plan");
     assert_eq!(spec.input_schema["properties"]["steps"]["minItems"], 1);
     assert_eq!(spec.input_schema["properties"]["steps"]["maxItems"], 64);
     assert_eq!(
@@ -4464,7 +4502,7 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
 }
 
 #[test]
-fn negotiated_required_tool_choice_tracks_all_completion_invariants() {
+fn negotiated_required_capability_does_not_override_completion_state() {
     let workspace = tempfile::tempdir().expect("workspace");
     let canonical_cwd = std::fs::canonicalize(workspace.path())
         .expect("canonical workspace")
@@ -4498,7 +4536,7 @@ fn negotiated_required_tool_choice_tracks_all_completion_invariants() {
     let mut verification = ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
     verification.tool_calls.push(tool_call(
         "command_call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({
             "argv": verification_argv,
             "cwd": ".",
@@ -4535,10 +4573,11 @@ fn negotiated_required_tool_choice_tracks_all_completion_invariants() {
     assert!(result.plan.as_ref().is_some_and(AgentPlan::is_completed));
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 4);
-    assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Required);
-    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
-    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Required);
-    assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::Auto);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.tool_choice.mode == ToolChoiceMode::Auto)
+    );
 }
 
 #[test]
@@ -4599,19 +4638,19 @@ fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments()
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     first_invalid.tool_calls.push(tool_call(
         "call_1",
-        "builtin.command",
+        "builtin_command",
         invalid_arguments.clone(),
     ));
     let mut second_invalid =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     second_invalid
         .tool_calls
-        .push(tool_call("call_2", "builtin.command", invalid_arguments));
+        .push(tool_call("call_2", "builtin_command", invalid_arguments));
     let mut successful_command =
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
     successful_command.tool_calls.push(tool_call(
         "call_3",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
     ));
     let final_response =
@@ -4678,7 +4717,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     edit_response.tool_calls.push(tool_call(
         "edit_call_1",
-        "builtin.edit",
+        "builtin_edit",
         serde_json::json!({
             "path": "README.md",
             "expected": "before",
@@ -4700,7 +4739,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
     verify_response.tool_calls.push(tool_call(
         "verify_call_1",
-        "builtin.command",
+        "builtin_command",
         serde_json::json!({"argv": test_command("success"), "timeout_seconds": 5}),
     ));
     verify_response.usage = ModelUsage {

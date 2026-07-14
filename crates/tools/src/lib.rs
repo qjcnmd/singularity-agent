@@ -66,12 +66,12 @@ const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "reveal hidden",
     "system prompt",
 ];
-pub const BUILTIN_READ_TOOL: &str = "builtin.read";
-pub const BUILTIN_LIST_TOOL: &str = "builtin.list";
-pub const BUILTIN_GREP_TOOL: &str = "builtin.grep";
-pub const BUILTIN_EDIT_TOOL: &str = "builtin.edit";
-pub const BUILTIN_PATCH_TOOL: &str = "builtin.patch";
-pub const BUILTIN_COMMAND_TOOL: &str = "builtin.command";
+pub const BUILTIN_READ_TOOL: &str = "builtin_read";
+pub const BUILTIN_LIST_TOOL: &str = "builtin_list";
+pub const BUILTIN_GREP_TOOL: &str = "builtin_grep";
+pub const BUILTIN_EDIT_TOOL: &str = "builtin_edit";
+pub const BUILTIN_PATCH_TOOL: &str = "builtin_patch";
+pub const BUILTIN_COMMAND_TOOL: &str = "builtin_command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2020,13 +2020,18 @@ pub fn command_scope_digest(
 }
 
 fn validate_tool_name(name: &str) -> Result<(), String> {
-    let parts = name.split('.').collect::<Vec<_>>();
-    if parts.iter().any(|part| part.is_empty()) {
-        return Err(format!("tool name has an empty namespace segment: {name}"));
-    }
-    match parts.as_slice() {
-        ["builtin", _tool] => Ok(()),
-        _ => Err(format!("tool name must use builtin.<tool>: {name}")),
+    let Some(tool) = name.strip_prefix("builtin_") else {
+        return Err(format!("tool name must use builtin_<tool>: {name}"));
+    };
+    if tool.is_empty()
+        || name.len() > 64
+        || !tool
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        Err(format!("tool name is not provider-portable: {name}"))
+    } else {
+        Ok(())
     }
 }
 

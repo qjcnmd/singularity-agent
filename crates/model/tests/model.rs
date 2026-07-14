@@ -6,10 +6,10 @@ use singularity_model::{
     ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderAttemptMetadata, ProviderCapabilityProfile, ProviderConfigSnapshot,
     ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
-    ProviderProtocolContract, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
-    classify_model_error, resolve_provider_config, validate_model_request,
-    validate_model_request_with_capabilities, validate_model_response,
-    validate_model_turn_response, validate_provider_config,
+    ProviderProtocolContract, ProviderToolDefinitionMode, ProviderToolReasoningMode,
+    ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint, classify_model_error,
+    resolve_provider_config, validate_model_request, validate_model_request_with_capabilities,
+    validate_model_response, validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -75,7 +75,7 @@ fn capability_test_request(
         request.model_preferences.model_name = Some(model_name.to_string());
     }
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({
             "type": "object",
@@ -153,14 +153,10 @@ fn configurable_probe_server(
             let (first_line, headers, request_body) = read_provider_request(&mut reader);
             assert!(first_line.contains("/v1/chat/completions"));
             assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if is_required_tool_choice_request(&request_body) {
-                let probe_body = required_tool_choice_probe_response(&request_body)
-                    .expect("required capability probe response");
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
-                if actual_count == 0 && probe_index == probe_responses.len() {
-                    tx.send(seen_requests).expect("send probe-only requests");
-                    break;
-                }
+            if is_capability_probe_continuation_request(&request_body) {
+                let body = capability_probe_response(&request_body)
+                    .expect("capability continuation response");
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, true);
                 continue;
             }
             if request_body.contains("singularity_capability_probe") {
@@ -170,10 +166,7 @@ fn configurable_probe_server(
                     .expect("capability probe response configured");
                 probe_index += 1;
                 write_provider_response(&mut stream, status_line, body, true);
-                if actual_count == 0
-                    && probe_index == probe_responses.len()
-                    && !base_probe_requires_required_tool_choice(status_line, body)
-                {
+                if actual_count == 0 && probe_index == probe_responses.len() {
                     tx.send(seen_requests).expect("send probe-only requests");
                     break;
                 }
@@ -191,36 +184,6 @@ fn configurable_probe_server(
     (format!("http://{addr}"), rx)
 }
 
-fn required_choice_probe_transport_failure_server() -> (String, Receiver<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind required transport provider");
-    let addr = listener
-        .local_addr()
-        .expect("required transport provider address");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept base capability request");
-        let mut reader = BufReader::new(stream.try_clone().expect("clone base capability stream"));
-        let (_, _, request_body) = read_provider_request(&mut reader);
-        assert!(!is_required_tool_choice_request(&request_body));
-        write_provider_response(
-            &mut stream,
-            "HTTP/1.1 200 OK",
-            PROBE_STRICT_PARALLEL_RESPONSE,
-            true,
-        );
-        let (stream, _) = listener
-            .accept()
-            .expect("accept required transport request");
-        let mut reader =
-            BufReader::new(stream.try_clone().expect("clone required transport stream"));
-        let (_, _, request_body) = read_provider_request(&mut reader);
-        assert!(is_required_tool_choice_request(&request_body));
-        tx.send(()).expect("send required transport started");
-        drop(stream);
-    });
-    (format!("http://{addr}"), rx)
-}
-
 fn strict_probe_server() -> (String, Receiver<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind strict capability provider");
     let addr = listener
@@ -228,49 +191,134 @@ fn strict_probe_server() -> (String, Receiver<Vec<String>>) {
         .expect("strict capability provider address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut requests = Vec::new();
-        loop {
-            let (mut stream, _) = listener.accept().expect("accept strict capability request");
-            let mut reader =
-                BufReader::new(stream.try_clone().expect("clone strict capability stream"));
-            let (first_line, headers, request_body) = read_provider_request(&mut reader);
-            assert!(first_line.contains("/v1/chat/completions"));
-            assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if is_required_tool_choice_request(&request_body) {
-                requests.push(request_body.clone());
-                let probe_body = required_tool_choice_probe_response(&request_body)
-                    .expect("required capability probe response");
-                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
-                tx.send(requests).expect("send strict capability requests");
-                break;
-            }
-            requests.push(request_body.clone());
+        let (mut stream, _) = listener.accept().expect("accept strict capability request");
+        let mut reader =
+            BufReader::new(stream.try_clone().expect("clone strict capability stream"));
+        let (first_line, headers, request_body) = read_provider_request(&mut reader);
+        assert!(first_line.contains("/v1/chat/completions"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
 
+        let request: serde_json::Value =
+            serde_json::from_str(&request_body).expect("strict capability request JSON");
+        let parameters = request
+            .pointer("/tools/0/function/parameters")
+            .expect("strict probe parameters");
+        let branch = parameters
+            .pointer("/oneOf/0")
+            .unwrap_or(&serde_json::Value::Null);
+        let valid_schema = parameters["oneOf"].as_array().map(Vec::len) == Some(2)
+            && branch["type"] == "object"
+            && branch["required"] == serde_json::json!(["probe", "values"])
+            && branch["additionalProperties"] == false
+            && branch["properties"]["probe"]["const"] == "schema_sentinel_alpha"
+            && branch["properties"]["values"]["type"] == "array";
+        let valid_roles = request["messages"][0]["role"] == "developer"
+            && request["messages"][1]["role"] == "user";
+        if valid_schema && valid_roles {
+            write_provider_response(
+                &mut stream,
+                "HTTP/1.1 200 OK",
+                PROBE_STRICT_PARALLEL_RESPONSE,
+                true,
+            );
+        } else {
+            write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
+            tx.send(vec![request_body])
+                .expect("send invalid strict capability request");
+            return;
+        }
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept strict capability continuation");
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .expect("clone strict capability continuation stream"),
+        );
+        let (_, _, continuation_body) = read_provider_request(&mut reader);
+        let response = capability_probe_response(&continuation_body)
+            .expect("strict capability continuation response");
+        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
+        tx.send(vec![request_body, continuation_body])
+            .expect("send strict capability requests");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn reasoning_stabilization_probe_server(
+    disabled_status: &'static str,
+    disabled_body: &'static str,
+    actual_body: &'static str,
+    actual_count: usize,
+) -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind reasoning capability provider");
+    let addr = listener
+        .local_addr()
+        .expect("reasoning capability provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        let mut actual_seen = 0;
+        loop {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept reasoning capability request");
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone reasoning capability stream"),
+            );
+            let (_, _, request_body) = read_provider_request(&mut reader);
             let request: serde_json::Value =
-                serde_json::from_str(&request_body).expect("strict capability request JSON");
-            let parameters = request
-                .pointer("/tools/0/function/parameters")
-                .expect("strict probe parameters");
-            let branch = parameters
-                .pointer("/oneOf/0")
-                .unwrap_or(&serde_json::Value::Null);
-            let valid_schema = parameters["oneOf"].as_array().map(Vec::len) == Some(2)
-                && branch["type"] == "object"
-                && branch["required"] == serde_json::json!(["probe", "values"])
-                && branch["additionalProperties"] == false
-                && branch["properties"]["probe"]["const"] == "schema_sentinel_alpha"
-                && branch["properties"]["values"]["type"] == "array";
-            let valid_roles = request["messages"][0]["role"] == "developer"
-                && request["messages"][1]["role"] == "user";
-            if valid_schema && valid_roles {
-                write_provider_response(
-                    &mut stream,
-                    "HTTP/1.1 200 OK",
-                    PROBE_STRICT_PARALLEL_RESPONSE,
-                    true,
-                );
-            } else {
-                write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
+                serde_json::from_str(&request_body).expect("reasoning capability request JSON");
+            requests.push(request_body);
+            if is_capability_probe_continuation_request(
+                requests.last().expect("continuation request"),
+            ) {
+                assert_eq!(request["thinking"]["type"], "disabled");
+                let response =
+                    capability_probe_response(requests.last().expect("continuation request body"))
+                        .expect("reasoning capability continuation response");
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
+                if actual_count == 0 {
+                    tx.send(requests).expect("send reasoning probe requests");
+                    break;
+                }
+                continue;
+            }
+            if request["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("singularity_capability_probe"))
+                })
+            }) {
+                if request
+                    .pointer("/thinking/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("disabled")
+                {
+                    write_provider_response(&mut stream, disabled_status, disabled_body, true);
+                } else {
+                    write_provider_response(
+                        &mut stream,
+                        "HTTP/1.1 200 OK",
+                        PROBE_STRICT_PARALLEL_REASONING_RESPONSE,
+                        true,
+                    );
+                }
+                if actual_count == 0 && requests.len() == 2 {
+                    tx.send(requests).expect("send reasoning probe requests");
+                    break;
+                }
+                continue;
+            }
+            actual_seen += 1;
+            write_provider_response(&mut stream, "HTTP/1.1 200 OK", actual_body, true);
+            if actual_seen == actual_count {
+                tx.send(requests)
+                    .expect("send reasoning negotiation requests");
+                break;
             }
         }
     });
@@ -335,17 +383,16 @@ fn strict_constraint_mismatch_probe_server(bad_arguments: &'static str) -> (Stri
         }
         let (mut stream, _) = listener
             .accept()
-            .expect("accept required capability request");
+            .expect("accept strict constraint continuation request");
         let mut reader = BufReader::new(
             stream
                 .try_clone()
-                .expect("clone required capability stream"),
+                .expect("clone strict constraint continuation stream"),
         );
         let (_, _, request_body) = read_provider_request(&mut reader);
-        assert!(is_required_tool_choice_request(&request_body));
-        let probe_body = required_tool_choice_probe_response(&request_body)
-            .expect("required capability probe response");
-        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
+        let response = capability_probe_response(&request_body)
+            .expect("strict constraint continuation response");
+        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
         tx.send(())
             .expect("send strict constraint probe completion");
     });
@@ -364,10 +411,8 @@ fn delayed_probe_server(
     let (started_tx, started_rx) = mpsc::channel();
     thread::spawn(move || {
         let mut seen_requests = Vec::new();
-        let mut response_index = 0;
-        let mut required_response = None;
-        let mut required_attempts = 0;
-        loop {
+        let mut expect_continuation = false;
+        for (status_line, body) in probe_responses {
             let (mut stream, _) = listener
                 .accept()
                 .expect("accept delayed capability request");
@@ -375,38 +420,6 @@ fn delayed_probe_server(
             let (first_line, headers, request_body) = read_provider_request(&mut reader);
             assert!(first_line.contains("/v1/chat/completions"));
             assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if is_required_tool_choice_request(&request_body) {
-                if required_response.is_none() {
-                    required_response = probe_responses.get(response_index).copied();
-                    if required_response.is_some() {
-                        response_index += 1;
-                    }
-                }
-                let default_probe_body = required_tool_choice_probe_response(&request_body);
-                let (status_line, body) = required_response.unwrap_or((
-                    "HTTP/1.1 200 OK",
-                    default_probe_body
-                        .as_deref()
-                        .unwrap_or(PROBE_STRICT_SINGLE_RESPONSE),
-                ));
-                started_tx
-                    .send(())
-                    .expect("send required capability request started");
-                required_attempts += 1;
-                thread::sleep(response_delay);
-                write_provider_response_best_effort(&mut stream, status_line, body, true);
-                if !(status_line.contains("429") || status_line.starts_with("HTTP/1.1 5"))
-                    || required_attempts == 3
-                {
-                    break;
-                }
-                continue;
-            }
-            let (status_line, body) = probe_responses
-                .get(response_index)
-                .copied()
-                .expect("delayed capability response configured");
-            response_index += 1;
             assert!(request_body.contains("singularity_capability_probe"));
             started_tx
                 .send(())
@@ -414,11 +427,29 @@ fn delayed_probe_server(
             thread::sleep(response_delay);
             seen_requests.push(request_body);
             write_provider_response_best_effort(&mut stream, status_line, body, true);
-            if response_index == probe_responses.len()
-                && !base_probe_requires_required_tool_choice(status_line, body)
-            {
-                break;
-            }
+            expect_continuation = status_line.contains("200 OK") && body.contains("\"tool_calls\"");
+        }
+        if expect_continuation {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept delayed capability continuation");
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone delayed capability continuation stream"),
+            );
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            assert!(is_capability_probe_continuation_request(&request_body));
+            started_tx
+                .send(())
+                .expect("send capability continuation started");
+            thread::sleep(response_delay);
+            let body = capability_probe_response(&request_body)
+                .expect("delayed capability continuation response");
+            seen_requests.push(request_body);
+            write_provider_response_best_effort(&mut stream, "HTTP/1.1 200 OK", &body, true);
         }
         request_tx
             .send(seen_requests)
@@ -440,9 +471,7 @@ fn multi_model_probe_server(actual_count: usize) -> (String, Receiver<Vec<String
             let (first_line, headers, request_body) = read_provider_request(&mut reader);
             assert!(first_line.contains("/v1/chat/completions"));
             assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            if !is_required_tool_choice_request(&request_body) {
-                all_requests.push(request_body.clone());
-            }
+            all_requests.push(request_body.clone());
             if let Some(probe_body) = capability_probe_response(&request_body) {
                 write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
                 continue;
@@ -458,12 +487,79 @@ fn multi_model_probe_server(actual_count: usize) -> (String, Receiver<Vec<String
     (format!("http://{addr}"), rx)
 }
 
+fn multi_turn_probe_recovery_server() -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind multi-turn probe provider");
+    let addr = listener
+        .local_addr()
+        .expect("multi-turn probe provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for index in 0..8 {
+            let (mut stream, _) = listener.accept().expect("accept multi-turn probe request");
+            let mut reader =
+                BufReader::new(stream.try_clone().expect("clone multi-turn probe stream"));
+            let (_, _, request_body) = read_provider_request(&mut reader);
+            requests.push(request_body.clone());
+            let (status, body) = match index {
+                0..=3 => ("HTTP/1.1 400 Bad Request", "{}".to_string()),
+                4 => ("HTTP/1.1 200 OK", PROBE_ROUTER_RESPONSE.to_string()),
+                5 => ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE.to_string()),
+                6 => (
+                    "HTTP/1.1 200 OK",
+                    PROBE_STRICT_PARALLEL_RESPONSE.to_string(),
+                ),
+                7 => (
+                    "HTTP/1.1 200 OK",
+                    capability_probe_response(&request_body)
+                        .expect("successful second multi-turn probe continuation"),
+                ),
+                _ => unreachable!(),
+            };
+            write_provider_response(&mut stream, status, &body, true);
+        }
+        tx.send(requests).expect("send multi-turn probe requests");
+    });
+    (format!("http://{addr}"), rx)
+}
+
 const PROBE_STRICT_PARALLEL_RESPONSE: &str = r#"{
     "id": "probe_strict_parallel",
     "choices": [{
         "message": {
             "role": "assistant",
             "content": "",
+            "tool_calls": [
+                {
+                    "id": "probe_call_a",
+                    "type": "function",
+                    "function": {
+                        "name": "singularity_capability_probe_a",
+                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
+                    }
+                },
+                {
+                    "id": "probe_call_b",
+                    "type": "function",
+                    "function": {
+                        "name": "singularity_capability_probe_b",
+                        "arguments": "{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}"
+                    }
+                }
+            ]
+        },
+        "finish_reason": "tool_calls"
+    }],
+    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+}"#;
+
+const PROBE_STRICT_PARALLEL_REASONING_RESPONSE: &str = r#"{
+    "id": "probe_strict_parallel_reasoning",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "fixed private probe reasoning",
             "tool_calls": [
                 {
                     "id": "probe_call_a",
@@ -579,6 +675,23 @@ const ACTUAL_DONE_RESPONSE: &str = r#"{
     }]
 }"#;
 
+const ACTUAL_TOOL_REASONING_RESPONSE: &str = r#"{
+    "id": "actual_tool_reasoning_response",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "private reasoning that requires replay",
+            "tool_calls": [{
+                "id": "actual_tool_call",
+                "type": "function",
+                "function": {"name": "builtin_read", "arguments": "{}"}
+            }]
+        },
+        "finish_reason": "tool_calls"
+    }]
+}"#;
+
 fn sequence_response_server(
     responses: Vec<(&'static str, &'static str)>,
 ) -> (String, Receiver<usize>) {
@@ -659,53 +772,8 @@ fn write_provider_response_best_effort(
     );
 }
 
-fn is_required_tool_choice_request(request_body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(request_body)
-        .ok()
-        .is_some_and(|request| request["tool_choice"] == "required")
-}
-
-fn base_probe_requires_required_tool_choice(status_line: &str, body: &str) -> bool {
-    status_line.starts_with("HTTP/1.1 2")
-        && matches!(
-            body,
-            PROBE_STRICT_PARALLEL_RESPONSE
-                | PROBE_STRICT_SINGLE_RESPONSE
-                | PROBE_NON_STRICT_SINGLE_RESPONSE
-                | PROBE_ROUTER_RESPONSE
-        )
-}
-
-fn required_tool_choice_probe_response(request_body: &str) -> Option<String> {
-    let request: serde_json::Value = serde_json::from_str(request_body).ok()?;
-    if request["tool_choice"] != "required" {
-        return None;
-    }
-    let tool_name = request.pointer("/tools/0/function/name")?.as_str()?;
-    if tool_name != "singularity_capability_router"
-        && !tool_name.starts_with("singularity_capability_probe")
-    {
-        return None;
-    }
-    let response = if tool_name == "singularity_capability_router" {
-        PROBE_ROUTER_RESPONSE
-    } else if request
-        .pointer("/tools/0/function/strict")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        PROBE_STRICT_SINGLE_RESPONSE
-    } else {
-        PROBE_NON_STRICT_SINGLE_RESPONSE
-    };
-    Some(response.to_string())
-}
-
 fn capability_probe_response(request_body: &str) -> Option<String> {
     let request: serde_json::Value = serde_json::from_str(request_body).ok()?;
-    if request["tool_choice"] == "required" {
-        return required_tool_choice_probe_response(request_body);
-    }
     let tools = request.get("tools")?.as_array()?;
     let names = tools
         .iter()
@@ -714,7 +782,23 @@ fn capability_probe_response(request_body: &str) -> Option<String> {
                 .and_then(serde_json::Value::as_str)
         })
         .collect::<Vec<_>>();
+    let continuation = request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
     if names.contains(&"singularity_capability_router") {
+        if continuation {
+            return Some(capability_probe_continuation_response(
+                "singularity_capability_router",
+                serde_json::json!({
+                    "tool_name": "singularity_capability_probe_a",
+                    "arguments": {
+                        "probe": "schema_sentinel_alpha",
+                        "values": [7, 7]
+                    }
+                }),
+            ));
+        }
         return Some(PROBE_ROUTER_RESPONSE.to_string());
     }
     if !names.contains(&"singularity_capability_probe_a") {
@@ -725,6 +809,17 @@ fn capability_probe_response(request_body: &str) -> Option<String> {
             .and_then(serde_json::Value::as_bool)
             == Some(true)
     });
+    if continuation {
+        let arguments = if strict {
+            serde_json::json!({"probe": "schema_sentinel_alpha", "values": [7, 7]})
+        } else {
+            serde_json::json!({})
+        };
+        return Some(capability_probe_continuation_response(
+            "singularity_capability_probe_a",
+            arguments,
+        ));
+    }
     if strict {
         return Some(
             if names.contains(&"singularity_capability_probe_b") {
@@ -766,6 +861,37 @@ fn capability_probe_response(request_body: &str) -> Option<String> {
         })
         .to_string(),
     )
+}
+
+fn is_capability_probe_continuation_request(request_body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(request_body)
+        .ok()
+        .and_then(|request| request.get("messages").cloned())
+        .and_then(|messages| messages.as_array().cloned())
+        .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"))
+}
+
+fn capability_probe_continuation_response(tool_name: &str, arguments: serde_json::Value) -> String {
+    serde_json::json!({
+        "id": "capability_probe_continuation_response",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "probe_continuation_call",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": arguments.to_string()
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+    })
+    .to_string()
 }
 
 #[test]
@@ -1169,12 +1295,17 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     assert!(!negotiation.contract.supports_json_mode);
     assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
     assert_eq!(negotiation.contract.max_tools_per_request, 8);
+    assert_eq!(
+        negotiation.contract.tool_definition_mode,
+        ProviderToolDefinitionMode::Direct
+    );
 
-    let requests = request_rx
+    let request_bodies = request_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("captured strict capability requests");
+    assert_eq!(request_bodies.len(), 2);
     let request: serde_json::Value =
-        serde_json::from_str(&requests[0]).expect("strict capability request JSON");
+        serde_json::from_str(&request_bodies[0]).expect("strict capability request JSON");
     assert_eq!(request["tools"].as_array().map(Vec::len), Some(8));
     let parameters = &request["tools"][0]["function"]["parameters"];
     assert_eq!(request["messages"][0]["role"], "developer");
@@ -1201,7 +1332,7 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
         .expect("strict probe instruction");
     assert_eq!(
         instruction,
-        "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each."
+        "First call singularity_capability_probe_a and singularity_capability_probe_b once each. After both tool results, call singularity_capability_probe_a once more."
     );
     assert!(!instruction.contains("schema_sentinel_alpha"));
     assert!(!instruction.contains("7"));
@@ -1218,17 +1349,25 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
         assert!(!description.contains("7"));
     }
     assert_eq!(request["tools"][0]["function"]["strict"], true);
-    assert!(negotiation.contract.supports_required_tool_choice);
-    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
-    let required_request: serde_json::Value =
-        serde_json::from_str(&requests[1]).expect("required probe JSON");
-    assert_eq!(required_request["tool_choice"], "required");
-    assert_eq!(required_request["tools"].as_array().map(Vec::len), Some(1));
-    assert_eq!(required_request["tools"][0]["function"]["strict"], true);
+    assert!(!negotiation.contract.supports_required_tool_choice);
+    let continuation: serde_json::Value = serde_json::from_str(&request_bodies[1])
+        .expect("strict capability continuation request JSON");
+    assert_eq!(continuation["tool_choice"], "auto");
+    assert_eq!(continuation["parallel_tool_calls"], false);
+    assert_eq!(continuation["messages"][2]["role"], "assistant");
     assert_eq!(
-        required_request["messages"][1]["content"],
-        "Call the only provided capability probe tool exactly once with arguments matching its schema."
+        continuation["messages"][2]["tool_calls"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
     );
+    assert_eq!(continuation["messages"][3]["role"], "tool");
+    assert_eq!(continuation["messages"][3].get("name"), None);
+    assert_eq!(continuation["messages"][3]["tool_call_id"], "probe_call_a");
+    assert_eq!(continuation["messages"][4]["role"], "tool");
+    assert_eq!(continuation["messages"][4].get("name"), None);
+    assert_eq!(continuation["messages"][4]["tool_call_id"], "probe_call_b");
+    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
     let cached = Provider::negotiate_tool_capabilities(
         &provider,
         &ModelPreferences::default(),
@@ -1243,6 +1382,147 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
         cached.metadata.probe_attempt_metadata,
         ProviderAttemptMetadata::default()
     );
+}
+
+#[test]
+fn openai_capability_negotiation_stabilizes_reasoning_content_tool_calls() {
+    let (base_url, requests) = reasoning_stabilization_probe_server(
+        "HTTP/1.1 200 OK",
+        PROBE_STRICT_PARALLEL_RESPONSE,
+        ACTUAL_DONE_RESPONSE,
+        1,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("reasoning tool calls stabilized");
+
+    assert_eq!(
+        negotiation.contract.tool_reasoning_mode,
+        ProviderToolReasoningMode::DisabledForToolCalls
+    );
+    assert_eq!(negotiation.metadata.profile_attempts, 1);
+    assert_eq!(negotiation.metadata.fallback_count, 0);
+    assert_eq!(negotiation.metadata.probe_usage.total_tokens, 9);
+    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 3);
+
+    provider
+        .complete(
+            &capability_test_request(None, true, 2),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("actual completion uses negotiated reasoning mode");
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured reasoning negotiation requests");
+    assert_eq!(captured.len(), 4);
+    let captured = captured
+        .iter()
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(request).expect("captured request JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(captured[0].get("thinking"), None);
+    assert_eq!(captured[1]["thinking"]["type"], "disabled");
+    assert_eq!(captured[2]["thinking"]["type"], "disabled");
+    assert_eq!(captured[3]["thinking"]["type"], "disabled");
+    assert!(
+        captured
+            .iter()
+            .all(|request| request["tool_choice"] == "auto")
+    );
+}
+
+#[test]
+fn openai_provider_rejects_tool_reasoning_when_negotiated_disable_is_not_honored() {
+    let (base_url, requests) = reasoning_stabilization_probe_server(
+        "HTTP/1.1 200 OK",
+        PROBE_STRICT_PARALLEL_RESPONSE,
+        ACTUAL_TOOL_REASONING_RESPONSE,
+        1,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("reasoning disable negotiation");
+    assert_eq!(
+        negotiation.contract.tool_reasoning_mode,
+        ProviderToolReasoningMode::DisabledForToolCalls
+    );
+
+    let error = provider
+        .complete(
+            &capability_test_request(None, true, 2),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("unreplayable tool reasoning must fail closed");
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_mode_not_honored")
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"tool_reasoning_disable_not_honored".to_string())
+    );
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured reasoning boundary requests");
+    assert_eq!(captured.len(), 4);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&captured[3]).expect("actual request JSON")["thinking"]
+            ["type"],
+        "disabled"
+    );
+}
+
+#[test]
+fn openai_capability_negotiation_rejects_unstable_reasoning_tool_mode() {
+    let (base_url, requests) = reasoning_stabilization_probe_server(
+        "HTTP/1.1 400 Bad Request",
+        "{}",
+        ACTUAL_DONE_RESPONSE,
+        0,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let error = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect_err("unsupported reasoning control must fail closed");
+
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_mode_unsupported")
+    );
+    assert_eq!(error.error.stage, Some(ProviderErrorStage::ResponseStatus));
+    assert_eq!(error.error.http_status, Some(400));
+    assert!(
+        error
+            .error
+            .validation_errors
+            .iter()
+            .any(|error| error == "tool_reasoning_disable_unsupported")
+    );
+    let metadata = error
+        .capability_metadata
+        .expect("reasoning failure capability metadata");
+    assert_eq!(metadata.profile_attempts, 1);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 2);
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured failed reasoning probes");
+    assert_eq!(captured.len(), 2);
 }
 
 #[test]
@@ -1289,157 +1569,7 @@ fn openai_capability_probe_negotiates_tool_definition_capacity_and_caches_it() {
                 .expect("probe tools")
         })
         .collect::<Vec<_>>();
-    assert_eq!(tool_counts, vec![8]);
-}
-
-#[test]
-fn openai_required_tool_choice_probe_classifies_optional_and_terminal_results() {
-    for (status_line, body, expected_kind, expected_attempts) in [
-        ("HTTP/1.1 400 Bad Request", "{}", None, 2),
-        ("HTTP/1.1 422 Unprocessable Entity", "{}", None, 2),
-        ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE, None, 2),
-        (
-            "HTTP/1.1 401 Unauthorized",
-            "{}",
-            Some(ModelErrorKind::AuthError),
-            2,
-        ),
-        (
-            "HTTP/1.1 403 Forbidden",
-            "{}",
-            Some(ModelErrorKind::AuthError),
-            2,
-        ),
-        (
-            "HTTP/1.1 404 Not Found",
-            "{}",
-            Some(ModelErrorKind::InvalidRequest),
-            2,
-        ),
-        (
-            "HTTP/1.1 429 Too Many Requests",
-            "{}",
-            Some(ModelErrorKind::RateLimited),
-            4,
-        ),
-        (
-            "HTTP/1.1 500 Internal Server Error",
-            "{}",
-            Some(ModelErrorKind::ProviderOverloaded),
-            4,
-        ),
-    ] {
-        let (base_url, requests, _started) = delayed_probe_server(
-            vec![
-                ("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE),
-                (status_line, body),
-            ],
-            Duration::ZERO,
-        );
-        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-        let result = Provider::negotiate_tool_capabilities(
-            &provider,
-            &ModelPreferences::default(),
-            &singularity_core::CancellationToken::new(),
-        );
-        match expected_kind {
-            Some(expected_kind) => {
-                let error = result.expect_err("terminal probe cause must not degrade");
-                assert_eq!(error.error.kind, expected_kind);
-                assert_eq!(
-                    error.error.http_status,
-                    Some(status_line[9..12].parse().unwrap())
-                );
-                assert_eq!(
-                    error
-                        .capability_metadata
-                        .expect("terminal capability metadata")
-                        .probe_attempt_metadata
-                        .attempt_count,
-                    expected_attempts
-                );
-            }
-            None => {
-                let negotiation = result.expect("optional probe must degrade safely");
-                assert!(!negotiation.contract.supports_required_tool_choice);
-                assert!(negotiation.contract.supports_strict_tool_schema);
-                assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
-                assert_eq!(negotiation.contract.max_tools_per_request, 8);
-                assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
-            }
-        }
-        assert!(requests.recv_timeout(Duration::from_secs(2)).is_ok());
-    }
-}
-
-#[test]
-fn openai_required_tool_choice_probe_preserves_transport_and_cancellation_causes() {
-    let (base_url, started) = required_choice_probe_transport_failure_server();
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let (result_tx, result_rx) = mpsc::channel();
-    thread::spawn(move || {
-        result_tx
-            .send(Provider::negotiate_tool_capabilities(
-                &provider,
-                &ModelPreferences::default(),
-                &singularity_core::CancellationToken::new(),
-            ))
-            .expect("send transport probe result");
-    });
-    started
-        .recv_timeout(Duration::from_secs(1))
-        .expect("required transport probe started");
-    let transport_error = result_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("transport probe result")
-        .expect_err("transport failure must terminate negotiation");
-    assert_eq!(transport_error.error.kind, ModelErrorKind::NetworkError);
-    assert_eq!(
-        transport_error
-            .capability_metadata
-            .expect("transport capability metadata")
-            .profile_attempts,
-        1
-    );
-
-    let (base_url, _requests, started) = delayed_probe_server(
-        vec![("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE)],
-        Duration::from_millis(250),
-    );
-    let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
-    let cancellation = singularity_core::CancellationToken::new();
-    let worker_cancellation = cancellation.clone();
-    let worker_provider = Arc::clone(&provider);
-    let (result_tx, result_rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
-        result_tx
-            .send(Provider::negotiate_tool_capabilities(
-                worker_provider.as_ref(),
-                &ModelPreferences::default(),
-                &worker_cancellation,
-            ))
-            .expect("send cancellation probe result");
-    });
-    started
-        .recv_timeout(Duration::from_secs(1))
-        .expect("base cancellation probe started");
-    started
-        .recv_timeout(Duration::from_secs(1))
-        .expect("required cancellation probe started");
-    cancellation.cancel();
-    let cancellation_error = result_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("cancellation probe result")
-        .expect_err("cancellation must terminate negotiation");
-    assert_eq!(cancellation_error.error.kind, ModelErrorKind::Cancelled);
-    assert_eq!(
-        cancellation_error
-            .capability_metadata
-            .expect("cancellation capability metadata")
-            .profile_attempts,
-        1
-    );
-    worker.join().expect("join cancellation probe");
+    assert_eq!(tool_counts, vec![8, 8]);
 }
 
 #[test]
@@ -1532,10 +1662,14 @@ fn openai_capability_probe_validates_router_before_low_capacity_fallback() {
 
     assert_eq!(
         negotiation.metadata.profile,
-        ProviderCapabilityProfile::NonStrictSingle
+        ProviderCapabilityProfile::RoutedSingle
     );
     assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
     assert_eq!(negotiation.contract.max_tools_per_request, 1);
+    assert_eq!(
+        negotiation.contract.tool_definition_mode,
+        ProviderToolDefinitionMode::Routed
+    );
     let captured = requests
         .recv_timeout(Duration::from_secs(1))
         .expect("captured capability requests");
@@ -1549,7 +1683,7 @@ fn openai_capability_probe_validates_router_before_low_capacity_fallback() {
                     .expect("probe tools")
             })
             .collect::<Vec<_>>(),
-        vec![8, 8, 8, 8, 1]
+        vec![8, 8, 8, 8, 1, 1]
     );
     let router: serde_json::Value =
         serde_json::from_str(captured.last().expect("router request")).expect("router JSON");
@@ -1726,7 +1860,7 @@ fn openai_capability_probe_waiter_cancellation_is_caller_local() {
         .expect("captured owner capability probe");
     assert_eq!(
         captured.len(),
-        1,
+        2,
         "waiter cancellation must not cancel owner"
     );
 }
@@ -1791,7 +1925,7 @@ fn openai_capability_probe_owner_cancellation_allows_waiter_takeover() {
         .expect("captured owner and takeover probes");
     assert_eq!(
         captured.len(),
-        2,
+        3,
         "waiter must take over after owner cancellation"
     );
 }
@@ -1819,11 +1953,15 @@ fn openai_capability_probe_fallback_keeps_usage_attempts_and_cache_metadata_sepa
 
     assert_eq!(
         negotiation.metadata.profile,
-        ProviderCapabilityProfile::NonStrictSingle
+        ProviderCapabilityProfile::RoutedSingle
     );
     assert!(!negotiation.contract.supports_strict_tool_schema);
     assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
     assert_eq!(negotiation.contract.max_tools_per_request, 1);
+    assert_eq!(
+        negotiation.contract.tool_definition_mode,
+        ProviderToolDefinitionMode::Routed
+    );
     assert_eq!(negotiation.metadata.profile_attempts, 5);
     assert_eq!(negotiation.metadata.fallback_count, 4);
     assert_eq!(negotiation.metadata.probe_usage.total_tokens, 6);
@@ -1873,11 +2011,70 @@ fn openai_capability_probe_final_text_response_is_typed_and_preserves_probe_meta
             .contains(&"capability_probe_native_tool_calls_missing".to_string())
     );
     let metadata = error.capability_metadata.expect("probe metadata");
-    assert_eq!(metadata.profile, ProviderCapabilityProfile::NonStrictSingle);
+    assert_eq!(metadata.profile, ProviderCapabilityProfile::RoutedSingle);
     assert_eq!(metadata.profile_attempts, 5);
     assert_eq!(metadata.fallback_count, 4);
     assert_eq!(metadata.probe_attempt_metadata.attempt_count, 5);
     assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+}
+
+#[test]
+fn openai_capability_probe_requires_native_tool_calls_after_tool_results_before_caching() {
+    let (base_url, requests) = multi_turn_probe_recovery_server();
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let cancellation = singularity_core::CancellationToken::new();
+
+    let error = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &cancellation,
+    )
+    .expect_err("a text continuation must not prove multi-turn native tools");
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"capability_probe_multi_turn_tool_calls_missing".to_string())
+    );
+    let failed_metadata = error.capability_metadata.expect("failed probe metadata");
+    assert_eq!(failed_metadata.profile_attempts, 5);
+    assert_eq!(failed_metadata.probe_attempt_metadata.attempt_count, 6);
+
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &cancellation,
+    )
+    .expect("a failed multi-turn probe must not poison or populate the success cache");
+    assert!(!negotiation.metadata.cache_hit);
+    assert_eq!(
+        negotiation.metadata.profile,
+        ProviderCapabilityProfile::StrictParallel
+    );
+    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
+    let cached = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &cancellation,
+    )
+    .expect("successful multi-turn probe is cached");
+    assert!(cached.metadata.cache_hit);
+
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured failed and successful multi-turn probes");
+    assert_eq!(captured.len(), 8);
+    for continuation_index in [5, 7] {
+        let request: serde_json::Value =
+            serde_json::from_str(&captured[continuation_index]).expect("continuation JSON");
+        assert_eq!(request["tool_choice"], "auto");
+        assert!(
+            request["messages"]
+                .as_array()
+                .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"))
+        );
+    }
 }
 
 #[test]
@@ -2031,7 +2228,7 @@ fn openai_capability_cache_is_partitioned_by_effective_model_and_shared_by_clone
         .filter(|request| request.contains("singularity_capability_probe"))
         .count();
     assert_eq!(
-        probe_count, 2,
+        probe_count, 4,
         "different models probe independently; clone shares cache"
     );
     let models = captured
@@ -2140,7 +2337,7 @@ fn model_request_validation_rejects_tool_count_above_provider_capability() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -2172,7 +2369,7 @@ fn required_tool_choice_requires_tools_and_negotiated_support() {
     );
 
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({
             "type": "object",
@@ -2200,7 +2397,7 @@ fn required_tool_choice_requires_tools_and_negotiated_support() {
         Some(&ModelMessage::text(ModelRole::Assistant, "text")),
         &[],
         &request.tool_choice,
-        &["builtin.read".to_string()],
+        &["builtin_read".to_string()],
         Some(&supported),
     );
     assert_eq!(
@@ -2217,7 +2414,7 @@ fn model_request_validation_rejects_tool_definitions_above_provider_capability()
     );
     request.tools = (0..3)
         .map(|index| ModelToolSchema {
-            name: format!("builtin.tool_{index}"),
+            name: format!("builtin_tool_{index}"),
             description: "test tool".to_string(),
             parameters_schema: serde_json::json!({"type": "object"}),
         })
@@ -2239,7 +2436,7 @@ fn model_request_validation_rejects_incompatible_strict_schema_locally() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -2263,7 +2460,7 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
         vec![ModelMessage::text(ModelRole::Developer, "instructions")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({
             "type": "object",
@@ -2319,7 +2516,7 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "builtin.read", "arguments": "{\"path\":\"README.md\"}"}
+                    "function": {"name": "builtin_read", "arguments": "{\"path\":\"README.md\"}"}
                 }]
             },
             "finish_reason": "tool_calls"
@@ -2333,7 +2530,7 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -2566,7 +2763,7 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
         "request_1",
         vec![
             ModelMessage::text(ModelRole::User, "hello"),
-            ModelMessage::assistant_tool_calls(vec![tool_call("call_1", "builtin.read")]),
+            ModelMessage::assistant_tool_calls(vec![tool_call("call_1", "builtin_read")]),
             tool_message,
         ],
     );
@@ -2586,7 +2783,7 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
     assert!(captured["messages"][1]["content"].is_null());
     assert_eq!(
         captured["messages"][1]["tool_calls"][0]["function"]["name"],
-        "read"
+        "builtin_read"
     );
     assert_eq!(
         captured["messages"][1]["tool_calls"][0]["function"]["arguments"],
@@ -2605,7 +2802,7 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
 }
 
 #[test]
-fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
+fn openai_provider_preserves_portable_tool_names_without_aliases() {
     let body = r#"{
         "id": "resp_1",
         "choices": [{
@@ -2615,7 +2812,7 @@ fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                    "function": {"name": "builtin_read", "arguments": "{\"path\":\"README.md\"}"}
                 }]
             },
             "finish_reason": "tool_calls"
@@ -2628,7 +2825,7 @@ fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({
             "type": "object",
@@ -2638,9 +2835,17 @@ fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
         }),
     });
     request.tool_choice.mode = ToolChoiceMode::SpecificTool;
-    request.tool_choice.tool_name = Some("builtin.read".to_string());
+    request.tool_choice.tool_name = Some("builtin_read".to_string());
     request.tool_choice.max_tool_calls = 2;
     request.tool_choice.strict_tool_schema = true;
+
+    let mut invalid_request = request.clone();
+    invalid_request.tools[0].name = "builtin.read".to_string();
+    invalid_request.tool_choice.tool_name = Some("builtin.read".to_string());
+    assert_eq!(
+        validate_model_request(&invalid_request).errors,
+        vec!["tool_name_not_provider_portable"]
+    );
 
     let response = provider
         .complete(&request, &singularity_core::CancellationToken::new())
@@ -2652,14 +2857,14 @@ fn openai_provider_projects_negotiated_tool_capabilities_and_wire_names() {
     )
     .expect("parse captured provider request body");
 
-    assert_eq!(captured["tools"][0]["function"]["name"], "read");
+    assert_eq!(captured["tools"][0]["function"]["name"], "builtin_read");
     assert_eq!(
         captured["tool_choice"],
-        serde_json::json!({"type": "function", "function": {"name": "read"}})
+        serde_json::json!({"type": "function", "function": {"name": "builtin_read"}})
     );
     assert_eq!(captured["parallel_tool_calls"], true);
     assert_eq!(captured["tools"][0]["function"]["strict"], true);
-    assert_eq!(response.tool_calls[0].tool_name, "builtin.read");
+    assert_eq!(response.tool_calls[0].tool_name, "builtin_read");
     assert_eq!(response.status, ModelTurnStatus::Success);
 }
 
@@ -2675,12 +2880,12 @@ fn openai_provider_classifies_calls_above_the_negotiated_limit() {
                     {
                         "id": "call_1",
                         "type": "function",
-                        "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
+                        "function": {"name": "builtin_read", "arguments": "{\"path\":\"README.md\"}"}
                     },
                     {
                         "id": "call_2",
                         "type": "function",
-                        "function": {"name": "read", "arguments": "{\"path\":\"Cargo.toml\"}"}
+                        "function": {"name": "builtin_read", "arguments": "{\"path\":\"Cargo.toml\"}"}
                     }
                 ]
             },
@@ -2694,7 +2899,7 @@ fn openai_provider_classifies_calls_above_the_negotiated_limit() {
         vec![ModelMessage::text(ModelRole::User, "read a file")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -2826,7 +3031,7 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "builtin.read", "arguments": "\"README.md\""}
+                    "function": {"name": "builtin_read", "arguments": "\"README.md\""}
                 }]
             },
             "finish_reason": "tool_calls"
@@ -2839,7 +3044,7 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin.read".to_string(),
+        name: "builtin_read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -2930,7 +3135,7 @@ fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes(
     let response_result = validate_model_turn_response(
         &request,
         &response,
-        &["builtin.read_file".to_string()],
+        &["builtin_read_file".to_string()],
         None,
     );
 
@@ -2956,7 +3161,7 @@ fn model_error_serializes_redacted_boundary_fields() {
 
 #[test]
 fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
-    let call = tool_call("call_1", "builtin.read_file");
+    let call = tool_call("call_1", "builtin_read_file");
     let none_result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         std::slice::from_ref(&call),
@@ -2964,7 +3169,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
             mode: ToolChoiceMode::None,
             ..Default::default()
         },
-        &["builtin.read_file".to_string()],
+        &["builtin_read_file".to_string()],
         None,
     );
 
@@ -2976,10 +3181,10 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         &[],
         &ToolChoicePolicy {
             mode: ToolChoiceMode::SpecificTool,
-            tool_name: Some("builtin.read_file".to_string()),
+            tool_name: Some("builtin_read_file".to_string()),
             ..Default::default()
         },
-        &["builtin.read_file".to_string()],
+        &["builtin_read_file".to_string()],
         None,
     );
 
@@ -2992,7 +3197,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         )),
         &[],
         &ToolChoicePolicy::default(),
-        &["builtin.read_file".to_string()],
+        &["builtin_read_file".to_string()],
         Some(&ProviderProtocolContract::default()),
     );
 
@@ -3001,11 +3206,38 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         vec!["text_tool_call_envelope_not_supported"]
     );
 
+    let prefixed_multiple_text_tool_calls = validate_model_response(
+        Some(&ModelMessage::text(
+            ModelRole::Assistant,
+            "I will inspect both files.<tool_call><function=builtin_read></function></tool_call><tool_call><function=builtin_read></function></tool_call>",
+        )),
+        &[],
+        &ToolChoicePolicy::default(),
+        &["builtin_read_file".to_string()],
+        Some(&ProviderProtocolContract::default()),
+    );
+    assert_eq!(
+        prefixed_multiple_text_tool_calls.errors,
+        vec!["text_tool_call_envelope_not_supported"]
+    );
+
+    let incomplete_marker = validate_model_response(
+        Some(&ModelMessage::text(
+            ModelRole::Assistant,
+            "The literal <tool_call> marker is unsupported.",
+        )),
+        &[],
+        &ToolChoicePolicy::default(),
+        &["builtin_read_file".to_string()],
+        Some(&ProviderProtocolContract::default()),
+    );
+    assert!(incomplete_marker.valid);
+
     let duplicate_result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         &[call.clone(), call],
         &ToolChoicePolicy::default(),
-        &["builtin.read_file".to_string()],
+        &["builtin_read_file".to_string()],
         Some(&ProviderProtocolContract::default()),
     );
 
@@ -3021,7 +3253,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
 
 #[test]
 fn model_response_validation_rejects_unknown_or_malformed_tool_calls() {
-    let mut malformed = tool_call("call_1", "builtin.unknown");
+    let mut malformed = tool_call("call_1", "builtin_unknown");
     malformed.parse_status = ModelToolParseStatus::InvalidJson;
     malformed
         .validation_errors
@@ -3031,7 +3263,7 @@ fn model_response_validation_rejects_unknown_or_malformed_tool_calls() {
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         &[malformed],
         &ToolChoicePolicy::default(),
-        &["builtin.read_file".to_string()],
+        &["builtin_read_file".to_string()],
         None,
     );
 
@@ -3042,14 +3274,14 @@ fn model_response_validation_rejects_unknown_or_malformed_tool_calls() {
 
 #[test]
 fn model_response_validation_requires_tool_call_arguments_object() {
-    let mut call = tool_call("call_1", "builtin.read_file");
+    let mut call = tool_call("call_1", "builtin_read_file");
     call.arguments = serde_json::json!("not an object");
 
     let result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         &[call],
         &ToolChoicePolicy::default(),
-        &["builtin.read_file".to_string()],
+        &["builtin_read_file".to_string()],
         None,
     );
 
@@ -3060,7 +3292,7 @@ fn model_response_validation_requires_tool_call_arguments_object() {
 #[test]
 fn model_boundary_objects_are_schema_backed_and_round_trip() {
     let tool_schema = ModelToolSchema {
-        name: "builtin.read_file".to_string(),
+        name: "builtin_read_file".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     };

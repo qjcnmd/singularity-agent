@@ -6,13 +6,13 @@ const IDENTIFIER_MAX_BYTES: usize = 128;
 const SHA1_HEX_LENGTH: usize = 40;
 const SHA256_HEX_LENGTH: usize = 64;
 const BUILTIN_TOOL_NAMES: [&str; 7] = [
-    "builtin.read",
-    "builtin.list",
-    "builtin.grep",
-    "builtin.edit",
-    "builtin.patch",
-    "builtin.command",
-    "builtin.update_plan",
+    "builtin_read",
+    "builtin_list",
+    "builtin_grep",
+    "builtin_edit",
+    "builtin_patch",
+    "builtin_command",
+    "builtin_update_plan",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

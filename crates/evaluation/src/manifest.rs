@@ -10,7 +10,7 @@ use crate::{
     TASK_SET_SCHEMA_VERSION, TaskId, ToolName, require_schema_version, validation_error,
 };
 
-const BUILTIN_COMMAND_TOOL_NAME: &str = "builtin.command";
+const BUILTIN_COMMAND_TOOL_NAME: &str = "builtin_command";
 const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

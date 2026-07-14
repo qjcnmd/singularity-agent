@@ -13,9 +13,9 @@ use singularity_model::{
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
     ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode, is_strict_tool_schema_compatible,
-    provider_error_response, validate_model_request_with_capabilities,
-    validate_model_turn_response,
+    ProviderErrorStage, ProviderProtocolContract, ProviderToolDefinitionMode,
+    is_strict_tool_schema_compatible, provider_error_response,
+    validate_model_request_with_capabilities, validate_model_turn_response,
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
@@ -23,18 +23,21 @@ use singularity_policy::{
     PermissionProfileName, PermissionRequest, PolicyEngine,
 };
 use singularity_tools::{
-    CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput,
-    SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolBrokerDecision, ToolCallRequest,
-    ToolExecutionMode, ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec,
-    WorkspacePatch, WorkspaceToolError, WorkspaceTools, command_scope_digest,
-    command_scope_resource, is_protected_path,
+    BUILTIN_COMMAND_TOOL as TOOL_COMMAND, BUILTIN_EDIT_TOOL as TOOL_EDIT,
+    BUILTIN_GREP_TOOL as TOOL_GREP, BUILTIN_LIST_TOOL as TOOL_LIST,
+    BUILTIN_PATCH_TOOL as TOOL_PATCH, BUILTIN_READ_TOOL as TOOL_READ, CommandToolInput,
+    EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, SandboxFilesystemMode,
+    SandboxNetworkMode, ToolBroker, ToolBrokerDecision, ToolCallRequest, ToolExecutionMode,
+    ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec, WorkspacePatch,
+    WorkspaceToolError, WorkspaceTools, command_scope_digest, command_scope_resource,
+    is_protected_path,
 };
 use thiserror::Error;
 
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
 const APPROVAL_CHECKPOINT_VERSION: u32 = 1;
-const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise builtin.update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
+const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise builtin_update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -60,20 +63,14 @@ const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
     "command_tests_failed",
     "command_build_failed",
 ];
-const TOOL_READ: &str = "builtin.read";
-const TOOL_LIST: &str = "builtin.list";
-const TOOL_GREP: &str = "builtin.grep";
-const TOOL_EDIT: &str = "builtin.edit";
-const TOOL_PATCH: &str = "builtin.patch";
-const TOOL_COMMAND: &str = "builtin.command";
-pub const BUILTIN_UPDATE_PLAN_TOOL: &str = "builtin.update_plan";
-pub const BUILTIN_INVOKE_TOOL: &str = "builtin.invoke_tool";
+pub const BUILTIN_UPDATE_PLAN_TOOL: &str = "builtin_update_plan";
+pub const BUILTIN_INVOKE_TOOL: &str = "builtin_invoke_tool";
 const MAX_PLAN_STEPS: usize = 64;
 const MAX_PLAN_STEP_CHARS: usize = 512;
 const MAX_VERIFICATION_REQUIREMENTS: usize = 64;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
-const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call builtin.update_plan with all steps marked completed before providing the final answer.";
+const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call builtin_update_plan with all steps marked completed before providing the final answer.";
 const EXACT_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: required verification commands are incomplete";
 
@@ -1199,7 +1196,6 @@ impl AgentLoopState {
 #[derive(Clone)]
 struct PreparedToolCall {
     call: ModelToolCall,
-    model_visible_tool_name: String,
     fingerprint: String,
     execution_mode: Option<ToolExecutionMode>,
     decision: Option<ToolBrokerDecision>,
@@ -1288,7 +1284,7 @@ where
             input,
             &context,
             max_tool_calls,
-            uses_tool_router(&self.tool_broker, &capabilities),
+            uses_tool_router(&capabilities),
         );
         state.context_trace = Some(AgentContextTrace::from(&context));
         self.continue_run(input, &budget, &capabilities, max_tool_calls, state, 0)
@@ -1550,7 +1546,7 @@ where
                 );
             }
         };
-        let (state, model_turn_offset, model_visible_tool_name) = match restore_checkpoint(
+        let (state, model_turn_offset) = match restore_checkpoint(
             input,
             pending,
             checkpoint_payload,
@@ -1604,7 +1600,7 @@ where
             &mut state.messages,
             input,
             max_tool_calls,
-            uses_tool_router(&self.tool_broker, &capabilities),
+            uses_tool_router(&capabilities),
         );
         let context = assemble_context_items_with_budget(&input.input, &budget);
         if let Some(context_trace) = &mut state.context_trace {
@@ -1635,9 +1631,7 @@ where
         let tool_result = self.execute_tool(&call, decision, &mut state);
         let failed_tool_result = !tool_result.ok;
         let recovery_feedback = state.observe_tool_result(&tool_result, &tool_call_fingerprint);
-        state
-            .messages
-            .push(tool_result_message(&tool_result, &model_visible_tool_name));
+        state.messages.push(tool_result_message(&tool_result));
         state.tool_results.push(tool_result.clone());
         if let Some(feedback) = recovery_feedback {
             state
@@ -1832,13 +1826,7 @@ where
             .map(
                 |((call, model_visible_call), (fingerprint, invalid_was_observed))| {
                     debug_assert_eq!(call.tool_call_id, model_visible_call.tool_call_id);
-                    self.prepare_tool_call(
-                        call,
-                        &model_visible_call.tool_name,
-                        fingerprint,
-                        *invalid_was_observed,
-                        state,
-                    )
+                    self.prepare_tool_call(call, fingerprint, *invalid_was_observed, state)
                 },
             )
             .collect::<Vec<_>>();
@@ -1927,7 +1915,6 @@ where
     fn prepare_tool_call(
         &self,
         execution_call: &ModelToolCall,
-        model_visible_tool_name: &str,
         fingerprint: &str,
         invalid_was_observed: bool,
         state: &mut AgentLoopState,
@@ -1947,7 +1934,6 @@ where
             };
             return PreparedToolCall {
                 call: execution_call.clone(),
-                model_visible_tool_name: model_visible_tool_name.to_string(),
                 fingerprint: fingerprint.to_string(),
                 execution_mode: None,
                 decision: None,
@@ -1972,7 +1958,6 @@ where
                 }
                 return PreparedToolCall {
                     call: execution_call.clone(),
-                    model_visible_tool_name: model_visible_tool_name.to_string(),
                     fingerprint: fingerprint.to_string(),
                     execution_mode: None,
                     decision: None,
@@ -1998,7 +1983,6 @@ where
                 }
                 return PreparedToolCall {
                     call: execution_call.clone(),
-                    model_visible_tool_name: model_visible_tool_name.to_string(),
                     fingerprint: fingerprint.to_string(),
                     execution_mode: Some(execution_mode),
                     decision: None,
@@ -2017,7 +2001,6 @@ where
                 let rejection = self.decision_result(&bound_call, &decision);
                 return PreparedToolCall {
                     call: bound_call,
-                    model_visible_tool_name: model_visible_tool_name.to_string(),
                     fingerprint: fingerprint.to_string(),
                     execution_mode: Some(execution_mode),
                     decision: Some(decision),
@@ -2037,7 +2020,6 @@ where
             }
             return PreparedToolCall {
                 call,
-                model_visible_tool_name: model_visible_tool_name.to_string(),
                 fingerprint: fingerprint.to_string(),
                 execution_mode: Some(execution_mode),
                 decision: None,
@@ -2051,7 +2033,6 @@ where
         if let Some(rejection) = self.workspace_preflight_rejection(&call) {
             return PreparedToolCall {
                 call,
-                model_visible_tool_name: model_visible_tool_name.to_string(),
                 fingerprint: fingerprint.to_string(),
                 execution_mode: Some(execution_mode),
                 decision: None,
@@ -2060,7 +2041,6 @@ where
         }
         PreparedToolCall {
             call,
-            model_visible_tool_name: model_visible_tool_name.to_string(),
             fingerprint: fingerprint.to_string(),
             execution_mode: Some(execution_mode),
             decision: None,
@@ -2203,10 +2183,7 @@ where
             if !result.ok && is_repairable_tool_result(&result) {
                 repairable_failure = state.last_repair_failure.clone();
             }
-            state.messages.push(tool_result_message(
-                &result,
-                &prepared.model_visible_tool_name,
-            ));
+            state.messages.push(tool_result_message(&result));
             state.tool_results.push(result);
             if let Some(feedback) = recovery_feedback {
                 state
@@ -2543,7 +2520,7 @@ fn context_budget(
     let developer_instruction_tokens = approximate_token_count(&developer_instructions(
         input,
         max_tool_calls,
-        uses_tool_router(loop_tools, capabilities),
+        uses_tool_router(capabilities),
     ));
     let tool_tokens = reserved_model_tool_tokens(loop_tools, capabilities)?;
     let message_count = u32::try_from(input.input.len().saturating_add(1)).unwrap_or(u32::MAX);
@@ -2606,7 +2583,6 @@ fn model_request_token_count(
             json!({
                 "role": message.role,
                 "content": content,
-                "name": message.name,
                 "tool_call_id": message.tool_call_id,
                 "tool_calls": tool_calls,
             })
@@ -2754,7 +2730,6 @@ fn compacted_tool_result_message(
     });
     let mut message = ModelMessage::text(ModelRole::Tool, content.to_string());
     message.tool_call_id = original.tool_call_id.clone();
-    message.name = original.name.clone();
     message
 }
 
@@ -2932,7 +2907,7 @@ fn restore_checkpoint(
     payload: &Value,
     tool_broker: &ToolBroker,
     permission_profile: &PermissionProfile,
-) -> Result<(AgentLoopState, u32, String), String> {
+) -> Result<(AgentLoopState, u32), String> {
     let checkpoint: AgentLoopCheckpoint = serde_json::from_value(payload.clone())
         .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
     if checkpoint.checkpoint_version != APPROVAL_CHECKPOINT_VERSION {
@@ -3105,7 +3080,7 @@ fn restore_checkpoint(
     state.context_trace = checkpoint.context_trace;
     state.seen_tool_call_fingerprints = seen_tool_call_fingerprints;
     state.last_repair_failure = checkpoint.last_repair_failure;
-    Ok((state, checkpoint.model_turns, model_visible_tool_name))
+    Ok((state, checkpoint.model_turns))
 }
 
 fn model_response_validation_error(validation_errors: Vec<String>) -> ModelError {
@@ -3234,9 +3209,6 @@ fn model_turn_request(
             ..input.model_preferences.clone()
         },
     };
-    if !state.allows_final() && capabilities.supports_required_tool_choice {
-        request.tool_choice.mode = ToolChoiceMode::Required;
-    }
     request.tool_choice.max_tool_calls = tool_view.max_tool_calls;
     request.tool_choice.strict_tool_schema = strict_tool_schema;
     request
@@ -3270,8 +3242,8 @@ fn visible_model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
         .collect()
 }
 
-fn uses_tool_router(loop_tools: &ToolBroker, capabilities: &ProviderProtocolContract) -> bool {
-    visible_model_tool_schemas(loop_tools).len() > capabilities.max_tools_per_request as usize
+fn uses_tool_router(capabilities: &ProviderProtocolContract) -> bool {
+    capabilities.tool_definition_mode == ProviderToolDefinitionMode::Routed
 }
 
 fn router_model_tool_schema(
@@ -3312,17 +3284,28 @@ fn model_tool_view(
         return Err("provider tool-definition limit must be greater than zero".to_string());
     }
     let visible_tools = visible_model_tool_schemas(loop_tools);
-    if visible_tools.len() <= capabilities.max_tools_per_request as usize {
-        return Ok(ModelToolView {
-            tools: visible_tools,
-            max_tool_calls,
-        });
+    match capabilities.tool_definition_mode {
+        ProviderToolDefinitionMode::Direct => {
+            if visible_tools.len() > capabilities.max_tools_per_request as usize {
+                return Err(format!(
+                    "provider direct tool-definition limit ({}) is below the required tool count ({})",
+                    capabilities.max_tools_per_request,
+                    visible_tools.len()
+                ));
+            }
+            Ok(ModelToolView {
+                tools: visible_tools,
+                max_tool_calls,
+            })
+        }
+        ProviderToolDefinitionMode::Routed => {
+            let router = router_model_tool_schema(loop_tools, &visible_tools)?;
+            Ok(ModelToolView {
+                tools: vec![router],
+                max_tool_calls: 1,
+            })
+        }
     }
-    let router = router_model_tool_schema(loop_tools, &visible_tools)?;
-    Ok(ModelToolView {
-        tools: vec![router],
-        max_tool_calls: 1,
-    })
 }
 
 fn resolve_routed_tool_calls(
@@ -3372,11 +3355,22 @@ fn reserved_model_tool_tokens(
     capabilities: &ProviderProtocolContract,
 ) -> Result<u32, String> {
     let visible_tools = visible_model_tool_schemas(loop_tools);
-    if visible_tools.len() <= capabilities.max_tools_per_request as usize {
-        return Ok(model_tool_payload_tokens(&visible_tools));
+    match capabilities.tool_definition_mode {
+        ProviderToolDefinitionMode::Direct => {
+            if visible_tools.len() > capabilities.max_tools_per_request as usize {
+                return Err(format!(
+                    "provider direct tool-definition limit ({}) is below the required tool count ({})",
+                    capabilities.max_tools_per_request,
+                    visible_tools.len()
+                ));
+            }
+            Ok(model_tool_payload_tokens(&visible_tools))
+        }
+        ProviderToolDefinitionMode::Routed => {
+            let router = router_model_tool_schema(loop_tools, &visible_tools)?;
+            Ok(model_tool_payload_tokens(&[router]))
+        }
     }
-    let router = router_model_tool_schema(loop_tools, &visible_tools)?;
-    Ok(model_tool_payload_tokens(&[router]))
 }
 
 fn model_messages_from_input(
@@ -3406,7 +3400,7 @@ fn developer_instructions(
         )
     };
     let router_instruction = if router_tool_view {
-        " The visible builtin.invoke_tool is a single-turn router: provide one exact visible tool_name and its complete arguments object in the same call. Do not invoke the router recursively."
+        " The visible builtin_invoke_tool is a single-turn router: provide one exact visible tool_name and its complete arguments object in the same call. Do not invoke the router recursively."
     } else {
         ""
     };
@@ -3460,13 +3454,12 @@ fn assistant_message_text(message: Option<&ModelMessage>) -> String {
         .unwrap_or_default()
 }
 
-fn tool_result_message(tool_result: &ToolResult, model_visible_tool_name: &str) -> ModelMessage {
+fn tool_result_message(tool_result: &ToolResult) -> ModelMessage {
     let mut message = ModelMessage::text(
         ModelRole::Tool,
         tool_result.to_message_payload().to_string(),
     );
     message.tool_call_id = Some(tool_result.tool_call_id.clone());
-    message.name = Some(model_visible_tool_name.to_string());
     message
 }
 

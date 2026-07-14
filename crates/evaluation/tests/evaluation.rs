@@ -34,10 +34,10 @@ fn valid_manifest() -> Value {
                     "instructions": "Apply the smallest focused fix.",
                     "allowed_paths": ["src/sqlfluff/rules/L060.py"],
                     "allowed_tools": [
-                        "builtin.read",
-                        "builtin.grep",
-                        "builtin.edit",
-                        "builtin.command"
+                        "builtin_read",
+                        "builtin_grep",
+                        "builtin_edit",
+                        "builtin_command"
                     ],
                     "smoke_commands": [
                         {
@@ -407,7 +407,7 @@ fn evaluation_commands_default_to_denied_network_and_allow_explicit_opt_in() {
 
 #[test]
 fn evaluation_rejects_unimplemented_tool_namespaces() {
-    for unsupported in ["plugin.server.tool", "mcp.server.tool", "builtin.unknown"] {
+    for unsupported in ["plugin.server.tool", "mcp.server.tool", "builtin_unknown"] {
         let mut manifest = valid_manifest();
         manifest["tasks"][0]["agent"]["allowed_tools"] = json!([unsupported]);
         let error = parse_manifest(&manifest).expect_err("reject unsupported tool");
@@ -423,12 +423,12 @@ fn evaluation_rejects_unimplemented_tool_namespaces() {
 #[test]
 fn smoke_commands_require_the_command_tool() {
     let mut manifest = valid_manifest();
-    manifest["tasks"][0]["agent"]["allowed_tools"] = json!(["builtin.read"]);
+    manifest["tasks"][0]["agent"]["allowed_tools"] = json!(["builtin_read"]);
     let error = parse_manifest(&manifest).expect_err("smoke command without command tool");
     assert!(
         error
             .to_string()
-            .contains("agent.smoke_commands requires builtin.command"),
+            .contains("agent.smoke_commands requires builtin_command"),
         "{error}"
     );
 }

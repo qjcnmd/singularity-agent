@@ -2431,7 +2431,7 @@ mod tests {
                 "agent": {
                     "instructions": "inspect",
                     "allowed_paths": ["README.md"],
-                    "allowed_tools": ["builtin.read"]
+                    "allowed_tools": ["builtin_read"]
                 },
                 "evaluator": {
                     "baseline": {"commands": [{"argv": ["cargo", "test"]}]},

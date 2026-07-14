@@ -2312,7 +2312,7 @@ mod tests {
             ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
         plan_response.tool_calls.push(ModelToolCall {
             tool_call_id: "plan_call_1".to_string(),
-            tool_name: "builtin.update_plan".to_string(),
+            tool_name: "builtin_update_plan".to_string(),
             raw_arguments: plan_arguments.to_string(),
             arguments: plan_arguments,
             parse_status: ModelToolParseStatus::Valid,
@@ -3263,7 +3263,7 @@ mod tests {
             ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
         command_response.tool_calls.push(ModelToolCall {
             tool_call_id: "call_1".to_string(),
-            tool_name: "builtin.command".to_string(),
+            tool_name: "builtin_command".to_string(),
             arguments: json!({
                 "argv": ["cmd.exe", "/C", "echo app-server-sandbox-ok"],
                 "timeout_seconds": 5

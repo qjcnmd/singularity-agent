@@ -50,9 +50,8 @@ const HTTP_STATUS_BAD_REQUEST: u16 = 400;
 const HTTP_STATUS_UNPROCESSABLE_ENTITY: u16 = 422;
 const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
-const BUILTIN_TOOL_PREFIX: &str = "builtin.";
-const TOOL_NAME_FALLBACK: &str = "tool";
 const CAPABILITY_PROBE_REQUEST_ID: &str = "singularity_capability_probe";
+const CAPABILITY_PROBE_CONTINUATION_REQUEST_ID: &str = "singularity_capability_probe_continuation";
 const CAPABILITY_PROBE_ROUTER: &str = "singularity_capability_router";
 const CAPABILITY_PROBE_TOOL_A: &str = "singularity_capability_probe_a";
 const CAPABILITY_PROBE_TOOL_B: &str = "singularity_capability_probe_b";
@@ -61,8 +60,6 @@ const CAPABILITY_PROBE_ALTERNATE_LABEL: &str = "schema_sentinel_beta";
 const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
 const CAPABILITY_PROBE_DEVELOPER_INSTRUCTION: &str =
     "Follow the fixed capability probe request using native structured tool calls.";
-const CAPABILITY_PROBE_REQUIRED_TOOL_INSTRUCTION: &str =
-    "Call the only provided capability probe tool exactly once with arguments matching its schema.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -78,7 +75,6 @@ pub enum ModelRole {
 pub struct ModelMessage {
     pub role: ModelRole,
     pub content: String,
-    pub name: Option<String>,
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ModelToolCall>,
@@ -89,7 +85,6 @@ impl ModelMessage {
         Self {
             role,
             content: content.into(),
-            name: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
         }
@@ -99,7 +94,6 @@ impl ModelMessage {
         Self {
             role: ModelRole::Assistant,
             content: String::new(),
-            name: None,
             tool_call_id: None,
             tool_calls,
         }
@@ -163,11 +157,29 @@ pub struct ModelToolCall {
     pub validation_errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderToolReasoningMode {
+    #[default]
+    Unspecified,
+    DisabledForToolCalls,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderToolDefinitionMode {
+    #[default]
+    Direct,
+    Routed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
     pub supports_required_tool_choice: bool,
     pub supports_strict_tool_schema: bool,
+    pub tool_reasoning_mode: ProviderToolReasoningMode,
+    pub tool_definition_mode: ProviderToolDefinitionMode,
     pub max_tool_calls_per_turn: u32,
     pub max_tools_per_request: u32,
     pub supports_json_mode: bool,
@@ -183,6 +195,8 @@ impl Default for ProviderProtocolContract {
             supports_tools: true,
             supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
+            tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
+            tool_definition_mode: ProviderToolDefinitionMode::Direct,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: false,
@@ -202,6 +216,7 @@ pub enum ProviderCapabilityProfile {
     StrictSingle,
     NonStrictParallel,
     NonStrictSingle,
+    RoutedSingle,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -819,6 +834,8 @@ impl OpenAiProviderConfig {
             supports_tools: true,
             supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
+            tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
+            tool_definition_mode: ProviderToolDefinitionMode::Direct,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: false,
@@ -1085,23 +1102,16 @@ impl OpenAiProvider {
                         &probe_attempt_metadata,
                     )));
             }
-            let response = match self.complete_with_contract(
+            let mut completion = match self.complete_capability_probe(
                 &profile.request,
                 cancellation,
                 &profile.contract,
                 model_name,
+                &mut probe_usage,
+                &mut probe_attempt_metadata,
             ) {
-                Ok(response) => {
-                    if let Some(metadata) = &response.provider_attempt_metadata {
-                        add_provider_attempt_metadata(&mut probe_attempt_metadata, metadata);
-                    }
-                    add_model_usage(&mut probe_usage, &response.usage);
-                    response
-                }
+                Ok(completion) => completion,
                 Err(error) if is_capability_probe_profile_rejection(&error) => {
-                    if let Some(metadata) = &error.provider_attempt_metadata {
-                        add_provider_attempt_metadata(&mut probe_attempt_metadata, metadata);
-                    }
                     if index + 1 == profile_count {
                         return Err(capability_probe_failure(
                             error,
@@ -1116,9 +1126,6 @@ impl OpenAiProvider {
                     continue;
                 }
                 Err(error) if is_capability_probe_validation_mismatch(&error) => {
-                    if let Some(metadata) = &error.provider_attempt_metadata {
-                        add_provider_attempt_metadata(&mut probe_attempt_metadata, metadata);
-                    }
                     if index + 1 == profile_count {
                         return Err(capability_probe_failure(
                             error,
@@ -1133,9 +1140,6 @@ impl OpenAiProvider {
                     continue;
                 }
                 Err(error) => {
-                    if let Some(metadata) = &error.provider_attempt_metadata {
-                        add_provider_attempt_metadata(&mut probe_attempt_metadata, metadata);
-                    }
                     return Err(error.with_capability_metadata(capability_probe_metadata(
                         profile.profile,
                         index as u32 + 1,
@@ -1145,41 +1149,151 @@ impl OpenAiProvider {
                     )));
                 }
             };
-            let single_call_fallback = profile.single_call_fallback.filter(|_| {
-                capability_probe_single_call_matches(&response, &profile.expected_calls)
-            });
-            if single_call_fallback.is_some()
-                || capability_probe_response_matches(&response, &profile.expected_calls)
-            {
-                let negotiated_profile = single_call_fallback.unwrap_or(profile.profile);
-                let required_probe =
-                    match self.probe_required_tool_choice(&profile, cancellation, model_name) {
-                        Ok(probe) => probe,
-                        Err(error) => {
-                            if let Some(metadata) = &error.provider_attempt_metadata {
-                                add_provider_attempt_metadata(
-                                    &mut probe_attempt_metadata,
-                                    metadata,
-                                );
-                            }
-                            return Err(error.with_capability_metadata(capability_probe_metadata(
-                                negotiated_profile,
+            let mut negotiated_profile =
+                capability_probe_profile_match(&completion.response, &profile);
+            let mut contract = profile.contract.clone();
+            if negotiated_profile.is_some() && completion.reasoning_content_present {
+                contract.tool_reasoning_mode = ProviderToolReasoningMode::DisabledForToolCalls;
+                completion = match self.complete_capability_probe(
+                    &profile.request,
+                    cancellation,
+                    &contract,
+                    model_name,
+                    &mut probe_usage,
+                    &mut probe_attempt_metadata,
+                ) {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        let error = if is_capability_probe_profile_rejection(&error) {
+                            capability_probe_tool_reasoning_rejection(error)
+                        } else {
+                            error
+                        };
+                        return Err(capability_probe_failure(
+                            error,
+                            profile.profile,
+                            index as u32 + 1,
+                            index as u32,
+                            &probe_usage,
+                            &probe_attempt_metadata,
+                            "tool_reasoning_disable_unsupported",
+                        ));
+                    }
+                };
+                if completion.reasoning_content_present {
+                    return Err(capability_probe_tool_reasoning_error(
+                        &completion.response,
+                        "tool_reasoning_disable_not_honored",
+                    )
+                    .with_capability_metadata(capability_probe_metadata(
+                        profile.profile,
+                        index as u32 + 1,
+                        index as u32,
+                        &probe_usage,
+                        &probe_attempt_metadata,
+                    )));
+                }
+                negotiated_profile = capability_probe_profile_match(&completion.response, &profile);
+                if negotiated_profile.is_none() {
+                    return Err(capability_probe_tool_reasoning_error(
+                        &completion.response,
+                        "tool_reasoning_disabled_profile_invalid",
+                    )
+                    .with_capability_metadata(capability_probe_metadata(
+                        profile.profile,
+                        index as u32 + 1,
+                        index as u32,
+                        &probe_usage,
+                        &probe_attempt_metadata,
+                    )));
+                }
+            }
+            if let Some(negotiated_profile) = negotiated_profile {
+                if negotiated_profile != profile.profile {
+                    contract.max_tool_calls_per_turn = 1;
+                }
+                let continuation_request =
+                    capability_probe_continuation_request(&profile, &completion.response);
+                let continuation_validation = validate_model_request_with_capabilities(
+                    &continuation_request,
+                    Some(&contract),
+                );
+                if !continuation_validation.valid {
+                    return Err(
+                        capability_probe_definition_error(continuation_validation.errors)
+                            .with_capability_metadata(capability_probe_metadata(
+                                profile.profile,
                                 index as u32 + 1,
                                 index as u32,
                                 &probe_usage,
                                 &probe_attempt_metadata,
-                            )));
-                        }
-                    };
-                add_model_usage(&mut probe_usage, &required_probe.usage);
-                add_provider_attempt_metadata(
+                            )),
+                    );
+                }
+                let continuation = match self.complete_capability_probe(
+                    &continuation_request,
+                    cancellation,
+                    &contract,
+                    model_name,
+                    &mut probe_usage,
                     &mut probe_attempt_metadata,
-                    &required_probe.attempt_metadata,
-                );
-                let mut contract = profile.contract;
-                contract.supports_required_tool_choice = required_probe.supported;
-                if single_call_fallback.is_some() {
-                    contract.max_tool_calls_per_turn = 1;
+                ) {
+                    Ok(completion) => completion,
+                    Err(error)
+                        if is_capability_probe_profile_rejection(&error)
+                            || is_capability_probe_validation_mismatch(&error) =>
+                    {
+                        if index + 1 == profile_count {
+                            return Err(capability_probe_failure(
+                                error,
+                                profile.profile,
+                                index as u32 + 1,
+                                index as u32,
+                                &probe_usage,
+                                &probe_attempt_metadata,
+                                "capability_probe_multi_turn_tool_calls_unsupported",
+                            ));
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error.with_capability_metadata(capability_probe_metadata(
+                            profile.profile,
+                            index as u32 + 1,
+                            index as u32,
+                            &probe_usage,
+                            &probe_attempt_metadata,
+                        )));
+                    }
+                };
+                if continuation.reasoning_content_present {
+                    let error = capability_probe_tool_reasoning_error(
+                        &continuation.response,
+                        "tool_reasoning_content_present_after_tool_result",
+                    );
+                    if index + 1 == profile_count {
+                        return Err(error.with_capability_metadata(capability_probe_metadata(
+                            profile.profile,
+                            index as u32 + 1,
+                            index as u32,
+                            &probe_usage,
+                            &probe_attempt_metadata,
+                        )));
+                    }
+                    continue;
+                }
+                if !capability_probe_continuation_matches(&continuation.response, &profile) {
+                    let error = capability_probe_continuation_error(&continuation.response);
+                    if index + 1 == profile_count {
+                        return Err(error.with_capability_metadata(capability_probe_metadata(
+                            profile.profile,
+                            index as u32 + 1,
+                            index as u32,
+                            &probe_usage,
+                            &probe_attempt_metadata,
+                        )));
+                    }
+                    continue;
                 }
                 let negotiation = ProviderProtocolNegotiation {
                     contract,
@@ -1198,17 +1312,14 @@ impl OpenAiProvider {
                 return Ok(negotiation);
             }
             if index + 1 == profile_count {
-                return Err(
-                    capability_probe_response_error(&response).with_capability_metadata(
-                        capability_probe_metadata(
-                            profile.profile,
-                            index as u32 + 1,
-                            index as u32,
-                            &probe_usage,
-                            &probe_attempt_metadata,
-                        ),
-                    ),
-                );
+                return Err(capability_probe_response_error(&completion.response)
+                    .with_capability_metadata(capability_probe_metadata(
+                        profile.profile,
+                        index as u32 + 1,
+                        index as u32,
+                        &probe_usage,
+                        &probe_attempt_metadata,
+                    )));
             }
         }
 
@@ -1218,69 +1329,31 @@ impl OpenAiProvider {
         )))
     }
 
-    fn probe_required_tool_choice(
+    fn complete_capability_probe(
         &self,
-        profile: &CapabilityProbeProfile,
+        request: &ModelTurnRequest,
         cancellation: &CancellationToken,
+        contract: &ProviderProtocolContract,
         model_name: &str,
-    ) -> Result<RequiredToolChoiceProbeResult, ProviderError> {
-        let mut request = profile.request.clone();
-        request.messages = vec![
-            ModelMessage::text(ModelRole::Developer, CAPABILITY_PROBE_DEVELOPER_INSTRUCTION),
-            ModelMessage::text(ModelRole::User, CAPABILITY_PROBE_REQUIRED_TOOL_INSTRUCTION),
-        ];
-        request.tools.truncate(1);
-        request.tool_choice = ToolChoicePolicy {
-            mode: ToolChoiceMode::Required,
-            tool_name: None,
-            allowed_tool_names: Vec::new(),
-            max_tool_calls: 1,
-            strict_tool_schema: profile.contract.supports_strict_tool_schema,
-        };
-        let mut probe_contract = profile.contract.clone();
-        probe_contract.supports_required_tool_choice = true;
-        match self.complete_with_contract(&request, cancellation, &probe_contract, model_name) {
-            Ok(response) => {
-                let attempt_metadata = response
-                    .provider_attempt_metadata
-                    .clone()
-                    .unwrap_or_else(ProviderAttemptMetadata::zero);
-                if response.status == ModelTurnStatus::Success && !response.tool_calls.is_empty() {
-                    return Ok(RequiredToolChoiceProbeResult {
-                        supported: true,
-                        usage: response.usage,
-                        attempt_metadata,
-                    });
+        probe_usage: &mut ModelUsage,
+        probe_attempt_metadata: &mut ProviderAttemptMetadata,
+    ) -> Result<OpenAiCompletion, ProviderError> {
+        let result =
+            self.complete_with_contract_details(request, cancellation, contract, model_name);
+        match &result {
+            Ok(completion) => {
+                add_model_usage(probe_usage, &completion.response.usage);
+                if let Some(metadata) = &completion.response.provider_attempt_metadata {
+                    add_provider_attempt_metadata(probe_attempt_metadata, metadata);
                 }
-                if response.tool_calls.is_empty()
-                    && response.validation.as_ref().is_some_and(|validation| {
-                        validation
-                            .errors
-                            .iter()
-                            .any(|error| error == REQUIRED_TOOL_CHOICE_MISSING_ERROR)
-                    })
-                {
-                    return Ok(RequiredToolChoiceProbeResult {
-                        supported: false,
-                        usage: response.usage,
-                        attempt_metadata,
-                    });
+            }
+            Err(error) => {
+                if let Some(metadata) = &error.provider_attempt_metadata {
+                    add_provider_attempt_metadata(probe_attempt_metadata, metadata);
                 }
-                Err(capability_probe_required_response_error(&response)
-                    .with_provider_attempt_metadata(attempt_metadata))
             }
-            Err(error) if is_capability_probe_profile_rejection(&error) => {
-                Ok(RequiredToolChoiceProbeResult {
-                    supported: false,
-                    usage: ModelUsage::default(),
-                    attempt_metadata: error
-                        .provider_attempt_metadata
-                        .clone()
-                        .unwrap_or_else(ProviderAttemptMetadata::zero),
-                })
-            }
-            Err(error) => Err(error),
         }
+        result
     }
 
     fn complete_with_contract(
@@ -1290,6 +1363,24 @@ impl OpenAiProvider {
         capabilities: &ProviderProtocolContract,
         model_name: &str,
     ) -> Result<ModelTurnResponse, ProviderError> {
+        let completion =
+            self.complete_with_contract_details(request, cancellation, capabilities, model_name)?;
+        if !request.tools.is_empty() && completion.reasoning_content_present {
+            return Err(provider_tool_reasoning_history_error(
+                &completion.response,
+                capabilities.tool_reasoning_mode,
+            ));
+        }
+        Ok(completion.response)
+    }
+
+    fn complete_with_contract_details(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        capabilities: &ProviderProtocolContract,
+        model_name: &str,
+    ) -> Result<OpenAiCompletion, ProviderError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1314,7 +1405,7 @@ impl OpenAiProvider {
                         self.client
                             .post(self.config.endpoint())
                             .bearer_auth(&self.config.api_key)
-                            .json(&openai_request_payload(request, model_name))
+                            .json(&openai_request_payload(request, model_name, capabilities))
                             .send()
                     },
                 ) {
@@ -1408,11 +1499,15 @@ impl OpenAiProvider {
                         &metadata, started_at,
                     ))
             })?;
+            let reasoning_content_present = openai_reasoning_content_present(&payload);
             return parse_openai_response(request, &self.config, payload, capabilities, model_name)
                 .map(|mut response| {
                     response.provider_attempt_metadata =
                         Some(provider_attempt_metadata(&metadata, started_at));
-                    response
+                    OpenAiCompletion {
+                        response,
+                        reasoning_content_present,
+                    }
                 })
                 .map_err(|error| {
                     error.with_provider_attempt_metadata(provider_attempt_metadata(
@@ -1580,7 +1675,11 @@ where
     provider_config_resolution(&values)
 }
 
-fn openai_request_payload(request: &ModelTurnRequest, model_name: &str) -> Value {
+fn openai_request_payload(
+    request: &ModelTurnRequest,
+    model_name: &str,
+    capabilities: &ProviderProtocolContract,
+) -> Value {
     let mut payload = json!({
         "model": request
             .model_preferences
@@ -1616,6 +1715,9 @@ fn openai_request_payload(request: &ModelTurnRequest, model_name: &str) -> Value
         );
         payload["tool_choice"] = openai_tool_choice_payload(request);
         payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
+        if capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls {
+            payload["thinking"] = json!({"type": "disabled"});
+        }
     }
     payload
 }
@@ -1629,9 +1731,6 @@ fn openai_message_payload(message: &ModelMessage) -> Value {
         "role": role,
         "content": openai_message_content(message),
     });
-    if let Some(name) = &message.name {
-        payload["name"] = json!(openai_wire_tool_name(name));
-    }
     if let Some(tool_call_id) = &message.tool_call_id {
         payload["tool_call_id"] = json!(tool_call_id);
     }
@@ -1661,7 +1760,7 @@ fn openai_tool_call_payload(tool_call: &ModelToolCall) -> Value {
         "id": tool_call.tool_call_id,
         "type": "function",
         "function": {
-            "name": openai_wire_tool_name(&tool_call.tool_name),
+            "name": tool_call.tool_name,
             "arguments": tool_call.raw_arguments,
         }
     })
@@ -1671,7 +1770,7 @@ fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> Valu
     let mut payload = json!({
         "type": "function",
         "function": {
-            "name": openai_wire_tool_name(&tool.name),
+            "name": tool.name,
             "description": tool.description,
             "parameters": tool.parameters_schema,
         }
@@ -1687,9 +1786,7 @@ fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
         ToolChoiceMode::None => json!("none"),
         ToolChoiceMode::Required => json!("required"),
         ToolChoiceMode::SpecificTool => match &request.tool_choice.tool_name {
-            Some(name) => {
-                json!({"type": "function", "function": {"name": openai_wire_tool_name(name)}})
-            }
+            Some(name) => json!({"type": "function", "function": {"name": name}}),
             None => json!("auto"),
         },
         ToolChoiceMode::Auto | ToolChoiceMode::AllowedTools => json!("auto"),
@@ -1704,10 +1801,9 @@ struct CapabilityProbeProfile {
     single_call_fallback: Option<ProviderCapabilityProfile>,
 }
 
-struct RequiredToolChoiceProbeResult {
-    supported: bool,
-    usage: ModelUsage,
-    attempt_metadata: ProviderAttemptMetadata,
+struct OpenAiCompletion {
+    response: ModelTurnResponse,
+    reasoning_content_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1820,9 +1916,13 @@ fn capability_probe_profiles(
         };
         request
     };
-    let make_contract = |strict: bool, max_tool_calls_per_turn: u32, max_tools_per_request: u32| {
+    let make_contract = |strict: bool,
+                         max_tool_calls_per_turn: u32,
+                         max_tools_per_request: u32,
+                         tool_definition_mode: ProviderToolDefinitionMode| {
         ProviderProtocolContract {
             supports_strict_tool_schema: strict,
+            tool_definition_mode,
             max_tool_calls_per_turn,
             max_tools_per_request,
             supports_json_mode: false,
@@ -1855,65 +1955,85 @@ fn capability_probe_profiles(
     let mut profiles = Vec::new();
     profiles.push(CapabilityProbeProfile {
         profile: ProviderCapabilityProfile::StrictParallel,
-        contract: make_contract(true, 2, direct_tool_count),
+        contract: make_contract(
+            true,
+            2,
+            direct_tool_count,
+            ProviderToolDefinitionMode::Direct,
+        ),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
             ToolChoiceMode::Auto,
             2,
             true,
-            "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each.",
+            "First call singularity_capability_probe_a and singularity_capability_probe_b once each. After both tool results, call singularity_capability_probe_a once more.",
         ),
         expected_calls: parallel_expected(strict_allowed_arguments.clone()),
         single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
     });
     profiles.push(CapabilityProbeProfile {
         profile: ProviderCapabilityProfile::StrictSingle,
-        contract: make_contract(true, 1, direct_tool_count),
+        contract: make_contract(
+            true,
+            1,
+            direct_tool_count,
+            ProviderToolDefinitionMode::Direct,
+        ),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
             ToolChoiceMode::Auto,
             1,
             true,
-            "Call singularity_capability_probe_a exactly once.",
+            "First call singularity_capability_probe_a once. After its tool result, call singularity_capability_probe_a once more.",
         ),
         expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, strict_allowed_arguments),
         single_call_fallback: None,
     });
     profiles.push(CapabilityProbeProfile {
         profile: ProviderCapabilityProfile::NonStrictParallel,
-        contract: make_contract(false, 2, direct_tool_count),
+        contract: make_contract(
+            false,
+            2,
+            direct_tool_count,
+            ProviderToolDefinitionMode::Direct,
+        ),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
             ToolChoiceMode::Auto,
             2,
             false,
-            "Call singularity_capability_probe_a and singularity_capability_probe_b exactly once each. Use exactly {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]} as each arguments object.",
+            "First call singularity_capability_probe_a and singularity_capability_probe_b once each with exactly {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]} as each arguments object. After both tool results, call singularity_capability_probe_a once more with the same arguments.",
         ),
         expected_calls: parallel_expected(Vec::new()),
         single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
     });
     profiles.push(CapabilityProbeProfile {
         profile: ProviderCapabilityProfile::NonStrictSingle,
-        contract: make_contract(false, 1, direct_tool_count),
+        contract: make_contract(
+            false,
+            1,
+            direct_tool_count,
+            ProviderToolDefinitionMode::Direct,
+        ),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
             ToolChoiceMode::Auto,
             1,
             false,
-            "Call singularity_capability_probe_a exactly once with arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}.",
+            "First call singularity_capability_probe_a once with arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}. After its tool result, call singularity_capability_probe_a once more with the same arguments.",
         ),
         expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, Vec::new()),
         single_call_fallback: None,
     });
     profiles.push(CapabilityProbeProfile {
-        profile: ProviderCapabilityProfile::NonStrictSingle,
-        contract: make_contract(false, 1, 1),
+        profile: ProviderCapabilityProfile::RoutedSingle,
+        contract: make_contract(false, 1, 1, ProviderToolDefinitionMode::Routed),
         request: make_request(
             vec![router_tool],
             ToolChoiceMode::Auto,
             1,
             false,
-            "Call singularity_capability_router exactly once with tool_name singularity_capability_probe_a and arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}.",
+            "First call singularity_capability_router once with tool_name singularity_capability_probe_a and arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}. After its tool result, make the same router call once more.",
         ),
         expected_calls: single_expected(
             CAPABILITY_PROBE_ROUTER,
@@ -1925,6 +2045,56 @@ fn capability_probe_profiles(
         single_call_fallback: None,
     });
     profiles
+}
+
+fn capability_probe_profile_match(
+    response: &ModelTurnResponse,
+    profile: &CapabilityProbeProfile,
+) -> Option<ProviderCapabilityProfile> {
+    profile
+        .single_call_fallback
+        .filter(|_| capability_probe_single_call_matches(response, &profile.expected_calls))
+        .or_else(|| {
+            capability_probe_response_matches(response, &profile.expected_calls)
+                .then_some(profile.profile)
+        })
+}
+
+fn capability_probe_continuation_request(
+    profile: &CapabilityProbeProfile,
+    response: &ModelTurnResponse,
+) -> ModelTurnRequest {
+    let mut request = profile.request.clone();
+    request.request_id = CAPABILITY_PROBE_CONTINUATION_REQUEST_ID.to_string();
+    request.messages.push(ModelMessage::assistant_tool_calls(
+        response.tool_calls.clone(),
+    ));
+    for call in &response.tool_calls {
+        let mut message = ModelMessage::text(
+            ModelRole::Tool,
+            json!({
+                "ok": true,
+                "tool_name": call.tool_name,
+                "tool_call_id": call.tool_call_id,
+                "truncated": false,
+                "content": {"probe": "completed"}
+            })
+            .to_string(),
+        );
+        message.tool_call_id = Some(call.tool_call_id.clone());
+        request.messages.push(message);
+    }
+    request.tool_choice.max_tool_calls = 1;
+    request
+}
+
+fn capability_probe_continuation_matches(
+    response: &ModelTurnResponse,
+    profile: &CapabilityProbeProfile,
+) -> bool {
+    profile.expected_calls.first().is_some_and(|expected| {
+        capability_probe_response_matches(response, std::slice::from_ref(expected))
+    })
 }
 
 fn capability_probe_response_matches(
@@ -2001,26 +2171,6 @@ fn add_provider_attempt_metadata(
     total.latency_ms = total.latency_ms.saturating_add(metadata.latency_ms);
 }
 
-fn openai_wire_tool_name(name: &str) -> String {
-    let public_name = name.strip_prefix(BUILTIN_TOOL_PREFIX).unwrap_or(name);
-    let sanitized = public_name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let trimmed = sanitized.trim_matches('_');
-    if trimmed.is_empty() {
-        TOOL_NAME_FALLBACK.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 fn provider_response_validation_error(
     config: &OpenAiProviderConfig,
     model_name: &str,
@@ -2036,6 +2186,14 @@ fn provider_response_validation_error(
         );
     error.validation_errors = validation_errors;
     ProviderError::from_model_error(error)
+}
+
+fn openai_reasoning_content_present(payload: &Value) -> bool {
+    match payload.pointer("/choices/0/message/reasoning_content") {
+        Some(Value::String(content)) => !content.is_empty(),
+        Some(value) => !value.is_null(),
+        None => false,
+    }
 }
 
 fn parse_openai_response(
@@ -2080,7 +2238,7 @@ fn parse_openai_response(
     let choice = &choices[0];
     let message = choice.get("message").unwrap_or(&Value::Null);
     let content = parse_openai_content(message.get("content"));
-    let tool_calls = parse_openai_tool_calls(request, message);
+    let tool_calls = parse_openai_tool_calls(message);
     let assistant_message = Some(ModelMessage {
         tool_calls: tool_calls.clone(),
         ..ModelMessage::text(ModelRole::Assistant, content)
@@ -2144,8 +2302,7 @@ fn parse_openai_response(
     Ok(response)
 }
 
-fn parse_openai_tool_calls(request: &ModelTurnRequest, message: &Value) -> Vec<ModelToolCall> {
-    let tool_name_map = openai_wire_tool_name_map(request);
+fn parse_openai_tool_calls(message: &Value) -> Vec<ModelToolCall> {
     message
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -2153,17 +2310,13 @@ fn parse_openai_tool_calls(request: &ModelTurnRequest, message: &Value) -> Vec<M
             calls
                 .iter()
                 .enumerate()
-                .map(|(index, call)| parse_openai_tool_call(index, call, &tool_name_map))
+                .map(|(index, call)| parse_openai_tool_call(index, call))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn parse_openai_tool_call(
-    _index: usize,
-    call: &Value,
-    tool_name_map: &[(String, String)],
-) -> ModelToolCall {
+fn parse_openai_tool_call(_index: usize, call: &Value) -> ModelToolCall {
     let function = call.get("function").unwrap_or(&Value::Null);
     let arguments_value = function.get("arguments").unwrap_or(&Value::Null);
     let raw_arguments = match arguments_value {
@@ -2187,28 +2340,12 @@ fn parse_openai_tool_call(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_default(),
-        tool_name: internal_tool_name(wire_tool_name, tool_name_map),
+        tool_name: wire_tool_name.to_string(),
         arguments,
         raw_arguments,
         parse_status,
         validation_errors,
     }
-}
-
-fn openai_wire_tool_name_map(request: &ModelTurnRequest) -> Vec<(String, String)> {
-    request
-        .tools
-        .iter()
-        .map(|tool| (openai_wire_tool_name(&tool.name), tool.name.clone()))
-        .collect()
-}
-
-fn internal_tool_name(wire_name: &str, tool_name_map: &[(String, String)]) -> String {
-    tool_name_map
-        .iter()
-        .find(|(wire, _internal)| wire == wire_name)
-        .map(|(_wire, internal)| internal.clone())
-        .unwrap_or_else(|| wire_name.to_string())
 }
 
 fn parse_tool_arguments(raw_arguments: &str) -> (Value, ModelToolParseStatus, Vec<String>) {
@@ -2565,21 +2702,96 @@ fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderErro
     capability_probe_unsupported_error(error)
 }
 
-fn capability_probe_required_response_error(response: &ModelTurnResponse) -> ProviderError {
+fn capability_probe_continuation_error(response: &ModelTurnResponse) -> ProviderError {
+    let mut error = capability_probe_response_error(response);
+    if !error
+        .error
+        .validation_errors
+        .iter()
+        .any(|existing| existing == "capability_probe_multi_turn_tool_calls_missing")
+    {
+        error
+            .error
+            .validation_errors
+            .push("capability_probe_multi_turn_tool_calls_missing".to_string());
+    }
+    error
+}
+
+fn capability_probe_tool_reasoning_error(
+    response: &ModelTurnResponse,
+    evidence: &str,
+) -> ProviderError {
     let mut error = response.error.as_ref().cloned().unwrap_or_else(|| {
         ModelError::new(
-            ModelErrorKind::JsonSchemaViolation,
-            "provider required tool choice probe response was invalid",
+            ModelErrorKind::UnsupportedCapability,
+            "provider cannot stabilize native tool calls with reasoning disabled",
         )
         .with_provider_diagnostic(
-            "provider_required_tool_choice_probe_invalid",
+            "provider_tool_reasoning_mode_unsupported",
             ProviderErrorStage::ResponseValidation,
         )
     });
     if let Some(validation) = &response.validation {
         error.validation_errors = validation.errors.clone();
     }
-    ProviderError::from_model_error(error)
+    if !error
+        .validation_errors
+        .iter()
+        .any(|existing| existing == evidence)
+    {
+        error.validation_errors.push(evidence.to_string());
+    }
+    let provider_error = ProviderError::from_model_error(error);
+    if let Some(metadata) = &response.provider_attempt_metadata {
+        provider_error.with_provider_attempt_metadata(metadata.clone())
+    } else {
+        provider_error
+    }
+}
+
+fn provider_tool_reasoning_history_error(
+    response: &ModelTurnResponse,
+    mode: ProviderToolReasoningMode,
+) -> ProviderError {
+    let (code, evidence) = if mode == ProviderToolReasoningMode::DisabledForToolCalls {
+        (
+            "provider_tool_reasoning_mode_not_honored",
+            "tool_reasoning_disable_not_honored",
+        )
+    } else {
+        (
+            "provider_tool_reasoning_history_unsupported",
+            "tool_reasoning_content_requires_adapter_history_support",
+        )
+    };
+    let mut error = ModelError::new(
+        ModelErrorKind::UnsupportedCapability,
+        "provider returned tool reasoning that cannot be safely replayed",
+    )
+    .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
+    error.validation_errors.push(evidence.to_string());
+    let provider_error = ProviderError::from_model_error(error);
+    if let Some(metadata) = &response.provider_attempt_metadata {
+        provider_error.with_provider_attempt_metadata(metadata.clone())
+    } else {
+        provider_error
+    }
+}
+
+fn capability_probe_tool_reasoning_rejection(error: ProviderError) -> ProviderError {
+    let provider_attempt_metadata = error.provider_attempt_metadata.clone();
+    let mut model_error = *error.error;
+    model_error.kind = ModelErrorKind::UnsupportedCapability;
+    model_error.message =
+        "provider does not support disabling reasoning for native tool calls".to_string();
+    model_error.code = Some("provider_tool_reasoning_mode_unsupported".to_string());
+    let provider_error = ProviderError::from_model_error(model_error);
+    if let Some(metadata) = provider_attempt_metadata {
+        provider_error.with_provider_attempt_metadata(metadata)
+    } else {
+        provider_error
+    }
 }
 
 fn is_capability_probe_profile_rejection(error: &ProviderError) -> bool {
@@ -2800,6 +3012,37 @@ pub fn validate_model_request_with_capabilities(
     if request.tool_choice.mode == ToolChoiceMode::Required && request.tools.is_empty() {
         errors.push(REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR.to_string());
     }
+    let request_uses_nonportable_tool_name = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .chain(
+            request
+                .messages
+                .iter()
+                .flat_map(|message| message.tool_calls.iter())
+                .map(|call| call.tool_name.as_str()),
+        )
+        .chain(request.tool_choice.tool_name.iter().map(String::as_str))
+        .chain(
+            request
+                .tool_choice
+                .allowed_tool_names
+                .iter()
+                .map(String::as_str),
+        )
+        .any(|name| !is_portable_tool_name(name));
+    if request_uses_nonportable_tool_name {
+        errors.push("tool_name_not_provider_portable".to_string());
+    }
+    let mut tool_names = HashSet::new();
+    if request
+        .tools
+        .iter()
+        .any(|tool| !tool_names.insert(tool.name.as_str()))
+    {
+        errors.push("tool_names_must_be_unique".to_string());
+    }
     if request.tool_choice.strict_tool_schema
         && request
             .tools
@@ -2857,6 +3100,14 @@ pub fn validate_model_request_with_capabilities(
         }
     }
     validation_result(errors, Vec::new())
+}
+
+fn is_portable_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
 pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
@@ -3119,8 +3370,8 @@ fn message_text(message: &ModelMessage) -> &str {
 }
 
 fn is_text_tool_call_envelope(text: &str) -> bool {
-    let text = text.trim();
-    text.starts_with("<tool_call>") && text.ends_with("</tool_call>")
+    text.find("<tool_call>")
+        .is_some_and(|start| text[start + "<tool_call>".len()..].contains("</tool_call>"))
 }
 
 fn missing(value: &Option<String>) -> bool {

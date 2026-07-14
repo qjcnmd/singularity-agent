@@ -49,13 +49,13 @@ fn resource_prefix_rules_match_only_the_named_path_tree() {
 
     for resource in ["src", "src/lib.rs", "src\\lib.rs"] {
         assert!(rule.matches(&PermissionRequest::new(
-            "builtin.edit",
+            "builtin_edit",
             PermissionOperation::Write,
             resource,
         )));
     }
     assert!(!rule.matches(&PermissionRequest::new(
-        "builtin.edit",
+        "builtin_edit",
         PermissionOperation::Write,
         "src2/lib.rs",
     )));
@@ -73,7 +73,7 @@ fn denied_profile_network_cannot_be_enabled_by_permission_rule() {
             "command:curl https://example.com",
         ))
         .evaluate(&PermissionRequest::new(
-            "builtin.command",
+            "builtin_command",
             PermissionOperation::Network,
             "command:curl https://example.com",
         ));
@@ -100,12 +100,12 @@ fn allowed_profile_network_still_requires_a_matching_rule() {
     ));
 
     let allowed = engine.evaluate(&PermissionRequest::new(
-        "builtin.command",
+        "builtin_command",
         PermissionOperation::Network,
         "command:curl https://example.com",
     ));
     let unmatched = engine.evaluate(&PermissionRequest::new(
-        "builtin.command",
+        "builtin_command",
         PermissionOperation::Network,
         "command:curl https://other.example",
     ));
@@ -117,7 +117,7 @@ fn allowed_profile_network_still_requires_a_matching_rule() {
 #[test]
 fn policy_engine_evaluates_hooks_and_rules_in_fail_closed_order() {
     let request =
-        PermissionRequest::new("builtin.shell", PermissionOperation::Execute, "cargo test");
+        PermissionRequest::new("builtin_shell", PermissionOperation::Execute, "cargo test");
     let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
         .with_rule(rule(
             "allow_test",
@@ -154,7 +154,7 @@ fn policy_engine_evaluates_hooks_and_rules_in_fail_closed_order() {
 
 #[test]
 fn managed_policy_precedence_wins_over_lower_scope_rules() {
-    let request = PermissionRequest::new("builtin.read", PermissionOperation::Read, "README.md");
+    let request = PermissionRequest::new("builtin_read", PermissionOperation::Read, "README.md");
     let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
         .with_rule(rule(
             "local_deny",
@@ -181,7 +181,7 @@ fn managed_policy_precedence_wins_over_lower_scope_rules() {
 
 #[test]
 fn sensitive_resources_are_denied_when_marked_by_caller() {
-    let request = PermissionRequest::new("builtin.read", PermissionOperation::Read, ".env")
+    let request = PermissionRequest::new("builtin_read", PermissionOperation::Read, ".env")
         .with_sensitive_resource();
 
     let decision =
@@ -195,7 +195,7 @@ fn sensitive_resources_are_denied_when_marked_by_caller() {
 #[test]
 fn explicit_ask_rule_creates_approval_flow() {
     let request =
-        PermissionRequest::new("builtin.shell", PermissionOperation::Execute, "cargo test");
+        PermissionRequest::new("builtin_shell", PermissionOperation::Execute, "cargo test");
     let decision = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
         .with_rule(rule(
             "ask_tests",
@@ -210,7 +210,7 @@ fn explicit_ask_rule_creates_approval_flow() {
     let approved = ApprovalDecision::new("approval_1", ApprovalOutcome::Allow, "operator approved");
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Ask);
-    assert_eq!(approval.action, "builtin.shell");
+    assert_eq!(approval.action, "builtin_shell");
     assert_eq!(approved.outcome, ApprovalOutcome::Allow);
 }
 
@@ -228,7 +228,7 @@ fn approval_policy_never_turns_approval_requests_into_deny() {
             "cargo test",
         ))
         .evaluate(&PermissionRequest::new(
-            "builtin.shell",
+            "builtin_shell",
             PermissionOperation::Execute,
             "cargo test",
         ));
@@ -253,7 +253,7 @@ fn approval_policy_untrusted_preserves_approval_requests() {
             "cargo test",
         ))
         .evaluate(&PermissionRequest::new(
-            "builtin.shell",
+            "builtin_shell",
             PermissionOperation::Execute,
             "cargo test",
         ));
@@ -269,7 +269,7 @@ fn explicit_danger_full_access_profile_does_not_bypass_approval_policy() {
     profile.approval_policy = ApprovalPolicy::Never;
 
     let decision = PolicyEngine::new(profile).evaluate(&PermissionRequest::new(
-        "builtin.command",
+        "builtin_command",
         PermissionOperation::Execute,
         "cargo test",
     ));
@@ -281,7 +281,7 @@ fn explicit_danger_full_access_profile_does_not_bypass_approval_policy() {
 #[test]
 fn unmatched_permission_requests_require_approval() {
     let decision = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).evaluate(
-        &PermissionRequest::new("builtin.git", PermissionOperation::Execute, "git status"),
+        &PermissionRequest::new("builtin_git", PermissionOperation::Execute, "git status"),
     );
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Ask);
@@ -299,12 +299,12 @@ fn equivalent_shell_forms_are_not_a_policy_special_case() {
     ));
 
     let wrapped = PermissionRequest::new(
-        "builtin.shell",
+        "builtin_shell",
         PermissionOperation::Execute,
         "cmd.exe /c cargo test",
     );
     let normalized =
-        PermissionRequest::new("builtin.shell", PermissionOperation::Execute, "cargo test");
+        PermissionRequest::new("builtin_shell", PermissionOperation::Execute, "cargo test");
 
     assert_eq!(
         engine.evaluate(&wrapped).outcome,
@@ -318,7 +318,7 @@ fn equivalent_shell_forms_are_not_a_policy_special_case() {
 
 #[test]
 fn pre_tool_hook_denies_before_lower_priority_allow_rule() {
-    let request = PermissionRequest::new("builtin.patch", PermissionOperation::Write, "README.md");
+    let request = PermissionRequest::new("builtin_patch", PermissionOperation::Write, "README.md");
     let hook = PreToolUseHook::new(
         "hook_1",
         PermissionDecision::new(PermissionDecisionOutcome::Deny, "hook denied write"),

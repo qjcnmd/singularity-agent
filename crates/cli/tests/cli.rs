@@ -590,7 +590,7 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     "agent": {
       "instructions": "Change solution.txt so value is 1.",
       "allowed_paths": ["solution.txt"],
-      "allowed_tools": ["builtin.read", "builtin.edit"]
+      "allowed_tools": ["builtin_read", "builtin_edit"]
     },
     "evaluator": {
       "baseline": {"commands": [{"argv": ["rustc", "--version"]}]},

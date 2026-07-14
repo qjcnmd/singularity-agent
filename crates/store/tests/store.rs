@@ -195,7 +195,7 @@ fn migrated_schema_rebuilds_foreign_key_tables() {
             insert into turns(turn_id, thread_id, status, agent_loop_status) values('turn_1', 'thread_1', '"blocked"', 'blocked');
             insert into items(item_id, turn_id, kind, payload, status) values('item_1', 'turn_1', '"userMessage"', '[{"type":"text","text":"legacy input"}]', '"completed"');
             insert into approvals(request_id, payload, decision_outcome, decision_reason)
-            values('approval_1', '{"request_id":"approval_1","session_id":"thread_1","task_id":"turn_1","thread_id":"thread_1","turn_id":"turn_1","tool_call_id":"call_1","action":"builtin.edit","resources":[],"reason":""}', null, null);
+            values('approval_1', '{"request_id":"approval_1","session_id":"thread_1","task_id":"turn_1","thread_id":"thread_1","turn_id":"turn_1","tool_call_id":"call_1","action":"builtin_edit","resources":[],"reason":""}', null, null);
             insert into pending_tool_calls(request_id, turn_id, tool_call_id, payload)
             values('approval_1', 'turn_1', 'call_1', '{"request_id":"approval_1","tool_call_id":"call_1"}');
             "#,
@@ -295,13 +295,13 @@ fn pending_tool_call_binding_rejects_request_mismatch() {
         "approval_turn_call_1",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.patch",
+        "builtin_patch",
     )
     .with_tool_call_id("call_1");
     let pending_tool_call = serde_json::json!({
         "request_id": "approval_other",
         "tool_call_id": "call_1",
-        "tool_name": "builtin.patch",
+        "tool_name": "builtin_patch",
         "raw_arguments": "{}",
         "resources": []
     });
@@ -327,7 +327,7 @@ fn approval_creation_requires_explicit_existing_thread_turn_binding() {
         thread_id: String::new(),
         turn_id: String::new(),
         tool_call_id: None,
-        action: "builtin.edit".to_string(),
+        action: "builtin_edit".to_string(),
         resources: Vec::new(),
         reason: String::new(),
     };
@@ -352,7 +352,7 @@ fn approval_creation_rejects_turn_bound_to_another_thread() {
         "approval_1",
         expected_thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     );
 
     assert!(matches!(
@@ -374,14 +374,14 @@ fn pending_tool_call_binding_requires_request_tool_call_id() {
         "approval_turn_call_1",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.patch",
+        "builtin_patch",
     );
     let pending_tool_call = serde_json::json!({
         "request_id": "approval_turn_call_1",
         "thread_id": &thread.thread_id,
         "turn_id": &turn.turn_id,
         "tool_call_id": "call_1",
-        "tool_name": "builtin.patch",
+        "tool_name": "builtin_patch",
         "raw_arguments": "{}",
         "resources": [],
         "checkpoint_version": 1,
@@ -417,7 +417,7 @@ fn pending_tool_call_requires_checkpoint_and_rolls_back_atomically() {
         "approval_turn_call_1",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1");
     let pending_tool_call = serde_json::json!({
@@ -425,7 +425,7 @@ fn pending_tool_call_requires_checkpoint_and_rolls_back_atomically() {
         "thread_id": &thread.thread_id,
         "turn_id": &turn.turn_id,
         "tool_call_id": "call_1",
-        "tool_name": "builtin.edit",
+        "tool_name": "builtin_edit",
         "raw_arguments": "{}",
         "resources": []
     });
@@ -473,7 +473,7 @@ fn pending_approval_creation_does_not_overwrite_cancel_requested_turn() {
         "approval_after_cancel",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1");
     let checkpoint = serde_json::json!({
@@ -481,7 +481,7 @@ fn pending_approval_creation_does_not_overwrite_cancel_requested_turn() {
         "thread_id": &request.thread_id,
         "turn_id": &request.turn_id,
         "tool_call_id": "call_1",
-        "tool_name": "builtin.edit",
+        "tool_name": "builtin_edit",
         "raw_arguments": "{}",
         "resources": [],
         "checkpoint_version": 1,
@@ -516,13 +516,13 @@ fn pending_tool_call_binding_requires_existing_turn() {
         "approval_missing_turn_call_1",
         "missing_thread",
         "missing_turn",
-        "builtin.patch",
+        "builtin_patch",
     )
     .with_tool_call_id("call_1");
     let pending_tool_call = serde_json::json!({
         "request_id": "approval_missing_turn_call_1",
         "tool_call_id": "call_1",
-        "tool_name": "builtin.patch",
+        "tool_name": "builtin_patch",
         "raw_arguments": "{}",
         "resources": []
     });
@@ -554,7 +554,7 @@ fn approval_decision_rejects_pending_tool_call_turn_mismatch() {
         "approval_turn_call_1",
         thread.thread_id.clone(),
         expected_turn.turn_id.clone(),
-        "builtin.patch",
+        "builtin_patch",
     )
     .with_tool_call_id("call_1");
     store.create_approval(&request).expect("approval");
@@ -573,7 +573,7 @@ fn approval_decision_rejects_pending_tool_call_turn_mismatch() {
                 serde_json::json!({
                     "request_id": request.request_id.as_str(),
                     "tool_call_id": "call_1",
-                    "tool_name": "builtin.patch",
+                    "tool_name": "builtin_patch",
                     "raw_arguments": "{}",
                     "resources": []
                 })
@@ -787,7 +787,7 @@ fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
         "approval_recovery",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1")
     .with_resources(["README.md"]);
@@ -796,11 +796,11 @@ fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
         "thread_id": &request.thread_id,
         "turn_id": &request.turn_id,
         "tool_call_id": "call_1",
-        "tool_name": "builtin.edit",
+        "tool_name": "builtin_edit",
         "raw_arguments": "{}",
         "resources": ["README.md"],
         "checkpoint_version": 1,
-        "messages": [{"role":"assistant","content":[],"tool_calls":[{"tool_call_id":"call_1","tool_name":"builtin.edit","arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
+        "messages": [{"role":"assistant","content":[],"tool_calls":[{"tool_call_id":"call_1","tool_name":"builtin_edit","arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
         "tool_results": [],
         "used_approval_grants": [],
         "approval_count": 1,
@@ -868,11 +868,11 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
             "thread_id": &thread.thread_id,
             "turn_id": &turn.turn_id,
             "tool_call_id": tool_call_id,
-            "tool_name": "builtin.edit",
+            "tool_name": "builtin_edit",
             "raw_arguments": "{}",
             "resources": [],
             "checkpoint_version": 1,
-            "messages": [{"role":"assistant","content":[],"tool_calls":[{"tool_call_id":tool_call_id,"tool_name":"builtin.edit","arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
+            "messages": [{"role":"assistant","content":[],"tool_calls":[{"tool_call_id":tool_call_id,"tool_name":"builtin_edit","arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
             "tool_results": [],
             "used_approval_grants": [],
             "approval_count": 1,
@@ -884,7 +884,7 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
         "approval_legacy_executing",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1");
     store
@@ -905,7 +905,7 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
         "approval_pending_successor",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_2");
     store
@@ -994,7 +994,7 @@ fn process_recovery_rolls_back_before_mutation_when_half_handoff_is_corrupt() {
             "thread_id": &thread.thread_id,
             "turn_id": &turn.turn_id,
             "tool_call_id": tool_call_id,
-            "tool_name": "builtin.edit",
+            "tool_name": "builtin_edit",
             "raw_arguments": "{}",
             "resources": [],
             "checkpoint_version": 1,
@@ -1010,7 +1010,7 @@ fn process_recovery_rolls_back_before_mutation_when_half_handoff_is_corrupt() {
         "approval_corrupt_first",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1");
     store
@@ -1032,7 +1032,7 @@ fn process_recovery_rolls_back_before_mutation_when_half_handoff_is_corrupt() {
         "approval_corrupt_next",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_2");
     store
@@ -1105,7 +1105,7 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
             format!("approval_ledger_{corruption}"),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            "builtin.edit",
+            "builtin_edit",
         )
         .with_tool_call_id("call_1");
         let checkpoint = serde_json::json!({
@@ -1113,7 +1113,7 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
             "thread_id": &request.thread_id,
             "turn_id": &request.turn_id,
             "tool_call_id": "call_1",
-            "tool_name": "builtin.edit",
+            "tool_name": "builtin_edit",
             "raw_arguments": "{}",
             "resources": [],
             "checkpoint_version": 1,
@@ -1215,7 +1215,7 @@ fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
         "approval_missing_checkpoint",
         thread.thread_id,
         turn.turn_id,
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1");
     store.create_approval(&request).expect("approval ledger");
@@ -1239,7 +1239,7 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
         "approval_first",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1");
     let checkpoint = |request_id: &str, tool_call_id: &str| {
@@ -1248,7 +1248,7 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
             "thread_id": &thread.thread_id,
             "turn_id": &turn.turn_id,
             "tool_call_id": tool_call_id,
-            "tool_name": "builtin.edit",
+            "tool_name": "builtin_edit",
             "raw_arguments": "{}",
             "resources": [],
             "checkpoint_version": 1,
@@ -1279,7 +1279,7 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
         "approval_next",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_2");
     let trace = TraceEvent {
@@ -1361,7 +1361,7 @@ fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
         "approval_deny",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1");
     let checkpoint = serde_json::json!({
@@ -1369,7 +1369,7 @@ fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
         "thread_id": &request.thread_id,
         "turn_id": &request.turn_id,
         "tool_call_id": "call_1",
-        "tool_name": "builtin.edit",
+        "tool_name": "builtin_edit",
         "raw_arguments": "{}",
         "resources": [],
         "checkpoint_version": 1,
@@ -1417,7 +1417,7 @@ fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
         "approval_archive_race",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.edit",
+        "builtin_edit",
     )
     .with_tool_call_id("call_1");
     let checkpoint = serde_json::json!({
@@ -1425,7 +1425,7 @@ fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
         "thread_id": &request.thread_id,
         "turn_id": &request.turn_id,
         "tool_call_id": "call_1",
-        "tool_name": "builtin.edit",
+        "tool_name": "builtin_edit",
         "raw_arguments": "{}",
         "resources": [],
         "checkpoint_version": 1,
@@ -1487,7 +1487,7 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
         "approval_turn_call_1",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin.patch",
+        "builtin_patch",
     )
     .with_tool_call_id("call_1");
     let pending_tool_call = serde_json::json!({
@@ -1495,7 +1495,7 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
         "thread_id": &thread.thread_id,
         "turn_id": &turn.turn_id,
         "tool_call_id": "call_1",
-        "tool_name": "builtin.patch",
+        "tool_name": "builtin_patch",
         "raw_arguments": "{}",
         "resources": [],
         "checkpoint_version": 1,
@@ -2309,7 +2309,7 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
         "history_approval",
         thread.thread_id.clone(),
         completed.clone(),
-        "builtin.read",
+        "builtin_read",
     );
     store.create_approval(&approval).expect("approval");
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
