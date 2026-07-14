@@ -292,7 +292,7 @@ fn failed_model_response(error: ModelError) -> ModelTurnResponse {
 }
 
 #[test]
-fn agent_loop_uses_negotiated_contract_for_strict_parallel_request() {
+fn agent_loop_uses_negotiated_parallel_limit_and_keeps_optional_tools_non_strict() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let negotiation_calls = Arc::new(AtomicUsize::new(0));
     let static_capabilities = ProviderProtocolContract {
@@ -334,7 +334,7 @@ fn agent_loop_uses_negotiated_contract_for_strict_parallel_request() {
     let requests = seen_requests.lock().expect("seen requests lock");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].tool_choice.max_tool_calls, 2);
-    assert!(requests[0].tool_choice.strict_tool_schema);
+    assert!(!requests[0].tool_choice.strict_tool_schema);
     let serialized = serde_json::to_value(&result).expect("serialize result");
     assert!(serialized.get("provider_protocol_contract").is_none());
     assert!(serialized.get("provider_capability_metadata").is_none());
@@ -489,7 +489,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
     let requests = seen_requests.lock().expect("seen requests lock");
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[1].tool_choice.max_tool_calls, 2);
-    assert!(requests[1].tool_choice.strict_tool_schema);
+    assert!(!requests[1].tool_choice.strict_tool_schema);
     assert_eq!(
         resumed.provider_protocol_contract,
         Some(negotiated_contract)
@@ -825,7 +825,7 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
     let requests = seen_requests.lock().expect("seen requests lock");
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].tool_choice.max_tool_calls, 2);
-    assert!(requests[0].tool_choice.strict_tool_schema);
+    assert!(!requests[0].tool_choice.strict_tool_schema);
     assert!(
         requests[0].messages[0]
             .content

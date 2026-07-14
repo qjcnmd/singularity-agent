@@ -399,11 +399,11 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "minLength": 1},
-                    "max_chars": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_READ_MAX_CHARS},
-                    "line_start": {"type": ["integer", "null"], "minimum": 1},
-                    "line_end": {"type": ["integer", "null"], "minimum": 1}
+                    "max_chars": {"type": "integer", "minimum": 1, "maximum": MAX_READ_MAX_CHARS},
+                    "line_start": {"type": "integer", "minimum": 1},
+                    "line_end": {"type": "integer", "minimum": 1}
                 },
-                "required": ["path", "max_chars", "line_start", "line_end"],
+                "required": ["path"],
                 "additionalProperties": false
             }),
             ToolExecutionMode::ParallelRead,
@@ -415,12 +415,12 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": ["string", "null"], "minLength": 1},
-                    "max_entries": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_LIST_MAX_ENTRIES},
+                    "path": {"type": "string", "minLength": 1},
+                    "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_ENTRIES},
                     "recursive": {"type": "boolean"},
-                    "max_depth": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_LIST_MAX_DEPTH}
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_DEPTH}
                 },
-                "required": ["path", "max_entries", "recursive", "max_depth"],
+                "required": [],
                 "additionalProperties": false
             }),
             ToolExecutionMode::ParallelRead,
@@ -432,12 +432,12 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": ["string", "null"], "minLength": 1},
+                    "path": {"type": "string", "minLength": 1},
                     "pattern": {"type": "string", "minLength": 1},
-                    "max_matches": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_GREP_MAX_MATCHES},
+                    "max_matches": {"type": "integer", "minimum": 1, "maximum": MAX_GREP_MAX_MATCHES},
                     "case_sensitive": {"type": "boolean"}
                 },
-                "required": ["path", "pattern", "max_matches", "case_sensitive"],
+                "required": ["pattern"],
                 "additionalProperties": false
             }),
             ToolExecutionMode::ParallelRead,
@@ -472,10 +472,10 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                             "type": "object",
                             "properties": {
                                 "path": {"type": "string", "minLength": 1},
-                                "expected": {"type": ["string", "null"]},
+                                "expected": {"type": "string"},
                                 "replacement": {"type": "string"}
                             },
-                            "required": ["path", "expected", "replacement"],
+                            "required": ["path", "replacement"],
                             "additionalProperties": false
                         }
                     }
@@ -497,10 +497,10 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
                         "items": {"type": "string"},
                         "minItems": 1
                     },
-                    "cwd": {"type": ["string", "null"], "minLength": 1},
-                    "timeout_seconds": {"type": ["integer", "null"], "minimum": 1, "maximum": MAX_COMMAND_TIMEOUT_SECONDS}
+                    "cwd": {"type": "string", "minLength": 1},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_COMMAND_TIMEOUT_SECONDS}
                 },
-                "required": ["argv", "cwd", "timeout_seconds"],
+                "required": ["argv"],
                 "additionalProperties": false
             }),
             ToolExecutionMode::Exclusive,

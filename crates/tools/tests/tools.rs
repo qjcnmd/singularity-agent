@@ -1120,6 +1120,65 @@ fn workspace_tool_specs_share_the_runtime_navigation_contract() {
 }
 
 #[test]
+fn workspace_tool_schemas_keep_optional_inputs_optional_and_provider_portable() {
+    let specs = workspace_tool_specs();
+    let cases: [(&str, &[&str], &[&str]); 4] = [
+        (
+            "builtin_read",
+            &["path"],
+            &["max_chars", "line_start", "line_end"],
+        ),
+        (
+            "builtin_list",
+            &[],
+            &["path", "max_entries", "recursive", "max_depth"],
+        ),
+        (
+            "builtin_grep",
+            &["pattern"],
+            &["path", "max_matches", "case_sensitive"],
+        ),
+        ("builtin_command", &["argv"], &["cwd", "timeout_seconds"]),
+    ];
+
+    for (tool_name, expected_required, optional_fields) in cases {
+        let schema = &specs
+            .iter()
+            .find(|spec| spec.name == tool_name)
+            .unwrap_or_else(|| panic!("missing {tool_name}"))
+            .input_schema;
+        let required = schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(required, expected_required, "{tool_name} required fields");
+        for field in optional_fields {
+            assert!(
+                schema["properties"][field]["type"].is_string(),
+                "{tool_name}.{field} must use a single JSON Schema type"
+            );
+            assert!(
+                !required.contains(field),
+                "{tool_name}.{field} must remain optional"
+            );
+        }
+    }
+
+    let patch_change = &specs
+        .iter()
+        .find(|spec| spec.name == "builtin_patch")
+        .expect("builtin_patch")
+        .input_schema["properties"]["changes"]["items"];
+    assert_eq!(
+        patch_change["required"],
+        serde_json::json!(["path", "replacement"])
+    );
+    assert_eq!(patch_change["properties"]["expected"]["type"], "string");
+}
+
+#[test]
 fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
     let cases = [
         serde_json::from_value::<ReadToolInput>(serde_json::json!({
