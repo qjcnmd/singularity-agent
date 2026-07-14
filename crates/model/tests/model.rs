@@ -20,7 +20,7 @@ use std::sync::{
     mpsc::{self, Receiver},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
 
@@ -140,6 +140,35 @@ fn captured_request_server(
             tx.send(request_body).expect("send request body");
             write_provider_response(&mut stream, status_line, body, false);
             break;
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn no_request_server() -> (String, Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind no-request provider");
+    listener
+        .set_nonblocking(true)
+        .expect("configure no-request provider");
+    let addr = listener.local_addr().expect("no-request provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    tx.send(()).expect("report unexpected provider request");
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
         }
     });
     (format!("http://{addr}"), rx)
@@ -1465,7 +1494,9 @@ fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
         ProviderToolReasoningMode::DisabledForToolCalls
     );
 
-    let request = capability_test_request(None, false, 2);
+    let mut request = capability_test_request(None, false, 2);
+    request.tool_choice.mode = ToolChoiceMode::SpecificTool;
+    request.tool_choice.tool_name = Some("builtin_read".to_string());
     let response = provider
         .complete(&request, &cancellation)
         .expect("Responses completion");
@@ -1521,6 +1552,10 @@ fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
         serde_json::from_str(&captured[2].1).expect("actual Responses request JSON");
     assert_eq!(actual["tools"][0]["name"], "builtin_read");
     assert_eq!(actual["tools"][0]["strict"], false);
+    assert_eq!(
+        actual["tool_choice"],
+        serde_json::json!({"type": "function", "name": "builtin_read"})
+    );
     assert_eq!(actual["reasoning"]["effort"], "none");
 }
 
@@ -2845,6 +2880,70 @@ fn required_tool_choice_requires_tools_and_negotiated_support() {
         missing_required_call.errors,
         vec!["required_tool_call_missing"]
     );
+}
+
+#[test]
+fn specific_tool_choice_requires_a_known_tool_without_transport() {
+    for (case, tool_name, expected_error) in [
+        ("missing", None, "specific_tool_name_required"),
+        ("empty", Some(""), "specific_tool_name_required"),
+        (
+            "unknown",
+            Some("builtin_missing"),
+            "specific_tool_name_unknown",
+        ),
+    ] {
+        let mut request = ModelTurnRequest::new(
+            format!("request_specific_{case}"),
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        request.tools.push(ModelToolSchema {
+            name: "builtin_read".to_string(),
+            description: "read".to_string(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        });
+        request.tool_choice.mode = ToolChoiceMode::SpecificTool;
+        request.tool_choice.tool_name = tool_name.map(str::to_string);
+
+        let local_validation = validate_model_request(&request);
+        assert_eq!(local_validation.errors, vec![expected_error]);
+
+        let (base_url, requests) = no_request_server();
+        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let error = provider
+            .complete(&request, &singularity_core::CancellationToken::new())
+            .expect_err("invalid tool choice");
+        assert_eq!(error.error.kind, ModelErrorKind::InvalidRequest);
+        assert_eq!(error.error.validation_errors, vec![expected_error]);
+        assert!(requests.recv_timeout(Duration::from_millis(700)).is_err());
+    }
+}
+
+#[test]
+fn tool_name_is_rejected_outside_specific_tool_choice() {
+    for mode in [
+        ToolChoiceMode::Auto,
+        ToolChoiceMode::None,
+        ToolChoiceMode::Required,
+    ] {
+        let mut request = ModelTurnRequest::new(
+            "request_tool_name_mode",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        request.tools.push(ModelToolSchema {
+            name: "builtin_read".to_string(),
+            description: "read".to_string(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+        });
+        request.tool_choice.mode = mode;
+        request.tool_choice.tool_name = Some("builtin_read".to_string());
+
+        let validation = validate_model_request(&request);
+        assert_eq!(
+            validation.errors,
+            vec!["tool_name_only_valid_for_specific_tool"]
+        );
+    }
 }
 
 #[test]

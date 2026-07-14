@@ -42,6 +42,9 @@ const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_call_missing";
 const REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR: &str = "required_tool_choice_requires_tools";
 const REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR: &str =
     "provider_does_not_support_required_tool_choice";
+const SPECIFIC_TOOL_NAME_REQUIRED_ERROR: &str = "specific_tool_name_required";
+const SPECIFIC_TOOL_NAME_UNKNOWN_ERROR: &str = "specific_tool_name_unknown";
+const TOOL_NAME_ONLY_VALID_FOR_SPECIFIC_TOOL_ERROR: &str = "tool_name_only_valid_for_specific_tool";
 const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
@@ -108,14 +111,12 @@ pub enum ToolChoiceMode {
     None,
     Required,
     SpecificTool,
-    AllowedTools,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolChoicePolicy {
     pub mode: ToolChoiceMode,
     pub tool_name: Option<String>,
-    pub allowed_tool_names: Vec<String>,
     pub max_tool_calls: u32,
     pub strict_tool_schema: bool,
 }
@@ -125,7 +126,6 @@ impl Default for ToolChoicePolicy {
         Self {
             mode: ToolChoiceMode::Auto,
             tool_name: None,
-            allowed_tool_names: Vec::new(),
             max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
             strict_tool_schema: false,
         }
@@ -1508,7 +1508,13 @@ impl OpenAiProvider {
             ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
                 openai_request_payload(request, model_name, capabilities)
             }
-        };
+        }
+        .map_err(|validation_error| {
+            provider_request_validation_error(
+                validation_result(vec![validation_error.to_string()], Vec::new()),
+                &self.config,
+            )
+        })?;
         loop {
             if cancellation.is_cancelled() {
                 return Err(provider_cancelled_error().with_provider_attempt_metadata(
@@ -1687,6 +1693,13 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error()
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
+        let local_validation = validate_model_request(request);
+        if !local_validation.valid {
+            return Err(provider_request_validation_error(
+                local_validation,
+                &self.config,
+            ));
+        }
         let (capabilities, capability_metadata, api_protocol) = if request.tools.is_empty() {
             (
                 self.protocol_contract(),
@@ -1711,24 +1724,8 @@ impl Provider for OpenAiProvider {
         let request_validation =
             validate_model_request_with_capabilities(request, Some(&capabilities));
         if !request_validation.valid {
-            let kind = if validation_is_unsupported_capability(&request_validation) {
-                ModelErrorKind::UnsupportedCapability
-            } else {
-                ModelErrorKind::InvalidRequest
-            };
-            let mut error = ModelError::new(
-                kind,
-                format!(
-                    "model request validation failed: {}",
-                    request_validation.errors.join(", ")
-                ),
-            )
-            .with_provider(self.config.provider_name.clone())
-            .with_model(self.config.model_name.clone())
-            .with_provider_diagnostic("provider_request_invalid", ProviderErrorStage::RequestSend);
-            error.validation_errors = request_validation.errors;
-            let provider_error = ProviderError::from_model_error(error)
-                .with_provider_attempt_metadata(ProviderAttemptMetadata::zero());
+            let provider_error =
+                provider_request_validation_error(request_validation, &self.config);
             return Err(attach_capability_metadata(
                 provider_error,
                 &capability_metadata,
@@ -1757,6 +1754,30 @@ pub struct ProviderError {
     pub error: Box<ModelError>,
     pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
     pub capability_metadata: Option<Box<ProviderCapabilityMetadata>>,
+}
+
+fn provider_request_validation_error(
+    validation: ModelValidationResult,
+    config: &OpenAiProviderConfig,
+) -> ProviderError {
+    let kind = if validation_is_unsupported_capability(&validation) {
+        ModelErrorKind::UnsupportedCapability
+    } else {
+        ModelErrorKind::InvalidRequest
+    };
+    let mut error = ModelError::new(
+        kind,
+        format!(
+            "model request validation failed: {}",
+            validation.errors.join(", ")
+        ),
+    )
+    .with_provider(config.provider_name.clone())
+    .with_model(config.model_name.clone())
+    .with_provider_diagnostic("provider_request_invalid", ProviderErrorStage::RequestSend);
+    error.validation_errors = validation.errors;
+    ProviderError::from_model_error(error)
+        .with_provider_attempt_metadata(ProviderAttemptMetadata::zero())
 }
 
 impl ProviderError {
@@ -1848,7 +1869,7 @@ fn openai_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-) -> Value {
+) -> Result<Value, &'static str> {
     let mut payload = json!({
         "model": request
             .model_preferences
@@ -1882,20 +1903,20 @@ fn openai_request_payload(
                 .map(|tool| openai_tool_payload(tool, request.tool_choice.strict_tool_schema))
                 .collect::<Vec<_>>()
         );
-        payload["tool_choice"] = openai_tool_choice_payload(request);
+        payload["tool_choice"] = openai_tool_choice_payload(request)?;
         payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
         if capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls {
             payload["thinking"] = json!({"type": "disabled"});
         }
     }
-    payload
+    Ok(payload)
 }
 
 fn openai_responses_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-) -> Value {
+) -> Result<Value, &'static str> {
     let (instructions, input) = openai_responses_input(&request.messages);
     let mut payload = json!({
         "model": request
@@ -1938,13 +1959,13 @@ fn openai_responses_request_payload(
                 })
                 .collect::<Vec<_>>()
         );
-        payload["tool_choice"] = openai_responses_tool_choice_payload(request);
+        payload["tool_choice"] = openai_responses_tool_choice_payload(request)?;
         payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
         if capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls {
             payload["reasoning"] = json!({"effort": "none"});
         }
     }
-    payload
+    Ok(payload)
 }
 
 fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
@@ -2003,15 +2024,18 @@ fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Val
     ((!instructions.is_empty()).then_some(instructions), items)
 }
 
-fn openai_responses_tool_choice_payload(request: &ModelTurnRequest) -> Value {
+fn openai_responses_tool_choice_payload(request: &ModelTurnRequest) -> Result<Value, &'static str> {
     match request.tool_choice.mode {
-        ToolChoiceMode::None => json!("none"),
-        ToolChoiceMode::Required => json!("required"),
-        ToolChoiceMode::SpecificTool => match &request.tool_choice.tool_name {
-            Some(name) => json!({"type": "function", "name": name}),
-            None => json!("auto"),
-        },
-        ToolChoiceMode::Auto | ToolChoiceMode::AllowedTools => json!("auto"),
+        ToolChoiceMode::None => Ok(json!("none")),
+        ToolChoiceMode::Required => Ok(json!("required")),
+        ToolChoiceMode::SpecificTool => request
+            .tool_choice
+            .tool_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| json!({"type": "function", "name": name}))
+            .ok_or(SPECIFIC_TOOL_NAME_REQUIRED_ERROR),
+        ToolChoiceMode::Auto => Ok(json!("auto")),
     }
 }
 
@@ -2074,15 +2098,18 @@ fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> Valu
     payload
 }
 
-fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
+fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Result<Value, &'static str> {
     match request.tool_choice.mode {
-        ToolChoiceMode::None => json!("none"),
-        ToolChoiceMode::Required => json!("required"),
-        ToolChoiceMode::SpecificTool => match &request.tool_choice.tool_name {
-            Some(name) => json!({"type": "function", "function": {"name": name}}),
-            None => json!("auto"),
-        },
-        ToolChoiceMode::Auto | ToolChoiceMode::AllowedTools => json!("auto"),
+        ToolChoiceMode::None => Ok(json!("none")),
+        ToolChoiceMode::Required => Ok(json!("required")),
+        ToolChoiceMode::SpecificTool => request
+            .tool_choice
+            .tool_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| json!({"type": "function", "function": {"name": name}}))
+            .ok_or(SPECIFIC_TOOL_NAME_REQUIRED_ERROR),
+        ToolChoiceMode::Auto => Ok(json!("auto")),
     }
 }
 
@@ -2204,7 +2231,6 @@ fn capability_probe_profiles(
         request.tool_choice = ToolChoicePolicy {
             mode,
             tool_name: None,
-            allowed_tool_names: Vec::new(),
             max_tool_calls,
             strict_tool_schema: strict,
         };
@@ -2793,13 +2819,17 @@ fn finalize_provider_response(
         model_name: Some(model_name.to_string()),
         provider_attempt_metadata: None,
     };
-    let allowed_tool_names = request
+    let available_tool_names = request
         .tools
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    let validation =
-        validate_model_turn_response(request, &response, &allowed_tool_names, Some(capabilities));
+    let validation = validate_model_turn_response(
+        request,
+        &response,
+        &available_tool_names,
+        Some(capabilities),
+    );
     if !validation.valid {
         response.status = ModelTurnStatus::Invalid;
         let provider_rejected_parallelism = validation
@@ -3561,6 +3591,24 @@ pub fn validate_model_request_with_capabilities(
     if request.tool_choice.mode == ToolChoiceMode::Required && request.tools.is_empty() {
         errors.push(REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR.to_string());
     }
+    match request.tool_choice.mode {
+        ToolChoiceMode::SpecificTool => match request.tool_choice.tool_name.as_deref() {
+            None => {
+                errors.push(SPECIFIC_TOOL_NAME_REQUIRED_ERROR.to_string());
+            }
+            Some(name) if name.trim().is_empty() => {
+                errors.push(SPECIFIC_TOOL_NAME_REQUIRED_ERROR.to_string());
+            }
+            Some(name) if !request.tools.iter().any(|tool| tool.name.as_str() == name) => {
+                errors.push(SPECIFIC_TOOL_NAME_UNKNOWN_ERROR.to_string());
+            }
+            Some(_) => {}
+        },
+        _ if request.tool_choice.tool_name.is_some() => {
+            errors.push(TOOL_NAME_ONLY_VALID_FOR_SPECIFIC_TOOL_ERROR.to_string());
+        }
+        _ => {}
+    }
     let request_uses_nonportable_tool_name = request
         .tools
         .iter()
@@ -3572,16 +3620,16 @@ pub fn validate_model_request_with_capabilities(
                 .flat_map(|message| message.tool_calls.iter())
                 .map(|call| call.tool_name.as_str()),
         )
-        .chain(request.tool_choice.tool_name.iter().map(String::as_str))
-        .chain(
-            request
-                .tool_choice
-                .allowed_tool_names
-                .iter()
-                .map(String::as_str),
-        )
         .any(|name| !is_portable_tool_name(name));
     if request_uses_nonportable_tool_name {
+        errors.push("tool_name_not_provider_portable".to_string());
+    }
+    if request
+        .tool_choice
+        .tool_name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty() && !is_portable_tool_name(name))
+    {
         errors.push("tool_name_not_provider_portable".to_string());
     }
     let mut tool_names = HashSet::new();
@@ -3719,14 +3767,14 @@ pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
-    allowed_tool_names: &[String],
+    available_tool_names: &[String],
     capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
     let mut result = validate_model_response(
         response.assistant_message.as_ref(),
         &response.tool_calls,
         &request.tool_choice,
-        allowed_tool_names,
+        available_tool_names,
         capabilities,
     );
     if response.request_id != request.request_id {
@@ -3759,7 +3807,7 @@ pub fn validate_model_response(
     assistant_message: Option<&ModelMessage>,
     tool_calls: &[ModelToolCall],
     tool_choice: &ToolChoicePolicy,
-    allowed_tool_names: &[String],
+    available_tool_names: &[String],
     capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
     let mut errors = Vec::new();
@@ -3771,7 +3819,7 @@ pub fn validate_model_response(
         }
         Some(message)
             if tool_calls.is_empty()
-                && !allowed_tool_names.is_empty()
+                && !available_tool_names.is_empty()
                 && is_text_tool_call_envelope(message_text(message)) =>
         {
             errors.push(TEXT_TOOL_CALL_ENVELOPE_ERROR.to_string());
@@ -3829,7 +3877,7 @@ pub fn validate_model_response(
         if !call.arguments.is_object() {
             errors.push("tool_call_arguments_must_be_object".to_string());
         }
-        if !allowed_tool_names
+        if !available_tool_names
             .iter()
             .any(|name| name == &call.tool_name)
         {
@@ -3858,14 +3906,6 @@ fn validate_tool_choice_name(
             if tool_choice.tool_name.as_deref() != Some(call.tool_name.as_str()) =>
         {
             errors.push("specific_tool_required".to_string());
-        }
-        ToolChoiceMode::AllowedTools
-            if !tool_choice
-                .allowed_tool_names
-                .iter()
-                .any(|name| name == &call.tool_name) =>
-        {
-            errors.push("tool_not_allowed_by_choice".to_string());
         }
         _ => {}
     }
