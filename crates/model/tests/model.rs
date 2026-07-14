@@ -2985,6 +2985,22 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
 
     assert_eq!(specific_without_call.errors, vec!["specific_tool_required"]);
 
+    let text_tool_call = validate_model_response(
+        Some(&ModelMessage::text(
+            ModelRole::Assistant,
+            "<tool_call>\n<function=read>\n<parameter=path>Cargo.toml</parameter>\n</function>\n</tool_call>",
+        )),
+        &[],
+        &ToolChoicePolicy::default(),
+        &["builtin.read_file".to_string()],
+        Some(&ProviderProtocolContract::default()),
+    );
+
+    assert_eq!(
+        text_tool_call.errors,
+        vec!["text_tool_call_envelope_not_supported"]
+    );
+
     let duplicate_result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         &[call.clone(), call],

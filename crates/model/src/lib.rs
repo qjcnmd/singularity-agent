@@ -41,6 +41,7 @@ const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_call_missing";
 const REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR: &str = "required_tool_choice_requires_tools";
 const REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR: &str =
     "provider_does_not_support_required_tool_choice";
+const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
 const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;
@@ -2967,6 +2968,13 @@ pub fn validate_model_response(
         Some(message) if message.role != ModelRole::Assistant => {
             errors.push("non_assistant_response".to_string());
         }
+        Some(message)
+            if tool_calls.is_empty()
+                && !allowed_tool_names.is_empty()
+                && is_text_tool_call_envelope(message_text(message)) =>
+        {
+            errors.push(TEXT_TOOL_CALL_ENVELOPE_ERROR.to_string());
+        }
         Some(message) if message_text(message).trim().is_empty() && tool_calls.is_empty() => {
             errors.push("empty_response".to_string());
         }
@@ -3108,6 +3116,11 @@ fn validation_result(mut errors: Vec<String>, warnings: Vec<String>) -> ModelVal
 
 fn message_text(message: &ModelMessage) -> &str {
     &message.content
+}
+
+fn is_text_tool_call_envelope(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("<tool_call>") && text.ends_with("</tool_call>")
 }
 
 fn missing(value: &Option<String>) -> bool {
