@@ -292,17 +292,17 @@ fn failed_model_response(error: ModelError) -> ModelTurnResponse {
 }
 
 #[test]
-fn agent_loop_uses_negotiated_parallel_limit_and_keeps_optional_tools_non_strict() {
+fn agent_loop_uses_negotiated_parallel_capability_and_keeps_optional_tools_non_strict() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let negotiation_calls = Arc::new(AtomicUsize::new(0));
     let static_capabilities = ProviderProtocolContract {
         supports_strict_tool_schema: false,
-        max_tool_calls_per_turn: 1,
+        supports_parallel_tool_calls: false,
         ..ProviderProtocolContract::default()
     };
     let negotiated_contract = ProviderProtocolContract {
         supports_strict_tool_schema: true,
-        max_tool_calls_per_turn: 2,
+        supports_parallel_tool_calls: true,
         ..ProviderProtocolContract::default()
     };
     let metadata = negotiated_capability_metadata();
@@ -333,7 +333,7 @@ fn agent_loop_uses_negotiated_parallel_limit_and_keeps_optional_tools_non_strict
     assert_eq!(result.provider_capability_metadata, Some(metadata));
     let requests = seen_requests.lock().expect("seen requests lock");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].tool_choice.max_tool_calls, 2);
+    assert_eq!(requests[0].tool_choice.max_tool_calls, 8);
     assert!(!requests[0].tool_choice.strict_tool_schema);
     let serialized = serde_json::to_value(&result).expect("serialize result");
     assert!(serialized.get("provider_protocol_contract").is_none());
@@ -430,7 +430,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
     let negotiation_calls = Arc::new(AtomicUsize::new(0));
     let negotiated_contract = ProviderProtocolContract {
         supports_strict_tool_schema: true,
-        max_tool_calls_per_turn: 2,
+        supports_parallel_tool_calls: true,
         ..ProviderProtocolContract::default()
     };
     let metadata = negotiated_capability_metadata();
@@ -445,7 +445,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
             negotiation_calls: Arc::clone(&negotiation_calls),
             static_capabilities: ProviderProtocolContract {
                 supports_strict_tool_schema: false,
-                max_tool_calls_per_turn: 1,
+                supports_parallel_tool_calls: false,
                 ..ProviderProtocolContract::default()
             },
             negotiated_capabilities: Ok(ProviderProtocolNegotiation {
@@ -470,7 +470,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
         .expect("approval checkpoint");
     checkpoint["provider_protocol_contract"] = serde_json::json!({
         "supports_strict_tool_schema": false,
-        "max_tool_calls_per_turn": 1
+        "supports_parallel_tool_calls": false
     });
     checkpoint["provider_capability_metadata"] = serde_json::json!({
         "profile": "declared",
@@ -488,7 +488,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
     assert_eq!(negotiation_calls.load(Ordering::SeqCst), 2);
     let requests = seen_requests.lock().expect("seen requests lock");
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[1].tool_choice.max_tool_calls, 2);
+    assert_eq!(requests[1].tool_choice.max_tool_calls, 8);
     assert!(!requests[1].tool_choice.strict_tool_schema);
     assert_eq!(
         resumed.provider_protocol_contract,
@@ -766,7 +766,8 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "first file").expect("write first file");
     std::fs::write(dir.path().join("CHANGELOG.md"), "second file").expect("write second file");
-    let input = AgentLoopInput::new("thread_1", "turn_1", "read two files").with_max_turns(2);
+    std::fs::write(dir.path().join("Cargo.toml"), "third file").expect("write third file");
+    let input = AgentLoopInput::new("thread_1", "turn_1", "read three files").with_max_turns(2);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
@@ -788,6 +789,16 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
             "line_end": null
         }),
     ));
+    response.tool_calls.push(tool_call(
+        "call_3",
+        "builtin_read",
+        serde_json::json!({
+            "path": "Cargo.toml",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let result = agent_loop_with_capabilities(
         vec![
@@ -798,7 +809,7 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
         Arc::clone(&seen_requests),
         ProviderProtocolContract {
             supports_strict_tool_schema: true,
-            max_tool_calls_per_turn: 2,
+            supports_parallel_tool_calls: true,
             ..ProviderProtocolContract::default()
         },
     )
@@ -807,9 +818,10 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.model_turns, 2);
-    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(result.tool_results.len(), 3);
     assert_eq!(result.tool_results[0].tool_call_id, "call_1");
     assert_eq!(result.tool_results[1].tool_call_id, "call_2");
+    assert_eq!(result.tool_results[2].tool_call_id, "call_3");
     assert!(
         result.tool_results[0]
             .to_message_payload()
@@ -822,9 +834,15 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
             .to_string()
             .contains("second file")
     );
+    assert!(
+        result.tool_results[2]
+            .to_message_payload()
+            .to_string()
+            .contains("third file")
+    );
     let requests = seen_requests.lock().expect("seen requests lock");
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].tool_choice.max_tool_calls, 2);
+    assert_eq!(requests[0].tool_choice.max_tool_calls, 8);
     assert!(!requests[0].tool_choice.strict_tool_schema);
     assert!(
         requests[0].messages[0]
@@ -873,7 +891,7 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
         allow_read_policy().with_rule(ask_readme),
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
-            max_tool_calls_per_turn: 2,
+            supports_parallel_tool_calls: true,
             ..ProviderProtocolContract::default()
         },
     )
@@ -942,7 +960,7 @@ fn agent_loop_rejects_a_mutating_batch_without_partial_write() {
         allow_read_write_policy(),
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
-            max_tool_calls_per_turn: 2,
+            supports_parallel_tool_calls: true,
             ..ProviderProtocolContract::default()
         },
     )
@@ -1004,7 +1022,7 @@ fn agent_loop_does_not_create_partial_approval_for_a_batch() {
         policy,
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
-            max_tool_calls_per_turn: 2,
+            supports_parallel_tool_calls: true,
             ..ProviderProtocolContract::default()
         },
     )
@@ -1462,7 +1480,7 @@ fn agent_loop_uses_explicit_routed_tool_mode_and_keeps_router_history() {
         allow_read_policy(),
         Arc::clone(&seen_requests),
         ProviderProtocolContract {
-            max_tool_calls_per_turn: 2,
+            supports_parallel_tool_calls: true,
             max_tools_per_request: 2,
             tool_definition_mode: ProviderToolDefinitionMode::Routed,
             ..ProviderProtocolContract::default()
@@ -2025,7 +2043,7 @@ fn agent_loop_rejects_zero_tool_definition_capacity_before_provider() {
     assert_eq!(result.model_turns, 0);
     assert_eq!(
         result.error.as_deref(),
-        Some("provider tool-definition limit must be greater than zero")
+        Some("provider direct tool-definition limit (0) is below the required tool count (4)")
     );
     assert!(seen_requests.lock().expect("seen requests").is_empty());
 }

@@ -2142,7 +2142,7 @@ mod tests {
     #[test]
     fn agent_blocker_kind_maps_typed_provider_categories() {
         let response_validation = ProviderDiagnostic {
-            code: Some("provider_tool_call_limit_exceeded".to_string()),
+            code: Some("provider_does_not_support_parallel_tool_calls".to_string()),
             stage: Some(ProviderErrorStage::ResponseValidation),
             transport_category: None,
             timeout_seconds: None,

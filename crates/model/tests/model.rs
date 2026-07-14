@@ -1685,9 +1685,10 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     );
     assert!(!default_config.protocol_contract().supports_system_message);
     assert!(!default_config.protocol_contract().supports_json_mode);
-    assert_eq!(
-        default_config.protocol_contract().max_tool_calls_per_turn,
-        1
+    assert!(
+        !default_config
+            .protocol_contract()
+            .supports_parallel_tool_calls
     );
     assert!(
         !default_config
@@ -1707,7 +1708,7 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
     let capabilities = configured.protocol_contract();
     assert_eq!(capabilities.max_context_tokens, 131_072);
     assert_eq!(capabilities.max_output_tokens, 8_192);
-    assert_eq!(capabilities.max_tool_calls_per_turn, 1);
+    assert!(!capabilities.supports_parallel_tool_calls);
     assert!(!capabilities.supports_strict_tool_schema);
 
     let provider = OpenAiProvider::new(configured).expect("provider");
@@ -1733,7 +1734,7 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     assert!(negotiation.contract.supports_developer_message);
     assert!(!negotiation.contract.supports_system_message);
     assert!(!negotiation.contract.supports_json_mode);
-    assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
+    assert!(negotiation.contract.supports_parallel_tool_calls);
     assert_eq!(negotiation.contract.max_tools_per_request, 8);
     assert_eq!(
         negotiation.contract.tool_definition_mode,
@@ -1991,7 +1992,7 @@ fn openai_capability_probe_negotiates_tool_definition_capacity_and_caches_it() {
         negotiation.metadata.profile,
         ProviderCapabilityProfile::StrictParallel
     );
-    assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
+    assert!(negotiation.contract.supports_parallel_tool_calls);
     assert_eq!(negotiation.contract.max_tools_per_request, 8);
     assert_eq!(negotiation.metadata.profile_attempts, 1);
     assert_eq!(negotiation.metadata.fallback_count, 0);
@@ -2035,7 +2036,7 @@ fn openai_capability_probe_strict_constraint_mismatch_falls_back_to_non_strict()
             ProviderCapabilityProfile::NonStrictParallel
         );
         assert!(!negotiation.contract.supports_strict_tool_schema);
-        assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
+        assert!(negotiation.contract.supports_parallel_tool_calls);
         assert_eq!(negotiation.contract.max_tools_per_request, 8);
         assert_eq!(negotiation.metadata.profile_attempts, 3);
         assert_eq!(negotiation.metadata.fallback_count, 2);
@@ -2104,7 +2105,7 @@ fn openai_capability_probe_validates_router_before_low_capacity_fallback() {
         negotiation.metadata.profile,
         ProviderCapabilityProfile::RoutedSingle
     );
-    assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
+    assert!(!negotiation.contract.supports_parallel_tool_calls);
     assert_eq!(negotiation.contract.max_tools_per_request, 1);
     assert_eq!(
         negotiation.contract.tool_definition_mode,
@@ -2169,7 +2170,7 @@ fn openai_capability_probe_preserves_strict_when_parallel_is_unproven() {
         ProviderCapabilityProfile::StrictSingle
     );
     assert!(negotiation.contract.supports_strict_tool_schema);
-    assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
+    assert!(!negotiation.contract.supports_parallel_tool_calls);
     assert_eq!(negotiation.metadata.profile_attempts, 1);
     assert_eq!(negotiation.metadata.fallback_count, 0);
 
@@ -2396,7 +2397,7 @@ fn openai_capability_probe_fallback_keeps_usage_attempts_and_cache_metadata_sepa
         ProviderCapabilityProfile::RoutedSingle
     );
     assert!(!negotiation.contract.supports_strict_tool_schema);
-    assert_eq!(negotiation.contract.max_tool_calls_per_turn, 1);
+    assert!(!negotiation.contract.supports_parallel_tool_calls);
     assert_eq!(negotiation.contract.max_tools_per_request, 1);
     assert_eq!(
         negotiation.contract.tool_definition_mode,
@@ -2723,7 +2724,7 @@ fn removed_tool_capability_envs_are_not_read_or_parsed() {
     })
     .expect("provider configuration");
 
-    assert_eq!(config.protocol_contract().max_tool_calls_per_turn, 1);
+    assert!(!config.protocol_contract().supports_parallel_tool_calls);
     assert!(!config.protocol_contract().supports_strict_tool_schema);
 }
 
@@ -2771,7 +2772,7 @@ fn model_request_validation_rejects_output_above_provider_capability() {
 }
 
 #[test]
-fn model_request_validation_rejects_tool_count_above_provider_capability() {
+fn model_request_validation_rejects_parallel_tool_calls_when_provider_does_not_support_them() {
     let mut request = ModelTurnRequest::new(
         "request_1",
         vec![ModelMessage::text(ModelRole::User, "hello")],
@@ -2790,7 +2791,7 @@ fn model_request_validation_rejects_tool_count_above_provider_capability() {
 
     assert_eq!(
         result.errors,
-        vec!["requested_tool_calls_exceed_provider_limit"]
+        vec!["provider_does_not_support_parallel_tool_calls"]
     );
 }
 
@@ -3309,7 +3310,7 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
 }
 
 #[test]
-fn openai_provider_classifies_calls_above_the_negotiated_limit() {
+fn openai_provider_rejects_calls_above_the_agent_request_limit() {
     let body = r#"{
         "id": "resp_1",
         "choices": [{
@@ -3358,15 +3359,12 @@ fn openai_provider_classifies_calls_above_the_negotiated_limit() {
     assert_eq!(metadata.attempt_count, 1);
     assert_eq!(metadata.retry_count, 0);
     let error = response.error.expect("contract violation error");
-    assert_eq!(error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(error.kind, ModelErrorKind::JsonSchemaViolation);
     assert_eq!(
         error.message,
-        "provider returned more tool calls than the negotiated limit of 1"
+        "provider_response_invalid: max_tool_calls_exceeded"
     );
-    assert_eq!(
-        error.code.as_deref(),
-        Some("provider_tool_call_limit_exceeded")
-    );
+    assert_eq!(error.code.as_deref(), Some("provider_response_invalid"));
     assert_eq!(error.stage, Some(ProviderErrorStage::ResponseValidation));
     assert_eq!(error.validation_errors, vec!["max_tool_calls_exceeded"]);
 }
@@ -3686,7 +3684,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         vec![
             "duplicate_tool_call_id",
             "max_tool_calls_exceeded",
-            "provider_tool_call_limit_exceeded"
+            "provider_does_not_support_parallel_tool_calls"
         ]
     );
 }

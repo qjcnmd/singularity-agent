@@ -1258,12 +1258,7 @@ where
             ControlFlow::Continue(result) => result,
             ControlFlow::Break(result) => return result,
         };
-        let max_tool_calls = match effective_max_tool_calls(&capabilities) {
-            Ok(max_tool_calls) => max_tool_calls,
-            Err(error) => {
-                return state.finish(AgentStatus::Failed, false, None, 0, Some(error));
-            }
-        };
+        let max_tool_calls = effective_max_tool_calls(&capabilities);
         let budget = match context_budget(input, &self.tool_broker, &capabilities, max_tool_calls) {
             Ok(budget) => budget,
             Err(error) => {
@@ -1572,18 +1567,7 @@ where
                 ControlFlow::Continue(result) => result,
                 ControlFlow::Break(result) => return result,
             };
-        let max_tool_calls = match effective_max_tool_calls(&capabilities) {
-            Ok(max_tool_calls) => max_tool_calls,
-            Err(error) => {
-                return state.finish(
-                    AgentStatus::Failed,
-                    false,
-                    None,
-                    model_turn_offset,
-                    Some(error),
-                );
-            }
-        };
+        let max_tool_calls = effective_max_tool_calls(&capabilities);
         let budget = match context_budget(input, &self.tool_broker, &capabilities, max_tool_calls) {
             Ok(budget) => budget,
             Err(error) => {
@@ -2496,16 +2480,12 @@ fn output_token_reservation(
     }
 }
 
-fn effective_max_tool_calls(capabilities: &ProviderProtocolContract) -> Result<u32, String> {
-    if capabilities.max_tool_calls_per_turn == 0 {
-        return Err("provider tool-call limit must be greater than zero".to_string());
+fn effective_max_tool_calls(capabilities: &ProviderProtocolContract) -> u32 {
+    if capabilities.supports_parallel_tool_calls {
+        MAX_PARALLEL_READ_TOOL_CALLS
+    } else {
+        1
     }
-    if capabilities.max_tools_per_request == 0 {
-        return Err("provider tool-definition limit must be greater than zero".to_string());
-    }
-    Ok(capabilities
-        .max_tool_calls_per_turn
-        .min(MAX_PARALLEL_READ_TOOL_CALLS))
 }
 
 fn context_budget(

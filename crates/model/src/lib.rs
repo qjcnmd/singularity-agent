@@ -38,7 +38,6 @@ const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_ATTEMPTS: u32 = 3;
 const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
-const PROVIDER_TOOL_CALL_LIMIT_EXCEEDED_CODE: &str = "provider_tool_call_limit_exceeded";
 const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_call_missing";
 const REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR: &str = "required_tool_choice_requires_tools";
 const REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR: &str =
@@ -187,11 +186,11 @@ pub enum ProviderApiProtocol {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
+    pub supports_parallel_tool_calls: bool,
     pub supports_required_tool_choice: bool,
     pub supports_strict_tool_schema: bool,
     pub tool_reasoning_mode: ProviderToolReasoningMode,
     pub tool_definition_mode: ProviderToolDefinitionMode,
-    pub max_tool_calls_per_turn: u32,
     pub max_tools_per_request: u32,
     pub supports_json_mode: bool,
     pub supports_system_message: bool,
@@ -204,11 +203,11 @@ impl Default for ProviderProtocolContract {
     fn default() -> Self {
         Self {
             supports_tools: true,
+            supports_parallel_tool_calls: false,
             supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             tool_definition_mode: ProviderToolDefinitionMode::Direct,
-            max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: false,
             supports_system_message: true,
@@ -872,11 +871,11 @@ impl OpenAiProviderConfig {
     pub fn protocol_contract(&self) -> ProviderProtocolContract {
         ProviderProtocolContract {
             supports_tools: true,
+            supports_parallel_tool_calls: false,
             supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
             tool_definition_mode: ProviderToolDefinitionMode::Direct,
-            max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: false,
             supports_system_message: false,
@@ -1300,7 +1299,7 @@ impl OpenAiProvider {
             }
             if let Some(negotiated_profile) = negotiated_profile {
                 if negotiated_profile != profile.profile {
-                    contract.max_tool_calls_per_turn = 1;
+                    contract.supports_parallel_tool_calls = false;
                 }
                 let continuation_request =
                     capability_probe_continuation_request(&profile, &completion.response);
@@ -2212,10 +2211,11 @@ fn capability_probe_profiles(
         request
     };
     let make_contract = |strict: bool,
-                         max_tool_calls_per_turn: u32,
+                         supports_parallel_tool_calls: bool,
                          max_tools_per_request: u32,
                          tool_definition_mode: ProviderToolDefinitionMode| {
         ProviderProtocolContract {
+            supports_parallel_tool_calls,
             supports_strict_tool_schema: strict,
             tool_reasoning_mode: if api_protocol == ProviderApiProtocol::OpenAiResponses {
                 ProviderToolReasoningMode::DisabledForToolCalls
@@ -2223,7 +2223,6 @@ fn capability_probe_profiles(
                 ProviderToolReasoningMode::Unspecified
             },
             tool_definition_mode,
-            max_tool_calls_per_turn,
             max_tools_per_request,
             supports_json_mode: false,
             supports_system_message: false,
@@ -2257,7 +2256,7 @@ fn capability_probe_profiles(
         profile: ProviderCapabilityProfile::StrictParallel,
         contract: make_contract(
             true,
-            2,
+            true,
             direct_tool_count,
             ProviderToolDefinitionMode::Direct,
         ),
@@ -2275,7 +2274,7 @@ fn capability_probe_profiles(
         profile: ProviderCapabilityProfile::StrictSingle,
         contract: make_contract(
             true,
-            1,
+            false,
             direct_tool_count,
             ProviderToolDefinitionMode::Direct,
         ),
@@ -2293,7 +2292,7 @@ fn capability_probe_profiles(
         profile: ProviderCapabilityProfile::NonStrictParallel,
         contract: make_contract(
             false,
-            2,
+            true,
             direct_tool_count,
             ProviderToolDefinitionMode::Direct,
         ),
@@ -2311,7 +2310,7 @@ fn capability_probe_profiles(
         profile: ProviderCapabilityProfile::NonStrictSingle,
         contract: make_contract(
             false,
-            1,
+            false,
             direct_tool_count,
             ProviderToolDefinitionMode::Direct,
         ),
@@ -2327,7 +2326,7 @@ fn capability_probe_profiles(
     });
     profiles.push(CapabilityProbeProfile {
         profile: ProviderCapabilityProfile::RoutedSingle,
-        contract: make_contract(false, 1, 1, ProviderToolDefinitionMode::Routed),
+        contract: make_contract(false, false, 1, ProviderToolDefinitionMode::Routed),
         request: make_request(
             vec![router_tool],
             ToolChoiceMode::Auto,
@@ -2803,16 +2802,15 @@ fn finalize_provider_response(
         validate_model_turn_response(request, &response, &allowed_tool_names, Some(capabilities));
     if !validation.valid {
         response.status = ModelTurnStatus::Invalid;
-        let tool_call_limit_exceeded =
-            response.tool_calls.len() > request.tool_choice.max_tool_calls as usize;
-        let (kind, message, diagnostic_code) = if tool_call_limit_exceeded {
+        let provider_rejected_parallelism = validation
+            .errors
+            .iter()
+            .any(|error| error == "provider_does_not_support_parallel_tool_calls");
+        let (kind, message, diagnostic_code) = if provider_rejected_parallelism {
             (
                 ModelErrorKind::UnsupportedCapability,
-                format!(
-                    "provider returned more tool calls than the negotiated limit of {}",
-                    request.tool_choice.max_tool_calls
-                ),
-                PROVIDER_TOOL_CALL_LIMIT_EXCEEDED_CODE,
+                "provider does not support parallel tool calls".to_string(),
+                "provider_does_not_support_parallel_tool_calls",
             )
         } else {
             (
@@ -3236,8 +3234,7 @@ fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderErro
                 validation_error.as_str(),
                 "provider_does_not_support_tools"
                     | "provider_does_not_support_strict_tool_schema"
-                    | "provider_tool_call_limit_exceeded"
-                    | "requested_tool_calls_exceed_provider_limit"
+                    | "provider_does_not_support_parallel_tool_calls"
                     | "max_tool_calls_exceeded"
                     | "specific_tool_required"
             )
@@ -3366,7 +3363,7 @@ fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> b
                 "provider_does_not_support_tools"
                     | REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR
                     | "provider_does_not_support_strict_tool_schema"
-                    | "requested_tool_calls_exceed_provider_limit"
+                    | "provider_does_not_support_parallel_tool_calls"
             )
         })
 }
@@ -3637,9 +3634,10 @@ pub fn validate_model_request_with_capabilities(
             errors.push("requested_output_tokens_exceed_provider_limit".to_string());
         }
         if !request.tools.is_empty()
-            && request.tool_choice.max_tool_calls > capabilities.max_tool_calls_per_turn
+            && request.tool_choice.max_tool_calls > 1
+            && !capabilities.supports_parallel_tool_calls
         {
-            errors.push("requested_tool_calls_exceed_provider_limit".to_string());
+            errors.push("provider_does_not_support_parallel_tool_calls".to_string());
         }
         if request.tools.len() > capabilities.max_tools_per_request as usize {
             errors.push("requested_tools_exceed_provider_limit".to_string());
@@ -3813,8 +3811,8 @@ pub fn validate_model_response(
         if !tool_calls.is_empty() && !capabilities.supports_tools {
             errors.push("provider_does_not_support_tools".to_string());
         }
-        if tool_calls.len() > capabilities.max_tool_calls_per_turn as usize {
-            errors.push("provider_tool_call_limit_exceeded".to_string());
+        if tool_calls.len() > 1 && !capabilities.supports_parallel_tool_calls {
+            errors.push("provider_does_not_support_parallel_tool_calls".to_string());
         }
     }
 
