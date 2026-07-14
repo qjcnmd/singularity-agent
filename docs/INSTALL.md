@@ -47,7 +47,7 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 2. 否则从启动目录向父目录查找最近的 `.env`。
 3. 三个必需值必须来自同一层，缺失时关闭失败。
 
-可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。工具能力不是用户配置项：每次 run/resume 都调用 capability negotiation；同一 `ProviderConfigSnapshot` 与 effective model 已有成功结果时命中 snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 probe。probe 先验证产品上限内的直接工具定义与实际 developer/user 消息角色；strict profile 另验证 schema 约束，non-strict profile 只证明原生结构化调用、合法工具名、对象参数和调用数。只有 direct capacity 不成立时才验证与真实 router 同形的 `oneOf/const` envelope。未验证的 system message 和 JSON mode 保持关闭；真实工具参数始终由本地完整 `ToolSpec` validation 校验。HTTP 200 但返回文本伪工具调用时 fail closed。
+可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。工具能力不是用户配置项：每次 run/resume 都调用 capability negotiation；同一 `ProviderConfigSnapshot` 与 effective model 已有成功结果时命中 snapshot cache，不发网络 probe，只有 cache miss 才执行固定、无用户数据的 probe。probe 先验证产品上限内的直接工具定义与实际 developer/user 消息角色；strict profile 另验证 schema 约束，non-strict profile 只证明原生结构化调用、合法工具名、对象参数和调用数。基础 profile 成立后再用固定单工具请求独立验证 required tool choice；明确的 `400/422` 或 `200` 但未调用工具只关闭该可选能力，authentication、rate limit、server、transport、decode 和 cancellation 等 typed failure 仍终止协商。只有 direct capacity 不成立时才验证与真实 router 同形的 `oneOf/const` envelope。Agent 仅在 contract 明确支持且本地 completion/plan/verification 仍不允许 final 时发送 required，否则保持 auto；未验证的 system message 和 JSON mode 保持关闭。真实工具参数始终由本地完整 `ToolSpec` validation 校验，HTTP 200 文本伪工具调用不能绕过本地状态机。
 
 修改配置后，新启动一次 `sg` 命令即可取得新快照。不要把 `.env` 提交到 Git。
 

@@ -37,7 +37,7 @@ const MAX_PROVIDER_ATTEMPTS: u32 = 3;
 const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 const PROVIDER_TOOL_CALL_LIMIT_EXCEEDED_CODE: &str = "provider_tool_call_limit_exceeded";
-const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_choice";
+const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_call_missing";
 const REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR: &str = "required_tool_choice_requires_tools";
 const REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR: &str =
     "provider_does_not_support_required_tool_choice";

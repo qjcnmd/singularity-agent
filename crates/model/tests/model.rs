@@ -2203,7 +2203,10 @@ fn required_tool_choice_requires_tools_and_negotiated_support() {
         &["builtin.read".to_string()],
         Some(&supported),
     );
-    assert_eq!(missing_required_call.errors, vec!["required_tool_choice"]);
+    assert_eq!(
+        missing_required_call.errors,
+        vec!["required_tool_call_missing"]
+    );
 }
 
 #[test]

@@ -4464,6 +4464,84 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
 }
 
 #[test]
+fn negotiated_required_tool_choice_tracks_all_completion_invariants() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let canonical_cwd = std::fs::canonicalize(workspace.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .into_owned();
+    let verification_argv = test_command("verify");
+    let verification_digest = command_scope_digest(
+        &verification_argv,
+        &canonical_cwd,
+        5,
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &SandboxNetworkMode::Denied,
+    );
+    let mut initial_plan = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    initial_plan.tool_calls.push(plan_tool_call(
+        "plan_call_1",
+        serde_json::json!([
+            {"step": "inspect", "status": "completed"},
+            {"step": "verify", "status": "in_progress"}
+        ]),
+    ));
+    let mut completed_plan =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    completed_plan.tool_calls.push(plan_tool_call(
+        "plan_call_2",
+        serde_json::json!([
+            {"step": "inspect", "status": "completed"},
+            {"step": "verify", "status": "completed"}
+        ]),
+    ));
+    let mut verification = ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    verification.tool_calls.push(tool_call(
+        "command_call_1",
+        "builtin.command",
+        serde_json::json!({
+            "argv": verification_argv,
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_plan_capabilities(
+        vec![initial_plan, completed_plan, verification, final_response],
+        allow_read_execute_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract {
+            supports_required_tool_choice: true,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new("thread_1", "turn_1", "finish and verify")
+            .with_max_turns(4)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                verification_digest,
+                1,
+            )]),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert!(result.verification.passed);
+    assert!(result.plan.as_ref().is_some_and(AgentPlan::is_completed));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Required);
+    assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::Auto);
+}
+
+#[test]
 fn agent_loop_reports_all_unsatisfied_completion_invariants() {
     let mut initial_plan = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     initial_plan.tool_calls.push(plan_tool_call(

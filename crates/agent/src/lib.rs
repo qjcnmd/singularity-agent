@@ -13,7 +13,7 @@ use singularity_model::{
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
     ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, is_strict_tool_schema_compatible,
+    ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode, is_strict_tool_schema_compatible,
     provider_error_response, validate_model_request_with_capabilities,
     validate_model_turn_response,
 };
@@ -3234,6 +3234,9 @@ fn model_turn_request(
             ..input.model_preferences.clone()
         },
     };
+    if !state.allows_final() && capabilities.supports_required_tool_choice {
+        request.tool_choice.mode = ToolChoiceMode::Required;
+    }
     request.tool_choice.max_tool_calls = tool_view.max_tool_calls;
     request.tool_choice.strict_tool_schema = strict_tool_schema;
     request
