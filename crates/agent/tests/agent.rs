@@ -3031,16 +3031,9 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
     assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_1"));
     let payload: serde_json::Value =
         serde_json::from_str(&tool_message.content).expect("tool result payload");
-    assert_eq!(payload["error_code"], "command_executable_unavailable");
-    assert_eq!(
-        payload["content"]["execution_status"],
-        "executable_unavailable"
-    );
-    assert!(
-        payload["content"]["stderr_preview"]
-            .as_str()
-            .is_some_and(|message| message.contains("'missing-host-tool'"))
-    );
+    assert_eq!(payload["error_code"], "command_exit_nonzero");
+    assert_eq!(payload["content"]["execution_status"], "completed");
+    assert_eq!(payload["content"]["stderr_preview"], "failed");
 }
 
 #[test]
