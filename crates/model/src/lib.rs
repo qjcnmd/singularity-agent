@@ -42,9 +42,6 @@ const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_call_missing";
 const REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR: &str = "required_tool_choice_requires_tools";
 const REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR: &str =
     "provider_does_not_support_required_tool_choice";
-const SPECIFIC_TOOL_NAME_REQUIRED_ERROR: &str = "specific_tool_name_required";
-const SPECIFIC_TOOL_NAME_UNKNOWN_ERROR: &str = "specific_tool_name_unknown";
-const TOOL_NAME_ONLY_VALID_FOR_SPECIFIC_TOOL_ERROR: &str = "tool_name_only_valid_for_specific_tool";
 const TEXT_TOOL_CALL_ENVELOPE_ERROR: &str = "text_tool_call_envelope_not_supported";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
@@ -110,13 +107,11 @@ pub enum ToolChoiceMode {
     Auto,
     None,
     Required,
-    SpecificTool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolChoicePolicy {
     pub mode: ToolChoiceMode,
-    pub tool_name: Option<String>,
     pub max_tool_calls: u32,
     pub strict_tool_schema: bool,
 }
@@ -125,7 +120,6 @@ impl Default for ToolChoicePolicy {
     fn default() -> Self {
         Self {
             mode: ToolChoiceMode::Auto,
-            tool_name: None,
             max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
             strict_tool_schema: false,
         }
@@ -1508,13 +1502,7 @@ impl OpenAiProvider {
             ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
                 openai_request_payload(request, model_name, capabilities)
             }
-        }
-        .map_err(|validation_error| {
-            provider_request_validation_error(
-                validation_result(vec![validation_error.to_string()], Vec::new()),
-                &self.config,
-            )
-        })?;
+        };
         loop {
             if cancellation.is_cancelled() {
                 return Err(provider_cancelled_error().with_provider_attempt_metadata(
@@ -1869,7 +1857,7 @@ fn openai_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-) -> Result<Value, &'static str> {
+) -> Value {
     let mut payload = json!({
         "model": request
             .model_preferences
@@ -1903,20 +1891,20 @@ fn openai_request_payload(
                 .map(|tool| openai_tool_payload(tool, request.tool_choice.strict_tool_schema))
                 .collect::<Vec<_>>()
         );
-        payload["tool_choice"] = openai_tool_choice_payload(request)?;
+        payload["tool_choice"] = openai_tool_choice_payload(request);
         payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
         if capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls {
             payload["thinking"] = json!({"type": "disabled"});
         }
     }
-    Ok(payload)
+    payload
 }
 
 fn openai_responses_request_payload(
     request: &ModelTurnRequest,
     model_name: &str,
     capabilities: &ProviderProtocolContract,
-) -> Result<Value, &'static str> {
+) -> Value {
     let (instructions, input) = openai_responses_input(&request.messages);
     let mut payload = json!({
         "model": request
@@ -1959,13 +1947,13 @@ fn openai_responses_request_payload(
                 })
                 .collect::<Vec<_>>()
         );
-        payload["tool_choice"] = openai_responses_tool_choice_payload(request)?;
+        payload["tool_choice"] = openai_responses_tool_choice_payload(request);
         payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
         if capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls {
             payload["reasoning"] = json!({"effort": "none"});
         }
     }
-    Ok(payload)
+    payload
 }
 
 fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
@@ -2024,18 +2012,11 @@ fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Val
     ((!instructions.is_empty()).then_some(instructions), items)
 }
 
-fn openai_responses_tool_choice_payload(request: &ModelTurnRequest) -> Result<Value, &'static str> {
+fn openai_responses_tool_choice_payload(request: &ModelTurnRequest) -> Value {
     match request.tool_choice.mode {
-        ToolChoiceMode::None => Ok(json!("none")),
-        ToolChoiceMode::Required => Ok(json!("required")),
-        ToolChoiceMode::SpecificTool => request
-            .tool_choice
-            .tool_name
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            .map(|name| json!({"type": "function", "name": name}))
-            .ok_or(SPECIFIC_TOOL_NAME_REQUIRED_ERROR),
-        ToolChoiceMode::Auto => Ok(json!("auto")),
+        ToolChoiceMode::None => json!("none"),
+        ToolChoiceMode::Required => json!("required"),
+        ToolChoiceMode::Auto => json!("auto"),
     }
 }
 
@@ -2098,18 +2079,11 @@ fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> Valu
     payload
 }
 
-fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Result<Value, &'static str> {
+fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
     match request.tool_choice.mode {
-        ToolChoiceMode::None => Ok(json!("none")),
-        ToolChoiceMode::Required => Ok(json!("required")),
-        ToolChoiceMode::SpecificTool => request
-            .tool_choice
-            .tool_name
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            .map(|name| json!({"type": "function", "function": {"name": name}}))
-            .ok_or(SPECIFIC_TOOL_NAME_REQUIRED_ERROR),
-        ToolChoiceMode::Auto => Ok(json!("auto")),
+        ToolChoiceMode::None => json!("none"),
+        ToolChoiceMode::Required => json!("required"),
+        ToolChoiceMode::Auto => json!("auto"),
     }
 }
 
@@ -2230,7 +2204,6 @@ fn capability_probe_profiles(
         request.tools = tools;
         request.tool_choice = ToolChoicePolicy {
             mode,
-            tool_name: None,
             max_tool_calls,
             strict_tool_schema: strict,
         };
@@ -3266,7 +3239,6 @@ fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderErro
                     | "provider_does_not_support_strict_tool_schema"
                     | "provider_does_not_support_parallel_tool_calls"
                     | "max_tool_calls_exceeded"
-                    | "specific_tool_required"
             )
         });
     if !response.tool_calls.is_empty() && !explicit_capability_violation {
@@ -3591,24 +3563,6 @@ pub fn validate_model_request_with_capabilities(
     if request.tool_choice.mode == ToolChoiceMode::Required && request.tools.is_empty() {
         errors.push(REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR.to_string());
     }
-    match request.tool_choice.mode {
-        ToolChoiceMode::SpecificTool => match request.tool_choice.tool_name.as_deref() {
-            None => {
-                errors.push(SPECIFIC_TOOL_NAME_REQUIRED_ERROR.to_string());
-            }
-            Some(name) if name.trim().is_empty() => {
-                errors.push(SPECIFIC_TOOL_NAME_REQUIRED_ERROR.to_string());
-            }
-            Some(name) if !request.tools.iter().any(|tool| tool.name.as_str() == name) => {
-                errors.push(SPECIFIC_TOOL_NAME_UNKNOWN_ERROR.to_string());
-            }
-            Some(_) => {}
-        },
-        _ if request.tool_choice.tool_name.is_some() => {
-            errors.push(TOOL_NAME_ONLY_VALID_FOR_SPECIFIC_TOOL_ERROR.to_string());
-        }
-        _ => {}
-    }
     let request_uses_nonportable_tool_name = request
         .tools
         .iter()
@@ -3622,14 +3576,6 @@ pub fn validate_model_request_with_capabilities(
         )
         .any(|name| !is_portable_tool_name(name));
     if request_uses_nonportable_tool_name {
-        errors.push("tool_name_not_provider_portable".to_string());
-    }
-    if request
-        .tool_choice
-        .tool_name
-        .as_deref()
-        .is_some_and(|name| !name.trim().is_empty() && !is_portable_tool_name(name))
-    {
         errors.push("tool_name_not_provider_portable".to_string());
     }
     let mut tool_names = HashSet::new();
@@ -3842,9 +3788,6 @@ pub fn validate_model_response(
         {
             errors.push(REQUIRED_TOOL_CHOICE_MISSING_ERROR.to_string());
         }
-        ToolChoiceMode::SpecificTool if tool_calls.is_empty() => {
-            errors.push("specific_tool_required".to_string());
-        }
         _ => {}
     }
     if tool_calls.len() > tool_choice.max_tool_calls as usize {
@@ -3883,7 +3826,6 @@ pub fn validate_model_response(
         {
             errors.push("unknown_tool".to_string());
         }
-        validate_tool_choice_name(call, tool_choice, &mut errors);
         match call.parse_status {
             ModelToolParseStatus::InvalidJson => errors.push("invalid_json".to_string()),
             ModelToolParseStatus::SchemaMismatch => errors.push("schema_mismatch".to_string()),
@@ -3894,21 +3836,6 @@ pub fn validate_model_response(
     }
 
     validation_result(errors, warnings)
-}
-
-fn validate_tool_choice_name(
-    call: &ModelToolCall,
-    tool_choice: &ToolChoicePolicy,
-    errors: &mut Vec<String>,
-) {
-    match tool_choice.mode {
-        ToolChoiceMode::SpecificTool
-            if tool_choice.tool_name.as_deref() != Some(call.tool_name.as_str()) =>
-        {
-            errors.push("specific_tool_required".to_string());
-        }
-        _ => {}
-    }
 }
 
 fn model_error_category(error: &ModelError) -> ModelErrorCategory {
