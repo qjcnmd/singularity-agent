@@ -3026,10 +3026,20 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
     assert_eq!(result.final_answer.as_deref(), Some("handled failure"));
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[1].messages.last().unwrap().role, ModelRole::Tool);
+    let tool_message = requests[1].messages.last().expect("tool result message");
+    assert_eq!(tool_message.role, ModelRole::Tool);
+    assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_1"));
+    let payload: serde_json::Value =
+        serde_json::from_str(&tool_message.content).expect("tool result payload");
+    assert_eq!(payload["error_code"], "command_executable_unavailable");
     assert_eq!(
-        requests[1].messages.last().unwrap().tool_call_id.as_deref(),
-        Some("call_1")
+        payload["content"]["execution_status"],
+        "executable_unavailable"
+    );
+    assert!(
+        payload["content"]["stderr_preview"]
+            .as_str()
+            .is_some_and(|message| message.contains("'missing-host-tool'"))
     );
 }
 

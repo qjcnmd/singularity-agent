@@ -238,7 +238,7 @@ mod tests {
         .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict);
 
         let blocker = infrastructure_blocker(&result, "setup command failed")
-            .expect("spawn failure must block");
+            .expect("unavailable evaluation executable must block");
 
         assert_eq!(blocker.kind, BlockerKind::Environment);
         assert!(blocker.message.contains("'python'"));
