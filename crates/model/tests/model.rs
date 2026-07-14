@@ -153,6 +153,16 @@ fn configurable_probe_server(
             let (first_line, headers, request_body) = read_provider_request(&mut reader);
             assert!(first_line.contains("/v1/chat/completions"));
             assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if is_required_tool_choice_request(&request_body) {
+                let probe_body = required_tool_choice_probe_response(&request_body)
+                    .expect("required capability probe response");
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
+                if actual_count == 0 && probe_index == probe_responses.len() {
+                    tx.send(seen_requests).expect("send probe-only requests");
+                    break;
+                }
+                continue;
+            }
             if request_body.contains("singularity_capability_probe") {
                 let (status_line, body) = probe_responses
                     .get(probe_index)
@@ -160,7 +170,10 @@ fn configurable_probe_server(
                     .expect("capability probe response configured");
                 probe_index += 1;
                 write_provider_response(&mut stream, status_line, body, true);
-                if actual_count == 0 && probe_index == probe_responses.len() {
+                if actual_count == 0
+                    && probe_index == probe_responses.len()
+                    && !base_probe_requires_required_tool_choice(status_line, body)
+                {
                     tx.send(seen_requests).expect("send probe-only requests");
                     break;
                 }
@@ -178,47 +191,87 @@ fn configurable_probe_server(
     (format!("http://{addr}"), rx)
 }
 
-fn strict_probe_server() -> (String, Receiver<String>) {
+fn required_choice_probe_transport_failure_server() -> (String, Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind required transport provider");
+    let addr = listener
+        .local_addr()
+        .expect("required transport provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept base capability request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone base capability stream"));
+        let (_, _, request_body) = read_provider_request(&mut reader);
+        assert!(!is_required_tool_choice_request(&request_body));
+        write_provider_response(
+            &mut stream,
+            "HTTP/1.1 200 OK",
+            PROBE_STRICT_PARALLEL_RESPONSE,
+            true,
+        );
+        let (stream, _) = listener
+            .accept()
+            .expect("accept required transport request");
+        let mut reader =
+            BufReader::new(stream.try_clone().expect("clone required transport stream"));
+        let (_, _, request_body) = read_provider_request(&mut reader);
+        assert!(is_required_tool_choice_request(&request_body));
+        tx.send(()).expect("send required transport started");
+        drop(stream);
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn strict_probe_server() -> (String, Receiver<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind strict capability provider");
     let addr = listener
         .local_addr()
         .expect("strict capability provider address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept strict capability request");
-        let mut reader =
-            BufReader::new(stream.try_clone().expect("clone strict capability stream"));
-        let (first_line, headers, request_body) = read_provider_request(&mut reader);
-        assert!(first_line.contains("/v1/chat/completions"));
-        assert!(headers.contains("authorization: Bearer sk-secret-value"));
-        tx.send(request_body.clone())
-            .expect("send strict capability request");
+        let mut requests = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept strict capability request");
+            let mut reader =
+                BufReader::new(stream.try_clone().expect("clone strict capability stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if is_required_tool_choice_request(&request_body) {
+                requests.push(request_body.clone());
+                let probe_body = required_tool_choice_probe_response(&request_body)
+                    .expect("required capability probe response");
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
+                tx.send(requests).expect("send strict capability requests");
+                break;
+            }
+            requests.push(request_body.clone());
 
-        let request: serde_json::Value =
-            serde_json::from_str(&request_body).expect("strict capability request JSON");
-        let parameters = request
-            .pointer("/tools/0/function/parameters")
-            .expect("strict probe parameters");
-        let branch = parameters
-            .pointer("/oneOf/0")
-            .unwrap_or(&serde_json::Value::Null);
-        let valid_schema = parameters["oneOf"].as_array().map(Vec::len) == Some(2)
-            && branch["type"] == "object"
-            && branch["required"] == serde_json::json!(["probe", "values"])
-            && branch["additionalProperties"] == false
-            && branch["properties"]["probe"]["const"] == "schema_sentinel_alpha"
-            && branch["properties"]["values"]["type"] == "array";
-        let valid_roles = request["messages"][0]["role"] == "developer"
-            && request["messages"][1]["role"] == "user";
-        if valid_schema && valid_roles {
-            write_provider_response(
-                &mut stream,
-                "HTTP/1.1 200 OK",
-                PROBE_STRICT_PARALLEL_RESPONSE,
-                true,
-            );
-        } else {
-            write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
+            let request: serde_json::Value =
+                serde_json::from_str(&request_body).expect("strict capability request JSON");
+            let parameters = request
+                .pointer("/tools/0/function/parameters")
+                .expect("strict probe parameters");
+            let branch = parameters
+                .pointer("/oneOf/0")
+                .unwrap_or(&serde_json::Value::Null);
+            let valid_schema = parameters["oneOf"].as_array().map(Vec::len) == Some(2)
+                && branch["type"] == "object"
+                && branch["required"] == serde_json::json!(["probe", "values"])
+                && branch["additionalProperties"] == false
+                && branch["properties"]["probe"]["const"] == "schema_sentinel_alpha"
+                && branch["properties"]["values"]["type"] == "array";
+            let valid_roles = request["messages"][0]["role"] == "developer"
+                && request["messages"][1]["role"] == "user";
+            if valid_schema && valid_roles {
+                write_provider_response(
+                    &mut stream,
+                    "HTTP/1.1 200 OK",
+                    PROBE_STRICT_PARALLEL_RESPONSE,
+                    true,
+                );
+            } else {
+                write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
+            }
         }
     });
     (format!("http://{addr}"), rx)
@@ -280,6 +333,19 @@ fn strict_constraint_mismatch_probe_server(bad_arguments: &'static str) -> (Stri
             assert!(request_body.contains("singularity_capability_probe"));
             write_provider_response(&mut stream, status_line, body, true);
         }
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept required capability request");
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .expect("clone required capability stream"),
+        );
+        let (_, _, request_body) = read_provider_request(&mut reader);
+        assert!(is_required_tool_choice_request(&request_body));
+        let probe_body = required_tool_choice_probe_response(&request_body)
+            .expect("required capability probe response");
+        write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
         tx.send(())
             .expect("send strict constraint probe completion");
     });
@@ -298,7 +364,10 @@ fn delayed_probe_server(
     let (started_tx, started_rx) = mpsc::channel();
     thread::spawn(move || {
         let mut seen_requests = Vec::new();
-        for (status_line, body) in probe_responses {
+        let mut response_index = 0;
+        let mut required_response = None;
+        let mut required_attempts = 0;
+        loop {
             let (mut stream, _) = listener
                 .accept()
                 .expect("accept delayed capability request");
@@ -306,6 +375,38 @@ fn delayed_probe_server(
             let (first_line, headers, request_body) = read_provider_request(&mut reader);
             assert!(first_line.contains("/v1/chat/completions"));
             assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if is_required_tool_choice_request(&request_body) {
+                if required_response.is_none() {
+                    required_response = probe_responses.get(response_index).copied();
+                    if required_response.is_some() {
+                        response_index += 1;
+                    }
+                }
+                let default_probe_body = required_tool_choice_probe_response(&request_body);
+                let (status_line, body) = required_response.unwrap_or((
+                    "HTTP/1.1 200 OK",
+                    default_probe_body
+                        .as_deref()
+                        .unwrap_or(PROBE_STRICT_SINGLE_RESPONSE),
+                ));
+                started_tx
+                    .send(())
+                    .expect("send required capability request started");
+                required_attempts += 1;
+                thread::sleep(response_delay);
+                write_provider_response_best_effort(&mut stream, status_line, body, true);
+                if !(status_line.contains("429") || status_line.starts_with("HTTP/1.1 5"))
+                    || required_attempts == 3
+                {
+                    break;
+                }
+                continue;
+            }
+            let (status_line, body) = probe_responses
+                .get(response_index)
+                .copied()
+                .expect("delayed capability response configured");
+            response_index += 1;
             assert!(request_body.contains("singularity_capability_probe"));
             started_tx
                 .send(())
@@ -313,6 +414,11 @@ fn delayed_probe_server(
             thread::sleep(response_delay);
             seen_requests.push(request_body);
             write_provider_response_best_effort(&mut stream, status_line, body, true);
+            if response_index == probe_responses.len()
+                && !base_probe_requires_required_tool_choice(status_line, body)
+            {
+                break;
+            }
         }
         request_tx
             .send(seen_requests)
@@ -334,7 +440,9 @@ fn multi_model_probe_server(actual_count: usize) -> (String, Receiver<Vec<String
             let (first_line, headers, request_body) = read_provider_request(&mut reader);
             assert!(first_line.contains("/v1/chat/completions"));
             assert!(headers.contains("authorization: Bearer sk-secret-value"));
-            all_requests.push(request_body.clone());
+            if !is_required_tool_choice_request(&request_body) {
+                all_requests.push(request_body.clone());
+            }
             if let Some(probe_body) = capability_probe_response(&request_body) {
                 write_provider_response(&mut stream, "HTTP/1.1 200 OK", &probe_body, true);
                 continue;
@@ -551,8 +659,53 @@ fn write_provider_response_best_effort(
     );
 }
 
+fn is_required_tool_choice_request(request_body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(request_body)
+        .ok()
+        .is_some_and(|request| request["tool_choice"] == "required")
+}
+
+fn base_probe_requires_required_tool_choice(status_line: &str, body: &str) -> bool {
+    status_line.starts_with("HTTP/1.1 2")
+        && matches!(
+            body,
+            PROBE_STRICT_PARALLEL_RESPONSE
+                | PROBE_STRICT_SINGLE_RESPONSE
+                | PROBE_NON_STRICT_SINGLE_RESPONSE
+                | PROBE_ROUTER_RESPONSE
+        )
+}
+
+fn required_tool_choice_probe_response(request_body: &str) -> Option<String> {
+    let request: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    if request["tool_choice"] != "required" {
+        return None;
+    }
+    let tool_name = request.pointer("/tools/0/function/name")?.as_str()?;
+    if tool_name != "singularity_capability_router"
+        && !tool_name.starts_with("singularity_capability_probe")
+    {
+        return None;
+    }
+    let response = if tool_name == "singularity_capability_router" {
+        PROBE_ROUTER_RESPONSE
+    } else if request
+        .pointer("/tools/0/function/strict")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        PROBE_STRICT_SINGLE_RESPONSE
+    } else {
+        PROBE_NON_STRICT_SINGLE_RESPONSE
+    };
+    Some(response.to_string())
+}
+
 fn capability_probe_response(request_body: &str) -> Option<String> {
     let request: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    if request["tool_choice"] == "required" {
+        return required_tool_choice_probe_response(request_body);
+    }
     let tools = request.get("tools")?.as_array()?;
     let names = tools
         .iter()
@@ -1017,12 +1170,11 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
     assert_eq!(negotiation.contract.max_tools_per_request, 8);
 
-    let request: serde_json::Value = serde_json::from_str(
-        &request_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("captured strict capability request"),
-    )
-    .expect("strict capability request JSON");
+    let requests = request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured strict capability requests");
+    let request: serde_json::Value =
+        serde_json::from_str(&requests[0]).expect("strict capability request JSON");
     assert_eq!(request["tools"].as_array().map(Vec::len), Some(8));
     let parameters = &request["tools"][0]["function"]["parameters"];
     assert_eq!(request["messages"][0]["role"], "developer");
@@ -1066,6 +1218,31 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
         assert!(!description.contains("7"));
     }
     assert_eq!(request["tools"][0]["function"]["strict"], true);
+    assert!(negotiation.contract.supports_required_tool_choice);
+    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
+    let required_request: serde_json::Value =
+        serde_json::from_str(&requests[1]).expect("required probe JSON");
+    assert_eq!(required_request["tool_choice"], "required");
+    assert_eq!(required_request["tools"].as_array().map(Vec::len), Some(1));
+    assert_eq!(required_request["tools"][0]["function"]["strict"], true);
+    assert_eq!(
+        required_request["messages"][1]["content"],
+        "Call the only provided capability probe tool exactly once with arguments matching its schema."
+    );
+    let cached = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("cached strict capability negotiation");
+    assert!(cached.metadata.cache_hit);
+    assert_eq!(cached.metadata.profile_attempts, 0);
+    assert_eq!(cached.metadata.fallback_count, 0);
+    assert_eq!(cached.metadata.probe_usage, ModelUsage::default());
+    assert_eq!(
+        cached.metadata.probe_attempt_metadata,
+        ProviderAttemptMetadata::default()
+    );
 }
 
 #[test]
@@ -1113,6 +1290,156 @@ fn openai_capability_probe_negotiates_tool_definition_capacity_and_caches_it() {
         })
         .collect::<Vec<_>>();
     assert_eq!(tool_counts, vec![8]);
+}
+
+#[test]
+fn openai_required_tool_choice_probe_classifies_optional_and_terminal_results() {
+    for (status_line, body, expected_kind, expected_attempts) in [
+        ("HTTP/1.1 400 Bad Request", "{}", None, 2),
+        ("HTTP/1.1 422 Unprocessable Entity", "{}", None, 2),
+        ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE, None, 2),
+        (
+            "HTTP/1.1 401 Unauthorized",
+            "{}",
+            Some(ModelErrorKind::AuthError),
+            2,
+        ),
+        (
+            "HTTP/1.1 403 Forbidden",
+            "{}",
+            Some(ModelErrorKind::AuthError),
+            2,
+        ),
+        (
+            "HTTP/1.1 404 Not Found",
+            "{}",
+            Some(ModelErrorKind::InvalidRequest),
+            2,
+        ),
+        (
+            "HTTP/1.1 429 Too Many Requests",
+            "{}",
+            Some(ModelErrorKind::RateLimited),
+            4,
+        ),
+        (
+            "HTTP/1.1 500 Internal Server Error",
+            "{}",
+            Some(ModelErrorKind::ProviderOverloaded),
+            4,
+        ),
+    ] {
+        let (base_url, requests, _started) = delayed_probe_server(
+            vec![
+                ("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE),
+                (status_line, body),
+            ],
+            Duration::ZERO,
+        );
+        let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+        let result = Provider::negotiate_tool_capabilities(
+            &provider,
+            &ModelPreferences::default(),
+            &singularity_core::CancellationToken::new(),
+        );
+        match expected_kind {
+            Some(expected_kind) => {
+                let error = result.expect_err("terminal probe cause must not degrade");
+                assert_eq!(error.error.kind, expected_kind);
+                assert_eq!(
+                    error.error.http_status,
+                    Some(status_line[9..12].parse().unwrap())
+                );
+                assert_eq!(
+                    error
+                        .capability_metadata
+                        .expect("terminal capability metadata")
+                        .probe_attempt_metadata
+                        .attempt_count,
+                    expected_attempts
+                );
+            }
+            None => {
+                let negotiation = result.expect("optional probe must degrade safely");
+                assert!(!negotiation.contract.supports_required_tool_choice);
+                assert!(negotiation.contract.supports_strict_tool_schema);
+                assert_eq!(negotiation.contract.max_tool_calls_per_turn, 2);
+                assert_eq!(negotiation.contract.max_tools_per_request, 8);
+                assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
+            }
+        }
+        assert!(requests.recv_timeout(Duration::from_secs(2)).is_ok());
+    }
+}
+
+#[test]
+fn openai_required_tool_choice_probe_preserves_transport_and_cancellation_causes() {
+    let (base_url, started) = required_choice_probe_transport_failure_server();
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        result_tx
+            .send(Provider::negotiate_tool_capabilities(
+                &provider,
+                &ModelPreferences::default(),
+                &singularity_core::CancellationToken::new(),
+            ))
+            .expect("send transport probe result");
+    });
+    started
+        .recv_timeout(Duration::from_secs(1))
+        .expect("required transport probe started");
+    let transport_error = result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("transport probe result")
+        .expect_err("transport failure must terminate negotiation");
+    assert_eq!(transport_error.error.kind, ModelErrorKind::NetworkError);
+    assert_eq!(
+        transport_error
+            .capability_metadata
+            .expect("transport capability metadata")
+            .profile_attempts,
+        1
+    );
+
+    let (base_url, _requests, started) = delayed_probe_server(
+        vec![("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE)],
+        Duration::from_millis(250),
+    );
+    let provider = Arc::new(OpenAiProvider::new(provider_test_config(base_url)).expect("provider"));
+    let cancellation = singularity_core::CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let worker_provider = Arc::clone(&provider);
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        result_tx
+            .send(Provider::negotiate_tool_capabilities(
+                worker_provider.as_ref(),
+                &ModelPreferences::default(),
+                &worker_cancellation,
+            ))
+            .expect("send cancellation probe result");
+    });
+    started
+        .recv_timeout(Duration::from_secs(1))
+        .expect("base cancellation probe started");
+    started
+        .recv_timeout(Duration::from_secs(1))
+        .expect("required cancellation probe started");
+    cancellation.cancel();
+    let cancellation_error = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cancellation probe result")
+        .expect_err("cancellation must terminate negotiation");
+    assert_eq!(cancellation_error.error.kind, ModelErrorKind::Cancelled);
+    assert_eq!(
+        cancellation_error
+            .capability_metadata
+            .expect("cancellation capability metadata")
+            .profile_attempts,
+        1
+    );
+    worker.join().expect("join cancellation probe");
 }
 
 #[test]
@@ -1499,8 +1826,8 @@ fn openai_capability_probe_fallback_keeps_usage_attempts_and_cache_metadata_sepa
     assert_eq!(negotiation.contract.max_tools_per_request, 1);
     assert_eq!(negotiation.metadata.profile_attempts, 5);
     assert_eq!(negotiation.metadata.fallback_count, 4);
-    assert_eq!(negotiation.metadata.probe_usage.total_tokens, 3);
-    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 5);
+    assert_eq!(negotiation.metadata.probe_usage.total_tokens, 6);
+    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 6);
     assert_eq!(negotiation.metadata.probe_attempt_metadata.retry_count, 0);
 
     provider
@@ -1828,6 +2155,55 @@ fn model_request_validation_rejects_tool_count_above_provider_capability() {
         result.errors,
         vec!["requested_tool_calls_exceed_provider_limit"]
     );
+}
+
+#[test]
+fn required_tool_choice_requires_tools_and_negotiated_support() {
+    let mut request = ModelTurnRequest::new(
+        "request_required",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request.tool_choice.mode = ToolChoiceMode::Required;
+
+    let missing_tools = validate_model_request(&request);
+    assert_eq!(
+        missing_tools.errors,
+        vec!["required_tool_choice_requires_tools"]
+    );
+
+    request.tools.push(ModelToolSchema {
+        name: "builtin.read".to_string(),
+        description: "read".to_string(),
+        parameters_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    });
+    let unsupported = validate_model_request_with_capabilities(
+        &request,
+        Some(&ProviderProtocolContract::default()),
+    );
+    assert_eq!(
+        unsupported.errors,
+        vec!["provider_does_not_support_required_tool_choice"]
+    );
+
+    let supported = ProviderProtocolContract {
+        supports_required_tool_choice: true,
+        ..ProviderProtocolContract::default()
+    };
+    assert!(validate_model_request_with_capabilities(&request, Some(&supported)).valid);
+
+    let missing_required_call = validate_model_response(
+        Some(&ModelMessage::text(ModelRole::Assistant, "text")),
+        &[],
+        &request.tool_choice,
+        &["builtin.read".to_string()],
+        Some(&supported),
+    );
+    assert_eq!(missing_required_call.errors, vec!["required_tool_choice"]);
 }
 
 #[test]

@@ -37,6 +37,10 @@ const MAX_PROVIDER_ATTEMPTS: u32 = 3;
 const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 const PROVIDER_TOOL_CALL_LIMIT_EXCEEDED_CODE: &str = "provider_tool_call_limit_exceeded";
+const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_choice";
+const REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR: &str = "required_tool_choice_requires_tools";
+const REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR: &str =
+    "provider_does_not_support_required_tool_choice";
 const HTTP_STATUS_UNAUTHORIZED: u16 = 401;
 const HTTP_STATUS_FORBIDDEN: u16 = 403;
 const HTTP_STATUS_REQUEST_TIMEOUT: u16 = 408;
@@ -56,6 +60,8 @@ const CAPABILITY_PROBE_ALTERNATE_LABEL: &str = "schema_sentinel_beta";
 const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
 const CAPABILITY_PROBE_DEVELOPER_INSTRUCTION: &str =
     "Follow the fixed capability probe request using native structured tool calls.";
+const CAPABILITY_PROBE_REQUIRED_TOOL_INSTRUCTION: &str =
+    "Call the only provided capability probe tool exactly once with arguments matching its schema.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +110,7 @@ impl ModelMessage {
 pub enum ToolChoiceMode {
     Auto,
     None,
+    Required,
     SpecificTool,
     AllowedTools,
 }
@@ -158,6 +165,7 @@ pub struct ModelToolCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
+    pub supports_required_tool_choice: bool,
     pub supports_strict_tool_schema: bool,
     pub max_tool_calls_per_turn: u32,
     pub max_tools_per_request: u32,
@@ -172,6 +180,7 @@ impl Default for ProviderProtocolContract {
     fn default() -> Self {
         Self {
             supports_tools: true,
+            supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
@@ -807,6 +816,7 @@ impl OpenAiProviderConfig {
     pub fn protocol_contract(&self) -> ProviderProtocolContract {
         ProviderProtocolContract {
             supports_tools: true,
+            supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
@@ -1140,13 +1150,36 @@ impl OpenAiProvider {
             if single_call_fallback.is_some()
                 || capability_probe_response_matches(&response, &profile.expected_calls)
             {
+                let negotiated_profile = single_call_fallback.unwrap_or(profile.profile);
+                let required_probe =
+                    match self.probe_required_tool_choice(&profile, cancellation, model_name) {
+                        Ok(probe) => probe,
+                        Err(error) => {
+                            if let Some(metadata) = &error.provider_attempt_metadata {
+                                add_provider_attempt_metadata(
+                                    &mut probe_attempt_metadata,
+                                    metadata,
+                                );
+                            }
+                            return Err(error.with_capability_metadata(capability_probe_metadata(
+                                negotiated_profile,
+                                index as u32 + 1,
+                                index as u32,
+                                &probe_usage,
+                                &probe_attempt_metadata,
+                            )));
+                        }
+                    };
+                add_model_usage(&mut probe_usage, &required_probe.usage);
+                add_provider_attempt_metadata(
+                    &mut probe_attempt_metadata,
+                    &required_probe.attempt_metadata,
+                );
                 let mut contract = profile.contract;
-                let negotiated_profile = if let Some(fallback_profile) = single_call_fallback {
+                contract.supports_required_tool_choice = required_probe.supported;
+                if single_call_fallback.is_some() {
                     contract.max_tool_calls_per_turn = 1;
-                    fallback_profile
-                } else {
-                    profile.profile
-                };
+                }
                 let negotiation = ProviderProtocolNegotiation {
                     contract,
                     metadata: capability_probe_metadata(
@@ -1182,6 +1215,71 @@ impl OpenAiProvider {
             ModelErrorKind::UnsupportedCapability,
             "provider does not support native structured tool calls",
         )))
+    }
+
+    fn probe_required_tool_choice(
+        &self,
+        profile: &CapabilityProbeProfile,
+        cancellation: &CancellationToken,
+        model_name: &str,
+    ) -> Result<RequiredToolChoiceProbeResult, ProviderError> {
+        let mut request = profile.request.clone();
+        request.messages = vec![
+            ModelMessage::text(ModelRole::Developer, CAPABILITY_PROBE_DEVELOPER_INSTRUCTION),
+            ModelMessage::text(ModelRole::User, CAPABILITY_PROBE_REQUIRED_TOOL_INSTRUCTION),
+        ];
+        request.tools.truncate(1);
+        request.tool_choice = ToolChoicePolicy {
+            mode: ToolChoiceMode::Required,
+            tool_name: None,
+            allowed_tool_names: Vec::new(),
+            max_tool_calls: 1,
+            strict_tool_schema: profile.contract.supports_strict_tool_schema,
+        };
+        let mut probe_contract = profile.contract.clone();
+        probe_contract.supports_required_tool_choice = true;
+        match self.complete_with_contract(&request, cancellation, &probe_contract, model_name) {
+            Ok(response) => {
+                let attempt_metadata = response
+                    .provider_attempt_metadata
+                    .clone()
+                    .unwrap_or_else(ProviderAttemptMetadata::zero);
+                if response.status == ModelTurnStatus::Success && !response.tool_calls.is_empty() {
+                    return Ok(RequiredToolChoiceProbeResult {
+                        supported: true,
+                        usage: response.usage,
+                        attempt_metadata,
+                    });
+                }
+                if response.tool_calls.is_empty()
+                    && response.validation.as_ref().is_some_and(|validation| {
+                        validation
+                            .errors
+                            .iter()
+                            .any(|error| error == REQUIRED_TOOL_CHOICE_MISSING_ERROR)
+                    })
+                {
+                    return Ok(RequiredToolChoiceProbeResult {
+                        supported: false,
+                        usage: response.usage,
+                        attempt_metadata,
+                    });
+                }
+                Err(capability_probe_required_response_error(&response)
+                    .with_provider_attempt_metadata(attempt_metadata))
+            }
+            Err(error) if is_capability_probe_profile_rejection(&error) => {
+                Ok(RequiredToolChoiceProbeResult {
+                    supported: false,
+                    usage: ModelUsage::default(),
+                    attempt_metadata: error
+                        .provider_attempt_metadata
+                        .clone()
+                        .unwrap_or_else(ProviderAttemptMetadata::zero),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn complete_with_contract(
@@ -1586,6 +1684,7 @@ fn openai_tool_payload(tool: &ModelToolSchema, strict_tool_schema: bool) -> Valu
 fn openai_tool_choice_payload(request: &ModelTurnRequest) -> Value {
     match request.tool_choice.mode {
         ToolChoiceMode::None => json!("none"),
+        ToolChoiceMode::Required => json!("required"),
         ToolChoiceMode::SpecificTool => match &request.tool_choice.tool_name {
             Some(name) => {
                 json!({"type": "function", "function": {"name": openai_wire_tool_name(name)}})
@@ -1602,6 +1701,12 @@ struct CapabilityProbeProfile {
     request: ModelTurnRequest,
     expected_calls: Vec<CapabilityProbeExpectedCall>,
     single_call_fallback: Option<ProviderCapabilityProfile>,
+}
+
+struct RequiredToolChoiceProbeResult {
+    supported: bool,
+    usage: ModelUsage,
+    attempt_metadata: ProviderAttemptMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -2459,6 +2564,23 @@ fn capability_probe_response_error(response: &ModelTurnResponse) -> ProviderErro
     capability_probe_unsupported_error(error)
 }
 
+fn capability_probe_required_response_error(response: &ModelTurnResponse) -> ProviderError {
+    let mut error = response.error.as_ref().cloned().unwrap_or_else(|| {
+        ModelError::new(
+            ModelErrorKind::JsonSchemaViolation,
+            "provider required tool choice probe response was invalid",
+        )
+        .with_provider_diagnostic(
+            "provider_required_tool_choice_probe_invalid",
+            ProviderErrorStage::ResponseValidation,
+        )
+    });
+    if let Some(validation) = &response.validation {
+        error.validation_errors = validation.errors.clone();
+    }
+    ProviderError::from_model_error(error)
+}
+
 fn is_capability_probe_profile_rejection(error: &ProviderError) -> bool {
     error.error.stage == Some(ProviderErrorStage::ResponseStatus)
         && matches!(
@@ -2477,6 +2599,7 @@ fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> b
             matches!(
                 error.as_str(),
                 "provider_does_not_support_tools"
+                    | REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR
                     | "provider_does_not_support_strict_tool_schema"
                     | "requested_tool_calls_exceed_provider_limit"
             )
@@ -2673,6 +2796,9 @@ pub fn validate_model_request_with_capabilities(
     if !request.tools.is_empty() && request.tool_choice.max_tool_calls == 0 {
         errors.push("max_tool_calls_must_be_positive".to_string());
     }
+    if request.tool_choice.mode == ToolChoiceMode::Required && request.tools.is_empty() {
+        errors.push(REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR.to_string());
+    }
     if request.tool_choice.strict_tool_schema
         && request
             .tools
@@ -2684,6 +2810,11 @@ pub fn validate_model_request_with_capabilities(
     if let Some(capabilities) = capabilities {
         if !request.tools.is_empty() && !capabilities.supports_tools {
             errors.push("provider_does_not_support_tools".to_string());
+        }
+        if request.tool_choice.mode == ToolChoiceMode::Required
+            && !capabilities.supports_required_tool_choice
+        {
+            errors.push(REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR.to_string());
         }
         if request.model_preferences.json_mode && !capabilities.supports_json_mode {
             errors.push("provider_does_not_support_json_mode".to_string());
@@ -2847,6 +2978,13 @@ pub fn validate_model_response(
         ToolChoiceMode::None if !tool_calls.is_empty() => {
             errors.push("tool_choice_none".to_string());
         }
+        ToolChoiceMode::Required
+            if tool_calls.is_empty()
+                && capabilities
+                    .is_none_or(|capabilities| capabilities.supports_required_tool_choice) =>
+        {
+            errors.push(REQUIRED_TOOL_CHOICE_MISSING_ERROR.to_string());
+        }
         ToolChoiceMode::SpecificTool if tool_calls.is_empty() => {
             errors.push("specific_tool_required".to_string());
         }
@@ -2856,6 +2994,11 @@ pub fn validate_model_response(
         errors.push("max_tool_calls_exceeded".to_string());
     }
     if let Some(capabilities) = capabilities {
+        if tool_choice.mode == ToolChoiceMode::Required
+            && !capabilities.supports_required_tool_choice
+        {
+            errors.push(REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR.to_string());
+        }
         if !tool_calls.is_empty() && !capabilities.supports_tools {
             errors.push("provider_does_not_support_tools".to_string());
         }
