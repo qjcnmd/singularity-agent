@@ -33,6 +33,37 @@ struct StaticProvider {
     capabilities: ProviderProtocolContract,
 }
 
+struct FinalizationAwareProvider {
+    setup_responses: Vec<ModelTurnResponse>,
+    repeated_tool_response: ModelTurnResponse,
+    final_response: ModelTurnResponse,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    capabilities: ProviderProtocolContract,
+}
+
+impl Provider for FinalizationAwareProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.capabilities.clone()
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
+        let response_index = seen_requests.len();
+        seen_requests.push(request.clone());
+        if let Some(response) = self.setup_responses.get(response_index) {
+            return Ok(response.clone());
+        }
+        if request.tool_choice.mode == ToolChoiceMode::None && request.tools.is_empty() {
+            return Ok(self.final_response.clone());
+        }
+        Ok(self.repeated_tool_response.clone())
+    }
+}
+
 impl Provider for StaticProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         self.capabilities.clone()
@@ -198,6 +229,18 @@ fn agent_loop_with_capabilities_and_plan(
     capabilities: ProviderProtocolContract,
     include_plan: bool,
 ) -> AgentLoop<StaticProvider> {
+    AgentLoop::new(
+        StaticProvider {
+            responses,
+            seen_requests,
+            capabilities,
+        },
+        agent_tool_broker_for_test(include_plan),
+        policy,
+    )
+}
+
+fn agent_tool_broker_for_test(include_plan: bool) -> ToolBroker {
     let mut registry = ToolRegistry::default();
     for spec in workspace_tool_specs().into_iter().filter(|spec| {
         [
@@ -217,15 +260,7 @@ fn agent_loop_with_capabilities_and_plan(
                 .expect("register agent control tool");
         }
     }
-    AgentLoop::new(
-        StaticProvider {
-            responses,
-            seen_requests,
-            capabilities,
-        },
-        ToolBroker::new(registry),
-        policy,
-    )
+    ToolBroker::new(registry)
 }
 
 fn allow_read_policy() -> PolicyEngine {
@@ -251,25 +286,7 @@ fn allow_read_execute_policy() -> PolicyEngine {
 }
 
 fn workspace_tool_broker_for_test() -> ToolBroker {
-    let mut registry = ToolRegistry::default();
-    for spec in workspace_tool_specs().into_iter().filter(|spec| {
-        [
-            "builtin_read",
-            "builtin_edit",
-            "builtin_patch",
-            "builtin_command",
-        ]
-        .contains(&spec.name.as_str())
-    }) {
-        registry.register(spec).expect("register workspace tool");
-    }
-    for spec in agent_control_tool_specs()
-        .into_iter()
-        .filter(|spec| spec.name == BUILTIN_INVOKE_TOOL)
-    {
-        registry.register(spec).expect("register tool router");
-    }
-    ToolBroker::new(registry)
+    agent_tool_broker_for_test(false)
 }
 
 fn allow_read_write_policy() -> PolicyEngine {
@@ -2274,6 +2291,7 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
         .for_operation(PermissionOperation::Write),
     );
 
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let result = agent_loop_with_responses_and_requests(
         vec![
             pre_mutation_verification,
@@ -2285,7 +2303,7 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
             final_response,
         ],
         policy,
-        Arc::new(Mutex::new(Vec::new())),
+        Arc::clone(&seen_requests),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
     .run(&input);
@@ -2302,6 +2320,16 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
         std::fs::read_to_string(dir.path().join("README.md")).expect("read file"),
         "after"
     );
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 7);
+    assert!(
+        requests[..6]
+            .iter()
+            .all(|request| request.tool_choice.mode == ToolChoiceMode::Auto)
+    );
+    assert_eq!(requests[6].tool_choice.mode, ToolChoiceMode::None);
+    assert_eq!(requests[6].tool_choice.max_tool_calls, 0);
+    assert!(requests[6].tools.is_empty());
 }
 
 #[test]
@@ -4626,7 +4654,7 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
 }
 
 #[test]
-fn negotiated_required_capability_does_not_override_completion_state() {
+fn verified_completed_plan_enters_tool_free_finalization() {
     let workspace = tempfile::tempdir().expect("workspace");
     let canonical_cwd = std::fs::canonicalize(workspace.path())
         .expect("canonical workspace")
@@ -4662,23 +4690,39 @@ fn negotiated_required_capability_does_not_override_completion_state() {
         "command_call_1",
         "builtin_command",
         serde_json::json!({
+            "argv": verification_argv.clone(),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let mut repeated_verification =
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "");
+    repeated_verification.tool_calls.push(tool_call(
+        "command_call_repeated",
+        "builtin_command",
+        serde_json::json!({
             "argv": verification_argv,
             "cwd": ".",
             "timeout_seconds": 5
         }),
     ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_final", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
 
-    let result = agent_loop_with_plan_capabilities(
-        vec![initial_plan, completed_plan, verification, final_response],
-        allow_read_execute_policy(),
-        Arc::clone(&seen_requests),
-        ProviderProtocolContract {
-            supports_required_tool_choice: true,
-            ..ProviderProtocolContract::default()
+    let result = AgentLoop::new(
+        FinalizationAwareProvider {
+            setup_responses: vec![initial_plan, completed_plan, verification],
+            repeated_tool_response: repeated_verification,
+            final_response,
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract {
+                supports_required_tool_choice: true,
+                ..ProviderProtocolContract::default()
+            },
         },
+        agent_tool_broker_for_test(true),
+        allow_read_execute_policy(),
     )
     .with_workspace_tools(
         WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
@@ -4693,15 +4737,26 @@ fn negotiated_required_capability_does_not_override_completion_state() {
     );
 
     assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
     assert!(result.verification.passed);
     assert!(result.plan.as_ref().is_some_and(AgentPlan::is_completed));
+    assert_eq!(
+        result
+            .tool_results
+            .iter()
+            .filter(|tool_result| tool_result.tool_name == "builtin_command")
+            .count(),
+        1
+    );
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 4);
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.tool_choice.mode == ToolChoiceMode::Auto)
-    );
+    assert!(requests[..3].iter().all(|request| {
+        request.tool_choice.mode == ToolChoiceMode::Auto && !request.tools.is_empty()
+    }));
+    assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::None);
+    assert_eq!(requests[3].tool_choice.max_tool_calls, 0);
+    assert!(!requests[3].tool_choice.strict_tool_schema);
+    assert!(requests[3].tools.is_empty());
 }
 
 #[test]
@@ -4950,5 +5005,13 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         std::fs::read_to_string(file_path).expect("read file"),
         "after"
     );
-    assert_eq!(seen_requests.lock().expect("seen requests").len(), 4);
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[..3]
+            .iter()
+            .all(|request| request.tool_choice.mode == ToolChoiceMode::Auto)
+    );
+    assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::None);
+    assert!(requests[3].tools.is_empty());
 }

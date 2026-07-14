@@ -13,7 +13,7 @@ use singularity_model::{
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
     ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, ProviderToolDefinitionMode,
+    ProviderErrorStage, ProviderProtocolContract, ProviderToolDefinitionMode, ToolChoiceMode,
     is_strict_tool_schema_compatible, provider_error_response,
     validate_model_request_with_capabilities, validate_model_turn_response,
 };
@@ -1102,6 +1102,13 @@ impl AgentLoopState {
         self.completion.allows_final() && self.plan.as_ref().is_none_or(AgentPlan::is_completed)
     }
 
+    fn finalization_ready(&self) -> bool {
+        // `allows_final` can be true before the first model turn for simple read-only work.
+        // Passed required verification supplies the additional evidence that the next request is
+        // only collecting the final answer. An explicit plan, when present, must also be complete.
+        self.completion.summary().passed && self.plan.as_ref().is_none_or(AgentPlan::is_completed)
+    }
+
     fn completion_rejection_reason(&self) -> String {
         let mut reasons = Vec::new();
         if self.plan.as_ref().is_some_and(|plan| !plan.is_completed()) {
@@ -1309,10 +1316,21 @@ where
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
             }
-            let tool_view = match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
-                Ok(tool_view) => tool_view,
-                Err(error) => {
-                    return state.finish(AgentStatus::Failed, false, None, turn_index, Some(error));
+            let finalization_only = state.finalization_ready();
+            let tool_view = if finalization_only {
+                ModelToolView::finalization()
+            } else {
+                match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
+                    Ok(tool_view) => tool_view,
+                    Err(error) => {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            turn_index,
+                            Some(error),
+                        );
+                    }
                 }
             };
             if !model_request_fits_context(&tool_view.tools, &state.messages, budget) {
@@ -1331,8 +1349,15 @@ where
                 }
                 state.messages = compaction.messages;
             }
-            let request =
-                model_turn_request(input, budget, turn_index, &state, tool_view, capabilities);
+            let request = model_turn_request(
+                input,
+                budget,
+                turn_index,
+                &state,
+                tool_view,
+                capabilities,
+                finalization_only,
+            );
             let request_validation =
                 validate_model_request_with_capabilities(&request, Some(capabilities));
             if !request_validation.valid {
@@ -3166,6 +3191,15 @@ struct ModelToolView {
     max_tool_calls: u32,
 }
 
+impl ModelToolView {
+    fn finalization() -> Self {
+        Self {
+            tools: Vec::new(),
+            max_tool_calls: 0,
+        }
+    }
+}
+
 fn model_turn_request(
     input: &AgentLoopInput,
     budget: &ContextBudget,
@@ -3173,9 +3207,11 @@ fn model_turn_request(
     state: &AgentLoopState,
     tool_view: ModelToolView,
     capabilities: &ProviderProtocolContract,
+    finalization_only: bool,
 ) -> ModelTurnRequest {
     let tools = tool_view.tools;
-    let strict_tool_schema = capabilities.supports_strict_tool_schema
+    let strict_tool_schema = !tools.is_empty()
+        && capabilities.supports_strict_tool_schema
         && tools
             .iter()
             .all(|tool| is_strict_tool_schema_compatible(&tool.parameters_schema));
@@ -3189,6 +3225,9 @@ fn model_turn_request(
             ..input.model_preferences.clone()
         },
     };
+    if finalization_only {
+        request.tool_choice.mode = ToolChoiceMode::None;
+    }
     request.tool_choice.max_tool_calls = tool_view.max_tool_calls;
     request.tool_choice.strict_tool_schema = strict_tool_schema;
     request

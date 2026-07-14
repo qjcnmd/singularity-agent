@@ -173,6 +173,56 @@ fn responses_provider_server(
     (format!("http://{addr}"), rx)
 }
 
+fn finalization_protocol_server() -> (String, Receiver<Vec<(String, String)>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind finalization provider");
+    let addr = listener
+        .local_addr()
+        .expect("finalization provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept finalization request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            requests.push((first_line.clone(), request_body.clone()));
+            if first_line.contains("/v1/responses")
+                && let Some(body) = responses_capability_probe_response(&request_body)
+            {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
+                continue;
+            }
+            let body = if first_line.contains("/v1/responses") {
+                serde_json::json!({
+                    "id": "response_final",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}]
+                    }],
+                    "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+                })
+            } else {
+                serde_json::json!({
+                    "id": "chat_final",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+                })
+            };
+            write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body.to_string(), false);
+            tx.send(requests).expect("send finalization requests");
+            break;
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
 fn responses_to_chat_fallback_server() -> (String, Receiver<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind protocol fallback provider");
     let addr = listener
@@ -1523,6 +1573,70 @@ fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
     assert_eq!(actual["tools"][0]["strict"], false);
     assert_eq!(actual["tool_choice"], "auto");
     assert_eq!(actual["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn openai_tool_history_finalization_reuses_negotiated_protocol_without_tools() {
+    let (base_url, requests) = finalization_protocol_server();
+    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
+    let cancellation = singularity_core::CancellationToken::new();
+    let negotiation = provider
+        .negotiate_tool_capabilities(&ModelPreferences::default(), &cancellation)
+        .expect("Responses capability negotiation");
+    assert_eq!(
+        negotiation.metadata.api_protocol,
+        ProviderApiProtocol::OpenAiResponses
+    );
+
+    let mut request = capability_test_request(None, false, 1);
+    request.request_id = "request_finalization".to_string();
+    let historical_call = tool_call("call_read", "builtin_read");
+    request
+        .messages
+        .push(ModelMessage::assistant_tool_calls(vec![historical_call]));
+    let mut tool_result = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
+    tool_result.tool_call_id = Some("call_read".to_string());
+    request.messages.push(tool_result);
+    request.tools.clear();
+    request.tool_choice = ToolChoicePolicy {
+        mode: ToolChoiceMode::None,
+        max_tool_calls: 0,
+        strict_tool_schema: false,
+    };
+
+    let response = provider
+        .complete(&request, &cancellation)
+        .expect("tool-history finalization response");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(
+        response
+            .assistant_message
+            .as_ref()
+            .map(|message| message.content.as_str()),
+        Some("done")
+    );
+
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured finalization requests");
+    assert_eq!(captured.len(), 3);
+    assert!(
+        captured
+            .iter()
+            .all(|(path, _)| path.contains("/v1/responses"))
+    );
+    let final_payload: serde_json::Value =
+        serde_json::from_str(&captured[2].1).expect("finalization request JSON");
+    let input = final_payload["input"]
+        .as_array()
+        .expect("Responses finalization input");
+    assert!(input.iter().any(|item| item["type"] == "function_call"));
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    );
+    assert!(final_payload.get("tools").is_none());
 }
 
 #[test]

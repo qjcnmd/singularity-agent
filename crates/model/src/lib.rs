@@ -1688,27 +1688,28 @@ impl Provider for OpenAiProvider {
                 &self.config,
             ));
         }
-        let (capabilities, capability_metadata, api_protocol) = if request.tools.is_empty() {
-            (
-                self.protocol_contract(),
-                None,
-                self.config.completion_protocol_without_tools(),
-            )
-        } else {
-            let effective_model_name = request
-                .model_preferences
-                .model_name
-                .as_deref()
-                .unwrap_or(&self.config.model_name);
-            let negotiation =
-                self.negotiate_openai_tool_capabilities(effective_model_name, cancellation)?;
-            let api_protocol = negotiation.metadata.api_protocol;
-            (
-                negotiation.contract,
-                Some(negotiation.metadata),
-                api_protocol,
-            )
-        };
+        let (capabilities, capability_metadata, api_protocol) =
+            if !request_uses_tool_protocol(request) {
+                (
+                    self.protocol_contract(),
+                    None,
+                    self.config.completion_protocol_without_tools(),
+                )
+            } else {
+                let effective_model_name = request
+                    .model_preferences
+                    .model_name
+                    .as_deref()
+                    .unwrap_or(&self.config.model_name);
+                let negotiation =
+                    self.negotiate_openai_tool_capabilities(effective_model_name, cancellation)?;
+                let api_protocol = negotiation.metadata.api_protocol;
+                (
+                    negotiation.contract,
+                    Some(negotiation.metadata),
+                    api_protocol,
+                )
+            };
         let request_validation =
             validate_model_request_with_capabilities(request, Some(&capabilities));
         if !request_validation.valid {
@@ -1733,6 +1734,14 @@ impl Provider for OpenAiProvider {
         )
         .map_err(|error| attach_capability_metadata(error, &capability_metadata))
     }
+}
+
+fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
+    !request.tools.is_empty()
+        || request
+            .messages
+            .iter()
+            .any(|message| message.role == ModelRole::Tool || !message.tool_calls.is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Error)]
