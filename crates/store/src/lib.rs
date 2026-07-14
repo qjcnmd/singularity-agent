@@ -85,10 +85,12 @@ pub enum StoreError {
     InvalidState(String),
     #[error("store initialization lock error: {0}")]
     InitializationLock(#[source] std::io::Error),
-    #[error("thread execution lock error: {0}")]
+    #[error("workspace execution lock error: {0}")]
     ExecutionLock(#[source] std::io::Error),
     #[error("thread {thread_id} already has non-terminal turn {turn_id}")]
     ThreadHasNonterminalTurn { thread_id: String, turn_id: String },
+    #[error("workspace already has non-terminal turn {turn_id} in thread {thread_id}")]
+    WorkspaceHasNonterminalTurn { thread_id: String, turn_id: String },
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -128,10 +130,15 @@ pub struct SessionStore {
     runtime_path: Option<PathBuf>,
 }
 
-pub struct ThreadExecutionGuard {
-    thread_id: String,
+pub struct WorkspaceExecutionGuard {
+    execution_scope: WorkspaceExecutionScope,
     store_path: PathBuf,
     _lock_file: File,
+}
+
+enum WorkspaceExecutionScope {
+    Workspace(String),
+    Thread(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -188,32 +195,33 @@ impl SessionStore {
         &self.descriptor
     }
 
-    pub fn try_begin_thread_execution(
+    pub fn try_begin_workspace_execution(
         &self,
         thread_id: &str,
-    ) -> StoreResult<Option<ThreadExecutionGuard>> {
-        self.get_thread(thread_id)?;
+    ) -> StoreResult<Option<WorkspaceExecutionGuard>> {
+        let thread = self.get_thread(thread_id)?;
         let store_path = self.runtime_path.clone().ok_or_else(|| {
             StoreError::ExecutionLock(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "thread execution ownership requires a file-backed store",
+                "workspace execution ownership requires a file-backed store",
             ))
         })?;
+        let execution_scope = workspace_execution_scope(&thread);
         let lock_file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(thread_execution_lock_path(&store_path, thread_id))
+            .open(workspace_execution_lock_path(&store_path, &execution_scope))
             .map_err(StoreError::ExecutionLock)?;
         match lock_file.try_lock() {
             Ok(()) => {
-                let guard = ThreadExecutionGuard {
-                    thread_id: thread_id.to_string(),
+                let guard = WorkspaceExecutionGuard {
+                    execution_scope,
                     store_path,
                     _lock_file: lock_file,
                 };
-                self.recover_abandoned_thread_execution(&guard)?;
+                self.recover_abandoned_workspace_execution(&guard)?;
                 Ok(Some(guard))
             }
             Err(error) => {
@@ -227,7 +235,7 @@ impl SessionStore {
         }
     }
 
-    pub fn recover_unowned_thread_executions(&self) -> StoreResult<()> {
+    pub fn recover_unowned_workspace_executions(&self) -> StoreResult<()> {
         let mut statement = self.connection.prepare(
             "select thread_id from turns
              where status not in (?1, ?2, ?3)
@@ -247,7 +255,7 @@ impl SessionStore {
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         for thread_id in thread_ids {
-            let _guard = self.try_begin_thread_execution(&thread_id)?;
+            let _guard = self.try_begin_workspace_execution(&thread_id)?;
         }
         Ok(())
     }
@@ -401,7 +409,7 @@ impl SessionStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::ensure_active_thread(&transaction, thread_id)?;
-        Self::ensure_thread_has_no_nonterminal_turn(&transaction, thread_id)?;
+        Self::ensure_workspace_has_no_nonterminal_turn(&transaction, thread_id, None)?;
         let turn_sequence = Self::next_turn_sequence(&transaction, thread_id)?;
         let turn = Self::new_turn(thread_id, agent_loop_status);
         Self::insert_turn(&transaction, &turn, turn_sequence)?;
@@ -440,7 +448,7 @@ impl SessionStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::ensure_active_thread(&transaction, thread_id)?;
-        Self::ensure_thread_has_no_nonterminal_turn(&transaction, thread_id)?;
+        Self::ensure_workspace_has_no_nonterminal_turn(&transaction, thread_id, None)?;
         let history =
             Self::read_thread_history_from(&transaction, thread_id, None, history_turn_limit)?;
         let turn_sequence = Self::next_turn_sequence(&transaction, thread_id)?;
@@ -1002,7 +1010,8 @@ impl SessionStore {
         component: &str,
         summary: &str,
     ) -> StoreResult<RecordedApprovalDecision> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let request_payload: String = transaction
             .query_row(
                 "select payload from approvals where request_id = ?1 and decision_outcome is null",
@@ -1086,6 +1095,11 @@ impl SessionStore {
                     PENDING_APPROVAL_ALLOW_REQUIRES_ACTIVE_THREAD.to_string(),
                 ));
             }
+            Self::ensure_workspace_has_no_nonterminal_turn(
+                &transaction,
+                &request.thread_id,
+                Some(&request.turn_id),
+            )?;
         }
         if decision.outcome == ApprovalOutcome::Defer {
             let trace = TraceEvent {
@@ -1289,7 +1303,7 @@ impl SessionStore {
     }
 
     fn recover_incomplete_approval_executions_for_thread(
-        &self,
+        transaction: &Connection,
         thread_id: &str,
     ) -> StoreResult<Vec<String>> {
         struct RecoveryRow {
@@ -1302,8 +1316,6 @@ impl SessionStore {
             agent_loop_status: String,
         }
 
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let mut statement = transaction.prepare(
             "select a.rowid, a.request_id, a.payload, a.decision_outcome,
                     a.decision_reason, p.rowid, p.thread_id, p.turn_id, p.tool_call_id, p.payload,
@@ -1592,19 +1604,51 @@ impl SessionStore {
             )?;
             recovered.push(request_id.clone());
         }
-        transaction.commit()?;
         Ok(recovered)
     }
 
-    fn recover_abandoned_thread_execution(
+    fn recover_abandoned_workspace_execution(
         &self,
-        guard: &ThreadExecutionGuard,
-    ) -> StoreResult<Vec<String>> {
-        self.validate_thread_execution_guard(guard)?;
-        self.recover_incomplete_approval_executions_for_thread(&guard.thread_id)?;
+        guard: &WorkspaceExecutionGuard,
+    ) -> StoreResult<()> {
+        self.validate_workspace_execution_guard(guard)?;
+        for thread_id in self.workspace_execution_thread_ids(&guard.execution_scope)? {
+            self.recover_abandoned_thread_execution(&thread_id)?;
+        }
+        Ok(())
+    }
 
+    fn workspace_execution_thread_ids(
+        &self,
+        execution_scope: &WorkspaceExecutionScope,
+    ) -> StoreResult<Vec<String>> {
+        match execution_scope {
+            WorkspaceExecutionScope::Workspace(workspace) => {
+                let mut statement = self
+                    .connection
+                    .prepare("select thread_id from threads where cwd = ?1 order by rowid")?;
+                let thread_ids = statement
+                    .query_map(params![workspace], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(thread_ids)
+            }
+            WorkspaceExecutionScope::Thread(thread_id) => Ok(vec![thread_id.clone()]),
+        }
+    }
+
+    fn recover_abandoned_thread_execution(&self, thread_id: &str) -> StoreResult<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        Self::recover_incomplete_approval_executions_for_thread(&transaction, thread_id)?;
+        Self::recover_abandoned_turns_for_thread(&transaction, thread_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn recover_abandoned_turns_for_thread(
+        transaction: &Connection,
+        thread_id: &str,
+    ) -> StoreResult<Vec<String>> {
         let mut statement = transaction.prepare(
             "select turn_id, status, agent_loop_status from turns
              where thread_id = ?1 and status not in (?2, ?3, ?4)
@@ -1613,7 +1657,7 @@ impl SessionStore {
         let turns = statement
             .query_map(
                 params![
-                    &guard.thread_id,
+                    thread_id,
                     serde_json::to_string(&TurnStatus::Completed)?,
                     serde_json::to_string(&TurnStatus::Failed)?,
                     serde_json::to_string(&TurnStatus::Interrupted)?,
@@ -1673,7 +1717,7 @@ impl SessionStore {
                 }),
                 ..TraceEvent::new(
                     format!("trace_{turn_id}_owner_lost_{}", Uuid::new_v4()),
-                    guard.thread_id.clone(),
+                    thread_id,
                     turn_id.clone(),
                     "app_server",
                     "turn interrupted after execution owner was lost",
@@ -1682,14 +1726,16 @@ impl SessionStore {
             Self::insert_trace(&transaction, &trace)?;
             recovered.push(turn_id);
         }
-        transaction.commit()?;
         Ok(recovered)
     }
 
-    fn validate_thread_execution_guard(&self, guard: &ThreadExecutionGuard) -> StoreResult<()> {
+    fn validate_workspace_execution_guard(
+        &self,
+        guard: &WorkspaceExecutionGuard,
+    ) -> StoreResult<()> {
         if self.runtime_path.as_ref() != Some(&guard.store_path) {
             return Err(StoreError::InvalidState(
-                "thread execution guard belongs to another store".to_string(),
+                "workspace execution guard belongs to another store".to_string(),
             ));
         }
         Ok(())
@@ -2020,6 +2066,52 @@ impl SessionStore {
                 thread_id: thread_id.to_string(),
                 turn_id,
             });
+        }
+        Ok(())
+    }
+
+    fn ensure_workspace_has_no_nonterminal_turn(
+        connection: &Connection,
+        thread_id: &str,
+        except_turn_id: Option<&str>,
+    ) -> StoreResult<()> {
+        let cwd = connection
+            .query_row(
+                "select cwd from threads where thread_id = ?1",
+                params![thread_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("thread {thread_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })?;
+        let workspace = cwd.as_deref().filter(|cwd| !cwd.trim().is_empty());
+        let conflict = connection
+            .query_row(
+                "select turns.thread_id, turns.turn_id
+                 from turns
+                 join threads on threads.thread_id = turns.thread_id
+                 where ((?1 is not null and threads.cwd = ?1)
+                        or (?1 is null and turns.thread_id = ?2))
+                   and turns.status not in (?3, ?4, ?5)
+                   and (?6 is null or turns.turn_id != ?6)
+                 order by turns.rowid
+                 limit 1",
+                params![
+                    workspace,
+                    thread_id,
+                    serde_json::to_string(&TurnStatus::Completed)?,
+                    serde_json::to_string(&TurnStatus::Failed)?,
+                    serde_json::to_string(&TurnStatus::Interrupted)?,
+                    except_turn_id,
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((thread_id, turn_id)) = conflict {
+            return Err(StoreError::WorkspaceHasNonterminalTurn { thread_id, turn_id });
         }
         Ok(())
     }
@@ -2730,10 +2822,24 @@ fn configure_connection(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-fn thread_execution_lock_path(store_path: &Path, thread_id: &str) -> PathBuf {
-    let digest = Sha256::digest(thread_id.as_bytes());
+fn workspace_execution_scope(thread: &Thread) -> WorkspaceExecutionScope {
+    match thread.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
+        Some(cwd) => WorkspaceExecutionScope::Workspace(cwd.to_string()),
+        None => WorkspaceExecutionScope::Thread(thread.thread_id.clone()),
+    }
+}
+
+fn workspace_execution_lock_path(
+    store_path: &Path,
+    execution_scope: &WorkspaceExecutionScope,
+) -> PathBuf {
+    let lock_identity = match execution_scope {
+        WorkspaceExecutionScope::Workspace(workspace) => format!("workspace:{workspace}"),
+        WorkspaceExecutionScope::Thread(thread_id) => format!("thread:{thread_id}"),
+    };
+    let digest = Sha256::digest(lock_identity.as_bytes());
     let mut lock_path = store_path.as_os_str().to_os_string();
-    lock_path.push(format!(".thread-{digest:x}.lock"));
+    lock_path.push(format!(".workspace-{digest:x}.lock"));
     PathBuf::from(lock_path)
 }
 

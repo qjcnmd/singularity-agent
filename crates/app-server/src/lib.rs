@@ -49,6 +49,8 @@ const THREAD_ARCHIVED: &str = "Thread is archived; resume it before starting a t
 const THREAD_ARCHIVED_CONTINUATION: &str =
     "Thread is archived; resume it before continuing the turn";
 const THREAD_EXECUTION_ACTIVE: &str = "Thread already has an active or pending turn";
+const WORKSPACE_EXECUTION_ACTIVE: &str = "Workspace already has an active or pending turn";
+const EXECUTION_STOPPED: &str = "AppServer is stopping; execution was not started";
 const TURN_NOT_FOUND: &str = "Turn not found";
 const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
 const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
@@ -90,15 +92,18 @@ pub struct AppServer {
     sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    execution_stopped: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 pub struct AppServerCancellationHandle {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    execution_stopped: Arc<AtomicBool>,
 }
 
 impl AppServerCancellationHandle {
-    pub fn cancel_active_turns(&self) -> AppServerResult<()> {
+    pub fn request_execution_stop(&self) -> AppServerResult<()> {
+        self.execution_stopped.store(true, Ordering::SeqCst);
         for cancellation in self
             .active_turns
             .lock()
@@ -141,6 +146,7 @@ impl AppServer {
             sandbox_backend: Arc::new(WindowsSandboxBackend::new()),
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
+            execution_stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -160,13 +166,14 @@ impl AppServer {
         self.initialized_acknowledged
     }
 
-    pub fn cancel_active_turns(&self) -> AppServerResult<()> {
-        self.cancellation_handle().cancel_active_turns()
+    pub fn request_execution_stop(&self) -> AppServerResult<()> {
+        self.cancellation_handle().request_execution_stop()
     }
 
     pub fn cancellation_handle(&self) -> AppServerCancellationHandle {
         AppServerCancellationHandle {
             active_turns: Arc::clone(&self.active_turns),
+            execution_stopped: Arc::clone(&self.execution_stopped),
         }
     }
 
@@ -180,6 +187,7 @@ impl AppServer {
             sandbox_backend: Arc::clone(&self.sandbox_backend),
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
+            execution_stopped: Arc::clone(&self.execution_stopped),
         })
     }
 
@@ -197,6 +205,9 @@ impl AppServer {
                 return Err(AppServerError::Workspace(format!(
                     "turn {turn_id} is already active"
                 )));
+            }
+            if self.execution_stopped.load(Ordering::SeqCst) {
+                cancellation.cancel();
             }
             active_turns.insert(turn_id.to_string(), cancellation.clone());
         }
@@ -220,7 +231,8 @@ impl AppServer {
         if is_terminal_turn_status(&turn.status) {
             return Ok(turn);
         }
-        let Some(_execution_guard) = self.store.try_begin_thread_execution(&turn.thread_id)? else {
+        let Some(_execution_guard) = self.store.try_begin_workspace_execution(&turn.thread_id)?
+        else {
             return Ok(turn);
         };
         self.store.get_turn(&turn.turn_id).map_err(Into::into)
@@ -537,11 +549,13 @@ impl AppServer {
             );
             return Ok(());
         }
-        let Some(_execution_guard) = self.store.try_begin_thread_execution(&params.thread_id)?
+        let Some(_execution_guard) = self
+            .store
+            .try_begin_workspace_execution(&params.thread_id)?
         else {
             emit_messages(
                 &mut emit,
-                invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE)?,
+                invalid_request_response(message.id, WORKSPACE_EXECUTION_ACTIVE)?,
             );
             return Ok(());
         };
@@ -559,10 +573,10 @@ impl AppServer {
                 emit_messages(&mut emit, not_found_response(message.id, THREAD_NOT_FOUND)?);
                 return Ok(());
             }
-            Err(StoreError::ThreadHasNonterminalTurn { .. }) => {
+            Err(StoreError::WorkspaceHasNonterminalTurn { .. }) => {
                 emit_messages(
                     &mut emit,
-                    invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE)?,
+                    invalid_request_response(message.id, WORKSPACE_EXECUTION_ACTIVE)?,
                 );
                 return Ok(());
             }
@@ -1082,7 +1096,7 @@ impl AppServer {
 
     fn server_shutdown(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         self.shutdown_requested = true;
-        self.cancel_active_turns()?;
+        self.request_execution_stop()?;
         Ok(vec![
             JsonRpcMessage::response(message.id, json!({"shutdown": true})).to_wire_value(),
         ])
@@ -1124,25 +1138,17 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let is_tool_continuation = pending_request.tool_call_id.is_some();
-        let _execution_guard = if is_tool_continuation {
-            if !self
+        if is_tool_continuation
+            && !self
                 .store
                 .has_pending_tool_call(&pending_request.request_id)?
-            {
-                return not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND);
-            }
-            let Some(guard) = self
-                .store
-                .try_begin_thread_execution(&pending_request.thread_id)?
-            else {
-                return invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE);
-            };
-            Some(guard)
-        } else {
-            None
-        };
+        {
+            return not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND);
+        }
         let pending_thread = self.store.get_thread(&pending_request.thread_id)?;
-        if is_tool_continuation && matches!(decision.outcome, ApprovalOutcome::Allow) {
+        let continues_execution =
+            is_tool_continuation && matches!(decision.outcome, ApprovalOutcome::Allow);
+        if continues_execution {
             if pending_thread.status != singularity_protocol::ThreadStatus::Active {
                 return invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION);
             }
@@ -1150,6 +1156,26 @@ impl AppServer {
                 return invalid_request_response(message.id, error);
             }
         }
+        let _execution_guard = if continues_execution {
+            let Some(guard) = self
+                .store
+                .try_begin_workspace_execution(&pending_request.thread_id)?
+            else {
+                return invalid_request_response(message.id, WORKSPACE_EXECUTION_ACTIVE);
+            };
+            Some(guard)
+        } else {
+            None
+        };
+        let active_turn = if continues_execution {
+            let active_turn = self.activate_turn(&pending_request.turn_id)?;
+            if active_turn.0.is_cancelled() {
+                return invalid_request_response(message.id, EXECUTION_STOPPED);
+            }
+            Some(active_turn)
+        } else {
+            None
+        };
         let recorded = match self.store.record_approval_decision(
             &decision,
             "approval",
@@ -1166,10 +1192,19 @@ impl AppServer {
                     {
                         invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION)
                     }
+                    StoreError::WorkspaceHasNonterminalTurn { .. } => {
+                        invalid_request_response(message.id, WORKSPACE_EXECUTION_ACTIVE)
+                    }
                     other => Err(other.into()),
                 };
             }
         };
+        if let Some((cancellation, _guard)) = active_turn.as_ref() {
+            let turn = self.store.get_turn(&recorded.request.turn_id)?;
+            if turn.agent_loop_status == "cancel_requested" {
+                cancellation.cancel();
+            }
+        }
         let pending_tool_call = recorded.pending_tool_call.clone();
         if matches!(decision.outcome, ApprovalOutcome::Defer) {
             return Ok(vec![
@@ -1189,13 +1224,6 @@ impl AppServer {
         }
         let mut messages = Vec::new();
         let continuation = (|| -> AppServerResult<_> {
-            let active_turn = if matches!(decision.outcome, ApprovalOutcome::Allow)
-                && pending_tool_call.is_some()
-            {
-                Some(self.activate_turn(&recorded.request.turn_id)?)
-            } else {
-                None
-            };
             let cancellation = active_turn
                 .as_ref()
                 .map(|(cancellation, _guard)| cancellation.clone())
@@ -1980,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_turn_activation_keeps_the_original_cancellation_token_registered() {
+    fn duplicate_activation_preserves_the_original_and_global_stop_cancels_future_turns() {
         let server = app_server(SessionStore::open(":memory:").expect("store"));
         let (original, _guard) = server.activate_turn("turn_1").expect("activate turn");
 
@@ -1988,8 +2016,98 @@ mod tests {
 
         assert!(matches!(duplicate, Err(AppServerError::Workspace(_))));
         assert!(!original.is_cancelled());
-        server.cancel_active_turns().expect("cancel active turn");
+        server
+            .request_execution_stop()
+            .expect("request execution stop");
         assert!(original.is_cancelled());
+        let (late, _late_guard) = server.activate_turn("turn_2").expect("late activation");
+        assert!(late.is_cancelled());
+    }
+
+    #[test]
+    fn stopped_execution_does_not_consume_a_pending_tool_approval() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(None, Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("blocked turn");
+        let request = ApprovalRequest::new(
+            "approval_stopped_execution",
+            thread.thread_id,
+            turn.turn_id,
+            TOOL_EDIT,
+        )
+        .with_tool_call_id("call_1");
+        let checkpoint = json!({
+            "request_id": &request.request_id,
+            "thread_id": &request.thread_id,
+            "turn_id": &request.turn_id,
+            "tool_call_id": "call_1",
+            "tool_name": TOOL_EDIT,
+            "raw_arguments": "{}",
+            "resources": [],
+            "checkpoint_version": 1,
+            "messages": [],
+            "tool_results": [],
+            "used_approval_grants": [],
+            "approval_count": 1,
+            "model_turns": 1,
+            "completion": {}
+        });
+        store
+            .create_approval_with_pending_tool_call_and_trace(
+                &request,
+                Some(checkpoint),
+                "approval",
+                "approval requested",
+            )
+            .expect("pending approval");
+        let mut server = app_server(store);
+        server
+            .request_execution_stop()
+            .expect("request execution stop");
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let message = serde_json::from_value(json!({
+            "method": "approval/decision",
+            "id": 1,
+            "params": decision,
+        }))
+        .expect("approval decision message");
+
+        let response = server
+            .approval_decision(message)
+            .expect("decision response");
+
+        assert_eq!(response[0]["error"]["message"], EXECUTION_STOPPED);
+        assert_eq!(
+            server
+                .store
+                .get_pending_approval(&request.request_id)
+                .expect("approval remains pending"),
+            request
+        );
+        assert!(
+            server
+                .store
+                .has_pending_tool_call(&request.request_id)
+                .expect("checkpoint remains pending")
+        );
     }
 
     struct StaticProvider {
@@ -2795,7 +2913,7 @@ mod tests {
         );
         server
             .store
-            .recover_unowned_thread_executions()
+            .recover_unowned_workspace_executions()
             .expect("recovery");
     }
 

@@ -835,7 +835,7 @@ fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
 
     let reopened = SessionStore::open(&db_path).expect("reopen store");
     reopened
-        .recover_unowned_thread_executions()
+        .recover_unowned_workspace_executions()
         .expect("recover executing approval");
 
     let recovered_turn = reopened.get_turn(&turn.turn_id).expect("recovered turn");
@@ -926,7 +926,7 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
 
     let reopened = SessionStore::open(&db_path).expect("reopen store");
     reopened
-        .recover_unowned_thread_executions()
+        .recover_unowned_workspace_executions()
         .expect("recover half handoff");
     assert!(
         !reopened
@@ -966,7 +966,7 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
     );
 
     reopened
-        .recover_unowned_thread_executions()
+        .recover_unowned_workspace_executions()
         .expect("idempotent recovery");
     assert_eq!(
         reopened
@@ -980,11 +980,12 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
 }
 
 #[test]
-fn process_recovery_rolls_back_before_mutation_when_half_handoff_is_corrupt() {
+fn process_recovery_rolls_back_approval_reconciliation_when_turn_recovery_fails() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
+    let other_thread = store.create_thread(None, None).expect("other thread");
     let turn = store
         .create_turn(&thread.thread_id, "running")
         .expect("turn");
@@ -1049,25 +1050,47 @@ fn process_recovery_rolls_back_before_mutation_when_half_handoff_is_corrupt() {
         .len();
     drop(store);
 
+    let orphan_request_id = "approval_orphan_pending";
+    let orphan_request = ApprovalRequest::new(
+        orphan_request_id,
+        other_thread.thread_id,
+        turn.turn_id.clone(),
+        "builtin_edit",
+    )
+    .with_tool_call_id("call_orphan");
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    let mut corrupt = checkpoint(&next.request_id, "call_2");
-    corrupt["thread_id"] = serde_json::json!("other_thread");
     connection
         .execute(
-            "update pending_tool_calls set payload = ?1 where request_id = ?2",
+            "insert into approvals(request_id, payload) values(?1, ?2)",
             rusqlite::params![
-                serde_json::to_string(&corrupt).expect("payload"),
-                next.request_id
+                orphan_request_id,
+                serde_json::to_string(&orphan_request).expect("orphan approval payload")
             ],
         )
-        .expect("corrupt checkpoint");
+        .expect("insert mismatched approval fixture");
+    connection
+        .execute(
+            "insert into pending_tool_calls(
+                request_id, thread_id, turn_id, tool_call_id, payload, execution_state
+             ) values(?1, ?2, ?3, ?4, '{}', 'pending')",
+            rusqlite::params![
+                orphan_request_id,
+                thread.thread_id,
+                turn.turn_id,
+                "call_orphan"
+            ],
+        )
+        .expect("insert orphan pending execution");
     drop(connection);
 
     let reopened = SessionStore::open(&db_path).expect("reopen store");
     assert!(matches!(
-        reopened.recover_unowned_thread_executions(),
+        reopened.recover_unowned_workspace_executions(),
         Err(StoreError::InvalidState(message))
-            if message == "approval checkpoint thread_id must match approval request"
+            if message == format!(
+                "turn {} has inconsistent pending execution state",
+                turn.turn_id
+            )
     ));
     assert!(
         reopened
@@ -1078,6 +1101,11 @@ fn process_recovery_rolls_back_before_mutation_when_half_handoff_is_corrupt() {
         reopened
             .has_pending_tool_call(&next.request_id)
             .expect("next")
+    );
+    assert!(
+        reopened
+            .has_pending_tool_call(orphan_request_id)
+            .expect("orphan")
     );
     let unchanged_turn = reopened.get_turn(&turn.turn_id).expect("turn");
     assert_eq!(unchanged_turn.status, TurnStatus::Blocked);
@@ -1175,7 +1203,7 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
 
         let reopened = SessionStore::open(&db_path).expect("reopen store");
         assert!(matches!(
-            reopened.recover_unowned_thread_executions(),
+            reopened.recover_unowned_workspace_executions(),
             Err(StoreError::InvalidState(message))
                 if message == format!(
                     "approval {} has inconsistent decision ledger",
@@ -1221,7 +1249,7 @@ fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
     store.create_approval(&request).expect("approval ledger");
 
     assert!(matches!(
-        store.recover_unowned_thread_executions(),
+        store.recover_unowned_workspace_executions(),
         Err(StoreError::InvalidState(message))
             if message == "approval approval_missing_checkpoint has inconsistent checkpoint state"
     ));
@@ -2580,7 +2608,7 @@ fn concurrent_connections_admit_one_turn_and_allocate_unique_item_sequences() {
         let (turn, item) = handle.join().expect("worker joins");
         match turn {
             Ok(_) => admitted_turns += 1,
-            Err(StoreError::ThreadHasNonterminalTurn { .. }) => {}
+            Err(StoreError::WorkspaceHasNonterminalTurn { .. }) => {}
             Err(error) => panic!("unexpected concurrent turn error: {error}"),
         }
         item.expect("concurrent item allocation");
@@ -2611,16 +2639,27 @@ fn concurrent_connections_admit_one_turn_and_allocate_unique_item_sequences() {
 }
 
 #[test]
-fn thread_execution_guard_serializes_one_thread_and_releases_after_owner_loss() {
+fn workspace_execution_guard_serializes_shared_workspace_and_releases_after_owner_loss() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
+    let workspace = dir.path().join("workspace");
+    let other_workspace = dir.path().join("other-workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::create_dir(&other_workspace).expect("other workspace");
     let owner = SessionStore::open(&db_path).expect("owner store");
     let observer = SessionStore::open(&db_path).expect("observer store");
-    let thread = owner.create_thread(None, None).expect("thread");
-    let other_thread = owner.create_thread(None, None).expect("other thread");
+    let thread = owner
+        .create_thread(None, Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let same_workspace_thread = owner
+        .create_thread(None, Some(&workspace.to_string_lossy()))
+        .expect("same workspace thread");
+    let other_workspace_thread = owner
+        .create_thread(None, Some(&other_workspace.to_string_lossy()))
+        .expect("other workspace thread");
 
     let guard = owner
-        .try_begin_thread_execution(&thread.thread_id)
+        .try_begin_workspace_execution(&thread.thread_id)
         .expect("acquire owner guard")
         .expect("owner guard available");
     let running = owner
@@ -2628,27 +2667,31 @@ fn thread_execution_guard_serializes_one_thread_and_releases_after_owner_loss() 
         .expect("start owned turn");
     assert!(
         observer
-            .try_begin_thread_execution(&thread.thread_id)
+            .try_begin_workspace_execution(&same_workspace_thread.thread_id)
             .expect("contended guard check")
             .is_none()
     );
+    assert!(matches!(
+        observer.create_turn(&same_workspace_thread.thread_id, "running"),
+        Err(StoreError::WorkspaceHasNonterminalTurn { .. })
+    ));
     let other_guard = observer
-        .try_begin_thread_execution(&other_thread.thread_id)
-        .expect("other thread guard")
-        .expect("other thread remains independent");
+        .try_begin_workspace_execution(&other_workspace_thread.thread_id)
+        .expect("other workspace guard")
+        .expect("other workspace remains independent");
     drop(other_guard);
 
     drop(guard);
     let recovered_guard = observer
-        .try_begin_thread_execution(&thread.thread_id)
+        .try_begin_workspace_execution(&same_workspace_thread.thread_id)
         .expect("recover released owner")
         .expect("released guard can be reacquired");
     let recovered = observer.get_turn(&running.turn_id).expect("recovered turn");
     assert_eq!(recovered.status, TurnStatus::Interrupted);
     assert_eq!(recovered.agent_loop_status, "interrupted");
     observer
-        .create_turn(&thread.thread_id, "running")
-        .expect("new turn after recovery");
+        .create_turn(&same_workspace_thread.thread_id, "running")
+        .expect("new workspace turn after recovery");
     drop(recovered_guard);
 }
 

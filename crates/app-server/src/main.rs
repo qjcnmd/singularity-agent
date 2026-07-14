@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Write};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -11,8 +11,10 @@ use singularity_protocol::{JsonRpcMessage, Method};
 use singularity_store::SessionStore;
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const REQUEST_WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MAX_REQUEST_WORKERS: usize = 16;
+const INPUT_QUEUE_CAPACITY: usize = 64;
+const OUTPUT_QUEUE_CAPACITY: usize = 256;
 const REQUEST_CAPACITY_EXCEEDED: &str = "AppServer request capacity exceeded";
 
 fn main() {
@@ -39,12 +41,12 @@ fn run() -> Result<(), String> {
     let store = SessionStore::open(&db_path)
         .map_err(|error| format!("failed to open app-server store {db_path}: {error}"))?;
     store
-        .recover_unowned_thread_executions()
+        .recover_unowned_workspace_executions()
         .map_err(|error| format!("failed to recover app-server thread executions: {error}"))?;
     let provider_snapshot = ProviderConfigSnapshot::capture(|name| std::env::var(name).ok());
     let mut server = AppServer::new(store, provider_snapshot);
     let cancellation = server.cancellation_handle();
-    let (output_tx, output_rx) = mpsc::channel::<Value>();
+    let (output_tx, output_rx) = mpsc::sync_channel::<Value>(OUTPUT_QUEUE_CAPACITY);
     let (writer_error_tx, writer_error_rx) = mpsc::channel::<String>();
     let writer_cancellation = cancellation.clone();
     let writer = thread::spawn(move || -> Result<(), String> {
@@ -58,14 +60,15 @@ fn run() -> Result<(), String> {
                         .map_err(|error| format!("failed to flush response: {error}"))
                 });
             if let Err(error) = result {
-                let _ = writer_cancellation.cancel_active_turns();
+                let _ = writer_cancellation.request_execution_stop();
                 let _ = writer_error_tx.send(error.clone());
                 return Err(error);
             }
         }
         Ok(())
     });
-    let (input_tx, input_rx) = mpsc::channel::<Result<Option<String>, String>>();
+    let (input_tx, input_rx) =
+        mpsc::sync_channel::<Result<Option<String>, String>>(INPUT_QUEUE_CAPACITY);
     thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             if input_tx
@@ -219,14 +222,16 @@ fn run() -> Result<(), String> {
         }
     }
 
-    server
-        .cancel_active_turns()
-        .map_err(|error| format!("failed to cancel active turns during shutdown: {error}"))?;
-    join_request_workers_during_shutdown(&server, &mut request_workers)?;
+    let shutdown_deadline = Instant::now() + SHUTDOWN_GRACE;
+    let request_worker_result = server
+        .request_execution_stop()
+        .map_err(|error| format!("failed to stop executions during shutdown: {error}"))
+        .and_then(|()| {
+            join_request_workers_during_shutdown(&mut request_workers, shutdown_deadline)
+        });
     drop(output_tx);
-    let writer_result = writer
-        .join()
-        .map_err(|_| "stdout writer panicked".to_string())?;
+    let writer_result = join_writer_during_shutdown(writer, shutdown_deadline);
+    request_worker_result?;
     if let Some(error) = terminal_error {
         return Err(error);
     }
@@ -246,81 +251,127 @@ fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
 fn run_request_worker(
     mut worker: AppServer,
     message: JsonRpcMessage,
-    output_tx: Sender<Value>,
+    output_tx: SyncSender<Value>,
     cancellation: AppServerCancellationHandle,
-) {
+) -> Result<(), String> {
     let request_id = message.id.clone();
+    let mut output_error = None;
     let result = if message.method.as_deref() == Some(Method::TurnStart.as_str()) {
         worker.handle_turn_start_streaming(message, |message| {
-            let _ = send_output(&output_tx, &cancellation, message);
+            if output_error.is_none()
+                && let Err(error) = send_output(&output_tx, &cancellation, message)
+            {
+                output_error = Some(error);
+            }
         })
     } else {
         worker.handle(message).map(|messages| {
             for message in messages {
-                let _ = send_output(&output_tx, &cancellation, message);
+                if let Err(error) = send_output(&output_tx, &cancellation, message) {
+                    output_error = Some(error);
+                    break;
+                }
             }
         })
     };
+    if let Some(error) = output_error {
+        return Err(error);
+    }
     if let Err(error) = result {
-        let _ = send_output(
+        send_output(
             &output_tx,
             &cancellation,
             transport_error_value(request_id, &error),
-        );
+        )?;
     }
+    Ok(())
 }
 
-fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) -> Result<(), String> {
+fn reap_finished_workers(workers: &mut Vec<JoinHandle<Result<(), String>>>) -> Result<(), String> {
     let mut active = Vec::with_capacity(workers.len());
+    let mut first_error = None;
     for worker in workers.drain(..) {
         if worker.is_finished() {
-            join_request_worker(worker)?;
+            if let Err(error) = join_request_worker(worker)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         } else {
             active.push(worker);
         }
     }
     *workers = active;
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn join_request_workers_during_shutdown(
-    server: &AppServer,
-    workers: &mut Vec<JoinHandle<()>>,
+    workers: &mut Vec<JoinHandle<Result<(), String>>>,
+    deadline: Instant,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + REQUEST_WORKER_SHUTDOWN_GRACE;
+    let mut first_error = None;
     while !workers.is_empty() {
-        server
-            .cancel_active_turns()
-            .map_err(|error| format!("failed to cancel active request during shutdown: {error}"))?;
-        reap_finished_workers(workers)?;
+        if let Err(error) = reap_finished_workers(workers)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
         if workers.is_empty() {
-            return Ok(());
+            break;
         }
         if Instant::now() >= deadline {
-            return Err(format!(
+            let timeout = format!(
                 "timed out waiting for {} request worker(s) during shutdown",
                 workers.len()
-            ));
+            );
+            return Err(match first_error {
+                Some(error) => format!("{error}; {timeout}"),
+                None => timeout,
+            });
         }
         thread::sleep(INPUT_POLL_INTERVAL);
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
-fn join_request_worker(worker: JoinHandle<()>) -> Result<(), String> {
+fn join_writer_during_shutdown(
+    writer: JoinHandle<Result<(), String>>,
+    deadline: Instant,
+) -> Result<(), String> {
+    while !writer.is_finished() {
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for stdout writer during shutdown".to_string());
+        }
+        thread::sleep(INPUT_POLL_INTERVAL);
+    }
+    writer
+        .join()
+        .map_err(|_| "stdout writer panicked".to_string())?
+}
+
+fn join_request_worker(worker: JoinHandle<Result<(), String>>) -> Result<(), String> {
     worker
         .join()
-        .map_err(|_| "request worker panicked".to_string())
+        .map_err(|_| "request worker panicked".to_string())?
 }
 
 fn send_output(
-    sender: &Sender<Value>,
+    sender: &SyncSender<Value>,
     cancellation: &AppServerCancellationHandle,
     message: Value,
 ) -> Result<(), String> {
-    sender.send(message).map_err(|_| {
-        let _ = cancellation.cancel_active_turns();
-        "stdout transport unavailable".to_string()
+    sender.try_send(message).map_err(|error| {
+        let _ = cancellation.request_execution_stop();
+        match error {
+            TrySendError::Full(_) => "stdout transport backpressure exceeded".to_string(),
+            TrySendError::Disconnected(_) => "stdout transport unavailable".to_string(),
+        }
     })
 }
 
@@ -341,4 +392,61 @@ fn internal_error_value(id: Option<Value>, message: impl Into<String>) -> Value 
 fn recover_request_id(line: &str) -> Option<Value> {
     let value = serde_json::from_str::<Value>(line).ok()?;
     value.get("id").cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdout_queue_fails_closed_when_backpressure_limit_is_reached() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let cancellation = server.cancellation_handle();
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        send_output(&sender, &cancellation, serde_json::json!({"first": true}))
+            .expect("first output fits");
+
+        let error = send_output(&sender, &cancellation, serde_json::json!({"second": true}))
+            .expect_err("full queue must fail closed");
+
+        assert_eq!(error, "stdout transport backpressure exceeded");
+    }
+
+    #[test]
+    fn stdout_writer_join_obeys_the_shutdown_deadline() {
+        let (release_sender, release_receiver) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            release_receiver.recv().expect("release writer");
+            Ok(())
+        });
+
+        let error = join_writer_during_shutdown(writer, Instant::now() + Duration::from_millis(20))
+            .expect_err("stalled writer must not outlive the deadline");
+        release_sender.send(()).expect("release detached writer");
+
+        assert_eq!(error, "timed out waiting for stdout writer during shutdown");
+    }
+
+    #[test]
+    fn failed_worker_does_not_drop_other_active_worker_handles() {
+        let failed = thread::spawn(|| Err("worker failed".to_string()));
+        while !failed.is_finished() {
+            thread::yield_now();
+        }
+        let (release_sender, release_receiver) = mpsc::channel();
+        let active = thread::spawn(move || {
+            release_receiver.recv().expect("release active worker");
+            Ok(())
+        });
+        let mut workers = vec![failed, active];
+
+        let error = reap_finished_workers(&mut workers).expect_err("failed worker is reported");
+
+        assert_eq!(error, "worker failed");
+        assert_eq!(workers.len(), 1);
+        release_sender.send(()).expect("release active worker");
+        join_request_workers_during_shutdown(&mut workers, Instant::now() + Duration::from_secs(1))
+            .expect("remaining worker is still tracked");
+    }
 }

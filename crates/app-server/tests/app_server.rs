@@ -1526,7 +1526,9 @@ fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
             .expect("decisions")
             .is_empty()
     );
-    store.recover_unowned_thread_executions().expect("recovery");
+    store
+        .recover_unowned_workspace_executions()
+        .expect("recovery");
 }
 
 #[test]
@@ -1814,7 +1816,7 @@ fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_s
 
 #[cfg(windows)]
 #[test]
-fn app_server_rejects_cross_process_overlap_and_observes_interrupt() {
+fn app_server_serializes_shared_workspace_across_processes_and_observes_interrupt() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
@@ -1847,13 +1849,15 @@ fn app_server_rejects_cross_process_overlap_and_observes_interrupt() {
     let (mut secondary, mut secondary_input, mut secondary_output) =
         spawn_app_server(&db_path, &workspace, &base_url);
     initialize_process(&mut secondary_input, &mut secondary_output);
+    let secondary_thread_id =
+        start_process_thread(&mut secondary_input, &mut secondary_output, &workspace, 10);
     send_json(
         &mut secondary_input,
         serde_json::json!({
             "method": "turn/start",
             "id": 11,
             "params": {
-                "threadId": thread_id,
+                "threadId": secondary_thread_id,
                 "input": [{"type": "text", "text": "must not overlap the active turn"}]
             }
         }),
@@ -1861,7 +1865,7 @@ fn app_server_rejects_cross_process_overlap_and_observes_interrupt() {
     let rejected = secondary_output.recv_id(11, Duration::from_secs(2));
     assert_eq!(
         rejected["error"]["message"],
-        "Thread already has an active or pending turn"
+        "Workspace already has an active or pending turn"
     );
     send_json(
         &mut secondary_input,
