@@ -152,7 +152,7 @@ pub(super) fn infrastructure_blocker(
             BlockerKind::Sandbox,
             format!("{context}: {}", result.stderr_preview),
         )),
-        CommandExecutionStatus::SpawnFailed
+        CommandExecutionStatus::ExecutableUnavailable
         | CommandExecutionStatus::TimedOut
         | CommandExecutionStatus::Cancelled => Some(evaluation_blocker(
             BlockerKind::Environment,
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn missing_host_executable_is_an_environment_blocker() {
-        let result = CommandResult::spawn_failed(
+        let result = CommandResult::executable_unavailable(
             "missing_tool",
             "required executable 'python' was not found on host PATH",
         )

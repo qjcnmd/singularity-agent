@@ -11,7 +11,7 @@ use singularity_core::{CancellationToken, contains_sensitive_text};
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
 const SANDBOX_BACKEND_UNAVAILABLE: &str = "sandbox-required command has no sandbox backend";
-const COMMAND_SPAWN_FAILED: &str = "sandbox command spawn failed";
+const COMMAND_EXECUTABLE_UNAVAILABLE: &str = "sandbox command executable unavailable";
 const COMMAND_TIMED_OUT: &str = "sandbox command timed out";
 const COMMAND_CANCELLED: &str = "sandbox command cancelled";
 #[cfg(windows)]
@@ -109,7 +109,7 @@ pub enum CommandExecutionStatus {
     PolicyDenied,
     ReviewRequired,
     Unsupported,
-    SpawnFailed,
+    ExecutableUnavailable,
     TimedOut,
     Cancelled,
     BackendError,
@@ -289,12 +289,15 @@ impl CommandResult {
         )
     }
 
-    pub fn spawn_failed(command_id: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn executable_unavailable(
+        command_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
         Self::blocked(
             command_id,
-            CommandExecutionStatus::SpawnFailed,
-            CommandSemanticStatus::PolicyBlocked,
-            format!("{}: {}", COMMAND_SPAWN_FAILED, reason.into()),
+            CommandExecutionStatus::ExecutableUnavailable,
+            CommandSemanticStatus::Unsupported,
+            format!("{}: {}", COMMAND_EXECUTABLE_UNAVAILABLE, reason.into()),
         )
     }
 
@@ -964,8 +967,27 @@ mod windows_backend {
     }
 
     enum PrepareCommandError {
-        Environment(String),
+        Executable(ExecutableResolutionError),
         Backend(String),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ExecutableResolutionError {
+        Unavailable(String),
+        NotPermitted(String),
+        Unsupported(String),
+    }
+
+    impl ExecutableResolutionError {
+        fn into_command_result(self, command_id: &str) -> CommandResult {
+            match self {
+                Self::Unavailable(message) => {
+                    CommandResult::executable_unavailable(command_id, message)
+                }
+                Self::Unsupported(message) => CommandResult::unsupported(command_id, message),
+                Self::NotPermitted(message) => CommandResult::policy_denied(command_id, message),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Default)]
@@ -1005,8 +1027,9 @@ mod windows_backend {
             }
             let prepared = match PreparedCommand::from_request(request) {
                 Ok(prepared) => prepared,
-                Err(PrepareCommandError::Environment(error)) => {
-                    return CommandResult::spawn_failed(&request.command_id, error)
+                Err(PrepareCommandError::Executable(error)) => {
+                    return error
+                        .into_command_result(&request.command_id)
                         .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
                 }
                 Err(PrepareCommandError::Backend(error)) => {
@@ -1045,7 +1068,7 @@ mod windows_backend {
                 .map_err(PrepareCommandError::Backend)?;
             let env_map = child_environment(&request.environment);
             let resolved = resolve_executable(&request.argv, &cwd, &env_map)
-                .map_err(PrepareCommandError::Environment)?;
+                .map_err(PrepareCommandError::Executable)?;
             let workspace_root = AbsolutePathBuf::from_absolute_path_checked(&workspace_root)
                 .map_err(|error| {
                     PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
@@ -1238,10 +1261,10 @@ mod windows_backend {
         argv: &[String],
         cwd: &Path,
         env_map: &HashMap<String, String>,
-    ) -> Result<ResolvedExecutable, String> {
-        let requested = argv
-            .first()
-            .ok_or_else(|| "sandbox command argv is empty".to_string())?;
+    ) -> Result<ResolvedExecutable, ExecutableResolutionError> {
+        let requested = argv.first().ok_or_else(|| {
+            ExecutableResolutionError::Unsupported("sandbox command argv is empty".to_string())
+        })?;
         let requested_path = Path::new(requested);
         let has_path = requested_path.is_absolute() || requested_path.components().count() > 1;
         let executable = if has_path {
@@ -1251,32 +1274,36 @@ mod windows_backend {
                 cwd.join(requested_path)
             };
             canonical_executable(&candidate).ok_or_else(|| {
-                format!(
+                ExecutableResolutionError::Unavailable(format!(
                     "required executable '{}' is unavailable",
                     executable_display_name(requested)
-                )
+                ))
             })?
         } else {
             find_executable_on_path(requested, env_map).ok_or_else(|| {
-                format!(
+                ExecutableResolutionError::Unavailable(format!(
                     "required executable '{}' was not found on host PATH",
                     executable_display_name(requested)
-                )
+                ))
             })?
         };
         if path_has_sensitive_component(&executable) {
-            return Err(format!(
+            return Err(ExecutableResolutionError::NotPermitted(format!(
                 "required executable '{}' is not permitted",
                 executable_display_name(requested)
-            ));
+            )));
         }
 
         let mut read_roots = executable_read_roots(&executable);
         let resolved_argv = if is_batch_executable(&executable) {
-            let shell = system_command_interpreter(env_map)
-                .ok_or_else(|| "required Windows command interpreter is unavailable".to_string())?;
+            let shell = system_command_interpreter(env_map).ok_or_else(|| {
+                ExecutableResolutionError::Unavailable(
+                    "required Windows command interpreter is unavailable".to_string(),
+                )
+            })?;
             read_roots.extend(executable_read_roots(&shell));
-            batch_argv(&shell, &executable, &argv[1..])?
+            batch_argv(&shell, &executable, &argv[1..])
+                .map_err(ExecutableResolutionError::Unsupported)?
         } else {
             let mut resolved = argv.to_vec();
             resolved[0] = executable.to_string_lossy().into_owned();
@@ -1642,8 +1669,11 @@ mod windows_backend {
             )
             .expect_err("unsafe batch argument must fail closed");
 
-            assert_eq!(error, UNSAFE_BATCH_ARGUMENT);
-            assert!(!error.contains(&temp.path().to_string_lossy().to_string()));
+            let ExecutableResolutionError::Unsupported(message) = error else {
+                panic!("unsafe batch arguments must be unsupported")
+            };
+            assert_eq!(message, UNSAFE_BATCH_ARGUMENT);
+            assert!(!message.contains(&temp.path().to_string_lossy().to_string()));
         }
 
         #[test]
@@ -1658,11 +1688,14 @@ mod windows_backend {
             let error = resolve_executable(&["runner".to_string()], temp.path(), &env)
                 .expect_err("relative PATH must be rejected");
 
+            let ExecutableResolutionError::Unavailable(message) = error else {
+                panic!("missing PATH executable must be unavailable")
+            };
             assert_eq!(
-                error,
+                message,
                 "required executable 'runner' was not found on host PATH"
             );
-            assert!(!error.contains(&temp.path().to_string_lossy().to_string()));
+            assert!(!message.contains(&temp.path().to_string_lossy().to_string()));
         }
 
         #[test]
@@ -1680,7 +1713,12 @@ mod windows_backend {
             )
             .expect_err("sensitive executable must be rejected");
 
-            assert_eq!(error, "required executable 'runner.exe' is not permitted");
+            assert_eq!(
+                error,
+                ExecutableResolutionError::NotPermitted(
+                    "required executable 'runner.exe' is not permitted".to_string()
+                )
+            );
         }
 
         #[test]

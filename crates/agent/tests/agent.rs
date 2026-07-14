@@ -3034,6 +3034,79 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
 }
 
 #[test]
+fn agent_loop_returns_unavailable_executable_to_model_for_repair() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = AgentLoopInput {
+        max_turns: 3,
+        ..AgentLoopInput::new("thread_1", "turn_1", "run command")
+    };
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    command_response.tool_calls.push(tool_call(
+        "call_1",
+        "builtin_command",
+        serde_json::json!({
+            "argv": ["missing-host-tool"],
+            "timeout_seconds": 5
+        }),
+    ));
+    let mut repaired_command_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    repaired_command_response.tool_calls.push(tool_call(
+        "call_2",
+        "builtin_command",
+        serde_json::json!({
+            "argv": test_command("repaired"),
+            "timeout_seconds": 5
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "recovered");
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+        PermissionRule::new(
+            "allow_command",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute),
+    );
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![command_response, repaired_command_response, final_response],
+        policy,
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(
+        AgentExecutableUnavailableBackend {
+            calls: AtomicUsize::new(0),
+        },
+    ))
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.model_turns, 3);
+    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("command_executable_unavailable")
+    );
+    assert_eq!(
+        result.tool_results[0].failure_kind,
+        Some(ToolFailureKind::Capability)
+    );
+    assert!(result.tool_results[1].ok);
+    assert_eq!(result.final_answer.as_deref(), Some("recovered"));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].messages.last().unwrap().role, ModelRole::Tool);
+    assert_eq!(
+        requests[1].messages.last().unwrap().tool_call_id.as_deref(),
+        Some("call_1")
+    );
+}
+
+#[test]
 fn agent_loop_cancels_a_running_sandbox_command() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cancellation = CancellationToken::new();
@@ -3536,6 +3609,35 @@ impl SandboxBackend for AgentFailThenSucceedBackend {
                 singularity_tools::SandboxBackendEnforcement::Strict,
             )
         }
+    }
+}
+
+struct AgentExecutableUnavailableBackend {
+    calls: AtomicUsize,
+}
+
+impl SandboxBackend for AgentExecutableUnavailableBackend {
+    fn name(&self) -> &'static str {
+        "agent_executable_unavailable_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        let result = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            CommandResult::executable_unavailable(
+                &request.command_id,
+                "required executable 'missing-host-tool' was not found on host PATH",
+            )
+        } else {
+            CommandResult::completed(&request.command_id, "repaired")
+        };
+        result.with_sandbox_execution(
+            self.name(),
+            singularity_tools::SandboxBackendEnforcement::Strict,
+        )
     }
 }
 
