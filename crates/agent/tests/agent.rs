@@ -4253,6 +4253,58 @@ fn plan_update_rejects_empty_duplicate_and_multiple_in_progress_steps() {
 }
 
 #[test]
+fn plan_tool_contract_preserves_actionable_validation_causes() {
+    let spec = agent_control_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "builtin.update_plan")
+        .expect("plan tool spec");
+    let too_many = (0..65)
+        .map(|index| serde_json::json!({"step": format!("step {index}"), "status": "pending"}))
+        .collect::<Vec<_>>();
+    let cases = [
+        (serde_json::json!({}), "plan_input_shape_invalid"),
+        (serde_json::json!({"steps": []}), "plan_steps_empty"),
+        (
+            serde_json::json!({"steps": [{"step": " ", "status": "pending"}]}),
+            "plan_step_empty",
+        ),
+        (
+            serde_json::json!({"steps": [{"step": "x".repeat(513), "status": "pending"}]}),
+            "plan_step_too_long",
+        ),
+        (
+            serde_json::json!({
+                "steps": [
+                    {"step": "same", "status": "pending"},
+                    {"step": "same", "status": "completed"}
+                ]
+            }),
+            "plan_step_duplicate",
+        ),
+        (
+            serde_json::json!({
+                "steps": [
+                    {"step": "first", "status": "in_progress"},
+                    {"step": "second", "status": "in_progress"}
+                ]
+            }),
+            "plan_multiple_in_progress",
+        ),
+        (
+            serde_json::json!({"steps": too_many}),
+            "plan_step_limit_exceeded",
+        ),
+    ];
+
+    for (input, expected_code) in cases {
+        let error = spec
+            .prepare_model_input(&input)
+            .expect_err("invalid plan input must be rejected");
+        assert_eq!(error.code, expected_code);
+    }
+}
+
+#[test]
 fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
     let mut plan_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");

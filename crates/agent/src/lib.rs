@@ -162,37 +162,76 @@ pub struct AgentPlan {
     pub steps: Vec<AgentPlanStep>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentPlanValidationFailure {
+    Empty,
+    TooManySteps,
+    EmptyStep,
+    StepTooLong,
+    DuplicateStep,
+    MultipleInProgress,
+}
+
+impl AgentPlanValidationFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Empty => "plan_steps_empty",
+            Self::TooManySteps => "plan_step_limit_exceeded",
+            Self::EmptyStep => "plan_step_empty",
+            Self::StepTooLong => "plan_step_too_long",
+            Self::DuplicateStep => "plan_step_duplicate",
+            Self::MultipleInProgress => "plan_multiple_in_progress",
+        }
+    }
+
+    fn message(self) -> String {
+        match self {
+            Self::Empty => "plan must contain at least one step".to_string(),
+            Self::TooManySteps => {
+                format!("plan must not contain more than {MAX_PLAN_STEPS} steps")
+            }
+            Self::EmptyStep => "plan steps must not be empty".to_string(),
+            Self::StepTooLong => {
+                format!("plan steps must not exceed {MAX_PLAN_STEP_CHARS} characters")
+            }
+            Self::DuplicateStep => "plan steps must be unique".to_string(),
+            Self::MultipleInProgress => "plan may have at most one in_progress step".to_string(),
+        }
+    }
+}
+
 impl AgentPlan {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_contract()
+            .map_err(AgentPlanValidationFailure::message)
+    }
+
+    fn validate_contract(&self) -> Result<(), AgentPlanValidationFailure> {
         if self.steps.is_empty() {
-            return Err("plan must contain at least one step".to_string());
+            return Err(AgentPlanValidationFailure::Empty);
         }
         if self.steps.len() > MAX_PLAN_STEPS {
-            return Err(format!(
-                "plan must not contain more than {MAX_PLAN_STEPS} steps"
-            ));
+            return Err(AgentPlanValidationFailure::TooManySteps);
         }
         let mut unique_steps = BTreeSet::new();
         let mut in_progress_count = 0usize;
         for plan_step in &self.steps {
             let normalized_step = plan_step.step.trim();
             if normalized_step.is_empty() {
-                return Err("plan steps must not be empty".to_string());
+                return Err(AgentPlanValidationFailure::EmptyStep);
             }
             if normalized_step.chars().count() > MAX_PLAN_STEP_CHARS {
-                return Err(format!(
-                    "plan steps must not exceed {MAX_PLAN_STEP_CHARS} characters"
-                ));
+                return Err(AgentPlanValidationFailure::StepTooLong);
             }
             if !unique_steps.insert(normalized_step.to_string()) {
-                return Err("plan steps must be unique".to_string());
+                return Err(AgentPlanValidationFailure::DuplicateStep);
             }
             if plan_step.status == AgentPlanStepStatus::InProgress {
                 in_progress_count += 1;
             }
         }
         if in_progress_count > 1 {
-            return Err("plan may have at most one in_progress step".to_string());
+            return Err(AgentPlanValidationFailure::MultipleInProgress);
         }
         Ok(())
     }
@@ -208,12 +247,13 @@ pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
             BUILTIN_UPDATE_PLAN_TOOL,
-            "Create or update the current execution plan",
+            "Replace the current execution plan with unique non-empty steps and at most one in_progress step",
             json!({
                 "type": "object",
                 "properties": {
                     "steps": {
                         "type": "array",
+                        "description": "The complete plan. Step text must be unique and at most one step may be in_progress.",
                         "minItems": 1,
                         "maxItems": MAX_PLAN_STEPS,
                         "items": {
@@ -221,11 +261,13 @@ pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
                             "properties": {
                                 "step": {
                                     "type": "string",
+                                    "description": "A unique, non-empty description of one execution step.",
                                     "minLength": 1,
                                     "maxLength": MAX_PLAN_STEP_CHARS
                                 },
                                 "status": {
                                     "type": "string",
+                                    "description": "Use in_progress for at most one step.",
                                     "enum": ["pending", "in_progress", "completed"]
                                 }
                             },
@@ -3831,9 +3873,11 @@ fn permission_failure_kind(cause: &PermissionDecisionCause) -> ToolFailureKind {
 }
 
 fn validate_plan_tool_input_contract(input: &Value) -> Result<(), ToolInputValidationError> {
-    update_plan_tool_input(input)
-        .map(|_| ())
-        .map_err(|_| ToolInputValidationError::new("plan_input_invalid"))
+    let input: AgentPlanUpdateInput = serde_json::from_value(input.clone())
+        .map_err(|_| ToolInputValidationError::new("plan_input_shape_invalid"))?;
+    AgentPlan { steps: input.steps }
+        .validate_contract()
+        .map_err(|failure| ToolInputValidationError::new(failure.code()))
 }
 
 fn validate_invoke_tool_input_contract(input: &Value) -> Result<(), ToolInputValidationError> {
