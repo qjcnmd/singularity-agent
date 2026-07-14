@@ -101,35 +101,6 @@ pub(crate) fn resolve_helper_for_launch(
     }
 }
 
-pub fn resolve_current_exe_for_launch(sandbox_home: &Path, fallback_executable: &str) -> PathBuf {
-    let source = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(_) => return PathBuf::from(fallback_executable),
-    };
-    resolve_exe_for_launch(&source, sandbox_home)
-}
-
-pub fn resolve_exe_for_launch(source: &Path, sandbox_home: &Path) -> PathBuf {
-    let Some(file_name) = source.file_name() else {
-        return source.to_path_buf();
-    };
-    let destination = helper_bin_dir(sandbox_home).join(file_name);
-    match copy_from_source_if_needed(source, &destination) {
-        Ok(_) => destination,
-        Err(err) => {
-            let sandbox_log_dir = crate::sandbox_dir(sandbox_home);
-            log_note(
-                &format!(
-                    "helper copy failed for executable: {err:#}; using source executable path {}",
-                    source.display()
-                ),
-                Some(&sandbox_log_dir),
-            );
-            source.to_path_buf()
-        }
-    }
-}
-
 pub(crate) fn copy_helper_if_needed(
     kind: HelperExecutable,
     sandbox_home: &Path,
