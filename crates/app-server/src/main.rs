@@ -1,14 +1,19 @@
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use singularity_app_server::{AppServer, AppServerError};
+use singularity_app_server::{AppServer, AppServerCancellationHandle, AppServerError};
 use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_protocol::{JsonRpcMessage, Method};
 use singularity_store::SessionStore;
+
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const REQUEST_WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const MAX_REQUEST_WORKERS: usize = 16;
+const REQUEST_CAPACITY_EXCEEDED: &str = "AppServer request capacity exceeded";
 
 fn main() {
     if let Err(error) = run() {
@@ -34,63 +39,179 @@ fn run() -> Result<(), String> {
     let store = SessionStore::open(&db_path)
         .map_err(|error| format!("failed to open app-server store {db_path}: {error}"))?;
     store
-        .recover_incomplete_approval_executions()
-        .map_err(|error| format!("failed to recover app-server approval executions: {error}"))?;
+        .recover_unowned_thread_executions()
+        .map_err(|error| format!("failed to recover app-server thread executions: {error}"))?;
     let provider_snapshot = ProviderConfigSnapshot::capture(|name| std::env::var(name).ok());
     let mut server = AppServer::new(store, provider_snapshot);
+    let cancellation = server.cancellation_handle();
     let (output_tx, output_rx) = mpsc::channel::<Value>();
+    let (writer_error_tx, writer_error_rx) = mpsc::channel::<String>();
+    let writer_cancellation = cancellation.clone();
     let writer = thread::spawn(move || -> Result<(), String> {
         let mut stdout = io::stdout().lock();
         for message in output_rx {
-            write_json_line(&mut stdout, &message)
-                .map_err(|error| format!("failed to write response: {error}"))?;
-            stdout
-                .flush()
-                .map_err(|error| format!("failed to flush response: {error}"))?;
+            let result = write_json_line(&mut stdout, &message)
+                .map_err(|error| format!("failed to write response: {error}"))
+                .and_then(|()| {
+                    stdout
+                        .flush()
+                        .map_err(|error| format!("failed to flush response: {error}"))
+                });
+            if let Err(error) = result {
+                let _ = writer_cancellation.cancel_active_turns();
+                let _ = writer_error_tx.send(error.clone());
+                return Err(error);
+            }
         }
         Ok(())
     });
+    let (input_tx, input_rx) = mpsc::channel::<Result<Option<String>, String>>();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if input_tx
+                .send(
+                    line.map(Some)
+                        .map_err(|error| format!("failed to read stdin: {error}")),
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = input_tx.send(Ok(None));
+    });
     let mut request_workers = Vec::new();
-    let stdin = io::stdin();
+    let mut terminal_error = None;
 
-    for line in stdin.lock().lines() {
-        reap_finished_workers(&mut request_workers)?;
-        let line = line.map_err(|error| format!("failed to read stdin: {error}"))?;
+    loop {
+        if let Err(error) = reap_finished_workers(&mut request_workers) {
+            terminal_error = Some(error);
+            break;
+        }
+        match writer_error_rx.try_recv() {
+            Ok(error) => {
+                terminal_error = Some(error);
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                terminal_error = Some("stdout writer stopped unexpectedly".to_string());
+                break;
+            }
+        }
+        let line = match input_rx.recv_timeout(INPUT_POLL_INTERVAL) {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                terminal_error = Some(error);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                terminal_error = Some("stdin reader stopped unexpectedly".to_string());
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
         let message = match serde_json::from_str::<JsonRpcMessage>(&line) {
             Ok(message) => message,
             Err(error) => {
-                send_output(
+                if let Err(error) = send_output(
                     &output_tx,
+                    &cancellation,
                     transport_error_value(
                         recover_request_id(&line),
                         &AppServerError::InvalidJson(error),
                     ),
-                );
+                ) {
+                    terminal_error = Some(error);
+                    break;
+                }
                 continue;
             }
         };
         let request_id = message.id.clone();
         if is_request_worker_method(&message) && server.ready_for_turn_worker() {
+            if request_workers.len() >= MAX_REQUEST_WORKERS {
+                if let Err(error) = send_output(
+                    &output_tx,
+                    &cancellation,
+                    JsonRpcMessage::error(
+                        request_id,
+                        ErrorCode::invalid_request(REQUEST_CAPACITY_EXCEEDED),
+                    )
+                    .to_wire_value(),
+                ) {
+                    terminal_error = Some(error);
+                    break;
+                }
+                continue;
+            }
             match server.turn_worker() {
                 Ok(worker) => {
-                    let output_tx = output_tx.clone();
-                    request_workers.push(thread::spawn(move || {
-                        run_request_worker(worker, message, output_tx)
-                    }));
+                    let worker_output_tx = output_tx.clone();
+                    let worker_cancellation = cancellation.clone();
+                    match thread::Builder::new()
+                        .name("singularity-request".to_string())
+                        .spawn(move || {
+                            run_request_worker(
+                                worker,
+                                message,
+                                worker_output_tx,
+                                worker_cancellation,
+                            )
+                        }) {
+                        Ok(worker) => request_workers.push(worker),
+                        Err(error) => {
+                            if let Err(error) = send_output(
+                                &output_tx,
+                                &cancellation,
+                                internal_error_value(
+                                    request_id,
+                                    format!("failed to start request worker: {error}"),
+                                ),
+                            ) {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
                 }
-                Err(error) => send_output(&output_tx, transport_error_value(request_id, &error)),
+                Err(error) => {
+                    if let Err(error) = send_output(
+                        &output_tx,
+                        &cancellation,
+                        transport_error_value(request_id, &error),
+                    ) {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                }
             }
         } else {
             match server.handle(message) {
                 Ok(messages) => {
                     for message in messages {
-                        send_output(&output_tx, message);
+                        if let Err(error) = send_output(&output_tx, &cancellation, message) {
+                            terminal_error = Some(error);
+                            break;
+                        }
                     }
                 }
-                Err(error) => send_output(&output_tx, transport_error_value(request_id, &error)),
+                Err(error) => {
+                    if let Err(error) = send_output(
+                        &output_tx,
+                        &cancellation,
+                        transport_error_value(request_id, &error),
+                    ) {
+                        terminal_error = Some(error);
+                    }
+                }
+            }
+            if terminal_error.is_some() {
+                break;
             }
         }
         if server.shutdown_requested() {
@@ -101,13 +222,15 @@ fn run() -> Result<(), String> {
     server
         .cancel_active_turns()
         .map_err(|error| format!("failed to cancel active turns during shutdown: {error}"))?;
-    for worker in request_workers {
-        join_request_worker_during_shutdown(&server, worker)?;
-    }
+    join_request_workers_during_shutdown(&server, &mut request_workers)?;
     drop(output_tx);
-    writer
+    let writer_result = writer
         .join()
-        .map_err(|_| "stdout writer panicked".to_string())??;
+        .map_err(|_| "stdout writer panicked".to_string())?;
+    if let Some(error) = terminal_error {
+        return Err(error);
+    }
+    writer_result?;
     Ok(())
 }
 
@@ -120,21 +243,30 @@ fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
     )
 }
 
-fn run_request_worker(mut worker: AppServer, message: JsonRpcMessage, output_tx: Sender<Value>) {
+fn run_request_worker(
+    mut worker: AppServer,
+    message: JsonRpcMessage,
+    output_tx: Sender<Value>,
+    cancellation: AppServerCancellationHandle,
+) {
     let request_id = message.id.clone();
     let result = if message.method.as_deref() == Some(Method::TurnStart.as_str()) {
         worker.handle_turn_start_streaming(message, |message| {
-            send_output(&output_tx, message);
+            let _ = send_output(&output_tx, &cancellation, message);
         })
     } else {
         worker.handle(message).map(|messages| {
             for message in messages {
-                send_output(&output_tx, message);
+                let _ = send_output(&output_tx, &cancellation, message);
             }
         })
     };
     if let Err(error) = result {
-        send_output(&output_tx, transport_error_value(request_id, &error));
+        let _ = send_output(
+            &output_tx,
+            &cancellation,
+            transport_error_value(request_id, &error),
+        );
     }
 }
 
@@ -151,17 +283,28 @@ fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) -> Result<(), String
     Ok(())
 }
 
-fn join_request_worker_during_shutdown(
+fn join_request_workers_during_shutdown(
     server: &AppServer,
-    worker: JoinHandle<()>,
+    workers: &mut Vec<JoinHandle<()>>,
 ) -> Result<(), String> {
-    while !worker.is_finished() {
+    let deadline = Instant::now() + REQUEST_WORKER_SHUTDOWN_GRACE;
+    while !workers.is_empty() {
         server
             .cancel_active_turns()
             .map_err(|error| format!("failed to cancel active request during shutdown: {error}"))?;
-        thread::sleep(Duration::from_millis(10));
+        reap_finished_workers(workers)?;
+        if workers.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for {} request worker(s) during shutdown",
+                workers.len()
+            ));
+        }
+        thread::sleep(INPUT_POLL_INTERVAL);
     }
-    join_request_worker(worker)
+    Ok(())
 }
 
 fn join_request_worker(worker: JoinHandle<()>) -> Result<(), String> {
@@ -170,8 +313,15 @@ fn join_request_worker(worker: JoinHandle<()>) -> Result<(), String> {
         .map_err(|_| "request worker panicked".to_string())
 }
 
-fn send_output(sender: &Sender<Value>, message: Value) {
-    let _ = sender.send(message);
+fn send_output(
+    sender: &Sender<Value>,
+    cancellation: &AppServerCancellationHandle,
+    message: Value,
+) -> Result<(), String> {
+    sender.send(message).map_err(|_| {
+        let _ = cancellation.cancel_active_turns();
+        "stdout transport unavailable".to_string()
+    })
 }
 
 fn write_json_line(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
@@ -181,11 +331,11 @@ fn write_json_line(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
 }
 
 fn transport_error_value(id: Option<Value>, error: &AppServerError) -> Value {
-    JsonRpcMessage::error(
-        id,
-        ErrorCode::new(JSON_RPC_INTERNAL_ERROR, error.to_string()),
-    )
-    .to_wire_value()
+    internal_error_value(id, error.to_string())
+}
+
+fn internal_error_value(id: Option<Value>, message: impl Into<String>) -> Value {
+    JsonRpcMessage::error(id, ErrorCode::new(JSON_RPC_INTERNAL_ERROR, message)).to_wire_value()
 }
 
 fn recover_request_id(line: &str) -> Option<Value> {

@@ -547,6 +547,13 @@ fn approval_decision_rejects_pending_tool_call_turn_mismatch() {
     let expected_turn = store
         .create_turn(&thread.thread_id, "blocked")
         .expect("expected turn");
+    store
+        .update_turn_state(
+            &expected_turn.turn_id,
+            TurnStatus::Interrupted,
+            "interrupted",
+        )
+        .expect("finish expected turn fixture");
     let other_turn = store
         .create_turn(&thread.thread_id, "blocked")
         .expect("other turn");
@@ -827,11 +834,10 @@ fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
     drop(store);
 
     let reopened = SessionStore::open(&db_path).expect("reopen store");
-    let recovered = reopened
-        .recover_incomplete_approval_executions()
+    reopened
+        .recover_unowned_thread_executions()
         .expect("recover executing approval");
 
-    assert_eq!(recovered, vec!["approval_recovery"]);
     let recovered_turn = reopened.get_turn(&turn.turn_id).expect("recovered turn");
     assert_eq!(recovered_turn.status, TurnStatus::Interrupted);
     assert_eq!(recovered_turn.agent_loop_status, "interrupted");
@@ -919,12 +925,9 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
     drop(store);
 
     let reopened = SessionStore::open(&db_path).expect("reopen store");
-    assert_eq!(
-        reopened
-            .recover_incomplete_approval_executions()
-            .expect("recover half handoff"),
-        vec![first.request_id.clone()]
-    );
+    reopened
+        .recover_unowned_thread_executions()
+        .expect("recover half handoff");
     assert!(
         !reopened
             .has_pending_tool_call(&first.request_id)
@@ -962,12 +965,9 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
         "approval_execution_superseded_by_pending_handoff"
     );
 
-    assert!(
-        reopened
-            .recover_incomplete_approval_executions()
-            .expect("idempotent recovery")
-            .is_empty()
-    );
+    reopened
+        .recover_unowned_thread_executions()
+        .expect("idempotent recovery");
     assert_eq!(
         reopened
             .list_trace(&thread.thread_id)
@@ -1065,7 +1065,7 @@ fn process_recovery_rolls_back_before_mutation_when_half_handoff_is_corrupt() {
 
     let reopened = SessionStore::open(&db_path).expect("reopen store");
     assert!(matches!(
-        reopened.recover_incomplete_approval_executions(),
+        reopened.recover_unowned_thread_executions(),
         Err(StoreError::InvalidState(message))
             if message == "approval checkpoint thread_id must match approval request"
     ));
@@ -1175,7 +1175,7 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
 
         let reopened = SessionStore::open(&db_path).expect("reopen store");
         assert!(matches!(
-            reopened.recover_incomplete_approval_executions(),
+            reopened.recover_unowned_thread_executions(),
             Err(StoreError::InvalidState(message))
                 if message == format!(
                     "approval {} has inconsistent decision ledger",
@@ -1221,7 +1221,7 @@ fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
     store.create_approval(&request).expect("approval ledger");
 
     assert!(matches!(
-        store.recover_incomplete_approval_executions(),
+        store.recover_unowned_thread_executions(),
         Err(StoreError::InvalidState(message))
             if message == "approval approval_missing_checkpoint has inconsistent checkpoint state"
     ));
@@ -1408,7 +1408,8 @@ fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
 #[test]
 fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("store");
     let thread = store.create_thread(None, None).expect("thread");
     let turn = store
         .create_turn(&thread.thread_id, "running")
@@ -1444,9 +1445,16 @@ fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
             "approval requested",
         )
         .expect("approval");
-    store
-        .update_thread_status(&thread.thread_id, ThreadStatus::Archived)
-        .expect("archive thread");
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "update threads set status = ?1 where thread_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&ThreadStatus::Archived).expect("status"),
+                thread.thread_id
+            ],
+        )
+        .expect("simulate external archive race");
 
     let decision = ApprovalDecision::new(
         request.request_id.clone(),
@@ -2251,8 +2259,17 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
             )
             .expect("assistant item");
         store
-            .update_turn_status(&started.turn.turn_id, status)
+            .update_turn_status(&started.turn.turn_id, status.clone())
             .expect("terminal status");
+        let history = store
+            .read_thread_history(&thread.thread_id, None, 20)
+            .expect("history excludes non-completed turn");
+        assert_eq!(history.messages.len(), 2);
+        if status == TurnStatus::Blocked {
+            store
+                .update_turn_status(&started.turn.turn_id, TurnStatus::Interrupted)
+                .expect("release blocked fixture");
+        }
     }
 
     let incomplete = store
@@ -2516,7 +2533,7 @@ fn turn_and_item_sequence_unique_indexes_reject_duplicates() {
 }
 
 #[test]
-fn concurrent_connections_allocate_unique_turn_and_item_sequences() {
+fn concurrent_connections_admit_one_turn_and_allocate_unique_item_sequences() {
     const WORKERS: usize = 12;
 
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2526,6 +2543,9 @@ fn concurrent_connections_allocate_unique_turn_and_item_sequences() {
     let shared_turn = store
         .create_turn(&thread.thread_id, "running")
         .expect("shared turn");
+    store
+        .update_turn_state(&shared_turn.turn_id, TurnStatus::Completed, "completed")
+        .expect("complete shared turn");
     drop(store);
 
     let stores = (0..WORKERS)
@@ -2555,11 +2575,17 @@ fn concurrent_connections_allocate_unique_turn_and_item_sequences() {
         })
         .collect::<Vec<_>>();
 
+    let mut admitted_turns = 0;
     for handle in handles {
         let (turn, item) = handle.join().expect("worker joins");
-        turn.expect("concurrent turn allocation");
+        match turn {
+            Ok(_) => admitted_turns += 1,
+            Err(StoreError::ThreadHasNonterminalTurn { .. }) => {}
+            Err(error) => panic!("unexpected concurrent turn error: {error}"),
+        }
         item.expect("concurrent item allocation");
     }
+    assert_eq!(admitted_turns, 1);
 
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     let turn_sequences = connection
@@ -2569,10 +2595,7 @@ fn concurrent_connections_allocate_unique_turn_and_item_sequences() {
         .expect("query turns")
         .collect::<Result<Vec<_>, _>>()
         .expect("collect turn sequences");
-    assert_eq!(
-        turn_sequences,
-        (1..=u64::try_from(WORKERS + 1).expect("worker count")).collect::<Vec<_>>()
-    );
+    assert_eq!(turn_sequences, vec![1, 2]);
 
     let item_sequences = connection
         .prepare("select item_sequence from items where turn_id = ?1 order by item_sequence")
@@ -2585,6 +2608,48 @@ fn concurrent_connections_allocate_unique_turn_and_item_sequences() {
         item_sequences,
         (1..=u64::try_from(WORKERS).expect("worker count")).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn thread_execution_guard_serializes_one_thread_and_releases_after_owner_loss() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let owner = SessionStore::open(&db_path).expect("owner store");
+    let observer = SessionStore::open(&db_path).expect("observer store");
+    let thread = owner.create_thread(None, None).expect("thread");
+    let other_thread = owner.create_thread(None, None).expect("other thread");
+
+    let guard = owner
+        .try_begin_thread_execution(&thread.thread_id)
+        .expect("acquire owner guard")
+        .expect("owner guard available");
+    let running = owner
+        .create_turn(&thread.thread_id, "running")
+        .expect("start owned turn");
+    assert!(
+        observer
+            .try_begin_thread_execution(&thread.thread_id)
+            .expect("contended guard check")
+            .is_none()
+    );
+    let other_guard = observer
+        .try_begin_thread_execution(&other_thread.thread_id)
+        .expect("other thread guard")
+        .expect("other thread remains independent");
+    drop(other_guard);
+
+    drop(guard);
+    let recovered_guard = observer
+        .try_begin_thread_execution(&thread.thread_id)
+        .expect("recover released owner")
+        .expect("released guard can be reacquired");
+    let recovered = observer.get_turn(&running.turn_id).expect("recovered turn");
+    assert_eq!(recovered.status, TurnStatus::Interrupted);
+    assert_eq!(recovered.agent_loop_status, "interrupted");
+    observer
+        .create_turn(&thread.thread_id, "running")
+        .expect("new turn after recovery");
+    drop(recovered_guard);
 }
 
 #[test]

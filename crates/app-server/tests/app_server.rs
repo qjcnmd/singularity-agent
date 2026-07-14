@@ -1103,7 +1103,7 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
 }
 
 #[test]
-fn archived_thread_rejects_approval_decision_without_consuming_it() {
+fn pending_approval_prevents_thread_archive_and_delete() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
@@ -1157,34 +1157,25 @@ fn archived_thread_rejects_approval_decision_without_consuming_it() {
             "approval requested",
         )
         .expect("approval");
-    store
-        .update_thread_status(
-            &thread.thread_id,
-            singularity_protocol::ThreadStatus::Archived,
-        )
-        .expect("archive thread");
     drop(store);
 
-    let decision = ApprovalDecision::new(
-        request.request_id.clone(),
-        ApprovalOutcome::Allow,
-        "operator approved",
-    );
-    let response = server
-        .handle_json(
-            &serde_json::json!({
-                "method": "approval/decision",
-                "id": 4,
-                "params": decision,
-            })
-            .to_string(),
-        )
-        .expect("decision response");
+    for method in ["thread/archive", "thread/delete"] {
+        let response = server
+            .handle_json(
+                &serde_json::json!({
+                    "method": method,
+                    "id": 4,
+                    "params": {"threadId": &thread.thread_id},
+                })
+                .to_string(),
+            )
+            .expect("lifecycle response");
 
-    assert_eq!(
-        response[0]["error"]["message"],
-        "Thread is archived; resume it before continuing the turn"
-    );
+        assert_eq!(
+            response[0]["error"]["message"],
+            "Thread already has an active or pending turn"
+        );
+    }
     let store = SessionStore::open(&db_path).expect("reopen store");
     assert_eq!(
         store
@@ -1306,151 +1297,134 @@ fn allow_resume_precondition_failure_is_terminalized_without_replay() {
 }
 
 #[test]
-fn archived_or_unavailable_workspace_only_blocks_allow_decisions() {
-    for unavailable_kind in ["archived", "workspace_missing"] {
-        for outcome in [
-            ApprovalOutcome::Allow,
-            ApprovalOutcome::Deny,
-            ApprovalOutcome::Defer,
-        ] {
-            let outcome_label = match outcome {
-                ApprovalOutcome::Allow => "allow",
-                ApprovalOutcome::Deny => "deny",
-                ApprovalOutcome::Defer => "defer",
-            };
-            let dir = tempfile::tempdir().expect("temp dir");
-            let workspace = dir.path().join("workspace");
-            std::fs::create_dir(&workspace).expect("workspace");
-            let db_path = dir.path().join("sessions.sqlite3");
-            let store = SessionStore::open(&db_path).expect("open store");
-            let mut server = app_server(store);
-            server
+fn unavailable_workspace_only_blocks_allow_decisions() {
+    for outcome in [
+        ApprovalOutcome::Allow,
+        ApprovalOutcome::Deny,
+        ApprovalOutcome::Defer,
+    ] {
+        let outcome_label = match outcome {
+            ApprovalOutcome::Allow => "allow",
+            ApprovalOutcome::Deny => "deny",
+            ApprovalOutcome::Defer => "defer",
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db_path).expect("open store");
+        let mut server = app_server(store);
+        server
                 .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
                 .expect("initialize");
-            server
-                .handle_json(r#"{"method":"initialized","params":{}}"#)
-                .expect("initialized");
+        server
+            .handle_json(r#"{"method":"initialized","params":{}}"#)
+            .expect("initialized");
 
-            let store = SessionStore::open(&db_path).expect("reopen store");
-            let thread = store
-                .create_thread(Some("test-model"), Some(&workspace.to_string_lossy()))
-                .expect("thread");
-            let (turn, _item, _trace) = store
-                .create_turn_with_input_and_trace(
-                    &thread.thread_id,
-                    "blocked",
-                    serde_json::json!([{"type": "text", "text": "edit readme"}]),
-                    "app_server",
-                    "turn started",
-                )
-                .expect("turn");
-            store
-                .update_turn_state(
-                    &turn.turn_id,
-                    singularity_protocol::TurnStatus::Blocked,
-                    "blocked",
-                )
-                .expect("blocked turn");
-            let request = ApprovalRequest::new(
-                format!("approval_{unavailable_kind}_{outcome_label}"),
-                thread.thread_id.clone(),
-                turn.turn_id.clone(),
-                "builtin_edit",
+        let store = SessionStore::open(&db_path).expect("reopen store");
+        let thread = store
+            .create_thread(Some("test-model"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                "blocked",
+                serde_json::json!([{"type": "text", "text": "edit readme"}]),
+                "app_server",
+                "turn started",
             )
-            .with_tool_call_id("call_1")
-            .with_resources(["README.md"]);
-            store
-                .create_approval_with_pending_tool_call_and_trace(
-                    &request,
-                    Some(approval_checkpoint(&request, "call_1")),
-                    "approval",
-                    "approval requested",
-                )
-                .expect("approval");
-            if unavailable_kind == "archived" {
-                store
-                    .update_thread_status(
-                        &thread.thread_id,
-                        singularity_protocol::ThreadStatus::Archived,
-                    )
-                    .expect("archive thread");
-            } else {
-                std::fs::remove_dir(&workspace).expect("remove workspace");
-            }
-            drop(store);
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                singularity_protocol::TurnStatus::Blocked,
+                "blocked",
+            )
+            .expect("blocked turn");
+        let request = ApprovalRequest::new(
+            format!("approval_workspace_missing_{outcome_label}"),
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "builtin_edit",
+        )
+        .with_tool_call_id("call_1")
+        .with_resources(["README.md"]);
+        store
+            .create_approval_with_pending_tool_call_and_trace(
+                &request,
+                Some(approval_checkpoint(&request, "call_1")),
+                "approval",
+                "approval requested",
+            )
+            .expect("approval");
+        std::fs::remove_dir(&workspace).expect("remove workspace");
+        drop(store);
 
-            let decision =
-                ApprovalDecision::new(request.request_id.clone(), outcome, "operator decision");
-            let response = server
-                .handle_json(
-                    &serde_json::json!({
-                        "method": "approval/decision",
-                        "id": 4,
-                        "params": decision,
-                    })
-                    .to_string(),
-                )
-                .expect("decision response");
-            let store = SessionStore::open(&db_path).expect("reopen store");
+        let decision =
+            ApprovalDecision::new(request.request_id.clone(), outcome, "operator decision");
+        let response = server
+            .handle_json(
+                &serde_json::json!({
+                    "method": "approval/decision",
+                    "id": 4,
+                    "params": decision,
+                })
+                .to_string(),
+            )
+            .expect("decision response");
+        let store = SessionStore::open(&db_path).expect("reopen store");
 
-            match outcome {
-                ApprovalOutcome::Allow => {
-                    assert!(response[0]["error"]["message"].is_string());
-                    assert!(
-                        store
-                            .has_pending_tool_call(&request.request_id)
-                            .expect("pending")
-                    );
-                    assert!(
-                        store
-                            .list_approval_decisions()
-                            .expect("decisions")
-                            .is_empty()
-                    );
-                    assert_eq!(
-                        store.get_turn(&turn.turn_id).expect("turn").status,
-                        singularity_protocol::TurnStatus::Blocked
-                    );
-                }
-                ApprovalOutcome::Deny => {
-                    assert_eq!(
-                        response.last().expect("decision response")["result"]["decision"]["outcome"],
-                        "deny"
-                    );
-                    assert!(
-                        !store
-                            .has_pending_tool_call(&request.request_id)
-                            .expect("pending")
-                    );
-                    assert_eq!(store.list_approval_decisions().expect("decisions").len(), 1);
-                    assert_eq!(
-                        store.get_turn(&turn.turn_id).expect("turn").status,
-                        singularity_protocol::TurnStatus::Failed
-                    );
-                }
-                ApprovalOutcome::Defer => {
-                    assert_eq!(response[0]["result"]["decision"]["outcome"], "defer");
-                    assert!(
-                        store
-                            .has_pending_tool_call(&request.request_id)
-                            .expect("pending")
-                    );
-                    assert!(
-                        store
-                            .list_approval_decisions()
-                            .expect("decisions")
-                            .is_empty()
-                    );
-                    assert_eq!(
-                        store.get_turn(&turn.turn_id).expect("turn").status,
-                        singularity_protocol::TurnStatus::Blocked
-                    );
-                }
-            }
-            if unavailable_kind == "archived" {
+        match outcome {
+            ApprovalOutcome::Allow => {
+                assert!(response[0]["error"]["message"].is_string());
+                assert!(
+                    store
+                        .has_pending_tool_call(&request.request_id)
+                        .expect("pending")
+                );
+                assert!(
+                    store
+                        .list_approval_decisions()
+                        .expect("decisions")
+                        .is_empty()
+                );
                 assert_eq!(
-                    store.get_thread(&thread.thread_id).expect("thread").status,
-                    singularity_protocol::ThreadStatus::Archived
+                    store.get_turn(&turn.turn_id).expect("turn").status,
+                    singularity_protocol::TurnStatus::Blocked
+                );
+            }
+            ApprovalOutcome::Deny => {
+                assert_eq!(
+                    response.last().expect("decision response")["result"]["decision"]["outcome"],
+                    "deny"
+                );
+                assert!(
+                    !store
+                        .has_pending_tool_call(&request.request_id)
+                        .expect("pending")
+                );
+                assert_eq!(store.list_approval_decisions().expect("decisions").len(), 1);
+                assert_eq!(
+                    store.get_turn(&turn.turn_id).expect("turn").status,
+                    singularity_protocol::TurnStatus::Failed
+                );
+            }
+            ApprovalOutcome::Defer => {
+                assert_eq!(response[0]["result"]["decision"]["outcome"], "defer");
+                assert!(
+                    store
+                        .has_pending_tool_call(&request.request_id)
+                        .expect("pending")
+                );
+                assert!(
+                    store
+                        .list_approval_decisions()
+                        .expect("decisions")
+                        .is_empty()
+                );
+                assert_eq!(
+                    store.get_turn(&turn.turn_id).expect("turn").status,
+                    singularity_protocol::TurnStatus::Blocked
                 );
             }
         }
@@ -1552,12 +1526,7 @@ fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
             .expect("decisions")
             .is_empty()
     );
-    assert!(
-        store
-            .recover_incomplete_approval_executions()
-            .expect("recovery")
-            .is_empty()
-    );
+    store.recover_unowned_thread_executions().expect("recovery");
 }
 
 #[test]
@@ -1845,7 +1814,7 @@ fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_s
 
 #[cfg(windows)]
 #[test]
-fn app_server_worker_observes_interrupt_written_by_another_process() {
+fn app_server_rejects_cross_process_overlap_and_observes_interrupt() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
@@ -1878,6 +1847,22 @@ fn app_server_worker_observes_interrupt_written_by_another_process() {
     let (mut secondary, mut secondary_input, mut secondary_output) =
         spawn_app_server(&db_path, &workspace, &base_url);
     initialize_process(&mut secondary_input, &mut secondary_output);
+    send_json(
+        &mut secondary_input,
+        serde_json::json!({
+            "method": "turn/start",
+            "id": 11,
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "must not overlap the active turn"}]
+            }
+        }),
+    );
+    let rejected = secondary_output.recv_id(11, Duration::from_secs(2));
+    assert_eq!(
+        rejected["error"]["message"],
+        "Thread already has an active or pending turn"
+    );
     send_json(
         &mut secondary_input,
         serde_json::json!({
@@ -2049,6 +2034,90 @@ fn app_server_binary_errors_are_valid_json_rpc_lines() {
             .unwrap()
             .contains("invalid type")
     );
+}
+
+#[test]
+fn turn_status_recovers_an_unowned_running_turn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("orphaned running turn");
+    let mut server = app_server(store);
+    server
+        .handle_json(
+            r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+        )
+        .expect("initialize");
+    server
+        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .expect("initialized");
+
+    let response = server
+        .handle_json(&format!(
+            r#"{{"method":"turn/status","id":2,"params":{{"turnId":"{}"}}}}"#,
+            turn.turn_id
+        ))
+        .expect("turn status");
+
+    assert_eq!(response[0]["result"]["turn"]["status"], "interrupted");
+    assert_eq!(
+        response[0]["result"]["turn"]["agent_loop_status"],
+        "interrupted"
+    );
+    let trace = server
+        .handle_json(&format!(
+            r#"{{"method":"trace/list","id":3,"params":{{"runId":"{}"}}}}"#,
+            thread.thread_id
+        ))
+        .expect("trace list");
+    assert!(
+        trace[0]["result"]["events"]
+            .as_array()
+            .is_some_and(|events| {
+                events.iter().any(|event| {
+                    event["session_id"] == turn.turn_id
+                        && event["payload"]["recovery_reason"] == "execution_owner_lost"
+                })
+            })
+    );
+}
+
+#[test]
+fn app_server_exits_when_stdout_transport_is_lost() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let mut child = Command::new(app_server_bin())
+        .env("SINGULARITY_APP_SERVER_DB", &db_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app-server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    drop(child.stdout.take().expect("stdout"));
+    stdin
+        .write_all(
+            b"{\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"test\",\"title\":\"Test\",\"version\":\"0.1.0\"}}}\n",
+        )
+        .expect("write initialize");
+    stdin.flush().expect("flush initialize");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll app-server") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("kill app-server with lost stdout");
+            child.wait().expect("reap app-server with lost stdout");
+            panic!("app-server continued running after stdout transport was lost");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    assert!(!status.success(), "lost stdout must be fatal");
 }
 
 #[test]

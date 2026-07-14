@@ -48,6 +48,7 @@ const THREAD_NOT_FOUND: &str = "Thread not found";
 const THREAD_ARCHIVED: &str = "Thread is archived; resume it before starting a turn";
 const THREAD_ARCHIVED_CONTINUATION: &str =
     "Thread is archived; resume it before continuing the turn";
+const THREAD_EXECUTION_ACTIVE: &str = "Thread already has an active or pending turn";
 const TURN_NOT_FOUND: &str = "Turn not found";
 const TRACE_RUN_NOT_FOUND: &str = "Trace run not found";
 const TRACE_EVENT_NOT_FOUND: &str = "Trace event not found";
@@ -89,6 +90,25 @@ pub struct AppServer {
     sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+#[derive(Clone)]
+pub struct AppServerCancellationHandle {
+    active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl AppServerCancellationHandle {
+    pub fn cancel_active_turns(&self) -> AppServerResult<()> {
+        for cancellation in self
+            .active_turns
+            .lock()
+            .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?
+            .values()
+        {
+            cancellation.cancel();
+        }
+        Ok(())
+    }
 }
 
 struct ActiveTurnGuard {
@@ -141,15 +161,13 @@ impl AppServer {
     }
 
     pub fn cancel_active_turns(&self) -> AppServerResult<()> {
-        for cancellation in self
-            .active_turns
-            .lock()
-            .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?
-            .values()
-        {
-            cancellation.cancel();
+        self.cancellation_handle().cancel_active_turns()
+    }
+
+    pub fn cancellation_handle(&self) -> AppServerCancellationHandle {
+        AppServerCancellationHandle {
+            active_turns: Arc::clone(&self.active_turns),
         }
-        Ok(())
     }
 
     pub fn turn_worker(&self) -> AppServerResult<Self> {
@@ -196,6 +214,16 @@ impl AppServer {
             monitor,
         };
         Ok((cancellation, guard))
+    }
+
+    fn refresh_turn_if_unowned(&self, turn: Turn) -> AppServerResult<Turn> {
+        if is_terminal_turn_status(&turn.status) {
+            return Ok(turn);
+        }
+        let Some(_execution_guard) = self.store.try_begin_thread_execution(&turn.thread_id)? else {
+            return Ok(turn);
+        };
+        self.store.get_turn(&turn.turn_id).map_err(Into::into)
     }
 
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
@@ -437,6 +465,9 @@ impl AppServer {
         ) {
             Ok(thread) => json_response(message.id, ThreadResult { thread }),
             Err(StoreError::NotFound(_)) => not_found_response(message.id, THREAD_NOT_FOUND),
+            Err(StoreError::ThreadHasNonterminalTurn { .. }) => {
+                invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -455,6 +486,9 @@ impl AppServer {
                 .to_wire_value(),
             ]),
             Err(StoreError::NotFound(_)) => not_found_response(message.id, THREAD_NOT_FOUND),
+            Err(StoreError::ThreadHasNonterminalTurn { .. }) => {
+                invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -503,6 +537,14 @@ impl AppServer {
             );
             return Ok(());
         }
+        let Some(_execution_guard) = self.store.try_begin_thread_execution(&params.thread_id)?
+        else {
+            emit_messages(
+                &mut emit,
+                invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE)?,
+            );
+            return Ok(());
+        };
         let payload = serde_json::to_value(&params.input)?;
         let started = match self.store.create_turn_with_input_trace_and_history(
             &params.thread_id,
@@ -515,6 +557,13 @@ impl AppServer {
             Ok(result) => result,
             Err(StoreError::NotFound(_)) => {
                 emit_messages(&mut emit, not_found_response(message.id, THREAD_NOT_FOUND)?);
+                return Ok(());
+            }
+            Err(StoreError::ThreadHasNonterminalTurn { .. }) => {
+                emit_messages(
+                    &mut emit,
+                    invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE)?,
+                );
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
@@ -948,8 +997,15 @@ impl AppServer {
 
     fn turn_interrupt(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnIdParams = parse_params(&message)?;
-        match self.store.get_turn(&params.turn_id) {
-            Ok(turn) if is_terminal_turn_status(&turn.status) => Ok(vec![
+        let turn = match self.store.get_turn(&params.turn_id) {
+            Ok(turn) => self.refresh_turn_if_unowned(turn)?,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.id, TURN_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if is_terminal_turn_status(&turn.status) {
+            return Ok(vec![
                 JsonRpcMessage::response(
                     message.id,
                     serde_json::to_value(TurnInterruptResult {
@@ -959,65 +1015,66 @@ impl AppServer {
                     })?,
                 )
                 .to_wire_value(),
-            ]),
-            Ok(turn) => {
-                let thread_id = turn.thread_id.clone();
-                if let Some(cancellation) = self
-                    .active_turns
-                    .lock()
-                    .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?
-                    .get(&turn.turn_id)
-                    .cloned()
-                {
-                    cancellation.cancel();
-                }
-                let trace = TraceEvent {
-                    payload: json!({
-                        "turn_id": turn.turn_id,
-                        "agent_loop_status": AgentStatus::CancelRequested.as_str(),
-                    }),
-                    ..TraceEvent::new(
-                        format!("trace_{}_interrupt_requested", turn.turn_id),
-                        thread_id,
-                        turn.turn_id.clone(),
-                        "app_server",
-                        "turn interrupt requested",
-                    )
-                };
-                let turn = self
-                    .store
-                    .request_turn_cancellation(&turn.turn_id, &trace)?;
-                let status = if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() {
-                    AgentStatus::CancelRequested.as_str()
-                } else {
-                    turn_status_str(&turn.status)
-                };
-                let mut messages = Vec::new();
-                if is_terminal_turn_status(&turn.status) {
-                    messages.extend(self.event_notification(AppEvent::turn_completed(&turn)));
-                }
-                messages.push(
-                    JsonRpcMessage::response(
-                        message.id,
-                        serde_json::to_value(TurnInterruptResult {
-                            turn_id: turn.turn_id,
-                            status: status.to_string(),
-                            agent_loop_status: Some(turn.agent_loop_status),
-                        })?,
-                    )
-                    .to_wire_value(),
-                );
-                Ok(messages)
-            }
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, TURN_NOT_FOUND),
-            Err(error) => Err(error.into()),
+            ]);
         }
+        let thread_id = turn.thread_id.clone();
+        if let Some(cancellation) = self
+            .active_turns
+            .lock()
+            .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?
+            .get(&turn.turn_id)
+            .cloned()
+        {
+            cancellation.cancel();
+        }
+        let trace = TraceEvent {
+            payload: json!({
+                "turn_id": turn.turn_id,
+                "agent_loop_status": AgentStatus::CancelRequested.as_str(),
+            }),
+            ..TraceEvent::new(
+                format!("trace_{}_interrupt_requested", turn.turn_id),
+                thread_id,
+                turn.turn_id.clone(),
+                "app_server",
+                "turn interrupt requested",
+            )
+        };
+        let turn = self
+            .store
+            .request_turn_cancellation(&turn.turn_id, &trace)?;
+        let status = if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() {
+            AgentStatus::CancelRequested.as_str()
+        } else {
+            turn_status_str(&turn.status)
+        };
+        let mut messages = Vec::new();
+        if is_terminal_turn_status(&turn.status) {
+            messages.extend(self.event_notification(AppEvent::turn_completed(&turn)));
+        }
+        messages.push(
+            JsonRpcMessage::response(
+                message.id,
+                serde_json::to_value(TurnInterruptResult {
+                    turn_id: turn.turn_id,
+                    status: status.to_string(),
+                    agent_loop_status: Some(turn.agent_loop_status),
+                })?,
+            )
+            .to_wire_value(),
+        );
+        Ok(messages)
     }
 
     fn turn_status(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TurnIdParams = parse_params(&message)?;
         match self.store.get_turn(&params.turn_id) {
-            Ok(turn) => json_response(message.id, TurnResult { turn }),
+            Ok(turn) => json_response(
+                message.id,
+                TurnResult {
+                    turn: self.refresh_turn_if_unowned(turn)?,
+                },
+            ),
             Err(StoreError::NotFound(_)) => not_found_response(message.id, TURN_NOT_FOUND),
             Err(error) => Err(error.into()),
         }
@@ -1066,12 +1123,26 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        let pending_thread = self.store.get_thread(&pending_request.thread_id)?;
-        if matches!(decision.outcome, ApprovalOutcome::Allow)
-            && self
+        let is_tool_continuation = pending_request.tool_call_id.is_some();
+        let _execution_guard = if is_tool_continuation {
+            if !self
                 .store
                 .has_pending_tool_call(&pending_request.request_id)?
-        {
+            {
+                return not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND);
+            }
+            let Some(guard) = self
+                .store
+                .try_begin_thread_execution(&pending_request.thread_id)?
+            else {
+                return invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE);
+            };
+            Some(guard)
+        } else {
+            None
+        };
+        let pending_thread = self.store.get_thread(&pending_request.thread_id)?;
+        if is_tool_continuation && matches!(decision.outcome, ApprovalOutcome::Allow) {
             if pending_thread.status != singularity_protocol::ThreadStatus::Active {
                 return invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION);
             }
@@ -2160,6 +2231,13 @@ mod tests {
                 AgentStatus::Blocked.as_str(),
             )
             .expect("block turn");
+        store
+            .update_turn_state(
+                &blocked.turn_id,
+                TurnStatus::Interrupted,
+                AgentStatus::Cancelled.as_str(),
+            )
+            .expect("release blocked fixture");
 
         let started = store
             .create_turn_with_input_trace_and_history(
@@ -2715,13 +2793,10 @@ mod tests {
                 .expect("pending")
                 .is_empty()
         );
-        assert!(
-            server
-                .store
-                .recover_incomplete_approval_executions()
-                .expect("recovery")
-                .is_empty()
-        );
+        server
+            .store
+            .recover_unowned_thread_executions()
+            .expect("recovery");
     }
 
     #[test]
@@ -2897,29 +2972,6 @@ mod tests {
                 AgentStatus::Blocked.as_str(),
             )
             .expect("blocked turn");
-        let (future, _, _) = store
-            .create_turn_with_input_and_trace(
-                &thread.thread_id,
-                AgentStatus::Running.as_str(),
-                json!([{"type": "text", "text": "future user must not replay"}]),
-                "app_server",
-                "future turn",
-            )
-            .expect("future turn");
-        store
-            .append_item(
-                &future.turn_id,
-                ItemKind::AgentMessage,
-                json!({"delta": "future assistant must not replay"}),
-            )
-            .expect("future assistant");
-        store
-            .update_turn_state(
-                &future.turn_id,
-                TurnStatus::Completed,
-                AgentStatus::Completed.as_str(),
-            )
-            .expect("complete future turn");
         let history = store
             .read_thread_history_before_turn(
                 &thread.thread_id,
@@ -3104,92 +3156,6 @@ mod tests {
             requests[0].messages[5].tool_call_id.as_deref(),
             Some("call_1")
         );
-        let request_json = serde_json::to_string(&requests[0]).expect("request json");
-        assert!(!request_json.contains("future user must not replay"));
-        assert!(!request_json.contains("future assistant must not replay"));
-    }
-
-    #[test]
-    fn archived_thread_cannot_resume_a_pending_approval_tool() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let workspace = dir.path().join("workspace");
-        std::fs::create_dir(&workspace).expect("workspace");
-        let file_path = workspace.join("README.md");
-        std::fs::write(&file_path, "before").expect("write readme");
-        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
-        let thread = store
-            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
-            .expect("thread");
-        let (turn, _, _) = store
-            .create_turn_with_input_and_trace(
-                &thread.thread_id,
-                AgentStatus::Blocked.as_str(),
-                json!([{"type": "text", "text": "edit readme"}]),
-                "app_server",
-                "turn started",
-            )
-            .expect("turn");
-        store
-            .update_turn_state(
-                &turn.turn_id,
-                TurnStatus::Blocked,
-                AgentStatus::Blocked.as_str(),
-            )
-            .expect("blocked turn");
-        store
-            .update_thread_status(
-                &thread.thread_id,
-                singularity_protocol::ThreadStatus::Archived,
-            )
-            .expect("archive thread");
-        let request = ApprovalRequest::new(
-            format!("approval_{}_call_1", turn.turn_id),
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            TOOL_EDIT,
-        )
-        .with_tool_call_id("call_1")
-        .with_resources(["README.md"]);
-        let pending = PendingToolCall {
-            request_id: request.request_id.clone(),
-            tool_call_id: "call_1".to_string(),
-            tool_name: TOOL_EDIT.to_string(),
-            raw_arguments: json!({
-                "path": "README.md",
-                "expected": "before",
-                "replacement": "after"
-            })
-            .to_string(),
-            resources: vec!["README.md".to_string()],
-        };
-        let decision = ApprovalDecision::new(
-            request.request_id.clone(),
-            ApprovalOutcome::Allow,
-            "approved",
-        );
-        let seen_requests = Arc::new(Mutex::new(Vec::new()));
-        let provider = StaticProvider {
-            responses: vec![ModelTurnResponse::completed("request", "response", "done")],
-            seen_requests: Arc::clone(&seen_requests),
-        };
-        let server = app_server(store);
-
-        let resumed = server
-            .resume_agent_loop_after_gate(
-                &request,
-                &decision,
-                Some(serde_json::to_value(pending).expect("pending payload")),
-                provider,
-                &CancellationToken::new(),
-            )
-            .expect("resume check");
-
-        assert!(resumed.is_none());
-        assert_eq!(
-            std::fs::read_to_string(&file_path).expect("read readme"),
-            "before"
-        );
-        assert!(seen_requests.lock().expect("seen requests").is_empty());
     }
 
     struct CompletedSandboxBackend;
