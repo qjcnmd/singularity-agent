@@ -69,12 +69,19 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
         "raw_arguments": "{}",
         "resources": &request.resources,
         "checkpoint_version": 1,
-        "messages": [{"role":"assistant","content":[],"tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
+        "messages": [{"role":"assistant","content":"","tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
         "tool_results": [],
         "used_approval_grants": [],
         "approval_count": 1,
         "model_turns": 1,
-        "completion": {},
+        "completion": {
+            "workspace_mutated": false,
+            "verified_after_last_mutation": false,
+            "successful_command_count": 0,
+            "required_command_counts": {},
+            "satisfied_command_counts": {},
+            "unresolved_failures": []
+        },
         "last_completion_error": null
     })
 }
@@ -1894,6 +1901,123 @@ fn app_server_worker_observes_interrupt_written_by_another_process() {
     release.send(()).expect("release provider");
     provider_worker.join().expect("provider worker joins");
     shutdown_process(&mut primary, &mut primary_input, &mut primary_output, 6);
+}
+
+#[cfg(windows)]
+#[test]
+fn app_server_approval_continuation_keeps_interrupt_and_shutdown_responsive() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    std::fs::write(workspace.join("README.md"), "before").expect("readme");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let (base_url, accepted, release, provider_worker) = hanging_provider();
+
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store
+        .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+        .expect("thread");
+    let (turn, _item, _trace) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "blocked",
+            serde_json::json!([{"type": "text", "text": "edit readme"}]),
+            "app_server",
+            "approval turn",
+        )
+        .expect("turn");
+    store
+        .update_turn_state(
+            &turn.turn_id,
+            singularity_protocol::TurnStatus::Blocked,
+            "blocked",
+        )
+        .expect("blocked state");
+    let request = ApprovalRequest::new(
+        format!("approval_{}_call_1", turn.turn_id),
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "builtin_edit",
+    )
+    .with_tool_call_id("call_1")
+    .with_resources(["README.md"]);
+    let mut checkpoint = approval_checkpoint(&request, "call_1");
+    let arguments = serde_json::json!({
+        "path": "README.md",
+        "expected": "before",
+        "replacement": "after"
+    });
+    checkpoint["raw_arguments"] = serde_json::json!(arguments.to_string());
+    checkpoint["messages"][0]["tool_calls"][0]["arguments"] = arguments.clone();
+    checkpoint["messages"][0]["tool_calls"][0]["raw_arguments"] =
+        serde_json::json!(arguments.to_string());
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(checkpoint),
+            "approval",
+            "approval requested",
+        )
+        .expect("approval");
+    drop(store);
+
+    let (mut child, mut input, mut output) = spawn_app_server(&db_path, &workspace, &base_url);
+    initialize_process(&mut input, &mut output);
+    send_json(
+        &mut input,
+        serde_json::json!({
+            "method": "approval/decision",
+            "id": 3,
+            "params": {
+                "request_id": request.request_id,
+                "decision_id": "decision_approval_continuation",
+                "outcome": "allow",
+                "reason": "operator approved"
+            }
+        }),
+    );
+    accepted
+        .recv_timeout(Duration::from_secs(2))
+        .expect("approval continuation reached provider");
+
+    send_json(
+        &mut input,
+        serde_json::json!({
+            "method": "turn/interrupt",
+            "id": 4,
+            "params": {"turnId": turn.turn_id}
+        }),
+    );
+    let interrupt = output.recv_id(4, Duration::from_secs(2));
+    assert_eq!(interrupt["result"]["status"], "cancel_requested");
+    assert_eq!(interrupt["result"]["agent_loop_status"], "cancel_requested");
+
+    send_json(
+        &mut input,
+        serde_json::json!({
+            "method": "server/shutdown",
+            "id": 5,
+            "params": {}
+        }),
+    );
+    let shutdown = output.recv_id(5, Duration::from_secs(2));
+    assert_eq!(shutdown["result"]["shutdown"], true);
+
+    release.send(()).expect("release provider");
+    let decision = output.recv_id(3, Duration::from_secs(7));
+    assert_eq!(decision["result"]["decision"]["outcome"], "allow");
+    drop(input);
+    let status = child.wait().expect("wait app-server");
+    assert!(status.success(), "app-server exited with {status}");
+    provider_worker.join().expect("provider worker joins");
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let persisted = store.get_turn(&turn.turn_id).expect("persisted turn");
+    assert_eq!(
+        persisted.status,
+        singularity_protocol::TurnStatus::Interrupted
+    );
+    assert_eq!(persisted.agent_loop_status, "cancelled");
 }
 
 #[test]

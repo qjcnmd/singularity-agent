@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use serde_json::Value;
 use singularity_app_server::{AppServer, AppServerError};
@@ -49,11 +50,11 @@ fn run() -> Result<(), String> {
         }
         Ok(())
     });
-    let mut turn_workers = Vec::new();
+    let mut request_workers = Vec::new();
     let stdin = io::stdin();
 
     for line in stdin.lock().lines() {
-        reap_finished_workers(&mut turn_workers)?;
+        reap_finished_workers(&mut request_workers)?;
         let line = line.map_err(|error| format!("failed to read stdin: {error}"))?;
         if line.trim().is_empty() {
             continue;
@@ -72,18 +73,12 @@ fn run() -> Result<(), String> {
             }
         };
         let request_id = message.id.clone();
-        let is_turn_start = message.method.as_deref() == Some(Method::TurnStart.as_str());
-        if is_turn_start && server.ready_for_turn_worker() {
+        if is_request_worker_method(&message) && server.ready_for_turn_worker() {
             match server.turn_worker() {
-                Ok(mut worker) => {
+                Ok(worker) => {
                     let output_tx = output_tx.clone();
-                    turn_workers.push(thread::spawn(move || {
-                        let result = worker.handle_turn_start_streaming(message, |message| {
-                            send_output(&output_tx, message);
-                        });
-                        if let Err(error) = result {
-                            send_output(&output_tx, transport_error_value(request_id, &error));
-                        }
+                    request_workers.push(thread::spawn(move || {
+                        run_request_worker(worker, message, output_tx)
                     }));
                 }
                 Err(error) => send_output(&output_tx, transport_error_value(request_id, &error)),
@@ -97,17 +92,17 @@ fn run() -> Result<(), String> {
                 }
                 Err(error) => send_output(&output_tx, transport_error_value(request_id, &error)),
             }
-            if server.shutdown_requested() {
-                break;
-            }
+        }
+        if server.shutdown_requested() {
+            break;
         }
     }
 
     server
         .cancel_active_turns()
         .map_err(|error| format!("failed to cancel active turns during shutdown: {error}"))?;
-    for worker in turn_workers {
-        join_turn_worker(worker)?;
+    for worker in request_workers {
+        join_request_worker_during_shutdown(&server, worker)?;
     }
     drop(output_tx);
     writer
@@ -116,11 +111,38 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
+    matches!(
+        message.method.as_deref(),
+        Some(method)
+            if method == Method::TurnStart.as_str()
+                || method == Method::ApprovalDecision.as_str()
+    )
+}
+
+fn run_request_worker(mut worker: AppServer, message: JsonRpcMessage, output_tx: Sender<Value>) {
+    let request_id = message.id.clone();
+    let result = if message.method.as_deref() == Some(Method::TurnStart.as_str()) {
+        worker.handle_turn_start_streaming(message, |message| {
+            send_output(&output_tx, message);
+        })
+    } else {
+        worker.handle(message).map(|messages| {
+            for message in messages {
+                send_output(&output_tx, message);
+            }
+        })
+    };
+    if let Err(error) = result {
+        send_output(&output_tx, transport_error_value(request_id, &error));
+    }
+}
+
 fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) -> Result<(), String> {
     let mut active = Vec::with_capacity(workers.len());
     for worker in workers.drain(..) {
         if worker.is_finished() {
-            join_turn_worker(worker)?;
+            join_request_worker(worker)?;
         } else {
             active.push(worker);
         }
@@ -129,10 +151,23 @@ fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) -> Result<(), String
     Ok(())
 }
 
-fn join_turn_worker(worker: JoinHandle<()>) -> Result<(), String> {
+fn join_request_worker_during_shutdown(
+    server: &AppServer,
+    worker: JoinHandle<()>,
+) -> Result<(), String> {
+    while !worker.is_finished() {
+        server
+            .cancel_active_turns()
+            .map_err(|error| format!("failed to cancel active request during shutdown: {error}"))?;
+        thread::sleep(Duration::from_millis(10));
+    }
+    join_request_worker(worker)
+}
+
+fn join_request_worker(worker: JoinHandle<()>) -> Result<(), String> {
     worker
         .join()
-        .map_err(|_| "turn worker panicked".to_string())
+        .map_err(|_| "request worker panicked".to_string())
 }
 
 fn send_output(sender: &Sender<Value>, message: Value) {

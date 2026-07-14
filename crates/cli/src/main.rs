@@ -224,6 +224,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             reason,
         } => {
             let mut client = AppServerClient::spawn()?;
+            client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
             client.approval_decision(&request_id, decision, reason.as_deref().unwrap_or(""))
         }

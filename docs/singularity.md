@@ -82,7 +82,7 @@ sg run <goal>
      -> turn/start response
 ```
 
-`singularity_app_server` 的 stdin 主线程继续处理 protocol 请求；每个 `turn/start` 由独立 worker 使用新的 SQLite connection 执行，因此同一进程可以在 turn 运行时接收 `turn/interrupt`。stdout 由单独 writer 串行输出 JSONL，避免 worker 交叉写坏消息边界。
+`singularity_app_server` 的 stdin 主线程继续处理 protocol 请求；每个 `turn/start` 和可能继续运行 AgentLoop 的 `approval/decision` 由独立 request worker 使用新的 SQLite connection 执行，因此同一进程可以在 turn 或 approval continuation 运行时接收 `turn/interrupt` 和 `server/shutdown`。worker 复用同一个 active-turn cancellation registry，关闭时取消并等待所有 request worker；stdout 由单独 writer 串行输出 JSONL，避免 worker 交叉写坏消息边界。
 
 ## 4. Thread、Turn 与 Continue
 
@@ -198,7 +198,7 @@ edit/patch 只有在目标字节实际变化时才返回成功；no-op 在整批
 
 当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint；pending 保存已经过 model admission、exact binding 和 profile 约束的 execution input，而不是重新暴露模型输入。resume 在匹配和消费 Approval 前重新验证 execution validator、exact execution allowlist 与当前 profile，持久化输入被篡改或权限收窄时 fail closed。Turn Blocked、request、checkpoint 和 approval trace 在同一事务提交。allow/deny 是单次消费；defer 只写脱敏审计事件，不写 decision ledger、不消费 approval，也不删除 checkpoint。只有 allow 需要 active thread 和当前可用的 workspace：workspace 在 claim 前检查，thread active 状态还会在 Store claim 事务内重检，条件不满足时不消费 request。deny 不执行工具，不依赖 thread 是否 archived 或 workspace 是否仍存在；它在 decision 同一事务终结 Turn 并删除 checkpoint。defer 同样不依赖这两个执行条件，保留 Blocked Turn、request 和 checkpoint。客户端不能通过 `approval/request` 自行向 ledger 注入请求。
 
-allow 在 decision ledger 同一事务把 `pending` 直接认领为 `executing`。AgentLoop 返回后，Turn outcome、terminal trace 和 checkpoint 删除在同一事务提交；若继续运行后再次 ask，旧 execution 完成、下一 request/checkpoint 和 Turn Blocked 也在该事务内交接。claim 之后的普通 AppServer continuation 错误会在当前进程归约为 Failed Turn 并原子删除 executing checkpoint；进程中断留下的 executing checkpoint 由启动恢复归约为 Interrupted 或 successor handoff，Store 持续不可写时则可能延迟终态提交。
+allow 在 decision ledger 同一事务把 `pending` 直接认领为 `executing`。`approval/decision` 的 continuation 在独立 request worker 中恢复，主 stdin loop 不同步等待 AgentLoop；AgentLoop 返回后，Turn outcome、terminal trace 和 checkpoint 删除在同一事务提交；若继续运行后再次 ask，旧 execution 完成、下一 request/checkpoint 和 Turn Blocked 也在该事务内交接。claim 之后的普通 AppServer continuation 错误会在当前进程归约为 Failed Turn 并原子删除 executing checkpoint；进程中断留下的 executing checkpoint 由启动恢复归约为 Interrupted 或 successor handoff，Store 持续不可写时则可能延迟终态提交。
 
 主进程启动恢复先验证所有 Approval、checkpoint、Turn 和 decision binding，再执行任何修改。没有 successor 的遗留 `executing` 被归约为 `Interrupted` 和 `approval_execution_outcome_unknown`；历史版本留下的较早 `executing` 加一个较晚且合法的 `pending` 被视为半交接，只删除旧 execution，并保留下一 Approval、checkpoint 和 Blocked Turn。歧义拓扑或损坏 checkpoint 使整个恢复事务失败且不修改数据库。两种可恢复路径都记录 `tool_replayed=false`，当前保证是 at-most-once execution attempt，不宣称 exactly-once。
 
