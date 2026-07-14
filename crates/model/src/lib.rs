@@ -30,6 +30,8 @@ const PROJECT_ENV_FILE: &str = ".env";
 const DEFAULT_PROVIDER_NAME: &str = "openai_compatible";
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
+const RESPONSES_PATH: &str = "/responses";
+const V1_RESPONSES_PATH: &str = "/v1/responses";
 const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -171,6 +173,15 @@ pub enum ProviderToolDefinitionMode {
     #[default]
     Direct,
     Routed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderApiProtocol {
+    #[default]
+    Declared,
+    OpenAiResponses,
+    OpenAiChatCompletions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -414,6 +425,7 @@ pub struct ModelUsage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderCapabilityMetadata {
+    pub api_protocol: ProviderApiProtocol,
     pub profile: ProviderCapabilityProfile,
     pub cache_hit: bool,
     pub profile_attempts: u32,
@@ -688,6 +700,7 @@ impl ProviderAttemptMetadata {
 impl ProviderCapabilityMetadata {
     fn declared() -> Self {
         Self {
+            api_protocol: ProviderApiProtocol::Declared,
             profile: ProviderCapabilityProfile::Declared,
             cache_hit: false,
             profile_attempts: 0,
@@ -827,6 +840,33 @@ impl OpenAiProviderConfig {
 
     pub fn endpoint(&self) -> String {
         chat_completions_endpoint(&self.base_url)
+    }
+
+    fn api_protocol_candidates(&self) -> Vec<ProviderApiProtocol> {
+        let base_url = self.base_url.trim().trim_end_matches('/');
+        if base_url.ends_with(RESPONSES_PATH) {
+            vec![ProviderApiProtocol::OpenAiResponses]
+        } else if base_url.ends_with(CHAT_COMPLETIONS_PATH) {
+            vec![ProviderApiProtocol::OpenAiChatCompletions]
+        } else {
+            vec![
+                ProviderApiProtocol::OpenAiResponses,
+                ProviderApiProtocol::OpenAiChatCompletions,
+            ]
+        }
+    }
+
+    fn completion_protocol_without_tools(&self) -> ProviderApiProtocol {
+        if self
+            .base_url
+            .trim()
+            .trim_end_matches('/')
+            .ends_with(RESPONSES_PATH)
+        {
+            ProviderApiProtocol::OpenAiResponses
+        } else {
+            ProviderApiProtocol::OpenAiChatCompletions
+        }
     }
 
     pub fn protocol_contract(&self) -> ProviderProtocolContract {
@@ -1074,15 +1114,69 @@ impl OpenAiProvider {
         model_name: &str,
         cancellation: &CancellationToken,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        let protocols = self.config.api_protocol_candidates();
+        let mut accumulated_metadata: Option<ProviderCapabilityMetadata> = None;
+        for (index, api_protocol) in protocols.iter().copied().enumerate() {
+            match self.probe_tool_capabilities_for_protocol(model_name, cancellation, api_protocol)
+            {
+                Ok(mut negotiation) => {
+                    if let Some(metadata) = accumulated_metadata.take() {
+                        merge_capability_metadata(&mut negotiation.metadata, &metadata);
+                    }
+                    negotiation.metadata.fallback_count = negotiation
+                        .metadata
+                        .fallback_count
+                        .saturating_add(index as u32);
+                    self.tool_capability_cache
+                        .lock()
+                        .map_err(|_| provider_capability_cache_error())?
+                        .insert(model_name.to_string(), negotiation.clone());
+                    return Ok(negotiation);
+                }
+                Err(mut error)
+                    if index + 1 < protocols.len()
+                        && provider_protocol_fallback_allowed(&error) =>
+                {
+                    if let Some(metadata) = error.capability_metadata.take().map(|value| *value) {
+                        match accumulated_metadata.as_mut() {
+                            Some(accumulated) => merge_capability_metadata(accumulated, &metadata),
+                            None => accumulated_metadata = Some(metadata),
+                        }
+                    }
+                }
+                Err(mut error) => {
+                    if let Some(accumulated) = accumulated_metadata {
+                        match error.capability_metadata.as_mut() {
+                            Some(metadata) => merge_capability_metadata(metadata, &accumulated),
+                            None => error.capability_metadata = Some(Box::new(accumulated)),
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Err(capability_probe_unsupported_error(ModelError::new(
+            ModelErrorKind::UnsupportedCapability,
+            "provider does not support native structured tool calls",
+        )))
+    }
+
+    fn probe_tool_capabilities_for_protocol(
+        &self,
+        model_name: &str,
+        cancellation: &CancellationToken,
+        api_protocol: ProviderApiProtocol,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         let mut probe_usage = ModelUsage::default();
         let mut probe_attempt_metadata = ProviderAttemptMetadata::zero();
-        let profiles = capability_probe_profiles(&self.config, model_name);
+        let profiles = capability_probe_profiles(&self.config, model_name, api_protocol);
         let profile_count = profiles.len();
 
         for (index, profile) in profiles.into_iter().enumerate() {
             if cancellation.is_cancelled() {
                 return Err(provider_cancelled_error().with_capability_metadata(
                     capability_probe_metadata(
+                        api_protocol,
                         profile.profile,
                         index as u32,
                         index as u32,
@@ -1095,6 +1189,7 @@ impl OpenAiProvider {
             if !local_validation.valid {
                 return Err(capability_probe_definition_error(local_validation.errors)
                     .with_capability_metadata(capability_probe_metadata(
+                        api_protocol,
                         profile.profile,
                         index as u32,
                         index as u32,
@@ -1106,7 +1201,7 @@ impl OpenAiProvider {
                 &profile.request,
                 cancellation,
                 &profile.contract,
-                model_name,
+                api_protocol,
                 &mut probe_usage,
                 &mut probe_attempt_metadata,
             ) {
@@ -1115,25 +1210,14 @@ impl OpenAiProvider {
                     if index + 1 == profile_count {
                         return Err(capability_probe_failure(
                             error,
-                            profile.profile,
-                            index as u32 + 1,
-                            index as u32,
-                            &probe_usage,
-                            &probe_attempt_metadata,
-                            "capability_profiles_exhausted",
-                        ));
-                    }
-                    continue;
-                }
-                Err(error) if is_capability_probe_validation_mismatch(&error) => {
-                    if index + 1 == profile_count {
-                        return Err(capability_probe_failure(
-                            error,
-                            profile.profile,
-                            index as u32 + 1,
-                            index as u32,
-                            &probe_usage,
-                            &probe_attempt_metadata,
+                            capability_probe_metadata(
+                                api_protocol,
+                                profile.profile,
+                                index as u32 + 1,
+                                index as u32,
+                                &probe_usage,
+                                &probe_attempt_metadata,
+                            ),
                             "capability_profiles_exhausted",
                         ));
                     }
@@ -1141,6 +1225,7 @@ impl OpenAiProvider {
                 }
                 Err(error) => {
                     return Err(error.with_capability_metadata(capability_probe_metadata(
+                        api_protocol,
                         profile.profile,
                         index as u32 + 1,
                         index as u32,
@@ -1158,7 +1243,7 @@ impl OpenAiProvider {
                     &profile.request,
                     cancellation,
                     &contract,
-                    model_name,
+                    api_protocol,
                     &mut probe_usage,
                     &mut probe_attempt_metadata,
                 ) {
@@ -1171,11 +1256,14 @@ impl OpenAiProvider {
                         };
                         return Err(capability_probe_failure(
                             error,
-                            profile.profile,
-                            index as u32 + 1,
-                            index as u32,
-                            &probe_usage,
-                            &probe_attempt_metadata,
+                            capability_probe_metadata(
+                                api_protocol,
+                                profile.profile,
+                                index as u32 + 1,
+                                index as u32,
+                                &probe_usage,
+                                &probe_attempt_metadata,
+                            ),
                             "tool_reasoning_disable_unsupported",
                         ));
                     }
@@ -1186,6 +1274,7 @@ impl OpenAiProvider {
                         "tool_reasoning_disable_not_honored",
                     )
                     .with_capability_metadata(capability_probe_metadata(
+                        api_protocol,
                         profile.profile,
                         index as u32 + 1,
                         index as u32,
@@ -1200,6 +1289,7 @@ impl OpenAiProvider {
                         "tool_reasoning_disabled_profile_invalid",
                     )
                     .with_capability_metadata(capability_probe_metadata(
+                        api_protocol,
                         profile.profile,
                         index as u32 + 1,
                         index as u32,
@@ -1222,6 +1312,7 @@ impl OpenAiProvider {
                     return Err(
                         capability_probe_definition_error(continuation_validation.errors)
                             .with_capability_metadata(capability_probe_metadata(
+                                api_protocol,
                                 profile.profile,
                                 index as u32 + 1,
                                 index as u32,
@@ -1234,23 +1325,23 @@ impl OpenAiProvider {
                     &continuation_request,
                     cancellation,
                     &contract,
-                    model_name,
+                    api_protocol,
                     &mut probe_usage,
                     &mut probe_attempt_metadata,
                 ) {
                     Ok(completion) => completion,
-                    Err(error)
-                        if is_capability_probe_profile_rejection(&error)
-                            || is_capability_probe_validation_mismatch(&error) =>
-                    {
+                    Err(error) if is_capability_probe_profile_rejection(&error) => {
                         if index + 1 == profile_count {
                             return Err(capability_probe_failure(
                                 error,
-                                profile.profile,
-                                index as u32 + 1,
-                                index as u32,
-                                &probe_usage,
-                                &probe_attempt_metadata,
+                                capability_probe_metadata(
+                                    api_protocol,
+                                    profile.profile,
+                                    index as u32 + 1,
+                                    index as u32,
+                                    &probe_usage,
+                                    &probe_attempt_metadata,
+                                ),
                                 "capability_probe_multi_turn_tool_calls_unsupported",
                             ));
                         }
@@ -1258,6 +1349,7 @@ impl OpenAiProvider {
                     }
                     Err(error) => {
                         return Err(error.with_capability_metadata(capability_probe_metadata(
+                            api_protocol,
                             profile.profile,
                             index as u32 + 1,
                             index as u32,
@@ -1273,6 +1365,7 @@ impl OpenAiProvider {
                     );
                     if index + 1 == profile_count {
                         return Err(error.with_capability_metadata(capability_probe_metadata(
+                            api_protocol,
                             profile.profile,
                             index as u32 + 1,
                             index as u32,
@@ -1286,6 +1379,7 @@ impl OpenAiProvider {
                     let error = capability_probe_continuation_error(&continuation.response);
                     if index + 1 == profile_count {
                         return Err(error.with_capability_metadata(capability_probe_metadata(
+                            api_protocol,
                             profile.profile,
                             index as u32 + 1,
                             index as u32,
@@ -1298,6 +1392,7 @@ impl OpenAiProvider {
                 let negotiation = ProviderProtocolNegotiation {
                     contract,
                     metadata: capability_probe_metadata(
+                        api_protocol,
                         negotiated_profile,
                         index as u32 + 1,
                         index as u32,
@@ -1305,15 +1400,12 @@ impl OpenAiProvider {
                         &probe_attempt_metadata,
                     ),
                 };
-                self.tool_capability_cache
-                    .lock()
-                    .map_err(|_| provider_capability_cache_error())?
-                    .insert(model_name.to_string(), negotiation.clone());
                 return Ok(negotiation);
             }
             if index + 1 == profile_count {
                 return Err(capability_probe_response_error(&completion.response)
                     .with_capability_metadata(capability_probe_metadata(
+                        api_protocol,
                         profile.profile,
                         index as u32 + 1,
                         index as u32,
@@ -1334,12 +1426,22 @@ impl OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         contract: &ProviderProtocolContract,
-        model_name: &str,
+        api_protocol: ProviderApiProtocol,
         probe_usage: &mut ModelUsage,
         probe_attempt_metadata: &mut ProviderAttemptMetadata,
     ) -> Result<OpenAiCompletion, ProviderError> {
-        let result =
-            self.complete_with_contract_details(request, cancellation, contract, model_name);
+        let model_name = request
+            .model_preferences
+            .model_name
+            .as_deref()
+            .unwrap_or(&self.config.model_name);
+        let result = self.complete_with_contract_details(
+            request,
+            cancellation,
+            contract,
+            api_protocol,
+            model_name,
+        );
         match &result {
             Ok(completion) => {
                 add_model_usage(probe_usage, &completion.response.usage);
@@ -1361,10 +1463,16 @@ impl OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         capabilities: &ProviderProtocolContract,
+        api_protocol: ProviderApiProtocol,
         model_name: &str,
     ) -> Result<ModelTurnResponse, ProviderError> {
-        let completion =
-            self.complete_with_contract_details(request, cancellation, capabilities, model_name)?;
+        let completion = self.complete_with_contract_details(
+            request,
+            cancellation,
+            capabilities,
+            api_protocol,
+            model_name,
+        )?;
         if !request.tools.is_empty() && completion.reasoning_content_present {
             return Err(provider_tool_reasoning_history_error(
                 &completion.response,
@@ -1379,6 +1487,7 @@ impl OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         capabilities: &ProviderProtocolContract,
+        api_protocol: ProviderApiProtocol,
         model_name: &str,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1387,6 +1496,20 @@ impl OpenAiProvider {
             .map_err(provider_runtime_error)?;
         let started_at = Instant::now();
         let mut metadata = ProviderAttemptMetadata::zero();
+        let endpoint = match api_protocol {
+            ProviderApiProtocol::OpenAiResponses => responses_endpoint(&self.config.base_url),
+            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                self.config.endpoint()
+            }
+        };
+        let request_payload = match api_protocol {
+            ProviderApiProtocol::OpenAiResponses => {
+                openai_responses_request_payload(request, model_name, capabilities)
+            }
+            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                openai_request_payload(request, model_name, capabilities)
+            }
+        };
         loop {
             if cancellation.is_cancelled() {
                 return Err(provider_cancelled_error().with_provider_attempt_metadata(
@@ -1403,9 +1526,9 @@ impl OpenAiProvider {
                     self.request_timeout_seconds,
                     || {
                         self.client
-                            .post(self.config.endpoint())
+                            .post(&endpoint)
                             .bearer_auth(&self.config.api_key)
-                            .json(&openai_request_payload(request, model_name, capabilities))
+                            .json(&request_payload)
                             .send()
                     },
                 ) {
@@ -1499,8 +1622,27 @@ impl OpenAiProvider {
                         &metadata, started_at,
                     ))
             })?;
-            let reasoning_content_present = openai_reasoning_content_present(&payload);
-            return parse_openai_response(request, &self.config, payload, capabilities, model_name)
+            let reasoning_content_present = match api_protocol {
+                ProviderApiProtocol::OpenAiResponses => {
+                    openai_responses_reasoning_content_present(&payload)
+                }
+                ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                    openai_reasoning_content_present(&payload)
+                }
+            };
+            let parsed = match api_protocol {
+                ProviderApiProtocol::OpenAiResponses => parse_openai_responses_response(
+                    request,
+                    &self.config,
+                    payload,
+                    capabilities,
+                    model_name,
+                ),
+                ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                    parse_openai_response(request, &self.config, payload, capabilities, model_name)
+                }
+            };
+            return parsed
                 .map(|mut response| {
                     response.provider_attempt_metadata =
                         Some(provider_attempt_metadata(&metadata, started_at));
@@ -1546,8 +1688,12 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error()
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
-        let (capabilities, capability_metadata) = if request.tools.is_empty() {
-            (self.protocol_contract(), None)
+        let (capabilities, capability_metadata, api_protocol) = if request.tools.is_empty() {
+            (
+                self.protocol_contract(),
+                None,
+                self.config.completion_protocol_without_tools(),
+            )
         } else {
             let effective_model_name = request
                 .model_preferences
@@ -1556,7 +1702,12 @@ impl Provider for OpenAiProvider {
                 .unwrap_or(&self.config.model_name);
             let negotiation =
                 self.negotiate_openai_tool_capabilities(effective_model_name, cancellation)?;
-            (negotiation.contract, Some(negotiation.metadata))
+            let api_protocol = negotiation.metadata.api_protocol;
+            (
+                negotiation.contract,
+                Some(negotiation.metadata),
+                api_protocol,
+            )
         };
         let request_validation =
             validate_model_request_with_capabilities(request, Some(&capabilities));
@@ -1589,8 +1740,14 @@ impl Provider for OpenAiProvider {
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        self.complete_with_contract(request, cancellation, &capabilities, effective_model_name)
-            .map_err(|error| attach_capability_metadata(error, &capability_metadata))
+        self.complete_with_contract(
+            request,
+            cancellation,
+            &capabilities,
+            api_protocol,
+            effective_model_name,
+        )
+        .map_err(|error| attach_capability_metadata(error, &capability_metadata))
     }
 }
 
@@ -1642,6 +1799,19 @@ pub fn chat_completions_endpoint(base_url: &str) -> String {
         format!("{trimmed}{CHAT_COMPLETIONS_PATH}")
     } else {
         format!("{trimmed}{V1_CHAT_COMPLETIONS_PATH}")
+    }
+}
+
+pub fn responses_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with(RESPONSES_PATH) {
+        trimmed.to_string()
+    } else if let Some(prefix) = trimmed.strip_suffix(CHAT_COMPLETIONS_PATH) {
+        format!("{prefix}{RESPONSES_PATH}")
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}{RESPONSES_PATH}")
+    } else {
+        format!("{trimmed}{V1_RESPONSES_PATH}")
     }
 }
 
@@ -1720,6 +1890,130 @@ fn openai_request_payload(
         }
     }
     payload
+}
+
+fn openai_responses_request_payload(
+    request: &ModelTurnRequest,
+    model_name: &str,
+    capabilities: &ProviderProtocolContract,
+) -> Value {
+    let (instructions, input) = openai_responses_input(&request.messages);
+    let mut payload = json!({
+        "model": request
+            .model_preferences
+            .model_name
+            .as_deref()
+            .unwrap_or(model_name),
+        "input": input,
+        "stream": false,
+        "store": false,
+    });
+    if let Some(instructions) = instructions {
+        payload["instructions"] = json!(instructions);
+    }
+    if let Some(max_output_tokens) = request.model_preferences.max_output_tokens {
+        payload["max_output_tokens"] = json!(max_output_tokens);
+    }
+    if let Some(temperature) = request.model_preferences.temperature {
+        payload["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = request.model_preferences.top_p {
+        payload["top_p"] = json!(top_p);
+    }
+    if request.model_preferences.json_mode {
+        payload["text"] = json!({"format": {"type": "json_object"}});
+    }
+    if !request.tools.is_empty() {
+        payload["tools"] = json!(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters_schema,
+                        "strict": request.tool_choice.strict_tool_schema,
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+        payload["tool_choice"] = openai_responses_tool_choice_payload(request);
+        payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
+        if capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls {
+            payload["reasoning"] = json!({"effort": "none"});
+        }
+    }
+    payload
+}
+
+fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
+    let instruction_count = messages
+        .iter()
+        .take_while(|message| matches!(message.role, ModelRole::System | ModelRole::Developer))
+        .count();
+    let instructions = messages[..instruction_count]
+        .iter()
+        .map(message_text)
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut items = Vec::new();
+    for message in &messages[instruction_count..] {
+        match message.role {
+            ModelRole::Tool => {
+                items.push(json!({
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id,
+                    "output": message_text(message),
+                }));
+            }
+            ModelRole::Assistant => {
+                if !message_text(message).is_empty() {
+                    items.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": message_text(message),
+                    }));
+                }
+                items.extend(message.tool_calls.iter().map(|call| {
+                    json!({
+                        "type": "function_call",
+                        "call_id": call.tool_call_id,
+                        "name": call.tool_name,
+                        "arguments": call.raw_arguments,
+                    })
+                }));
+            }
+            ModelRole::System | ModelRole::Developer | ModelRole::User => {
+                let role = match message.role {
+                    ModelRole::System => "system",
+                    ModelRole::Developer => "developer",
+                    ModelRole::User => "user",
+                    ModelRole::Assistant | ModelRole::Tool => unreachable!(),
+                };
+                items.push(json!({
+                    "type": "message",
+                    "role": role,
+                    "content": message_text(message),
+                }));
+            }
+        }
+    }
+    ((!instructions.is_empty()).then_some(instructions), items)
+}
+
+fn openai_responses_tool_choice_payload(request: &ModelTurnRequest) -> Value {
+    match request.tool_choice.mode {
+        ToolChoiceMode::None => json!("none"),
+        ToolChoiceMode::Required => json!("required"),
+        ToolChoiceMode::SpecificTool => match &request.tool_choice.tool_name {
+            Some(name) => json!({"type": "function", "name": name}),
+            None => json!("auto"),
+        },
+        ToolChoiceMode::Auto | ToolChoiceMode::AllowedTools => json!("auto"),
+    }
 }
 
 fn openai_message_payload(message: &ModelMessage) -> Value {
@@ -1815,6 +2109,7 @@ struct CapabilityProbeExpectedCall {
 fn capability_probe_profiles(
     config: &OpenAiProviderConfig,
     model_name: &str,
+    api_protocol: ProviderApiProtocol,
 ) -> Vec<CapabilityProbeProfile> {
     let base = config.protocol_contract();
     let schema_branch = |label: &str| {
@@ -1922,6 +2217,11 @@ fn capability_probe_profiles(
                          tool_definition_mode: ProviderToolDefinitionMode| {
         ProviderProtocolContract {
             supports_strict_tool_schema: strict,
+            tool_reasoning_mode: if api_protocol == ProviderApiProtocol::OpenAiResponses {
+                ProviderToolReasoningMode::DisabledForToolCalls
+            } else {
+                ProviderToolReasoningMode::Unspecified
+            },
             tool_definition_mode,
             max_tool_calls_per_turn,
             max_tools_per_request,
@@ -2196,6 +2496,214 @@ fn openai_reasoning_content_present(payload: &Value) -> bool {
     }
 }
 
+fn openai_responses_reasoning_content_present(payload: &Value) -> bool {
+    payload
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("reasoning")
+                    && ["content", "summary", "encrypted_content", "text"]
+                        .iter()
+                        .filter_map(|field| item.get(*field))
+                        .any(value_has_content)
+            })
+        })
+}
+
+fn value_has_content(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+fn parse_openai_responses_response(
+    request: &ModelTurnRequest,
+    config: &OpenAiProviderConfig,
+    payload: Value,
+    capabilities: &ProviderProtocolContract,
+    model_name: &str,
+) -> Result<ModelTurnResponse, ProviderError> {
+    if payload.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(provider_response_validation_error(
+            config,
+            model_name,
+            "provider Responses payload contained an error",
+            vec!["responses_error_present".to_string()],
+        ));
+    }
+    let status = payload.get("status").and_then(Value::as_str);
+    if status != Some("completed") {
+        return Err(provider_response_validation_error(
+            config,
+            model_name,
+            "provider Responses payload was not completed",
+            vec!["responses_status_not_completed".to_string()],
+        ));
+    }
+    let output = payload
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            provider_response_validation_error(
+                config,
+                model_name,
+                "provider Responses payload missing output items",
+                vec!["responses_output_missing".to_string()],
+            )
+        })?;
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    for (index, item) in output.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let message = parse_openai_responses_message(item).map_err(|evidence| {
+                    provider_response_validation_error(
+                        config,
+                        model_name,
+                        "provider Responses message content was invalid",
+                        vec![evidence.to_string()],
+                    )
+                })?;
+                content.push_str(&message);
+            }
+            Some("function_call") => tool_calls.push(parse_openai_responses_tool_call(index, item)),
+            Some("reasoning") if !openai_responses_reasoning_item_has_content(item) => {}
+            Some("reasoning") => {
+                return Err(provider_response_validation_error(
+                    config,
+                    model_name,
+                    "provider returned reasoning content that cannot be replayed safely",
+                    vec!["responses_reasoning_content_present".to_string()],
+                ));
+            }
+            _ => {
+                return Err(provider_response_validation_error(
+                    config,
+                    model_name,
+                    "provider Responses payload contained an unsupported output item",
+                    vec!["responses_output_item_unsupported".to_string()],
+                ));
+            }
+        }
+    }
+    let assistant_message = Some(ModelMessage {
+        tool_calls: tool_calls.clone(),
+        ..ModelMessage::text(ModelRole::Assistant, content)
+    });
+    finalize_provider_response(
+        request,
+        config,
+        model_name,
+        capabilities,
+        payload
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("response")
+            .to_string(),
+        assistant_message,
+        tool_calls,
+        parse_openai_responses_usage(payload.get("usage")),
+        status.map(str::to_string),
+    )
+}
+
+fn openai_responses_reasoning_item_has_content(item: &Value) -> bool {
+    ["content", "summary", "encrypted_content", "text"]
+        .iter()
+        .filter_map(|field| item.get(*field))
+        .any(value_has_content)
+}
+
+fn parse_openai_responses_message(message: &Value) -> Result<String, &'static str> {
+    match message.get("content") {
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Array(parts)) => {
+            let mut content = String::new();
+            for part in parts {
+                let text = match part.get("type").and_then(Value::as_str) {
+                    Some("output_text") | Some("text") => part.get("text").and_then(Value::as_str),
+                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                    _ => return Err("responses_message_content_part_unsupported"),
+                }
+                .ok_or("responses_message_content_text_missing")?;
+                content.push_str(text);
+            }
+            Ok(content)
+        }
+        None | Some(Value::Null) => Err("responses_message_content_missing"),
+        Some(_) => Err("responses_message_content_invalid"),
+    }
+}
+
+fn parse_openai_responses_tool_call(_index: usize, call: &Value) -> ModelToolCall {
+    let arguments_value = call.get("arguments").unwrap_or(&Value::Null);
+    let raw_arguments = match arguments_value {
+        Value::String(raw) => raw.clone(),
+        Value::Object(_) => serde_json::to_string(arguments_value).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let (arguments, parse_status, validation_errors) = if arguments_value.is_object() {
+        (
+            arguments_value.clone(),
+            ModelToolParseStatus::Valid,
+            Vec::new(),
+        )
+    } else {
+        parse_tool_arguments(&raw_arguments)
+    };
+    ModelToolCall {
+        tool_call_id: call
+            .get("call_id")
+            .or_else(|| call.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        tool_name: call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        arguments,
+        raw_arguments,
+        parse_status,
+        validation_errors,
+    }
+}
+
+fn parse_openai_responses_usage(usage: Option<&Value>) -> ModelUsage {
+    let Some(usage) = usage else {
+        return ModelUsage::default();
+    };
+    ModelUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        total_tokens: usage
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        cached_input_tokens: usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        reasoning_tokens: usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        cost_estimate: None,
+    }
+}
+
 fn parse_openai_response(
     request: &ModelTurnRequest,
     config: &OpenAiProviderConfig,
@@ -2247,13 +2755,38 @@ fn parse_openai_response(
         .get("finish_reason")
         .and_then(Value::as_str)
         .map(str::to_string);
+    finalize_provider_response(
+        request,
+        config,
+        model_name,
+        capabilities,
+        response_id,
+        assistant_message,
+        tool_calls,
+        parse_openai_usage(payload.get("usage")),
+        finish_reason,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_provider_response(
+    request: &ModelTurnRequest,
+    config: &OpenAiProviderConfig,
+    model_name: &str,
+    capabilities: &ProviderProtocolContract,
+    response_id: String,
+    assistant_message: Option<ModelMessage>,
+    tool_calls: Vec<ModelToolCall>,
+    usage: ModelUsage,
+    finish_reason: Option<String>,
+) -> Result<ModelTurnResponse, ProviderError> {
     let mut response = ModelTurnResponse {
         request_id: request.request_id.clone(),
-        response_id: response_id.clone(),
+        response_id,
         status: ModelTurnStatus::Success,
         assistant_message,
         tool_calls,
-        usage: parse_openai_usage(payload.get("usage")),
+        usage,
         finish_reason,
         validation: None,
         error: None,
@@ -2553,6 +3086,7 @@ fn provider_cancelled_error() -> ProviderError {
 
 fn capability_probe_cancelled_error() -> ProviderError {
     provider_cancelled_error().with_capability_metadata(capability_probe_metadata(
+        ProviderApiProtocol::Declared,
         ProviderCapabilityProfile::Declared,
         0,
         0,
@@ -2588,6 +3122,7 @@ fn capability_probe_definition_error(errors: Vec<String>) -> ProviderError {
 }
 
 fn capability_probe_metadata(
+    api_protocol: ProviderApiProtocol,
     profile: ProviderCapabilityProfile,
     profile_attempts: u32,
     fallback_count: u32,
@@ -2595,6 +3130,7 @@ fn capability_probe_metadata(
     probe_attempt_metadata: &ProviderAttemptMetadata,
 ) -> ProviderCapabilityMetadata {
     ProviderCapabilityMetadata {
+        api_protocol,
         profile,
         cache_hit: false,
         profile_attempts,
@@ -2606,11 +3142,7 @@ fn capability_probe_metadata(
 
 fn capability_probe_failure(
     error: ProviderError,
-    profile: ProviderCapabilityProfile,
-    profile_attempts: u32,
-    fallback_count: u32,
-    probe_usage: &ModelUsage,
-    probe_attempt_metadata: &ProviderAttemptMetadata,
+    metadata: ProviderCapabilityMetadata,
     evidence: &str,
 ) -> ProviderError {
     let provider_attempt_metadata = error.provider_attempt_metadata.clone();
@@ -2628,13 +3160,7 @@ fn capability_probe_failure(
     } else {
         provider_error
     };
-    provider_error.with_capability_metadata(capability_probe_metadata(
-        profile,
-        profile_attempts,
-        fallback_count,
-        probe_usage,
-        probe_attempt_metadata,
-    ))
+    provider_error.with_capability_metadata(metadata)
 }
 
 fn cache_hit_negotiation(
@@ -2646,6 +3172,36 @@ fn cache_hit_negotiation(
     negotiation.metadata.probe_usage = ModelUsage::default();
     negotiation.metadata.probe_attempt_metadata = ProviderAttemptMetadata::zero();
     negotiation
+}
+
+fn merge_capability_metadata(
+    target: &mut ProviderCapabilityMetadata,
+    previous: &ProviderCapabilityMetadata,
+) {
+    target.profile_attempts = target
+        .profile_attempts
+        .saturating_add(previous.profile_attempts);
+    target.fallback_count = target
+        .fallback_count
+        .saturating_add(previous.fallback_count);
+    add_model_usage(&mut target.probe_usage, &previous.probe_usage);
+    add_provider_attempt_metadata(
+        &mut target.probe_attempt_metadata,
+        &previous.probe_attempt_metadata,
+    );
+}
+
+fn provider_protocol_fallback_allowed(error: &ProviderError) -> bool {
+    error.error.kind == ModelErrorKind::UnsupportedCapability
+        || (error.error.stage == Some(ProviderErrorStage::ResponseStatus)
+            && matches!(
+                error.error.http_status,
+                Some(
+                    HTTP_STATUS_BAD_REQUEST
+                        | HTTP_STATUS_NOT_FOUND
+                        | HTTP_STATUS_UNPROCESSABLE_ENTITY
+                )
+            ))
 }
 
 fn capability_probe_unsupported_error(mut error: ModelError) -> ProviderError {
@@ -2800,10 +3356,6 @@ fn is_capability_probe_profile_rejection(error: &ProviderError) -> bool {
             error.error.http_status,
             Some(HTTP_STATUS_BAD_REQUEST | HTTP_STATUS_UNPROCESSABLE_ENTITY)
         )
-}
-
-fn is_capability_probe_validation_mismatch(error: &ProviderError) -> bool {
-    error.error.stage == Some(ProviderErrorStage::ResponseValidation)
 }
 
 fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> bool {

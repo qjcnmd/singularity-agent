@@ -4,12 +4,13 @@ use singularity_model::{
     ModelErrorCategory, ModelErrorKind, ModelMessage, ModelPreferences, ModelProviderConfig,
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
-    ProviderAttemptMetadata, ProviderCapabilityProfile, ProviderConfigSnapshot,
-    ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
+    ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityProfile,
+    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
     ProviderProtocolContract, ProviderToolDefinitionMode, ProviderToolReasoningMode,
     ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint, classify_model_error,
-    resolve_provider_config, validate_model_request, validate_model_request_with_capabilities,
-    validate_model_response, validate_model_turn_response, validate_provider_config,
+    resolve_provider_config, responses_endpoint, validate_model_request,
+    validate_model_request_with_capabilities, validate_model_response,
+    validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -51,6 +52,14 @@ fn tool_call(id: &str, name: &str) -> ModelToolCall {
 }
 
 fn provider_test_config(base_url: String) -> OpenAiProviderConfig {
+    provider_config_with_base_url(chat_completions_endpoint(&base_url))
+}
+
+fn provider_auto_test_config(base_url: String) -> OpenAiProviderConfig {
+    provider_config_with_base_url(base_url)
+}
+
+fn provider_config_with_base_url(base_url: String) -> OpenAiProviderConfig {
     OpenAiProviderConfig {
         provider_name: "openai_compatible".to_string(),
         model_name: "gpt-test".to_string(),
@@ -132,6 +141,110 @@ fn captured_request_server(
             write_provider_response(&mut stream, status_line, body, false);
             break;
         }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn responses_provider_server(
+    actual_body: serde_json::Value,
+) -> (String, Receiver<Vec<(String, String)>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Responses provider");
+    let addr = listener.local_addr().expect("Responses provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept Responses request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/responses"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            requests.push((first_line, request_body.clone()));
+            if let Some(body) = responses_capability_probe_response(&request_body) {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
+                continue;
+            }
+            let body = actual_body.to_string();
+            write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
+            tx.send(requests).expect("send Responses requests");
+            break;
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn responses_to_chat_fallback_server() -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind protocol fallback provider");
+    let addr = listener
+        .local_addr()
+        .expect("protocol fallback provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut paths = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().expect("accept protocol request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let (first_line, _, request_body) = read_provider_request(&mut reader);
+            paths.push(first_line.clone());
+            if first_line.contains("/v1/responses") {
+                write_provider_response(
+                    &mut stream,
+                    "HTTP/1.1 404 Not Found",
+                    r#"{"error":"unsupported endpoint"}"#,
+                    false,
+                );
+                continue;
+            }
+            assert!(first_line.contains("/v1/chat/completions"));
+            if let Some(body) = capability_probe_response(&request_body) {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &body, false);
+                continue;
+            }
+            write_provider_response(
+                &mut stream,
+                "HTTP/1.1 200 OK",
+                &serde_json::json!({
+                    "id": "chat_actual",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_read",
+                                "type": "function",
+                                "function": {"name": "builtin_read", "arguments": "{}"}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                })
+                .to_string(),
+                false,
+            );
+            tx.send(paths).expect("send protocol fallback paths");
+            break;
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn protocol_status_server(
+    status_line: &'static str,
+    body: &'static str,
+) -> (String, Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind protocol status provider");
+    let addr = listener
+        .local_addr()
+        .expect("protocol status provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept protocol request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone protocol stream"));
+        let (first_line, headers, _) = read_provider_request(&mut reader);
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        write_provider_response(&mut stream, status_line, body, false);
+        tx.send(first_line).expect("send protocol request path");
     });
     (format!("http://{addr}"), rx)
 }
@@ -863,6 +976,86 @@ fn capability_probe_response(request_body: &str) -> Option<String> {
     )
 }
 
+fn responses_capability_probe_response(request_body: &str) -> Option<String> {
+    let request: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let tools = request.get("tools")?.as_array()?;
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    let continuation = request
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        });
+    let (tool_name, arguments) = if names.contains(&"singularity_capability_router") {
+        (
+            "singularity_capability_router",
+            serde_json::json!({
+                "tool_name": "singularity_capability_probe_a",
+                "arguments": {"probe": "schema_sentinel_alpha", "values": [7, 7]}
+            }),
+        )
+    } else if names.contains(&"singularity_capability_probe_a") {
+        let strict = tools
+            .iter()
+            .any(|tool| tool.get("strict").and_then(serde_json::Value::as_bool) == Some(true));
+        (
+            "singularity_capability_probe_a",
+            if strict {
+                serde_json::json!({"probe": "schema_sentinel_alpha", "values": [7, 7]})
+            } else {
+                serde_json::json!({})
+            },
+        )
+    } else {
+        return None;
+    };
+    let mut calls = vec![serde_json::json!({
+        "type": "function_call",
+        "call_id": if continuation { "probe_call_continuation" } else { "probe_call_a" },
+        "name": tool_name,
+        "arguments": arguments.to_string(),
+    })];
+    if !continuation
+        && names.contains(&"singularity_capability_probe_b")
+        && request["parallel_tool_calls"] == true
+    {
+        let strict = tools
+            .iter()
+            .any(|tool| tool.get("strict").and_then(serde_json::Value::as_bool) == Some(true));
+        calls.push(serde_json::json!({
+            "type": "function_call",
+            "call_id": "probe_call_b",
+            "name": "singularity_capability_probe_b",
+            "arguments": if strict {
+                serde_json::json!({"probe": "schema_sentinel_alpha", "values": [7, 7]}).to_string()
+            } else {
+                serde_json::json!({}).to_string()
+            },
+        }));
+    }
+    Some(
+        serde_json::json!({
+            "id": if continuation { "capability_probe_continuation_response" } else { "capability_probe_response" },
+            "object": "response",
+            "status": "completed",
+            "output": calls,
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 1,
+                "total_tokens": 3,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0}
+            }
+        })
+        .to_string(),
+    )
+}
+
 fn is_capability_probe_continuation_request(request_body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(request_body)
         .ok()
@@ -1202,6 +1395,18 @@ fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
         chat_completions_endpoint("https://provider.example/api"),
         "https://provider.example/api/v1/chat/completions"
     );
+    assert_eq!(
+        responses_endpoint("https://provider.example/v1"),
+        "https://provider.example/v1/responses"
+    );
+    assert_eq!(
+        responses_endpoint("https://provider.example/v1/chat/completions"),
+        "https://provider.example/v1/responses"
+    );
+    assert_eq!(
+        responses_endpoint("https://provider.example/api"),
+        "https://provider.example/api/v1/responses"
+    );
 
     let config = OpenAiProviderConfig::from_env(|name| match name {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
@@ -1219,6 +1424,241 @@ fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
     assert_eq!(status.api_key_status, "present(redacted)");
     assert!(!serialized.contains("sk-secret-value"));
     assert!(!serialized.contains("provider.example"));
+}
+
+#[test]
+fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
+    let (base_url, requests) = responses_provider_server(serde_json::json!({
+        "id": "response_actual",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_read",
+            "name": "builtin_read",
+            "arguments": "{}"
+        }],
+        "usage": {
+            "input_tokens": 9,
+            "output_tokens": 4,
+            "total_tokens": 13,
+            "input_tokens_details": {"cached_tokens": 2},
+            "output_tokens_details": {"reasoning_tokens": 0}
+        }
+    }));
+    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
+    let cancellation = singularity_core::CancellationToken::new();
+    let negotiation = provider
+        .negotiate_tool_capabilities(&ModelPreferences::default(), &cancellation)
+        .expect("Responses capability negotiation");
+
+    assert_eq!(
+        negotiation.metadata.api_protocol,
+        ProviderApiProtocol::OpenAiResponses
+    );
+    assert_eq!(
+        negotiation.metadata.profile,
+        ProviderCapabilityProfile::StrictParallel
+    );
+    assert_eq!(
+        negotiation.contract.tool_reasoning_mode,
+        ProviderToolReasoningMode::DisabledForToolCalls
+    );
+
+    let request = capability_test_request(None, false, 2);
+    let response = provider
+        .complete(&request, &cancellation)
+        .expect("Responses completion");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "builtin_read");
+    assert_eq!(response.tool_calls[0].tool_call_id, "call_read");
+    assert_eq!(response.usage.input_tokens, 9);
+    assert_eq!(response.usage.cached_input_tokens, 2);
+
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured Responses requests");
+    assert_eq!(captured.len(), 3);
+    let first: serde_json::Value =
+        serde_json::from_str(&captured[0].1).expect("first Responses probe JSON");
+    assert_eq!(first["store"], false);
+    assert_eq!(first["reasoning"]["effort"], "none");
+    assert_eq!(first["tool_choice"], "auto");
+    assert_eq!(first["parallel_tool_calls"], true);
+    assert!(
+        first["instructions"]
+            .as_str()
+            .is_some_and(|instructions| instructions.contains("capability probe"))
+    );
+    assert_eq!(first["input"][0]["role"], "user");
+    assert!(
+        first["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["role"] != "developer"))
+    );
+    assert_eq!(first["tools"][0]["type"], "function");
+    assert_eq!(first["tools"][0]["strict"], true);
+    assert!(first["tools"][0].get("function").is_none());
+
+    let continuation: serde_json::Value =
+        serde_json::from_str(&captured[1].1).expect("Responses continuation JSON");
+    let continuation_items = continuation["input"]
+        .as_array()
+        .expect("Responses continuation items");
+    assert!(
+        continuation_items
+            .iter()
+            .any(|item| item["type"] == "function_call")
+    );
+    assert!(
+        continuation_items
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    );
+
+    let actual: serde_json::Value =
+        serde_json::from_str(&captured[2].1).expect("actual Responses request JSON");
+    assert_eq!(actual["tools"][0]["name"], "builtin_read");
+    assert_eq!(actual["tools"][0]["strict"], false);
+    assert_eq!(actual["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
+    let (base_url, requests) = responses_provider_server(serde_json::json!({
+        "id": "response_text_tool_call",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "<tool_call><function=builtin_read><parameter=path>Cargo.toml</parameter></function></tool_call>"
+            }]
+        }],
+        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    }));
+    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
+    let response = provider
+        .complete(
+            &capability_test_request(None, false, 2),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("invalid provider response remains observable");
+
+    assert_eq!(response.status, ModelTurnStatus::Invalid);
+    assert!(response.tool_calls.is_empty());
+    assert_eq!(
+        response.validation.expect("response validation").errors,
+        vec!["text_tool_call_envelope_not_supported"]
+    );
+    assert_eq!(
+        requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured Responses requests")
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn openai_provider_falls_back_from_unsupported_responses_endpoint_to_chat() {
+    let (base_url, requests) = responses_to_chat_fallback_server();
+    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
+    let cancellation = singularity_core::CancellationToken::new();
+    let negotiation = provider
+        .negotiate_tool_capabilities(&ModelPreferences::default(), &cancellation)
+        .expect("Chat fallback negotiation");
+
+    assert_eq!(
+        negotiation.metadata.api_protocol,
+        ProviderApiProtocol::OpenAiChatCompletions
+    );
+    assert_eq!(negotiation.metadata.profile_attempts, 2);
+    assert_eq!(negotiation.metadata.fallback_count, 1);
+
+    let response = provider
+        .complete(&capability_test_request(None, false, 2), &cancellation)
+        .expect("Chat fallback completion");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(response.tool_calls[0].tool_name, "builtin_read");
+
+    let paths = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured protocol fallback paths");
+    assert_eq!(paths.len(), 4);
+    assert!(paths[0].contains("/v1/responses"));
+    assert!(
+        paths[1..]
+            .iter()
+            .all(|path| path.contains("/v1/chat/completions"))
+    );
+}
+
+#[test]
+fn openai_provider_does_not_fallback_protocol_on_authentication_failure() {
+    let (base_url, request_path) =
+        protocol_status_server("HTTP/1.1 401 Unauthorized", r#"{"error":"unauthorized"}"#);
+    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
+    let error = provider
+        .negotiate_tool_capabilities(
+            &ModelPreferences::default(),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("authentication failure must terminate protocol negotiation");
+
+    assert_eq!(error.error.kind, ModelErrorKind::AuthError);
+    assert_eq!(error.error.http_status, Some(401));
+    assert_eq!(
+        error
+            .capability_metadata
+            .expect("capability metadata")
+            .api_protocol,
+        ProviderApiProtocol::OpenAiResponses
+    );
+    assert!(
+        request_path
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured protocol request")
+            .contains("/v1/responses")
+    );
+}
+
+#[test]
+fn openai_provider_does_not_retry_or_fallback_malformed_responses_output() {
+    let (base_url, request_path) = protocol_status_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"bad_response","status":"completed","output":[{"type":"unsupported"}]}"#,
+    );
+    let provider = OpenAiProvider::new(provider_auto_test_config(base_url)).expect("provider");
+    let error = provider
+        .negotiate_tool_capabilities(
+            &ModelPreferences::default(),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("malformed Responses output must terminate negotiation");
+
+    assert_eq!(error.error.kind, ModelErrorKind::JsonSchemaViolation);
+    assert_eq!(
+        error.error.stage,
+        Some(ProviderErrorStage::ResponseValidation)
+    );
+    assert_eq!(
+        error.error.validation_errors,
+        vec!["responses_output_item_unsupported"]
+    );
+    let metadata = error.capability_metadata.expect("capability metadata");
+    assert_eq!(metadata.api_protocol, ProviderApiProtocol::OpenAiResponses);
+    assert_eq!(metadata.profile_attempts, 1);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 1);
+    assert!(
+        request_path
+            .recv_timeout(Duration::from_secs(1))
+            .expect("captured protocol request")
+            .contains("/v1/responses")
+    );
 }
 
 #[test]

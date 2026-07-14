@@ -8,8 +8,8 @@ use singularity_core::CancellationToken;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelPreferences,
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
-    ModelTurnStatus, ModelUsage, Provider, ProviderAttemptMetadata, ProviderCapabilityMetadata,
-    ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
+    ModelTurnStatus, ModelUsage, Provider, ProviderApiProtocol, ProviderAttemptMetadata,
+    ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
     ProviderProtocolNegotiation, ProviderToolDefinitionMode, ToolChoiceMode,
 };
 use singularity_policy::{
@@ -98,6 +98,7 @@ impl Provider for NegotiatingProvider {
 
 fn negotiated_capability_metadata() -> ProviderCapabilityMetadata {
     ProviderCapabilityMetadata {
+        api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
         profile: ProviderCapabilityProfile::StrictParallel,
         cache_hit: false,
         profile_attempts: 2,
