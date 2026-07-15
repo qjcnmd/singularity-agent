@@ -1,7 +1,7 @@
-//! AppServer 的 stdio 传输层。
+//! `AppServer` 的标准输入输出（stdio）传输层。
 //!
-//! 输入独立读取；request-worker 准入队列和传输队列均有界，由单一 writer 串行化 JSON 行输出，
-//! 并在背压时保持 fail-closed。
+//! 输入独立读取；请求工作线程准入队列和传输队列均有界，由单一写入方串行化 JSON 行输出，
+//! 并在背压时拒绝继续处理。
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -22,7 +22,7 @@ const INPUT_QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
 const REQUEST_CAPACITY_EXCEEDED: &str = "AppServer request capacity exceeded";
 
-/// 启动 stdio server；传输或生命周期关闭失败时以非零状态退出。
+/// 启动标准输入输出服务；传输或生命周期关闭失败时以非零状态退出。
 fn main() {
     if let Err(error) = run() {
         eprintln!("app-server error: {error}");
@@ -30,7 +30,7 @@ fn main() {
     }
 }
 
-/// 负责 stdin 读取、request-worker 准入、stdout 串行化和优雅关闭。
+/// 负责 `stdin` 读取、请求工作线程准入、`stdout` 串行化和优雅关闭。
 fn run() -> Result<(), String> {
     let db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
@@ -255,7 +255,7 @@ fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
     )
 }
 
-/// 分发一个由 worker 负责的请求，并通过共享有界队列发送全部响应。
+/// 分发一个由工作线程负责的请求，并通过共享有界队列发送全部响应。
 fn run_request_worker(
     mut worker: AppServer,
     message: JsonRpcMessage,
@@ -369,7 +369,7 @@ fn join_request_worker(worker: JoinHandle<Result<(), String>>) -> Result<(), Str
         .map_err(|_| "request worker panicked".to_string())?
 }
 
-/// 入队一个响应；检测到 stdout 背压或断开时停止执行。
+/// 入队一个响应；检测到 `stdout` 背压或断开时停止执行。
 fn send_output(
     sender: &SyncSender<Value>,
     cancellation: &AppServerCancellationHandle,
@@ -384,7 +384,7 @@ fn send_output(
     })
 }
 
-/// 将一个 JSON-RPC 值严格串行化为一条以换行分隔的 stdout 记录。
+/// 将一个 JSON-RPC 值严格串行化为一条以换行分隔的 `stdout` 记录。
 fn write_json_line(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *stdout, value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

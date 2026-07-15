@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Tool schema、broker 决策、workspace 操作和公开 tool-result 投影。
+//! 工具模式、工具代理器决策、工作区操作和公开工具结果投影。
 //!
-//! broker 会在执行边界再次校验面向模型的输入；`WorkspaceTools` 则在任何文件系统副作用前
-//! 强制执行 workspace 和 protected-path 规则。
+//! 工具代理器会在执行边界再次校验面向模型的输入；`WorkspaceTools` 则在任何文件系统副作用前
+//! 强制执行工作区和受保护路径规则。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -80,7 +80,7 @@ pub const BUILTIN_COMMAND_TOOL: &str = "builtin_command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// tool call 可以与其他只读调用并行，还是必须独占运行。
+/// 工具调用可以与其他只读调用并行，还是必须独占运行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionMode {
@@ -88,7 +88,7 @@ pub enum ToolExecutionMode {
     Exclusive,
 }
 
-/// tool 到达执行阶段前返回的结构化校验代码。
+/// 工具到达执行阶段前返回的结构化校验代码。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolInputValidationError {
     pub code: String,
@@ -108,7 +108,7 @@ struct ToolInputBinding {
     execution_input: Value,
 }
 
-/// 面向 Provider 的 schema，以及独立的校验逻辑和可选的精确输入绑定。
+/// 面向模型提供方的模式，以及独立的校验逻辑和可选的精确输入绑定。
 #[derive(Clone)]
 pub struct ToolSpec {
     pub name: String,
@@ -398,7 +398,7 @@ where
         .map_err(|_| ToolInputValidationError::new(validation_code))
 }
 
-/// 返回内置的 workspace 读取、搜索、变更和命令 tool 定义。
+/// 返回内置的工作区读取、搜索、变更和命令工具定义。
 pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -519,7 +519,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// 负责管理向模型暴露且供 broker 使用的 tool 的 registry。
+/// 负责管理向模型暴露且供工具代理器使用的工具注册表。
 #[derive(Debug, Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolSpec>,
@@ -571,7 +571,7 @@ impl ToolRegistry {
     }
 }
 
-/// 保留失败类别，使调用方能够区分输入、策略、sandbox 和执行错误。
+/// 保留失败类别，使调用方能够区分输入、策略、沙箱和执行错误。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolFailureKind {
@@ -591,7 +591,7 @@ pub enum ToolFailureKind {
     Cancelled,
 }
 
-/// 决定 broker 执行、拒绝还是暂停调用的授权结果。
+/// 决定工具代理器执行、拒绝还是暂停调用的授权结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolBrokerDecision {
@@ -639,7 +639,7 @@ impl ToolBrokerDecision {
     }
 }
 
-/// 执行边界；调用 executor closure 前会重新校验 tool 输入。
+/// 执行边界；调用执行器闭包前会重新校验工具输入。
 #[derive(Debug, Default, Clone)]
 pub struct ToolBroker {
     registry: ToolRegistry,
@@ -678,7 +678,7 @@ impl ToolBroker {
         self.registry.validate_execution_input(name, input)
     }
 
-    /// 执行允许的调用；否则返回类型化结果且不调用 closure。
+    /// 执行允许的调用；否则返回类型化结果且不调用闭包。
     pub fn execute<F>(
         &self,
         envelope: &ToolCallRequest,
@@ -740,7 +740,7 @@ impl ToolBroker {
     }
 }
 
-/// 从模型 tool call 传给 broker 和 executor 的规范化 envelope。
+/// 从模型工具调用传给工具代理器和执行器的规范化封装结构。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolCallRequest {
     pub tool_call_id: String,
@@ -762,7 +762,7 @@ impl ToolCallRequest {
     }
 }
 
-/// broker 对其公开投影进行有界化和脱敏前的原始 executor 输出。
+/// 工具代理器对其公开投影进行有界化和脱敏前的执行器原始输出。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolOutput {
     pub ok: bool,
@@ -805,7 +805,7 @@ impl ToolOutput {
     }
 }
 
-/// 用于派生模型历史、trace 和 completion evidence 的有界内部结果。
+/// 用于派生模型历史、追踪和完成证据的有界内部结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolResult {
     pub tool_call_id: String,
@@ -1028,7 +1028,7 @@ fn value_string_array(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-/// workspace tool 返回的 workspace 边界、protected-path、sandbox 和变更错误。
+/// 工作区工具返回的工作区边界、受保护路径、沙箱和变更错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceToolError {
     OutsideWorkspace(String),
@@ -1066,7 +1066,7 @@ impl fmt::Display for WorkspaceToolError {
 
 impl std::error::Error for WorkspaceToolError {}
 
-/// workspace tool 接受的有界文件读取请求。
+/// 工作区工具接受的有界文件读取请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadToolInput {
@@ -1092,7 +1092,7 @@ impl ReadToolInput {
     }
 }
 
-/// workspace tool 接受的有界目录列表请求。
+/// 工作区工具接受的有界目录列表请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListToolInput {
@@ -1124,7 +1124,7 @@ impl ListToolInput {
     }
 }
 
-/// workspace tool 接受的有界文本搜索请求。
+/// 工作区工具接受的有界文本搜索请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrepToolInput {
@@ -1155,7 +1155,7 @@ impl GrepToolInput {
     }
 }
 
-/// workspace tool 接受的单文件替换请求。
+/// 工作区工具接受的单文件替换请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditToolInput {
@@ -1191,7 +1191,7 @@ impl WorkspacePatch {
     }
 }
 
-/// workspace patch 中一个带预期内容保护的变更。
+/// 工作区补丁中一个带预期内容保护的变更。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePatchChange {
@@ -1200,7 +1200,7 @@ pub struct WorkspacePatchChange {
     pub replacement: String,
 }
 
-/// 绑定到根目录的 workspace 文件 tool，以及为命令配置的 strict sandbox backend。
+/// 绑定到根目录的工作区文件工具，以及为命令配置的严格沙箱后端。
 #[derive(Clone)]
 pub struct WorkspaceTools {
     workspace_root: PathBuf,
@@ -1548,7 +1548,7 @@ impl WorkspaceTools {
         self.command_cancellable(input, &CancellationToken::new())
     }
 
-    /// 仅通过已配置的 sandbox 运行命令，并将取消传播给命令。
+    /// 仅通过已配置的沙箱运行命令，并将取消传播给命令。
     pub fn command_cancellable(
         &self,
         input: CommandToolInput,
@@ -1755,7 +1755,7 @@ impl WorkspaceTools {
         Ok(false)
     }
 
-    /// 规范化请求路径，并拒绝越出 workspace 或包含受保护组件的路径。
+    /// 规范化请求路径，并拒绝越出工作区或包含受保护组件的路径。
     fn resolve_workspace_path(
         &self,
         path: &str,
@@ -1917,7 +1917,7 @@ impl CommandModelInput {
     }
 }
 
-/// 面向模型的命令输入；sandbox 和网络模式稍后由执行路径应用。
+/// 面向模型的命令输入；沙箱和网络模式稍后由执行路径应用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandToolInput {
@@ -2039,7 +2039,7 @@ pub fn command_scope_resource(
     }
 }
 
-/// 对命令、cwd、超时、文件系统模式和网络模式计算哈希，用于校验绑定。
+/// 对命令、`cwd`、超时、文件系统模式和网络模式计算哈希，用于校验绑定。
 pub fn command_scope_digest(
     argv: &[String],
     cwd: &str,
@@ -2115,7 +2115,7 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, WorkspaceTool
     Ok(normalize_path(&resolved))
 }
 
-/// 判断规范化路径是否包含受保护或类似 secret 的组件。
+/// 判断规范化路径是否包含受保护或类似敏感信息的组件。
 pub fn is_protected_path(path: &str) -> bool {
     path.replace('\\', "/")
         .split('/')
