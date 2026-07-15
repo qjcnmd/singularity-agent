@@ -3,7 +3,7 @@
 //! 面向模型的消息、模型提供方能力契约和兼容 OpenAI 的传输。
 //!
 //! 模型提供方协商和校验位于此边界，使 `AgentLoop` 只执行选定模型提供方已声明或探测到的
-//! 请求和工具调用。
+//! 请求和 tool call。
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -78,7 +78,7 @@ pub enum ModelRole {
     Tool,
 }
 
-/// 面向模型提供方的消息，包括继续回合所需的工具调用元数据。
+/// 面向模型提供方的消息，包括继续 turn 所需的 tool call 元数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelMessage {
     pub role: ModelRole,
@@ -108,7 +108,7 @@ impl ModelMessage {
     }
 }
 
-/// 控制模型提供方可以选择工具、必须选择一个工具，还是不得调用工具。
+/// 控制模型提供方可以选择 tool、必须选择一个 tool，还是不得调用 tool。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoiceMode {
@@ -117,7 +117,7 @@ pub enum ToolChoiceMode {
     Required,
 }
 
-/// 应用于一次模型请求的工具选择限制和模式严格程度。
+/// 应用于一次模型请求的 tool 选择限制和模式严格程度。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolChoicePolicy {
     pub mode: ToolChoiceMode,
@@ -144,7 +144,7 @@ pub enum ModelToolParseStatus {
     UnknownTool,
 }
 
-/// 一个可执行工具面向模型提供方暴露的模式。
+/// 一个可执行 tool 面向模型提供方暴露的模式。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelToolSchema {
     pub name: String,
@@ -152,7 +152,7 @@ pub struct ModelToolSchema {
     pub parameters_schema: Value,
 }
 
-/// 已解析的模型工具调用，以及原始参数和校验结果。
+/// 已解析的模型 tool call，以及原始参数和校验结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelToolCall {
     pub tool_call_id: String,
@@ -163,7 +163,7 @@ pub struct ModelToolCall {
     pub validation_errors: Vec<String>,
 }
 
-/// 工具推理内容是否符合模型提供方的工具调用历史契约。
+/// tool 推理内容是否符合模型提供方的 tool call 历史契约。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderToolReasoningMode {
@@ -172,7 +172,7 @@ pub enum ProviderToolReasoningMode {
     DisabledForToolCalls,
 }
 
-/// 描述工具是直接发送，还是通过面向模型提供方的路由封装结构发送。
+/// 描述 tool 是直接发送，还是通过面向模型提供方的路由封装结构发送。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderToolDefinitionMode {
@@ -639,7 +639,7 @@ pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
     model_error_category(error)
 }
 
-/// 传给模型提供方的完整模型请求，包括可见工具和工具策略。
+/// 传给模型提供方的完整模型请求，包括可见 tool 和 tool 策略。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelTurnRequest {
     pub request_id: String,
@@ -661,7 +661,7 @@ impl ModelTurnRequest {
     }
 }
 
-/// 模型提供方回合产生了有效完成，还是未通过校验。
+/// 模型提供方 turn 产生了有效完成，还是未通过校验。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTurnStatus {
@@ -670,7 +670,7 @@ pub enum ModelTurnStatus {
     Invalid,
 }
 
-/// 模型提供方完成结果及其配对的已解析工具调用、用量、校验和错误状态。
+/// 模型提供方完成结果及其配对的已解析 tool call、用量、校验和错误状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelTurnResponse {
     pub request_id: String,
@@ -757,7 +757,7 @@ pub trait Provider {
     /// 在动态协商前返回模型提供方声明的基线契约。
     fn protocol_contract(&self) -> ProviderProtocolContract;
 
-    /// 在发送带工具的请求前探测或解析工具能力。
+    /// 在发送带 tool 的请求前探测或解析 tool 能力。
     fn negotiate_tool_capabilities(
         &self,
         _model_preferences: &ModelPreferences,
@@ -3719,7 +3719,7 @@ fn is_portable_tool_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-/// 报告 `JSON Schema` 是否能够在模型提供方的严格工具模式契约下发送。
+/// 报告 `JSON Schema` 是否能够在模型提供方的严格 tool 模式契约下发送。
 pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
     if schema.get("const").is_some() {
         return true;
@@ -3776,7 +3776,7 @@ pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
     }
 }
 
-/// 根据对应请求和协商能力校验完整的模型提供方回合。
+/// 根据对应请求和协商能力校验完整的模型提供方 turn。
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
@@ -3817,7 +3817,7 @@ pub fn validate_model_turn_response(
     result
 }
 
-/// 在 `AgentLoop` 处理前校验已解析的模型提供方内容和工具调用。
+/// 在 `AgentLoop` 处理前校验已解析的模型提供方内容和 tool call。
 pub fn validate_model_response(
     assistant_message: Option<&ModelMessage>,
     tool_calls: &[ModelToolCall],

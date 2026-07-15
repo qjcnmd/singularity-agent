@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! 由 SQLite 支持的会话、回合、审批、追踪、产物和恢复状态。
+//! 由 SQLite 支持的会话、turn、approval、追踪、产物和恢复状态。
 //!
-//! 变更操作使用事务和显式绑定，使审批检查点、回合结果和执行所有权能够恢复，
+//! 变更操作使用事务和显式绑定，使 approval 检查点、turn 结果和执行所有权能够恢复，
 //! 且无需重放未知的外部副作用。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -117,7 +117,7 @@ pub struct ThreadHistoryPage {
     pub next_before_turn_sequence: Option<u64>,
 }
 
-/// 创建回合、用户条目、追踪和初始历史页后得到的原子结果。
+/// 创建 turn、用户条目、追踪和初始历史页后得到的原子结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StartedTurn {
     pub turn: Turn,
@@ -126,7 +126,7 @@ pub struct StartedTurn {
     pub history: ThreadHistoryPage,
 }
 
-/// 回合的原子结果，以及相关的持久化计划、助手条目和追踪（如有）。
+/// turn 的原子结果，以及相关的持久化计划、助手条目和追踪（如有）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTurnOutcome {
     pub turn: Turn,
@@ -135,7 +135,7 @@ pub struct CommittedTurnOutcome {
     pub trace: TraceEvent,
 }
 
-/// 负责回合生命周期、审批、追踪、产物和恢复的持久化 SQLite 存储。
+/// 负责 turn 生命周期、approval、追踪、产物和恢复的持久化 SQLite 存储。
 pub struct SessionStore {
     connection: Connection,
     descriptor: SessionStoreDescriptor,
@@ -154,7 +154,7 @@ enum WorkspaceExecutionScope {
     Thread(String),
 }
 
-/// 审批决定，以及 `AppServer` 所需的检查点和追踪数据。
+/// approval 决定，以及 `AppServer` 所需的检查点和追踪数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordedApprovalDecision {
     pub request: ApprovalRequest,
@@ -174,7 +174,7 @@ pub struct RegisterArtifactRefParams<'a> {
     pub metadata: Value,
 }
 
-/// 为一个终止、已中断或审批阻塞的回合结果提交的持久化字段。
+/// 为一个终止、已中断或 approval 阻塞的 turn 结果提交的持久化字段。
 pub struct CommitTurnOutcomeParams<'a> {
     pub status: TurnStatus,
     pub agent_loop_status: &'a str,
@@ -455,7 +455,7 @@ impl SessionStore {
         Ok((started.turn, started.item, started.trace))
     }
 
-    /// 原子地创建回合、清理其输入、记录追踪，并读取此前的历史。
+    /// 原子地创建 turn、清理其输入、记录追踪，并读取此前的历史。
     pub fn create_turn_with_input_trace_and_history(
         &self,
         thread_id: &str,
@@ -590,7 +590,7 @@ impl SessionStore {
         self.get_turn(turn_id)
     }
 
-    /// 在一个事务中提交回合状态及其持久化条目和追踪。
+    /// 在一个事务中提交 turn 状态及其持久化条目和追踪。
     pub fn commit_turn_outcome(
         &self,
         turn_id: &str,
@@ -691,7 +691,7 @@ impl SessionStore {
         })
     }
 
-    /// 记录取消，同时保留待处理审批与执行中工作之间的区别。
+    /// 记录取消，同时保留待处理 approval 与执行中工作之间的区别。
     pub fn request_turn_cancellation(
         &self,
         turn_id: &str,
@@ -918,7 +918,7 @@ impl SessionStore {
         self.create_approval_with_pending_tool_call_and_trace(request, None, component, summary)
     }
 
-    /// 保存审批请求和可选检查点，并将其绑定到阻塞的回合。
+    /// 保存 approval 请求和可选检查点，并将其绑定到阻塞的 turn。
     pub fn create_approval_with_pending_tool_call_and_trace(
         &self,
         request: &ApprovalRequest,
@@ -1027,7 +1027,7 @@ impl SessionStore {
         Ok(decisions)
     }
 
-    /// 校验并记录审批结果，延后或认领其待执行操作。
+    /// 校验并记录 approval 结果，延后或认领其待执行操作。
     pub fn record_approval_decision(
         &self,
         decision: &ApprovalDecision,
@@ -1248,7 +1248,7 @@ impl SessionStore {
         })
     }
 
-    /// 原子地用回合结果和后续检查点（如有）解决执行中的审批。
+    /// 原子地用 turn 结果和后续检查点（如有）解决执行中的 approval。
     pub fn commit_turn_outcome_and_resolve_pending_execution(
         &self,
         request_id: &str,
@@ -1327,7 +1327,7 @@ impl SessionStore {
         Ok(committed)
     }
 
-    /// 对执行中的审批进行协调，而不重放其未知的外部副作用。
+    /// 对执行中的 approval 进行协调，而不重放其未知的外部副作用。
     fn recover_incomplete_approval_executions_for_thread(
         transaction: &Connection,
         thread_id: &str,

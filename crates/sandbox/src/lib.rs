@@ -105,7 +105,7 @@ pub struct SandboxFilesystemPolicy {
     pub workspace_root: String,
 }
 
-/// 由选定沙箱后端应用的网络策略。
+/// 由选定沙箱 backend 应用的网络策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxNetworkPolicy {
     pub mode: SandboxNetworkMode,
@@ -125,7 +125,7 @@ pub enum CommandExecutionStatus {
     BackendError,
 }
 
-/// 命令结果的领域语义，与后端执行状态分开保存。
+/// 命令结果的领域语义，与 backend 执行状态分开保存。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandSemanticStatus {
@@ -148,7 +148,7 @@ pub enum CommandEnvironmentPolicy {
     EvaluationIsolated,
 }
 
-/// 交给沙箱后端的完整可移植命令请求。
+/// 交给沙箱 backend 的完整可移植命令请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandRequest {
     pub command_id: String,
@@ -193,7 +193,7 @@ impl CommandRequest {
     }
 }
 
-/// 后端实际提供的强制执行强度。
+/// backend 实际提供的强制执行强度。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxBackendEnforcement {
@@ -202,7 +202,7 @@ pub enum SandboxBackendEnforcement {
     Unavailable,
 }
 
-/// 用于区分严格、受限和不可用后端的安全执行元数据。
+/// 用于区分严格、受限和不可用 backend 的安全执行元数据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxExecutionMetadata {
     pub backend: String,
@@ -228,7 +228,7 @@ impl SandboxExecutionMetadata {
     }
 }
 
-/// 带脱敏预览和后端强制执行元数据的有界命令结果。
+/// 带脱敏预览和 backend 强制执行元数据的有界命令结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandResult {
     pub command_id: String,
@@ -418,7 +418,7 @@ fn command_output_contains_sensitive_marker(output: &str) -> bool {
     contains_sensitive_text(output)
 }
 
-/// 后端必须提供、命令执行才可视为可用的能力。
+/// backend 必须提供、命令执行才可视为可用的能力。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxCapabilities {
     pub filesystem_isolation: bool,
@@ -522,13 +522,13 @@ impl SandboxCapabilities {
     }
 }
 
-/// 严格命令执行和取消传播的后端边界。
+/// 严格命令执行和取消传播的 backend 边界。
 pub trait SandboxBackend {
-    /// 用于能力和执行元数据的稳定后端名称。
+    /// 用于能力和执行元数据的稳定 backend 名称。
     fn name(&self) -> &'static str;
-    /// 报告该后端在当前平台能够强制执行的控制项。
+    /// 报告该 backend 在当前平台能够强制执行的控制项。
     fn capabilities(&self) -> SandboxCapabilities;
-    /// 执行一个请求；不可用或不支持的后端必须返回阻塞结果。
+    /// 执行一个请求；不可用或不支持的 backend 必须返回阻塞结果。
     fn execute(&self, request: &CommandRequest) -> CommandResult;
 
     /// 执行并支持取消，默认先进行执行前取消检查。

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! 在进程边界负责回合准入、`AgentLoop` 执行、持久化和取消的 JSON-RPC 应用服务。
+//! 在进程边界负责 turn 准入、`AgentLoop` 执行、持久化和取消的 JSON-RPC 应用服务。
 //!
 //! 服务将协议处理与工作线程执行分离，并通过 `SessionStore` 提交终态后再发出对应事件。
 
@@ -89,7 +89,7 @@ pub enum AppServerError {
 pub type AppServerResult<T> = Result<T, AppServerError>;
 type ApprovalCheckpoint = (ApprovalRequest, Value);
 
-/// 协调线程、回合、审批、追踪和工作线程的有状态 JSON-RPC 服务。
+/// 协调线程、turn、approval、追踪和工作线程的有状态 JSON-RPC 服务。
 pub struct AppServer {
     store: SessionStore,
     initialized: bool,
@@ -110,7 +110,7 @@ pub struct AppServerCancellationHandle {
 }
 
 impl AppServerCancellationHandle {
-    /// 停止后续执行，并将取消传播到每个活动回合。
+    /// 停止后续执行，并将取消传播到每个活动 turn。
     pub fn request_execution_stop(&self) -> AppServerResult<()> {
         self.execution_stopped.store(true, Ordering::SeqCst);
         for cancellation in self
@@ -202,7 +202,7 @@ impl AppServer {
         })
     }
 
-    /// 注册一个活动回合，并为其附加持久化取消监视器。
+    /// 注册一个活动 turn，并为其附加持久化取消监视器。
     fn activate_turn(
         &self,
         turn_id: &str,
@@ -681,7 +681,7 @@ impl AppServer {
         }
     }
 
-    /// 仅当存储与回合仍满足其契约时恢复已批准的检查点。
+    /// 仅当存储与 turn 仍满足其契约时恢复已批准的检查点。
     fn resume_agent_loop(
         &self,
         request: &ApprovalRequest,
@@ -724,7 +724,7 @@ impl AppServer {
         )
     }
 
-    /// 重建规范化的循环输入，并执行一个已批准的待执行调用。
+    /// 重建规范化的 loop 输入，并执行一个已批准的待执行调用。
     fn resume_agent_loop_after_gate<P>(
         &self,
         request: &ApprovalRequest,
@@ -908,7 +908,7 @@ impl AppServer {
         }
     }
 
-    /// 在向客户端暴露阻塞回合前持久化每个 `AgentLoop` 检查点。
+    /// 在向客户端暴露阻塞 turn 前持久化每个 `AgentLoop` 检查点。
     fn persist_agent_approval_requests(&self, result: &AgentLoopResult) -> AppServerResult<()> {
         for (request, pending_tool_call) in approval_checkpoints(result)? {
             match self.store.create_approval_with_pending_tool_call_and_trace(
@@ -925,7 +925,7 @@ impl AppServer {
         Ok(())
     }
 
-    /// 将运行状态映射为持久化回合状态，并在提交时让取消优先。
+    /// 将运行状态映射为持久化 turn 状态，并在提交时让取消优先。
     fn commit_turn_run_status(
         &self,
         turn: Turn,
@@ -987,7 +987,7 @@ impl AppServer {
         )
     }
 
-    /// 在一个存储事务中提交审批续行状态及后续检查点（如有）。
+    /// 在一个存储事务中提交 approval 续行状态及后续检查点（如有）。
     fn commit_effective_turn_status_resolving_approval(
         &self,
         request_id: &str,
@@ -1149,7 +1149,7 @@ impl AppServer {
         invalid_request_response(message.id, APPROVAL_REQUEST_INTERNAL_ONLY)
     }
 
-    /// 记录审批，并保留、失败处理或恢复已认领的检查点。
+    /// 记录 approval，并保留、失败处理或恢复已认领的检查点。
     fn approval_decision(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let decision: ApprovalDecision = parse_params(&message)?;
         let pending_request = match self.store.get_pending_approval(&decision.request_id) {
@@ -1551,7 +1551,7 @@ fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
     }
 }
 
-/// 监视持久化回合状态，使外部中断能够到达进程内 `AgentLoop`。
+/// 监视持久化 turn 状态，使外部中断能够到达进程内 `AgentLoop`。
 fn cancellation_monitor(
     store_path: &str,
     turn_id: &str,

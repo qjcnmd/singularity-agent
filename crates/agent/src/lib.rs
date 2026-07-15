@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! 负责模型回合、工具执行、审批检查点和完成校验的 `AgentLoop` 状态机。
+//! 负责模型 turn、tool 执行、approval 检查点和完成校验的 `AgentLoop` 状态机。
 //!
-//! 循环将模型提供方可见历史与规范化可执行调用分离，所有副作用都经由 `ToolBroker`，
+//! loop 将模型提供方可见历史与规范化可执行调用分离，所有副作用都经由 `ToolBroker`，
 //! 并在完成或恢复不变量不满足时拒绝继续执行。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -255,7 +255,7 @@ impl AgentPlan {
     }
 }
 
-/// 返回用于更新计划或路由模型工具调用的独占控制工具。
+/// 返回用于更新计划或路由模型 tool call 的独占控制 tool。
 pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -344,7 +344,7 @@ pub struct AgentRecoveryMetrics {
     pub completion_rejection_count: u32,
 }
 
-/// 从循环派生的公开运行状态，包括门禁证据和安全诊断信息。
+/// 从 loop 派生的公开运行状态，包括门禁证据和安全诊断信息。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunStatus {
     pub status: AgentStatus,
@@ -423,7 +423,7 @@ impl AgentRunStatus {
     }
 }
 
-/// `AgentLoop` 所需执行后端的可用性和阻塞信息。
+/// `AgentLoop` 所需执行 backend 的可用性和阻塞信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopCapability {
     pub available: bool,
@@ -452,7 +452,7 @@ impl AgentLoopCapability {
     }
 }
 
-/// 一次运行的输入，包括当前回合上下文、安全历史、授权和校验规则。
+/// 一次运行的输入，包括当前 turn 上下文、安全历史、授权和校验规则。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopInput {
     pub thread_id: String,
@@ -530,7 +530,7 @@ impl AgentLoopInput {
     }
 }
 
-/// 已获批准的工具调用，并绑定到其请求、工具和资源集合。
+/// 已获批准的 tool call，并绑定到其请求、tool 和资源集合。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ApprovalGrant {
     pub request_id: String,
@@ -558,7 +558,7 @@ impl ApprovalGrant {
     }
 }
 
-/// 一次运行的完整结果，包括待处理审批检查点和工具结果。
+/// 一次运行的完整结果，包括待处理 approval 检查点和 tool 结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopResult {
     pub status: AgentStatus,
@@ -641,7 +641,7 @@ impl AgentLoopResult {
     }
 }
 
-/// 审批暂停运行期间保留的规范化可执行工具调用数据。
+/// approval 暂停运行期间保留的规范化可执行 tool call 数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PendingToolCall {
     pub request_id: String,
@@ -675,7 +675,7 @@ impl PendingToolCall {
     }
 }
 
-/// 由工具结果和审批检查点共享的完成门禁状态。
+/// 由 tool 结果和 approval 检查点共享的完成门禁状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct CompletionTracker {
     workspace_mutated: bool,
@@ -898,7 +898,7 @@ impl CheckpointToolResult {
     }
 }
 
-/// 用于安全恢复审批门控工具调用的可序列化暂停状态。
+/// 用于安全恢复受 approval 控制的 tool call 的可序列化暂停状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentLoopCheckpoint {
     #[serde(flatten)]
@@ -931,7 +931,7 @@ struct AgentLoopCheckpoint {
     last_repair_failure: Option<RepairFailureState>,
 }
 
-/// 在形成 `AgentLoopResult` 前跨模型提供方回合累积的可变状态。
+/// 在形成 `AgentLoopResult` 前跨模型提供方 turn 累积的可变状态。
 struct AgentLoopState {
     messages: Vec<ModelMessage>,
     tool_results: Vec<ToolResult>,
@@ -1248,7 +1248,7 @@ enum ToolBatchControl {
     Cancelled,
 }
 
-/// 编排模型提供方回合、策略决策、沙箱工具、审批和最终答复阶段。
+/// 编排模型提供方 turn、策略决策、沙箱 tool、approval 和最终答复阶段。
 pub struct AgentLoop<P> {
     provider: P,
     tool_broker: ToolBroker,
@@ -1281,7 +1281,7 @@ where
         self
     }
 
-    /// 运行一个新回合，直到完成、因审批阻塞、被取消或拒绝继续执行。
+    /// 运行一个新 turn，直到完成、因 approval 阻塞、被取消或拒绝继续执行。
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
         let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
@@ -1326,7 +1326,7 @@ where
         self.continue_run(input, &budget, &capabilities, max_tool_calls, state, 0)
     }
 
-    /// 在每次模型提供方响应或工具结果后推进状态机。
+    /// 在每次模型提供方响应或 tool 结果后推进状态机。
     fn continue_run(
         &self,
         input: &AgentLoopInput,
@@ -1597,7 +1597,7 @@ where
         )
     }
 
-    /// 恢复已校验的审批检查点，执行已批准调用，并继续运行。
+    /// 恢复已校验的 approval 检查点，执行已批准调用，并继续运行。
     pub fn resume_pending_tool_call(
         &self,
         input: &AgentLoopInput,
@@ -1890,7 +1890,7 @@ where
         })
     }
 
-    /// 对模型提供方的工具调用批次执行预检、授权、执行或创建检查点。
+    /// 对模型提供方的 tool 批次执行预检、授权、执行或创建检查点。
     fn process_tool_calls(
         &self,
         input: &AgentLoopInput,
@@ -2247,7 +2247,7 @@ where
             .collect()
     }
 
-    /// 将工具结果送入完成和修复状态，同时保留失败类别。
+    /// 将 tool 结果送入完成和修复状态，同时保留失败类别。
     fn record_tool_results(
         &self,
         input: &AgentLoopInput,
@@ -2598,7 +2598,7 @@ fn effective_max_tool_calls(capabilities: &ProviderProtocolContract) -> u32 {
     }
 }
 
-/// 预留输出、指令、工具和封装开销后计算请求预算。
+/// 预留输出、指令、tool 和封装开销后计算请求预算。
 fn context_budget(
     input: &AgentLoopInput,
     loop_tools: &ToolBroker,
@@ -2897,7 +2897,7 @@ fn compaction_control_instructions(state: &AgentLoopState) -> Vec<String> {
     instructions
 }
 
-/// 选择符合请求令牌预算的公开当前回合条目和最新历史。
+/// 选择符合请求令牌预算的公开当前 turn 条目和最新历史。
 pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> ContextBundle {
     let budget = ContextBudget::for_public_assembly(max_tokens);
     assemble_context_items_with_budget(items, &budget)

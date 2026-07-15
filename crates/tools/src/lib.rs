@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! 工具模式、工具代理器决策、工作区操作和公开工具结果投影。
+//! tool 模式、tool 代理器决策、工作区操作和公开 tool 结果投影。
 //!
-//! 工具代理器会在执行边界再次校验面向模型的输入；`WorkspaceTools` 则在任何文件系统副作用前
+//! tool 代理器会在执行边界再次校验面向模型的输入；`WorkspaceTools` 则在任何文件系统副作用前
 //! 强制执行工作区和受保护路径规则。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,7 +80,7 @@ pub const BUILTIN_COMMAND_TOOL: &str = "builtin_command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// 工具调用可以与其他只读调用并行，还是必须独占运行。
+/// tool call 可以与其他只读调用并行，还是必须独占运行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionMode {
@@ -88,7 +88,7 @@ pub enum ToolExecutionMode {
     Exclusive,
 }
 
-/// 工具到达执行阶段前返回的结构化校验代码。
+/// tool 到达执行阶段前返回的结构化校验代码。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolInputValidationError {
     pub code: String,
@@ -398,7 +398,7 @@ where
         .map_err(|_| ToolInputValidationError::new(validation_code))
 }
 
-/// 返回内置的工作区读取、搜索、变更和命令工具定义。
+/// 返回内置的工作区读取、搜索、变更和命令 tool 定义。
 pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -519,7 +519,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// 负责管理向模型暴露且供工具代理器使用的工具注册表。
+/// 负责管理向模型暴露且供 tool 代理器使用的 tool 注册表。
 #[derive(Debug, Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolSpec>,
@@ -591,7 +591,7 @@ pub enum ToolFailureKind {
     Cancelled,
 }
 
-/// 决定工具代理器执行、拒绝还是暂停调用的授权结果。
+/// 决定 tool 代理器执行、拒绝还是暂停调用的授权结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolBrokerDecision {
@@ -639,7 +639,7 @@ impl ToolBrokerDecision {
     }
 }
 
-/// 执行边界；调用执行器闭包前会重新校验工具输入。
+/// 执行边界；调用执行器闭包前会重新校验 tool 输入。
 #[derive(Debug, Default, Clone)]
 pub struct ToolBroker {
     registry: ToolRegistry,
@@ -740,7 +740,7 @@ impl ToolBroker {
     }
 }
 
-/// 从模型工具调用传给工具代理器和执行器的规范化封装结构。
+/// 从模型 tool call 传给 tool 代理器和执行器的规范化封装结构。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolCallRequest {
     pub tool_call_id: String,
@@ -762,7 +762,7 @@ impl ToolCallRequest {
     }
 }
 
-/// 工具代理器对其公开投影进行有界化和脱敏前的执行器原始输出。
+/// tool 代理器对其公开投影进行有界化和脱敏前的执行器原始输出。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolOutput {
     pub ok: bool,
@@ -1028,7 +1028,7 @@ fn value_string_array(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-/// 工作区工具返回的工作区边界、受保护路径、沙箱和变更错误。
+/// 工作区 tool 返回的工作区边界、受保护路径、沙箱和变更错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceToolError {
     OutsideWorkspace(String),
@@ -1066,7 +1066,7 @@ impl fmt::Display for WorkspaceToolError {
 
 impl std::error::Error for WorkspaceToolError {}
 
-/// 工作区工具接受的有界文件读取请求。
+/// 工作区 tool 接受的有界文件读取请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadToolInput {
@@ -1092,7 +1092,7 @@ impl ReadToolInput {
     }
 }
 
-/// 工作区工具接受的有界目录列表请求。
+/// 工作区 tool 接受的有界目录列表请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListToolInput {
@@ -1124,7 +1124,7 @@ impl ListToolInput {
     }
 }
 
-/// 工作区工具接受的有界文本搜索请求。
+/// 工作区 tool 接受的有界文本搜索请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrepToolInput {
@@ -1155,7 +1155,7 @@ impl GrepToolInput {
     }
 }
 
-/// 工作区工具接受的单文件替换请求。
+/// 工作区 tool 接受的单文件替换请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditToolInput {
@@ -1200,7 +1200,7 @@ pub struct WorkspacePatchChange {
     pub replacement: String,
 }
 
-/// 绑定到根目录的工作区文件工具，以及为命令配置的严格沙箱后端。
+/// 绑定到根目录的工作区文件 tool，以及为命令配置的严格沙箱 backend。
 #[derive(Clone)]
 pub struct WorkspaceTools {
     workspace_root: PathBuf,
