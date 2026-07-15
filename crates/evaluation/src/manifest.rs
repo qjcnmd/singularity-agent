@@ -1,3 +1,8 @@
+//! Evaluation manifest 的版本化 schema、任务投影与输入约束。
+//!
+//! manifest 保留可信执行器使用的内部 `argv`，由 app-server 在模型边界投影为
+//! `command` 字符串；验证规则在这里集中维护，避免执行层重复解释 manifest。
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,7 +15,7 @@ use crate::{
     TASK_SET_SCHEMA_VERSION, TaskId, ToolName, require_schema_version, validation_error,
 };
 
-const BUILTIN_COMMAND_TOOL_NAME: &str = "builtin_command";
+const COMMAND_TOOL_NAME: &str = "command";
 const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,10 +224,10 @@ impl AgentTaskSpec {
             && !self
                 .allowed_tools
                 .iter()
-                .any(|tool| tool.as_str() == BUILTIN_COMMAND_TOOL_NAME)
+                .any(|tool| tool.as_str() == COMMAND_TOOL_NAME)
         {
             return Err(validation_error(format!(
-                "evaluation task {task_id} agent.smoke_commands requires {BUILTIN_COMMAND_TOOL_NAME} in agent.allowed_tools"
+                "evaluation task {task_id} agent.smoke_commands requires {COMMAND_TOOL_NAME} in agent.allowed_tools"
             )));
         }
         validate_commands(task_id, "agent.smoke_commands", &self.smoke_commands, false)

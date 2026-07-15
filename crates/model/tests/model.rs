@@ -6,10 +6,9 @@ use singularity_model::{
     ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityProfile,
     ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
-    ProviderProtocolContract, ProviderToolDefinitionMode, ProviderToolReasoningMode,
-    ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint, classify_model_error,
-    resolve_provider_config, responses_endpoint, validate_model_request,
-    validate_model_request_with_capabilities, validate_model_response,
+    ProviderProtocolContract, ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy,
+    chat_completions_endpoint, classify_model_error, resolve_provider_config, responses_endpoint,
+    validate_model_request, validate_model_request_with_capabilities, validate_model_response,
     validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
@@ -84,7 +83,7 @@ fn capability_test_request(
         request.model_preferences.model_name = Some(model_name.to_string());
     }
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({
             "type": "object",
@@ -107,7 +106,7 @@ fn history_only_finalization_request(request_id: &str) -> ModelTurnRequest {
         .messages
         .push(ModelMessage::assistant_tool_calls(vec![tool_call(
             "call_read",
-            "builtin_read",
+            "read",
         )]));
     let mut tool_result = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
     tool_result.tool_call_id = Some("call_read".to_string());
@@ -284,7 +283,7 @@ fn responses_to_chat_fallback_server() -> (String, Receiver<Vec<String>>) {
                             "tool_calls": [{
                                 "id": "call_read",
                                 "type": "function",
-                                "function": {"name": "builtin_read", "arguments": "{}"}
+                                "function": {"name": "read", "arguments": "{}"}
                             }]
                         },
                         "finish_reason": "tool_calls"
@@ -873,7 +872,7 @@ const ACTUAL_TOOL_REASONING_RESPONSE: &str = r#"{
             "tool_calls": [{
                 "id": "actual_tool_call",
                 "type": "function",
-                "function": {"name": "builtin_read", "arguments": "{}"}
+                "function": {"name": "read", "arguments": "{}"}
             }]
         },
         "finish_reason": "tool_calls"
@@ -1224,19 +1223,6 @@ fn model_turn_schema_excludes_runtime_and_trace_metadata() {
 }
 
 #[test]
-fn provider_tool_definition_mode_schema_is_direct_only() {
-    let schema = serde_json::to_value(schema_for!(ProviderToolDefinitionMode))
-        .expect("serialize tool definition mode schema");
-
-    assert_eq!(schema["enum"], serde_json::json!(["direct"]));
-    assert_eq!(
-        serde_json::to_value(ProviderToolDefinitionMode::Direct).expect("serialize direct mode"),
-        "direct"
-    );
-    assert!(!schema.to_string().contains("routed"));
-}
-
-#[test]
 fn provider_config_validation_reports_missing_boundary_fields() {
     let result = validate_provider_config(&ModelProviderConfig {
         provider_name: None,
@@ -1527,7 +1513,7 @@ fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
         "output": [{
             "type": "function_call",
             "call_id": "call_read",
-            "name": "builtin_read",
+            "name": "read",
             "arguments": "{}"
         }],
         "usage": {
@@ -1563,7 +1549,7 @@ fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
         .expect("Responses completion");
     assert_eq!(response.status, ModelTurnStatus::Success);
     assert_eq!(response.tool_calls.len(), 1);
-    assert_eq!(response.tool_calls[0].tool_name, "builtin_read");
+    assert_eq!(response.tool_calls[0].tool_name, "read");
     assert_eq!(response.tool_calls[0].tool_call_id, "call_read");
     assert_eq!(response.usage.input_tokens, 9);
     assert_eq!(response.usage.cached_input_tokens, 2);
@@ -1611,7 +1597,7 @@ fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
 
     let actual: serde_json::Value =
         serde_json::from_str(&captured[2].1).expect("actual Responses request JSON");
-    assert_eq!(actual["tools"][0]["name"], "builtin_read");
+    assert_eq!(actual["tools"][0]["name"], "read");
     assert_eq!(actual["tools"][0]["strict"], false);
     assert_eq!(actual["tool_choice"], "auto");
     assert_eq!(actual["reasoning"]["effort"], "none");
@@ -1746,7 +1732,7 @@ fn openai_responses_text_tool_envelope_remains_invalid_and_unexecuted() {
             "role": "assistant",
             "content": [{
                 "type": "output_text",
-                "text": "<tool_call><function=builtin_read><parameter=path>Cargo.toml</parameter></function></tool_call>"
+                "text": "<tool_call><function=read><parameter=path>Cargo.toml</parameter></function></tool_call>"
             }]
         }],
         "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
@@ -1794,7 +1780,7 @@ fn openai_provider_falls_back_from_unsupported_responses_endpoint_to_chat() {
         .complete(&capability_test_request(None, false, 2), &cancellation)
         .expect("Chat fallback completion");
     assert_eq!(response.status, ModelTurnStatus::Success);
-    assert_eq!(response.tool_calls[0].tool_name, "builtin_read");
+    assert_eq!(response.tool_calls[0].tool_name, "read");
 
     let paths = requests
         .recv_timeout(Duration::from_secs(1))
@@ -1947,11 +1933,6 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     assert!(!negotiation.contract.supports_json_mode);
     assert!(negotiation.contract.supports_parallel_tool_calls);
     assert_eq!(negotiation.contract.max_tools_per_request, 8);
-    assert_eq!(
-        negotiation.contract.tool_definition_mode,
-        ProviderToolDefinitionMode::Direct
-    );
-
     let request_bodies = request_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("captured strict capability requests");
@@ -2904,7 +2885,7 @@ fn model_request_validation_rejects_parallel_tool_calls_when_provider_does_not_s
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -2936,7 +2917,7 @@ fn required_tool_choice_requires_tools_and_negotiated_support() {
     );
 
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({
             "type": "object",
@@ -2964,7 +2945,7 @@ fn required_tool_choice_requires_tools_and_negotiated_support() {
         Some(&ModelMessage::text(ModelRole::Assistant, "text")),
         &[],
         &request.tool_choice,
-        &["builtin_read".to_string()],
+        &["read".to_string()],
         Some(&supported),
     );
     assert_eq!(
@@ -2981,7 +2962,7 @@ fn model_request_validation_rejects_tool_definitions_above_provider_capability()
     );
     request.tools = (0..3)
         .map(|index| ModelToolSchema {
-            name: format!("builtin_tool_{index}"),
+            name: format!("tool_{index}"),
             description: "test tool".to_string(),
             parameters_schema: serde_json::json!({"type": "object"}),
         })
@@ -3003,7 +2984,7 @@ fn model_request_validation_rejects_incompatible_strict_schema_locally() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -3027,7 +3008,7 @@ fn model_request_validation_rejects_unsupported_declared_capabilities() {
         vec![ModelMessage::text(ModelRole::Developer, "instructions")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "read".to_string(),
         parameters_schema: serde_json::json!({
             "type": "object",
@@ -3083,7 +3064,7 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "builtin_read", "arguments": "{\"path\":\"README.md\"}"}
+                    "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
                 }]
             },
             "finish_reason": "tool_calls"
@@ -3097,7 +3078,7 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -3319,8 +3300,8 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
         serde_json::json!({
             "ok": false,
             "content": {
-                "validation_code": "argv_not_array",
-                "retry_inputs": [{"argv": ["cargo", "test"]}],
+                "validation_code": "command_not_string",
+                "retry_inputs": [{"command": "cargo test"}],
             }
         })
         .to_string(),
@@ -3330,7 +3311,7 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
         "request_1",
         vec![
             ModelMessage::text(ModelRole::User, "hello"),
-            ModelMessage::assistant_tool_calls(vec![tool_call("call_1", "builtin_read")]),
+            ModelMessage::assistant_tool_calls(vec![tool_call("call_1", "read")]),
             tool_message,
         ],
     );
@@ -3350,7 +3331,7 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
     assert!(captured["messages"][1]["content"].is_null());
     assert_eq!(
         captured["messages"][1]["tool_calls"][0]["function"]["name"],
-        "builtin_read"
+        "read"
     );
     assert_eq!(
         captured["messages"][1]["tool_calls"][0]["function"]["arguments"],
@@ -3364,8 +3345,14 @@ fn openai_provider_sends_assistant_tool_call_history_before_tool_result() {
             .expect("tool content string"),
     )
     .expect("structured tool content");
-    assert_eq!(tool_content["content"]["validation_code"], "argv_not_array");
-    assert!(tool_content["content"]["retry_inputs"][0]["argv"].is_array());
+    assert_eq!(
+        tool_content["content"]["validation_code"],
+        "command_not_string"
+    );
+    assert_eq!(
+        tool_content["content"]["retry_inputs"][0]["command"],
+        "cargo test"
+    );
 }
 
 #[test]
@@ -3379,7 +3366,7 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "builtin_read", "arguments": "{\"path\":\"README.md\"}"}
+                    "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
                 }]
             },
             "finish_reason": "tool_calls"
@@ -3392,7 +3379,7 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({
             "type": "object",
@@ -3421,11 +3408,11 @@ fn openai_provider_preserves_portable_tool_names_without_aliases() {
     )
     .expect("parse captured provider request body");
 
-    assert_eq!(captured["tools"][0]["function"]["name"], "builtin_read");
+    assert_eq!(captured["tools"][0]["function"]["name"], "read");
     assert_eq!(captured["tool_choice"], "auto");
     assert_eq!(captured["parallel_tool_calls"], true);
     assert_eq!(captured["tools"][0]["function"]["strict"], true);
-    assert_eq!(response.tool_calls[0].tool_name, "builtin_read");
+    assert_eq!(response.tool_calls[0].tool_name, "read");
     assert_eq!(response.status, ModelTurnStatus::Success);
 }
 
@@ -3441,12 +3428,12 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
                     {
                         "id": "call_1",
                         "type": "function",
-                        "function": {"name": "builtin_read", "arguments": "{\"path\":\"README.md\"}"}
+                        "function": {"name": "read", "arguments": "{\"path\":\"README.md\"}"}
                     },
                     {
                         "id": "call_2",
                         "type": "function",
-                        "function": {"name": "builtin_read", "arguments": "{\"path\":\"Cargo.toml\"}"}
+                        "function": {"name": "read", "arguments": "{\"path\":\"Cargo.toml\"}"}
                     }
                 ]
             },
@@ -3460,7 +3447,7 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
         vec![ModelMessage::text(ModelRole::User, "read a file")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -3589,7 +3576,7 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "builtin_read", "arguments": "\"README.md\""}
+                    "function": {"name": "read", "arguments": "\"README.md\""}
                 }]
             },
             "finish_reason": "tool_calls"
@@ -3602,7 +3589,7 @@ fn openai_provider_validation_rejects_non_object_tool_arguments() {
         vec![ModelMessage::text(ModelRole::User, "hello")],
     );
     request.tools.push(ModelToolSchema {
-        name: "builtin_read".to_string(),
+        name: "read".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     });
@@ -3690,12 +3677,8 @@ fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes(
     assert_eq!(request_result.errors, vec!["messages_required"]);
 
     let response = ModelTurnResponse::completed("other_request", "response_1", "done");
-    let response_result = validate_model_turn_response(
-        &request,
-        &response,
-        &["builtin_read_file".to_string()],
-        None,
-    );
+    let response_result =
+        validate_model_turn_response(&request, &response, &["read_file".to_string()], None);
 
     assert!(!response_result.valid);
     assert_eq!(response_result.errors, vec!["response_request_id_mismatch"]);
@@ -3711,7 +3694,7 @@ fn model_turn_response_validation_rejects_text_tool_envelope_after_tool_history(
         .messages
         .push(ModelMessage::assistant_tool_calls(vec![tool_call(
             "call_read",
-            "builtin_read",
+            "read",
         )]));
     let mut tool_result = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
     tool_result.tool_call_id = Some("call_read".to_string());
@@ -3722,7 +3705,7 @@ fn model_turn_response_validation_rejects_text_tool_envelope_after_tool_history(
         strict_tool_schema: false,
     };
 
-    let envelope = "<tool_call><function=builtin_read></function></tool_call>";
+    let envelope = "<tool_call><function=read></function></tool_call>";
     let response = ModelTurnResponse::completed(
         request.request_id.clone(),
         "response_finalization",
@@ -3765,7 +3748,7 @@ fn model_error_serializes_redacted_boundary_fields() {
 
 #[test]
 fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
-    let call = tool_call("call_1", "builtin_read_file");
+    let call = tool_call("call_1", "read_file");
     let none_result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         std::slice::from_ref(&call),
@@ -3773,7 +3756,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
             mode: ToolChoiceMode::None,
             ..Default::default()
         },
-        &["builtin_read_file".to_string()],
+        &["read_file".to_string()],
         None,
     );
 
@@ -3787,7 +3770,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         )),
         &[],
         &ToolChoicePolicy::default(),
-        &["builtin_read_file".to_string()],
+        &["read_file".to_string()],
         Some(&ProviderProtocolContract::default()),
     );
 
@@ -3799,11 +3782,11 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
     let prefixed_multiple_text_tool_calls = validate_model_response(
         Some(&ModelMessage::text(
             ModelRole::Assistant,
-            "I will inspect both files.<tool_call><function=builtin_read></function></tool_call><tool_call><function=builtin_read></function></tool_call>",
+            "I will inspect both files.<tool_call><function=read></function></tool_call><tool_call><function=read></function></tool_call>",
         )),
         &[],
         &ToolChoicePolicy::default(),
-        &["builtin_read_file".to_string()],
+        &["read_file".to_string()],
         Some(&ProviderProtocolContract::default()),
     );
     assert_eq!(
@@ -3818,7 +3801,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         )),
         &[],
         &ToolChoicePolicy::default(),
-        &["builtin_read_file".to_string()],
+        &["read_file".to_string()],
         Some(&ProviderProtocolContract::default()),
     );
     assert!(incomplete_marker.valid);
@@ -3827,7 +3810,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         &[call.clone(), call],
         &ToolChoicePolicy::default(),
-        &["builtin_read_file".to_string()],
+        &["read_file".to_string()],
         Some(&ProviderProtocolContract::default()),
     );
 
@@ -3843,7 +3826,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
 
 #[test]
 fn model_response_validation_reports_unknown_tools_without_hiding_structural_errors() {
-    let mut malformed = tool_call("call_1", "builtin_unknown");
+    let mut malformed = tool_call("call_1", "unknown");
     malformed.parse_status = ModelToolParseStatus::InvalidJson;
     malformed
         .validation_errors
@@ -3853,7 +3836,7 @@ fn model_response_validation_reports_unknown_tools_without_hiding_structural_err
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         &[malformed],
         &ToolChoicePolicy::default(),
-        &["builtin_read_file".to_string()],
+        &["read_file".to_string()],
         None,
     );
 
@@ -3864,14 +3847,14 @@ fn model_response_validation_reports_unknown_tools_without_hiding_structural_err
 
 #[test]
 fn model_response_validation_requires_tool_call_arguments_object() {
-    let mut call = tool_call("call_1", "builtin_read_file");
+    let mut call = tool_call("call_1", "read_file");
     call.arguments = serde_json::json!("not an object");
 
     let result = validate_model_response(
         Some(&ModelMessage::text(ModelRole::Assistant, "")),
         &[call],
         &ToolChoicePolicy::default(),
-        &["builtin_read_file".to_string()],
+        &["read_file".to_string()],
         None,
     );
 
@@ -3882,7 +3865,7 @@ fn model_response_validation_requires_tool_call_arguments_object() {
 #[test]
 fn model_boundary_objects_are_schema_backed_and_round_trip() {
     let tool_schema = ModelToolSchema {
-        name: "builtin_read_file".to_string(),
+        name: "read_file".to_string(),
         description: "Read a file".to_string(),
         parameters_schema: serde_json::json!({"type": "object"}),
     };

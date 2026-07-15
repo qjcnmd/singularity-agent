@@ -214,6 +214,29 @@ impl CommandScriptRequest {
         }
     }
 
+    /// 创建由 Agent/Policy 绑定文件系统和网络范围的模型 command 请求。
+    pub fn agent_requested_with_policy(
+        command_id: impl Into<String>,
+        script: impl Into<String>,
+        cwd: impl Into<String>,
+        workspace_root: impl Into<String>,
+        filesystem: SandboxFilesystemMode,
+        network: SandboxNetworkMode,
+    ) -> Self {
+        Self {
+            command_id: command_id.into(),
+            script: script.into(),
+            cwd: cwd.into(),
+            timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            network: SandboxNetworkPolicy { mode: network },
+            filesystem: SandboxFilesystemPolicy {
+                mode: filesystem,
+                workspace_root: workspace_root.into(),
+            },
+            environment: CommandEnvironmentPolicy::default(),
+        }
+    }
+
     /// 模型脚本始终要求经过 sandbox backend 执行。
     pub fn requires_sandbox(&self) -> bool {
         true

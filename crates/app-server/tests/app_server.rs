@@ -587,7 +587,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
       "agent": {
         "instructions": "Finish the task.",
         "allowed_paths": ["README.md"],
-        "allowed_tools": ["builtin_read"]
+        "allowed_tools": ["read"]
       },
       "evaluator": {
         "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
@@ -691,7 +691,7 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
       "agent": {
         "instructions": "Finish the task.",
         "allowed_paths": ["README.md"],
-        "allowed_tools": ["builtin_read", "builtin_command"],
+        "allowed_tools": ["read", "command"],
         "smoke_commands": [
           {"argv": ["git", "status", "--short"], "timeout_seconds": 30}
         ]
@@ -765,7 +765,7 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
       "agent": {
         "instructions": "Finish the task.",
         "allowed_paths": ["README.md"],
-        "allowed_tools": ["builtin_read"]
+        "allowed_tools": ["read"]
       },
       "evaluator": {
         "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
@@ -1060,7 +1060,7 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
         format!("approval_{}_call_1", turn.turn_id),
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin_edit",
+        "edit",
     )
     .with_tool_call_id("call_1")
     .with_resources(["README.md"]);
@@ -1145,7 +1145,7 @@ fn pending_approval_prevents_thread_archive_and_delete() {
         "approval_archived",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin_edit",
+        "edit",
     )
     .with_tool_call_id("call_1")
     .with_resources(["README.md"]);
@@ -1157,7 +1157,7 @@ fn pending_approval_prevents_thread_archive_and_delete() {
                 "thread_id": &thread.thread_id,
                 "turn_id": &turn.turn_id,
                 "tool_call_id": "call_1",
-                "tool_name": "builtin_edit",
+                "tool_name": "edit",
                 "raw_arguments": "{}",
                 "resources": ["README.md"],
                 "checkpoint_version": 1,
@@ -1241,7 +1241,7 @@ fn allow_resume_precondition_failure_is_terminalized_without_replay() {
         "approval_resume_error",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin_edit",
+        "edit",
     )
     .with_tool_call_id("call_1")
     .with_resources(["README.md"]);
@@ -1360,7 +1360,7 @@ fn unavailable_workspace_only_blocks_allow_decisions() {
             format!("approval_workspace_missing_{outcome_label}"),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            "builtin_edit",
+            "edit",
         )
         .with_tool_call_id("call_1")
         .with_resources(["README.md"]);
@@ -1484,7 +1484,7 @@ fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
         "approval_interrupted",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin_edit",
+        "edit",
     )
     .with_tool_call_id("call_1")
     .with_resources(["README.md"]);
@@ -1596,7 +1596,7 @@ fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_agent_loop
             format!("approval_{}_call_1", turn.turn_id),
             thread_id.to_string(),
             turn.turn_id.clone(),
-            "builtin_edit",
+            "edit",
         )
         .with_tool_call_id("call_1")
         .with_resources([request_resource]);
@@ -1941,7 +1941,7 @@ fn app_server_approval_continuation_keeps_interrupt_and_shutdown_responsive() {
         format!("approval_{}_call_1", turn.turn_id),
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "builtin_edit",
+        "edit",
     )
     .with_tool_call_id("call_1")
     .with_resources(["README.md"]);

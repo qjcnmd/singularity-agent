@@ -100,8 +100,8 @@ sg eval run docs/evaluation/public-representative-task.json --run-id representat
 
 - 工作区写入前进行规范化路径检查；符号链接、junction 和 `..` 不能绕过根目录边界。
 - `.git`、`.singularity`、环境文件、密钥和其他受保护路径默认拒绝模型写入。
-- 命令默认无网络，且必须经过 restricted token、Job Object、进程树终止、超时和有界输出捕获。
-- 网络被拒绝时只接受 elevated offline identity；不能执行时直接失败，不使用本地进程或无沙箱后端。
+- 命令默认无网络，并由平台 sandbox 自动执行；超时、取消、进程树终止和输出上限由运行时统一处理。
+- 网络或越界操作按 Policy/Approval 合同处理；当前平台无法提供严格 sandbox 时明确失败，不使用本地进程或无沙箱后端。
 - provider 原始响应、密钥、原始工具参数和内部审计字段不会投影到公共工具结果。
 - 修改工作区后，AgentLoop 必须观察到成功命令验证，且不能带着未解决的可修复失败直接完成。
 

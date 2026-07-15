@@ -41,10 +41,9 @@ use singularity_protocol::{
 use singularity_sandbox::{SandboxBackend, SandboxBackendEnforcement, WindowsSandboxBackend};
 use singularity_store::{CommitTurnOutcomeParams, CommittedTurnOutcome, SessionStore, StoreError};
 use singularity_tools::{
-    BUILTIN_COMMAND_TOOL as TOOL_COMMAND, BUILTIN_EDIT_TOOL as TOOL_EDIT,
-    BUILTIN_GREP_TOOL as TOOL_GREP, BUILTIN_LIST_TOOL as TOOL_LIST,
-    BUILTIN_PATCH_TOOL as TOOL_PATCH, BUILTIN_READ_TOOL as TOOL_READ, CommandToolInput, ToolBroker,
-    ToolRegistry, WorkspaceTools, command_scope_digest, workspace_tool_specs,
+    COMMAND_TOOL as TOOL_COMMAND, CommandToolInput, EDIT_TOOL as TOOL_EDIT, GREP_TOOL as TOOL_GREP,
+    LIST_TOOL as TOOL_LIST, PATCH_TOOL as TOOL_PATCH, READ_TOOL as TOOL_READ, ToolBroker,
+    ToolRegistry, WorkspaceTools, command_script_scope_digest, workspace_tool_specs,
 };
 use thiserror::Error;
 
@@ -1634,6 +1633,8 @@ fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<V
     let mut audit = json!({
         "sandbox_backend": "not_executed",
         "sandbox_enforcement": "not_executed",
+        "sandbox_mode": "unknown",
+        "network_access": "unknown",
     });
     let Some(raw_arguments) = raw_arguments else {
         audit["cwd"] = json!("unknown");
@@ -1651,21 +1652,15 @@ fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<V
         audit["command_scope_digest"] = json!("unavailable");
         return Some(audit);
     };
-    let sandbox_mode = input.sandbox_mode();
-    let network_access = input.network_access();
     merge_json_object(
         &mut audit,
         json!({
             "cwd": input.effective_cwd(),
             "timeout_seconds": input.effective_timeout_seconds(),
-            "sandbox_mode": sandbox_mode,
-            "network_access": network_access,
-            "command_scope_digest": command_scope_digest(
-                &input.argv,
+            "command_scope_digest": command_script_scope_digest(
+                &input.command,
                 input.effective_cwd(),
                 input.effective_timeout_seconds(),
-                &sandbox_mode,
-                &network_access,
             ),
         }),
     );
@@ -2022,6 +2017,7 @@ mod tests {
         ProviderError, ProviderProtocolContract,
     };
     use singularity_protocol::ItemKind;
+    use singularity_sandbox::CommandScriptRequest;
     use singularity_tools::{CommandRequest, CommandResult};
 
     use super::*;
@@ -2485,19 +2481,10 @@ mod tests {
     fn app_server_registers_the_agent_control_tools() {
         let registry = workspace_tool_registry();
         let plan = registry
-            .get(singularity_agent::BUILTIN_UPDATE_PLAN_TOOL)
+            .get(singularity_agent::UPDATE_PLAN_TOOL)
             .expect("plan tool registered");
-        let router = registry
-            .get(singularity_agent::BUILTIN_INVOKE_TOOL)
-            .expect("tool router registered");
-
         assert_eq!(plan.input_schema["properties"]["steps"]["maxItems"], 64);
         assert_eq!(plan.input_schema["additionalProperties"], false);
-        assert_eq!(
-            router.input_schema["required"],
-            json!(["tool_name", "arguments"])
-        );
-        assert_eq!(router.input_schema["additionalProperties"], false);
     }
 
     #[test]
@@ -2531,7 +2518,7 @@ mod tests {
             ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
         plan_response.tool_calls.push(ModelToolCall {
             tool_call_id: "plan_call_1".to_string(),
-            tool_name: "builtin_update_plan".to_string(),
+            tool_name: "update_plan".to_string(),
             raw_arguments: plan_arguments.to_string(),
             arguments: plan_arguments,
             parse_status: ModelToolParseStatus::Valid,
@@ -2692,9 +2679,8 @@ mod tests {
             tool_call_id: "call_1".to_string(),
             tool_name: TOOL_COMMAND.to_string(),
             raw_arguments: json!({
-                "argv": ["test-program", "success"],
-                "sandbox_mode": "workspace_write",
-                "network_access": "allowed"
+                "command": "test-program success",
+                "timeout_seconds": 5
             })
             .to_string(),
             resources: Vec::new(),
@@ -2712,11 +2698,8 @@ mod tests {
             .expect("status")
             .expect("terminal status");
 
-        assert_eq!(
-            run_status.audit_events[0]["sandbox_mode"],
-            "workspace_write"
-        );
-        assert_eq!(run_status.audit_events[0]["network_access"], "allowed");
+        assert_eq!(run_status.audit_events[0]["sandbox_mode"], "unknown");
+        assert_eq!(run_status.audit_events[0]["network_access"], "unknown");
         assert_eq!(
             run_status.audit_events[0]["sandbox_backend"],
             "not_executed"
@@ -2978,9 +2961,8 @@ mod tests {
             "approved",
         );
         let valid_command = json!({
-            "argv": ["test-program", "success"],
-            "sandbox_mode": "workspace_write",
-            "network_access": "allowed"
+            "command": "test-program success",
+            "timeout_seconds": 5
         })
         .to_string();
         let mismatched_pending = PendingToolCall {
@@ -3151,11 +3133,11 @@ mod tests {
             tool_call_id: "call_verify".to_string(),
             tool_name: TOOL_COMMAND.to_string(),
             arguments: json!({
-                "argv": ["cmd.exe", "/C", "echo verified"],
+                "command": "cmd.exe /C \"echo verified\"",
                 "timeout_seconds": 5
             }),
             raw_arguments: json!({
-                "argv": ["cmd.exe", "/C", "echo verified"],
+                "command": "cmd.exe /C \"echo verified\"",
                 "timeout_seconds": 5
             })
             .to_string(),
@@ -3317,6 +3299,14 @@ mod tests {
                     singularity_tools::SandboxBackendEnforcement::Strict,
                 )
         }
+
+        fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+            CommandResult::completed(&request.command_id, "app-server-sandbox-ok")
+                .with_sandbox_execution(
+                    self.name(),
+                    singularity_tools::SandboxBackendEnforcement::Strict,
+                )
+        }
     }
 
     struct UnavailableSandboxBackend;
@@ -3331,6 +3321,10 @@ mod tests {
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
+            CommandResult::sandbox_backend_unavailable(&request.command_id)
+        }
+
+        fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
             CommandResult::sandbox_backend_unavailable(&request.command_id)
         }
     }
@@ -3370,13 +3364,13 @@ mod tests {
             ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
         command_response.tool_calls.push(ModelToolCall {
             tool_call_id: "call_1".to_string(),
-            tool_name: "builtin_command".to_string(),
+            tool_name: "command".to_string(),
             arguments: json!({
-                "argv": ["cmd.exe", "/C", "echo app-server-sandbox-ok"],
+                "command": "cmd.exe /C \"echo app-server-sandbox-ok\"",
                 "timeout_seconds": 5
             }),
             raw_arguments: json!({
-                "argv": ["cmd.exe", "/C", "echo app-server-sandbox-ok"],
+                "command": "cmd.exe /C \"echo app-server-sandbox-ok\"",
                 "timeout_seconds": 5
             })
             .to_string(),

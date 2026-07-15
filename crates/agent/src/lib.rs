@@ -18,9 +18,9 @@ use singularity_model::{
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
     ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, ProviderToolDefinitionMode, ToolChoiceMode,
-    is_strict_tool_schema_compatible, provider_error_response,
-    validate_model_request_with_capabilities, validate_model_turn_response,
+    ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode, is_strict_tool_schema_compatible,
+    provider_error_response, validate_model_request_with_capabilities,
+    validate_model_turn_response,
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
@@ -28,21 +28,20 @@ use singularity_policy::{
     PermissionProfileName, PermissionRequest, PolicyEngine,
 };
 use singularity_tools::{
-    BUILTIN_COMMAND_TOOL as TOOL_COMMAND, BUILTIN_EDIT_TOOL as TOOL_EDIT,
-    BUILTIN_GREP_TOOL as TOOL_GREP, BUILTIN_LIST_TOOL as TOOL_LIST,
-    BUILTIN_PATCH_TOOL as TOOL_PATCH, BUILTIN_READ_TOOL as TOOL_READ, CommandToolInput,
-    EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, SandboxFilesystemMode,
+    COMMAND_TOOL as TOOL_COMMAND, CommandToolInput, EDIT_TOOL as TOOL_EDIT, EditToolInput,
+    GREP_TOOL as TOOL_GREP, GrepToolInput, LIST_TOOL as TOOL_LIST, ListToolInput,
+    PATCH_TOOL as TOOL_PATCH, READ_TOOL as TOOL_READ, ReadToolInput, SandboxFilesystemMode,
     SandboxNetworkMode, ToolBroker, ToolBrokerDecision, ToolCallRequest, ToolExecutionMode,
     ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec, WorkspacePatch,
-    WorkspaceToolError, WorkspaceTools, command_scope_digest, command_scope_resource,
-    is_protected_path,
+    WorkspaceToolError, WorkspaceTools, command_script_scope_digest_with_policy,
+    command_script_scope_resource_with_policy, is_protected_path,
 };
 use thiserror::Error;
 
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
 const APPROVAL_CHECKPOINT_VERSION: u32 = 1;
-const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise builtin_update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
+const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -54,10 +53,6 @@ const MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR: &str = "model request exceeds the mo
 const MODEL_RESPONSE_VALIDATION_ERROR: &str = "model response validation failed";
 const POST_MUTATION_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: verification required after workspace mutation";
-const COMMAND_SANDBOX_PROFILE_DENIED: &str =
-    "command sandbox mode cannot exceed the permission profile";
-const COMMAND_NETWORK_PROFILE_DENIED: &str =
-    "command network access cannot exceed the permission profile";
 const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
     "invalid_tool_arguments",
     "invalid_tool_input",
@@ -70,16 +65,15 @@ const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
 ];
 const TOOL_SELECTION_FAILURE_GROUP: &str = "tool_selection";
 const TOOL_SELECTION_FAILURE_PREFIX: &str = "tool_selection:";
-pub const BUILTIN_UPDATE_PLAN_TOOL: &str = "builtin_update_plan";
-pub const BUILTIN_INVOKE_TOOL: &str = "builtin_invoke_tool";
+pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 // Provider-facing history only; this placeholder is never registered or executed.
-const PROVIDER_HISTORY_REJECTED_TOOL: &str = "builtin_tool_rejected";
+const PROVIDER_HISTORY_REJECTED_TOOL: &str = "tool_rejected";
 const MAX_PLAN_STEPS: usize = 64;
 const MAX_PLAN_STEP_CHARS: usize = 512;
 const MAX_VERIFICATION_REQUIREMENTS: usize = 64;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
-const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call builtin_update_plan with all steps marked completed before providing the final answer.";
+const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call update_plan with all steps marked completed before providing the final answer.";
 const EXACT_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: required verification commands are incomplete";
 
@@ -255,62 +249,45 @@ impl AgentPlan {
     }
 }
 
-/// 返回用于更新计划或路由模型 tool call 的独占控制 tool。
+/// 返回用于更新计划的独占控制 tool。
 pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec::new(
-            BUILTIN_UPDATE_PLAN_TOOL,
-            "Replace the current execution plan with unique non-empty steps and at most one in_progress step",
-            json!({
-                "type": "object",
-                "properties": {
-                    "steps": {
-                        "type": "array",
-                        "description": "The complete plan. Step text must be unique and at most one step may be in_progress.",
-                        "minItems": 1,
-                        "maxItems": MAX_PLAN_STEPS,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "step": {
-                                    "type": "string",
-                                    "description": "A unique, non-empty description of one execution step.",
-                                    "minLength": 1,
-                                    "maxLength": MAX_PLAN_STEP_CHARS
-                                },
-                                "status": {
-                                    "type": "string",
-                                    "description": "Use in_progress for at most one step.",
-                                    "enum": ["pending", "in_progress", "completed"]
-                                }
+    vec![ToolSpec::new(
+        UPDATE_PLAN_TOOL,
+        "Replace the current execution plan with unique non-empty steps and at most one in_progress step",
+        json!({
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "description": "The complete plan. Step text must be unique and at most one step may be in_progress.",
+                    "minItems": 1,
+                    "maxItems": MAX_PLAN_STEPS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {
+                                "type": "string",
+                                "description": "A unique, non-empty description of one execution step.",
+                                "minLength": 1,
+                                "maxLength": MAX_PLAN_STEP_CHARS
                             },
-                            "required": ["step", "status"],
-                            "additionalProperties": false
-                        }
+                            "status": {
+                                "type": "string",
+                                "description": "Use in_progress for at most one step.",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
                     }
-                },
-                "required": ["steps"],
-                "additionalProperties": false
-            }),
-            ToolExecutionMode::Exclusive,
-            validate_plan_tool_input_contract,
-        ),
-        ToolSpec::new(
-            BUILTIN_INVOKE_TOOL,
-            "Invoke one registered tool through a bounded model-facing router",
-            json!({
-                "type": "object",
-                "properties": {
-                    "tool_name": {"type": "string", "minLength": 1},
-                    "arguments": {"type": "object"}
-                },
-                "required": ["tool_name", "arguments"],
-                "additionalProperties": false
-            }),
-            ToolExecutionMode::Exclusive,
-            validate_invoke_tool_input_contract,
-        ),
-    ]
+                }
+            },
+            "required": ["steps"],
+            "additionalProperties": false
+        }),
+        ToolExecutionMode::Exclusive,
+        validate_plan_tool_input_contract,
+    )]
 }
 
 /// 用于替换当前执行计划的模型输入。
@@ -318,13 +295,6 @@ pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
 #[serde(deny_unknown_fields)]
 pub struct AgentPlanUpdateInput {
     pub steps: Vec<AgentPlanStep>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentToolInvocationInput {
-    tool_name: String,
-    arguments: Value,
 }
 
 impl AgentPlanUpdateInput {
@@ -653,12 +623,20 @@ pub struct PendingToolCall {
 
 impl PendingToolCall {
     pub fn new(input: &AgentLoopInput, call: &ModelToolCall) -> Self {
+        Self::new_with_profile(input, call, &PermissionProfile::workspace_write("."))
+    }
+
+    fn new_with_profile(
+        input: &AgentLoopInput,
+        call: &ModelToolCall,
+        profile: &PermissionProfile,
+    ) -> Self {
         Self {
             request_id: approval_request_id(input, call),
             tool_call_id: call.tool_call_id.clone(),
             tool_name: call.tool_name.clone(),
             raw_arguments: call.raw_arguments.clone(),
-            resources: permission_resources_for_tool(call),
+            resources: permission_resources_for_tool(call, profile),
         }
     }
 
@@ -1316,12 +1294,7 @@ where
                 Some(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string()),
             );
         }
-        state.messages = model_messages_from_input(
-            input,
-            &context,
-            max_tool_calls,
-            uses_tool_router(&capabilities),
-        );
+        state.messages = model_messages_from_input(input, &context, max_tool_calls);
         state.context_trace = Some(AgentContextTrace::from(&context));
         self.continue_run(input, &budget, &capabilities, max_tool_calls, state, 0)
     }
@@ -1529,9 +1502,8 @@ where
                 ));
                 continue;
             }
-            let routed = provider_tool_names.as_slice() == [BUILTIN_INVOKE_TOOL];
             let execution_tool_calls =
-                resolve_model_tool_calls(&response.tool_calls, routed, &visible_tool_names);
+                resolve_model_tool_calls(&response.tool_calls, &visible_tool_names);
             let execution_tool_names = execution_tool_calls
                 .iter()
                 .map(|call| call.tool_name.clone())
@@ -1680,12 +1652,7 @@ where
                 );
             }
         };
-        refresh_developer_instructions(
-            &mut state.messages,
-            input,
-            max_tool_calls,
-            uses_tool_router(&capabilities),
-        );
+        refresh_developer_instructions(&mut state.messages, input, max_tool_calls);
         let context = assemble_context_items_with_budget(&input.input, &budget);
         if let Some(context_trace) = &mut state.context_trace {
             context_trace.refresh_context(&context);
@@ -1823,7 +1790,7 @@ where
             );
         }
         let request_id = approval_request_id(input, call);
-        let resources = permission_resources_for_tool(call);
+        let resources = permission_resources_for_tool(call, &self.policy.profile);
         let permission = self.tool_permission_decision(call);
         if used_approval_grants.contains(&request_id) {
             return ToolBrokerDecision::deny_with_kind(
@@ -1855,11 +1822,10 @@ where
     }
 
     fn tool_permission_decision(&self, call: &ModelToolCall) -> PermissionDecision {
-        let resources = permission_resources_for_tool(call);
+        let resources = permission_resources_for_tool(call, &self.policy.profile);
         let mut operations = vec![permission_operation_for_tool(&call.tool_name)];
         if call.tool_name == TOOL_COMMAND
-            && command_tool_input(&call.arguments)
-                .is_ok_and(|input| input.network_access() != SandboxNetworkMode::Denied)
+            && self.policy.profile.network_access == NetworkAccess::Allowed
         {
             operations.push(PermissionOperation::Network);
         }
@@ -1977,10 +1943,15 @@ where
                 approval_request_id,
                 &prepared.call,
                 reason,
+                &self.policy.profile,
             ));
             state
                 .pending_tool_calls
-                .push(PendingToolCall::new(input, &prepared.call));
+                .push(PendingToolCall::new_with_profile(
+                    input,
+                    &prepared.call,
+                    &self.policy.profile,
+                ));
             let pending = state
                 .pending_tool_calls
                 .last()
@@ -2082,18 +2053,6 @@ where
                     )),
                 };
             }
-            Err(CommandBindingError::ProfileViolation(reason)) => {
-                let decision =
-                    ToolBrokerDecision::deny_with_kind(ToolFailureKind::PermissionProfile, reason);
-                let rejection = self.decision_result(&bound_call, &decision);
-                return PreparedToolCall {
-                    call: bound_call,
-                    fingerprint: fingerprint.to_string(),
-                    execution_mode: Some(execution_mode),
-                    decision: Some(decision),
-                    rejection: Some(rejection),
-                };
-            }
         };
         if let Err(error) = self
             .tool_broker
@@ -2136,7 +2095,7 @@ where
     }
 
     fn workspace_preflight_rejection(&self, call: &ModelToolCall) -> Option<ToolResult> {
-        if call.tool_name == BUILTIN_UPDATE_PLAN_TOOL {
+        if call.tool_name == UPDATE_PLAN_TOOL {
             return None;
         }
         let envelope = tool_call_request(call);
@@ -2147,7 +2106,11 @@ where
             .map(|error| {
                 let output = if call.tool_name == TOOL_COMMAND {
                     match command_tool_input(&call.arguments) {
-                        Ok(input) => command_workspace_tool_failure(&input, error.into()),
+                        Ok(input) => command_workspace_tool_failure(
+                            &input,
+                            error.into(),
+                            &self.policy.profile,
+                        ),
                         Err(_) => workspace_tool_failure(error.into()),
                     }
                 } else {
@@ -2191,6 +2154,7 @@ where
                 &prepared.call,
                 decision,
                 self.policy.profile.approval_policy,
+                &self.policy.profile,
             ));
         }
         result
@@ -2208,6 +2172,7 @@ where
                 call,
                 decision,
                 self.policy.profile.approval_policy,
+                &self.policy.profile,
             ));
         }
         result
@@ -2227,7 +2192,13 @@ where
                 .expect("admitted parallel read has a policy decision");
             let envelope = tool_call_request(&worker.call);
             broker.execute(&envelope, decision.clone(), |_| {
-                execute_workspace_tool_call(workspace_tools, cancellation, &worker.call, &decision)
+                execute_workspace_tool_call(
+                    workspace_tools,
+                    cancellation,
+                    &worker.call,
+                    &decision,
+                    &PermissionProfile::workspace_write("."),
+                )
             })
         });
         prepared
@@ -2309,7 +2280,7 @@ where
         let mut result = self
             .tool_broker
             .execute(&envelope, decision.clone(), |_envelope| {
-                if call.tool_name == BUILTIN_UPDATE_PLAN_TOOL {
+                if call.tool_name == UPDATE_PLAN_TOOL {
                     self.execute_plan_update(call, state)
                 } else {
                     self.execute_workspace_tool(call, &executor_decision)
@@ -2322,6 +2293,7 @@ where
                 call,
                 &decision,
                 self.policy.profile.approval_policy,
+                &self.policy.profile,
             ));
         }
         result
@@ -2355,6 +2327,7 @@ where
             &self.cancellation,
             call,
             decision,
+            &self.policy.profile,
         )
     }
 }
@@ -2364,6 +2337,7 @@ fn execute_workspace_tool_call(
     cancellation: &CancellationToken,
     call: &ModelToolCall,
     decision: &ToolBrokerDecision,
+    profile: &PermissionProfile,
 ) -> ToolOutput {
     if cancellation.is_cancelled() {
         return ToolOutput::failure_with_kind(
@@ -2391,10 +2365,18 @@ fn execute_workspace_tool_call(
         TOOL_PATCH => patch_tool_input(&call.arguments)
             .and_then(|input| workspace_tools.patch(input, decision).map_err(Into::into)),
         TOOL_COMMAND => match command_tool_input(&call.arguments) {
-            Ok(input) => Ok(workspace_tools
-                .command_cancellable(input.clone(), cancellation)
-                .map_err(Into::into)
-                .unwrap_or_else(|error| command_workspace_tool_failure(&input, error))),
+            Ok(input) => {
+                let (filesystem, network) = effective_command_policy(profile);
+                Ok(workspace_tools
+                    .command_cancellable_with_policy(
+                        input.clone(),
+                        filesystem,
+                        network,
+                        cancellation,
+                    )
+                    .map_err(Into::into)
+                    .unwrap_or_else(|error| command_workspace_tool_failure(&input, error, profile)))
+            }
             Err(error) => Err(error),
         },
         _ => Ok(ToolOutput::failure_with_kind(
@@ -2608,11 +2590,8 @@ fn context_budget(
     if capabilities.max_context_tokens == 0 || capabilities.max_output_tokens == 0 {
         return Err("provider token capabilities must be greater than zero".to_string());
     }
-    let developer_instruction_tokens = approximate_token_count(&developer_instructions(
-        input,
-        max_tool_calls,
-        uses_tool_router(capabilities),
-    ));
+    let developer_instruction_tokens =
+        approximate_token_count(&developer_instructions(input, max_tool_calls));
     let tool_tokens = reserved_model_tool_tokens(loop_tools, capabilities)?;
     let message_count = u32::try_from(input.input.len().saturating_add(1)).unwrap_or(u32::MAX);
     let message_framing_tokens = message_count.saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
@@ -3043,34 +3022,16 @@ fn restore_checkpoint(
         return Err("approval checkpoint assistant tool-call ordering is invalid".to_string());
     }
     let model_visible_call = &last_message.tool_calls[0];
-    let model_visible_tool_name = model_visible_call.tool_name.clone();
     if model_visible_call.parse_status != ModelToolParseStatus::Valid {
         return Err("approval checkpoint assistant tool-call name is invalid".to_string());
     }
     let pending_call = pending
         .to_model_tool_call()
         .map_err(|error| format!("invalid pending checkpoint tool call arguments: {error}"))?;
-    if pending.tool_name == BUILTIN_INVOKE_TOOL {
-        return Err("approval checkpoint cannot persist the model-facing router".to_string());
+    if model_visible_call.tool_name != pending.tool_name {
+        return Err("approval checkpoint assistant tool-call name is invalid".to_string());
     }
-    let canonical_model_call = if model_visible_tool_name == BUILTIN_INVOKE_TOOL {
-        let invocation = invoke_tool_input(&model_visible_call.arguments)
-            .map_err(|_| "approval checkpoint router invocation is invalid".to_string())?;
-        ModelToolCall {
-            tool_call_id: model_visible_call.tool_call_id.clone(),
-            tool_name: invocation.tool_name,
-            raw_arguments: serde_json::to_string(&invocation.arguments)
-                .expect("model tool arguments serialize"),
-            arguments: invocation.arguments,
-            parse_status: ModelToolParseStatus::Valid,
-            validation_errors: Vec::new(),
-        }
-    } else {
-        if model_visible_tool_name != pending.tool_name {
-            return Err("approval checkpoint assistant tool-call name is invalid".to_string());
-        }
-        model_visible_call.clone()
-    };
+    let canonical_model_call = model_visible_call.clone();
     let canonical_model_call =
         canonicalize_model_tool_call(tool_broker, &canonical_model_call, permission_profile)
             .map_err(|error| format!("approval checkpoint tool call is invalid: {error}"))?;
@@ -3155,7 +3116,7 @@ fn restore_checkpoint(
     }
     let derived_plan_update_count = tool_results
         .iter()
-        .filter(|tool_result| tool_result.tool_name == BUILTIN_UPDATE_PLAN_TOOL && tool_result.ok)
+        .filter(|tool_result| tool_result.tool_name == UPDATE_PLAN_TOOL && tool_result.ok)
         .count() as u32;
     if derived_plan_update_count != checkpoint.plan_update_count {
         return Err("approval checkpoint plan update count mismatch".to_string());
@@ -3349,42 +3310,6 @@ fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
 
 fn visible_model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
     model_tool_schemas(loop_tools)
-        .into_iter()
-        .filter(|tool| tool.name != BUILTIN_INVOKE_TOOL)
-        .collect()
-}
-
-fn uses_tool_router(capabilities: &ProviderProtocolContract) -> bool {
-    capabilities.tool_definition_mode == ProviderToolDefinitionMode::Routed
-}
-
-fn router_model_tool_schema(
-    loop_tools: &ToolBroker,
-    visible_tools: &[ModelToolSchema],
-) -> Result<ModelToolSchema, String> {
-    let mut router = model_tool_schemas(loop_tools)
-        .into_iter()
-        .find(|tool| tool.name == BUILTIN_INVOKE_TOOL)
-        .ok_or_else(|| "tool router is not registered".to_string())?;
-    let branches = visible_tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "object",
-                "properties": {
-                    "tool_name": {
-                        "const": &tool.name,
-                        "description": &tool.description,
-                    },
-                    "arguments": &tool.parameters_schema,
-                },
-                "required": ["tool_name", "arguments"],
-                "additionalProperties": false,
-            })
-        })
-        .collect::<Vec<_>>();
-    router.parameters_schema = json!({"oneOf": branches});
-    Ok(router)
 }
 
 fn model_tool_view(
@@ -3400,35 +3325,22 @@ fn model_tool_view(
         .iter()
         .map(|tool| tool.name.clone())
         .collect::<Vec<_>>();
-    match capabilities.tool_definition_mode {
-        ProviderToolDefinitionMode::Direct => {
-            if visible_tools.len() > capabilities.max_tools_per_request as usize {
-                return Err(format!(
-                    "provider direct tool-definition limit ({}) is below the required tool count ({})",
-                    capabilities.max_tools_per_request,
-                    visible_tools.len()
-                ));
-            }
-            Ok(ModelToolView {
-                tools: visible_tools,
-                visible_tool_names,
-                max_tool_calls,
-            })
-        }
-        ProviderToolDefinitionMode::Routed => {
-            let router = router_model_tool_schema(loop_tools, &visible_tools)?;
-            Ok(ModelToolView {
-                tools: vec![router],
-                visible_tool_names,
-                max_tool_calls: 1,
-            })
-        }
+    if visible_tools.len() > capabilities.max_tools_per_request as usize {
+        return Err(format!(
+            "provider direct tool-definition limit ({}) is below the required tool count ({})",
+            capabilities.max_tools_per_request,
+            visible_tools.len()
+        ));
     }
+    Ok(ModelToolView {
+        tools: visible_tools,
+        visible_tool_names,
+        max_tool_calls,
+    })
 }
 
 fn resolve_model_tool_calls(
     provider_calls: &[ModelToolCall],
-    router_enabled: bool,
     visible_tool_names: &[String],
 ) -> Vec<ModelToolCall> {
     provider_calls
@@ -3437,25 +3349,7 @@ fn resolve_model_tool_calls(
             if call.parse_status != ModelToolParseStatus::Valid {
                 return call.clone();
             }
-            let mut resolved = if router_enabled {
-                if call.tool_name != BUILTIN_INVOKE_TOOL {
-                    let mut resolved = call.clone();
-                    resolved.parse_status = ModelToolParseStatus::UnknownTool;
-                    resolved
-                } else {
-                    let Ok(invocation) = invoke_tool_input(&call.arguments) else {
-                        return call.clone();
-                    };
-                    let mut resolved = call.clone();
-                    resolved.tool_name = invocation.tool_name;
-                    resolved.raw_arguments = serde_json::to_string(&invocation.arguments)
-                        .expect("model tool arguments serialize");
-                    resolved.arguments = invocation.arguments;
-                    resolved
-                }
-            } else {
-                call.clone()
-            };
+            let mut resolved = call.clone();
             if resolved.parse_status == ModelToolParseStatus::Valid
                 && !visible_tool_names
                     .iter()
@@ -3477,57 +3371,38 @@ fn reserved_model_tool_tokens(
     capabilities: &ProviderProtocolContract,
 ) -> Result<u32, String> {
     let visible_tools = visible_model_tool_schemas(loop_tools);
-    match capabilities.tool_definition_mode {
-        ProviderToolDefinitionMode::Direct => {
-            if visible_tools.len() > capabilities.max_tools_per_request as usize {
-                return Err(format!(
-                    "provider direct tool-definition limit ({}) is below the required tool count ({})",
-                    capabilities.max_tools_per_request,
-                    visible_tools.len()
-                ));
-            }
-            Ok(model_tool_payload_tokens(&visible_tools))
-        }
-        ProviderToolDefinitionMode::Routed => {
-            let router = router_model_tool_schema(loop_tools, &visible_tools)?;
-            Ok(model_tool_payload_tokens(&[router]))
-        }
+    if visible_tools.len() > capabilities.max_tools_per_request as usize {
+        return Err(format!(
+            "provider direct tool-definition limit ({}) is below the required tool count ({})",
+            capabilities.max_tools_per_request,
+            visible_tools.len()
+        ));
     }
+    Ok(model_tool_payload_tokens(&visible_tools))
 }
 
 fn model_messages_from_input(
     input: &AgentLoopInput,
     context: &ContextBundle,
     max_tool_calls: u32,
-    router_tool_view: bool,
 ) -> Vec<ModelMessage> {
     let mut messages = vec![ModelMessage::text(
         ModelRole::Developer,
-        developer_instructions(input, max_tool_calls, router_tool_view),
+        developer_instructions(input, max_tool_calls),
     )];
     messages.extend(model_messages_from_context(context));
     messages
 }
 
-fn developer_instructions(
-    input: &AgentLoopInput,
-    max_tool_calls: u32,
-    router_tool_view: bool,
-) -> String {
-    let tool_call_instruction = if router_tool_view || max_tool_calls == 1 {
+fn developer_instructions(input: &AgentLoopInput, max_tool_calls: u32) -> String {
+    let tool_call_instruction = if max_tool_calls == 1 {
         "Issue at most one tool call per assistant response and wait for its result.".to_string()
     } else {
         format!(
             "Issue up to {max_tool_calls} tool calls in one response only when every call is an independent read-only operation. Issue mutations, commands, plan updates, approval-sensitive calls, and calls that depend on earlier results one at a time and wait for each result."
         )
     };
-    let router_instruction = if router_tool_view {
-        " The visible builtin_invoke_tool is a single-turn router: provide one exact visible tool_name and its complete arguments object in the same call. Do not invoke the router recursively."
-    } else {
-        ""
-    };
-    let instructions =
-        format!("{AGENT_DEVELOPER_INSTRUCTIONS} {tool_call_instruction}{router_instruction}");
+    let instructions = format!("{AGENT_DEVELOPER_INSTRUCTIONS} {tool_call_instruction}");
     match input.project_instructions.as_deref() {
         Some(project) => {
             format!("{instructions}\n\nProject instructions:\n{project}")
@@ -3540,13 +3415,12 @@ fn refresh_developer_instructions(
     messages: &mut [ModelMessage],
     input: &AgentLoopInput,
     max_tool_calls: u32,
-    router_tool_view: bool,
 ) {
     if let Some(message) = messages
         .iter_mut()
         .find(|message| message.role == ModelRole::Developer)
     {
-        message.content = developer_instructions(input, max_tool_calls, router_tool_view);
+        message.content = developer_instructions(input, max_tool_calls);
     }
 }
 
@@ -3640,6 +3514,7 @@ fn command_audit_metadata(
     call: &ModelToolCall,
     decision: &ToolBrokerDecision,
     approval_policy: ApprovalPolicy,
+    profile: &PermissionProfile,
 ) -> Value {
     let mut audit = existing.cloned().unwrap_or_else(|| json!({}));
     if let Ok(input) = command_tool_input(&call.arguments) {
@@ -3649,21 +3524,14 @@ fn command_audit_metadata(
         if audit.get("timeout_seconds").is_none() {
             audit["timeout_seconds"] = json!(input.effective_timeout_seconds());
         }
-        if audit.get("sandbox_mode").is_none() {
-            audit["sandbox_mode"] =
-                serde_json::to_value(input.sandbox_mode()).unwrap_or(json!("unknown"));
-        }
-        if audit.get("network_access").is_none() {
-            audit["network_access"] =
-                serde_json::to_value(input.network_access()).unwrap_or(json!("unknown"));
-        }
+        let (sandbox_mode, network_access) = effective_command_policy(profile);
         if audit.get("command_scope_digest").is_none() {
-            audit["command_scope_digest"] = json!(command_scope_digest(
-                &input.argv,
+            audit["command_scope_digest"] = json!(command_script_scope_digest_with_policy(
+                &input.command,
                 input.effective_cwd(),
                 input.effective_timeout_seconds(),
-                &input.sandbox_mode(),
-                &input.network_access(),
+                sandbox_mode,
+                network_access,
             ));
         }
         audit["approval_policy"] =
@@ -3786,6 +3654,7 @@ fn approval_request(
     approval_request_id: &str,
     call: &ModelToolCall,
     reason: &str,
+    profile: &PermissionProfile,
 ) -> ApprovalRequest {
     let mut request = ApprovalRequest::new(
         approval_request_id,
@@ -3794,7 +3663,7 @@ fn approval_request(
         call.tool_name.clone(),
     )
     .with_tool_call_id(call.tool_call_id.clone())
-    .with_resources(permission_resources_for_tool(call));
+    .with_resources(permission_resources_for_tool(call, profile));
     request.reason = reason.to_string();
     request
 }
@@ -3811,8 +3680,6 @@ fn approval_request_id_from_tool_call_id(turn_id: &str, tool_call_id: &str) -> S
 enum CommandBindingError {
     #[error("{0}")]
     InvalidArguments(AgentLoopToolError),
-    #[error("{0}")]
-    ProfileViolation(String),
 }
 
 fn canonicalize_model_tool_call(
@@ -3836,73 +3703,28 @@ fn canonicalize_model_tool_call(
 
 fn bind_tool_call_to_profile(
     call: &ModelToolCall,
-    profile: &PermissionProfile,
+    _profile: &PermissionProfile,
 ) -> Result<ModelToolCall, CommandBindingError> {
     if call.tool_name != TOOL_COMMAND {
         return Ok(call.clone());
     }
-    let mut input =
-        command_tool_input(&call.arguments).map_err(CommandBindingError::InvalidArguments)?;
-    let cwd = input.effective_cwd().to_string();
-    let timeout_seconds = input.effective_timeout_seconds();
-    let (sandbox_mode, network_access) =
-        effective_command_policy(profile, &input).map_err(CommandBindingError::ProfileViolation)?;
-    input.cwd = Some(cwd);
-    input.timeout_seconds = Some(timeout_seconds);
-    input.sandbox_mode = Some(sandbox_mode);
-    input.network_access = Some(network_access);
-    let arguments = serde_json::to_value(input)
-        .map_err(|error| CommandBindingError::ProfileViolation(error.to_string()))?;
-    let mut bound = call.clone();
-    bound.raw_arguments = arguments.to_string();
-    bound.arguments = arguments;
-    Ok(bound)
+    command_tool_input(&call.arguments).map_err(CommandBindingError::InvalidArguments)?;
+    Ok(call.clone())
 }
 
 fn effective_command_policy(
     profile: &PermissionProfile,
-    input: &CommandToolInput,
-) -> Result<(SandboxFilesystemMode, SandboxNetworkMode), String> {
+) -> (SandboxFilesystemMode, SandboxNetworkMode) {
     let session_filesystem = match profile.profile {
         PermissionProfileName::ReadOnly => SandboxFilesystemMode::ReadOnly,
         PermissionProfileName::WorkspaceWrite => SandboxFilesystemMode::WorkspaceWrite,
         PermissionProfileName::DangerFullAccess => SandboxFilesystemMode::DangerFullAccess,
     };
-    let requested_filesystem = input
-        .sandbox_mode
-        .clone()
-        .unwrap_or(session_filesystem.clone());
-    if !filesystem_request_within_profile(&session_filesystem, &requested_filesystem) {
-        return Err(COMMAND_SANDBOX_PROFILE_DENIED.to_string());
-    }
-
     let session_network = match profile.network_access {
         NetworkAccess::Denied => SandboxNetworkMode::Denied,
         NetworkAccess::Allowed => SandboxNetworkMode::Allowed,
     };
-    let requested_network = input
-        .network_access
-        .clone()
-        .unwrap_or(session_network.clone());
-    if session_network == SandboxNetworkMode::Denied
-        && requested_network != SandboxNetworkMode::Denied
-    {
-        return Err(COMMAND_NETWORK_PROFILE_DENIED.to_string());
-    }
-    Ok((requested_filesystem, requested_network))
-}
-
-fn filesystem_request_within_profile(
-    profile: &SandboxFilesystemMode,
-    requested: &SandboxFilesystemMode,
-) -> bool {
-    match profile {
-        SandboxFilesystemMode::ReadOnly => requested == &SandboxFilesystemMode::ReadOnly,
-        SandboxFilesystemMode::WorkspaceWrite => {
-            requested != &SandboxFilesystemMode::DangerFullAccess
-        }
-        SandboxFilesystemMode::DangerFullAccess => true,
-    }
+    (session_filesystem, session_network)
 }
 
 fn permission_operation_for_tool(tool_name: &str) -> PermissionOperation {
@@ -3913,9 +3735,9 @@ fn permission_operation_for_tool(tool_name: &str) -> PermissionOperation {
     }
 }
 
-fn permission_resources_for_tool(call: &ModelToolCall) -> Vec<String> {
+fn permission_resources_for_tool(call: &ModelToolCall, profile: &PermissionProfile) -> Vec<String> {
     if call.tool_name == TOOL_COMMAND {
-        return command_permission_resources(&call.arguments, &call.tool_name);
+        return command_permission_resources(&call.arguments, &call.tool_name, profile);
     }
     let paths = path_arguments(&call.arguments);
     if paths.is_empty() {
@@ -3925,16 +3747,21 @@ fn permission_resources_for_tool(call: &ModelToolCall) -> Vec<String> {
     }
 }
 
-fn command_permission_resources(arguments: &Value, fallback: &str) -> Vec<String> {
+fn command_permission_resources(
+    arguments: &Value,
+    fallback: &str,
+    profile: &PermissionProfile,
+) -> Vec<String> {
     let Ok(input) = serde_json::from_value::<CommandToolInput>(arguments.clone()) else {
         return vec![fallback.to_string()];
     };
-    let resource = command_scope_resource(
-        &input.argv,
+    let (filesystem, network) = effective_command_policy(profile);
+    let resource = command_script_scope_resource_with_policy(
+        &input.command,
         input.effective_cwd(),
         input.effective_timeout_seconds(),
-        &input.sandbox_mode(),
-        &input.network_access(),
+        filesystem,
+        network,
     );
     if resource.is_empty() {
         vec![fallback.to_string()]
@@ -3995,22 +3822,6 @@ fn update_plan_tool_input(arguments: &Value) -> Result<AgentPlan, AgentLoopToolE
         .map_err(AgentLoopToolError::InvalidArguments)
 }
 
-fn invoke_tool_input(arguments: &Value) -> Result<AgentToolInvocationInput, AgentLoopToolError> {
-    let input: AgentToolInvocationInput =
-        serde_json::from_value(arguments.clone()).map_err(invalid_tool_arguments)?;
-    if input.tool_name.trim().is_empty() {
-        return Err(AgentLoopToolError::InvalidArguments(
-            "tool_name must not be empty".to_string(),
-        ));
-    }
-    if !input.arguments.is_object() {
-        return Err(AgentLoopToolError::InvalidArguments(
-            "arguments must be an object".to_string(),
-        ));
-    }
-    Ok(input)
-}
-
 fn permission_failure_kind(cause: &PermissionDecisionCause) -> ToolFailureKind {
     match cause {
         PermissionDecisionCause::NetworkProfile => ToolFailureKind::PermissionProfile,
@@ -4029,12 +3840,6 @@ fn validate_plan_tool_input_contract(input: &Value) -> Result<(), ToolInputValid
     AgentPlan { steps: input.steps }
         .validate_contract()
         .map_err(|failure| ToolInputValidationError::new(failure.code()))
-}
-
-fn validate_invoke_tool_input_contract(input: &Value) -> Result<(), ToolInputValidationError> {
-    invoke_tool_input(input)
-        .map(|_| ())
-        .map_err(|_| ToolInputValidationError::new("tool_invocation_input_invalid"))
 }
 
 fn invalid_tool_arguments_result(
@@ -4079,10 +3884,10 @@ fn invalid_tool_arguments_result(
 }
 
 fn command_argument_validation_code(call: &ModelToolCall) -> &'static str {
-    match call.arguments.get("argv") {
-        None => "missing_argv",
-        Some(Value::Array(_)) => "invalid_command_arguments",
-        Some(_) => "argv_not_array",
+    match call.arguments.get("command") {
+        None => "missing_command",
+        Some(Value::String(_)) => "invalid_command_arguments",
+        Some(_) => "command_not_string",
     }
 }
 
@@ -4095,7 +3900,7 @@ fn invalid_command_arguments_output(validation_code: &str, spec: Option<&ToolSpe
     let retry_inputs = spec.map(ToolSpec::exact_model_inputs).unwrap_or_default();
     if !retry_inputs.is_empty() {
         summary.push_str(
-            ". The argv field must be a JSON array of strings. Copy one complete retry_inputs object exactly",
+            ". The command field must be a shell command string. Copy one complete retry_inputs object exactly",
         );
     }
     if let Some(schema) = spec.map(|spec| &spec.input_schema) {
@@ -4187,21 +3992,23 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
 fn command_workspace_tool_failure(
     input: &CommandToolInput,
     error: AgentLoopToolError,
+    profile: &PermissionProfile,
 ) -> ToolOutput {
     let mut output = workspace_tool_failure(error);
+    let (sandbox_mode, network_access) = effective_command_policy(profile);
     output.metadata["audit"] = json!({
         "cwd": input.effective_cwd(),
         "timeout_seconds": input.effective_timeout_seconds(),
-        "sandbox_mode": input.sandbox_mode(),
-        "network_access": input.network_access(),
+        "sandbox_mode": sandbox_mode,
+        "network_access": network_access,
         "sandbox_backend": "unavailable",
         "sandbox_enforcement": "unavailable",
-        "command_scope_digest": command_scope_digest(
-            &input.argv,
+        "command_scope_digest": command_script_scope_digest_with_policy(
+            &input.command,
             input.effective_cwd(),
             input.effective_timeout_seconds(),
-            &input.sandbox_mode(),
-            &input.network_access(),
+            sandbox_mode,
+            network_access,
         ),
         "command_provenance": "agent_requested",
     });

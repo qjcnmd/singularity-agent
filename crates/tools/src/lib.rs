@@ -56,12 +56,12 @@ const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "reveal hidden",
     "system prompt",
 ];
-pub const BUILTIN_READ_TOOL: &str = "builtin_read";
-pub const BUILTIN_LIST_TOOL: &str = "builtin_list";
-pub const BUILTIN_GREP_TOOL: &str = "builtin_grep";
-pub const BUILTIN_EDIT_TOOL: &str = "builtin_edit";
-pub const BUILTIN_PATCH_TOOL: &str = "builtin_patch";
-pub const BUILTIN_COMMAND_TOOL: &str = "builtin_command";
+pub const READ_TOOL: &str = "read";
+pub const LIST_TOOL: &str = "list";
+pub const GREP_TOOL: &str = "grep";
+pub const EDIT_TOOL: &str = "edit";
+pub const PATCH_TOOL: &str = "patch";
+pub const COMMAND_TOOL: &str = "command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -386,7 +386,7 @@ where
 pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
-            BUILTIN_READ_TOOL,
+            READ_TOOL,
             "Read a bounded range from a workspace text file",
             json!({
                 "type": "object",
@@ -403,7 +403,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             validate_read_tool_input,
         ),
         ToolSpec::new(
-            BUILTIN_LIST_TOOL,
+            LIST_TOOL,
             "List bounded workspace directory entries with optional recursion",
             json!({
                 "type": "object",
@@ -420,7 +420,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             validate_list_tool_input,
         ),
         ToolSpec::new(
-            BUILTIN_GREP_TOOL,
+            GREP_TOOL,
             "Search bounded workspace text with deterministic ordering",
             json!({
                 "type": "object",
@@ -437,7 +437,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             validate_grep_tool_input,
         ),
         ToolSpec::new(
-            BUILTIN_EDIT_TOOL,
+            EDIT_TOOL,
             "Replace expected text in a workspace file",
             json!({
                 "type": "object",
@@ -453,7 +453,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             validate_edit_tool_input,
         ),
         ToolSpec::new(
-            BUILTIN_PATCH_TOOL,
+            PATCH_TOOL,
             "Apply explicit workspace file changes",
             json!({
                 "type": "object",
@@ -480,7 +480,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             validate_patch_tool_input,
         ),
         ToolSpec::new(
-            BUILTIN_COMMAND_TOOL,
+            COMMAND_TOOL,
             "Run a bounded sandboxed command",
             json!({
                 "type": "object",
@@ -1233,17 +1233,17 @@ impl WorkspaceTools {
     /// 在执行或变更前校验输入，并解析每个被引用的路径。
     pub fn preflight(&self, tool_name: &str, input: &Value) -> Result<(), WorkspaceToolError> {
         match tool_name {
-            BUILTIN_READ_TOOL => {
+            READ_TOOL => {
                 let input: ReadToolInput = preflight_input(input)?;
                 input.validate()?;
                 self.resolve_workspace_path(&input.path, false)?;
             }
-            BUILTIN_LIST_TOOL => {
+            LIST_TOOL => {
                 let input: ListToolInput = preflight_input(input)?;
                 input.validate()?;
                 self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
             }
-            BUILTIN_GREP_TOOL => {
+            GREP_TOOL => {
                 let input: GrepToolInput = preflight_input(input)?;
                 input.validate()?;
                 self.resolve_workspace_path(
@@ -1251,12 +1251,12 @@ impl WorkspaceTools {
                     input.path.is_none(),
                 )?;
             }
-            BUILTIN_EDIT_TOOL => {
+            EDIT_TOOL => {
                 let input: EditToolInput = preflight_input(input)?;
                 input.validate()?;
                 self.resolve_workspace_path(&input.path, false)?;
             }
-            BUILTIN_PATCH_TOOL => {
+            PATCH_TOOL => {
                 let patch: WorkspacePatch = preflight_input(input)?;
                 patch.validate()?;
                 let mut targets = BTreeSet::new();
@@ -1269,7 +1269,7 @@ impl WorkspaceTools {
                     }
                 }
             }
-            BUILTIN_COMMAND_TOOL => {
+            COMMAND_TOOL => {
                 let input: CommandToolInput = preflight_input(input)?;
                 input.validate()?;
                 let Some(backend) = &self.sandbox_backend else {
@@ -1534,6 +1534,22 @@ impl WorkspaceTools {
         input: CommandToolInput,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput, WorkspaceToolError> {
+        self.command_cancellable_with_policy(
+            input,
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+            cancellation,
+        )
+    }
+
+    /// 按 Agent/Policy 已绑定的范围执行模型 command string。
+    pub fn command_cancellable_with_policy(
+        &self,
+        input: CommandToolInput,
+        filesystem: SandboxFilesystemMode,
+        network: SandboxNetworkMode,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolOutput, WorkspaceToolError> {
         input.validate()?;
         let Some(backend) = &self.sandbox_backend else {
             return Err(WorkspaceToolError::SandboxUnavailable);
@@ -1544,18 +1560,25 @@ impl WorkspaceTools {
         }
         let requested_cwd = input.cwd.as_deref().unwrap_or(".");
         let command_cwd = self.resolve_workspace_path(requested_cwd, false)?;
-        let mut request = CommandScriptRequest::agent_requested(
+        let mut request = CommandScriptRequest::agent_requested_with_policy(
             next_command_id(),
             input.command,
             command_cwd.to_string_lossy().into_owned(),
             self.workspace_root.to_string_lossy().into_owned(),
+            filesystem,
+            network,
         );
         request.environment = self.command_environment.clone();
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }
-        let scope_digest =
-            command_script_scope_digest(&request.script, &request.cwd, request.timeout_seconds);
+        let scope_digest = command_script_scope_digest_with_policy(
+            &request.script,
+            &request.cwd,
+            request.timeout_seconds,
+            request.filesystem.mode.clone(),
+            request.network.mode.clone(),
+        );
         let result = backend.execute_script_cancellable(&request, cancellation);
         let execution = result.sandbox.clone();
         let mut output = command_tool_output(result);
@@ -2021,13 +2044,19 @@ struct CommandScriptScope<'a> {
 }
 
 impl<'a> CommandScriptScope<'a> {
-    fn new(command: &'a str, cwd: &'a str, timeout_seconds: u64) -> Self {
+    fn new(
+        command: &'a str,
+        cwd: &'a str,
+        timeout_seconds: u64,
+        sandbox_mode: SandboxFilesystemMode,
+        network_access: SandboxNetworkMode,
+    ) -> Self {
         Self {
             command,
             cwd,
             timeout_seconds,
-            sandbox_mode: SandboxFilesystemMode::ReadOnly,
-            network_access: SandboxNetworkMode::Denied,
+            sandbox_mode,
+            network_access,
         }
     }
 
@@ -2039,7 +2068,24 @@ impl<'a> CommandScriptScope<'a> {
 
 /// 对模型 command string 及其固定的只读、离线执行范围计算哈希。
 pub fn command_script_scope_digest(command: &str, cwd: &str, timeout_seconds: u64) -> String {
-    CommandScriptScope::new(command, cwd, timeout_seconds).digest()
+    command_script_scope_digest_with_policy(
+        command,
+        cwd,
+        timeout_seconds,
+        SandboxFilesystemMode::ReadOnly,
+        SandboxNetworkMode::Denied,
+    )
+}
+
+/// 对模型 command 及其经 Policy 绑定的执行范围计算哈希。
+pub fn command_script_scope_digest_with_policy(
+    command: &str,
+    cwd: &str,
+    timeout_seconds: u64,
+    sandbox_mode: SandboxFilesystemMode,
+    network_access: SandboxNetworkMode,
+) -> String {
+    CommandScriptScope::new(command, cwd, timeout_seconds, sandbox_mode, network_access).digest()
 }
 
 /// 返回不包含原始 command 内容的脚本权限资源摘要。
@@ -2050,13 +2096,31 @@ pub fn command_script_scope_resource(command: &str, cwd: &str, timeout_seconds: 
     )
 }
 
+/// 返回不包含原始 command 内容、但绑定执行范围的脚本权限资源摘要。
+pub fn command_script_scope_resource_with_policy(
+    command: &str,
+    cwd: &str,
+    timeout_seconds: u64,
+    sandbox_mode: SandboxFilesystemMode,
+    network_access: SandboxNetworkMode,
+) -> String {
+    format!(
+        "command_script;scope_digest:{}",
+        command_script_scope_digest_with_policy(
+            command,
+            cwd,
+            timeout_seconds,
+            sandbox_mode,
+            network_access,
+        )
+    )
+}
+
 fn validate_tool_name(name: &str) -> Result<(), String> {
-    let Some(tool) = name.strip_prefix("builtin_") else {
-        return Err(format!("tool name must use builtin_<tool>: {name}"));
-    };
-    if tool.is_empty()
+    if name.starts_with("builtin_")
+        || name.is_empty()
         || name.len() > 64
-        || !tool
+        || !name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
     {
@@ -2225,7 +2289,18 @@ fn next_command_id() -> String {
 fn command_tool_output(result: CommandResult) -> ToolOutput {
     let ok = result.execution_status == CommandExecutionStatus::Completed
         && result.semantic_status == CommandSemanticStatus::Succeeded;
-    let content = serde_json::to_value(&result).expect("command result serializes");
+    // 模型只接收命令语义和有界输出，backend/enforcement 仅保留在 audit metadata。
+    let content = json!({
+        "execution_status": result.execution_status,
+        "semantic_status": result.semantic_status,
+        "exit_code": result.exit_code,
+        "duration_ms": result.duration_ms,
+        "timed_out": result.timed_out,
+        "stdout_preview": result.stdout_preview,
+        "stderr_preview": result.stderr_preview,
+        "output_truncated": result.output_truncated,
+        "redacted": result.redacted,
+    });
     if ok {
         ToolOutput::success(content)
     } else {

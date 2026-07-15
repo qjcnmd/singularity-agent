@@ -171,14 +171,6 @@ pub enum ProviderToolReasoningMode {
     DisabledForToolCalls,
 }
 
-/// 描述 tool 以模型提供方支持的原生结构直接发送。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderToolDefinitionMode {
-    #[default]
-    Direct,
-}
-
 /// 为模型提供方完成请求选定的线路协议。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -197,7 +189,6 @@ pub struct ProviderProtocolContract {
     pub supports_required_tool_choice: bool,
     pub supports_strict_tool_schema: bool,
     pub tool_reasoning_mode: ProviderToolReasoningMode,
-    pub tool_definition_mode: ProviderToolDefinitionMode,
     pub max_tools_per_request: u32,
     pub supports_json_mode: bool,
     pub supports_system_message: bool,
@@ -214,7 +205,6 @@ impl Default for ProviderProtocolContract {
             supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
-            tool_definition_mode: ProviderToolDefinitionMode::Direct,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: false,
             supports_system_message: true,
@@ -910,7 +900,6 @@ impl OpenAiProviderConfig {
             supports_required_tool_choice: false,
             supports_strict_tool_schema: false,
             tool_reasoning_mode: ProviderToolReasoningMode::Unspecified,
-            tool_definition_mode: ProviderToolDefinitionMode::Direct,
             max_tools_per_request: DEFAULT_MAX_TOOLS_PER_REQUEST,
             supports_json_mode: false,
             supports_system_message: false,
@@ -2254,7 +2243,6 @@ fn capability_probe_profiles(
                 } else {
                     ProviderToolReasoningMode::Unspecified
                 },
-                tool_definition_mode: ProviderToolDefinitionMode::Direct,
                 max_tools_per_request,
                 supports_json_mode: false,
                 supports_system_message: false,

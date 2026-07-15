@@ -5,14 +5,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 const IDENTIFIER_MAX_BYTES: usize = 128;
 const SHA1_HEX_LENGTH: usize = 40;
 const SHA256_HEX_LENGTH: usize = 64;
-const BUILTIN_TOOL_NAMES: [&str; 7] = [
-    "builtin_read",
-    "builtin_list",
-    "builtin_grep",
-    "builtin_edit",
-    "builtin_patch",
-    "builtin_command",
-    "builtin_update_plan",
+const CORE_TOOL_NAMES: [&str; 7] = [
+    "read",
+    "list",
+    "grep",
+    "edit",
+    "patch",
+    "command",
+    "update_plan",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -347,12 +347,12 @@ fn validate_remote_repository(value: &str) -> Result<(), String> {
 }
 
 fn validate_tool_name(value: &str) -> Result<(), String> {
-    if BUILTIN_TOOL_NAMES.contains(&value) {
+    if CORE_TOOL_NAMES.contains(&value) {
         Ok(())
     } else {
         Err(format!(
             "unsupported evaluation tool name {value}; expected one of {}",
-            BUILTIN_TOOL_NAMES.join(", ")
+            CORE_TOOL_NAMES.join(", ")
         ))
     }
 }

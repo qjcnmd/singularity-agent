@@ -57,12 +57,11 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 
 用户不需要选择 backend 或维护 sandbox 配置文件。AgentLoop 的命令工具固定经过 `WindowsSandboxBackend`：
 
-1. 先尝试 Codex 风格的 elevated sandbox。
-2. 如果尚未完成 setup，Windows 显示 UAC 提示，setup helper 自动建立产品专用的受限账户、ACL、WFP/防火墙规则和 helper 目录。
-3. 网络被拒绝时必须使用 elevated offline identity；失败后不会降级。
-4. 只有请求允许网络、restricted token 足以满足权限时，才允许 unelevated restricted-token 路径。
-5. 所有路径都使用 Job Object、进程树终止、超时和有界输出捕获。
-6. 裸命令通过宿主机 `PATH`/`PATHEXT` 解析为规范化可执行文件；安全的外部工具链目录只获得读取和执行权限，写入仍限于 workspace 和 sandbox 临时目录。
+1. 启动时自动选择当前平台可用的严格 sandbox；用户不需要选择 backend 或维护安全配置文件。
+2. 首次需要平台初始化时，应用自动完成必要准备并在确需提升权限时显示系统提示。
+3. 越界写入、网络请求和受保护路径由 Policy/Approval 处理；不能在当前平台安全执行时明确失败，不降级为本地进程。
+4. 命令工具接受 `command` 字符串以及可选 `cwd`、`timeout_seconds`；PATH、shell 方言和可信内部参数转换由平台 adapter 处理。
+5. 运行时统一提供取消、超时、进程树终止和有界输出；这些实现细节不会进入模型工具 schema。
 
 默认 sandbox home 是 `%USERPROFILE%\.singularity`。确实需要把其状态放到其他盘时，可在启动 `sg` 前设置绝对路径：
 

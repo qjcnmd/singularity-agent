@@ -60,17 +60,17 @@
         ]
       },
       "agent": {
-        "instructions": "Fix SQLFluff issue sqlfluff__sqlfluff-2419. Rule L060 must emit exactly \"Use 'COALESCE' instead of 'IFNULL'.\" for IFNULL and exactly \"Use 'COALESCE' instead of 'NVL'.\" for NVL. Apply the smallest focused change to src/sqlfluff/rules/L060.py, then call builtin_command with the exact argv from agent.smoke_commands without substituting another Python executable or command, and report the verification result.",
+        "instructions": "Fix SQLFluff issue sqlfluff__sqlfluff-2419. Rule L060 must emit exactly \"Use 'COALESCE' instead of 'IFNULL'.\" for IFNULL and exactly \"Use 'COALESCE' instead of 'NVL'.\" for NVL. Apply the smallest focused change to src/sqlfluff/rules/L060.py, then call command with the exact command string derived from agent.smoke_commands without substituting another Python executable or command, and report the verification result.",
         "allowed_paths": [
           "src/sqlfluff/rules/L060.py"
         ],
         "allowed_tools": [
-          "builtin_read",
-          "builtin_grep",
-          "builtin_edit",
-          "builtin_patch",
-          "builtin_command",
-          "builtin_update_plan"
+          "read",
+          "grep",
+          "edit",
+          "patch",
+          "command",
+          "update_plan"
         ],
         "smoke_commands": [
           {
@@ -151,18 +151,18 @@
         }
       },
       "agent": {
-        "instructions": "Fix the seeded multi-line receipt bug in pricing.py and receipt.py. Apply the smallest focused changes needed so subtotal handles every item and the receipt total includes tax; do not modify smoke_test.py or add dependencies. Use the host Python executable and call builtin_command with exactly [\"python\", \"-B\", \"smoke_test.py\"] after your focused edits. Continue until that exact smoke command succeeds, then report the verification result.",
+        "instructions": "Fix the seeded multi-line receipt bug in pricing.py and receipt.py. Apply the smallest focused changes needed so subtotal handles every item and the receipt total includes tax; do not modify smoke_test.py or add dependencies. Use the host Python executable and call command with exactly [\"python\", \"-B\", \"smoke_test.py\"] after your focused edits. Continue until that exact smoke command succeeds, then report the verification result.",
         "allowed_paths": [
           "pricing.py",
           "receipt.py"
         ],
         "allowed_tools": [
-          "builtin_read",
-          "builtin_grep",
-          "builtin_edit",
-          "builtin_patch",
-          "builtin_command",
-          "builtin_update_plan"
+          "read",
+          "grep",
+          "edit",
+          "patch",
+          "command",
+          "update_plan"
         ],
         "smoke_commands": [
           {
@@ -259,18 +259,18 @@
         }
       },
       "agent": {
-        "instructions": "Fix the seeded Rust and Node multi-line total bugs. Only modify src/lib.rs and calculator.mjs. Run both exact smoke commands through builtin_command and continue until both succeed.",
+        "instructions": "Fix the seeded Rust and Node multi-line total bugs. Only modify src/lib.rs and calculator.mjs. Run both exact smoke commands through command and continue until both succeed.",
         "allowed_paths": [
           "src/lib.rs",
           "calculator.mjs"
         ],
         "allowed_tools": [
-          "builtin_read",
-          "builtin_grep",
-          "builtin_edit",
-          "builtin_patch",
-          "builtin_command",
-          "builtin_update_plan"
+          "read",
+          "grep",
+          "edit",
+          "patch",
+          "command",
+          "update_plan"
         ],
         "smoke_commands": [
           {
@@ -329,18 +329,18 @@
         }
       },
       "agent": {
-        "instructions": "Implement the seeded inventory summary feature in catalog.mjs and inventory.mjs. Only modify those two source files, do not modify smoke_test.mjs or add dependencies. Use builtin_command with exactly [\"node\", \"smoke_test.mjs\"] after your focused edits; continue until it succeeds and report the verification result.",
+        "instructions": "Implement the seeded inventory summary feature in catalog.mjs and inventory.mjs. Only modify those two source files, do not modify smoke_test.mjs or add dependencies. Use command with exactly [\"node\", \"smoke_test.mjs\"] after your focused edits; continue until it succeeds and report the verification result.",
         "allowed_paths": [
           "catalog.mjs",
           "inventory.mjs"
         ],
         "allowed_tools": [
-          "builtin_read",
-          "builtin_grep",
-          "builtin_edit",
-          "builtin_patch",
-          "builtin_command",
-          "builtin_update_plan"
+          "read",
+          "grep",
+          "edit",
+          "patch",
+          "command",
+          "update_plan"
         ],
         "smoke_commands": [
           {
@@ -414,19 +414,19 @@
         }
       },
       "agent": {
-        "instructions": "Fix the seeded billing report behavior in src/billing/ledger.py and src/billing/report.py. First use builtin_list, builtin_grep, and builtin_read to inspect the multi-directory repository and trace the billing rules; only modify those two source files, do not modify smoke_test.py or add dependencies. Use builtin_command with exactly [\"python\", \"-B\", \"smoke_test.py\"] after your focused edits; continue until it succeeds and report the verification result.",
+        "instructions": "Fix the seeded billing report behavior in src/billing/ledger.py and src/billing/report.py. First use list, grep, and read to inspect the multi-directory repository and trace the billing rules; only modify those two source files, do not modify smoke_test.py or add dependencies. Use command with exactly [\"python\", \"-B\", \"smoke_test.py\"] after your focused edits; continue until it succeeds and report the verification result.",
         "allowed_paths": [
           "src/billing/ledger.py",
           "src/billing/report.py"
         ],
         "allowed_tools": [
-          "builtin_read",
-          "builtin_list",
-          "builtin_grep",
-          "builtin_edit",
-          "builtin_patch",
-          "builtin_command",
-          "builtin_update_plan"
+          "read",
+          "list",
+          "grep",
+          "edit",
+          "patch",
+          "command",
+          "update_plan"
         ],
         "smoke_commands": [
           {

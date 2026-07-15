@@ -1,3 +1,8 @@
+//! Evaluation runner 的任务投影、Agent stage、验证证据与安全产物协调。
+//!
+//! 本模块只把 manifest 的可信内部命令和模型可见 command string 分开投影，
+//! 并在固定 gate、sandbox 与 evidence 合同下汇总结果。
+
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -10,8 +15,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics, AgentStatus,
-    AgentVerificationRequirement, BUILTIN_INVOKE_TOOL, BUILTIN_UPDATE_PLAN_TOOL,
-    agent_control_tool_specs,
+    AgentVerificationRequirement, UPDATE_PLAN_TOOL, agent_control_tool_specs,
 };
 use singularity_core::{contains_sensitive_text, load_project_instructions_from_cwd};
 use singularity_evaluation::{
@@ -32,8 +36,8 @@ use singularity_policy::{
 use singularity_protocol::{EvalRunParams, EvalRunResult};
 use singularity_tools::{
     CommandEnvironmentPolicy, SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode,
-    ToolBroker, ToolRegistry, WorkspaceTools, command_scope_digest, command_scope_resource,
-    workspace_tool_specs,
+    ToolBroker, ToolRegistry, WorkspaceTools, command_script_scope_digest_with_policy,
+    command_script_scope_resource_with_policy, workspace_tool_specs,
 };
 
 use super::{TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ};
@@ -1587,7 +1591,7 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
         .into_iter()
         .chain(agent_control_tool_specs())
     {
-        if spec.name != BUILTIN_INVOKE_TOOL && !allowed.contains(spec.name.as_str()) {
+        if !allowed.contains(spec.name.as_str()) {
             continue;
         }
         if spec.name == TOOL_COMMAND {
@@ -1624,7 +1628,7 @@ fn evaluation_policy(workspace: &Path, projection: &AgentTaskProjection) -> Poli
         .map(|tool| tool.as_str())
         .collect::<BTreeSet<_>>();
     let mut policy = PolicyEngine::new(profile);
-    if [TOOL_READ, TOOL_LIST, TOOL_GREP, BUILTIN_UPDATE_PLAN_TOOL]
+    if [TOOL_READ, TOOL_LIST, TOOL_GREP, UPDATE_PLAN_TOOL]
         .iter()
         .any(|tool| allowed.contains(tool))
     {
@@ -1653,14 +1657,14 @@ fn evaluation_policy(workspace: &Path, projection: &AgentTaskProjection) -> Poli
     if allowed.contains(TOOL_COMMAND) {
         for (index, command) in projection.smoke_commands.iter().enumerate() {
             let network = sandbox_network_mode(command.network_access);
-            let resource = command_scope_resource(
-                command.argv.as_slice(),
+            let resource = command_script_scope_resource_with_policy(
+                &command_script_from_argv(command.argv.as_slice()),
                 command.cwd.as_ref().map_or(".", |cwd| cwd.as_str()),
                 command
                     .timeout_seconds
                     .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-                &SandboxFilesystemMode::WorkspaceWrite,
-                &network,
+                SandboxFilesystemMode::WorkspaceWrite,
+                network.clone(),
             );
             policy = policy.with_rule(
                 PermissionRule::new(
@@ -1721,20 +1725,32 @@ fn agent_prompt(projection: &AgentTaskProjection) -> String {
 
 fn smoke_command_model_input(command: &CommandSpec) -> Value {
     json!({
-        "argv": command.argv.as_slice(),
+        "command": command_script_from_argv(command.argv.as_slice()),
         "cwd": command.cwd.as_ref().map(|cwd| cwd.as_str()).unwrap_or("."),
         "timeout_seconds": command.timeout_seconds.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
     })
 }
 
 fn smoke_command_execution_input(command: &CommandSpec) -> Value {
-    let mut input = smoke_command_model_input(command);
-    input["sandbox_mode"] = json!("workspace_write");
-    input["network_access"] = json!(match command.network_access {
-        NetworkAccess::Denied => "denied",
-        NetworkAccess::Allowed => "allowed",
-    });
-    input
+    smoke_command_model_input(command)
+}
+
+fn command_script_from_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| {
+            if !argument.is_empty()
+                && argument.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_' | '.' | '/' | '\\' | ':')
+                })
+            {
+                argument.clone()
+            } else {
+                format!("'{}'", argument.replace('\'', "''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn agent_verification_requirements(
@@ -1754,14 +1770,14 @@ fn agent_verification_requirements(
             })?;
             let network = sandbox_network_mode(command.network_access);
             Ok(AgentVerificationRequirement::new(
-                command_scope_digest(
-                    command.argv.as_slice(),
+                command_script_scope_digest_with_policy(
+                    &command_script_from_argv(command.argv.as_slice()),
                     &cwd,
                     command
                         .timeout_seconds
                         .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-                    &SandboxFilesystemMode::WorkspaceWrite,
-                    &network,
+                    SandboxFilesystemMode::WorkspaceWrite,
+                    network,
                 ),
                 1,
             ))
@@ -1786,14 +1802,14 @@ fn smoke_commands_satisfied(
         let Some(cwd) = resolved_smoke_cwd(workspace, command) else {
             return false;
         };
-        let expected = command_scope_digest(
-            command.argv.as_slice(),
+        let expected = command_script_scope_digest_with_policy(
+            &command_script_from_argv(command.argv.as_slice()),
             &cwd,
             command
                 .timeout_seconds
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-            &SandboxFilesystemMode::WorkspaceWrite,
-            &network,
+            SandboxFilesystemMode::WorkspaceWrite,
+            network,
         );
         let Some(index) = eligible_results
             .iter()
@@ -2200,6 +2216,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn command_script_projection_preserves_argument_boundaries() {
+        let argv = vec![
+            "python".to_string(),
+            "script with spaces.py".to_string(),
+            "it's-safe".to_string(),
+        ];
+        assert_eq!(
+            command_script_from_argv(&argv),
+            "python 'script with spaces.py' 'it''s-safe'"
+        );
+    }
+
     fn successful_command_result(
         tool_call_id: &str,
         command: &CommandSpec,
@@ -2207,14 +2236,14 @@ mod tests {
     ) -> singularity_tools::ToolResult {
         let mut result =
             singularity_tools::ToolResult::summary(tool_call_id, TOOL_COMMAND, true, "ok");
-        result.result_id = Some(command_scope_digest(
-            command.argv.as_slice(),
+        result.result_id = Some(command_script_scope_digest_with_policy(
+            &command_script_from_argv(command.argv.as_slice()),
             &resolved_smoke_cwd(workspace, command).expect("resolved smoke cwd"),
             command
                 .timeout_seconds
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-            &SandboxFilesystemMode::WorkspaceWrite,
-            &sandbox_network_mode(command.network_access),
+            SandboxFilesystemMode::WorkspaceWrite,
+            sandbox_network_mode(command.network_access),
         ));
         result
     }
@@ -2262,7 +2291,7 @@ mod tests {
         };
 
         let prompt = agent_prompt(&projection);
-        assert!(prompt.contains("\"argv\":[\"cargo\",\"test\"]"));
+        assert!(prompt.contains("\"command\":\"cargo test\""));
         assert!(!prompt.contains("sandbox_mode"));
         assert!(!prompt.contains("network_access"));
         assert!(!prompt.contains("evaluator"));
@@ -2411,7 +2440,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_exposes_manifest_tools_and_the_internal_router() {
+    fn registry_exposes_only_manifest_tools() {
         let projection = AgentTaskProjection {
             task_id: TaskId::new("task-1").expect("task id"),
             description: "description".to_string(),
@@ -2422,7 +2451,7 @@ mod tests {
         };
         let registry = evaluation_registry(&projection).expect("registry");
         assert!(registry.get(TOOL_READ).is_some());
-        assert!(registry.get(BUILTIN_INVOKE_TOOL).is_some());
+        assert!(registry.get(UPDATE_PLAN_TOOL).is_none());
         assert!(registry.get(TOOL_COMMAND).is_none());
         assert!(registry.get(TOOL_EDIT).is_none());
     }
@@ -2444,8 +2473,8 @@ mod tests {
         let payload = smoke_command_model_input(&smoke);
 
         assert_eq!(
-            command.input_schema["properties"]["argv"]["const"],
-            payload["argv"]
+            command.input_schema["properties"]["command"]["const"],
+            payload["command"]
         );
         assert!(singularity_model::is_strict_tool_schema_compatible(
             &command.input_schema
@@ -2455,15 +2484,14 @@ mod tests {
         let (_, execution_input) = registry
             .prepare_model_input(TOOL_COMMAND, &payload)
             .expect("declared command model input");
-        assert_eq!(execution_input["sandbox_mode"], "workspace_write");
-        assert_eq!(execution_input["network_access"], "denied");
+        assert_eq!(execution_input, payload);
         assert!(
             registry
                 .validate_execution_input(TOOL_COMMAND, &execution_input)
                 .is_ok()
         );
         let mut undeclared = payload;
-        undeclared["argv"] = json!(["cargo", "check"]);
+        undeclared["command"] = json!("cargo check");
         assert_eq!(
             registry
                 .prepare_model_input(TOOL_COMMAND, &undeclared)
@@ -2561,7 +2589,7 @@ mod tests {
                 "agent": {
                     "instructions": "inspect",
                     "allowed_paths": ["README.md"],
-                    "allowed_tools": ["builtin_read"]
+                    "allowed_tools": ["read"]
                 },
                 "evaluator": {
                     "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
