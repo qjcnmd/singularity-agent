@@ -31,7 +31,8 @@ const GOOGLE_API_KEY_BODY_MIN_CHARS: usize = 30;
 const GOOGLE_API_KEY_BODY_MAX_CHARS: usize = 45;
 const JWT_MIN_PARTS: usize = 3;
 const JWT_MIN_PART_CHARS: usize = 8;
-const PROTECTED_PATH_EXACT_MARKERS: [&str; 13] = [
+/// Protected path components that must be denied wherever they occur in a workspace.
+pub const PROTECTED_PATH_EXACT_MARKERS: [&str; 13] = [
     ".aws",
     ".azure",
     ".git",
@@ -46,8 +47,12 @@ const PROTECTED_PATH_EXACT_MARKERS: [&str; 13] = [
     "secret",
     "secrets",
 ];
-const PROTECTED_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"];
-const PROTECTED_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
+/// Protected component prefixes; only the prefix itself or a dotted variant matches.
+pub const PROTECTED_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"];
+/// Protected component suffixes.
+pub const PROTECTED_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
+/// Substrings that identify protected components.
+pub const PROTECTED_PATH_CONTAINS_MARKERS: [&str; 1] = ["secret"];
 const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
     ".aws",
     ".azure",
@@ -272,7 +277,9 @@ pub fn is_protected_path(path: &str) -> bool {
                 || PROTECTED_PATH_SUFFIXES
                     .iter()
                     .any(|suffix| component.ends_with(suffix))
-                || component.contains("secret")
+                || PROTECTED_PATH_CONTAINS_MARKERS
+                    .iter()
+                    .any(|marker| component.contains(marker))
         })
 }
 

@@ -84,6 +84,7 @@ mod tests {
     use super::plan_deny_read_acl_paths;
     use pretty_assertions::assert_eq;
     use std::collections::HashSet;
+    use std::os::windows::process::CommandExt;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -115,5 +116,30 @@ mod tests {
         .collect();
 
         assert_eq!(planned, expected);
+    }
+
+    #[test]
+    fn plan_includes_lexical_and_canonical_reparse_targets() {
+        let tmp = TempDir::new().expect("tempdir");
+        let target = tmp.path().join("target");
+        let alias = tmp.path().join("protected-link");
+        std::fs::create_dir(&target).expect("create target");
+        let link = format!("\"{}\"", alias.display());
+        let target_arg = format!("\"{}\"", target.display());
+        let junction_created = std::process::Command::new("cmd.exe")
+            .raw_arg("/c")
+            .raw_arg("mklink")
+            .raw_arg("/J")
+            .raw_arg(&link)
+            .raw_arg(&target_arg)
+            .output()
+            .is_ok_and(|output| output.status.success() && alias.exists());
+        assert!(junction_created, "junction fixture must be available");
+
+        let planned: HashSet<PathBuf> = plan_deny_read_acl_paths(std::slice::from_ref(&alias))
+            .into_iter()
+            .collect();
+        assert!(planned.contains(&alias));
+        assert!(planned.contains(&dunce::canonicalize(target).expect("canonical target")));
     }
 }

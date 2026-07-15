@@ -5,21 +5,38 @@ use crate::permissions::FileSystemSandboxEntry;
 use crate::permissions::FileSystemSandboxPolicy;
 use crate::permissions::ReadDenyMatcher;
 use std::collections::HashSet;
+use std::fs::Metadata;
 use std::path::Path;
 use std::path::PathBuf;
 
+const MAX_DENY_READ_SCAN_DEPTH: usize = 64;
+const MAX_DENY_READ_SCAN_ENTRIES: usize = 100_000;
+
 struct GlobScanPlan {
     root: PathBuf,
-    max_depth: Option<usize>,
+    max_depth: usize,
+    recursive: bool,
 }
 
-/// Resolve split filesystem `None` read entries into concrete Windows ACL targets.
+struct ScanState {
+    scanned_entries: usize,
+}
+
+struct GlobScanContext<'a> {
+    matcher: &'a ReadDenyMatcher,
+    paths: &'a mut Vec<AbsolutePathBuf>,
+    seen_paths: &'a mut HashSet<PathBuf>,
+    seen_scan_dirs: &'a mut HashSet<String>,
+    scan_boundary: &'a Path,
+    scan_plan: &'a GlobScanPlan,
+    scan_state: &'a mut ScanState,
+}
+
+/// 将 filesystem deny entries 展开为 Windows ACL 可应用的具体路径。
 ///
-/// Windows ACLs do not understand Singularity filesystem glob patterns directly. Exact
-/// unreadable roots can be passed through as-is, including paths that do not
-/// exist yet. Glob entries are snapshot-expanded to the files/directories that
-/// already exist under their literal scan root; future exact paths are handled
-/// later by materializing them before the deny ACE is applied.
+/// Windows ACL 不直接理解 glob；exact 路径原样保留，glob 只对现有条目做一次有界快照
+/// 展开。无法安全检查的子树会把其词法路径加入 deny-read，不静默放行；reparse target
+/// 仅在 workspace 边界内跟随，ACL 层随后同时保留词法路径和 canonical target。
 pub fn resolve_windows_deny_read_paths(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
@@ -47,22 +64,33 @@ pub fn resolve_windows_deny_read_paths(
             })
             .collect(),
     );
-    let Some(matcher) = ReadDenyMatcher::try_new(&glob_policy, cwd.as_path())? else {
+    let Some(matcher) = ReadDenyMatcher::try_new(&glob_policy, cwd.as_path())
+        .map_err(|error| sanitize_glob_error(&error))?
+    else {
         return Ok(paths);
     };
 
+    let scan_boundary = dunce::canonicalize(cwd.as_path())
+        .map_err(|_| "deny_read_resolution_workspace_unavailable".to_string())?;
+    let mut scan_plans = Vec::new();
     for pattern in unreadable_globs {
-        let mut seen_scan_dirs = HashSet::new();
         let scan_plan = glob_scan_plan(&pattern, file_system_sandbox_policy.glob_scan_max_depth);
-        collect_existing_glob_matches(
-            &scan_plan.root,
-            &matcher,
-            &mut paths,
-            &mut seen,
-            &mut seen_scan_dirs,
-            scan_plan.max_depth,
-            /*depth*/ 0,
-        )?;
+        merge_scan_plan(&mut scan_plans, scan_plan);
+    }
+
+    let mut scan_state = ScanState { scanned_entries: 0 };
+    for scan_plan in scan_plans {
+        let mut seen_scan_dirs = HashSet::new();
+        let mut context = GlobScanContext {
+            matcher: &matcher,
+            paths: &mut paths,
+            seen_paths: &mut seen,
+            seen_scan_dirs: &mut seen_scan_dirs,
+            scan_boundary: &scan_boundary,
+            scan_plan: &scan_plan,
+            scan_state: &mut scan_state,
+        };
+        collect_existing_glob_matches(&scan_plan.root, /*depth*/ 0, &mut context)?;
     }
 
     Ok(paths)
@@ -70,53 +98,98 @@ pub fn resolve_windows_deny_read_paths(
 
 fn collect_existing_glob_matches(
     path: &Path,
-    matcher: &ReadDenyMatcher,
-    paths: &mut Vec<AbsolutePathBuf>,
-    seen_paths: &mut HashSet<PathBuf>,
-    seen_scan_dirs: &mut HashSet<PathBuf>,
-    max_depth: Option<usize>,
     depth: usize,
+    context: &mut GlobScanContext<'_>,
 ) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if matcher.is_read_denied(path) {
-        push_absolute_path(paths, seen_paths, path.to_path_buf())?;
-    }
-
-    let Ok(metadata) = path.metadata() else {
-        return Ok(());
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+            return Ok(());
+        }
     };
-    if !metadata.is_dir() {
-        return Ok(());
-    }
+    let reparse_point = metadata_is_reparse_point(&metadata);
 
-    // Canonical directory keys keep recursive scans from following a symlink or
-    // junction cycle forever while preserving the original matched path for the
-    // ACL layer.
-    let scan_key = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !seen_scan_dirs.insert(scan_key) {
-        return Ok(());
-    }
-
-    if max_depth.is_some_and(|max_depth| depth >= max_depth) {
-        return Ok(());
-    }
-
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Ok(());
+    if context.matcher.is_read_denied(path) {
+        push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+        if metadata.is_dir() || reparse_point {
+            return Ok(());
+        }
     };
-    for entry in entries.flatten() {
-        collect_existing_glob_matches(
-            &entry.path(),
-            matcher,
-            paths,
-            seen_paths,
-            seen_scan_dirs,
-            max_depth,
-            depth + 1,
-        )?;
+
+    let canonical = match dunce::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(_) => {
+            push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+            return Ok(());
+        }
+    };
+    if !path_is_within(&canonical, context.scan_boundary) {
+        // workspace 外的 reparse target 是未知子树：只 deny 词法入口，不跟随越界 target。
+        push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+        return Ok(());
+    }
+    if context.matcher.is_read_denied(&canonical) {
+        push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+        if metadata.is_dir() || reparse_point {
+            return Ok(());
+        }
+    }
+
+    let target_metadata = if reparse_point {
+        match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+                return Ok(());
+            }
+        }
+    } else {
+        metadata
+    };
+    if !target_metadata.is_dir() {
+        return Ok(());
+    }
+
+    // canonical directory key 防止 symlink/junction cycle 无限递归；词法路径交给
+    // ACL planner，使其同时记录现有 reparse point 的 canonical target。
+    let scan_key = path_key(&canonical);
+    if !context.seen_scan_dirs.insert(scan_key) {
+        return Ok(());
+    }
+
+    if depth >= context.scan_plan.max_depth {
+        if context.scan_plan.recursive {
+            push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+        }
+        return Ok(());
+    }
+
+    let mut entries = Vec::new();
+    for entry in match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => {
+            push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+            return Ok(());
+        }
+    } {
+        if context.scan_state.scanned_entries >= MAX_DENY_READ_SCAN_ENTRIES {
+            push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+            return Ok(());
+        }
+        context.scan_state.scanned_entries += 1;
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(_) => {
+                push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+                return Ok(());
+            }
+        }
+    }
+    entries.sort_by_key(|entry| path_key(&entry.path()));
+    for entry in entries {
+        collect_existing_glob_matches(&entry.path(), depth + 1, context)?;
     }
 
     Ok(())
@@ -128,7 +201,7 @@ fn push_absolute_path(
     path: PathBuf,
 ) -> Result<(), String> {
     let absolute_path = AbsolutePathBuf::from_absolute_path(dunce::simplified(&path))
-        .map_err(|err| err.to_string())?;
+        .map_err(|_| "deny_read_resolution_invalid_path".to_string())?;
     if seen.insert(absolute_path.to_path_buf()) {
         paths.push(absolute_path);
     }
@@ -136,9 +209,8 @@ fn push_absolute_path(
 }
 
 fn glob_scan_plan(pattern: &str, configured_max_depth: Option<usize>) -> GlobScanPlan {
-    // Start scanning at the deepest literal directory prefix before the first
-    // glob metacharacter. For example, `C:\repo\**\*.env` only scans `C:\repo`
-    // instead of the current directory or drive root.
+    // 从第一个 glob 元字符前的最深词法目录开始扫描；例如 `C:\repo\**\*.env`
+    // 只扫描 `C:\repo`，避免退回当前目录或盘符根目录。
     let first_glob = pattern
         .char_indices()
         .find(|(_, ch)| matches!(ch, '*' | '?' | '['))
@@ -149,6 +221,9 @@ fn glob_scan_plan(pattern: &str, configured_max_depth: Option<usize>) -> GlobSca
         return GlobScanPlan {
             root: PathBuf::from("."),
             max_depth: effective_glob_scan_max_depth(pattern, configured_max_depth),
+            recursive: pattern
+                .split(['/', '\\'])
+                .any(|component| component == "**"),
         };
     };
     let pattern_suffix = &pattern[separator_index + 1..];
@@ -161,28 +236,90 @@ fn glob_scan_plan(pattern: &str, configured_max_depth: Option<usize>) -> GlobSca
         return GlobScanPlan {
             root: PathBuf::from(&literal_prefix[..=separator_index]),
             max_depth: effective_glob_scan_max_depth(pattern_suffix, configured_max_depth),
+            recursive: pattern_suffix
+                .split(['/', '\\'])
+                .any(|component| component == "**"),
         };
     }
     GlobScanPlan {
         root: PathBuf::from(literal_prefix[..separator_index].to_string()),
         max_depth: effective_glob_scan_max_depth(pattern_suffix, configured_max_depth),
+        recursive: pattern_suffix
+            .split(['/', '\\'])
+            .any(|component| component == "**"),
     }
 }
 
 fn effective_glob_scan_max_depth(
     pattern_suffix: &str,
     configured_max_depth: Option<usize>,
-) -> Option<usize> {
+) -> usize {
     let components = pattern_suffix
         .split(['/', '\\'])
         .filter(|component| !component.is_empty())
         .collect::<Vec<_>>();
     if components.contains(&"**") {
-        return configured_max_depth;
+        return configured_max_depth
+            .unwrap_or(MAX_DENY_READ_SCAN_DEPTH)
+            .min(MAX_DENY_READ_SCAN_DEPTH);
     }
-    Some(configured_max_depth.map_or(components.len(), |max_depth| {
-        max_depth.min(components.len())
-    }))
+    configured_max_depth
+        .map_or(components.len(), |max_depth| {
+            max_depth.min(components.len())
+        })
+        .min(MAX_DENY_READ_SCAN_DEPTH)
+}
+
+fn merge_scan_plan(plans: &mut Vec<GlobScanPlan>, candidate: GlobScanPlan) {
+    if let Some(existing) = plans
+        .iter_mut()
+        .find(|plan| path_key(&plan.root) == path_key(&candidate.root))
+    {
+        existing.max_depth = existing.max_depth.max(candidate.max_depth);
+        existing.recursive |= candidate.recursive;
+    } else {
+        plans.push(candidate);
+    }
+}
+
+fn sanitize_glob_error(error: &str) -> String {
+    let reason = if error.contains("invalid range") {
+        "invalid range"
+    } else {
+        "invalid pattern"
+    };
+    format!("invalid deny-read glob pattern: {reason}")
+}
+
+fn path_key(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    }
+}
+
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    if cfg!(windows) {
+        let path = path_key(path);
+        let root = path_key(root);
+        path == root || path.starts_with(&format!("{root}/"))
+    } else {
+        path.starts_with(root)
+    }
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_type().is_symlink() || metadata.file_attributes() & 0x0400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 #[cfg(test)]
@@ -218,6 +355,28 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+        symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn link_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+        use std::os::windows::process::CommandExt;
+
+        let link_path = link.to_path_buf();
+        let link = format!("\"{}\"", link.display());
+        let target = format!("\"{}\"", target.display());
+        std::process::Command::new("cmd.exe")
+            .raw_arg("/c")
+            .raw_arg("mklink")
+            .raw_arg("/J")
+            .raw_arg(&link)
+            .raw_arg(&target)
+            .output()
+            .is_ok_and(|output| output.status.success() && link_path.exists())
+    }
+
     #[test]
     fn scan_root_uses_literal_prefix_before_glob() {
         assert_eq!(
@@ -242,27 +401,40 @@ mod tests {
     fn scan_depth_is_bounded_for_non_recursive_globs() {
         assert_eq!(
             glob_scan_plan("/tmp/work/*.env", /*configured_max_depth*/ None).max_depth,
-            Some(1)
+            1
         );
         assert_eq!(
             glob_scan_plan("/tmp/work/*/*.env", /*configured_max_depth*/ None).max_depth,
-            Some(2)
+            2
         );
         assert_eq!(
             glob_scan_plan("/tmp/work/**/*.env", /*configured_max_depth*/ None).max_depth,
-            None
+            64
         );
     }
 
     #[test]
     fn configured_depth_caps_recursive_glob_scans() {
+        assert_eq!(glob_scan_plan("/tmp/work/**/*.env", Some(2)).max_depth, 2);
+        assert_eq!(glob_scan_plan("/tmp/work/*/*.env", Some(1)).max_depth, 1);
+    }
+
+    #[test]
+    fn recursive_depth_limit_denies_the_unscanned_subtree() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let secret = tmp.path().join("deep").join("secret.env");
+        std::fs::create_dir_all(secret.parent().expect("secret parent")).expect("deep directory");
+        std::fs::write(&secret, "secret").expect("write secret");
+        let mut policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/**/*.env",
+            tmp.path().display()
+        ))]);
+        policy.glob_scan_max_depth = Some(0);
+
         assert_eq!(
-            glob_scan_plan("/tmp/work/**/*.env", Some(2)).max_depth,
-            Some(2)
-        );
-        assert_eq!(
-            glob_scan_plan("/tmp/work/*/*.env", Some(1)).max_depth,
-            Some(1)
+            resolve_windows_deny_read_paths(&policy, &cwd).expect("resolve"),
+            vec![AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute workspace")]
         );
     }
 
@@ -327,6 +499,7 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(err.contains("invalid range"), "unexpected error: {err}");
+        assert!(!err.contains(tmp.path().to_string_lossy().as_ref()));
     }
 
     #[test]
@@ -349,7 +522,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn aliased_glob_roots_each_preserve_their_lexical_matches() {
         let tmp = TempDir::new().expect("tempdir");
@@ -360,8 +533,22 @@ mod tests {
         let secret = target.join("secret.env");
         std::fs::create_dir_all(&target).expect("create target");
         std::fs::write(&secret, "secret").expect("write secret");
-        symlink(&target, &alias_a).expect("create alias a");
-        symlink(&target, &alias_b).expect("create alias b");
+        #[cfg(unix)]
+        {
+            symlink(&target, &alias_a).expect("create alias a");
+            symlink(&target, &alias_b).expect("create alias b");
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                link_dir(&target, &alias_a),
+                "junction fixture must be available"
+            );
+            assert!(
+                link_dir(&target, &alias_b),
+                "junction fixture must be available"
+            );
+        }
         let policy = FileSystemSandboxPolicy::restricted(vec![
             unreadable_glob_entry(format!("{}/**/*.env", alias_a.display())),
             unreadable_glob_entry(format!("{}/**/*.env", alias_b.display())),
@@ -377,5 +564,37 @@ mod tests {
             .collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn reparse_targets_are_bounded_and_unknown_entries_are_denied() {
+        let workspace = TempDir::new().expect("workspace");
+        let outside = TempDir::new().expect("outside");
+        std::fs::write(outside.path().join("outside.env"), "secret").expect("outside secret");
+        let external_alias = workspace.path().join("external");
+        let cycle_alias = workspace.path().join("cycle");
+        assert!(
+            link_dir(outside.path(), &external_alias),
+            "reparse fixture must be available"
+        );
+        assert!(
+            link_dir(workspace.path(), &cycle_alias),
+            "cycle reparse fixture must be available"
+        );
+
+        let cwd = AbsolutePathBuf::from_absolute_path(workspace.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/**/*.env",
+            workspace.path().display()
+        ))]);
+        let actual: HashSet<PathBuf> = resolve_windows_deny_read_paths(&policy, &cwd)
+            .expect("resolve")
+            .into_iter()
+            .map(AbsolutePathBuf::into_path_buf)
+            .collect();
+
+        assert!(actual.contains(&external_alias));
+        assert!(!actual.contains(&outside.path().join("outside.env")));
     }
 }

@@ -15,9 +15,6 @@ use serde::{Deserialize, Serialize};
 use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
 
-#[cfg(windows)]
-mod protected_paths;
-
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
 const SANDBOX_BACKEND_UNAVAILABLE: &str = "sandbox-required command has no sandbox backend";
@@ -1040,20 +1037,23 @@ mod windows_backend {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use singularity_windows_sandbox::{
-        AbsolutePathBuf, ElevatedSandboxProfileCaptureRequest, FileSystemSandboxPolicy,
-        ManagedFileSystemPermissions, NetworkSandboxPolicy, PermissionProfile,
-        WindowsSandboxCancellationToken, run_windows_sandbox_capture,
-        run_windows_sandbox_capture_for_permission_profile_elevated,
-    };
-
-    use super::protected_paths::{ProtectedPathDiscoveryError, discover_existing_protected_paths};
     use super::{
         COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
         CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
         CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
         SandboxFilesystemMode, SandboxNetworkMode, command_request_denial,
         command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
+    };
+    use singularity_core::{
+        PROTECTED_PATH_CONTAINS_MARKERS, PROTECTED_PATH_EXACT_MARKERS, PROTECTED_PATH_PREFIXES,
+        PROTECTED_PATH_SUFFIXES,
+    };
+    use singularity_windows_sandbox::{
+        AbsolutePathBuf, ElevatedSandboxProfileCaptureRequest, FileSystemAccessMode,
+        FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
+        ManagedFileSystemPermissions, NetworkSandboxPolicy, PermissionProfile,
+        WindowsSandboxCancellationToken, resolve_windows_deny_read_paths,
+        run_windows_sandbox_capture, run_windows_sandbox_capture_for_permission_profile_elevated,
     };
 
     const BACKEND_NAME: &str = "windows";
@@ -1078,7 +1078,7 @@ mod windows_backend {
     enum PrepareCommandError {
         Executable(ExecutableResolutionError),
         Backend(String),
-        ProtectedPaths(ProtectedPathDiscoveryError),
+        ProtectedPaths(String),
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1150,7 +1150,7 @@ mod windows_backend {
                         );
                 }
                 Err(PrepareCommandError::ProtectedPaths(error)) => {
-                    return CommandResult::backend_error(&request.command_id, error.to_string())
+                    return CommandResult::backend_error(&request.command_id, error)
                         .with_sandbox_execution(
                             self.name(),
                             SandboxBackendEnforcement::Unavailable,
@@ -1196,7 +1196,7 @@ mod windows_backend {
                         );
                 }
                 Err(PrepareCommandError::ProtectedPaths(error)) => {
-                    return CommandResult::backend_error(&request.command_id, error.to_string())
+                    return CommandResult::backend_error(&request.command_id, error)
                         .with_sandbox_execution(
                             self.name(),
                             SandboxBackendEnforcement::Unavailable,
@@ -1209,6 +1209,59 @@ mod windows_backend {
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
             }
         }
+    }
+
+    /// 将 core 的 protected path 规则投影为 resolver 可展开的 workspace glob。
+    fn resolve_existing_protected_paths(
+        workspace_root: &AbsolutePathBuf,
+    ) -> Result<Vec<AbsolutePathBuf>, String> {
+        let entries = protected_path_glob_entries(workspace_root);
+        let policy = FileSystemSandboxPolicy::restricted(entries);
+        resolve_windows_deny_read_paths(&policy, workspace_root)
+    }
+
+    fn protected_path_glob_entries(
+        workspace_root: &AbsolutePathBuf,
+    ) -> Vec<FileSystemSandboxEntry> {
+        let mut patterns = Vec::new();
+        for marker in PROTECTED_PATH_EXACT_MARKERS {
+            patterns.push(format_workspace_protected_glob(workspace_root, marker));
+        }
+        for prefix in PROTECTED_PATH_PREFIXES {
+            patterns.push(format_workspace_protected_glob(workspace_root, prefix));
+            patterns.push(format_workspace_protected_glob(
+                workspace_root,
+                &format!("{prefix}.*"),
+            ));
+        }
+        for suffix in PROTECTED_PATH_SUFFIXES {
+            patterns.push(format_workspace_protected_glob(
+                workspace_root,
+                &format!("*{suffix}"),
+            ));
+        }
+        for marker in PROTECTED_PATH_CONTAINS_MARKERS {
+            patterns.push(format_workspace_protected_glob(
+                workspace_root,
+                &format!("*{marker}*"),
+            ));
+        }
+        patterns
+            .into_iter()
+            .map(|pattern| FileSystemSandboxEntry {
+                path: FileSystemPath::GlobPattern { pattern },
+                access: FileSystemAccessMode::Deny,
+            })
+            .collect()
+    }
+
+    fn format_workspace_protected_glob(
+        workspace_root: &AbsolutePathBuf,
+        component_pattern: &str,
+    ) -> String {
+        let root = workspace_root.to_string_lossy().replace('\\', "/");
+        let separator = if root.ends_with('/') { "" } else { "/" };
+        format!("{root}{separator}**/{component_pattern}")
     }
 
     struct PreparedCommand {
@@ -1307,7 +1360,7 @@ mod windows_backend {
                 .map_err(|error| {
                     PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
                 })?;
-            let protected_deny_read_paths = discover_existing_protected_paths(&workspace_root)
+            let protected_deny_read_paths = resolve_existing_protected_paths(&workspace_root)
                 .map_err(PrepareCommandError::ProtectedPaths)?;
             let workspace_roots = vec![workspace_root];
             let network = match request.network.mode {
@@ -2101,6 +2154,29 @@ mod windows_backend {
         }
 
         #[test]
+        fn ordinary_reparse_does_not_reject_script_preparation() {
+            use std::os::windows::fs::symlink_dir;
+
+            let workspace = tempfile::tempdir().expect("workspace");
+            let target = workspace.path().join("ordinary-target");
+            let alias = workspace.path().join("ordinary-link");
+            fs::create_dir(&target).expect("create target");
+            if symlink_dir(&target, &alias).is_err() {
+                return;
+            }
+            let request = CommandScriptRequest::agent_requested(
+                "script_reparse_boundary",
+                "Write-Output ready",
+                workspace.path().to_string_lossy(),
+                workspace.path().to_string_lossy(),
+            );
+
+            let prepared = PreparedCommand::from_script_request(&request)
+                .expect("ordinary reparse must not reject script preparation");
+            assert!(prepared.protected_deny_read_paths.is_empty());
+        }
+
+        #[test]
         fn existing_protected_path_disables_restricted_token_fallback() {
             let workspace = tempfile::tempdir().expect("workspace");
             let nested = workspace.path().join("nested");
@@ -2109,6 +2185,7 @@ mod windows_backend {
             create_test_file(&workspace.path().join(".env.local"), "opaque");
             create_test_file(&nested.join("private-key.pem"), "opaque");
             create_test_file(&nested.join("client.p12"), "opaque");
+            create_test_file(&nested.join("client-secret.txt"), "opaque");
             let mut request = CommandScriptRequest::agent_requested(
                 "script_protected_path",
                 "Join-Path 'nested' (Get-Random) | Out-Null",
@@ -2135,6 +2212,7 @@ mod windows_backend {
                     workspace.path().join(".env.local"),
                     nested.join("private-key.pem"),
                     nested.join("client.p12"),
+                    nested.join("client-secret.txt"),
                 ]
                 .into_iter()
                 .map(|path| dunce::canonicalize(path).expect("canonical protected path"))
