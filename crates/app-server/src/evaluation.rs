@@ -1204,6 +1204,15 @@ fn run_agent_stage(
     task_dir: &Path,
 ) -> AgentStageExecution {
     let projection = &plan.projection;
+    let pristine_source = match snapshot_workspace(source_dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                Vec::new(),
+            );
+        }
+    };
     if let Err(error) = copy_tree_checked(source_dir, agent_dir) {
         return blocked_agent_stage(
             evaluation_blocker(BlockerKind::WorkspacePreparation, error),
@@ -1398,8 +1407,9 @@ fn run_agent_stage(
             };
         }
     };
-    let changed_files = evaluation_changed_paths(&before, &after);
-    let patch_evidence = workspace_change_evidence(&before, &after, &projection.allowed_paths);
+    let changed_files = evaluation_changed_paths(&before, &after, &pristine_source);
+    let patch_evidence =
+        workspace_change_evidence(&before, &after, &pristine_source, &projection.allowed_paths);
     let patch_digest = patch_evidence_digest(&patch_evidence);
     let patch_evidence_path = task_dir.join(PATCH_EVIDENCE_FILE);
     let patch_evidence_path = match write_json_atomic(&patch_evidence_path, &patch_evidence) {
@@ -2604,8 +2614,14 @@ mod tests {
     fn evaluation_change_evidence_ignores_toolchain_artifacts_but_keeps_disallowed_source() {
         let temp = tempfile::tempdir().expect("workspace");
         fs::create_dir_all(temp.path().join("src")).expect("src");
+        fs::create_dir_all(temp.path().join("target")).expect("tracked target");
+        fs::create_dir_all(temp.path().join("coverage")).expect("tracked coverage");
         fs::write(temp.path().join("src/lib.rs"), "before").expect("source");
-        let before = snapshot_workspace(temp.path()).expect("before");
+        fs::write(temp.path().join("target/tracked.rs"), "before").expect("tracked target file");
+        fs::write(temp.path().join("coverage/tracked.txt"), "before")
+            .expect("tracked coverage file");
+        let pristine_source = snapshot_workspace(temp.path()).expect("pristine source");
+        let before = pristine_source.clone();
 
         fs::create_dir_all(temp.path().join("target/debug")).expect("cargo target");
         fs::write(temp.path().join("target/debug/app"), "binary").expect("cargo output");
@@ -2620,19 +2636,39 @@ mod tests {
         fs::write(temp.path().join("node_modules/.cache/bundle"), "cache").expect("node output");
         fs::create_dir_all(temp.path().join("generated")).expect("unknown output");
         fs::write(temp.path().join("generated/cache.bin"), "unknown").expect("unknown artifact");
+        fs::write(temp.path().join("target/tracked.rs"), "after")
+            .expect("modify tracked target file");
+        fs::remove_file(temp.path().join("coverage/tracked.txt"))
+            .expect("delete tracked coverage file");
         fs::write(temp.path().join("src/disallowed.rs"), "user source").expect("disallowed source");
         let after = snapshot_workspace(temp.path()).expect("after");
         let allowed_paths = [RelativePath::new("src/lib.rs").expect("allowed path")];
-        let changed_files = evaluation_changed_paths(&before, &after);
+        let changed_files = evaluation_changed_paths(&before, &after, &pristine_source);
 
-        let evidence = workspace_change_evidence(&before, &after, &allowed_paths);
+        let evidence = workspace_change_evidence(&before, &after, &pristine_source, &allowed_paths);
         let paths = evidence
             .iter()
             .map(|change| change.path.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(changed_files, ["generated/cache.bin", "src/disallowed.rs"]);
-        assert_eq!(paths, ["generated/cache.bin", "src/disallowed.rs"]);
+        assert_eq!(
+            changed_files,
+            [
+                "coverage/tracked.txt",
+                "generated/cache.bin",
+                "src/disallowed.rs",
+                "target/tracked.rs",
+            ]
+        );
+        assert_eq!(
+            paths,
+            [
+                "coverage/tracked.txt",
+                "generated/cache.bin",
+                "src/disallowed.rs",
+                "target/tracked.rs",
+            ]
+        );
         assert!(evidence.iter().all(|change| !change.allowed));
     }
 

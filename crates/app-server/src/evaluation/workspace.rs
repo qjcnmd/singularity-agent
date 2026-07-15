@@ -300,19 +300,23 @@ pub(super) fn changed_paths(before: &WorkspaceSnapshot, after: &WorkspaceSnapsho
 pub(super) fn evaluation_changed_paths(
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
+    pristine_source: &WorkspaceSnapshot,
 ) -> Vec<String> {
     changed_paths(before, after)
         .into_iter()
-        .filter(|path| !is_evaluation_artifact_path(path))
+        .filter(|path| {
+            pristine_source.contains_key(path.as_str()) || !is_evaluation_artifact_path(path)
+        })
         .collect()
 }
 
 pub(super) fn workspace_change_evidence(
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
+    pristine_source: &WorkspaceSnapshot,
     allowed_paths: &[singularity_evaluation::RelativePath],
 ) -> Vec<WorkspaceChangeEvidence> {
-    evaluation_changed_paths(before, after)
+    evaluation_changed_paths(before, after, pristine_source)
         .into_iter()
         .map(|path| WorkspaceChangeEvidence {
             change_kind: match (before.contains_key(&path), after.contains_key(&path)) {
