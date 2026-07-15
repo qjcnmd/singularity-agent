@@ -643,6 +643,29 @@ fn delayed_probe_server(
     (format!("http://{addr}"), request_rx, started_rx)
 }
 
+fn direct_only_probe_server() -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind direct capability provider");
+    let addr = listener
+        .local_addr()
+        .expect("direct capability provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().expect("accept direct capability request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone direct stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            assert!(request_body.contains("singularity_capability_probe"));
+            requests.push(request_body);
+            write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
+        }
+        tx.send(requests).expect("send direct capability requests");
+    });
+    (format!("http://{addr}"), rx)
+}
+
 fn multi_model_probe_server(actual_count: usize) -> (String, Receiver<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind multi-model provider");
     let addr = listener.local_addr().expect("multi-model provider address");
@@ -680,21 +703,21 @@ fn multi_turn_probe_recovery_server() -> (String, Receiver<Vec<String>>) {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut requests = Vec::new();
-        for index in 0..8 {
+        for index in 0..7 {
             let (mut stream, _) = listener.accept().expect("accept multi-turn probe request");
             let mut reader =
                 BufReader::new(stream.try_clone().expect("clone multi-turn probe stream"));
             let (_, _, request_body) = read_provider_request(&mut reader);
             requests.push(request_body.clone());
             let (status, body) = match index {
-                0..=3 => ("HTTP/1.1 400 Bad Request", "{}".to_string()),
-                4 => ("HTTP/1.1 200 OK", PROBE_ROUTER_RESPONSE.to_string()),
-                5 => ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE.to_string()),
-                6 => (
+                0..=2 => ("HTTP/1.1 400 Bad Request", "{}".to_string()),
+                3 => ("HTTP/1.1 200 OK", PROBE_STRICT_SINGLE_RESPONSE.to_string()),
+                4 => ("HTTP/1.1 200 OK", PROBE_TEXT_RESPONSE.to_string()),
+                5 => (
                     "HTTP/1.1 200 OK",
                     PROBE_STRICT_PARALLEL_RESPONSE.to_string(),
                 ),
-                7 => (
+                6 => (
                     "HTTP/1.1 200 OK",
                     capability_probe_response(&request_body)
                         .expect("successful second multi-turn probe continuation"),
@@ -832,26 +855,6 @@ const PROBE_BAD_ARGUMENTS_RESPONSE: &str = r#"{
     }]
 }"#;
 
-const PROBE_ROUTER_RESPONSE: &str = r#"{
-    "id": "probe_router",
-    "choices": [{
-        "message": {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "probe_router_call",
-                "type": "function",
-                "function": {
-                    "name": "singularity_capability_router",
-                    "arguments": "{\"tool_name\":\"singularity_capability_probe_a\",\"arguments\":{\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}}"
-                }
-            }]
-        },
-        "finish_reason": "tool_calls"
-    }],
-    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
-}"#;
-
 const ACTUAL_DONE_RESPONSE: &str = r#"{
     "id": "actual_response",
     "choices": [{
@@ -983,21 +986,6 @@ fn capability_probe_response(request_body: &str) -> Option<String> {
         .get("messages")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
-    if names.contains(&"singularity_capability_router") {
-        if continuation {
-            return Some(capability_probe_continuation_response(
-                "singularity_capability_router",
-                serde_json::json!({
-                    "tool_name": "singularity_capability_probe_a",
-                    "arguments": {
-                        "probe": "schema_sentinel_alpha",
-                        "values": [7, 7]
-                    }
-                }),
-            ));
-        }
-        return Some(PROBE_ROUTER_RESPONSE.to_string());
-    }
     if !names.contains(&"singularity_capability_probe_a") {
         return None;
     }
@@ -1075,15 +1063,7 @@ fn responses_capability_probe_response(request_body: &str) -> Option<String> {
                 .iter()
                 .any(|item| item["type"] == "function_call_output")
         });
-    let (tool_name, arguments) = if names.contains(&"singularity_capability_router") {
-        (
-            "singularity_capability_router",
-            serde_json::json!({
-                "tool_name": "singularity_capability_probe_a",
-                "arguments": {"probe": "schema_sentinel_alpha", "values": [7, 7]}
-            }),
-        )
-    } else if names.contains(&"singularity_capability_probe_a") {
+    let (tool_name, arguments) = if names.contains(&"singularity_capability_probe_a") {
         let strict = tools
             .iter()
             .any(|tool| tool.get("strict").and_then(serde_json::Value::as_bool) == Some(true));
@@ -1241,6 +1221,19 @@ fn model_turn_schema_excludes_runtime_and_trace_metadata() {
                 .contains_key(removed_field)
         );
     }
+}
+
+#[test]
+fn provider_tool_definition_mode_schema_is_direct_only() {
+    let schema = serde_json::to_value(schema_for!(ProviderToolDefinitionMode))
+        .expect("serialize tool definition mode schema");
+
+    assert_eq!(schema["enum"], serde_json::json!(["direct"]));
+    assert_eq!(
+        serde_json::to_value(ProviderToolDefinitionMode::Direct).expect("serialize direct mode"),
+        "direct"
+    );
+    assert!(!schema.to_string().contains("routed"));
 }
 
 #[test]
@@ -2299,73 +2292,44 @@ fn openai_capability_probe_non_strict_single_uses_auto_tool_choice() {
 }
 
 #[test]
-fn openai_capability_probe_validates_router_before_low_capacity_fallback() {
-    let (base_url, requests, _started) = delayed_probe_server(
-        vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 200 OK", PROBE_ROUTER_RESPONSE),
-        ],
-        Duration::ZERO,
-    );
+fn openai_capability_probe_fails_closed_when_direct_tools_are_unsupported() {
+    let (base_url, requests) = direct_only_probe_server();
     let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
 
-    let negotiation = Provider::negotiate_tool_capabilities(
+    let error = Provider::negotiate_tool_capabilities(
         &provider,
         &ModelPreferences::default(),
         &singularity_core::CancellationToken::new(),
     )
-    .expect("validated router fallback");
+    .expect_err("unsupported direct tools must not become a negotiated capability");
 
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
     assert_eq!(
-        negotiation.metadata.profile,
-        ProviderCapabilityProfile::RoutedSingle
-    );
-    assert!(!negotiation.contract.supports_parallel_tool_calls);
-    assert_eq!(negotiation.contract.max_tools_per_request, 1);
-    assert_eq!(
-        negotiation.contract.tool_definition_mode,
-        ProviderToolDefinitionMode::Routed
+        error.error.code.as_deref(),
+        Some("provider_native_structured_tool_calls_unsupported")
     );
     let captured = requests
         .recv_timeout(Duration::from_secs(1))
-        .expect("captured capability requests");
-    assert_eq!(
-        captured
+        .expect("captured direct capability requests");
+    assert_eq!(captured.len(), 4);
+    for request in captured {
+        let request: serde_json::Value = serde_json::from_str(&request).expect("probe JSON");
+        let names = request["tools"]
+            .as_array()
+            .expect("probe tools")
             .iter()
-            .map(|request| {
-                serde_json::from_str::<serde_json::Value>(request).expect("probe JSON")["tools"]
-                    .as_array()
-                    .map(Vec::len)
-                    .expect("probe tools")
+            .filter_map(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
             })
-            .collect::<Vec<_>>(),
-        vec![8, 8, 8, 8, 1, 1]
-    );
-    let router: serde_json::Value =
-        serde_json::from_str(captured.last().expect("router request")).expect("router JSON");
-    assert_eq!(
-        router["tools"][0]["function"]["name"],
-        "singularity_capability_router"
-    );
-    let branches = router["tools"][0]["function"]["parameters"]["oneOf"]
-        .as_array()
-        .expect("router branches");
-    assert_eq!(branches.len(), 8);
-    assert_eq!(
-        branches[0]["required"],
-        serde_json::json!(["tool_name", "arguments"])
-    );
-    assert_eq!(
-        branches[0]["properties"]["tool_name"]["const"],
-        "singularity_capability_probe_a"
-    );
-    assert_eq!(
-        branches[0]["properties"]["arguments"]["required"],
-        serde_json::json!(["probe", "values"])
-    );
+            .collect::<Vec<_>>();
+        assert!(!names.is_empty());
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with("singularity_capability_probe_"))
+        );
+    }
 }
 
 #[test]
@@ -2415,7 +2379,6 @@ fn openai_capability_probe_failed_single_flight_shares_typed_outcome() {
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 422 Unprocessable Entity", "{}"),
         ],
         Duration::from_millis(100),
@@ -2453,13 +2416,13 @@ fn openai_capability_probe_failed_single_flight_shares_typed_outcome() {
             .as_ref()
             .expect("capability metadata")
             .profile_attempts,
-        5
+        4
     );
 
     let captured = requests
         .recv_timeout(Duration::from_secs(2))
         .expect("captured capability probes");
-    assert_eq!(captured.len(), 5, "one shared probe round is required");
+    assert_eq!(captured.len(), 4, "one shared probe round is required");
 }
 
 #[test]
@@ -2590,62 +2553,9 @@ fn openai_capability_probe_owner_cancellation_allows_waiter_takeover() {
 }
 
 #[test]
-fn openai_capability_probe_fallback_keeps_usage_attempts_and_cache_metadata_separate() {
-    let (base_url, requests) = configurable_probe_server(
-        vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 200 OK", PROBE_ROUTER_RESPONSE),
-        ],
-        ACTUAL_DONE_RESPONSE,
-        1,
-    );
-    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
-    let negotiation = Provider::negotiate_tool_capabilities(
-        &provider,
-        &ModelPreferences::default(),
-        &singularity_core::CancellationToken::new(),
-    )
-    .expect("non-strict single negotiation");
-
-    assert_eq!(
-        negotiation.metadata.profile,
-        ProviderCapabilityProfile::RoutedSingle
-    );
-    assert!(!negotiation.contract.supports_strict_tool_schema);
-    assert!(!negotiation.contract.supports_parallel_tool_calls);
-    assert_eq!(negotiation.contract.max_tools_per_request, 1);
-    assert_eq!(
-        negotiation.contract.tool_definition_mode,
-        ProviderToolDefinitionMode::Routed
-    );
-    assert_eq!(negotiation.metadata.profile_attempts, 5);
-    assert_eq!(negotiation.metadata.fallback_count, 4);
-    assert_eq!(negotiation.metadata.probe_usage.total_tokens, 6);
-    assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 6);
-    assert_eq!(negotiation.metadata.probe_attempt_metadata.retry_count, 0);
-
-    provider
-        .complete(
-            &capability_test_request(None, false, 1),
-            &singularity_core::CancellationToken::new(),
-        )
-        .expect("actual completion after cache hit");
-    let captured = requests
-        .recv_timeout(Duration::from_secs(1))
-        .expect("captured actual request");
-    assert_eq!(captured.len(), 1, "cache hit must avoid a second probe");
-    let actual: serde_json::Value = serde_json::from_str(&captured[0]).expect("actual JSON");
-    assert_eq!(actual["tools"][0]["function"].get("strict"), None);
-}
-
-#[test]
 fn openai_capability_probe_final_text_response_is_typed_and_preserves_probe_metadata() {
     let (base_url, requests) = configurable_probe_server(
         vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
@@ -2670,10 +2580,10 @@ fn openai_capability_probe_final_text_response_is_typed_and_preserves_probe_meta
             .contains(&"capability_probe_native_tool_calls_missing".to_string())
     );
     let metadata = error.capability_metadata.expect("probe metadata");
-    assert_eq!(metadata.profile, ProviderCapabilityProfile::RoutedSingle);
-    assert_eq!(metadata.profile_attempts, 5);
-    assert_eq!(metadata.fallback_count, 4);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 5);
+    assert_eq!(metadata.profile, ProviderCapabilityProfile::NonStrictSingle);
+    assert_eq!(metadata.profile_attempts, 4);
+    assert_eq!(metadata.fallback_count, 3);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 4);
     assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
 }
 
@@ -2697,8 +2607,8 @@ fn openai_capability_probe_requires_native_tool_calls_after_tool_results_before_
             .contains(&"capability_probe_multi_turn_tool_calls_missing".to_string())
     );
     let failed_metadata = error.capability_metadata.expect("failed probe metadata");
-    assert_eq!(failed_metadata.profile_attempts, 5);
-    assert_eq!(failed_metadata.probe_attempt_metadata.attempt_count, 6);
+    assert_eq!(failed_metadata.profile_attempts, 4);
+    assert_eq!(failed_metadata.probe_attempt_metadata.attempt_count, 5);
 
     let negotiation = Provider::negotiate_tool_capabilities(
         &provider,
@@ -2723,8 +2633,8 @@ fn openai_capability_probe_requires_native_tool_calls_after_tool_results_before_
     let captured = requests
         .recv_timeout(Duration::from_secs(1))
         .expect("captured failed and successful multi-turn probes");
-    assert_eq!(captured.len(), 8);
-    for continuation_index in [5, 7] {
+    assert_eq!(captured.len(), 7);
+    for continuation_index in [4, 6] {
         let request: serde_json::Value =
             serde_json::from_str(&captured[continuation_index]).expect("continuation JSON");
         assert_eq!(request["tool_choice"], "auto");
@@ -2767,7 +2677,6 @@ fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 422 Unprocessable Entity", "{}"),
         ],
         ACTUAL_DONE_RESPONSE,
@@ -2791,9 +2700,9 @@ fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
             .contains(&"capability_profiles_exhausted".to_string())
     );
     let metadata = error.capability_metadata.expect("probe metadata");
-    assert_eq!(metadata.profile_attempts, 5);
-    assert_eq!(metadata.fallback_count, 4);
-    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 5);
+    assert_eq!(metadata.profile_attempts, 4);
+    assert_eq!(metadata.fallback_count, 3);
+    assert_eq!(metadata.probe_attempt_metadata.attempt_count, 4);
     assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
 }
 
@@ -2801,7 +2710,6 @@ fn openai_capability_probe_all_profile_rejections_preserve_provider_cause() {
 fn openai_capability_probe_preserves_structured_validation_errors() {
     let (base_url, _requests) = configurable_probe_server(
         vec![
-            ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),
             ("HTTP/1.1 400 Bad Request", "{}"),

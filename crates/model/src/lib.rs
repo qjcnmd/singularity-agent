@@ -58,7 +58,6 @@ const HTTP_STATUS_RATE_LIMITED: u16 = 429;
 const HTTP_STATUS_INTERNAL_SERVER_ERROR: u16 = 500;
 const CAPABILITY_PROBE_REQUEST_ID: &str = "singularity_capability_probe";
 const CAPABILITY_PROBE_CONTINUATION_REQUEST_ID: &str = "singularity_capability_probe_continuation";
-const CAPABILITY_PROBE_ROUTER: &str = "singularity_capability_router";
 const CAPABILITY_PROBE_TOOL_A: &str = "singularity_capability_probe_a";
 const CAPABILITY_PROBE_TOOL_B: &str = "singularity_capability_probe_b";
 const CAPABILITY_PROBE_EXPECTED_LABEL: &str = "schema_sentinel_alpha";
@@ -172,13 +171,12 @@ pub enum ProviderToolReasoningMode {
     DisabledForToolCalls,
 }
 
-/// 描述 tool 是直接发送，还是通过面向模型提供方的路由封装结构发送。
+/// 描述 tool 以模型提供方支持的原生结构直接发送。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderToolDefinitionMode {
     #[default]
     Direct,
-    Routed,
 }
 
 /// 为模型提供方完成请求选定的线路协议。
@@ -236,7 +234,6 @@ pub enum ProviderCapabilityProfile {
     StrictSingle,
     NonStrictParallel,
     NonStrictSingle,
-    RoutedSingle,
 }
 
 /// `AgentLoop` 为完成请求提供的可选模型参数。
@@ -1247,7 +1244,7 @@ impl OpenAiProvider {
                 Err(error) if is_capability_probe_profile_rejection(&error) => {
                     if index + 1 == profile_count {
                         return Err(capability_probe_failure(
-                            error,
+                            capability_probe_direct_unsupported_error(error),
                             capability_probe_metadata(
                                 api_protocol,
                                 profile.profile,
@@ -1371,7 +1368,7 @@ impl OpenAiProvider {
                     Err(error) if is_capability_probe_profile_rejection(&error) => {
                         if index + 1 == profile_count {
                             return Err(capability_probe_failure(
-                                error,
+                                capability_probe_direct_unsupported_error(error),
                                 capability_probe_metadata(
                                     api_protocol,
                                     profile.profile,
@@ -2226,31 +2223,6 @@ fn capability_probe_profiles(
             .map(|index| tool(probe_tool_name(index), parameters_schema.clone()))
             .collect::<Vec<_>>()
     };
-    let router_schema = json!({
-        "oneOf": (0..DEFAULT_MAX_TOOLS_PER_REQUEST)
-            .map(|index| {
-                let target = probe_tool_name(index);
-                let label = if index % 2 == 0 {
-                    CAPABILITY_PROBE_EXPECTED_LABEL
-                } else {
-                    CAPABILITY_PROBE_ALTERNATE_LABEL
-                };
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "tool_name": {
-                            "type": "string",
-                            "const": target
-                        },
-                        "arguments": schema_branch(label)
-                    },
-                    "required": ["tool_name", "arguments"],
-                    "additionalProperties": false
-                })
-            })
-            .collect::<Vec<_>>()
-    });
-    let router_tool = tool(CAPABILITY_PROBE_ROUTER.to_string(), router_schema);
     let make_request = |tools: Vec<ModelToolSchema>,
                         mode: ToolChoiceMode,
                         max_tool_calls: u32,
@@ -2272,26 +2244,24 @@ fn capability_probe_profiles(
         };
         request
     };
-    let make_contract = |strict: bool,
-                         supports_parallel_tool_calls: bool,
-                         max_tools_per_request: u32,
-                         tool_definition_mode: ProviderToolDefinitionMode| {
-        ProviderProtocolContract {
-            supports_parallel_tool_calls,
-            supports_strict_tool_schema: strict,
-            tool_reasoning_mode: if api_protocol == ProviderApiProtocol::OpenAiResponses {
-                ProviderToolReasoningMode::DisabledForToolCalls
-            } else {
-                ProviderToolReasoningMode::Unspecified
-            },
-            tool_definition_mode,
-            max_tools_per_request,
-            supports_json_mode: false,
-            supports_system_message: false,
-            supports_developer_message: true,
-            ..base.clone()
-        }
-    };
+    let make_contract =
+        |strict: bool, supports_parallel_tool_calls: bool, max_tools_per_request: u32| {
+            ProviderProtocolContract {
+                supports_parallel_tool_calls,
+                supports_strict_tool_schema: strict,
+                tool_reasoning_mode: if api_protocol == ProviderApiProtocol::OpenAiResponses {
+                    ProviderToolReasoningMode::DisabledForToolCalls
+                } else {
+                    ProviderToolReasoningMode::Unspecified
+                },
+                tool_definition_mode: ProviderToolDefinitionMode::Direct,
+                max_tools_per_request,
+                supports_json_mode: false,
+                supports_system_message: false,
+                supports_developer_message: true,
+                ..base.clone()
+            }
+        };
     let parallel_expected = |allowed_arguments: Vec<Value>| {
         vec![
             CapabilityProbeExpectedCall {
@@ -2320,7 +2290,6 @@ fn capability_probe_profiles(
             true,
             true,
             direct_tool_count,
-            ProviderToolDefinitionMode::Direct,
         ),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
@@ -2338,7 +2307,6 @@ fn capability_probe_profiles(
             true,
             false,
             direct_tool_count,
-            ProviderToolDefinitionMode::Direct,
         ),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
@@ -2356,7 +2324,6 @@ fn capability_probe_profiles(
             false,
             true,
             direct_tool_count,
-            ProviderToolDefinitionMode::Direct,
         ),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
@@ -2374,7 +2341,6 @@ fn capability_probe_profiles(
             false,
             false,
             direct_tool_count,
-            ProviderToolDefinitionMode::Direct,
         ),
         request: make_request(
             probe_tools(direct_tool_count, &tool_schema),
@@ -2384,25 +2350,6 @@ fn capability_probe_profiles(
             "First call singularity_capability_probe_a once with arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}. After its tool result, call singularity_capability_probe_a once more with the same arguments.",
         ),
         expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, Vec::new()),
-        single_call_fallback: None,
-    });
-    profiles.push(CapabilityProbeProfile {
-        profile: ProviderCapabilityProfile::RoutedSingle,
-        contract: make_contract(false, false, 1, ProviderToolDefinitionMode::Routed),
-        request: make_request(
-            vec![router_tool],
-            ToolChoiceMode::Auto,
-            1,
-            false,
-            "First call singularity_capability_router once with tool_name singularity_capability_probe_a and arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}. After its tool result, make the same router call once more.",
-        ),
-        expected_calls: single_expected(
-            CAPABILITY_PROBE_ROUTER,
-            vec![json!({
-                "tool_name": CAPABILITY_PROBE_TOOL_A,
-                "arguments": strict_arguments
-            })],
-        ),
         single_call_fallback: None,
     });
     profiles
@@ -3225,6 +3172,22 @@ fn capability_probe_failure(
         provider_error
     };
     provider_error.with_capability_metadata(metadata)
+}
+
+// 将 Direct tool 的 HTTP 400 拒绝归一为稳定的能力错误，同时保留尝试诊断。
+fn capability_probe_direct_unsupported_error(error: ProviderError) -> ProviderError {
+    if error.error.http_status != Some(HTTP_STATUS_BAD_REQUEST) {
+        return error;
+    }
+    let provider_attempt_metadata = error.provider_attempt_metadata.clone();
+    let mut provider_error = capability_probe_unsupported_error(*error.error);
+    provider_error.error.code =
+        Some("provider_native_structured_tool_calls_unsupported".to_string());
+    if let Some(metadata) = provider_attempt_metadata {
+        provider_error.with_provider_attempt_metadata(metadata)
+    } else {
+        provider_error
+    }
 }
 
 fn cache_hit_negotiation(
