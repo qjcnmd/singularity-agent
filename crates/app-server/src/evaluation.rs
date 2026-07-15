@@ -50,7 +50,7 @@ use evidence::{
     agent_command_observation, build_evaluation_evidence, content_digest, safe_command_scope_digest,
 };
 use workspace::{
-    WorkspaceChangeEvidence, apply_agent_changes, changed_paths, copy_tree_checked,
+    WorkspaceChangeEvidence, apply_agent_changes, copy_tree_checked, evaluation_changed_paths,
     patch_evidence_digest, path_is_allowed, snapshot_workspace, validate_tree,
     workspace_change_evidence, workspace_tree_digest,
 };
@@ -1398,7 +1398,7 @@ fn run_agent_stage(
             };
         }
     };
-    let changed_files = changed_paths(&before, &after);
+    let changed_files = evaluation_changed_paths(&before, &after);
     let patch_evidence = workspace_change_evidence(&before, &after, &projection.allowed_paths);
     let patch_digest = patch_evidence_digest(&patch_evidence);
     let patch_evidence_path = task_dir.join(PATCH_EVIDENCE_FILE);
@@ -2594,7 +2594,46 @@ mod tests {
         fs::remove_file(temp.path().join("b.txt")).expect("delete b");
         fs::write(temp.path().join("c.txt"), "add").expect("add c");
         let after = snapshot_workspace(temp.path()).expect("after");
-        assert_eq!(changed_paths(&before, &after), ["a.txt", "b.txt", "c.txt"]);
+        assert_eq!(
+            super::workspace::changed_paths(&before, &after),
+            ["a.txt", "b.txt", "c.txt"]
+        );
+    }
+
+    #[test]
+    fn evaluation_change_evidence_ignores_toolchain_artifacts_but_keeps_disallowed_source() {
+        let temp = tempfile::tempdir().expect("workspace");
+        fs::create_dir_all(temp.path().join("src")).expect("src");
+        fs::write(temp.path().join("src/lib.rs"), "before").expect("source");
+        let before = snapshot_workspace(temp.path()).expect("before");
+
+        fs::create_dir_all(temp.path().join("target/debug")).expect("cargo target");
+        fs::write(temp.path().join("target/debug/app"), "binary").expect("cargo output");
+        fs::create_dir_all(temp.path().join("python/__pycache__")).expect("python cache");
+        fs::write(
+            temp.path()
+                .join("python/__pycache__/module.cpython-312.pyc"),
+            "bytecode",
+        )
+        .expect("python bytecode");
+        fs::create_dir_all(temp.path().join("node_modules/.cache")).expect("node cache");
+        fs::write(temp.path().join("node_modules/.cache/bundle"), "cache").expect("node output");
+        fs::create_dir_all(temp.path().join("generated")).expect("unknown output");
+        fs::write(temp.path().join("generated/cache.bin"), "unknown").expect("unknown artifact");
+        fs::write(temp.path().join("src/disallowed.rs"), "user source").expect("disallowed source");
+        let after = snapshot_workspace(temp.path()).expect("after");
+        let allowed_paths = [RelativePath::new("src/lib.rs").expect("allowed path")];
+        let changed_files = evaluation_changed_paths(&before, &after);
+
+        let evidence = workspace_change_evidence(&before, &after, &allowed_paths);
+        let paths = evidence
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(changed_files, ["generated/cache.bin", "src/disallowed.rs"]);
+        assert_eq!(paths, ["generated/cache.bin", "src/disallowed.rs"]);
+        assert!(evidence.iter().all(|change| !change.allowed));
     }
 
     #[test]

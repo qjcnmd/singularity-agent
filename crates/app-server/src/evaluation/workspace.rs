@@ -297,12 +297,22 @@ pub(super) fn changed_paths(before: &WorkspaceSnapshot, after: &WorkspaceSnapsho
         .collect()
 }
 
+pub(super) fn evaluation_changed_paths(
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+) -> Vec<String> {
+    changed_paths(before, after)
+        .into_iter()
+        .filter(|path| !is_evaluation_artifact_path(path))
+        .collect()
+}
+
 pub(super) fn workspace_change_evidence(
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
     allowed_paths: &[singularity_evaluation::RelativePath],
 ) -> Vec<WorkspaceChangeEvidence> {
-    changed_paths(before, after)
+    evaluation_changed_paths(before, after)
         .into_iter()
         .map(|path| WorkspaceChangeEvidence {
             change_kind: match (before.contains_key(&path), after.contains_key(&path)) {
@@ -317,6 +327,51 @@ pub(super) fn workspace_change_evidence(
             path,
         })
         .collect()
+}
+
+fn is_evaluation_artifact_path(path: &str) -> bool {
+    // Keep this classification closed: only stable toolchain-owned names are
+    // artifacts. Unknown workspace paths must remain visible to the allowlist.
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.iter().any(|segment| {
+        matches!(
+            *segment,
+            "target"
+                | "__pycache__"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+                | ".hypothesis"
+                | ".tox"
+                | ".nox"
+                | ".cache"
+                | ".next"
+                | ".nuxt"
+                | ".svelte-kit"
+                | ".parcel-cache"
+                | ".turbo"
+                | ".vite"
+                | "coverage"
+                | "htmlcov"
+        )
+    }) {
+        return true;
+    }
+
+    segments
+        .iter()
+        .any(|segment| segment.ends_with(".egg-info"))
+        || segments.last().is_some_and(|file| {
+            file.ends_with(".pyc")
+                || file.ends_with(".pyo")
+                || *file == ".coverage"
+                || file.starts_with(".coverage.")
+                || *file == ".eslintcache"
+                || *file == ".stylelintcache"
+        })
 }
 
 pub(super) fn patch_evidence_digest(evidence: &[WorkspaceChangeEvidence]) -> Option<String> {
