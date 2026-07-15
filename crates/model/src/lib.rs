@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+//! Model-facing messages, provider capability contracts, and the OpenAI-compatible transport.
+//!
+//! Provider negotiation and validation live at this boundary so the AgentLoop can execute only
+//! requests and tool calls that the selected provider has declared or probed.
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
@@ -62,6 +67,7 @@ const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
 const CAPABILITY_PROBE_DEVELOPER_INSTRUCTION: &str =
     "Follow the fixed capability probe request using native structured tool calls.";
 
+/// The roles supported by the model-facing conversation history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRole {
@@ -72,6 +78,7 @@ pub enum ModelRole {
     Tool,
 }
 
+/// A provider-facing message, including tool-call metadata needed to continue a turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelMessage {
     pub role: ModelRole,
@@ -101,6 +108,7 @@ impl ModelMessage {
     }
 }
 
+/// Controls whether the provider may choose tools, must choose one, or must not call tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoiceMode {
@@ -109,6 +117,7 @@ pub enum ToolChoiceMode {
     Required,
 }
 
+/// Tool-selection limits and schema strictness applied to one model request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolChoicePolicy {
     pub mode: ToolChoiceMode,
@@ -135,6 +144,7 @@ pub enum ModelToolParseStatus {
     UnknownTool,
 }
 
+/// The provider-visible schema for one executable tool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelToolSchema {
     pub name: String,
@@ -142,6 +152,7 @@ pub struct ModelToolSchema {
     pub parameters_schema: Value,
 }
 
+/// A parsed model tool call together with raw arguments and validation outcome.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelToolCall {
     pub tool_call_id: String,
@@ -152,6 +163,7 @@ pub struct ModelToolCall {
     pub validation_errors: Vec<String>,
 }
 
+/// Whether tool reasoning content is compatible with the provider's tool-call history contract.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderToolReasoningMode {
@@ -160,6 +172,7 @@ pub enum ProviderToolReasoningMode {
     DisabledForToolCalls,
 }
 
+/// Describes whether tools are sent directly or through a provider-facing router envelope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderToolDefinitionMode {
@@ -168,6 +181,7 @@ pub enum ProviderToolDefinitionMode {
     Routed,
 }
 
+/// The wire protocol selected for a provider completion request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
@@ -177,6 +191,7 @@ pub enum ProviderApiProtocol {
     OpenAiChatCompletions,
 }
 
+/// Capabilities that the provider must honor for request construction and response validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
@@ -212,6 +227,7 @@ impl Default for ProviderProtocolContract {
     }
 }
 
+/// The negotiated provider profile used for diagnostics and later request validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderCapabilityProfile {
@@ -223,6 +239,7 @@ pub enum ProviderCapabilityProfile {
     RoutedSingle,
 }
 
+/// Optional model parameters supplied by the AgentLoop for a completion request.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelPreferences {
     pub model_name: Option<String>,
@@ -232,6 +249,7 @@ pub struct ModelPreferences {
     pub json_mode: bool,
 }
 
+/// Redacted provider configuration presence information; secrets are never stored here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelProviderConfig {
     pub provider_name: Option<String>,
@@ -240,6 +258,7 @@ pub struct ModelProviderConfig {
     pub api_key_present: bool,
 }
 
+/// The configuration layer from which effective provider values were resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderConfigSource {
     ProcessEnvironment,
@@ -255,12 +274,17 @@ impl ProviderConfigSource {
     }
 }
 
+/// Resolved provider source and redacted configuration status before provider construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfigResolution {
     pub source: Option<ProviderConfigSource>,
     pub config: ModelProviderConfig,
 }
 
+/// A turn-scoped provider configuration snapshot with redacted status and initialized provider.
+///
+/// Capturing once lets the AppServer report and use the same configuration without exposing the
+/// API key or other raw environment values.
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
     snapshot_id: String,
@@ -330,6 +354,7 @@ impl ProviderConfigSnapshot {
     }
 }
 
+/// A stable blocker category reported when provider setup cannot proceed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelBlockerKind {
@@ -378,6 +403,7 @@ fn provider_initialization_blocker(category: &ModelErrorCategory) -> Option<Mode
     }
 }
 
+/// Redacted provider readiness and blocker information exposed to the AppServer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderConfigurationStatus {
     pub configured: bool,
@@ -406,6 +432,7 @@ impl ProviderConfigurationStatus {
     }
 }
 
+/// Token and cost counters accumulated from provider completions and capability probes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -416,6 +443,7 @@ pub struct ModelUsage {
     pub cost_estimate: Option<f64>,
 }
 
+/// Sanitized evidence describing a capability probe and the selected protocol profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderCapabilityMetadata {
     pub api_protocol: ProviderApiProtocol,
@@ -427,12 +455,14 @@ pub struct ProviderCapabilityMetadata {
     pub probe_attempt_metadata: ProviderAttemptMetadata,
 }
 
+/// The contract and diagnostics returned by provider capability negotiation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolNegotiation {
     pub contract: ProviderProtocolContract,
     pub metadata: ProviderCapabilityMetadata,
 }
 
+/// Validation errors and non-fatal warnings for a model-side request or response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelValidationResult {
     pub valid: bool,
@@ -458,6 +488,7 @@ impl ModelValidationResult {
     }
 }
 
+/// Specific failure kinds preserved from the provider boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorKind {
@@ -477,6 +508,7 @@ pub enum ModelErrorKind {
     UnknownProviderError,
 }
 
+/// Coarser error categories used by callers to decide status and recovery behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorCategory {
@@ -495,6 +527,7 @@ pub enum ModelErrorCategory {
     UnknownProviderError,
 }
 
+/// Stage at which a provider request or response failed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorStage {
@@ -507,6 +540,7 @@ pub enum ProviderErrorStage {
     Cancelled,
 }
 
+/// Transport-level cause retained separately from model or policy semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderTransportCategory {
@@ -517,6 +551,7 @@ pub enum ProviderTransportCategory {
     Unknown,
 }
 
+/// A model error with typed classification and sanitized provider diagnostics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelError {
     pub kind: ModelErrorKind,
@@ -537,6 +572,7 @@ pub struct ModelError {
     pub validation_errors: Vec<String>,
 }
 
+/// The diagnostic subset of a model error that can cross the provider boundary safely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderDiagnostic {
     pub code: Option<String>,
@@ -604,6 +640,7 @@ pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
     model_error_category(error)
 }
 
+/// The complete model request passed to a provider, including visible tools and tool policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelTurnRequest {
     pub request_id: String,
@@ -625,6 +662,7 @@ impl ModelTurnRequest {
     }
 }
 
+/// Whether a provider turn produced a valid completion or failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTurnStatus {
@@ -633,6 +671,7 @@ pub enum ModelTurnStatus {
     Invalid,
 }
 
+/// A provider completion paired with parsed tool calls, usage, validation, and error state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelTurnResponse {
     pub request_id: String,
@@ -673,6 +712,7 @@ impl ModelTurnResponse {
     }
 }
 
+/// Attempt and retry counts recorded for one provider operation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderAttemptMetadata {
     pub attempt_count: u32,
@@ -713,9 +753,12 @@ impl ProviderProtocolNegotiation {
     }
 }
 
+/// Provider boundary used by the AgentLoop for capability negotiation and completion.
 pub trait Provider {
+    /// Returns the provider's declared baseline contract before dynamic negotiation.
     fn protocol_contract(&self) -> ProviderProtocolContract;
 
+    /// Probes or resolves tool capabilities before tool-bearing requests are sent.
     fn negotiate_tool_capabilities(
         &self,
         _model_preferences: &ModelPreferences,
@@ -726,6 +769,7 @@ pub trait Provider {
         ))
     }
 
+    /// Completes one validated request while preserving cancellation and typed provider errors.
     fn complete(
         &self,
         request: &ModelTurnRequest,
@@ -733,6 +777,7 @@ pub trait Provider {
     ) -> Result<ModelTurnResponse, ProviderError>;
 }
 
+/// Resolved OpenAI-compatible connection settings with secrets retained only for transport use.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OpenAiProviderConfig {
     pub provider_name: String,
@@ -880,6 +925,7 @@ impl OpenAiProviderConfig {
     }
 }
 
+/// OpenAI-compatible provider that negotiates capabilities and validates every completion.
 #[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
@@ -1746,6 +1792,7 @@ fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Error)]
 #[error("{message}")]
+/// A provider failure with typed model error, attempt metadata, and optional capability evidence.
 pub struct ProviderError {
     pub message: String,
     pub error: Box<ModelError>,
@@ -1808,6 +1855,7 @@ fn attach_capability_metadata(
     error
 }
 
+/// Resolves a base URL to an OpenAI-compatible Chat Completions endpoint.
 pub fn chat_completions_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.ends_with(CHAT_COMPLETIONS_PATH) {
@@ -1819,6 +1867,7 @@ pub fn chat_completions_endpoint(base_url: &str) -> String {
     }
 }
 
+/// Resolves a base URL to an OpenAI-compatible Responses endpoint.
 pub fn responses_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.ends_with(RESPONSES_PATH) {
@@ -1832,6 +1881,7 @@ pub fn responses_endpoint(base_url: &str) -> String {
     }
 }
 
+/// Converts a provider failure into the failed response shape consumed by the AgentLoop.
 pub fn provider_error_response(
     request: &ModelTurnRequest,
     error: ProviderError,
@@ -1853,6 +1903,7 @@ pub fn provider_error_response(
     }
 }
 
+/// Resolves provider configuration while reporting only redacted presence and source metadata.
 pub fn resolve_provider_config<F>(get_env: F) -> ProviderConfigResolution
 where
     F: FnMut(&str) -> Option<String>,
@@ -3538,6 +3589,7 @@ fn provider_response_json_error() -> ModelError {
     )
 }
 
+/// Checks whether the redacted provider configuration contains all required values.
 pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidationResult {
     let mut errors = Vec::new();
     if missing(&config.provider_name) {
@@ -3555,6 +3607,7 @@ pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidation
     validation_result(errors, Vec::new())
 }
 
+/// Validates a model request before provider-specific capability checks are applied.
 pub fn validate_model_request(request: &ModelTurnRequest) -> ModelValidationResult {
     validate_model_request_with_capabilities(request, None)
 }
@@ -3667,6 +3720,7 @@ fn is_portable_tool_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
+/// Reports whether a JSON Schema can be sent under the provider's strict tool-schema contract.
 pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
     if schema.get("const").is_some() {
         return true;
@@ -3723,6 +3777,7 @@ pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
     }
 }
 
+/// Validates a complete provider turn against its request and negotiated capabilities.
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
@@ -3763,6 +3818,7 @@ pub fn validate_model_turn_response(
     result
 }
 
+/// Validates parsed provider content and tool calls before the AgentLoop acts on them.
 pub fn validate_model_response(
     assistant_message: Option<&ModelMessage>,
     tool_calls: &[ModelToolCall],

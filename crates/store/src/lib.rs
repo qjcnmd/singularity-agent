@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+//! SQLite-backed session, turn, approval, trace, artifact, and recovery state.
+//!
+//! Mutating operations use transactions and explicit bindings so approval checkpoints, turn
+//! outcomes, and execution ownership can be recovered without replaying an unknown side effect.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -67,6 +72,7 @@ const APPROVAL_CHECKPOINT_TOOL_CALL_MISMATCH: &str =
 const PENDING_APPROVAL_ALLOW_REQUIRES_ACTIVE_THREAD: &str =
     "pending approval allow requires an active thread";
 
+/// Errors that preserve storage, integrity, binding, and execution-ownership causes.
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -93,8 +99,10 @@ pub enum StoreError {
     WorkspaceHasNonterminalTurn { thread_id: String, turn_id: String },
 }
 
+/// Result type returned by all session-store operations.
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// Public description of the SQLite store and its supported schema version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStoreDescriptor {
     pub backend: String,
@@ -102,12 +110,14 @@ pub struct SessionStoreDescriptor {
     pub schema_version: u32,
 }
 
+/// A page of completed conversation history ordered for model reconstruction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadHistoryPage {
     pub messages: Vec<ConversationMessage>,
     pub next_before_turn_sequence: Option<u64>,
 }
 
+/// Atomic result of creating a turn, its user item, trace, and initial history page.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StartedTurn {
     pub turn: Turn,
@@ -116,6 +126,7 @@ pub struct StartedTurn {
     pub history: ThreadHistoryPage,
 }
 
+/// Atomic turn outcome together with any durable plan, assistant item, and trace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTurnOutcome {
     pub turn: Turn,
@@ -124,12 +135,14 @@ pub struct CommittedTurnOutcome {
     pub trace: TraceEvent,
 }
 
+/// Durable SQLite store that owns turn lifecycle, approvals, traces, artifacts, and recovery.
 pub struct SessionStore {
     connection: Connection,
     descriptor: SessionStoreDescriptor,
     runtime_path: Option<PathBuf>,
 }
 
+/// Process-held ownership guard that serializes execution for a thread or workspace.
 pub struct WorkspaceExecutionGuard {
     execution_scope: WorkspaceExecutionScope,
     store_path: PathBuf,
@@ -141,6 +154,7 @@ enum WorkspaceExecutionScope {
     Thread(String),
 }
 
+/// Approval decision plus the checkpoint and trace data needed by the AppServer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordedApprovalDecision {
     pub request: ApprovalRequest,
@@ -149,6 +163,7 @@ pub struct RecordedApprovalDecision {
     pub trace: TraceEvent,
 }
 
+/// Inputs for registering a redacted, content-addressed artifact reference.
 pub struct RegisterArtifactRefParams<'a> {
     pub run_id: &'a str,
     pub item_id: Option<&'a str>,
@@ -159,6 +174,7 @@ pub struct RegisterArtifactRefParams<'a> {
     pub metadata: Value,
 }
 
+/// Durable fields committed for one terminal, interrupted, or approval-blocked turn outcome.
 pub struct CommitTurnOutcomeParams<'a> {
     pub status: TurnStatus,
     pub agent_loop_status: &'a str,
@@ -168,6 +184,7 @@ pub struct CommitTurnOutcomeParams<'a> {
 }
 
 impl SessionStore {
+    /// Opens a SQLite store, configures fail-closed pragmas, and applies schema checks/migrations.
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
         let _initialization_lock = acquire_store_initialization_lock(path)?;
@@ -195,6 +212,7 @@ impl SessionStore {
         &self.descriptor
     }
 
+    /// Attempts to claim execution ownership and recovers abandoned work before returning it.
     pub fn try_begin_workspace_execution(
         &self,
         thread_id: &str,
@@ -235,6 +253,7 @@ impl SessionStore {
         }
     }
 
+    /// Reclaims persisted non-terminal work whose process owner is no longer present.
     pub fn recover_unowned_workspace_executions(&self) -> StoreResult<()> {
         let mut statement = self.connection.prepare(
             "select thread_id from turns
@@ -436,6 +455,7 @@ impl SessionStore {
         Ok((started.turn, started.item, started.trace))
     }
 
+    /// Atomically creates a turn, sanitizes its input, records its trace, and reads prior history.
     pub fn create_turn_with_input_trace_and_history(
         &self,
         thread_id: &str,
@@ -570,6 +590,7 @@ impl SessionStore {
         self.get_turn(turn_id)
     }
 
+    /// Commits a turn state and its durable items and trace in one transaction.
     pub fn commit_turn_outcome(
         &self,
         turn_id: &str,
@@ -670,6 +691,7 @@ impl SessionStore {
         })
     }
 
+    /// Records cancellation while preserving the distinction between pending approval and work in flight.
     pub fn request_turn_cancellation(
         &self,
         turn_id: &str,
@@ -896,6 +918,7 @@ impl SessionStore {
         self.create_approval_with_pending_tool_call_and_trace(request, None, component, summary)
     }
 
+    /// Stores an approval request and optional checkpoint while binding it to a blocked turn.
     pub fn create_approval_with_pending_tool_call_and_trace(
         &self,
         request: &ApprovalRequest,
@@ -1004,6 +1027,7 @@ impl SessionStore {
         Ok(decisions)
     }
 
+    /// Validates and records an approval outcome, deferring or claiming its pending execution.
     pub fn record_approval_decision(
         &self,
         decision: &ApprovalDecision,
@@ -1224,6 +1248,7 @@ impl SessionStore {
         })
     }
 
+    /// Atomically resolves an executing approval with its turn outcome and next checkpoint(s).
     pub fn commit_turn_outcome_and_resolve_pending_execution(
         &self,
         request_id: &str,
@@ -1302,6 +1327,7 @@ impl SessionStore {
         Ok(committed)
     }
 
+    /// Reconciles executing approvals without replaying their unknown external side effect.
     fn recover_incomplete_approval_executions_for_thread(
         transaction: &Connection,
         thread_id: &str,
@@ -1607,6 +1633,7 @@ impl SessionStore {
         Ok(recovered)
     }
 
+    /// Applies ownership-loss recovery to every thread covered by an execution guard.
     fn recover_abandoned_workspace_execution(
         &self,
         guard: &WorkspaceExecutionGuard,
@@ -2181,6 +2208,7 @@ impl SessionStore {
         }
     }
 
+    /// Initializes or validates the schema while failing closed on partial or future versions.
     fn init_schema(&self) -> StoreResult<()> {
         self.connection.execute_batch(
             "

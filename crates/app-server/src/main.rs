@@ -1,3 +1,8 @@
+//! Stdio transport for the AppServer.
+//!
+//! Input is read independently, turn and approval requests run in bounded worker threads, and a
+//! a single writer serializes JSON-line output with fail-closed backpressure handling.
+
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
@@ -17,6 +22,7 @@ const INPUT_QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 256;
 const REQUEST_CAPACITY_EXCEEDED: &str = "AppServer request capacity exceeded";
 
+/// Starts the stdio server and exits non-zero when transport or lifecycle shutdown fails.
 fn main() {
     if let Err(error) = run() {
         eprintln!("app-server error: {error}");
@@ -24,6 +30,7 @@ fn main() {
     }
 }
 
+/// Owns stdin ingestion, request-worker admission, stdout serialization, and graceful shutdown.
 fn run() -> Result<(), String> {
     let db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
@@ -248,6 +255,7 @@ fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
     )
 }
 
+/// Dispatches one worker-owned request and sends all responses through the shared bounded queue.
 fn run_request_worker(
     mut worker: AppServer,
     message: JsonRpcMessage,
@@ -361,6 +369,7 @@ fn join_request_worker(worker: JoinHandle<Result<(), String>>) -> Result<(), Str
         .map_err(|_| "request worker panicked".to_string())?
 }
 
+/// Enqueues one response or stops execution when stdout backpressure/disconnect is detected.
 fn send_output(
     sender: &SyncSender<Value>,
     cancellation: &AppServerCancellationHandle,
@@ -375,6 +384,7 @@ fn send_output(
     })
 }
 
+/// Serializes exactly one JSON-RPC value as one newline-delimited stdout record.
 fn write_json_line(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *stdout, value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

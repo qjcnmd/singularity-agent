@@ -1,5 +1,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//! Cross-platform command request and result contracts for strict sandbox execution.
+//!
+//! Platform adapters implement the `SandboxBackend` boundary; this crate owns the portable
+//! permission modes, capability checks, cancellation semantics, and fail-closed result mapping.
+
 use std::path::Path;
 #[cfg(windows)]
 use std::path::{Component, PathBuf};
@@ -76,6 +81,7 @@ const SENSITIVE_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"]
 #[cfg(windows)]
 const SENSITIVE_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
 
+/// Filesystem permission requested for a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxFilesystemMode {
@@ -84,6 +90,7 @@ pub enum SandboxFilesystemMode {
     DangerFullAccess,
 }
 
+/// Network permission requested for a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxNetworkMode {
@@ -91,17 +98,20 @@ pub enum SandboxNetworkMode {
     Allowed,
 }
 
+/// Filesystem policy paired with the workspace root used by a command request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxFilesystemPolicy {
     pub mode: SandboxFilesystemMode,
     pub workspace_root: String,
 }
 
+/// Network policy applied by the selected sandbox backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxNetworkPolicy {
     pub mode: SandboxNetworkMode,
 }
 
+/// Whether execution completed, was denied, cancelled, timed out, or unavailable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandExecutionStatus {
@@ -115,6 +125,7 @@ pub enum CommandExecutionStatus {
     BackendError,
 }
 
+/// Domain meaning of a command result, kept separate from backend execution status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandSemanticStatus {
@@ -128,6 +139,7 @@ pub enum CommandSemanticStatus {
     Cancelled,
 }
 
+/// Controls which host environment variables are allowed into a child command.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandEnvironmentPolicy {
@@ -136,6 +148,7 @@ pub enum CommandEnvironmentPolicy {
     EvaluationIsolated,
 }
 
+/// Complete portable command request handed to a sandbox backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandRequest {
     pub command_id: String,
@@ -171,6 +184,7 @@ impl CommandRequest {
         }
     }
 
+    /// Indicates that this command must not fall back to a local unsandboxed process.
     pub fn requires_sandbox(&self) -> bool {
         true
     }
@@ -180,6 +194,7 @@ impl CommandRequest {
     }
 }
 
+/// Strength of enforcement actually provided by a backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxBackendEnforcement {
@@ -188,6 +203,7 @@ pub enum SandboxBackendEnforcement {
     Unavailable,
 }
 
+/// Safe execution metadata used to distinguish strict, restricted, and unavailable backends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxExecutionMetadata {
     pub backend: String,
@@ -213,6 +229,7 @@ impl SandboxExecutionMetadata {
     }
 }
 
+/// Bounded command result with redacted previews and backend enforcement metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandResult {
     pub command_id: String,
@@ -228,12 +245,14 @@ pub struct CommandResult {
     pub sandbox: SandboxExecutionMetadata,
 }
 
+/// Bounded text preview returned by output-limiting helpers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BoundedCommandOutput {
     pub preview: String,
     pub truncated: bool,
 }
 
+/// Bounds command output without exposing unbounded stdout or stderr to callers.
 pub fn bound_command_output(output: &str, max_chars: usize) -> BoundedCommandOutput {
     let preview = output.chars().take(max_chars).collect::<String>();
     let truncated = output.chars().count() > preview.chars().count();
@@ -400,6 +419,7 @@ fn command_output_contains_sensitive_marker(output: &str) -> bool {
     contains_sensitive_text(output)
 }
 
+/// Capabilities a backend must expose before command execution is considered available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxCapabilities {
     pub filesystem_isolation: bool,
@@ -460,6 +480,7 @@ impl SandboxCapabilities {
         }
     }
 
+    /// Returns whether the capability set is sufficient for the strict command contract.
     pub fn supports_command_execution(&self) -> bool {
         self.env_isolation
             && self.path_admission
@@ -470,6 +491,7 @@ impl SandboxCapabilities {
                 || (self.restricted_token && self.job_object))
     }
 
+    /// Projects capabilities into the enforcement level recorded on command results.
     pub fn enforcement(&self) -> SandboxBackendEnforcement {
         if !self.supports_command_execution() {
             SandboxBackendEnforcement::Unavailable
@@ -501,11 +523,16 @@ impl SandboxCapabilities {
     }
 }
 
+/// Backend boundary for strict command execution and cancellation propagation.
 pub trait SandboxBackend {
+    /// Stable backend name used in capability and execution metadata.
     fn name(&self) -> &'static str;
+    /// Reports the controls this backend can enforce for the current platform.
     fn capabilities(&self) -> SandboxCapabilities;
+    /// Executes one request; unavailable or unsupported backends must return a blocked result.
     fn execute(&self, request: &CommandRequest) -> CommandResult;
 
+    /// Executes with cancellation, defaulting to a pre-execution cancellation check.
     fn execute_cancellable(
         &self,
         request: &CommandRequest,
@@ -548,6 +575,7 @@ impl SandboxBackend for WindowsSandboxBackend {
     }
 }
 
+/// Converts argv into the stable permission resource used by policy and audit records.
 pub fn command_permission_resource(argv: &[String]) -> String {
     if argv.is_empty() {
         return String::new();

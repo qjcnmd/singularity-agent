@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+//! Tool schemas, broker decisions, workspace operations, and public tool-result projection.
+//!
+//! The broker validates the model-facing input again at the execution boundary, while
+//! `WorkspaceTools` enforces workspace and protected-path rules before any filesystem side effect.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions};
@@ -75,6 +80,7 @@ pub const BUILTIN_COMMAND_TOOL: &str = "builtin_command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a tool call may run with other read-only calls or must run alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionMode {
@@ -82,6 +88,7 @@ pub enum ToolExecutionMode {
     Exclusive,
 }
 
+/// Structured validation code returned before a tool reaches execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolInputValidationError {
     pub code: String,
@@ -101,6 +108,7 @@ struct ToolInputBinding {
     execution_input: Value,
 }
 
+/// Provider-visible schema plus separate validation and optional exact input bindings.
 #[derive(Clone)]
 pub struct ToolSpec {
     pub name: String,
@@ -390,6 +398,7 @@ where
         .map_err(|_| ToolInputValidationError::new(validation_code))
 }
 
+/// Returns the built-in workspace read, search, mutation, and command tool definitions.
 pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -510,6 +519,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// Registry that owns the tools exposed to the model and used by the broker.
 #[derive(Debug, Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolSpec>,
@@ -561,6 +571,7 @@ impl ToolRegistry {
     }
 }
 
+/// Failure category retained so callers can distinguish input, policy, sandbox, and execution errors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolFailureKind {
@@ -580,6 +591,7 @@ pub enum ToolFailureKind {
     Cancelled,
 }
 
+/// Authorization result that determines whether the broker executes, denies, or pauses a call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolBrokerDecision {
@@ -627,6 +639,7 @@ impl ToolBrokerDecision {
     }
 }
 
+/// Execution boundary that revalidates tool input before invoking an executor closure.
 #[derive(Debug, Default, Clone)]
 pub struct ToolBroker {
     registry: ToolRegistry,
@@ -665,6 +678,7 @@ impl ToolBroker {
         self.registry.validate_execution_input(name, input)
     }
 
+    /// Executes an allowed call or returns a typed result without invoking the closure.
     pub fn execute<F>(
         &self,
         envelope: &ToolCallRequest,
@@ -726,6 +740,7 @@ impl ToolBroker {
     }
 }
 
+/// Canonical envelope passed from a model tool call to the broker and executor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolCallRequest {
     pub tool_call_id: String,
@@ -747,6 +762,7 @@ impl ToolCallRequest {
     }
 }
 
+/// Raw executor output before the broker bounds and redacts its public projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolOutput {
     pub ok: bool,
@@ -789,6 +805,7 @@ impl ToolOutput {
     }
 }
 
+/// Safe, bounded tool result used in model history, traces, and completion checks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolResult {
     pub tool_call_id: String,
@@ -1011,6 +1028,7 @@ fn value_string_array(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
+/// Workspace boundary, protected-path, sandbox, and mutation errors returned by workspace tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceToolError {
     OutsideWorkspace(String),
@@ -1048,6 +1066,7 @@ impl fmt::Display for WorkspaceToolError {
 
 impl std::error::Error for WorkspaceToolError {}
 
+/// Bounded file-read request accepted by the workspace tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadToolInput {
@@ -1073,6 +1092,7 @@ impl ReadToolInput {
     }
 }
 
+/// Bounded directory-list request accepted by the workspace tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListToolInput {
@@ -1104,6 +1124,7 @@ impl ListToolInput {
     }
 }
 
+/// Bounded text-search request accepted by the workspace tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrepToolInput {
@@ -1134,6 +1155,7 @@ impl GrepToolInput {
     }
 }
 
+/// Single-file replacement request accepted by the workspace tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditToolInput {
@@ -1148,6 +1170,7 @@ impl EditToolInput {
     }
 }
 
+/// Multi-file mutation whose targets are validated before any write begins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePatch {
@@ -1168,6 +1191,7 @@ impl WorkspacePatch {
     }
 }
 
+/// One expected-content-guarded change within a workspace patch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePatchChange {
@@ -1176,6 +1200,7 @@ pub struct WorkspacePatchChange {
     pub replacement: String,
 }
 
+/// Workspace file tools bound to a root and, for commands, a strict sandbox backend.
 #[derive(Clone)]
 pub struct WorkspaceTools {
     workspace_root: PathBuf,
@@ -1225,6 +1250,7 @@ impl WorkspaceTools {
         self
     }
 
+    /// Validates inputs and resolves every referenced path before execution or mutation.
     pub fn preflight(&self, tool_name: &str, input: &Value) -> Result<(), WorkspaceToolError> {
         match tool_name {
             BUILTIN_READ_TOOL => {
@@ -1522,6 +1548,7 @@ impl WorkspaceTools {
         self.command_cancellable(input, &CancellationToken::new())
     }
 
+    /// Runs a command only through the configured sandbox and propagates cancellation to it.
     pub fn command_cancellable(
         &self,
         input: CommandToolInput,
@@ -1728,6 +1755,7 @@ impl WorkspaceTools {
         Ok(false)
     }
 
+    /// Canonicalizes a requested path and rejects workspace escapes and protected components.
     fn resolve_workspace_path(
         &self,
         path: &str,
@@ -1889,6 +1917,7 @@ impl CommandModelInput {
     }
 }
 
+/// Model-facing command input; sandbox and network modes are applied later by the execution path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandToolInput {
@@ -1989,6 +2018,7 @@ impl<'a> CommandScope<'a> {
     }
 }
 
+/// Builds the auditable permission resource for a command and its effective execution scope.
 pub fn command_scope_resource(
     argv: &[String],
     cwd: &str,
@@ -2009,6 +2039,7 @@ pub fn command_scope_resource(
     }
 }
 
+/// Hashes the command, cwd, timeout, filesystem mode, and network mode for verification binding.
 pub fn command_scope_digest(
     argv: &[String],
     cwd: &str,
@@ -2084,6 +2115,7 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, WorkspaceTool
     Ok(normalize_path(&resolved))
 }
 
+/// Reports whether a normalized path contains a protected or secret-like component.
 pub fn is_protected_path(path: &str) -> bool {
     path.replace('\\', "/")
         .split('/')
@@ -2123,6 +2155,7 @@ fn artifact_ref(prefix: &str, path: &str) -> String {
     format!("{prefix}{sanitized}")
 }
 
+/// Replaces one file through a temporary file so callers can roll back a multi-file mutation.
 fn atomic_write(path: &Path, content: &str) -> Result<(), WorkspaceToolError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io_error)?;

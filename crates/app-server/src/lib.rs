@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+//! JSON-RPC application server that owns turn admission, AgentLoop execution, persistence, and
+//! cancellation at the process boundary.
+//!
+//! The server keeps protocol handling separate from worker execution and commits terminal state
+//! through the SessionStore before emitting corresponding events.
+
 mod evaluation;
 
 use std::collections::HashMap;
@@ -66,6 +72,7 @@ const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 const TURN_CANCELLATION_POLL_MS: u64 = 25;
 const STRICT_COMMAND_SANDBOX_UNAVAILABLE: &str = "strict_command_sandbox_unavailable";
 
+/// Errors translated into JSON-RPC responses at the application boundary.
 #[derive(Debug, Error)]
 pub enum AppServerError {
     #[error("invalid json: {0}")]
@@ -80,9 +87,11 @@ pub enum AppServerError {
     Workspace(String),
 }
 
+/// Result type for AppServer request handling and lifecycle operations.
 pub type AppServerResult<T> = Result<T, AppServerError>;
 type ApprovalCheckpoint = (ApprovalRequest, Value);
 
+/// Stateful JSON-RPC server coordinating threads, turns, approvals, traces, and workers.
 pub struct AppServer {
     store: SessionStore,
     initialized: bool,
@@ -95,6 +104,7 @@ pub struct AppServer {
     execution_stopped: Arc<AtomicBool>,
 }
 
+/// Cloneable stop handle shared by request workers and the stdio transport.
 #[derive(Clone)]
 pub struct AppServerCancellationHandle {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -102,6 +112,7 @@ pub struct AppServerCancellationHandle {
 }
 
 impl AppServerCancellationHandle {
+    /// Stops future execution and propagates cancellation to every active turn.
     pub fn request_execution_stop(&self) -> AppServerResult<()> {
         self.execution_stopped.store(true, Ordering::SeqCst);
         for cancellation in self
@@ -136,6 +147,7 @@ impl Drop for ActiveTurnGuard {
 }
 
 impl AppServer {
+    /// Creates an uninitialized server using the platform sandbox and captured provider snapshot.
     pub fn new(store: SessionStore, provider_snapshot: ProviderConfigSnapshot) -> Self {
         Self {
             store,
@@ -177,6 +189,7 @@ impl AppServer {
         }
     }
 
+    /// Opens an independent store connection for a request worker while sharing stop state.
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
             store: SessionStore::open(&self.store.descriptor().path)?,
@@ -191,6 +204,7 @@ impl AppServer {
         })
     }
 
+    /// Registers one active turn and attaches a durable cancellation monitor to it.
     fn activate_turn(
         &self,
         turn_id: &str,
@@ -238,11 +252,13 @@ impl AppServer {
         self.store.get_turn(&turn.turn_id).map_err(Into::into)
     }
 
+    /// Parses one JSON-RPC line and dispatches it through the protocol state machine.
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
         let message: JsonRpcMessage = serde_json::from_str(line)?;
         self.handle(message)
     }
 
+    /// Handles one parsed JSON-RPC request and returns zero or more wire responses/events.
     pub fn handle(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let id = message.id.clone();
         let Some(method_name) = message.method.as_deref() else {
@@ -511,6 +527,7 @@ impl AppServer {
         Ok(messages)
     }
 
+    /// Runs `turn/start` while emitting lifecycle events as each durable stage completes.
     pub fn handle_turn_start_streaming(
         &mut self,
         message: JsonRpcMessage,
@@ -629,6 +646,7 @@ impl AppServer {
         }
     }
 
+    /// Builds the AgentLoop from the captured provider, workspace policy, and persisted history.
     fn run_agent_loop(
         &self,
         thread: &Thread,
@@ -665,6 +683,7 @@ impl AppServer {
         }
     }
 
+    /// Resumes an approved checkpoint only when the store and turn still satisfy its contract.
     fn resume_agent_loop(
         &self,
         request: &ApprovalRequest,
@@ -707,6 +726,7 @@ impl AppServer {
         )
     }
 
+    /// Reconstructs the canonical loop input and executes one approved pending call.
     fn resume_agent_loop_after_gate<P>(
         &self,
         request: &ApprovalRequest,
@@ -890,6 +910,7 @@ impl AppServer {
         }
     }
 
+    /// Persists every AgentLoop checkpoint before the blocked turn is exposed to clients.
     fn persist_agent_approval_requests(&self, result: &AgentLoopResult) -> AppServerResult<()> {
         for (request, pending_tool_call) in approval_checkpoints(result)? {
             match self.store.create_approval_with_pending_tool_call_and_trace(
@@ -906,6 +927,7 @@ impl AppServer {
         Ok(())
     }
 
+    /// Maps run status to durable turn state, giving cancellation precedence at commit time.
     fn commit_turn_run_status(
         &self,
         turn: Turn,
@@ -967,6 +989,7 @@ impl AppServer {
         )
     }
 
+    /// Commits approval continuation state and any next checkpoint as one store transaction.
     fn commit_effective_turn_status_resolving_approval(
         &self,
         request_id: &str,
@@ -1128,6 +1151,7 @@ impl AppServer {
         invalid_request_response(message.id, APPROVAL_REQUEST_INTERNAL_ONLY)
     }
 
+    /// Records an approval and either preserves it, fails it, or resumes the claimed checkpoint.
     fn approval_decision(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let decision: ApprovalDecision = parse_params(&message)?;
         let pending_request = match self.store.get_pending_approval(&decision.request_id) {
@@ -1529,6 +1553,7 @@ fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
     }
 }
 
+/// Watches the durable turn state so an external interrupt reaches the in-process AgentLoop.
 fn cancellation_monitor(
     store_path: &str,
     turn_id: &str,

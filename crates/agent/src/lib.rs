@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+//! The AgentLoop state machine for model turns, tool execution, approval checkpoints, and
+//! completion verification.
+//!
+//! The loop keeps provider-visible history separate from canonical executable calls, routes every
+//! side effect through the ToolBroker, and fails closed when completion or recovery invariants are
+//! not satisfied.
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::ControlFlow;
 
@@ -78,6 +85,7 @@ const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan
 const EXACT_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: required verification commands are incomplete";
 
+/// The externally observable lifecycle state of one AgentLoop run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -116,6 +124,7 @@ impl From<&str> for AgentStatus {
     }
 }
 
+/// Evidence collected by the completion gate after workspace changes or required checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct AgentVerification {
     pub required: bool,
@@ -126,6 +135,7 @@ pub struct AgentVerification {
     pub unresolved_failures: Vec<String>,
 }
 
+/// One exact command-scope requirement that must be satisfied before finalization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentVerificationRequirement {
@@ -142,6 +152,7 @@ impl AgentVerificationRequirement {
     }
 }
 
+/// Lifecycle state for one user-visible execution-plan step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPlanStepStatus {
@@ -150,6 +161,7 @@ pub enum AgentPlanStepStatus {
     Completed,
 }
 
+/// A plan step and its current lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPlanStep {
@@ -157,6 +169,7 @@ pub struct AgentPlanStep {
     pub status: AgentPlanStepStatus,
 }
 
+/// The complete plan; validation keeps it bounded, unique, and unambiguous.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPlan {
@@ -244,6 +257,7 @@ impl AgentPlan {
     }
 }
 
+/// Returns the exclusive control tools used to update a plan or route a model tool call.
 pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -301,6 +315,7 @@ pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// The model input for replacing the current execution plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPlanUpdateInput {
@@ -322,6 +337,7 @@ impl AgentPlanUpdateInput {
     }
 }
 
+/// Counters for invalid calls, repair attempts, and rejected completion attempts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRecoveryMetrics {
     pub invalid_tool_call_count: u32,
@@ -330,6 +346,7 @@ pub struct AgentRecoveryMetrics {
     pub completion_rejection_count: u32,
 }
 
+/// Public run state derived from the loop, including gate evidence and safe diagnostics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunStatus {
     pub status: AgentStatus,
@@ -408,6 +425,7 @@ impl AgentRunStatus {
     }
 }
 
+/// Availability and blocker information for the AgentLoop's required execution backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopCapability {
     pub available: bool,
@@ -436,6 +454,7 @@ impl AgentLoopCapability {
     }
 }
 
+/// Inputs for a run, including current-turn context, safe history, grants, and verification rules.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopInput {
     pub thread_id: String,
@@ -513,6 +532,7 @@ impl AgentLoopInput {
     }
 }
 
+/// A previously approved tool invocation bound to its request, tool, and resource set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ApprovalGrant {
     pub request_id: String,
@@ -540,6 +560,7 @@ impl ApprovalGrant {
     }
 }
 
+/// The full result of a run, including pending approval checkpoints and tool results.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopResult {
     pub status: AgentStatus,
@@ -622,6 +643,7 @@ impl AgentLoopResult {
     }
 }
 
+/// Canonical executable tool-call data retained while approval pauses a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PendingToolCall {
     pub request_id: String,
@@ -655,6 +677,7 @@ impl PendingToolCall {
     }
 }
 
+/// Completion-gate state shared across tool results and approval checkpoints.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct CompletionTracker {
     workspace_mutated: bool,
@@ -877,6 +900,7 @@ impl CheckpointToolResult {
     }
 }
 
+/// Serializable pause state used to resume an approval-gated tool call safely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentLoopCheckpoint {
     #[serde(flatten)]
@@ -909,6 +933,7 @@ struct AgentLoopCheckpoint {
     last_repair_failure: Option<RepairFailureState>,
 }
 
+/// Mutable state accumulated across provider turns before it becomes an `AgentLoopResult`.
 struct AgentLoopState {
     messages: Vec<ModelMessage>,
     tool_results: Vec<ToolResult>,
@@ -1225,6 +1250,7 @@ enum ToolBatchControl {
     Cancelled,
 }
 
+/// Orchestrates provider turns, policy decisions, sandboxed tools, approvals, and finalization.
 pub struct AgentLoop<P> {
     provider: P,
     tool_broker: ToolBroker,
@@ -1257,6 +1283,7 @@ where
         self
     }
 
+    /// Runs a new turn until it completes, blocks for approval, is cancelled, or fails closed.
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
         let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
@@ -1301,6 +1328,7 @@ where
         self.continue_run(input, &budget, &capabilities, max_tool_calls, state, 0)
     }
 
+    /// Advances the state machine after each provider response or tool result.
     fn continue_run(
         &self,
         input: &AgentLoopInput,
@@ -1571,6 +1599,7 @@ where
         )
     }
 
+    /// Restores a validated approval checkpoint, executes the approved call, and continues the run.
     pub fn resume_pending_tool_call(
         &self,
         input: &AgentLoopInput,
@@ -1721,6 +1750,7 @@ where
         )
     }
 
+    /// Negotiates provider capabilities and records the result before building model context.
     fn negotiate_tool_capabilities(
         &self,
         input: &AgentLoopInput,
@@ -1862,6 +1892,7 @@ where
         })
     }
 
+    /// Preflights, authorizes, executes, or checkpoints the provider's tool-call batch.
     fn process_tool_calls(
         &self,
         input: &AgentLoopInput,
@@ -1969,6 +2000,7 @@ where
         self.record_tool_results(input, state, vec![(prepared, result)], false)
     }
 
+    /// Canonicalizes one model call and validates its executable input before policy evaluation.
     fn prepare_tool_call(
         &self,
         execution_call: &ModelToolCall,
@@ -2217,6 +2249,7 @@ where
             .collect()
     }
 
+    /// Feeds tool outcomes into completion and repair state while preserving failure categories.
     fn record_tool_results(
         &self,
         input: &AgentLoopInput,
@@ -2401,6 +2434,7 @@ enum AgentLoopToolError {
     Workspace(#[from] WorkspaceToolError),
 }
 
+/// Priority used when selecting public context for a provider request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum AgentContextItemPriority {
     System,
@@ -2420,6 +2454,7 @@ impl AgentContextItemPriority {
     }
 }
 
+/// A context item that may be projected into model history when its visibility permits it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentContextItem {
     pub item_id: String,
@@ -2565,6 +2600,7 @@ fn effective_max_tool_calls(capabilities: &ProviderProtocolContract) -> u32 {
     }
 }
 
+/// Computes the request budget after reserving output, instructions, tools, and framing overhead.
 fn context_budget(
     input: &AgentLoopInput,
     loop_tools: &ToolBroker,
@@ -2674,6 +2710,7 @@ struct ContextCompactionOutcome {
     after_tokens: u32,
 }
 
+/// Compacts prior model messages while retaining current control and verification evidence.
 fn compact_model_messages(
     tools: &[ModelToolSchema],
     state: &AgentLoopState,
@@ -2862,6 +2899,7 @@ fn compaction_control_instructions(state: &AgentLoopState) -> Vec<String> {
     instructions
 }
 
+/// Selects public current-turn items and newest history that fit the requested token budget.
 pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> ContextBundle {
     let budget = ContextBudget::for_public_assembly(max_tokens);
     assemble_context_items_with_budget(items, &budget)
@@ -2958,6 +2996,7 @@ fn current_turn_excluded(input: &AgentLoopInput, context: &ContextBundle) -> boo
     })
 }
 
+/// Restores and re-canonicalizes a checkpoint before an approved call can execute.
 fn restore_checkpoint(
     input: &AgentLoopInput,
     pending: &PendingToolCall,
@@ -3184,6 +3223,7 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
     }
 }
 
+/// Provider-ready context messages plus inclusion metadata for trace and diagnostics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ContextBundle {
     pub messages: Vec<Value>,
@@ -3192,6 +3232,7 @@ pub struct ContextBundle {
     pub budget: Value,
 }
 
+/// Trace-safe context selection and compaction counters persisted with a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentContextTrace {
     pub included_item_ids: Vec<String>,
