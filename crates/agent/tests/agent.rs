@@ -36,7 +36,8 @@ struct StaticProvider {
 struct FinalizationAwareProvider {
     setup_responses: Vec<ModelTurnResponse>,
     repeated_tool_response: ModelTurnResponse,
-    final_response: ModelTurnResponse,
+    final_response: Result<ModelTurnResponse, ProviderError>,
+    cancel_on_finalization: bool,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
     capabilities: ProviderProtocolContract,
 }
@@ -49,7 +50,7 @@ impl Provider for FinalizationAwareProvider {
     fn complete(
         &self,
         request: &ModelTurnRequest,
-        _cancellation: &CancellationToken,
+        cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError> {
         let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
         let response_index = seen_requests.len();
@@ -58,7 +59,10 @@ impl Provider for FinalizationAwareProvider {
             return Ok(response.clone());
         }
         if request.tool_choice.mode == ToolChoiceMode::None && request.tools.is_empty() {
-            return Ok(self.final_response.clone());
+            if self.cancel_on_finalization {
+                cancellation.cancel();
+            }
+            return self.final_response.clone();
         }
         Ok(self.repeated_tool_response.clone())
     }
@@ -4716,7 +4720,8 @@ fn verified_completed_plan_enters_tool_free_finalization() {
         FinalizationAwareProvider {
             setup_responses: vec![initial_plan, completed_plan, verification],
             repeated_tool_response: repeated_verification,
-            final_response,
+            final_response: Ok(final_response),
+            cancel_on_finalization: false,
             seen_requests: Arc::clone(&seen_requests),
             capabilities: ProviderProtocolContract {
                 supports_required_tool_choice: true,
@@ -4761,6 +4766,254 @@ fn verified_completed_plan_enters_tool_free_finalization() {
     assert_eq!(requests[3].tool_choice.max_tool_calls, 0);
     assert!(!requests[3].tool_choice.strict_tool_schema);
     assert!(requests[3].tools.is_empty());
+}
+
+#[test]
+fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
+    #[derive(Clone, Copy)]
+    enum FinalizationCase {
+        ProviderError,
+        EmptyResponse,
+        StructuredToolCall,
+        Cancelled,
+    }
+
+    for case in [
+        FinalizationCase::ProviderError,
+        FinalizationCase::EmptyResponse,
+        FinalizationCase::StructuredToolCall,
+        FinalizationCase::Cancelled,
+    ] {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let canonical_cwd = std::fs::canonicalize(workspace.path())
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
+        let verification_argv = test_command("verify");
+        let verification_digest = command_scope_digest(
+            &verification_argv,
+            &canonical_cwd,
+            5,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Denied,
+        );
+        let response_with_accounting = |request_id: &str,
+                                        response_id: &str,
+                                        content: &str,
+                                        input_tokens: u64,
+                                        output_tokens: u64,
+                                        total_tokens: u64,
+                                        latency_ms: u64| {
+            let mut response = ModelTurnResponse::completed(request_id, response_id, content);
+            response.usage = ModelUsage {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                ..ModelUsage::default()
+            };
+            response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+                attempt_count: 1,
+                retry_count: 0,
+                latency_ms,
+            });
+            response
+        };
+
+        let mut verification =
+            response_with_accounting("model_request_turn_1_0", "response_1", "", 30, 3, 33, 30);
+        verification.tool_calls.push(tool_call(
+            "verify_call_1",
+            "builtin_command",
+            serde_json::json!({
+                "argv": verification_argv.clone(),
+                "cwd": ".",
+                "timeout_seconds": 5
+            }),
+        ));
+
+        let final_response = match case {
+            FinalizationCase::ProviderError => Err(ProviderError::from_model_error(
+                ModelError::new(
+                    ModelErrorKind::UnknownProviderError,
+                    "terminal provider failed",
+                )
+                .with_provider_diagnostic(
+                    "terminal_provider_failed",
+                    singularity_model::ProviderErrorStage::RequestSend,
+                ),
+            )
+            .with_provider_attempt_metadata(ProviderAttemptMetadata {
+                attempt_count: 2,
+                retry_count: 1,
+                latency_ms: 40,
+            })),
+            FinalizationCase::EmptyResponse | FinalizationCase::Cancelled => {
+                Ok(response_with_accounting(
+                    "model_request_turn_1_1",
+                    "response_final",
+                    if matches!(case, FinalizationCase::Cancelled) {
+                        "done"
+                    } else {
+                        ""
+                    },
+                    40,
+                    4,
+                    44,
+                    40,
+                ))
+            }
+            FinalizationCase::StructuredToolCall => {
+                let mut response = response_with_accounting(
+                    "model_request_turn_1_1",
+                    "response_final",
+                    "",
+                    40,
+                    4,
+                    44,
+                    40,
+                );
+                response.tool_calls.push(tool_call(
+                    "terminal_call",
+                    "builtin_command",
+                    serde_json::json!({
+                        "argv": test_command("must-not-run"),
+                        "timeout_seconds": 5
+                    }),
+                ));
+                Ok(response)
+            }
+        };
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let cancellation = CancellationToken::new();
+        let result = AgentLoop::new(
+            FinalizationAwareProvider {
+                setup_responses: vec![verification.clone()],
+                repeated_tool_response: verification,
+                final_response,
+                cancel_on_finalization: matches!(case, FinalizationCase::Cancelled),
+                seen_requests: Arc::clone(&seen_requests),
+                capabilities: ProviderProtocolContract {
+                    supports_required_tool_choice: true,
+                    ..ProviderProtocolContract::default()
+                },
+            },
+            agent_tool_broker_for_test(true),
+            allow_read_execute_policy(),
+        )
+        .with_workspace_tools(
+            WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+        )
+        .with_cancellation_token(cancellation);
+
+        let result = result.run(
+            &AgentLoopInput::new("thread_1", "turn_1", "verify")
+                .with_max_turns(1)
+                .with_verification_requirements([AgentVerificationRequirement::new(
+                    verification_digest,
+                    1,
+                )]),
+        );
+
+        assert_eq!(result.model_turns, 2);
+        assert_eq!(result.model_turn_limit, 1);
+        assert_ne!(result.status, AgentStatus::Completed);
+        assert!(!result.completed);
+        assert!(result.final_answer.is_none());
+        assert!(result.verification.passed);
+        assert_eq!(result.tool_calls, 1);
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(
+            result
+                .tool_results
+                .iter()
+                .filter(|tool_result| tool_result.tool_name == "builtin_command")
+                .count(),
+            1
+        );
+
+        let requests = seen_requests.lock().expect("seen requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
+        assert!(!requests[0].tools.is_empty());
+        assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::None);
+        assert_eq!(requests[1].tool_choice.max_tool_calls, 0);
+        assert!(requests[1].tools.is_empty());
+        drop(requests);
+
+        match case {
+            FinalizationCase::ProviderError => {
+                assert_eq!(result.status, AgentStatus::Failed);
+                assert_eq!(result.error.as_deref(), Some("terminal provider failed"));
+                assert_eq!(
+                    result.error_category,
+                    Some(ModelErrorCategory::UnknownProviderError)
+                );
+                assert_eq!(result.model_usage.input_tokens, 30);
+                assert_eq!(result.model_usage.output_tokens, 3);
+                assert_eq!(result.model_usage.total_tokens, 33);
+                assert_eq!(result.provider_attempts.attempt_count, 3);
+                assert_eq!(result.provider_attempts.retry_count, 1);
+                assert_eq!(result.provider_attempts.latency_ms, 70);
+            }
+            FinalizationCase::EmptyResponse => {
+                assert_eq!(result.status, AgentStatus::Failed);
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some("model response validation failed: empty_response")
+                );
+                assert_eq!(result.error_category, Some(ModelErrorCategory::JsonSchema));
+                let diagnostic = result
+                    .provider_diagnostic
+                    .as_ref()
+                    .expect("typed empty response diagnostic");
+                assert_eq!(
+                    diagnostic.code.as_deref(),
+                    Some("provider_response_invalid")
+                );
+                assert_eq!(diagnostic.validation_errors, ["empty_response"]);
+                assert_eq!(result.model_usage.total_tokens, 77);
+                assert_eq!(result.provider_attempts.attempt_count, 2);
+                assert_eq!(result.provider_attempts.latency_ms, 70);
+            }
+            FinalizationCase::StructuredToolCall => {
+                assert_eq!(result.status, AgentStatus::Failed);
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some(
+                        "model response validation failed: max_tool_calls_exceeded, tool_choice_none, unknown_tool"
+                    )
+                );
+                assert_eq!(result.error_category, Some(ModelErrorCategory::JsonSchema));
+                let diagnostic = result
+                    .provider_diagnostic
+                    .as_ref()
+                    .expect("typed structured response diagnostic");
+                assert_eq!(
+                    diagnostic.code.as_deref(),
+                    Some("provider_response_invalid")
+                );
+                assert_eq!(
+                    diagnostic.validation_errors,
+                    [
+                        "max_tool_calls_exceeded",
+                        "tool_choice_none",
+                        "unknown_tool"
+                    ]
+                );
+                assert_eq!(result.recovery_metrics.invalid_tool_call_count, 1);
+                assert_eq!(result.model_usage.total_tokens, 77);
+                assert_eq!(result.provider_attempts.attempt_count, 2);
+                assert_eq!(result.provider_attempts.latency_ms, 70);
+            }
+            FinalizationCase::Cancelled => {
+                assert_eq!(result.status, AgentStatus::Cancelled);
+                assert!(result.error.is_none());
+                assert_eq!(result.model_usage.total_tokens, 77);
+                assert_eq!(result.provider_attempts.attempt_count, 2);
+                assert_eq!(result.provider_attempts.latency_ms, 70);
+            }
+        }
+    }
 }
 
 #[test]
