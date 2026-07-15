@@ -17,6 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+pub use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
 pub use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
@@ -49,23 +50,6 @@ const DEFAULT_RESULT_PREVIEW_MAX_CHARS: usize = 4_096;
 const BINARY_CONTENT_PREVIEW: &str = "[binary content omitted]";
 const DIFF_ARTIFACT_PREFIX: &str = "artifact://diff/";
 const RESULT_ARTIFACT_PREFIX: &str = "artifact://result/";
-const PROTECTED_PATH_EXACT_MARKERS: [&str; 13] = [
-    ".aws",
-    ".azure",
-    ".git",
-    ".gnupg",
-    ".ssh",
-    "credentials",
-    "credentials.json",
-    "id_dsa",
-    "id_ecdsa",
-    "id_ed25519",
-    "id_rsa",
-    "secret",
-    "secrets",
-];
-const PROTECTED_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"];
-const PROTECTED_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
 const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "developer message",
     "ignore previous",
@@ -2129,28 +2113,6 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, WorkspaceTool
         resolved.push(component);
     }
     Ok(normalize_path(&resolved))
-}
-
-/// 判断规范化路径是否包含受保护或类似敏感信息的组件。
-pub fn is_protected_path(path: &str) -> bool {
-    path.replace('\\', "/")
-        .split('/')
-        .map(str::to_ascii_lowercase)
-        .any(|component| is_protected_component(&component))
-}
-
-fn is_protected_component(component: &str) -> bool {
-    PROTECTED_PATH_EXACT_MARKERS.contains(&component)
-        || PROTECTED_PATH_PREFIXES.iter().any(|prefix| {
-            component == *prefix
-                || component
-                    .strip_prefix(*prefix)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-        })
-        || PROTECTED_PATH_SUFFIXES
-            .iter()
-            .any(|suffix| component.ends_with(suffix))
-        || component.contains("secret")
 }
 
 fn is_binary(bytes: &[u8]) -> bool {

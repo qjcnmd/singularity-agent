@@ -31,6 +31,23 @@ const GOOGLE_API_KEY_BODY_MIN_CHARS: usize = 30;
 const GOOGLE_API_KEY_BODY_MAX_CHARS: usize = 45;
 const JWT_MIN_PARTS: usize = 3;
 const JWT_MIN_PART_CHARS: usize = 8;
+const PROTECTED_PATH_EXACT_MARKERS: [&str; 13] = [
+    ".aws",
+    ".azure",
+    ".git",
+    ".gnupg",
+    ".ssh",
+    "credentials",
+    "credentials.json",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+    "secret",
+    "secrets",
+];
+const PROTECTED_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"];
+const PROTECTED_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
 const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
     ".aws",
     ".azure",
@@ -239,6 +256,26 @@ pub fn contains_sensitive_text(text: &str) -> bool {
         || contains_secret_flag_argument(&lowered)
 }
 
+/// 判断工作区相对路径是否命中统一的 protected path 规则。
+pub fn is_protected_path(path: &str) -> bool {
+    path.replace('\\', "/")
+        .split('/')
+        .map(str::to_ascii_lowercase)
+        .any(|component| {
+            PROTECTED_PATH_EXACT_MARKERS.contains(&component.as_str())
+                || PROTECTED_PATH_PREFIXES.iter().any(|prefix| {
+                    component == *prefix
+                        || component
+                            .strip_prefix(prefix)
+                            .is_some_and(|suffix| suffix.starts_with('.'))
+                })
+                || PROTECTED_PATH_SUFFIXES
+                    .iter()
+                    .any(|suffix| component.ends_with(suffix))
+                || component.contains("secret")
+        })
+}
+
 fn contains_secret_like_token(text: &str) -> bool {
     text.split(secret_token_delimiter)
         .any(is_secret_like_token_fragment)
@@ -323,4 +360,25 @@ fn secret_value_delimiter(ch: char) -> bool {
 
 fn is_base64url_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_protected_path;
+
+    #[test]
+    fn protected_path_policy_covers_exact_prefix_and_suffix_markers() {
+        for path in [
+            ".git/config",
+            "nested/.env.local",
+            "nested/private-key.pem",
+            "nested/backup.p12",
+            "nested/client-secret.txt",
+        ] {
+            assert!(is_protected_path(path), "{path} should be protected");
+        }
+        for path in ["src/main.rs", "config/example.env.sample", "notes/key.txt"] {
+            assert!(!is_protected_path(path), "{path} should be allowed");
+        }
+    }
 }

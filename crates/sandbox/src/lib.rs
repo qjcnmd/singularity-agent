@@ -11,7 +11,12 @@ use std::path::{Component, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
+
+#[cfg(windows)]
+mod protected_paths;
 
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
@@ -64,26 +69,6 @@ const SECRET_ENV_MARKERS: [&str; 6] = [
     "SECRET",
     "TOKEN",
 ];
-#[cfg(windows)]
-const SENSITIVE_PATH_EXACT_MARKERS: [&str; 12] = [
-    ".aws",
-    ".azure",
-    ".git",
-    ".gnupg",
-    ".ssh",
-    "credentials",
-    "credentials.json",
-    "id_dsa",
-    "id_ecdsa",
-    "id_ed25519",
-    "id_rsa",
-    "secrets",
-];
-#[cfg(windows)]
-const SENSITIVE_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"];
-#[cfg(windows)]
-const SENSITIVE_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
-
 /// 命令请求的文件系统权限。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -760,7 +745,7 @@ fn command_token_has_sensitive_path_marker(token: &str) -> bool {
                 })
                 .to_ascii_lowercase()
         })
-        .any(|component| sensitive_path_component(&component))
+        .any(|component| is_protected_path(&component))
 }
 
 #[cfg(windows)]
@@ -1045,22 +1030,7 @@ fn path_has_sensitive_component(path: &Path) -> bool {
             Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
             _ => None,
         })
-        .any(|component| sensitive_path_component(&component))
-}
-
-#[cfg(windows)]
-fn sensitive_path_component(component: &str) -> bool {
-    SENSITIVE_PATH_EXACT_MARKERS.contains(&component)
-        || SENSITIVE_PATH_PREFIXES.iter().any(|prefix| {
-            component == *prefix
-                || component
-                    .strip_prefix(*prefix)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-        })
-        || SENSITIVE_PATH_SUFFIXES
-            .iter()
-            .any(|suffix| component.ends_with(suffix))
-        || component.contains("secret")
+        .any(|component| is_protected_path(&component))
 }
 
 #[cfg(windows)]
@@ -1077,6 +1047,7 @@ mod windows_backend {
         run_windows_sandbox_capture_for_permission_profile_elevated,
     };
 
+    use super::protected_paths::{ProtectedPathDiscoveryError, discover_existing_protected_paths};
     use super::{
         COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
         CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
@@ -1094,6 +1065,7 @@ mod windows_backend {
     const UNSAFE_BATCH_ARGUMENT: &str = "batch command contains unsupported shell syntax";
     const ELEVATED_FAILURE_PREFIX: &str = "elevated Windows sandbox failed";
     const RESTRICTED_FAILURE_PREFIX: &str = "restricted-token Windows sandbox failed";
+    const PROTECTED_PATH_ENFORCEMENT_FAILED: &str = "protected workspace path enforcement failed";
     const DANGER_FULL_ACCESS_UNSUPPORTED: &str = "danger-full-access requires an explicit unsandboxed executor and is unavailable in the sandbox backend";
 
     #[derive(Debug)]
@@ -1102,9 +1074,11 @@ mod windows_backend {
         read_roots: Vec<PathBuf>,
     }
 
+    #[derive(Debug)]
     enum PrepareCommandError {
         Executable(ExecutableResolutionError),
         Backend(String),
+        ProtectedPaths(ProtectedPathDiscoveryError),
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1175,6 +1149,13 @@ mod windows_backend {
                             SandboxBackendEnforcement::Unavailable,
                         );
                 }
+                Err(PrepareCommandError::ProtectedPaths(error)) => {
+                    return CommandResult::backend_error(&request.command_id, error.to_string())
+                        .with_sandbox_execution(
+                            self.name(),
+                            SandboxBackendEnforcement::Unavailable,
+                        );
+                }
             };
             match execute_windows_sandbox(&request.command_id, cancellation, prepared) {
                 Ok(result) => result,
@@ -1214,6 +1195,13 @@ mod windows_backend {
                             SandboxBackendEnforcement::Unavailable,
                         );
                 }
+                Err(PrepareCommandError::ProtectedPaths(error)) => {
+                    return CommandResult::backend_error(&request.command_id, error.to_string())
+                        .with_sandbox_execution(
+                            self.name(),
+                            SandboxBackendEnforcement::Unavailable,
+                        );
+                }
             };
             match execute_windows_sandbox(&request.command_id, cancellation, prepared) {
                 Ok(result) => result,
@@ -1233,6 +1221,7 @@ mod windows_backend {
         restricted_token_fallback: bool,
         argv: Vec<String>,
         read_roots: Vec<PathBuf>,
+        protected_deny_read_paths: Vec<AbsolutePathBuf>,
     }
 
     impl PreparedCommand {
@@ -1290,6 +1279,7 @@ mod windows_backend {
                 restricted_token_fallback,
                 argv: resolved.argv,
                 read_roots: resolved.read_roots,
+                protected_deny_read_paths: Vec::new(),
             })
         }
 
@@ -1317,6 +1307,8 @@ mod windows_backend {
                 .map_err(|error| {
                     PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
                 })?;
+            let protected_deny_read_paths = discover_existing_protected_paths(&workspace_root)
+                .map_err(PrepareCommandError::ProtectedPaths)?;
             let workspace_roots = vec![workspace_root];
             let network = match request.network.mode {
                 SandboxNetworkMode::Denied => NetworkSandboxPolicy::Restricted,
@@ -1348,7 +1340,8 @@ mod windows_backend {
                     "invalid Windows sandbox permissions: {error}"
                 ))
             })?
-            .supports_restricted_token_fallback();
+            .supports_restricted_token_fallback()
+                && protected_deny_read_paths.is_empty();
             Ok(Self {
                 permission_profile,
                 workspace_roots,
@@ -1359,8 +1352,29 @@ mod windows_backend {
                 restricted_token_fallback,
                 argv,
                 read_roots: executable_read_roots(&powershell),
+                protected_deny_read_paths,
             })
         }
+    }
+
+    /// 将准备阶段的 deny-read 集合绑定到现有 elevated capture 请求。
+    fn elevated_capture_request<'a>(
+        prepared: &'a PreparedCommand,
+        windows_cancellation: WindowsSandboxCancellationToken,
+    ) -> ElevatedSandboxProfileCaptureRequest<'a> {
+        let mut elevated = ElevatedSandboxProfileCaptureRequest::new(
+            &prepared.permission_profile,
+            &prepared.workspace_roots,
+            &prepared.sandbox_home,
+            prepared.argv.clone(),
+            &prepared.cwd,
+            prepared.env_map.clone(),
+        );
+        elevated.timeout_ms = Some(prepared.timeout_ms);
+        elevated.cancellation = Some(windows_cancellation);
+        elevated.additional_read_roots = &prepared.read_roots;
+        elevated.deny_read_paths_override = &prepared.protected_deny_read_paths;
+        elevated
     }
 
     fn execute_windows_sandbox(
@@ -1373,24 +1387,16 @@ mod windows_backend {
             let cancellation = cancellation.clone();
             move || cancellation.is_cancelled()
         });
-        let elevated = run_windows_sandbox_capture_for_permission_profile_elevated({
-            let mut elevated = ElevatedSandboxProfileCaptureRequest::new(
-                &prepared.permission_profile,
-                &prepared.workspace_roots,
-                &prepared.sandbox_home,
-                prepared.argv.clone(),
-                &prepared.cwd,
-                prepared.env_map.clone(),
-            );
-            elevated.timeout_ms = Some(prepared.timeout_ms);
-            elevated.cancellation = Some(windows_cancellation.clone());
-            elevated.additional_read_roots = &prepared.read_roots;
-            elevated
-        });
+        let elevated = run_windows_sandbox_capture_for_permission_profile_elevated(
+            elevated_capture_request(&prepared, windows_cancellation.clone()),
+        );
         match elevated {
             Ok(capture) => Ok(command_result_from_capture(command_id, capture, started)
                 .with_sandbox_execution(ELEVATED_BACKEND_NAME, SandboxBackendEnforcement::Strict)),
-            Err(elevated_error) if prepared.restricted_token_fallback => {
+            Err(elevated_error)
+                if prepared.restricted_token_fallback
+                    && prepared.protected_deny_read_paths.is_empty() =>
+            {
                 let elevated_error = windows_error_summary(&elevated_error);
                 let capture = run_windows_sandbox_capture(
                     &prepared.permission_profile,
@@ -1415,10 +1421,16 @@ mod windows_backend {
                         SandboxBackendEnforcement::RestrictedToken,
                     ))
             }
-            Err(error) => Err(format!(
-                "{ELEVATED_FAILURE_PREFIX}: {}",
-                windows_error_summary(&error)
-            )),
+            Err(error) => {
+                if !prepared.protected_deny_read_paths.is_empty() {
+                    Err(PROTECTED_PATH_ENFORCEMENT_FAILED.to_string())
+                } else {
+                    Err(format!(
+                        "{ELEVATED_FAILURE_PREFIX}: {}",
+                        windows_error_summary(&error)
+                    ))
+                }
+            }
         }
     }
 
@@ -2086,6 +2098,54 @@ mod windows_backend {
             );
 
             assert!(command_script_request_denial(&request).is_none());
+        }
+
+        #[test]
+        fn existing_protected_path_disables_restricted_token_fallback() {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let nested = workspace.path().join("nested");
+            fs::create_dir_all(&nested).expect("nested directory");
+            fs::create_dir(workspace.path().join(".git")).expect("git directory");
+            create_test_file(&workspace.path().join(".env.local"), "opaque");
+            create_test_file(&nested.join("private-key.pem"), "opaque");
+            create_test_file(&nested.join("client.p12"), "opaque");
+            let mut request = CommandScriptRequest::agent_requested(
+                "script_protected_path",
+                "Join-Path 'nested' (Get-Random) | Out-Null",
+                workspace.path().to_string_lossy(),
+                workspace.path().to_string_lossy(),
+            );
+            request.network.mode = SandboxNetworkMode::Allowed;
+
+            let prepared = match PreparedCommand::from_script_request(&request) {
+                Ok(prepared) => prepared,
+                Err(_) => panic!("script preparation should succeed"),
+            };
+
+            assert!(!prepared.restricted_token_fallback);
+            let protected_paths = prepared
+                .protected_deny_read_paths
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                protected_paths,
+                [
+                    workspace.path().join(".git"),
+                    workspace.path().join(".env.local"),
+                    nested.join("private-key.pem"),
+                    nested.join("client.p12"),
+                ]
+                .into_iter()
+                .map(|path| dunce::canonicalize(path).expect("canonical protected path"))
+                .collect()
+            );
+            let elevated =
+                elevated_capture_request(&prepared, WindowsSandboxCancellationToken::new(|| false));
+            assert_eq!(
+                elevated.deny_read_paths_override,
+                prepared.protected_deny_read_paths.as_slice()
+            );
         }
 
         #[test]
