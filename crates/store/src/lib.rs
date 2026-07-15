@@ -1469,7 +1469,7 @@ impl SessionStore {
                         ));
                     }
                     let payload = serde_json::from_str::<Value>(payload)?;
-                    let _ = pending_tool_call_id(&transaction, &request, &payload)?;
+                    let _ = pending_tool_call_id(transaction, &request, &payload)?;
                 }
                 _ => {
                     return Err(StoreError::InvalidState(format!(
@@ -1597,7 +1597,7 @@ impl SessionStore {
                     summary,
                 )
             };
-            Self::insert_trace(&transaction, &trace)?;
+            Self::insert_trace(transaction, &trace)?;
             transaction.execute(
                 "delete from pending_tool_calls where request_id = ?1",
                 params![request_id],
@@ -1723,7 +1723,7 @@ impl SessionStore {
                     "turn interrupted after execution owner was lost",
                 )
             };
-            Self::insert_trace(&transaction, &trace)?;
+            Self::insert_trace(transaction, &trace)?;
             recovered.push(turn_id);
         }
         Ok(recovered)
