@@ -281,7 +281,7 @@ pub struct ProviderConfigResolution {
     pub config: ModelProviderConfig,
 }
 
-/// A turn-scoped provider configuration snapshot with redacted status and initialized provider.
+/// A server-scoped provider configuration snapshot with redacted status and initialized provider.
 ///
 /// Capturing once lets the AppServer report and use the same configuration without exposing the
 /// API key or other raw environment values.
