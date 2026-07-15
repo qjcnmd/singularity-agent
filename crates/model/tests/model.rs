@@ -3934,7 +3934,7 @@ fn model_response_validation_enforces_tool_choice_and_provider_capabilities() {
 }
 
 #[test]
-fn model_response_validation_rejects_unknown_or_malformed_tool_calls() {
+fn model_response_validation_reports_unknown_tools_without_hiding_structural_errors() {
     let mut malformed = tool_call("call_1", "builtin_unknown");
     malformed.parse_status = ModelToolParseStatus::InvalidJson;
     malformed
@@ -3950,8 +3950,8 @@ fn model_response_validation_rejects_unknown_or_malformed_tool_calls() {
     );
 
     assert!(!result.valid);
-    assert_eq!(result.errors, vec!["invalid_json", "unknown_tool"]);
-    assert_eq!(result.warnings, vec!["schema detail"]);
+    assert_eq!(result.errors, vec!["invalid_json"]);
+    assert_eq!(result.warnings, vec!["unknown_tool", "schema detail"]);
 }
 
 #[test]

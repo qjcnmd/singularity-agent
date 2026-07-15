@@ -717,9 +717,11 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
 }
 
 #[test]
-fn agent_loop_rejects_unknown_tool_response_before_execution() {
+fn agent_loop_returns_unknown_native_tool_to_model_without_execution() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "ready").expect("write fixture");
     let input = AgentLoopInput {
-        max_turns: 1,
+        max_turns: 3,
         ..AgentLoopInput::new("thread_1", "turn_1", "hello")
     };
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
@@ -728,29 +730,68 @@ fn agent_loop_rejects_unknown_tool_response_before_execution() {
         "builtin_missing",
         serde_json::json!({}),
     ));
+    let mut repaired_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    repaired_response.tool_calls.push(tool_call(
+        "call_2",
+        "builtin_read",
+        serde_json::json!({
+            "path": "README.md",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "recovered");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
 
-    let result = agent_loop_with_response(response, allow_read_policy()).run(&input);
+    let result = agent_loop_with_responses_and_requests(
+        vec![response, repaired_response, final_response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .run(&input);
 
-    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.model_turns, 3);
+    assert_eq!(result.final_answer.as_deref(), Some("recovered"));
+    assert_eq!(result.tool_results.len(), 2);
     assert_eq!(
-        result.error.as_deref(),
-        Some("model response validation failed: unknown_tool")
-    );
-    assert_eq!(result.error_category, Some(ModelErrorCategory::JsonSchema));
-    let diagnostic = result
-        .provider_diagnostic
-        .as_ref()
-        .expect("typed response validation diagnostic");
-    assert_eq!(
-        diagnostic.code.as_deref(),
-        Some("provider_response_invalid")
+        result.tool_results[0].failure_kind,
+        Some(ToolFailureKind::Visibility)
     );
     assert_eq!(
-        diagnostic.stage,
-        Some(singularity_model::ProviderErrorStage::ResponseValidation)
+        result.tool_results[0].error_code.as_deref(),
+        Some("tool_not_visible")
     );
-    assert_eq!(diagnostic.validation_errors, ["unknown_tool"]);
-    assert!(result.tool_results.is_empty());
+    let audit = result.tool_results[0]
+        .audit_metadata()
+        .expect("unknown tool audit");
+    assert_eq!(audit["policy_evaluated"], false);
+    assert_eq!(audit["executor_started"], false);
+    assert!(result.tool_results[1].ok);
+    assert_eq!(result.tool_results[1].tool_name, "builtin_read");
+    assert!(result.verification.unresolved_failures.is_empty());
+    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 1);
+    assert!(result.error.is_none());
+    assert!(result.provider_diagnostic.is_none());
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == ModelRole::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_call_id == "call_1")
+    }));
+    let tool_message = requests[1].messages.last().expect("tool error message");
+    assert_eq!(tool_message.role, ModelRole::Tool);
+    assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_1"));
+    let payload: serde_json::Value =
+        serde_json::from_str(&tool_message.content).expect("tool result payload");
+    assert_eq!(payload["error_code"], "tool_not_visible");
 }
 
 #[test]
@@ -1758,7 +1799,7 @@ fn routed_input_failure_is_repaired_on_the_next_router_call() {
 }
 
 #[test]
-fn agent_loop_rejects_registered_tool_hidden_by_the_current_view() {
+fn routed_provider_cannot_bypass_the_current_tool_view() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "read_1",
@@ -1779,11 +1820,20 @@ fn agent_loop_rejects_registered_tool_hidden_by_the_current_view() {
     .run(&AgentLoopInput::new("thread_1", "turn_1", "read").with_max_turns(1));
 
     assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.tool_results.len(), 1);
     assert_eq!(
-        result.error.as_deref(),
-        Some("model response validation failed: unknown_tool")
+        result.tool_results[0].failure_kind,
+        Some(ToolFailureKind::Visibility)
     );
-    assert!(result.tool_results.is_empty());
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("tool_not_visible")
+    );
+    let audit = result.tool_results[0]
+        .audit_metadata()
+        .expect("hidden tool audit");
+    assert_eq!(audit["policy_evaluated"], false);
+    assert_eq!(audit["executor_started"], false);
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests[0].tools[0].name, BUILTIN_INVOKE_TOOL);
 }
@@ -4980,7 +5030,7 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
                 assert_eq!(
                     result.error.as_deref(),
                     Some(
-                        "model response validation failed: max_tool_calls_exceeded, tool_choice_none, unknown_tool"
+                        "model response validation failed: max_tool_calls_exceeded, tool_choice_none"
                     )
                 );
                 assert_eq!(result.error_category, Some(ModelErrorCategory::JsonSchema));
@@ -4994,11 +5044,7 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
                 );
                 assert_eq!(
                     diagnostic.validation_errors,
-                    [
-                        "max_tool_calls_exceeded",
-                        "tool_choice_none",
-                        "unknown_tool"
-                    ]
+                    ["max_tool_calls_exceeded", "tool_choice_none"]
                 );
                 assert_eq!(result.recovery_metrics.invalid_tool_call_count, 1);
                 assert_eq!(result.model_usage.total_tokens, 77);

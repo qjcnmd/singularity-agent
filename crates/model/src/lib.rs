@@ -3852,17 +3852,18 @@ fn validate_model_response_with_protocol_context(
         if !call.arguments.is_object() {
             errors.push("tool_call_arguments_must_be_object".to_string());
         }
-        if !available_tool_names
+        let unknown_tool = !available_tool_names
             .iter()
             .any(|name| name == &call.tool_name)
-        {
-            errors.push("unknown_tool".to_string());
-        }
+            || call.parse_status == ModelToolParseStatus::UnknownTool;
         match call.parse_status {
             ModelToolParseStatus::InvalidJson => errors.push("invalid_json".to_string()),
             ModelToolParseStatus::SchemaMismatch => errors.push("schema_mismatch".to_string()),
-            ModelToolParseStatus::UnknownTool => errors.push("unknown_tool".to_string()),
+            ModelToolParseStatus::UnknownTool => {}
             ModelToolParseStatus::Valid => {}
+        }
+        if unknown_tool {
+            warnings.push("unknown_tool".to_string());
         }
         warnings.extend(call.validation_errors.iter().cloned());
     }

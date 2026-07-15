@@ -63,6 +63,8 @@ const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
     "command_tests_failed",
     "command_build_failed",
 ];
+const TOOL_SELECTION_FAILURE_GROUP: &str = "tool_selection";
+const TOOL_SELECTION_FAILURE_PREFIX: &str = "tool_selection:";
 pub const BUILTIN_UPDATE_PLAN_TOOL: &str = "builtin_update_plan";
 pub const BUILTIN_INVOKE_TOOL: &str = "builtin_invoke_tool";
 const MAX_PLAN_STEPS: usize = 64;
@@ -696,14 +698,19 @@ impl CompletionTracker {
     }
 
     fn observe(&mut self, tool_result: &ToolResult) {
-        let failure_group = match tool_result.tool_name.as_str() {
-            TOOL_EDIT | TOOL_PATCH => "workspace_mutation",
-            TOOL_COMMAND => "verification",
-            tool_name => tool_name,
+        let failure_group = match tool_result.failure_kind.as_ref() {
+            Some(ToolFailureKind::Visibility) => TOOL_SELECTION_FAILURE_GROUP,
+            _ => match tool_result.tool_name.as_str() {
+                TOOL_EDIT | TOOL_PATCH => "workspace_mutation",
+                TOOL_COMMAND => "verification",
+                tool_name => tool_name,
+            },
         };
         if tool_result.ok {
-            self.unresolved_failures
-                .retain(|failure| !failure.starts_with(failure_group));
+            self.unresolved_failures.retain(|failure| {
+                !failure.starts_with(failure_group)
+                    && !failure.starts_with(TOOL_SELECTION_FAILURE_PREFIX)
+            });
             if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH) {
                 self.workspace_mutated = true;
                 self.verified_after_last_mutation = false;
@@ -3382,10 +3389,13 @@ fn resolve_routed_tool_calls(
     provider_calls
         .iter()
         .map(|call| {
-            if call.tool_name != BUILTIN_INVOKE_TOOL
-                || call.parse_status != ModelToolParseStatus::Valid
-            {
+            if call.parse_status != ModelToolParseStatus::Valid {
                 return call.clone();
+            }
+            if call.tool_name != BUILTIN_INVOKE_TOOL {
+                let mut resolved = call.clone();
+                resolved.parse_status = ModelToolParseStatus::UnknownTool;
+                return resolved;
             }
             let Ok(invocation) = invoke_tool_input(&call.arguments) else {
                 return call.clone();
