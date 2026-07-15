@@ -1302,7 +1302,9 @@ where
         model_turn_offset: u32,
     ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
-        if model_turn_offset >= max_turns {
+        if model_turn_offset > max_turns
+            || (model_turn_offset == max_turns && !state.finalization_ready())
+        {
             let model_turns = model_turn_offset.max(max_turns);
             return state.finish(
                 AgentStatus::Failed,
@@ -1312,11 +1314,24 @@ where
                 Some("max turns exceeded".to_string()),
             );
         }
-        for turn_index in model_turn_offset..max_turns {
+        let mut finalization_attempted = false;
+        let mut actual_model_turns = model_turn_offset;
+        // The inclusive endpoint is a terminal-only slot; without readiness it preserves the
+        // ordinary work-turn limit and its max-turn failure.
+        for turn_index in model_turn_offset..=max_turns {
+            let finalization_only = state.finalization_ready();
+            if !finalization_only && turn_index == max_turns {
+                break;
+            }
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
             }
-            let finalization_only = state.finalization_ready();
+            if finalization_only {
+                if finalization_attempted {
+                    break;
+                }
+                finalization_attempted = true;
+            }
             let tool_view = if finalization_only {
                 ModelToolView::finalization()
             } else {
@@ -1377,8 +1392,15 @@ where
                 Err(error) => provider_error_response(&request, error),
             };
             state.observe_model_response(&response);
+            actual_model_turns = turn_index.saturating_add(1);
             if self.is_cancelled(input) {
-                return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
+                return state.finish(
+                    AgentStatus::Cancelled,
+                    false,
+                    None,
+                    actual_model_turns,
+                    None,
+                );
             }
             if response.status != ModelTurnStatus::Success {
                 let model_error = response.error.as_ref();
@@ -1386,7 +1408,7 @@ where
                     AgentStatus::Failed,
                     false,
                     None,
-                    turn_index + 1,
+                    actual_model_turns,
                     model_error.map(|error| error.message.clone()),
                     model_error,
                 );
@@ -1411,7 +1433,7 @@ where
                     AgentStatus::Failed,
                     false,
                     None,
-                    turn_index + 1,
+                    actual_model_turns,
                     Some(model_error.message.clone()),
                     Some(&model_error),
                 );
@@ -1426,7 +1448,7 @@ where
                     AgentStatus::Failed,
                     false,
                     None,
-                    turn_index + 1,
+                    actual_model_turns,
                     Some(model_error.message.clone()),
                     Some(&model_error),
                 );
@@ -1442,7 +1464,7 @@ where
                         AgentStatus::Failed,
                         false,
                         None,
-                        turn_index + 1,
+                        actual_model_turns,
                         Some(EMPTY_FINAL_ANSWER_ERROR.to_string()),
                     );
                 }
@@ -1451,7 +1473,7 @@ where
                         AgentStatus::Completed,
                         true,
                         Some(final_answer),
-                        turn_index + 1,
+                        actual_model_turns,
                         None,
                     );
                 }
@@ -1496,21 +1518,33 @@ where
                 &response.tool_calls,
                 &observed_tool_calls,
                 &mut state,
-                turn_index + 1,
+                actual_model_turns,
             ) {
                 ToolBatchControl::Continue => {}
                 ToolBatchControl::Blocked => {
-                    return state.finish(AgentStatus::Blocked, false, None, turn_index + 1, None);
+                    return state.finish(
+                        AgentStatus::Blocked,
+                        false,
+                        None,
+                        actual_model_turns,
+                        None,
+                    );
                 }
                 ToolBatchControl::Cancelled => {
-                    return state.finish(AgentStatus::Cancelled, false, None, turn_index + 1, None);
+                    return state.finish(
+                        AgentStatus::Cancelled,
+                        false,
+                        None,
+                        actual_model_turns,
+                        None,
+                    );
                 }
                 ToolBatchControl::Failed(error) => {
                     return state.finish(
                         AgentStatus::Failed,
                         false,
                         None,
-                        turn_index + 1,
+                        actual_model_turns,
                         Some(error),
                     );
                 }
@@ -1520,7 +1554,13 @@ where
             .last_completion_error
             .take()
             .unwrap_or_else(|| "max turns exceeded".to_string());
-        state.finish(AgentStatus::Failed, false, None, max_turns, Some(error))
+        state.finish(
+            AgentStatus::Failed,
+            false,
+            None,
+            actual_model_turns,
+            Some(error),
+        )
     }
 
     pub fn resume_pending_tool_call(

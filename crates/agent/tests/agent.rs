@@ -2406,7 +2406,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let first_argv = test_command("success");
     let second_argv = test_command("second-success");
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit and verify twice")
-        .with_max_turns(4)
+        .with_max_turns(3)
         .with_verification_requirements([
             AgentVerificationRequirement::new(
                 command_scope_digest(
@@ -2528,6 +2528,8 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
 
     assert_eq!(resumed.status, AgentStatus::Completed);
+    assert_eq!(resumed.model_turns, 4);
+    assert_eq!(resumed.model_turn_limit, 3);
     assert!(resumed.verification.passed);
     assert_eq!(resumed.verification.required_command_count, 2);
     assert_eq!(resumed.verification.satisfied_command_count, 2);
@@ -4729,7 +4731,7 @@ fn verified_completed_plan_enters_tool_free_finalization() {
     )
     .run(
         &AgentLoopInput::new("thread_1", "turn_1", "finish and verify")
-            .with_max_turns(4)
+            .with_max_turns(3)
             .with_verification_requirements([AgentVerificationRequirement::new(
                 verification_digest,
                 1,
@@ -4738,6 +4740,8 @@ fn verified_completed_plan_enters_tool_free_finalization() {
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(result.model_turns, 4);
+    assert_eq!(result.model_turn_limit, 3);
     assert!(result.verification.passed);
     assert!(result.plan.as_ref().is_some_and(AgentPlan::is_completed));
     assert_eq!(
@@ -4960,7 +4964,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     .with_workspace_tools(
         WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
     );
-    let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(4);
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(3);
     let blocked = agent_loop.run(&input);
 
     assert_eq!(blocked.status, AgentStatus::Blocked);
@@ -4987,6 +4991,8 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
 
     assert_eq!(resumed.status, AgentStatus::Completed);
+    assert_eq!(resumed.model_turns, 4);
+    assert_eq!(resumed.model_turn_limit, 3);
     assert_eq!(resumed.plan_update_count, 1);
     assert_eq!(resumed.recovery_metrics, AgentRecoveryMetrics::default());
     assert_eq!(resumed.model_usage.input_tokens, 100);
