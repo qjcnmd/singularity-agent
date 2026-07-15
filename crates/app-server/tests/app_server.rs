@@ -635,13 +635,15 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     );
     let result_path = result["result_path"].as_str().expect("result path");
     let report_path = result["report_path"].as_str().expect("report path");
+    let evidence_path = result["evidence_path"].as_str().expect("evidence path");
     assert!(std::path::Path::new(result_path).exists());
     assert!(std::path::Path::new(report_path).exists());
+    assert!(std::path::Path::new(evidence_path).exists());
     let (expected_baseline_status, _) = expected_pre_agent_blocked_stage_statuses();
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
-    assert_eq!(payload["schema_version"], "evaluation.result/v4");
+    assert_eq!(payload["schema_version"], "evaluation.result/v5");
     assert_eq!(payload["status"], "blocked");
     assert_eq!(
         payload["tasks"][0]["blocker"]["kind"],
@@ -652,6 +654,19 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
         expected_baseline_status
     );
     assert_eq!(payload["tasks"][0]["stages"]["public"]["status"], "skipped");
+    assert_eq!(payload["summary"]["scored_task_count"], 1);
+    let evidence_json = std::fs::read_to_string(evidence_path).expect("evidence json");
+    assert!(!evidence_json.contains(&dir.path().to_string_lossy().to_string()));
+    assert!(!evidence_json.contains("missing-source"));
+    let evidence: serde_json::Value =
+        serde_json::from_str(&evidence_json).expect("evidence payload");
+    assert_eq!(evidence["schema_version"], "evaluation.evidence/v1");
+    assert_eq!(evidence["denominator_task_count"], 1);
+    assert_eq!(evidence["tasks"][0]["allowlist"], "unknown");
+    assert_eq!(
+        evidence["tasks"][0]["local_process_fallback_unknown_count"],
+        0
+    );
 }
 
 #[test]

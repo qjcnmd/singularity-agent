@@ -7,7 +7,7 @@ use singularity_evaluation::{BlockerKind, CommandSpec, EvaluationBlocker};
 use singularity_policy::NetworkAccess;
 use singularity_tools::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
-    CommandSemanticStatus, SandboxFilesystemMode, SandboxNetworkMode,
+    CommandSemanticStatus, SandboxFilesystemMode, SandboxNetworkMode, command_scope_digest,
 };
 
 use super::workspace::canonical_or_original;
@@ -29,6 +29,8 @@ pub(super) struct CommandDiagnostic {
     sandbox_backend: String,
     sandbox_enforcement: singularity_tools::SandboxBackendEnforcement,
     pub(super) local_process_fallback: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) scope_digest: Option<String>,
 }
 
 impl CommandDiagnostic {
@@ -46,13 +48,42 @@ impl CommandDiagnostic {
             sandbox_backend: result.sandbox.backend.clone(),
             sandbox_enforcement: result.sandbox.enforcement.clone(),
             local_process_fallback: result.sandbox.local_process_fallback,
+            scope_digest: None,
         }
+    }
+
+    pub(super) fn for_spec(
+        phase: impl Into<String>,
+        workspace: &Path,
+        command: &CommandSpec,
+        default_timeout_seconds: u64,
+        result: &CommandResult,
+    ) -> Self {
+        let mut diagnostic = Self::new(phase, result);
+        diagnostic.scope_digest =
+            command_scope_digest_for_spec(workspace, command, default_timeout_seconds).ok();
+        diagnostic
     }
 
     pub(super) fn is_strictly_sandboxed(&self) -> bool {
         !self.local_process_fallback
             && self.sandbox_enforcement == singularity_tools::SandboxBackendEnforcement::Strict
     }
+}
+
+pub(super) fn command_scope_digest_for_spec(
+    workspace: &Path,
+    command: &CommandSpec,
+    default_timeout_seconds: u64,
+) -> Result<String, String> {
+    let cwd = resolve_command_cwd(workspace, command.cwd.as_ref().map(|cwd| cwd.as_str()))?;
+    Ok(command_scope_digest(
+        command.argv.as_slice(),
+        &cwd.to_string_lossy(),
+        command.timeout_seconds.unwrap_or(default_timeout_seconds),
+        &SandboxFilesystemMode::WorkspaceWrite,
+        &sandbox_network_mode(command.network_access),
+    ))
 }
 
 pub(super) fn run_command_spec(

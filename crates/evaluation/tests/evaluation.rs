@@ -4,8 +4,8 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use singularity_evaluation::{
-    CommandExpectation, EvaluationError, EvaluationManifest, EvaluationResult, EvaluationStage,
-    EvaluationStatus, PlannedWorkspaceSource, StageStatus, TaskId, WorkspaceSeed,
+    CommandExpectation, EvaluationError, EvaluationEvidence, EvaluationManifest, EvaluationResult,
+    EvaluationStage, EvaluationStatus, PlannedWorkspaceSource, StageStatus, TaskId, WorkspaceSeed,
 };
 
 const IMMUTABLE_COMMIT: &str = "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030";
@@ -99,7 +99,7 @@ fn valid_manifest() -> Value {
 
 fn valid_result() -> Value {
     json!({
-        "schema_version": "evaluation.result/v4",
+        "schema_version": "evaluation.result/v5",
         "run_id": "public-representative-20260710",
         "status": "completed",
         "evaluation_passed": false,
@@ -153,8 +153,58 @@ fn valid_result() -> Value {
                     "agent_duration_ms": 700,
                     "smoke_command_satisfied": true,
                     "strict_sandbox_command_count": 3,
-                    "local_process_fallback_count": 0
+                    "local_process_fallback_count": 0,
+                    "local_process_fallback_unknown_count": 0
                 }
+            }
+        ]
+    })
+}
+
+fn valid_evidence() -> Value {
+    let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    json!({
+        "schema_version": "evaluation.evidence/v1",
+        "run_id": "public-representative-20260710",
+        "manifest_digest": digest,
+        "task_selection_digest": "sha256:bb1808f38961b3a490cc4dea9275c1b6068760461d4530de79ba8f64e417dfce",
+        "denominator_task_count": 1,
+        "tasks": [
+            {
+                "task_id": "sqlfluff__sqlfluff-2419",
+                "source_tree_digest": digest,
+                "source_commit": IMMUTABLE_COMMIT,
+                "allowed_paths_digest": digest,
+                "changed_paths_digest": digest,
+                "allowlist": "passed",
+                "smoke": {
+                    "expectation_known": true,
+                    "expected_scope_digests": [digest],
+                    "observed_scope_digests": [digest],
+                    "required_scopes_satisfied": "passed"
+                },
+                "baseline": {
+                    "expectation_known": true,
+                    "expected_scope_digests": [digest],
+                    "observed_scope_digests": [digest],
+                    "required_scopes_satisfied": "passed"
+                },
+                "public": {
+                    "expectation_known": true,
+                    "expected_scope_digests": [digest],
+                    "observed_scope_digests": [digest],
+                    "required_scopes_satisfied": "passed"
+                },
+                "hidden": {
+                    "expectation_known": true,
+                    "expected_scope_digests": [digest],
+                    "observed_scope_digests": [digest],
+                    "required_scopes_satisfied": "passed"
+                },
+                "trace_digest": digest,
+                "patch_digest": digest,
+                "local_process_fallback_count": 0,
+                "local_process_fallback_unknown_count": 0
             }
         ]
     })
@@ -171,6 +221,76 @@ fn parse_result(value: &Value) -> Result<EvaluationResult, EvaluationError> {
     EvaluationResult::from_json_str(
         &serde_json::to_string(value).expect("serialize result fixture"),
     )
+}
+
+#[test]
+fn evaluation_evidence_contract_binds_a_fixed_safe_task_set() {
+    let evidence = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&valid_evidence()).expect("serialize evidence fixture"),
+    )
+    .expect("valid evidence");
+
+    assert_eq!(evidence.denominator_task_count, 1);
+    assert_eq!(evidence.tasks.len(), 1);
+
+    let mut forged_denominator = valid_evidence();
+    forged_denominator["denominator_task_count"] = json!(0);
+    let error = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&forged_denominator).expect("serialize forged evidence"),
+    )
+    .expect_err("denominator must stay bound to the selected tasks");
+    assert!(error.to_string().contains("denominator_task_count"));
+
+    let mut forged_selection = valid_evidence();
+    forged_selection["task_selection_digest"] =
+        json!("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let error = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&forged_selection).expect("serialize forged selection"),
+    )
+    .expect_err("task selection digest must bind the selected task identities");
+    assert!(error.to_string().contains("task_selection_digest"));
+
+    let mut inconsistent_scope = valid_evidence();
+    inconsistent_scope["tasks"][0]["smoke"]["expectation_known"] = json!(false);
+    let error = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&inconsistent_scope).expect("serialize inconsistent scope"),
+    )
+    .expect_err("scope verdict must match known expected and observed digests");
+    assert!(error.to_string().contains("required_scopes_satisfied"));
+
+    let mut unsafe_extension = valid_evidence();
+    unsafe_extension["tasks"][0]["raw_arguments"] = json!("secret");
+    let error = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&unsafe_extension).expect("serialize unsafe evidence"),
+    )
+    .expect_err("unknown raw fields must fail closed");
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[test]
+fn evaluation_evidence_is_bound_to_the_stable_result() {
+    let result = parse_result(&valid_result()).expect("valid result");
+    let evidence = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&valid_evidence()).expect("serialize evidence fixture"),
+    )
+    .expect("valid evidence");
+
+    evidence
+        .validate_against_result(&result)
+        .expect("matching result and evidence");
+
+    let mut mismatched = valid_evidence();
+    mismatched["tasks"][0]["task_id"] = json!("different_task");
+    mismatched["task_selection_digest"] =
+        json!("sha256:9c8c5be48cd2a67107bb720d569dd9c7b541ddb0d24892666c8eb7531e1ef263");
+    let mismatched = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&mismatched).expect("serialize mismatched evidence"),
+    )
+    .expect("structurally valid evidence");
+    let error = mismatched
+        .validate_against_result(&result)
+        .expect_err("task identities must match");
+    assert!(error.to_string().contains("task"));
 }
 
 #[test]
@@ -603,7 +723,7 @@ fn blocked_status_requires_a_typed_blocker() {
         "message": "restricted-token sandbox is unavailable"
     });
     blocked["tasks"][0]["agent_completed"] = json!(false);
-    blocked["summary"]["scored_task_count"] = json!(0);
+    blocked["summary"]["scored_task_count"] = json!(1);
     blocked["summary"]["agent_completed_count"] = json!(0);
     blocked["summary"]["blocked_count"] = json!(1);
 
@@ -731,6 +851,24 @@ fn run_summary_reports_success_rate_without_weakening_evaluation_passed() {
     forged["summary"]["meets_core_task_success_threshold"] = json!(true);
     let error = parse_result(&forged).expect_err("summary must be derived from task results");
     assert!(error.to_string().contains("summary"));
+}
+
+#[test]
+fn evaluation_pass_requires_complete_local_process_fallback_observation() {
+    let mut unknown = valid_result();
+    unknown["tasks"][0]["stages"]["public"]["status"] = json!("passed");
+    unknown["tasks"][0]["tests_passed"] = json!(true);
+    unknown["tasks"][0]["evaluation_passed"] = json!(true);
+    unknown["tasks"][0]["evidence"]["local_process_fallback_unknown_count"] = json!(1);
+    unknown["summary"]["tests_passed_count"] = json!(1);
+    unknown["summary"]["evaluation_passed_count"] = json!(1);
+    unknown["summary"]["task_success_rate_basis_points"] = json!(10_000);
+    unknown["summary"]["meets_core_task_success_threshold"] = json!(true);
+    unknown["evaluation_passed"] = json!(true);
+
+    let error = parse_result(&unknown)
+        .expect_err("unknown fallback observation must not satisfy evaluation");
+    assert!(error.to_string().contains("fallback"));
 }
 
 #[test]

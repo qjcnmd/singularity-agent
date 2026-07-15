@@ -39,11 +39,15 @@ use singularity_tools::{
 use super::{TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ};
 
 mod command;
+mod evidence;
 mod workspace;
 
 use command::{
     CommandDiagnostic, command_blocker, command_succeeded, infrastructure_blocker,
     run_command_spec, run_raw_command, sandbox_network_mode,
+};
+use evidence::{
+    agent_command_observation, build_evaluation_evidence, content_digest, safe_command_scope_digest,
 };
 use workspace::{
     WorkspaceChangeEvidence, apply_agent_changes, changed_paths, copy_tree_checked,
@@ -66,6 +70,7 @@ const HIDDEN_DIR: &str = "hidden";
 const EVALUATOR_PATCH_FILE: &str = ".singularity-evaluator.patch";
 const RESULT_FILE: &str = "result.json";
 const REPORT_FILE: &str = "report.json";
+const EVIDENCE_FILE: &str = "evidence.json";
 const AGENT_TRACE_FILE: &str = "agent-trace.json";
 const PATCH_EVIDENCE_FILE: &str = "patch-evidence.json";
 const ARTIFACT_TEMP_FILE_ATTEMPTS: usize = 64;
@@ -121,6 +126,8 @@ struct TaskDiagnostics {
     provider_latency_ms: u64,
     agent_duration_ms: u64,
     local_process_fallback_count: usize,
+    local_process_fallback_unknown_count: usize,
+    observed_smoke_scope_digests: Vec<String>,
     trace_path: Option<String>,
     error: Option<String>,
     provider_diagnostic: Option<ProviderDiagnostic>,
@@ -212,6 +219,8 @@ struct AgentStageExecution {
     provider_attempts: ProviderAttemptMetadata,
     agent_duration_ms: u64,
     audit_events: Vec<Value>,
+    observed_smoke_scope_digests: Vec<String>,
+    local_process_fallback_unknown_count: usize,
     trace_path: Option<String>,
     error: Option<String>,
     provider_diagnostic: Option<ProviderDiagnostic>,
@@ -219,7 +228,7 @@ struct AgentStageExecution {
 
 struct TaskExecution {
     result: EvaluationTaskResult,
-    report: Value,
+    diagnostics: TaskDiagnostics,
 }
 
 pub(crate) fn run_evaluation(
@@ -227,7 +236,21 @@ pub(crate) fn run_evaluation(
     sandbox_backend: SharedSandboxBackend,
     provider_snapshot: &ProviderConfigSnapshot,
 ) -> Result<EvalRunResult, String> {
-    let manifest = EvaluationManifest::load(&params.manifest)
+    let manifest_path = Path::new(&params.manifest);
+    let manifest_json = fs::read_to_string(manifest_path).map_err(|error| {
+        format!(
+            "invalid eval manifest: failed to read {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest_digest = content_digest(manifest_json.as_bytes());
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        format!(
+            "invalid eval manifest: manifest path has no parent: {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest = EvaluationManifest::from_json_str(&manifest_json, manifest_dir)
         .map_err(|error| format!("invalid eval manifest: {error}"))?;
     let run_id = RunId::new(params.run_id.clone())
         .map_err(|error| format!("invalid eval run id: {error}"))?;
@@ -287,7 +310,7 @@ pub(crate) fn run_evaluation(
         EvaluationStatus::Failed
     };
     let result = EvaluationResult {
-        schema_version: EvaluationResultSchemaVersion::V4,
+        schema_version: EvaluationResultSchemaVersion::V5,
         run_id: run_id.clone(),
         status,
         blocker,
@@ -295,16 +318,37 @@ pub(crate) fn run_evaluation(
         summary: EvaluationRunSummary::from_tasks(&tasks),
         tasks,
     };
-    result
-        .validate()
-        .map_err(|error| format!("invalid evaluation result: {error}"))?;
+    if let Err(error) = result.validate() {
+        return Err(cleanup_incomplete_run(
+            &run_dir,
+            format!("invalid evaluation result: {error}"),
+        ));
+    }
 
     let result_path = run_dir.join(RESULT_FILE);
     let report_path = run_dir.join(REPORT_FILE);
-    let task_reports = task_executions
-        .into_iter()
-        .map(|execution| execution.report)
-        .collect::<Vec<_>>();
+    let evidence_path = run_dir.join(EVIDENCE_FILE);
+    let evidence = match build_evaluation_evidence(
+        &run_id,
+        manifest_digest,
+        &plans,
+        &task_executions,
+        &run_dir,
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => return Err(cleanup_incomplete_run(&run_dir, error)),
+    };
+    if let Err(error) = evidence.validate_against_result(&result) {
+        return Err(cleanup_incomplete_run(
+            &run_dir,
+            format!("evaluation evidence/result mismatch: {error}"),
+        ));
+    }
+    let status_string = match enum_string(result.status) {
+        Ok(status) => status,
+        Err(error) => return Err(cleanup_incomplete_run(&run_dir, error)),
+    };
+    let task_reports = task_executions.iter().map(task_report).collect::<Vec<_>>();
     let report = json!({
         "manifest": params.manifest,
         "runner": RUNNER_NAME,
@@ -312,29 +356,55 @@ pub(crate) fn run_evaluation(
         "tasks": task_reports,
         "result_path": result_path.to_string_lossy(),
         "report_path": report_path.to_string_lossy(),
+        "evidence_path": evidence_path.to_string_lossy(),
     });
-    if let Err(error) = publish_evaluation_artifacts(&result_path, &result, &report_path, &report) {
-        return match fs::remove_dir_all(&run_dir) {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(format!(
-                "{error}; failed to clean incomplete evaluation run {}: {cleanup_error}",
-                run_dir.display()
-            )),
-        };
+    if let Err(error) = publish_evaluation_artifacts(
+        &result_path,
+        &result,
+        &report_path,
+        &report,
+        &evidence_path,
+        &evidence,
+    ) {
+        return Err(cleanup_incomplete_run(&run_dir, error));
     }
 
     Ok(EvalRunResult {
         run_id: run_id.as_str().to_string(),
         manifest: params.manifest.clone(),
         runner: RUNNER_NAME.to_string(),
-        status: enum_string(result.status)?,
+        status: status_string,
         blocker: result.blocker.as_ref().map(blocker_code),
         tasks: report["tasks"].as_array().cloned().unwrap_or_default(),
         result_path: Some(result_path.to_string_lossy().into_owned()),
         report_path: Some(report_path.to_string_lossy().into_owned()),
+        evidence_path: Some(evidence_path.to_string_lossy().into_owned()),
         evaluation_passed: result.evaluation_passed,
     })
 }
+
+fn cleanup_incomplete_run(run_dir: &Path, error: String) -> String {
+    match fs::remove_dir_all(run_dir) {
+        Ok(()) => error,
+        Err(cleanup_error) => format!(
+            "{error}; failed to clean incomplete evaluation run {}: {cleanup_error}",
+            run_dir.display()
+        ),
+    }
+}
+
+fn task_report(execution: &TaskExecution) -> Value {
+    let mut report =
+        serde_json::to_value(&execution.result).expect("evaluation task result serializes");
+    if let Some(object) = report.as_object_mut() {
+        object.insert(
+            "diagnostics".to_string(),
+            serde_json::to_value(&execution.diagnostics).expect("evaluation diagnostics serialize"),
+        );
+    }
+    report
+}
+
 fn run_task(
     run_id: &RunId,
     run_dir: &Path,
@@ -479,6 +549,9 @@ fn run_task(
     diagnostics.provider_retry_count = agent_execution.provider_attempts.retry_count;
     diagnostics.provider_latency_ms = agent_execution.provider_attempts.latency_ms;
     diagnostics.agent_duration_ms = agent_execution.agent_duration_ms;
+    diagnostics.observed_smoke_scope_digests = agent_execution.observed_smoke_scope_digests.clone();
+    diagnostics.local_process_fallback_unknown_count =
+        agent_execution.local_process_fallback_unknown_count;
     diagnostics.trace_path = agent_execution.trace_path.clone();
     diagnostics.error = agent_execution.error.clone();
     diagnostics.provider_diagnostic = agent_execution.provider_diagnostic.clone();
@@ -637,7 +710,8 @@ fn finish_task(
     let evaluation_passed = stages.baseline.status == StageStatus::Passed
         && agent_completed
         && tests_passed
-        && diagnostics.local_process_fallback_count == 0;
+        && diagnostics.local_process_fallback_count == 0
+        && diagnostics.local_process_fallback_unknown_count == 0;
     let strict_sandbox_command_count = diagnostics
         .source_commands
         .iter()
@@ -693,16 +767,16 @@ fn finish_task(
                 .unwrap_or(u32::MAX),
             local_process_fallback_count: u32::try_from(diagnostics.local_process_fallback_count)
                 .unwrap_or(u32::MAX),
+            local_process_fallback_unknown_count: u32::try_from(
+                diagnostics.local_process_fallback_unknown_count,
+            )
+            .unwrap_or(u32::MAX),
         },
     };
-    let mut report = serde_json::to_value(&result).expect("evaluation task result serializes");
-    if let Some(object) = report.as_object_mut() {
-        object.insert(
-            "diagnostics".to_string(),
-            serde_json::to_value(diagnostics).expect("evaluation diagnostics serialize"),
-        );
+    TaskExecution {
+        result,
+        diagnostics,
     }
-    TaskExecution { result, report }
 }
 
 fn prepare_source(
@@ -911,8 +985,11 @@ fn run_verification_after_setup(
                 );
             }
         };
-        diagnostics.push(CommandDiagnostic::new(
+        diagnostics.push(CommandDiagnostic::for_spec(
             format!("verification.command.{index}"),
+            stage_dir,
+            command,
+            DEFAULT_COMMAND_TIMEOUT_SECONDS,
             &result,
         ));
         if let Some(blocker) = infrastructure_blocker(&result, "verification command failed") {
@@ -954,8 +1031,11 @@ fn run_setup_commands(
             Arc::clone(&sandbox_backend),
         )
         .map_err(|error| evaluation_blocker(BlockerKind::WorkspacePreparation, error))?;
-        diagnostics.push(CommandDiagnostic::new(
+        diagnostics.push(CommandDiagnostic::for_spec(
             format!("setup.command.{index}"),
+            workspace,
+            command,
+            DEFAULT_SETUP_TIMEOUT_SECONDS,
             &result,
         ));
         if !command_succeeded(&result) {
@@ -1197,6 +1277,8 @@ fn run_agent_stage(
         .run(&input);
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let run_status = result.to_run_status();
+    let (observed_smoke_scope_digests, local_process_fallback_unknown_count) =
+        agent_command_observation(&result);
     let trace_path = task_dir.join(AGENT_TRACE_FILE);
     let trace = json!({
         "status": run_status.status,
@@ -1232,6 +1314,7 @@ fn run_agent_stage(
             "ok": tool_result.ok,
             "error_code": tool_result.error_code.as_deref().map(safe_text),
             "truncated": tool_result.truncated,
+            "result_id": safe_command_scope_digest(tool_result),
         })).collect::<Vec<_>>(),
         "approval_count": run_status.approval_count,
         "verification": run_status.verification,
@@ -1270,6 +1353,8 @@ fn run_agent_stage(
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
+                observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
+                local_process_fallback_unknown_count,
                 trace_path: None,
                 error: Some(safe_text(error)),
                 provider_diagnostic: run_status.provider_diagnostic,
@@ -1305,6 +1390,8 @@ fn run_agent_stage(
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
+                observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
+                local_process_fallback_unknown_count,
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
                 provider_diagnostic: run_status.provider_diagnostic,
@@ -1346,6 +1433,8 @@ fn run_agent_stage(
                 provider_attempts: result.provider_attempts.clone(),
                 agent_duration_ms,
                 audit_events: run_status.audit_events,
+                observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
+                local_process_fallback_unknown_count,
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
                 provider_diagnostic: run_status.provider_diagnostic,
@@ -1435,6 +1524,8 @@ fn run_agent_stage(
         provider_attempts: result.provider_attempts.clone(),
         agent_duration_ms,
         audit_events: run_status.audit_events,
+        observed_smoke_scope_digests,
+        local_process_fallback_unknown_count,
         trace_path: trace_path_string,
         error,
         provider_diagnostic: run_status.provider_diagnostic,
@@ -1467,6 +1558,8 @@ fn blocked_agent_stage(
         provider_attempts: ProviderAttemptMetadata::default(),
         agent_duration_ms: 0,
         audit_events: Vec::new(),
+        observed_smoke_scope_digests: Vec::new(),
+        local_process_fallback_unknown_count: 0,
         trace_path: None,
         error: Some(blocker.message),
         provider_diagnostic: None,
@@ -1842,10 +1935,17 @@ fn preflight_evaluation_path_budget_with_limit(
     for (context, path) in [
         ("evaluation result artifact", run_dir.join(RESULT_FILE)),
         ("evaluation report artifact", run_dir.join(REPORT_FILE)),
+        ("evaluation evidence artifact", run_dir.join(EVIDENCE_FILE)),
         (
             "evaluation report temporary artifact",
             run_dir.join(format!(
                 ".{REPORT_FILE}.4294967295.18446744073709551615.tmp"
+            )),
+        ),
+        (
+            "evaluation evidence temporary artifact",
+            run_dir.join(format!(
+                ".{EVIDENCE_FILE}.4294967295.18446744073709551615.tmp"
             )),
         ),
     ] {
@@ -1930,29 +2030,49 @@ fn publish_evaluation_artifacts(
     result: &impl Serialize,
     report_path: &Path,
     report: &impl Serialize,
+    evidence_path: &Path,
+    evidence: &impl Serialize,
 ) -> Result<(), String> {
     let report_temp = write_json_temp(report_path, report)?;
-    let result_temp = match write_json_temp(result_path, result) {
+    let evidence_temp = match write_json_temp(evidence_path, evidence) {
         Ok(temp) => temp,
         Err(error) => {
             let _ = fs::remove_file(&report_temp);
             return Err(error);
         }
     };
-    if let Err(error) = publish_json_temp(&report_temp, report_path) {
+    let result_temp = match write_json_temp(result_path, result) {
+        Ok(temp) => temp,
+        Err(error) => {
+            let _ = fs::remove_file(&report_temp);
+            let _ = fs::remove_file(&evidence_temp);
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_json_temp(&evidence_temp, evidence_path) {
+        let _ = fs::remove_file(&report_temp);
         let _ = fs::remove_file(&result_temp);
         return Err(error);
     }
+    if let Err(error) = publish_json_temp(&report_temp, report_path) {
+        let _ = fs::remove_file(&result_temp);
+        return Err(cleanup_published_artifact(evidence_path, error));
+    }
     if let Err(error) = publish_json_temp(&result_temp, result_path) {
-        return match fs::remove_file(report_path) {
-            Ok(()) => Err(error),
-            Err(cleanup_error) => Err(format!(
-                "{error}; failed to remove incomplete report {}: {cleanup_error}",
-                report_path.display()
-            )),
-        };
+        let error = cleanup_published_artifact(report_path, error);
+        return Err(cleanup_published_artifact(evidence_path, error));
     }
     Ok(())
+}
+
+fn cleanup_published_artifact(path: &Path, error: String) -> String {
+    match fs::remove_file(path) {
+        Ok(()) => error,
+        Err(cleanup_error) => format!(
+            "{error}; failed to remove incomplete artifact {}: {cleanup_error}",
+            path.display()
+        ),
+    }
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -2665,10 +2785,11 @@ mod tests {
     }
 
     #[test]
-    fn result_commit_marker_is_not_published_without_a_complete_report_pair() {
+    fn result_commit_marker_requires_complete_report_and_evidence_artifacts() {
         let temp = tempfile::tempdir().expect("temp");
         let result_path = temp.path().join("result.json");
         let report_path = temp.path().join("report.json");
+        let evidence_path = temp.path().join("evidence.json");
         fs::create_dir(&result_path).expect("blocking result directory");
 
         let error = publish_evaluation_artifacts(
@@ -2676,11 +2797,14 @@ mod tests {
             &json!({"status": "completed"}),
             &report_path,
             &json!({"runner": RUNNER_NAME}),
+            &evidence_path,
+            &json!({"schema_version": "evaluation.evidence/v1"}),
         )
         .expect_err("publish must fail");
 
         assert!(error.contains("failed to publish artifact"));
         assert!(!report_path.exists());
+        assert!(!evidence_path.exists());
         assert!(result_path.is_dir());
         assert_eq!(
             fs::read_dir(temp.path())
@@ -2724,10 +2848,7 @@ mod tests {
             diagnostics,
         );
 
-        assert_eq!(
-            execution.report["diagnostics"]["local_process_fallback_count"],
-            1
-        );
+        assert_eq!(execution.diagnostics.local_process_fallback_count, 1);
         assert_eq!(execution.result.status, EvaluationStatus::Failed);
         assert!(!execution.result.evaluation_passed);
     }

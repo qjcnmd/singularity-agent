@@ -9,8 +9,8 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvaluationResultSchemaVersion {
-    #[serde(rename = "evaluation.result/v4")]
-    V4,
+    #[serde(rename = "evaluation.result/v5")]
+    V5,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +43,7 @@ pub struct EvaluationEvidenceSummary {
     pub smoke_command_satisfied: bool,
     pub strict_sandbox_command_count: u32,
     pub local_process_fallback_count: u32,
+    pub local_process_fallback_unknown_count: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +66,7 @@ impl EvaluationRunSummary {
         let tests_passed_count = count_tasks(tasks, |task| task.tests_passed);
         let evaluation_passed_count = count_tasks(tasks, |task| task.evaluation_passed);
         let blocked_count = count_tasks(tasks, |task| task.status == EvaluationStatus::Blocked);
-        let scored_task_count = task_count.saturating_sub(blocked_count);
+        let scored_task_count = task_count;
         let task_success_rate_basis_points = if scored_task_count == 0 {
             0
         } else {
@@ -247,10 +248,11 @@ impl EvaluationTaskResult {
             && (!self.evidence.smoke_command_satisfied
                 || self.evidence.strict_sandbox_command_count == 0
                 || self.evidence.local_process_fallback_count != 0
+                || self.evidence.local_process_fallback_unknown_count != 0
                 || self.evidence.patch_digest.is_none())
         {
             return Err(validation_error(format!(
-                "{context} evaluation_passed requires patch, smoke, and strict sandbox evidence"
+                "{context} evaluation_passed requires patch, smoke, strict sandbox, and complete zero-fallback evidence"
             )));
         }
         if self.evidence.provider_retry_count > self.evidence.provider_attempt_count {

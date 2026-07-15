@@ -435,6 +435,8 @@ pub struct EvalRunResult {
     pub result_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_path: Option<String>,
     pub evaluation_passed: bool,
 }
 

@@ -631,11 +631,13 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
                             "evaluation_passed": true,
                             "diagnostics": {
                                 "smoke_command_satisfied": true,
-                                "local_process_fallback_count": 0
+                                "local_process_fallback_count": 0,
+                                "local_process_fallback_unknown_count": 0
                             }
                         }],
                         "result_path": path_str(&eval_output.join("eval_agent/result.json")),
-                        "report_path": path_str(&eval_output.join("eval_agent/report.json"))
+                        "report_path": path_str(&eval_output.join("eval_agent/report.json")),
+                        "evidence_path": path_str(&eval_output.join("eval_agent/evidence.json"))
                     })),
                 ],
             )
@@ -665,8 +667,13 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
         value["tasks"][0]["diagnostics"]["local_process_fallback_count"],
         0
     );
+    assert_eq!(
+        value["tasks"][0]["diagnostics"]["local_process_fallback_unknown_count"],
+        0
+    );
     assert!(value["result_path"].as_str().is_some());
     assert!(value["report_path"].as_str().is_some());
+    assert!(value["evidence_path"].as_str().is_some());
     let params: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(agent_loop_trace).expect("agent loop trace"))
             .expect("agent loop turn params");

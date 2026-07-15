@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod evidence;
 mod manifest;
 mod result;
 mod value;
 
 use std::path::PathBuf;
 
+pub use evidence::{
+    EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationScopeEvidence,
+    EvaluationTaskEvidence, EvidenceVerdict, task_selection_digest,
+};
 pub use manifest::{
     AgentStagePlan, AgentTaskProjection, AgentTaskSpec, BaselineStagePlan, CommandExpectation,
     CommandSpec, EvaluationCapability, EvaluationManifest, EvaluationStage, EvaluationTask,
@@ -21,7 +26,8 @@ pub use result::{
 pub use value::{Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId, ToolName};
 
 pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v4";
-pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v4";
+pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v5";
+pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v1";
 pub const CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
 
 #[derive(Debug, thiserror::Error)]
