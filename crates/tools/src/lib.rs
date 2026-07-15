@@ -56,11 +56,17 @@ const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "reveal hidden",
     "system prompt",
 ];
+/// 核心 read tool 名称。
 pub const READ_TOOL: &str = "read";
+/// 核心 list tool 名称。
 pub const LIST_TOOL: &str = "list";
+/// 核心 grep tool 名称。
 pub const GREP_TOOL: &str = "grep";
+/// 核心 edit tool 名称。
 pub const EDIT_TOOL: &str = "edit";
+/// 核心 patch tool 名称。
 pub const PATCH_TOOL: &str = "patch";
+/// 核心 command tool 名称。
 pub const COMMAND_TOOL: &str = "command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -80,11 +86,13 @@ pub struct ToolInputValidationError {
 }
 
 impl ToolInputValidationError {
+    /// 创建带稳定校验代码的输入错误。
     pub fn new(code: impl Into<String>) -> Self {
         Self { code: code.into() }
     }
 }
 
+/// tool 输入的本地校验函数签名。
 pub type ToolInputValidator = fn(&Value) -> Result<(), ToolInputValidationError>;
 
 #[derive(Clone)]
@@ -119,6 +127,7 @@ impl fmt::Debug for ToolSpec {
 }
 
 impl ToolSpec {
+    /// 创建同时用于模型 schema 和执行校验的 tool 定义。
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -137,11 +146,13 @@ impl ToolSpec {
         }
     }
 
+    /// 替换执行边界使用的输入校验器。
     pub fn with_execution_input_validator(mut self, validator: ToolInputValidator) -> Self {
         self.execution_input_validator = validator;
         self
     }
 
+    /// 校验并投影模型提交的输入。
     pub fn prepare_model_input(&self, input: &Value) -> Result<Value, ToolInputValidationError> {
         (self.model_input_validator)(input)?;
         match &self.exact_input_bindings {
@@ -154,6 +165,7 @@ impl ToolSpec {
         }
     }
 
+    /// 在执行器闸门重新校验可执行输入。
     pub fn validate_execution_input(&self, input: &Value) -> Result<(), ToolInputValidationError> {
         (self.execution_input_validator)(input)?;
         if self.exact_input_bindings.as_ref().is_some_and(|bindings| {
@@ -166,6 +178,7 @@ impl ToolSpec {
         Ok(())
     }
 
+    /// 将 tool 限制为一组模型与执行输入完全相同的值。
     pub fn restrict_to_exact_inputs(&mut self, inputs: Vec<Value>) -> Result<(), String> {
         self.restrict_to_input_bindings(
             inputs
@@ -175,6 +188,7 @@ impl ToolSpec {
         )
     }
 
+    /// 设置模型输入到执行输入的显式绑定。
     pub fn restrict_to_input_bindings(
         &mut self,
         bindings: Vec<(Value, Value)>,
@@ -506,6 +520,7 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// 注册一个新的 tool 定义。
     pub fn register(&mut self, spec: ToolSpec) -> Result<(), String> {
         validate_tool_name(&spec.name)?;
         if self.tools.contains_key(&spec.name) {
@@ -515,10 +530,12 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// 按名称查找 tool 定义。
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
         self.tools.get(name)
     }
 
+    /// 返回全部模型可见的 schema payload。
     pub fn schema_payloads(&self) -> Vec<Value> {
         self.tools
             .values()
@@ -526,6 +543,7 @@ impl ToolRegistry {
             .collect::<Vec<_>>()
     }
 
+    /// 校验并准备指定 tool 的模型输入。
     pub fn prepare_model_input(
         &self,
         name: &str,
@@ -538,6 +556,7 @@ impl ToolRegistry {
         Ok((spec.execution_mode, execution_input))
     }
 
+    /// 校验指定 tool 的执行输入。
     pub fn validate_execution_input(
         &self,
         name: &str,
@@ -590,10 +609,12 @@ pub enum ToolBrokerDecision {
 }
 
 impl ToolBrokerDecision {
+    /// 构造策略拒绝决策。
     pub fn deny(reason: impl Into<String>) -> Self {
         Self::deny_with_kind(ToolFailureKind::Policy, reason)
     }
 
+    /// 构造带失败类别的拒绝决策。
     pub fn deny_with_kind(failure_kind: ToolFailureKind, reason: impl Into<String>) -> Self {
         Self::Deny {
             failure_kind,
@@ -601,16 +622,19 @@ impl ToolBrokerDecision {
         }
     }
 
+    /// 判断决策是否允许进入执行边界。
     pub fn is_allowed(&self) -> bool {
         matches!(self, Self::Allow | Self::Approved { .. })
     }
 
+    /// 构造 approval 已授予的决策。
     pub fn approved(approval_grant_id: impl Into<String>) -> Self {
         Self::Approved {
             approval_grant_id: approval_grant_id.into(),
         }
     }
 
+    /// 构造等待 approval 的决策。
     pub fn ask(approval_request_id: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Ask {
             approval_request_id: approval_request_id.into(),
@@ -626,22 +650,27 @@ pub struct ToolBroker {
 }
 
 impl ToolBroker {
+    /// 用已注册的 tool 表创建执行边界。
     pub fn new(registry: ToolRegistry) -> Self {
         Self { registry }
     }
 
+    /// 注册 tool 并保持 broker 的名称约束。
     pub fn register(&mut self, spec: ToolSpec) -> Result<(), String> {
         self.registry.register(spec)
     }
 
+    /// 按名称查找 tool 定义。
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
         self.registry.get(name)
     }
 
+    /// 返回 broker 暴露给模型的 schema。
     pub fn tool_schema_payloads(&self) -> Vec<Value> {
         self.registry.schema_payloads()
     }
 
+    /// 准备模型提交的 tool 输入。
     pub fn prepare_model_input(
         &self,
         name: &str,
@@ -650,6 +679,7 @@ impl ToolBroker {
         self.registry.prepare_model_input(name, input)
     }
 
+    /// 在执行前校验 tool 输入。
     pub fn validate_execution_input(
         &self,
         name: &str,
@@ -729,6 +759,7 @@ pub struct ToolCallRequest {
 }
 
 impl ToolCallRequest {
+    /// 创建规范化的 tool call 封装。
     pub fn new(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -754,6 +785,7 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
+    /// 构造成功输出。
     pub fn success(content: Value) -> Self {
         Self {
             ok: true,
@@ -765,10 +797,12 @@ impl ToolOutput {
         }
     }
 
+    /// 构造默认执行失败输出。
     pub fn failure(error_code: impl Into<String>, content: Value) -> Self {
         Self::failure_with_kind(ToolFailureKind::Execution, error_code, content)
     }
 
+    /// 构造带稳定失败类别的输出。
     pub fn failure_with_kind(
         failure_kind: ToolFailureKind,
         error_code: impl Into<String>,
@@ -807,6 +841,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// 构造仅含有界预览的结果。
     pub fn summary(
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -828,15 +863,18 @@ impl ToolResult {
         }
     }
 
+    /// 附加内部审计 metadata，不进入模型公开内容。
     pub fn with_audit(mut self, metadata: Value) -> Self {
         self.audit_metadata = Some(metadata);
         self
     }
 
+    /// 返回内部审计 metadata。
     pub fn audit_metadata(&self) -> Option<&Value> {
         self.audit_metadata.as_ref()
     }
 
+    /// 将执行器输出投影为模型和 trace 可用结果。
     pub fn from_result(envelope: &ToolCallRequest, result: &ToolOutput) -> Self {
         let result_content = result.content.to_string();
         let content_is_safe = redact_public_text(&result_content) == result_content;
@@ -1202,6 +1240,7 @@ impl fmt::Debug for WorkspaceTools {
 }
 
 impl WorkspaceTools {
+    /// 将工作区根目录绑定到文件和 command tool。
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
@@ -1210,6 +1249,7 @@ impl WorkspaceTools {
         }
     }
 
+    /// 绑定一个严格 sandbox backend。
     pub fn with_sandbox_backend(
         self,
         sandbox_backend: impl SandboxBackend + Send + Sync + 'static,
@@ -1217,6 +1257,7 @@ impl WorkspaceTools {
         self.with_shared_sandbox_backend(Arc::new(sandbox_backend))
     }
 
+    /// 绑定可共享的 sandbox backend。
     pub fn with_shared_sandbox_backend(
         mut self,
         sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
@@ -1225,6 +1266,7 @@ impl WorkspaceTools {
         self
     }
 
+    /// 设置命令子进程环境策略。
     pub fn with_command_environment(mut self, environment: CommandEnvironmentPolicy) -> Self {
         self.command_environment = environment;
         self
@@ -1289,6 +1331,7 @@ impl WorkspaceTools {
         Ok(())
     }
 
+    /// 在工作区内读取有界文件内容。
     pub fn read(&self, input: ReadToolInput) -> Result<ToolOutput, WorkspaceToolError> {
         input.validate()?;
         let max_chars = input.max_chars.unwrap_or(DEFAULT_READ_MAX_CHARS);
@@ -1383,6 +1426,7 @@ impl WorkspaceTools {
         Ok(ToolOutput::success(output))
     }
 
+    /// 列出工作区内的有界目录内容。
     pub fn list(&self, input: ListToolInput) -> Result<ToolOutput, WorkspaceToolError> {
         input.validate()?;
         let target = self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
@@ -1416,6 +1460,7 @@ impl WorkspaceTools {
         })))
     }
 
+    /// 在工作区内执行有界文本搜索。
     pub fn grep(&self, input: GrepToolInput) -> Result<ToolOutput, WorkspaceToolError> {
         input.validate()?;
         let root = self
@@ -1437,6 +1482,7 @@ impl WorkspaceTools {
         })))
     }
 
+    /// 以单文件 patch 语义执行受保护的替换。
     pub fn edit(
         &self,
         input: EditToolInput,
@@ -1455,6 +1501,7 @@ impl WorkspaceTools {
         )
     }
 
+    /// 先整批预检再原子写入多个文件变更。
     pub fn patch(
         &self,
         patch: WorkspacePatch,
@@ -1524,6 +1571,7 @@ impl WorkspaceTools {
         })))
     }
 
+    /// 在严格 sandbox backend 中执行命令字符串。
     pub fn command(&self, input: CommandToolInput) -> Result<ToolOutput, WorkspaceToolError> {
         self.command_cancellable(input, &CancellationToken::new())
     }

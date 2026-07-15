@@ -159,6 +159,7 @@ impl AppServer {
         }
     }
 
+    /// 替换服务使用的 sandbox backend。
     pub fn with_sandbox_backend(
         mut self,
         sandbox_backend: impl SandboxBackend + Send + Sync + 'static,
@@ -167,18 +168,22 @@ impl AppServer {
         self
     }
 
+    /// 判断服务是否已收到 shutdown 请求。
     pub fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
     }
 
+    /// 判断初始化握手是否允许启动 turn worker。
     pub fn ready_for_turn_worker(&self) -> bool {
         self.initialized_acknowledged
     }
 
+    /// 请求当前进程所有执行停止。
     pub fn request_execution_stop(&self) -> AppServerResult<()> {
         self.cancellation_handle().request_execution_stop()
     }
 
+    /// 返回共享的执行取消句柄。
     pub fn cancellation_handle(&self) -> AppServerCancellationHandle {
         AppServerCancellationHandle {
             active_turns: Arc::clone(&self.active_turns),

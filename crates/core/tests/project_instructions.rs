@@ -1,3 +1,5 @@
+//! 项目指令 workspace 边界、大小限制和错误归因测试。
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

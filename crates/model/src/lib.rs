@@ -20,8 +20,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const DEFAULT_MAX_TOOL_CALLS: u32 = 1;
+/// 单次模型请求的默认 tool 数量上限。
 pub const DEFAULT_MAX_TOOLS_PER_REQUEST: u32 = 8;
+/// 默认模型上下文 token 上限。
 pub const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 128_000;
+/// 默认模型输出 token 上限。
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4_096;
 const MAX_CONFIGURED_CONTEXT_TOKENS: u32 = 2_000_000;
 const MAX_CONFIGURED_OUTPUT_TOKENS: u32 = 256_000;
@@ -88,6 +91,7 @@ pub struct ModelMessage {
 }
 
 impl ModelMessage {
+    /// 创建普通文本消息。
     pub fn text(role: ModelRole, content: impl Into<String>) -> Self {
         Self {
             role,
@@ -97,6 +101,7 @@ impl ModelMessage {
         }
     }
 
+    /// 创建带结构化 tool calls 的 assistant 消息。
     pub fn assistant_tool_calls(tool_calls: Vec<ModelToolCall>) -> Self {
         Self {
             role: ModelRole::Assistant,
@@ -136,6 +141,7 @@ impl Default for ToolChoicePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+/// 模型 tool call 的解析状态。
 pub enum ModelToolParseStatus {
     Valid,
     InvalidJson,
@@ -253,6 +259,7 @@ pub enum ProviderConfigSource {
 }
 
 impl ProviderConfigSource {
+    /// 返回配置来源的稳定字符串。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProcessEnvironment => "process_env",
@@ -293,6 +300,7 @@ impl fmt::Debug for ProviderConfigSnapshot {
 }
 
 impl ProviderConfigSnapshot {
+    /// 从环境读取并固定一份 provider 配置快照。
     pub fn capture<F>(get_env: F) -> Self
     where
         F: FnMut(&str) -> Option<String>,
@@ -319,22 +327,27 @@ impl ProviderConfigSnapshot {
         }
     }
 
+    /// 返回配置来源。
     pub fn source(&self) -> Option<ProviderConfigSource> {
         self.source
     }
 
+    /// 返回脱敏后的 provider 配置。
     pub fn redacted_config(&self) -> &ModelProviderConfig {
         &self.redacted_config
     }
 
+    /// 返回配置可用性状态。
     pub fn configuration(&self) -> &ProviderConfigurationStatus {
         &self.configuration
     }
 
+    /// 返回快照稳定标识。
     pub fn snapshot_id(&self) -> &str {
         &self.snapshot_id
     }
 
+    /// 从快照创建 provider 实例。
     pub fn provider(&self) -> Result<OpenAiProvider, ProviderError> {
         self.provider.clone()
     }
@@ -351,6 +364,7 @@ pub enum ModelBlockerKind {
 }
 
 impl ModelBlockerKind {
+    /// 返回阻塞类别代码。
     pub fn code(&self) -> &'static str {
         match self {
             Self::RequiredEnvMissing => "required_env_missing",
@@ -360,6 +374,7 @@ impl ModelBlockerKind {
         }
     }
 
+    /// 返回阻塞类别说明。
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::RequiredEnvMissing => "required env missing",
@@ -401,6 +416,7 @@ pub struct ProviderConfigurationStatus {
 }
 
 impl ProviderConfigurationStatus {
+    /// 从 provider 配置生成脱敏状态。
     pub fn from_config(config: &ModelProviderConfig) -> Self {
         let validation = validate_provider_config(config);
         Self {
@@ -457,6 +473,7 @@ pub struct ModelValidationResult {
 }
 
 impl ModelValidationResult {
+    /// 构造通过校验且无警告的结果。
     pub fn valid() -> Self {
         Self {
             valid: true,
@@ -465,6 +482,7 @@ impl ModelValidationResult {
         }
     }
 
+    /// 构造带错误的失败结果。
     pub fn invalid(errors: Vec<String>) -> Self {
         Self {
             valid: false,
@@ -571,6 +589,7 @@ pub struct ProviderDiagnostic {
 }
 
 impl ModelError {
+    /// 创建带稳定 kind 的模型错误。
     pub fn new(kind: ModelErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -586,16 +605,19 @@ impl ModelError {
         }
     }
 
+    /// 绑定 provider 名称。
     pub fn with_provider(mut self, provider_name: impl Into<String>) -> Self {
         self.provider_name = Some(provider_name.into());
         self
     }
 
+    /// 绑定模型名称。
     pub fn with_model(mut self, model_name: impl Into<String>) -> Self {
         self.model_name = Some(model_name.into());
         self
     }
 
+    /// 附加脱敏 provider 诊断。
     pub fn with_provider_diagnostic(
         mut self,
         code: impl Into<String>,
@@ -606,10 +628,12 @@ impl ModelError {
         self
     }
 
+    /// 归类为公共模型错误类别。
     pub fn category(&self) -> ModelErrorCategory {
         classify_model_error(self)
     }
 
+    /// 返回 provider 诊断的脱敏副本。
     pub fn provider_diagnostic(&self) -> ProviderDiagnostic {
         ProviderDiagnostic {
             code: self.code.clone(),
@@ -622,6 +646,7 @@ impl ModelError {
     }
 }
 
+/// 将模型错误映射为稳定公共类别。
 pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
     model_error_category(error)
 }
@@ -637,6 +662,7 @@ pub struct ModelTurnRequest {
 }
 
 impl ModelTurnRequest {
+    /// 创建模型 turn 请求。
     pub fn new(request_id: impl Into<String>, messages: Vec<ModelMessage>) -> Self {
         Self {
             request_id: request_id.into(),
@@ -676,6 +702,7 @@ pub struct ModelTurnResponse {
 }
 
 impl ModelTurnResponse {
+    /// 构造已完成的模型响应。
     pub fn completed(
         request_id: impl Into<String>,
         response_id: impl Into<String>,
@@ -791,6 +818,7 @@ impl fmt::Debug for OpenAiProviderConfig {
 }
 
 impl OpenAiProviderConfig {
+    /// 从环境加载并验证 OpenAI-compatible 配置。
     pub fn from_env<F>(get_env: F) -> Result<Self, ProviderError>
     where
         F: FnMut(&str) -> Option<String>,
@@ -853,6 +881,7 @@ impl OpenAiProviderConfig {
         })
     }
 
+    /// 返回脱敏 provider 配置状态。
     pub fn redacted_status(&self) -> ProviderConfigurationStatus {
         ProviderConfigurationStatus::from_config(&ModelProviderConfig {
             provider_name: Some(self.provider_name.clone()),
@@ -862,6 +891,7 @@ impl OpenAiProviderConfig {
         })
     }
 
+    /// 返回当前请求 endpoint。
     pub fn endpoint(&self) -> String {
         chat_completions_endpoint(&self.base_url)
     }
@@ -893,6 +923,7 @@ impl OpenAiProviderConfig {
         }
     }
 
+    /// 返回当前 provider 的能力契约。
     pub fn protocol_contract(&self) -> ProviderProtocolContract {
         ProviderProtocolContract {
             supports_tools: true,
@@ -1040,6 +1071,7 @@ impl Drop for CapabilityProbeOwnerGuard {
 }
 
 impl OpenAiProvider {
+    /// 创建并校验 OpenAI-compatible provider。
     pub fn new(config: OpenAiProviderConfig) -> Result<Self, ProviderError> {
         Self::new_with_request_timeout(config, PROVIDER_TIMEOUT_SECONDS)
     }
@@ -1061,6 +1093,7 @@ impl OpenAiProvider {
         })
     }
 
+    /// 从环境加载 OpenAI-compatible provider。
     pub fn from_env<F>(get_env: F) -> Result<Self, ProviderError>
     where
         F: FnMut(&str) -> Option<String>,
@@ -1810,6 +1843,7 @@ fn provider_request_validation_error(
 }
 
 impl ProviderError {
+    /// 从模型错误创建 provider 错误。
     pub fn from_model_error(error: ModelError) -> Self {
         Self {
             message: error.message.clone(),
@@ -1819,11 +1853,13 @@ impl ProviderError {
         }
     }
 
+    /// 附加一次 provider attempt 的脱敏元数据。
     pub fn with_provider_attempt_metadata(mut self, metadata: ProviderAttemptMetadata) -> Self {
         self.provider_attempt_metadata = Some(metadata);
         self
     }
 
+    /// 附加能力协商的脱敏元数据。
     pub fn with_capability_metadata(mut self, metadata: ProviderCapabilityMetadata) -> Self {
         self.capability_metadata = Some(Box::new(metadata));
         self

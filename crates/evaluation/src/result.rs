@@ -1,3 +1,5 @@
+//! Evaluation task/result 状态、门禁汇总和 blocker 校验。
+
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
@@ -8,6 +10,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Evaluation result 的 schema 版本。
 pub enum EvaluationResultSchemaVersion {
     #[serde(rename = "evaluation.result/v5")]
     V5,
@@ -15,6 +18,7 @@ pub enum EvaluationResultSchemaVersion {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 单个任务的执行证据计数和摘要。
 pub struct EvaluationEvidenceSummary {
     pub workspace_change_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +52,7 @@ pub struct EvaluationEvidenceSummary {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 整个 Evaluation run 的汇总计数和门禁结果。
 pub struct EvaluationRunSummary {
     pub task_count: u32,
     pub scored_task_count: u32,
@@ -60,6 +65,7 @@ pub struct EvaluationRunSummary {
 }
 
 impl EvaluationRunSummary {
+    /// 从各任务结果计算不可手工覆盖的 run 汇总。
     pub fn from_tasks(tasks: &[EvaluationTaskResult]) -> Self {
         let task_count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
         let agent_completed_count = count_tasks(tasks, |task| task.agent_completed);
@@ -98,6 +104,7 @@ fn count_tasks(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Evaluation run 的生命周期状态。
 pub enum EvaluationStatus {
     Pending,
     Running,
@@ -108,6 +115,7 @@ pub enum EvaluationStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// 单个阶段的执行状态。
 pub enum StageStatus {
     NotRun,
     Passed,
@@ -118,6 +126,7 @@ pub enum StageStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// 阻塞 Evaluation 的稳定原因类别。
 pub enum BlockerKind {
     Environment,
     WorkspacePreparation,
@@ -131,6 +140,7 @@ pub enum BlockerKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Evaluation 或阶段的阻塞原因。
 pub struct EvaluationBlocker {
     pub kind: BlockerKind,
     pub message: String,
@@ -149,6 +159,7 @@ impl EvaluationBlocker {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 单个阶段的状态与可选 blocker。
 pub struct StageResult {
     pub status: StageStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +174,7 @@ impl StageResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 一个任务的 baseline、agent、public、hidden 阶段结果。
 pub struct EvaluationStageResults {
     pub baseline: StageResult,
     pub agent: StageResult,
@@ -185,6 +197,7 @@ impl EvaluationStageResults {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 单个 Evaluation 任务的最终结果和门禁字段。
 pub struct EvaluationTaskResult {
     pub task_id: TaskId,
     pub capabilities: Vec<EvaluationCapability>,
@@ -266,6 +279,7 @@ impl EvaluationTaskResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 一个 Evaluation run 的稳定结果。
 pub struct EvaluationResult {
     pub schema_version: EvaluationResultSchemaVersion,
     pub run_id: RunId,
@@ -278,6 +292,7 @@ pub struct EvaluationResult {
 }
 
 impl EvaluationResult {
+    /// 从 JSON 读取并校验稳定结果。
     pub fn from_json_str(json: &str) -> Result<Self> {
         require_schema_version(json, RESULT_SCHEMA_VERSION)?;
         let result: Self = serde_json::from_str(json)?;
@@ -285,6 +300,7 @@ impl EvaluationResult {
         Ok(result)
     }
 
+    /// 校验结果、阶段状态和汇总字段的一致性。
     pub fn validate(&self) -> Result<()> {
         validate_evaluation_blocker(self.status, self.blocker.as_ref(), "evaluation run")?;
         if self.tasks.is_empty() {

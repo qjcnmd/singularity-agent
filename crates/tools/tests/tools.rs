@@ -1,3 +1,5 @@
+//! Direct workspace tool schema、整批 preflight、approval 和结果脱敏测试。
+
 use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, SandboxBackend, SandboxCapabilities, SandboxFilesystemMode,

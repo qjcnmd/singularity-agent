@@ -19,6 +19,7 @@ const COMMAND_TOOL_NAME: &str = "command";
 const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Evaluation task set 的 schema 版本。
 pub enum TaskSetSchemaVersion {
     #[serde(rename = "evaluation.task_set/v4")]
     V4,
@@ -26,6 +27,7 @@ pub enum TaskSetSchemaVersion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// 任务声明覆盖的能力标签。
 pub enum EvaluationCapability {
     SingleFileFix,
     MultiFileChange,
@@ -46,6 +48,7 @@ pub enum EvaluationCapability {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 一组可验证的 Evaluation 任务。
 pub struct EvaluationTaskSet {
     pub schema_version: TaskSetSchemaVersion,
     pub tasks: Vec<EvaluationTask>,
@@ -71,6 +74,7 @@ impl EvaluationTaskSet {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 单个任务的工作区、agent 和 evaluator 定义。
 pub struct EvaluationTask {
     pub task_id: TaskId,
     pub description: String,
@@ -94,6 +98,7 @@ impl EvaluationTask {
         self.evaluator.validate(&self.task_id)
     }
 
+    /// 投影为 AgentLoop 使用的最小任务输入。
     pub fn agent_projection(&self) -> AgentTaskProjection {
         AgentTaskProjection {
             task_id: self.task_id.clone(),
@@ -172,6 +177,7 @@ impl EvaluationTask {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 任务工作区来源与初始化命令。
 pub struct WorkspaceSpec {
     pub source: WorkspaceSource,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -191,6 +197,7 @@ impl WorkspaceSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+/// 本地或固定 commit 的远程 Git 工作区来源。
 pub enum WorkspaceSource {
     Local {
         path: RelativePath,
@@ -203,6 +210,7 @@ pub enum WorkspaceSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Agent 阶段的指令、路径、工具和 smoke 命令。
 pub struct AgentTaskSpec {
     pub instructions: String,
     pub allowed_paths: Vec<RelativePath>,
@@ -236,6 +244,7 @@ impl AgentTaskSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// baseline、public 和 hidden evaluator 配置。
 pub struct EvaluatorSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_test_patch: Option<EvaluatorTestPatch>,
@@ -278,6 +287,7 @@ impl EvaluatorSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 单个 evaluator 阶段的命令列表。
 pub struct EvaluatorStageSpec {
     pub commands: Vec<CommandSpec>,
 }
@@ -290,6 +300,7 @@ impl EvaluatorStageSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// evaluator 使用的受限命令描述。
 pub struct CommandSpec {
     pub argv: Argv,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -332,18 +343,21 @@ impl CommandSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// evaluator 测试补丁的格式。
 pub enum PatchFormat {
     UnifiedDiff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// evaluator 阶段应用的测试补丁。
 pub struct EvaluatorTestPatch {
     pub format: PatchFormat,
     content: String,
 }
 
 impl EvaluatorTestPatch {
+    /// 返回未经修改的补丁正文。
     pub fn content(&self) -> &str {
         &self.content
     }
@@ -359,12 +373,14 @@ impl EvaluatorTestPatch {
 }
 
 #[derive(Debug, Clone)]
+/// 已校验并绑定 manifest 目录的 Evaluation 定义。
 pub struct EvaluationManifest {
     task_set: EvaluationTaskSet,
     manifest_dir: PathBuf,
 }
 
 impl EvaluationManifest {
+    /// 从 JSON 和 manifest 所在目录加载并校验定义。
     pub fn from_json_str(json: &str, manifest_dir: impl AsRef<Path>) -> Result<Self> {
         require_schema_version(json, TASK_SET_SCHEMA_VERSION)?;
         let manifest_dir = canonicalize(manifest_dir.as_ref())?;
@@ -382,6 +398,7 @@ impl EvaluationManifest {
         })
     }
 
+    /// 从文件加载 Evaluation manifest。
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = canonicalize(path.as_ref())?;
         let json = fs::read_to_string(&path).map_err(|source| EvaluationError::Io {
@@ -397,14 +414,17 @@ impl EvaluationManifest {
         Self::from_json_str(&json, manifest_dir)
     }
 
+    /// 返回原始 task set。
     pub fn task_set(&self) -> &EvaluationTaskSet {
         &self.task_set
     }
 
+    /// 返回 manifest 的规范化目录。
     pub fn manifest_dir(&self) -> &Path {
         &self.manifest_dir
     }
 
+    /// 为指定任务生成四阶段工作区计划。
     pub fn workspace_plan(&self, task_id: &TaskId) -> Result<WorkspacePlan> {
         self.task_set
             .tasks
@@ -417,6 +437,7 @@ impl EvaluationManifest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Evaluation 执行阶段。
 pub enum EvaluationStage {
     Baseline,
     Agent,
@@ -426,6 +447,7 @@ pub enum EvaluationStage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// 阶段工作区的来源种子。
 pub enum WorkspaceSeed {
     TaskSource,
     AgentOutput,
@@ -433,6 +455,7 @@ pub enum WorkspaceSeed {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// 阶段命令的预期结果。
 pub enum CommandExpectation {
     Success,
     Failure,
@@ -440,6 +463,7 @@ pub enum CommandExpectation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// 已解析的工作区来源计划。
 pub enum PlannedWorkspaceSource {
     Local {
         path: PathBuf,
@@ -451,6 +475,7 @@ pub enum PlannedWorkspaceSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// 单个任务的完整执行计划。
 pub struct WorkspacePlan {
     pub task_id: TaskId,
     pub capabilities: Vec<EvaluationCapability>,
@@ -462,6 +487,7 @@ pub struct WorkspacePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// baseline 阶段计划。
 pub struct BaselineStagePlan {
     pub stage: EvaluationStage,
     pub seed: WorkspaceSeed,
@@ -472,6 +498,7 @@ pub struct BaselineStagePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Agent 阶段计划。
 pub struct AgentStagePlan {
     pub stage: EvaluationStage,
     pub seed: WorkspaceSeed,
@@ -480,6 +507,7 @@ pub struct AgentStagePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// public 或 hidden 验证阶段计划。
 pub struct VerificationStagePlan {
     pub stage: EvaluationStage,
     pub seed: WorkspaceSeed,
@@ -491,6 +519,7 @@ pub struct VerificationStagePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 传给 AgentLoop 的任务输入投影。
 pub struct AgentTaskProjection {
     pub task_id: TaskId,
     pub description: String,

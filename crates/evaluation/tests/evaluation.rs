@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+//! Evaluation manifest、result、evidence 和固定任务集的合同测试。
+
 use std::path::Path;
 
 use serde_json::{Value, json};

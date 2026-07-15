@@ -1,3 +1,5 @@
+//! AppServer protocol、approval continuation、recovery 和 sandbox 边界测试。
+
 use singularity_app_server::AppServer;
 use singularity_model::ProviderConfigSnapshot;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};

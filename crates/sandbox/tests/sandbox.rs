@@ -1,3 +1,5 @@
+//! Command request、sandbox result、取消和 backend capability 测试。
+
 use schemars::schema_for;
 use singularity_core::CancellationToken;
 use singularity_sandbox::{

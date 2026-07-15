@@ -1,3 +1,5 @@
+//! Evaluation workspace 的安全复制、快照、变更归因和 allowlist 校验。
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -9,6 +11,7 @@ const REPARSE_POINT_ATTRIBUTE: u32 = 0x0400;
 type WorkspaceSnapshot = BTreeMap<String, String>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// 单个工作区变更及其前后摘要。
 pub(super) struct WorkspaceChangeEvidence {
     pub path: String,
     pub change_kind: &'static str,
@@ -17,6 +20,7 @@ pub(super) struct WorkspaceChangeEvidence {
     pub allowed: bool,
 }
 
+/// 将 Agent workspace 的已知变更复制到 Evaluation 工作区。
 pub(super) fn apply_agent_changes(
     agent_workspace: &Path,
     destination: &Path,
@@ -88,6 +92,7 @@ pub(super) fn apply_agent_changes(
     }
     Ok(())
 }
+/// 在排除 .git 和 reparse point 后安全复制工作区。
 pub(super) fn copy_tree_checked(source: &Path, destination: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| format!("failed to inspect source {}: {error}", source.display()))?;
@@ -200,10 +205,12 @@ fn copy_tree_entries(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 校验工作区树只包含可接受的普通文件和目录。
 pub(super) fn validate_tree(root: &Path) -> Result<(), String> {
     snapshot_workspace(root).map(|_| ())
 }
 
+/// 对工作区文件生成相对路径到 sha256 的快照。
 pub(super) fn snapshot_workspace(root: &Path) -> Result<WorkspaceSnapshot, String> {
     let metadata = fs::symlink_metadata(root)
         .map_err(|error| format!("failed to inspect workspace {}: {error}", root.display()))?;
@@ -218,6 +225,7 @@ pub(super) fn snapshot_workspace(root: &Path) -> Result<WorkspaceSnapshot, Strin
     Ok(snapshot)
 }
 
+/// 计算工作区快照的稳定摘要。
 pub(super) fn workspace_tree_digest(root: &Path) -> Result<String, String> {
     let snapshot = snapshot_workspace(root)?;
     let canonical = serde_json::to_vec(&snapshot)
@@ -286,6 +294,7 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
+/// 返回前后快照中内容发生变化的路径。
 pub(super) fn changed_paths(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> Vec<String> {
     before
         .keys()
@@ -297,6 +306,7 @@ pub(super) fn changed_paths(before: &WorkspaceSnapshot, after: &WorkspaceSnapsho
         .collect()
 }
 
+/// 归因变更并排除闭集工具链产物。
 pub(super) fn evaluation_changed_paths(
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
@@ -310,6 +320,7 @@ pub(super) fn evaluation_changed_paths(
         .collect()
 }
 
+/// 将变更路径转换为带 allowlist 结果的 evidence。
 pub(super) fn workspace_change_evidence(
     before: &WorkspaceSnapshot,
     after: &WorkspaceSnapshot,
@@ -334,8 +345,7 @@ pub(super) fn workspace_change_evidence(
 }
 
 fn is_evaluation_artifact_path(path: &str) -> bool {
-    // Keep this classification closed: only stable toolchain-owned names are
-    // artifacts. Unknown workspace paths must remain visible to the allowlist.
+    // 该分类保持闭集：只忽略稳定的工具链产物，未知路径仍交给 allowlist。
     let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -378,6 +388,7 @@ fn is_evaluation_artifact_path(path: &str) -> bool {
         })
 }
 
+/// 计算工作区变更 evidence 的稳定摘要。
 pub(super) fn patch_evidence_digest(evidence: &[WorkspaceChangeEvidence]) -> Option<String> {
     if evidence.is_empty() {
         return None;
@@ -386,6 +397,7 @@ pub(super) fn patch_evidence_digest(evidence: &[WorkspaceChangeEvidence]) -> Opt
     Some(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
 
+/// 判断变更路径是否落在任务允许路径内。
 pub(super) fn path_is_allowed(
     path: &str,
     allowed_paths: &[singularity_evaluation::RelativePath],
@@ -415,6 +427,7 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     }
 }
 
+/// 优先返回规范化路径，失败时保留原路径。
 pub(super) fn canonical_or_original(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

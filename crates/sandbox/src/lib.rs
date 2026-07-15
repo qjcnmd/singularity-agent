@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
 
+/// command tool 未指定超时时使用的秒数。
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
+/// 命令公开输出的默认字符上限。
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 40_000;
 const SANDBOX_BACKEND_UNAVAILABLE: &str = "sandbox-required command has no sandbox backend";
 const COMMAND_EXECUTABLE_UNAVAILABLE: &str = "sandbox command executable unavailable";
@@ -147,6 +149,7 @@ pub struct CommandRequest {
 }
 
 impl CommandRequest {
+    /// 构造 evaluator 使用的命令请求。
     pub fn project_verification(
         command_id: impl Into<String>,
         argv: Vec<String>,
@@ -169,10 +172,12 @@ impl CommandRequest {
         }
     }
 
+    /// 判断请求是否必须经过 sandbox。
     pub fn requires_sandbox(&self) -> bool {
         true
     }
 
+    /// 返回用于 policy/approval 的资源标识。
     pub fn permission_resource(&self) -> String {
         command_permission_resource(&self.argv)
     }
@@ -261,6 +266,7 @@ pub struct SandboxExecutionMetadata {
 }
 
 impl SandboxExecutionMetadata {
+    /// 构造 backend 不可用的结果元数据。
     pub fn unavailable(backend: impl Into<String>) -> Self {
         Self {
             backend: backend.into(),
@@ -269,6 +275,7 @@ impl SandboxExecutionMetadata {
         }
     }
 
+    /// 构造已在 sandbox 中执行的结果元数据。
     pub fn sandboxed(backend: impl Into<String>, enforcement: SandboxBackendEnforcement) -> Self {
         Self {
             backend: backend.into(),
@@ -309,6 +316,7 @@ pub fn bound_command_output(output: &str, max_chars: usize) -> BoundedCommandOut
 }
 
 impl CommandResult {
+    /// 构造成功且带有界预览的结果。
     pub fn completed(command_id: impl Into<String>, stdout_preview: impl Into<String>) -> Self {
         let stdout = safe_command_preview(stdout_preview.into());
         Self {
@@ -326,6 +334,7 @@ impl CommandResult {
         }
     }
 
+    /// 构造策略拒绝结果。
     pub fn policy_denied(command_id: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::blocked(
             command_id,
@@ -335,10 +344,12 @@ impl CommandResult {
         )
     }
 
+    /// 构造 sandbox backend 不可用结果。
     pub fn sandbox_backend_unavailable(command_id: impl Into<String>) -> Self {
         Self::backend_error(command_id, SANDBOX_BACKEND_UNAVAILABLE)
     }
 
+    /// 构造 backend 错误结果。
     pub fn backend_error(command_id: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::blocked(
             command_id,
@@ -348,6 +359,7 @@ impl CommandResult {
         )
     }
 
+    /// 构造平台不支持结果。
     pub fn unsupported(command_id: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::blocked(
             command_id,
@@ -357,6 +369,7 @@ impl CommandResult {
         )
     }
 
+    /// 构造可执行文件不可用结果。
     pub fn executable_unavailable(
         command_id: impl Into<String>,
         reason: impl Into<String>,
@@ -369,6 +382,7 @@ impl CommandResult {
         )
     }
 
+    /// 构造超时结果。
     pub fn timed_out(command_id: impl Into<String>, duration_ms: u64) -> Self {
         let mut result = Self::blocked(
             command_id,
@@ -381,6 +395,7 @@ impl CommandResult {
         result
     }
 
+    /// 构造取消结果。
     pub fn cancelled(command_id: impl Into<String>, duration_ms: u64) -> Self {
         let mut result = Self::blocked(
             command_id,
@@ -392,6 +407,7 @@ impl CommandResult {
         result
     }
 
+    /// 构造已执行命令的详细结果。
     pub fn executed(
         command_id: impl Into<String>,
         exit_code: i32,
@@ -422,6 +438,7 @@ impl CommandResult {
         }
     }
 
+    /// 记录 sandbox 执行元数据。
     pub fn with_sandbox_execution(
         mut self,
         backend: impl Into<String>,
@@ -489,6 +506,7 @@ pub struct SandboxCapabilities {
 }
 
 impl SandboxCapabilities {
+    /// 返回完整严格命令执行能力。
     pub fn strict() -> Self {
         Self {
             filesystem_isolation: true,
@@ -509,6 +527,7 @@ impl SandboxCapabilities {
         }
     }
 
+    /// 返回仅具备 restricted-token 能力的执行集合。
     pub fn restricted_token() -> Self {
         Self {
             filesystem_isolation: false,
@@ -551,6 +570,7 @@ impl SandboxCapabilities {
         }
     }
 
+    /// 返回没有可用命令 backend 的能力集合。
     pub fn unavailable() -> Self {
         Self {
             filesystem_isolation: false,
@@ -616,10 +636,12 @@ pub use windows_backend::WindowsSandboxBackend;
 
 #[cfg(not(windows))]
 #[derive(Debug, Clone, Default)]
+/// 非 Windows 平台的占位 backend；执行始终保持 unsupported。
 pub struct WindowsSandboxBackend;
 
 #[cfg(not(windows))]
 impl WindowsSandboxBackend {
+    /// 创建平台不支持的 backend 占位对象。
     pub fn new() -> Self {
         Self
     }
@@ -1124,9 +1146,11 @@ mod windows_backend {
     }
 
     #[derive(Debug, Clone, Default)]
+    /// Windows 严格 sandbox backend。
     pub struct WindowsSandboxBackend;
 
     impl WindowsSandboxBackend {
+        /// 创建 Windows sandbox backend。
         pub fn new() -> Self {
             Self
         }

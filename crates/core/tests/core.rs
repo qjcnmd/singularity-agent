@@ -1,3 +1,5 @@
+//! core 公共类型、脱敏和 JSON-RPC 基础合同测试。
+
 use singularity_core::{
     CancellationToken, ClientInfo, ErrorCode, RequestId, Timestamp, contains_sensitive_text,
 };

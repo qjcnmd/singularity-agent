@@ -65,8 +65,9 @@ const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
 ];
 const TOOL_SELECTION_FAILURE_GROUP: &str = "tool_selection";
 const TOOL_SELECTION_FAILURE_PREFIX: &str = "tool_selection:";
+/// AgentLoop 内部使用的计划更新 tool 名称。
 pub const UPDATE_PLAN_TOOL: &str = "update_plan";
-// Provider-facing history only; this placeholder is never registered or executed.
+// 仅供 provider history 使用；该占位名称不会注册，也不会执行。
 const PROVIDER_HISTORY_REJECTED_TOOL: &str = "tool_rejected";
 const MAX_PLAN_STEPS: usize = 64;
 const MAX_PLAN_STEP_CHARS: usize = 512;
@@ -90,6 +91,7 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
+    /// 返回稳定的生命周期状态字符串。
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -136,6 +138,7 @@ pub struct AgentVerificationRequirement {
 }
 
 impl AgentVerificationRequirement {
+    /// 创建命令作用域验证要求。
     pub fn new(command_scope_digest: impl Into<String>, required_success_count: u32) -> Self {
         Self {
             command_scope_digest: command_scope_digest.into(),
@@ -207,6 +210,7 @@ impl AgentPlanValidationFailure {
 }
 
 impl AgentPlan {
+    /// 校验计划步骤和完成状态契约。
     pub fn validate(&self) -> Result<(), String> {
         self.validate_contract()
             .map_err(AgentPlanValidationFailure::message)
@@ -242,6 +246,7 @@ impl AgentPlan {
         Ok(())
     }
 
+    /// 判断计划是否已完成。
     pub fn is_completed(&self) -> bool {
         self.steps
             .iter()
@@ -298,6 +303,7 @@ pub struct AgentPlanUpdateInput {
 }
 
 impl AgentPlanUpdateInput {
+    /// 将模型输入转换为已校验计划。
     pub fn into_plan(self) -> Result<AgentPlan, String> {
         let plan = AgentPlan { steps: self.steps };
         plan.validate()?;
@@ -352,6 +358,7 @@ pub struct AgentRunStatus {
 }
 
 impl AgentRunStatus {
+    /// 构造普通失败状态。
     pub fn failed(message: impl Into<String>) -> Self {
         Self {
             status: AgentStatus::Failed,
@@ -377,6 +384,7 @@ impl AgentRunStatus {
         }
     }
 
+    /// 构造带稳定错误分类的失败状态。
     pub fn failed_with_category(
         message: impl Into<String>,
         error_category: Option<ModelErrorCategory>,
@@ -386,6 +394,7 @@ impl AgentRunStatus {
         status
     }
 
+    /// 更新状态并保留已有诊断字段。
     pub fn with_status(mut self, status: AgentStatus) -> Self {
         self.completed = status == AgentStatus::Completed;
         self.status = status;
@@ -403,6 +412,7 @@ pub struct AgentLoopCapability {
 }
 
 impl AgentLoopCapability {
+    /// 构造可用能力摘要。
     pub fn available(reason: impl Into<String>) -> Self {
         Self {
             available: true,
@@ -412,6 +422,7 @@ impl AgentLoopCapability {
         }
     }
 
+    /// 构造不可用能力摘要及 blocker。
     pub fn unavailable(reason: impl Into<String>, blocker: impl Into<String>) -> Self {
         Self {
             available: false,
@@ -441,6 +452,7 @@ pub struct AgentLoopInput {
 }
 
 impl AgentLoopInput {
+    /// 创建最小 AgentLoop 输入。
     pub fn new(
         thread_id: impl Into<String>,
         turn_id: impl Into<String>,
@@ -460,16 +472,19 @@ impl AgentLoopInput {
         }
     }
 
+    /// 设置本轮模型名称。
     pub fn with_model_name(mut self, model_name: Option<String>) -> Self {
         self.model_preferences.model_name = model_name;
         self
     }
 
+    /// 设置最大 model turn 数。
     pub fn with_max_turns(mut self, max_turns: u32) -> Self {
         self.max_turns = max_turns;
         self
     }
 
+    /// 设置完成前必须满足的验证要求。
     pub fn with_verification_requirements(
         mut self,
         requirements: impl IntoIterator<Item = AgentVerificationRequirement>,
@@ -478,12 +493,14 @@ impl AgentLoopInput {
         self
     }
 
+    /// 附加项目指令文本。
     pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
         let instructions = instructions.into();
         self.project_instructions = (!instructions.trim().is_empty()).then_some(instructions);
         self
     }
 
+    /// 设置安全的历史上下文。
     pub fn with_history(mut self, history: impl IntoIterator<Item = AgentContextItem>) -> Self {
         let mut history: Vec<AgentContextItem> = history
             .into_iter()
@@ -494,6 +511,7 @@ impl AgentLoopInput {
         self
     }
 
+    /// 设置 approval 恢复授权。
     pub fn with_approval_grant(mut self, grant: ApprovalGrant) -> Self {
         self.approval_grants.push(grant);
         self
@@ -510,6 +528,7 @@ pub struct ApprovalGrant {
 }
 
 impl ApprovalGrant {
+    /// 构造允许恢复的 approval 授权。
     pub fn allow<I, S>(
         request_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -573,6 +592,7 @@ pub struct AgentLoopResult {
 }
 
 impl AgentLoopResult {
+    /// 读取指定 approval request 的 checkpoint。
     pub fn approval_checkpoint(&self, request_id: &str) -> Option<Value> {
         self.approval_checkpoints
             .iter()
@@ -585,6 +605,7 @@ impl AgentLoopResult {
             .cloned()
     }
 
+    /// 将内部结果投影为持久化运行状态。
     pub fn to_run_status(&self) -> AgentRunStatus {
         AgentRunStatus {
             status: self.status.clone(),
@@ -622,6 +643,7 @@ pub struct PendingToolCall {
 }
 
 impl PendingToolCall {
+    /// 从模型调用创建待执行记录。
     pub fn new(input: &AgentLoopInput, call: &ModelToolCall) -> Self {
         Self::new_with_profile(input, call, &PermissionProfile::workspace_write("."))
     }
@@ -1239,6 +1261,7 @@ impl<P> AgentLoop<P>
 where
     P: Provider,
 {
+    /// 创建带 broker、policy 和 provider 的 AgentLoop。
     pub fn new(provider: P, tool_broker: ToolBroker, policy: PolicyEngine) -> Self {
         Self {
             provider,
@@ -1249,11 +1272,13 @@ where
         }
     }
 
+    /// 绑定工作区 tool 执行器。
     pub fn with_workspace_tools(mut self, workspace_tools: WorkspaceTools) -> Self {
         self.workspace_tools = Some(workspace_tools);
         self
     }
 
+    /// 绑定取消 token。
     pub fn with_cancellation_token(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
@@ -1324,8 +1349,7 @@ where
         }
         let mut finalization_attempted = false;
         let mut actual_model_turns = model_turn_offset;
-        // The inclusive endpoint is a terminal-only slot; without readiness it preserves the
-        // ordinary work-turn limit and its max-turn failure.
+        // 包含端点只保留给终态；没有 readiness 时仍维持普通工作回合上限及其失败语义。
         for turn_index in model_turn_offset..=max_turns {
             let finalization_only = state.finalization_ready();
             if !finalization_only && turn_index == max_turns {
@@ -2447,6 +2471,7 @@ pub struct AgentContextItem {
 }
 
 impl AgentContextItem {
+    /// 构造用户上下文项。
     pub fn user(item_id: impl Into<String>, content: impl Into<String>) -> Self {
         let content = content.into();
         Self {
@@ -2460,10 +2485,12 @@ impl AgentContextItem {
         }
     }
 
+    /// 构造历史用户消息上下文项。
     pub fn history_user(item_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self::history(item_id, content, USER_MESSAGE_ROLE)
     }
 
+    /// 构造历史 assistant 消息上下文项。
     pub fn history_assistant(item_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self::history(item_id, content, ASSISTANT_MESSAGE_ROLE)
     }
@@ -3455,8 +3482,7 @@ fn provider_history_assistant_message(
     model_visible_calls: &[ModelToolCall],
     execution_calls: &[ModelToolCall],
 ) -> ModelMessage {
-    // Keep rejected calls diagnostically intact in state/tool_results, but never replay their raw
-    // provider name or arguments in the next ModelTurnRequest.
+    // 在 state/tool_results 中保留拒绝调用的诊断信息，但不把 provider 原始名称或参数重放到下一次请求。
     debug_assert_eq!(model_visible_calls.len(), execution_calls.len());
     let mut message = original
         .cloned()
@@ -3493,8 +3519,7 @@ fn tool_result_message(tool_result: &ToolResult, provider_tool_name: Option<&str
 }
 
 fn tool_call_request(call: &ModelToolCall) -> ToolCallRequest {
-    // The execution broker validates the parsed executable input; provider raw text remains in
-    // model messages and approval checkpoints rather than defining the executor payload.
+    // 执行 broker 校验解析后的可执行输入；provider 原始文本保留在模型消息和 approval checkpoint 中，不能定义执行器 payload。
     ToolCallRequest::new(
         call.tool_call_id.clone(),
         call.tool_name.clone(),

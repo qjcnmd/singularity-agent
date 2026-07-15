@@ -1,3 +1,5 @@
+//! Evaluation fixture：按数量计算节点总价。
+
 pub fn line_total(unit_price: i64, quantity: i64) -> i64 {
     let _ = quantity;
     unit_price

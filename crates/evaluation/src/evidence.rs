@@ -1,3 +1,5 @@
+//! Evaluation evidence 的 schema、摘要校验和结果绑定规则。
+
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Evaluation evidence 的 schema 版本。
 pub enum EvaluationEvidenceSchemaVersion {
     #[serde(rename = "evaluation.evidence/v1")]
     V1,
@@ -16,6 +19,7 @@ pub enum EvaluationEvidenceSchemaVersion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// 单项 evidence 的判定结果。
 pub enum EvidenceVerdict {
     Passed,
     Failed,
@@ -24,6 +28,7 @@ pub enum EvidenceVerdict {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 一组作用域摘要及其满足状态。
 pub struct EvaluationScopeEvidence {
     pub expectation_known: bool,
     pub expected_scope_digests: Vec<String>,
@@ -64,6 +69,7 @@ impl EvaluationScopeEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 单个任务的来源、路径、trace 和阶段 evidence。
 pub struct EvaluationTaskEvidence {
     pub task_id: TaskId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +116,7 @@ impl EvaluationTaskEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 与稳定 EvaluationResult 绑定的脱敏 evidence。
 pub struct EvaluationEvidence {
     pub schema_version: EvaluationEvidenceSchemaVersion,
     pub run_id: RunId,
@@ -120,6 +127,7 @@ pub struct EvaluationEvidence {
 }
 
 impl EvaluationEvidence {
+    /// 从 JSON 读取并校验证据。
     pub fn from_json_str(json: &str) -> Result<Self> {
         require_schema_version(json, EVIDENCE_SCHEMA_VERSION)?;
         let evidence: Self = serde_json::from_str(json)?;
@@ -127,6 +135,7 @@ impl EvaluationEvidence {
         Ok(evidence)
     }
 
+    /// 校验证据自身的闭集约束和任务选择摘要。
     pub fn validate(&self) -> Result<()> {
         validate_sha256_digest(&self.manifest_digest, "evaluation evidence manifest")?;
         validate_sha256_digest(
@@ -166,6 +175,7 @@ impl EvaluationEvidence {
         Ok(())
     }
 
+    /// 校验证据与稳定 EvaluationResult 的逐任务一致性。
     pub fn validate_against_result(&self, result: &EvaluationResult) -> Result<()> {
         self.validate()?;
         result.validate()?;
@@ -219,6 +229,7 @@ impl EvaluationEvidence {
     }
 }
 
+/// 计算固定顺序的任务选择摘要。
 pub fn task_selection_digest(task_ids: &[TaskId]) -> String {
     let values = task_ids
         .iter()

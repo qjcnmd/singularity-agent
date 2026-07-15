@@ -1,3 +1,5 @@
+//! AgentLoop 的 Direct tool、completion、approval 和恢复回归测试。
+
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopInput, AgentPlan,
     AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentStatus,

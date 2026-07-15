@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! 跨 crate 共享的 JSON-RPC 基础类型、敏感信息检测和 workspace 规则。
+
 mod cancellation;
 mod project_instructions;
 
@@ -17,12 +19,19 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+/// JSON-RPC 请求结构无效。
 pub const JSON_RPC_INVALID_REQUEST: i64 = -32600;
+/// JSON-RPC 方法不存在。
 pub const JSON_RPC_METHOD_NOT_FOUND: i64 = -32601;
+/// JSON-RPC 参数无效。
 pub const JSON_RPC_INVALID_PARAMS: i64 = -32602;
+/// JSON-RPC 内部错误。
 pub const JSON_RPC_INTERNAL_ERROR: i64 = -32603;
+/// AppServer 尚未初始化。
 pub const APP_ERROR_NOT_INITIALIZED: i64 = -32002;
+/// AppServer 已经初始化。
 pub const APP_ERROR_ALREADY_INITIALIZED: i64 = -32003;
+/// 请求的持久化对象不存在。
 pub const APP_ERROR_NOT_FOUND: i64 = -32004;
 const TOKEN_VALUE_MIN_BODY_CHARS: usize = 8;
 const SECRET_ASSIGNMENT_MIN_VALUE_CHARS: usize = 1;
@@ -112,6 +121,7 @@ const SECRET_FLAG_MARKERS: [&str; 6] = [
     "--password",
 ];
 
+/// 连接 AppServer 的客户端身份信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClientInfo {
     pub name: String,
@@ -120,6 +130,7 @@ pub struct ClientInfo {
 }
 
 impl ClientInfo {
+    /// 创建客户端身份信息。
     pub fn new(
         name: impl Into<String>,
         title: impl Into<String>,
@@ -133,11 +144,13 @@ impl ClientInfo {
     }
 }
 
+/// JSON-RPC 请求或持久化对象使用的字符串 ID。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct RequestId(String);
 
 impl RequestId {
+    /// 返回 ID 字符串视图。
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -160,10 +173,12 @@ impl From<String> for RequestId {
 pub struct Timestamp(OffsetDateTime);
 
 impl Timestamp {
+    /// 创建当前 UTC 时间戳。
     pub fn now_utc() -> Self {
         Self(OffsetDateTime::now_utc())
     }
 
+    /// 解析 RFC 3339 时间戳。
     pub fn parse(value: &str) -> Result<Self, time::error::Parse> {
         OffsetDateTime::parse(value, &Rfc3339).map(Self)
     }
@@ -205,6 +220,7 @@ impl JsonSchema for Timestamp {
     }
 }
 
+/// JSON-RPC 错误码和脱敏错误消息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorCode {
     pub code: i64,
@@ -212,6 +228,7 @@ pub struct ErrorCode {
 }
 
 impl ErrorCode {
+    /// 创建 JSON-RPC 错误码。
     pub fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -219,22 +236,27 @@ impl ErrorCode {
         }
     }
 
+    /// 构造未初始化错误。
     pub fn not_initialized() -> Self {
         Self::new(APP_ERROR_NOT_INITIALIZED, "Not initialized")
     }
 
+    /// 构造重复初始化错误。
     pub fn already_initialized() -> Self {
         Self::new(APP_ERROR_ALREADY_INITIALIZED, "Already initialized")
     }
 
+    /// 构造无效请求错误。
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(JSON_RPC_INVALID_REQUEST, message)
     }
 
+    /// 构造无效参数错误。
     pub fn invalid_params(message: impl Into<String>) -> Self {
         Self::new(JSON_RPC_INVALID_PARAMS, message)
     }
 
+    /// 构造方法不存在错误。
     pub fn method_not_found(method: impl AsRef<str>) -> Self {
         Self::new(
             JSON_RPC_METHOD_NOT_FOUND,
@@ -242,15 +264,18 @@ impl ErrorCode {
         )
     }
 
+    /// 构造资源不存在错误。
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(APP_ERROR_NOT_FOUND, message)
     }
 
+    /// 返回错误消息。
     pub fn message(&self) -> &str {
         &self.message
     }
 }
 
+/// 判断文本是否包含密钥、provider payload 或其他敏感信息标记。
 pub fn contains_sensitive_text(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     SENSITIVE_TEXT_MARKERS

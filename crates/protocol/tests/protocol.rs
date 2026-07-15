@@ -1,3 +1,5 @@
+//! JSON-RPC 请求、响应、事件和参数 schema 的协议测试。
+
 use singularity_core::ClientInfo;
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ArtifactFetchParams, ArtifactRef, ConversationMessage,

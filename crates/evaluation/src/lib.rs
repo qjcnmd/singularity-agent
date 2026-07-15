@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+//! Evaluation manifest、任务投影、结果和安全 evidence 的公共领域模型。
+
 mod evidence;
 mod manifest;
 mod result;
@@ -25,12 +27,17 @@ pub use result::{
 };
 pub use value::{Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId, ToolName};
 
+/// 当前 task set schema 版本。
 pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v4";
+/// 当前稳定 result schema 版本。
 pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v5";
+/// 当前 evidence schema 版本。
 pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v1";
+/// 核心任务成功率门禁的 basis points 阈值。
 pub const CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
 
 #[derive(Debug, thiserror::Error)]
+/// Evaluation 输入、执行和结果校验错误。
 pub enum EvaluationError {
     #[error("invalid evaluation JSON: {0}")]
     Json(#[from] serde_json::Error),
@@ -53,6 +60,7 @@ pub enum EvaluationError {
     TaskNotFound(TaskId),
 }
 
+/// Evaluation crate 的统一结果类型。
 pub type Result<T> = std::result::Result<T, EvaluationError>;
 
 pub(crate) fn require_schema_version(json: &str, expected: &'static str) -> Result<()> {

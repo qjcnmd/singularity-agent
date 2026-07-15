@@ -1,20 +1,27 @@
+//! 从 workspace 层级读取并限制项目指令的安全实现。
+
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+/// 项目指令文件名。
 pub const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
+/// 单个项目指令文件的最大字节数。
 pub const PROJECT_INSTRUCTIONS_MAX_FILE_BYTES: usize = 32 * 1024;
+/// 合并项目指令的最大总字节数。
 pub const PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES: usize = 64 * 1024;
 const PROJECT_INSTRUCTIONS_SEPARATOR: &str = "\n\n";
 const PROJECT_ROOT_MARKER: &str = ".git";
 
+/// 当前 workspace 读取到的项目指令集合。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInstructions {
     pub content: String,
     pub sources: Vec<PathBuf>,
 }
 
+/// 项目指令读取失败的稳定原因分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectInstructionErrorCode {
     WorkspaceRootUnavailable,
@@ -33,6 +40,7 @@ pub enum ProjectInstructionErrorCode {
 }
 
 impl ProjectInstructionErrorCode {
+    /// 返回稳定的错误代码字符串。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::WorkspaceRootUnavailable => "project_instruction_workspace_root_unavailable",
@@ -58,6 +66,7 @@ impl ProjectInstructionErrorCode {
     }
 }
 
+/// 项目指令错误及其关联路径。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInstructionError {
     pub code: ProjectInstructionErrorCode,
@@ -110,6 +119,7 @@ impl Display for ProjectInstructionError {
 
 impl std::error::Error for ProjectInstructionError {}
 
+/// 从 cwd 向上查找 workspace 并加载项目指令。
 pub fn load_project_instructions_from_cwd(
     cwd: impl AsRef<Path>,
 ) -> Result<Option<ProjectInstructions>, ProjectInstructionError> {
@@ -122,6 +132,7 @@ pub fn load_project_instructions_from_cwd(
     load_project_instructions(&workspace_root, &cwd)
 }
 
+/// 在给定 workspace 与 cwd 边界内加载项目指令。
 pub fn load_project_instructions(
     workspace_root: impl AsRef<Path>,
     cwd: impl AsRef<Path>,

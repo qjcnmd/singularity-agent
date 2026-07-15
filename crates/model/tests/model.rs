@@ -1,3 +1,5 @@
+//! Provider adapter、Direct capability probe、协议投影和错误归因测试。
+
 use schemars::schema_for;
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelBlockerKind, ModelError,

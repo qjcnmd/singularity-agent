@@ -1,3 +1,5 @@
+//! Evaluation command 的可信执行、scope digest 和 sandbox 诊断辅助逻辑。
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +18,7 @@ use super::{SharedSandboxBackend, evaluation_blocker};
 static COMMAND_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
+/// Evaluation command 的脱敏执行诊断。
 pub(super) struct CommandDiagnostic {
     pub(super) phase: String,
     execution_status: CommandExecutionStatus,
@@ -34,6 +37,7 @@ pub(super) struct CommandDiagnostic {
 }
 
 impl CommandDiagnostic {
+    /// 从命令结果构造阶段诊断。
     pub(super) fn new(phase: impl Into<String>, result: &CommandResult) -> Self {
         Self {
             phase: phase.into(),
@@ -52,6 +56,7 @@ impl CommandDiagnostic {
         }
     }
 
+    /// 为 manifest 命令补充稳定 scope digest。
     pub(super) fn for_spec(
         phase: impl Into<String>,
         workspace: &Path,
@@ -65,12 +70,14 @@ impl CommandDiagnostic {
         diagnostic
     }
 
+    /// 判断命令是否由严格 sandbox 执行。
     pub(super) fn is_strictly_sandboxed(&self) -> bool {
         !self.local_process_fallback
             && self.sandbox_enforcement == singularity_tools::SandboxBackendEnforcement::Strict
     }
 }
 
+/// 计算 manifest 命令的稳定 scope digest。
 pub(super) fn command_scope_digest_for_spec(
     workspace: &Path,
     command: &CommandSpec,
@@ -86,6 +93,7 @@ pub(super) fn command_scope_digest_for_spec(
     ))
 }
 
+/// 将 manifest 命令转换为 sandbox 请求并执行。
 pub(super) fn run_command_spec(
     workspace: &Path,
     command: &CommandSpec,
@@ -103,6 +111,7 @@ pub(super) fn run_command_spec(
     ))
 }
 
+/// 执行已经解析的 Evaluation command 请求。
 pub(super) fn run_raw_command(
     workspace: &Path,
     cwd: &Path,
@@ -151,6 +160,7 @@ fn resolve_command_cwd(workspace: &Path, cwd: Option<&str>) -> Result<PathBuf, S
     Ok(candidate)
 }
 
+/// 判断命令是否成功且满足 sandbox 门禁。
 pub(super) fn command_succeeded(result: &CommandResult) -> bool {
     result.execution_status == CommandExecutionStatus::Completed
         && result.semantic_status == CommandSemanticStatus::Succeeded
@@ -158,6 +168,7 @@ pub(super) fn command_succeeded(result: &CommandResult) -> bool {
         && result.sandbox.enforcement != singularity_tools::SandboxBackendEnforcement::Unavailable
 }
 
+/// 将 sandbox/backend 状态映射为基础设施 blocker。
 pub(super) fn infrastructure_blocker(
     result: &CommandResult,
     context: &str,
@@ -192,6 +203,7 @@ pub(super) fn infrastructure_blocker(
     }
 }
 
+/// 为命令结果生成最终 blocker。
 pub(super) fn command_blocker(
     result: &CommandResult,
     default_kind: BlockerKind,
@@ -205,6 +217,7 @@ pub(super) fn command_blocker(
     })
 }
 
+/// 将 Evaluation 网络策略投影为 sandbox 网络模式。
 pub(super) fn sandbox_network_mode(network_access: NetworkAccess) -> SandboxNetworkMode {
     match network_access {
         NetworkAccess::Denied => SandboxNetworkMode::Denied,

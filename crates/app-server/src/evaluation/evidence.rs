@@ -1,3 +1,5 @@
+//! Evaluation 结果的脱敏 command 观察、artifact 摘要和 evidence 构造。
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -18,6 +20,7 @@ use super::{
     StageDiagnostics, TOOL_COMMAND, TaskExecution,
 };
 
+/// 从任务计划和执行诊断构造脱敏 evidence。
 pub(super) fn build_evaluation_evidence(
     run_id: &RunId,
     manifest_digest: String,
@@ -51,10 +54,12 @@ pub(super) fn build_evaluation_evidence(
     Ok(evidence)
 }
 
+/// 计算产物内容摘要。
 pub(super) fn content_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+/// 从 Agent 结果提取 command scope 与未知审计计数。
 pub(super) fn agent_command_observation(result: &AgentLoopResult) -> (Vec<String>, usize) {
     let mut observed = Vec::new();
     let mut unknown_count = 0usize;
@@ -87,6 +92,7 @@ pub(super) fn agent_command_observation(result: &AgentLoopResult) -> (Vec<String
     (observed, unknown_count)
 }
 
+/// 只接受格式正确的 command scope digest。
 pub(super) fn safe_command_scope_digest(tool_result: &ToolResult) -> Option<&str> {
     (tool_result.tool_name == TOOL_COMMAND)
         .then_some(tool_result.result_id.as_deref())

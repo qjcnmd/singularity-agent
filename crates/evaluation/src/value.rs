@@ -1,3 +1,5 @@
+//! Evaluation 中可移植标识、工具名称和路径值对象的验证。
+
 use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -16,9 +18,11 @@ const CORE_TOOL_NAMES: [&str; 7] = [
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Evaluation 任务标识。
 pub struct TaskId(String);
 
 impl TaskId {
+    /// 创建并校验任务标识。
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         validate_identifier("task id", &value)?;
@@ -55,9 +59,11 @@ impl<'de> Deserialize<'de> for TaskId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Evaluation run 标识。
 pub struct RunId(String);
 
 impl RunId {
+    /// 创建并校验 run 标识。
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         validate_identifier("run id", &value)?;
@@ -94,9 +100,11 @@ impl<'de> Deserialize<'de> for RunId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// manifest 内允许的相对路径。
 pub struct RelativePath(String);
 
 impl RelativePath {
+    /// 创建并校验相对路径。
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         validate_relative_path(&value)?;
@@ -133,9 +141,11 @@ impl<'de> Deserialize<'de> for RelativePath {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// 经过脱敏约束的远程仓库地址。
 pub struct RemoteRepository(String);
 
 impl RemoteRepository {
+    /// 创建并校验远程仓库地址。
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         validate_remote_repository(&value)?;
@@ -166,9 +176,11 @@ impl<'de> Deserialize<'de> for RemoteRepository {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// 固定长度的完整 Git object id。
 pub struct GitCommit(String);
 
 impl GitCommit {
+    /// 创建并校验 40 或 64 位十六进制 commit。
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         if !matches!(value.len(), SHA1_HEX_LENGTH | SHA256_HEX_LENGTH)
@@ -206,9 +218,11 @@ impl<'de> Deserialize<'de> for GitCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Evaluation 允许使用的核心工具名。
 pub struct ToolName(String);
 
 impl ToolName {
+    /// 创建并校验工具名。
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         validate_tool_name(&value)?;
@@ -239,18 +253,22 @@ impl<'de> Deserialize<'de> for ToolName {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// 受验证的命令参数数组。
 pub struct Argv(Vec<String>);
 
 impl Argv {
+    /// 创建并校验命令参数数组。
     pub fn new(argv: Vec<String>) -> Result<Self, String> {
         validate_argv(&argv)?;
         Ok(Self(argv))
     }
 
+    /// 返回参数数组视图。
     pub fn as_slice(&self) -> &[String] {
         &self.0
     }
 
+    /// 取出参数数组所有权。
     pub fn into_vec(self) -> Vec<String> {
         self.0
     }

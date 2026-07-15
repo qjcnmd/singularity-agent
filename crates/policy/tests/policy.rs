@@ -1,3 +1,5 @@
+//! Policy rule、approval policy 和 permission decision 的行为测试。
+
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess,
     PermissionDecision, PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation,
