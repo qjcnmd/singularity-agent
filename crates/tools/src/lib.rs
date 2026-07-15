@@ -805,7 +805,7 @@ impl ToolOutput {
     }
 }
 
-/// Safe, bounded tool result used in model history, traces, and completion checks.
+/// Bounded internal outcome used to derive model history, traces, and completion evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolResult {
     pub tool_call_id: String,

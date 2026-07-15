@@ -184,7 +184,6 @@ impl CommandRequest {
         }
     }
 
-    /// Indicates that this command must not fall back to a local unsandboxed process.
     pub fn requires_sandbox(&self) -> bool {
         true
     }

@@ -1,7 +1,7 @@
 //! Stdio transport for the AppServer.
 //!
-//! Input is read independently, turn and approval requests run in bounded worker threads, and a
-//! a single writer serializes JSON-line output with fail-closed backpressure handling.
+//! Input is read independently; request-worker admission and transport queues are bounded, and a
+//! single writer serializes JSON-line output with fail-closed backpressure handling.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
