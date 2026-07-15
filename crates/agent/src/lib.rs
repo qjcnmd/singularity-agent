@@ -67,6 +67,8 @@ const TOOL_SELECTION_FAILURE_GROUP: &str = "tool_selection";
 const TOOL_SELECTION_FAILURE_PREFIX: &str = "tool_selection:";
 pub const BUILTIN_UPDATE_PLAN_TOOL: &str = "builtin_update_plan";
 pub const BUILTIN_INVOKE_TOOL: &str = "builtin_invoke_tool";
+// Provider-facing history only; this placeholder is never registered or executed.
+const PROVIDER_HISTORY_REJECTED_TOOL: &str = "builtin_tool_rejected";
 const MAX_PLAN_STEPS: usize = 64;
 const MAX_PLAN_STEP_CHARS: usize = 512;
 const MAX_VERIFICATION_REQUIREMENTS: usize = 64;
@@ -1512,13 +1514,11 @@ where
                 .iter()
                 .map(|call| state.observe_model_tool_call(call, &execution_tool_names))
                 .collect::<Vec<_>>();
-            let mut assistant_tool_message = response
-                .assistant_message
-                .clone()
-                .unwrap_or_else(|| ModelMessage::assistant_tool_calls(response.tool_calls.clone()));
-            if assistant_tool_message.tool_calls.is_empty() {
-                assistant_tool_message.tool_calls = response.tool_calls.clone();
-            }
+            let assistant_tool_message = provider_history_assistant_message(
+                response.assistant_message.as_ref(),
+                &response.tool_calls,
+                &execution_tool_calls,
+            );
             state.messages.push(assistant_tool_message);
             match self.process_tool_calls(
                 input,
@@ -1688,7 +1688,7 @@ where
         let tool_result = self.execute_tool(&call, decision, &mut state);
         let failed_tool_result = !tool_result.ok;
         let recovery_feedback = state.observe_tool_result(&tool_result, &tool_call_fingerprint);
-        state.messages.push(tool_result_message(&tool_result));
+        state.messages.push(tool_result_message(&tool_result, None));
         state.tool_results.push(tool_result.clone());
         if let Some(feedback) = recovery_feedback {
             state
@@ -2240,7 +2240,11 @@ where
             if !result.ok && is_repairable_tool_result(&result) {
                 repairable_failure = state.last_repair_failure.clone();
             }
-            state.messages.push(tool_result_message(&result));
+            let provider_tool_name = (prepared.call.parse_status != ModelToolParseStatus::Valid)
+                .then_some(PROVIDER_HISTORY_REJECTED_TOOL);
+            state
+                .messages
+                .push(tool_result_message(&result, provider_tool_name));
             state.tool_results.push(result);
             if let Some(feedback) = recovery_feedback {
                 state
@@ -3533,11 +3537,44 @@ fn assistant_message_text(message: Option<&ModelMessage>) -> String {
         .unwrap_or_default()
 }
 
-fn tool_result_message(tool_result: &ToolResult) -> ModelMessage {
-    let mut message = ModelMessage::text(
-        ModelRole::Tool,
-        tool_result.to_message_payload().to_string(),
-    );
+fn provider_history_assistant_message(
+    original: Option<&ModelMessage>,
+    model_visible_calls: &[ModelToolCall],
+    execution_calls: &[ModelToolCall],
+) -> ModelMessage {
+    // Keep rejected calls diagnostically intact in state/tool_results, but never replay their raw
+    // provider name or arguments in the next ModelTurnRequest.
+    debug_assert_eq!(model_visible_calls.len(), execution_calls.len());
+    let mut message = original
+        .cloned()
+        .unwrap_or_else(|| ModelMessage::assistant_tool_calls(Vec::new()));
+    message.tool_calls = model_visible_calls
+        .iter()
+        .zip(execution_calls)
+        .map(|(model_visible_call, execution_call)| {
+            if execution_call.parse_status == ModelToolParseStatus::Valid {
+                model_visible_call.clone()
+            } else {
+                ModelToolCall {
+                    tool_call_id: model_visible_call.tool_call_id.clone(),
+                    tool_name: PROVIDER_HISTORY_REJECTED_TOOL.to_string(),
+                    arguments: json!({}),
+                    raw_arguments: "{}".to_string(),
+                    parse_status: ModelToolParseStatus::Valid,
+                    validation_errors: Vec::new(),
+                }
+            }
+        })
+        .collect();
+    message
+}
+
+fn tool_result_message(tool_result: &ToolResult, provider_tool_name: Option<&str>) -> ModelMessage {
+    let mut payload = tool_result.to_message_payload();
+    if let Some(provider_tool_name) = provider_tool_name {
+        payload["tool_name"] = json!(provider_tool_name);
+    }
+    let mut message = ModelMessage::text(ModelRole::Tool, payload.to_string());
     message.tool_call_id = Some(tool_result.tool_call_id.clone());
     message
 }

@@ -717,7 +717,7 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
 }
 
 #[test]
-fn agent_loop_returns_unknown_native_tool_to_model_without_execution() {
+fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "ready").expect("write fixture");
     let input = AgentLoopInput {
@@ -727,7 +727,7 @@ fn agent_loop_returns_unknown_native_tool_to_model_without_execution() {
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
-        "builtin_missing",
+        "builtin/missing",
         serde_json::json!({}),
     ));
     let mut repaired_response =
@@ -766,6 +766,7 @@ fn agent_loop_returns_unknown_native_tool_to_model_without_execution() {
         result.tool_results[0].error_code.as_deref(),
         Some("tool_not_visible")
     );
+    assert_eq!(result.tool_results[0].tool_name, "builtin/missing");
     let audit = result.tool_results[0]
         .audit_metadata()
         .expect("unknown tool audit");
@@ -779,19 +780,47 @@ fn agent_loop_returns_unknown_native_tool_to_model_without_execution() {
     assert!(result.provider_diagnostic.is_none());
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
-    assert!(requests[1].messages.iter().any(|message| {
-        message.role == ModelRole::Assistant
-            && message
-                .tool_calls
-                .iter()
-                .any(|call| call.tool_call_id == "call_1")
-    }));
+    let rejected_assistant = requests[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == ModelRole::Assistant
+                && message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.tool_call_id == "call_1")
+        })
+        .expect("rejected assistant history");
+    let rejected_call = rejected_assistant
+        .tool_calls
+        .iter()
+        .find(|call| call.tool_call_id == "call_1")
+        .expect("rejected assistant tool call");
+    assert_eq!(rejected_call.tool_name, "builtin_tool_rejected");
+    assert_eq!(rejected_call.arguments, serde_json::json!({}));
+    assert_eq!(rejected_call.raw_arguments, "{}");
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .flat_map(|message| &message.tool_calls)
+            .all(|call| call.tool_name.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            ))
+    );
     let tool_message = requests[1].messages.last().expect("tool error message");
     assert_eq!(tool_message.role, ModelRole::Tool);
     assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_1"));
     let payload: serde_json::Value =
         serde_json::from_str(&tool_message.content).expect("tool result payload");
+    assert_eq!(payload["tool_name"], "builtin_tool_rejected");
     assert_eq!(payload["error_code"], "tool_not_visible");
+    assert!(
+        !requests[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("builtin/missing"))
+    );
 }
 
 #[test]
