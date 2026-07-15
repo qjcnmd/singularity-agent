@@ -98,6 +98,28 @@ fn capability_test_request(
     request
 }
 
+fn history_only_finalization_request(request_id: &str) -> ModelTurnRequest {
+    let mut request = ModelTurnRequest::new(
+        request_id,
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request
+        .messages
+        .push(ModelMessage::assistant_tool_calls(vec![tool_call(
+            "call_read",
+            "builtin_read",
+        )]));
+    let mut tool_result = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
+    tool_result.tool_call_id = Some("call_read".to_string());
+    request.messages.push(tool_result);
+    request.tool_choice = ToolChoicePolicy {
+        mode: ToolChoiceMode::None,
+        max_tool_calls: 0,
+        strict_tool_schema: false,
+    };
+    request
+}
+
 fn single_response_server(status_line: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test provider");
     let addr = listener.local_addr().expect("test provider address");
@@ -435,7 +457,7 @@ fn reasoning_stabilization_probe_server(
             let request: serde_json::Value =
                 serde_json::from_str(&request_body).expect("reasoning capability request JSON");
             requests.push(request_body);
-            if is_capability_probe_continuation_request(
+            if is_reasoning_probe_continuation_request(
                 requests.last().expect("continuation request"),
             ) {
                 assert_eq!(request["thinking"]["type"], "disabled");
@@ -855,6 +877,18 @@ const ACTUAL_TOOL_REASONING_RESPONSE: &str = r#"{
     }]
 }"#;
 
+const CHAT_HISTORY_REASONING_RESPONSE: &str = r#"{
+    "id": "chat_history_reasoning",
+    "choices": [{
+        "message": {
+            "role": "assistant",
+            "content": "done",
+            "reasoning_content": "private reasoning that requires replay"
+        },
+        "finish_reason": "stop"
+    }]
+}"#;
+
 fn sequence_response_server(
     responses: Vec<(&'static str, &'static str)>,
 ) -> (String, Receiver<usize>) {
@@ -1112,6 +1146,21 @@ fn is_capability_probe_continuation_request(request_body: &str) -> bool {
         .and_then(|request| request.get("messages").cloned())
         .and_then(|messages| messages.as_array().cloned())
         .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"))
+}
+
+fn is_reasoning_probe_continuation_request(request_body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(request_body)
+        .ok()
+        .and_then(|request| request.get("messages").cloned())
+        .and_then(|messages| messages.as_array().cloned())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"]
+                        .as_str()
+                        .is_some_and(|tool_call_id| tool_call_id.starts_with("probe_"))
+            })
+        })
 }
 
 fn capability_probe_continuation_response(tool_name: &str, arguments: serde_json::Value) -> String {
@@ -1588,21 +1637,7 @@ fn openai_tool_history_finalization_reuses_negotiated_protocol_without_tools() {
         ProviderApiProtocol::OpenAiResponses
     );
 
-    let mut request = capability_test_request(None, false, 1);
-    request.request_id = "request_finalization".to_string();
-    let historical_call = tool_call("call_read", "builtin_read");
-    request
-        .messages
-        .push(ModelMessage::assistant_tool_calls(vec![historical_call]));
-    let mut tool_result = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
-    tool_result.tool_call_id = Some("call_read".to_string());
-    request.messages.push(tool_result);
-    request.tools.clear();
-    request.tool_choice = ToolChoicePolicy {
-        mode: ToolChoiceMode::None,
-        max_tool_calls: 0,
-        strict_tool_schema: false,
-    };
+    let request = history_only_finalization_request("request_finalization");
 
     let response = provider
         .complete(&request, &cancellation)
@@ -1637,6 +1672,74 @@ fn openai_tool_history_finalization_reuses_negotiated_protocol_without_tools() {
             .any(|item| item["type"] == "function_call_output")
     );
     assert!(final_payload.get("tools").is_none());
+    assert_eq!(final_payload["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn openai_chat_tool_history_finalization_disables_reasoning_without_tools() {
+    let (base_url, requests) = reasoning_stabilization_probe_server(
+        "HTTP/1.1 200 OK",
+        PROBE_STRICT_PARALLEL_RESPONSE,
+        ACTUAL_DONE_RESPONSE,
+        1,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+
+    let response = provider
+        .complete(
+            &history_only_finalization_request("chat_request_finalization"),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("Chat tool-history finalization response");
+    assert_eq!(response.status, ModelTurnStatus::Success);
+
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured Chat finalization requests");
+    assert_eq!(captured.len(), 4);
+    let payload: serde_json::Value =
+        serde_json::from_str(captured.last().expect("Chat finalization request"))
+            .expect("Chat finalization request JSON");
+    assert!(payload.get("tools").is_none());
+    assert_eq!(payload["thinking"]["type"], "disabled");
+}
+
+#[test]
+fn openai_chat_tool_history_finalization_rejects_reasoning_content() {
+    let (base_url, requests) = reasoning_stabilization_probe_server(
+        "HTTP/1.1 200 OK",
+        PROBE_STRICT_PARALLEL_RESPONSE,
+        CHAT_HISTORY_REASONING_RESPONSE,
+        1,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+
+    let error = provider
+        .complete(
+            &history_only_finalization_request("chat_request_reasoning"),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("Chat history-only reasoning must fail closed");
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_mode_not_honored")
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"tool_reasoning_disable_not_honored".to_string())
+    );
+    let captured = requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("captured Chat reasoning boundary requests");
+    assert_eq!(captured.len(), 4);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(captured.last().expect("actual request JSON"))
+            .expect("actual request JSON")["thinking"]["type"],
+        "disabled"
+    );
 }
 
 #[test]

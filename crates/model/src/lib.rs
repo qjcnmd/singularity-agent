@@ -1466,7 +1466,7 @@ impl OpenAiProvider {
             api_protocol,
             model_name,
         )?;
-        if !request.tools.is_empty() && completion.reasoning_content_present {
+        if request_uses_tool_protocol(request) && completion.reasoning_content_present {
             return Err(provider_tool_reasoning_history_error(
                 &completion.response,
                 capabilities.tool_reasoning_mode,
@@ -1902,9 +1902,11 @@ fn openai_request_payload(
         );
         payload["tool_choice"] = openai_tool_choice_payload(request);
         payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
-        if capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls {
-            payload["thinking"] = json!({"type": "disabled"});
-        }
+    }
+    if request_uses_tool_protocol(request)
+        && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
+    {
+        payload["thinking"] = json!({"type": "disabled"});
     }
     payload
 }
@@ -1958,9 +1960,11 @@ fn openai_responses_request_payload(
         );
         payload["tool_choice"] = openai_responses_tool_choice_payload(request);
         payload["parallel_tool_calls"] = json!(request.tool_choice.max_tool_calls > 1);
-        if capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls {
-            payload["reasoning"] = json!({"effort": "none"});
-        }
+    }
+    if request_uses_tool_protocol(request)
+        && capabilities.tool_reasoning_mode == ProviderToolReasoningMode::DisabledForToolCalls
+    {
+        payload["reasoning"] = json!({"effort": "none"});
     }
     payload
 }
