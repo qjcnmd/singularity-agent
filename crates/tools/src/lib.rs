@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Tool schemas, broker decisions, workspace operations, and public tool-result projection.
+//! Tool schema、broker 决策、workspace 操作和公开 tool-result 投影。
 //!
-//! The broker validates the model-facing input again at the execution boundary, while
-//! `WorkspaceTools` enforces workspace and protected-path rules before any filesystem side effect.
+//! broker 会在执行边界再次校验面向模型的输入；`WorkspaceTools` 则在任何文件系统副作用前
+//! 强制执行 workspace 和 protected-path 规则。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -80,7 +80,7 @@ pub const BUILTIN_COMMAND_TOOL: &str = "builtin_command";
 static COMMAND_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a tool call may run with other read-only calls or must run alone.
+/// tool call 可以与其他只读调用并行，还是必须独占运行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionMode {
@@ -88,7 +88,7 @@ pub enum ToolExecutionMode {
     Exclusive,
 }
 
-/// Structured validation code returned before a tool reaches execution.
+/// tool 到达执行阶段前返回的结构化校验代码。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolInputValidationError {
     pub code: String,
@@ -108,7 +108,7 @@ struct ToolInputBinding {
     execution_input: Value,
 }
 
-/// Provider-visible schema plus separate validation and optional exact input bindings.
+/// 面向 Provider 的 schema，以及独立的校验逻辑和可选的精确输入绑定。
 #[derive(Clone)]
 pub struct ToolSpec {
     pub name: String,
@@ -398,7 +398,7 @@ where
         .map_err(|_| ToolInputValidationError::new(validation_code))
 }
 
-/// Returns the built-in workspace read, search, mutation, and command tool definitions.
+/// 返回内置的 workspace 读取、搜索、变更和命令 tool 定义。
 pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -519,7 +519,7 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// Registry that owns the tools exposed to the model and used by the broker.
+/// 负责管理向模型暴露且供 broker 使用的 tool 的 registry。
 #[derive(Debug, Default, Clone)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolSpec>,
@@ -571,7 +571,7 @@ impl ToolRegistry {
     }
 }
 
-/// Failure category retained so callers can distinguish input, policy, sandbox, and execution errors.
+/// 保留失败类别，使调用方能够区分输入、策略、sandbox 和执行错误。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolFailureKind {
@@ -591,7 +591,7 @@ pub enum ToolFailureKind {
     Cancelled,
 }
 
-/// Authorization result that determines whether the broker executes, denies, or pauses a call.
+/// 决定 broker 执行、拒绝还是暂停调用的授权结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolBrokerDecision {
@@ -639,7 +639,7 @@ impl ToolBrokerDecision {
     }
 }
 
-/// Execution boundary that revalidates tool input before invoking an executor closure.
+/// 执行边界；调用 executor closure 前会重新校验 tool 输入。
 #[derive(Debug, Default, Clone)]
 pub struct ToolBroker {
     registry: ToolRegistry,
@@ -678,7 +678,7 @@ impl ToolBroker {
         self.registry.validate_execution_input(name, input)
     }
 
-    /// Executes an allowed call or returns a typed result without invoking the closure.
+    /// 执行允许的调用；否则返回类型化结果且不调用 closure。
     pub fn execute<F>(
         &self,
         envelope: &ToolCallRequest,
@@ -740,7 +740,7 @@ impl ToolBroker {
     }
 }
 
-/// Canonical envelope passed from a model tool call to the broker and executor.
+/// 从模型 tool call 传给 broker 和 executor 的规范化 envelope。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolCallRequest {
     pub tool_call_id: String,
@@ -762,7 +762,7 @@ impl ToolCallRequest {
     }
 }
 
-/// Raw executor output before the broker bounds and redacts its public projection.
+/// broker 对其公开投影进行有界化和脱敏前的原始 executor 输出。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolOutput {
     pub ok: bool,
@@ -805,7 +805,7 @@ impl ToolOutput {
     }
 }
 
-/// Bounded internal outcome used to derive model history, traces, and completion evidence.
+/// 用于派生模型历史、trace 和 completion evidence 的有界内部结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolResult {
     pub tool_call_id: String,
@@ -1028,7 +1028,7 @@ fn value_string_array(value: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-/// Workspace boundary, protected-path, sandbox, and mutation errors returned by workspace tools.
+/// workspace tool 返回的 workspace 边界、protected-path、sandbox 和变更错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceToolError {
     OutsideWorkspace(String),
@@ -1066,7 +1066,7 @@ impl fmt::Display for WorkspaceToolError {
 
 impl std::error::Error for WorkspaceToolError {}
 
-/// Bounded file-read request accepted by the workspace tool.
+/// workspace tool 接受的有界文件读取请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadToolInput {
@@ -1092,7 +1092,7 @@ impl ReadToolInput {
     }
 }
 
-/// Bounded directory-list request accepted by the workspace tool.
+/// workspace tool 接受的有界目录列表请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListToolInput {
@@ -1124,7 +1124,7 @@ impl ListToolInput {
     }
 }
 
-/// Bounded text-search request accepted by the workspace tool.
+/// workspace tool 接受的有界文本搜索请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GrepToolInput {
@@ -1155,7 +1155,7 @@ impl GrepToolInput {
     }
 }
 
-/// Single-file replacement request accepted by the workspace tool.
+/// workspace tool 接受的单文件替换请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditToolInput {
@@ -1170,7 +1170,7 @@ impl EditToolInput {
     }
 }
 
-/// Multi-file mutation whose targets are validated before any write begins.
+/// 多文件变更；所有目标会在开始写入前完成校验。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePatch {
@@ -1191,7 +1191,7 @@ impl WorkspacePatch {
     }
 }
 
-/// One expected-content-guarded change within a workspace patch.
+/// workspace patch 中一个带预期内容保护的变更。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspacePatchChange {
@@ -1200,7 +1200,7 @@ pub struct WorkspacePatchChange {
     pub replacement: String,
 }
 
-/// Workspace file tools bound to a root and, for commands, a strict sandbox backend.
+/// 绑定到根目录的 workspace 文件 tool，以及为命令配置的 strict sandbox backend。
 #[derive(Clone)]
 pub struct WorkspaceTools {
     workspace_root: PathBuf,
@@ -1250,7 +1250,7 @@ impl WorkspaceTools {
         self
     }
 
-    /// Validates inputs and resolves every referenced path before execution or mutation.
+    /// 在执行或变更前校验输入，并解析每个被引用的路径。
     pub fn preflight(&self, tool_name: &str, input: &Value) -> Result<(), WorkspaceToolError> {
         match tool_name {
             BUILTIN_READ_TOOL => {
@@ -1548,7 +1548,7 @@ impl WorkspaceTools {
         self.command_cancellable(input, &CancellationToken::new())
     }
 
-    /// Runs a command only through the configured sandbox and propagates cancellation to it.
+    /// 仅通过已配置的 sandbox 运行命令，并将取消传播给命令。
     pub fn command_cancellable(
         &self,
         input: CommandToolInput,
@@ -1755,7 +1755,7 @@ impl WorkspaceTools {
         Ok(false)
     }
 
-    /// Canonicalizes a requested path and rejects workspace escapes and protected components.
+    /// 规范化请求路径，并拒绝越出 workspace 或包含受保护组件的路径。
     fn resolve_workspace_path(
         &self,
         path: &str,
@@ -1917,7 +1917,7 @@ impl CommandModelInput {
     }
 }
 
-/// Model-facing command input; sandbox and network modes are applied later by the execution path.
+/// 面向模型的命令输入；sandbox 和网络模式稍后由执行路径应用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandToolInput {
@@ -2018,7 +2018,7 @@ impl<'a> CommandScope<'a> {
     }
 }
 
-/// Builds the auditable permission resource for a command and its effective execution scope.
+/// 为命令及其生效执行范围构建可审计的权限资源标识。
 pub fn command_scope_resource(
     argv: &[String],
     cwd: &str,
@@ -2039,7 +2039,7 @@ pub fn command_scope_resource(
     }
 }
 
-/// Hashes the command, cwd, timeout, filesystem mode, and network mode for verification binding.
+/// 对命令、cwd、超时、文件系统模式和网络模式计算哈希，用于校验绑定。
 pub fn command_scope_digest(
     argv: &[String],
     cwd: &str,
@@ -2115,7 +2115,7 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, WorkspaceTool
     Ok(normalize_path(&resolved))
 }
 
-/// Reports whether a normalized path contains a protected or secret-like component.
+/// 判断规范化路径是否包含受保护或类似 secret 的组件。
 pub fn is_protected_path(path: &str) -> bool {
     path.replace('\\', "/")
         .split('/')
@@ -2155,7 +2155,7 @@ fn artifact_ref(prefix: &str, path: &str) -> String {
     format!("{prefix}{sanitized}")
 }
 
-/// Replaces one file through a temporary file so callers can roll back a multi-file mutation.
+/// 通过临时文件替换一个文件，使调用方能够回滚多文件变更。
 fn atomic_write(path: &Path, content: &str) -> Result<(), WorkspaceToolError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io_error)?;

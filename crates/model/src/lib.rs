@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Model-facing messages, provider capability contracts, and the OpenAI-compatible transport.
+//! 面向模型的消息、Provider 能力契约和 OpenAI-compatible 传输。
 //!
-//! Provider negotiation and validation live at this boundary so the AgentLoop can execute only
-//! requests and tool calls that the selected provider has declared or probed.
+//! Provider 协商和校验位于此边界，使 AgentLoop 只执行选定 Provider 已声明或探测到的请求
+//! 和 tool call。
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -67,7 +67,7 @@ const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
 const CAPABILITY_PROBE_DEVELOPER_INSTRUCTION: &str =
     "Follow the fixed capability probe request using native structured tool calls.";
 
-/// The roles supported by the model-facing conversation history.
+/// 面向模型的对话历史支持的角色。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelRole {
@@ -78,7 +78,7 @@ pub enum ModelRole {
     Tool,
 }
 
-/// A provider-facing message, including tool-call metadata needed to continue a turn.
+/// 面向 Provider 的消息，包括继续 turn 所需的 tool-call 元数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelMessage {
     pub role: ModelRole,
@@ -108,7 +108,7 @@ impl ModelMessage {
     }
 }
 
-/// Controls whether the provider may choose tools, must choose one, or must not call tools.
+/// 控制 Provider 可以选择 tool、必须选择一个 tool，还是不得调用 tool。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoiceMode {
@@ -117,7 +117,7 @@ pub enum ToolChoiceMode {
     Required,
 }
 
-/// Tool-selection limits and schema strictness applied to one model request.
+/// 应用于一次模型请求的 tool 选择限制和 schema 严格程度。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ToolChoicePolicy {
     pub mode: ToolChoiceMode,
@@ -144,7 +144,7 @@ pub enum ModelToolParseStatus {
     UnknownTool,
 }
 
-/// The provider-visible schema for one executable tool.
+/// 一个可执行 tool 面向 Provider 暴露的 schema。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelToolSchema {
     pub name: String,
@@ -152,7 +152,7 @@ pub struct ModelToolSchema {
     pub parameters_schema: Value,
 }
 
-/// A parsed model tool call together with raw arguments and validation outcome.
+/// 已解析的模型 tool call，以及原始参数和校验结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelToolCall {
     pub tool_call_id: String,
@@ -163,7 +163,7 @@ pub struct ModelToolCall {
     pub validation_errors: Vec<String>,
 }
 
-/// Whether tool reasoning content is compatible with the provider's tool-call history contract.
+/// tool reasoning 内容是否符合 Provider 的 tool-call 历史契约。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderToolReasoningMode {
@@ -172,7 +172,7 @@ pub enum ProviderToolReasoningMode {
     DisabledForToolCalls,
 }
 
-/// Describes whether tools are sent directly or through a provider-facing router envelope.
+/// 描述 tool 是直接发送，还是通过面向 Provider 的 router envelope 发送。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderToolDefinitionMode {
@@ -181,7 +181,7 @@ pub enum ProviderToolDefinitionMode {
     Routed,
 }
 
-/// The wire protocol selected for a provider completion request.
+/// 为 Provider completion 请求选定的线路协议。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
@@ -191,7 +191,7 @@ pub enum ProviderApiProtocol {
     OpenAiChatCompletions,
 }
 
-/// Capabilities that the provider must honor for request construction and response validation.
+/// Provider 必须遵守、用于构建请求和校验响应的能力。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolContract {
     pub supports_tools: bool,
@@ -227,7 +227,7 @@ impl Default for ProviderProtocolContract {
     }
 }
 
-/// The negotiated provider profile used for diagnostics and later request validation.
+/// 协商得到的 Provider profile，用于诊断和后续请求校验。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderCapabilityProfile {
@@ -239,7 +239,7 @@ pub enum ProviderCapabilityProfile {
     RoutedSingle,
 }
 
-/// Optional model parameters supplied by the AgentLoop for a completion request.
+/// AgentLoop 为 completion 请求提供的可选模型参数。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelPreferences {
     pub model_name: Option<String>,
@@ -249,7 +249,7 @@ pub struct ModelPreferences {
     pub json_mode: bool,
 }
 
-/// Redacted provider configuration presence information; secrets are never stored here.
+/// 脱敏的 Provider 配置存在性信息；这里永不存储 secret。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelProviderConfig {
     pub provider_name: Option<String>,
@@ -258,7 +258,7 @@ pub struct ModelProviderConfig {
     pub api_key_present: bool,
 }
 
-/// The configuration layer from which effective provider values were resolved.
+/// 解析出有效 Provider 配置值的配置层。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderConfigSource {
     ProcessEnvironment,
@@ -274,17 +274,16 @@ impl ProviderConfigSource {
     }
 }
 
-/// Resolved provider source and redacted configuration status before provider construction.
+/// 构建 Provider 前解析得到的来源和脱敏配置状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfigResolution {
     pub source: Option<ProviderConfigSource>,
     pub config: ModelProviderConfig,
 }
 
-/// A server-scoped provider configuration snapshot with redacted status and initialized provider.
+/// server-scoped 的 Provider 配置快照，包含脱敏状态和已初始化的 Provider。
 ///
-/// Capturing once lets the AppServer report and use the same configuration without exposing the
-/// API key or other raw environment values.
+/// 只捕获一次，使 AppServer 报告和使用同一份配置，同时不暴露 API key 或其他原始环境值。
 #[derive(Clone)]
 pub struct ProviderConfigSnapshot {
     snapshot_id: String,
@@ -354,7 +353,7 @@ impl ProviderConfigSnapshot {
     }
 }
 
-/// A stable blocker category reported when provider setup cannot proceed.
+/// Provider 初始化无法继续时报告的稳定阻塞类别。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelBlockerKind {
@@ -403,7 +402,7 @@ fn provider_initialization_blocker(category: &ModelErrorCategory) -> Option<Mode
     }
 }
 
-/// Redacted provider readiness and blocker information exposed to the AppServer.
+/// 暴露给 AppServer 的脱敏 Provider 就绪状态和阻塞信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderConfigurationStatus {
     pub configured: bool,
@@ -432,7 +431,7 @@ impl ProviderConfigurationStatus {
     }
 }
 
-/// Token and cost counters accumulated from provider completions and capability probes.
+/// 从 Provider completion 和能力探测中累积的 token 与成本计数器。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -443,7 +442,7 @@ pub struct ModelUsage {
     pub cost_estimate: Option<f64>,
 }
 
-/// Sanitized evidence describing a capability probe and the selected protocol profile.
+/// 描述能力探测和选定协议 profile 的清理后证据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderCapabilityMetadata {
     pub api_protocol: ProviderApiProtocol,
@@ -455,14 +454,14 @@ pub struct ProviderCapabilityMetadata {
     pub probe_attempt_metadata: ProviderAttemptMetadata,
 }
 
-/// The contract and diagnostics returned by provider capability negotiation.
+/// Provider 能力协商返回的契约和诊断信息。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderProtocolNegotiation {
     pub contract: ProviderProtocolContract,
     pub metadata: ProviderCapabilityMetadata,
 }
 
-/// Validation errors and non-fatal warnings for a model-side request or response.
+/// 模型侧请求或响应的校验错误和非致命警告。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelValidationResult {
     pub valid: bool,
@@ -488,7 +487,7 @@ impl ModelValidationResult {
     }
 }
 
-/// Specific failure kinds preserved from the provider boundary.
+/// 从 Provider 边界保留下来的具体失败类型。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorKind {
@@ -508,7 +507,7 @@ pub enum ModelErrorKind {
     UnknownProviderError,
 }
 
-/// Coarser error categories used by callers to decide status and recovery behavior.
+/// 供调用方决定状态和恢复行为的较粗错误类别。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelErrorCategory {
@@ -527,7 +526,7 @@ pub enum ModelErrorCategory {
     UnknownProviderError,
 }
 
-/// Stage at which a provider request or response failed.
+/// Provider 请求或响应发生失败的阶段。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorStage {
@@ -540,7 +539,7 @@ pub enum ProviderErrorStage {
     Cancelled,
 }
 
-/// Transport-level cause retained separately from model or policy semantics.
+/// 与模型或策略语义分开保留的传输层原因。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderTransportCategory {
@@ -551,7 +550,7 @@ pub enum ProviderTransportCategory {
     Unknown,
 }
 
-/// A model error with typed classification and sanitized provider diagnostics.
+/// 带类型分类和清理后 Provider 诊断信息的模型错误。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelError {
     pub kind: ModelErrorKind,
@@ -572,7 +571,7 @@ pub struct ModelError {
     pub validation_errors: Vec<String>,
 }
 
-/// The diagnostic subset of a model error that can cross the provider boundary safely.
+/// 模型错误中可以安全跨越 Provider 边界的诊断子集。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderDiagnostic {
     pub code: Option<String>,
@@ -640,7 +639,7 @@ pub fn classify_model_error(error: &ModelError) -> ModelErrorCategory {
     model_error_category(error)
 }
 
-/// The complete model request passed to a provider, including visible tools and tool policy.
+/// 传给 Provider 的完整模型请求，包括可见 tool 和 tool 策略。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelTurnRequest {
     pub request_id: String,
@@ -662,7 +661,7 @@ impl ModelTurnRequest {
     }
 }
 
-/// Whether a provider turn produced a valid completion or failed validation.
+/// Provider turn 产生了有效 completion，还是未通过校验。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTurnStatus {
@@ -671,7 +670,7 @@ pub enum ModelTurnStatus {
     Invalid,
 }
 
-/// A provider completion paired with parsed tool calls, usage, validation, and error state.
+/// Provider completion 及其配对的已解析 tool call、usage、校验和错误状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ModelTurnResponse {
     pub request_id: String,
@@ -712,7 +711,7 @@ impl ModelTurnResponse {
     }
 }
 
-/// Attempt and retry counts recorded for one provider operation.
+/// 一次 Provider 操作记录的尝试次数和重试次数。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderAttemptMetadata {
     pub attempt_count: u32,
@@ -753,12 +752,12 @@ impl ProviderProtocolNegotiation {
     }
 }
 
-/// Provider boundary used by the AgentLoop for capability negotiation and completion.
+/// AgentLoop 用于能力协商和 completion 的 Provider 边界。
 pub trait Provider {
-    /// Returns the provider's declared baseline contract before dynamic negotiation.
+    /// 在动态协商前返回 Provider 声明的基线契约。
     fn protocol_contract(&self) -> ProviderProtocolContract;
 
-    /// Probes or resolves tool capabilities before tool-bearing requests are sent.
+    /// 在发送带 tool 的请求前探测或解析 tool 能力。
     fn negotiate_tool_capabilities(
         &self,
         _model_preferences: &ModelPreferences,
@@ -769,7 +768,7 @@ pub trait Provider {
         ))
     }
 
-    /// Completes one validated request while preserving cancellation and typed provider errors.
+    /// 完成一个已校验请求，同时保留取消和类型化 Provider 错误。
     fn complete(
         &self,
         request: &ModelTurnRequest,
@@ -777,7 +776,7 @@ pub trait Provider {
     ) -> Result<ModelTurnResponse, ProviderError>;
 }
 
-/// Resolved OpenAI-compatible connection settings with secrets retained only for transport use.
+/// 已解析的 OpenAI-compatible 连接设置；secret 仅为传输使用而保留。
 #[derive(Clone, PartialEq, Eq)]
 pub struct OpenAiProviderConfig {
     pub provider_name: String,
@@ -925,7 +924,7 @@ impl OpenAiProviderConfig {
     }
 }
 
-/// OpenAI-compatible provider that negotiates capabilities and validates every completion.
+/// 协商能力并校验每次 completion 的 OpenAI-compatible Provider。
 #[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
@@ -1792,7 +1791,7 @@ fn request_uses_tool_protocol(request: &ModelTurnRequest) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Error)]
 #[error("{message}")]
-/// A provider failure with typed model error, attempt metadata, and optional capability evidence.
+/// Provider 失败，包含类型化模型错误、尝试元数据和可选能力证据。
 pub struct ProviderError {
     pub message: String,
     pub error: Box<ModelError>,
@@ -1855,7 +1854,7 @@ fn attach_capability_metadata(
     error
 }
 
-/// Resolves a base URL to an OpenAI-compatible Chat Completions endpoint.
+/// 将 base URL 解析为 OpenAI-compatible Chat Completions endpoint。
 pub fn chat_completions_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.ends_with(CHAT_COMPLETIONS_PATH) {
@@ -1867,7 +1866,7 @@ pub fn chat_completions_endpoint(base_url: &str) -> String {
     }
 }
 
-/// Resolves a base URL to an OpenAI-compatible Responses endpoint.
+/// 将 base URL 解析为 OpenAI-compatible Responses endpoint。
 pub fn responses_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.ends_with(RESPONSES_PATH) {
@@ -1881,7 +1880,7 @@ pub fn responses_endpoint(base_url: &str) -> String {
     }
 }
 
-/// Converts a provider failure into the failed response shape consumed by the AgentLoop.
+/// 将 Provider 失败转换为 AgentLoop 使用的失败响应结构。
 pub fn provider_error_response(
     request: &ModelTurnRequest,
     error: ProviderError,
@@ -1903,7 +1902,7 @@ pub fn provider_error_response(
     }
 }
 
-/// Resolves provider configuration while reporting only redacted presence and source metadata.
+/// 解析 Provider 配置，同时只报告脱敏存在性和来源元数据。
 pub fn resolve_provider_config<F>(get_env: F) -> ProviderConfigResolution
 where
     F: FnMut(&str) -> Option<String>,
@@ -3589,7 +3588,7 @@ fn provider_response_json_error() -> ModelError {
     )
 }
 
-/// Checks whether the redacted provider configuration contains all required values.
+/// 检查脱敏 Provider 配置是否包含全部必需值。
 pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidationResult {
     let mut errors = Vec::new();
     if missing(&config.provider_name) {
@@ -3607,7 +3606,7 @@ pub fn validate_provider_config(config: &ModelProviderConfig) -> ModelValidation
     validation_result(errors, Vec::new())
 }
 
-/// Validates a model request before provider-specific capability checks are applied.
+/// 在应用 Provider 专属能力检查前校验模型请求。
 pub fn validate_model_request(request: &ModelTurnRequest) -> ModelValidationResult {
     validate_model_request_with_capabilities(request, None)
 }
@@ -3720,7 +3719,7 @@ fn is_portable_tool_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
-/// Reports whether a JSON Schema can be sent under the provider's strict tool-schema contract.
+/// 报告 JSON Schema 是否能够在 Provider 的严格 tool-schema 契约下发送。
 pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
     if schema.get("const").is_some() {
         return true;
@@ -3777,7 +3776,7 @@ pub fn is_strict_tool_schema_compatible(schema: &Value) -> bool {
     }
 }
 
-/// Validates a complete provider turn against its request and negotiated capabilities.
+/// 根据对应请求和协商能力校验完整的 Provider turn。
 pub fn validate_model_turn_response(
     request: &ModelTurnRequest,
     response: &ModelTurnResponse,
@@ -3818,7 +3817,7 @@ pub fn validate_model_turn_response(
     result
 }
 
-/// Validates parsed provider content and tool calls before the AgentLoop acts on them.
+/// 在 AgentLoop 处理前校验已解析的 Provider 内容和 tool call。
 pub fn validate_model_response(
     assistant_message: Option<&ModelMessage>,
     tool_calls: &[ModelToolCall],

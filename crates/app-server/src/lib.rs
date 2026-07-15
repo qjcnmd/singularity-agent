@@ -1,10 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! JSON-RPC application server that owns turn admission, AgentLoop execution, persistence, and
-//! cancellation at the process boundary.
+//! 在进程边界负责 turn 准入、AgentLoop 执行、持久化和取消的 JSON-RPC application server。
 //!
-//! The server keeps protocol handling separate from worker execution and commits terminal state
-//! through the SessionStore before emitting corresponding events.
+//! server 将协议处理与 worker 执行分离，并通过 SessionStore 提交终态后再发出对应事件。
 
 mod evaluation;
 
@@ -72,7 +70,7 @@ const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 const TURN_CANCELLATION_POLL_MS: u64 = 25;
 const STRICT_COMMAND_SANDBOX_UNAVAILABLE: &str = "strict_command_sandbox_unavailable";
 
-/// Errors translated into JSON-RPC responses at the application boundary.
+/// 在 application 边界转换为 JSON-RPC 响应的错误。
 #[derive(Debug, Error)]
 pub enum AppServerError {
     #[error("invalid json: {0}")]
@@ -87,11 +85,11 @@ pub enum AppServerError {
     Workspace(String),
 }
 
-/// Result type for AppServer request handling and lifecycle operations.
+/// AppServer 请求处理和生命周期操作使用的结果类型。
 pub type AppServerResult<T> = Result<T, AppServerError>;
 type ApprovalCheckpoint = (ApprovalRequest, Value);
 
-/// Stateful JSON-RPC server coordinating threads, turns, approvals, traces, and workers.
+/// 协调 thread、turn、approval、trace 和 worker 的有状态 JSON-RPC server。
 pub struct AppServer {
     store: SessionStore,
     initialized: bool,
@@ -104,7 +102,7 @@ pub struct AppServer {
     execution_stopped: Arc<AtomicBool>,
 }
 
-/// Cloneable stop handle shared by request workers and the stdio transport.
+/// 由 request worker 与 stdio 传输层共享的可克隆停止句柄。
 #[derive(Clone)]
 pub struct AppServerCancellationHandle {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -112,7 +110,7 @@ pub struct AppServerCancellationHandle {
 }
 
 impl AppServerCancellationHandle {
-    /// Stops future execution and propagates cancellation to every active turn.
+    /// 停止后续执行，并将取消传播到每个活动 turn。
     pub fn request_execution_stop(&self) -> AppServerResult<()> {
         self.execution_stopped.store(true, Ordering::SeqCst);
         for cancellation in self
@@ -147,7 +145,7 @@ impl Drop for ActiveTurnGuard {
 }
 
 impl AppServer {
-    /// Creates an uninitialized server using the platform sandbox and captured provider snapshot.
+    /// 使用平台 sandbox 和已捕获的 Provider 配置快照创建未初始化的 server。
     pub fn new(store: SessionStore, provider_snapshot: ProviderConfigSnapshot) -> Self {
         Self {
             store,
@@ -189,7 +187,7 @@ impl AppServer {
         }
     }
 
-    /// Opens an independent store connection for a request worker while sharing stop state.
+    /// 为 request worker 打开独立的 store 连接，同时共享停止状态。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
             store: SessionStore::open(&self.store.descriptor().path)?,
@@ -204,7 +202,7 @@ impl AppServer {
         })
     }
 
-    /// Registers one active turn and attaches a durable cancellation monitor to it.
+    /// 注册一个活动 turn，并为其附加持久化取消监视器。
     fn activate_turn(
         &self,
         turn_id: &str,
@@ -252,13 +250,13 @@ impl AppServer {
         self.store.get_turn(&turn.turn_id).map_err(Into::into)
     }
 
-    /// Parses one JSON-RPC line and dispatches it through the protocol state machine.
+    /// 解析一行 JSON-RPC，并通过协议状态机进行分发。
     pub fn handle_json(&mut self, line: &str) -> AppServerResult<Vec<Value>> {
         let message: JsonRpcMessage = serde_json::from_str(line)?;
         self.handle(message)
     }
 
-    /// Handles one parsed JSON-RPC request and returns zero or more wire responses/events.
+    /// 处理一个已解析的 JSON-RPC 请求，并返回零个或多个线路响应/事件。
     pub fn handle(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let id = message.id.clone();
         let Some(method_name) = message.method.as_deref() else {
@@ -527,7 +525,7 @@ impl AppServer {
         Ok(messages)
     }
 
-    /// Runs `turn/start` while emitting lifecycle events as each durable stage completes.
+    /// 执行 `turn/start`，并在每个持久化阶段完成时发出生命周期事件。
     pub fn handle_turn_start_streaming(
         &mut self,
         message: JsonRpcMessage,
@@ -646,7 +644,7 @@ impl AppServer {
         }
     }
 
-    /// Builds the AgentLoop from the captured provider, workspace policy, and persisted history.
+    /// 根据已捕获的 Provider、workspace 策略和持久化历史构建 AgentLoop。
     fn run_agent_loop(
         &self,
         thread: &Thread,
@@ -683,7 +681,7 @@ impl AppServer {
         }
     }
 
-    /// Resumes an approved checkpoint only when the store and turn still satisfy its contract.
+    /// 仅当 store 与 turn 仍满足其契约时恢复已批准的 checkpoint。
     fn resume_agent_loop(
         &self,
         request: &ApprovalRequest,
@@ -726,7 +724,7 @@ impl AppServer {
         )
     }
 
-    /// Reconstructs the canonical loop input and executes one approved pending call.
+    /// 重建规范化的 loop 输入，并执行一个已批准的待执行调用。
     fn resume_agent_loop_after_gate<P>(
         &self,
         request: &ApprovalRequest,
@@ -910,7 +908,7 @@ impl AppServer {
         }
     }
 
-    /// Persists every AgentLoop checkpoint before the blocked turn is exposed to clients.
+    /// 在向客户端暴露阻塞 turn 前持久化每个 AgentLoop checkpoint。
     fn persist_agent_approval_requests(&self, result: &AgentLoopResult) -> AppServerResult<()> {
         for (request, pending_tool_call) in approval_checkpoints(result)? {
             match self.store.create_approval_with_pending_tool_call_and_trace(
@@ -927,7 +925,7 @@ impl AppServer {
         Ok(())
     }
 
-    /// Maps run status to durable turn state, giving cancellation precedence at commit time.
+    /// 将运行状态映射为持久化 turn 状态，并在提交时让取消优先。
     fn commit_turn_run_status(
         &self,
         turn: Turn,
@@ -989,7 +987,7 @@ impl AppServer {
         )
     }
 
-    /// Commits approval continuation state and any next checkpoint as one store transaction.
+    /// 在一个 store 事务中提交 approval 续行状态及后续 checkpoint（如有）。
     fn commit_effective_turn_status_resolving_approval(
         &self,
         request_id: &str,
@@ -1151,7 +1149,7 @@ impl AppServer {
         invalid_request_response(message.id, APPROVAL_REQUEST_INTERNAL_ONLY)
     }
 
-    /// Records an approval and either preserves it, fails it, or resumes the claimed checkpoint.
+    /// 记录 approval，并保留、失败处理或恢复已认领的 checkpoint。
     fn approval_decision(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let decision: ApprovalDecision = parse_params(&message)?;
         let pending_request = match self.store.get_pending_approval(&decision.request_id) {
@@ -1553,7 +1551,7 @@ fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
     }
 }
 
-/// Watches the durable turn state so an external interrupt reaches the in-process AgentLoop.
+/// 监视持久化 turn 状态，使外部中断能够到达进程内 AgentLoop。
 fn cancellation_monitor(
     store_path: &str,
     turn_id: &str,

@@ -1,9 +1,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! Cross-platform command request and result contracts for strict sandbox execution.
+//! 严格 sandbox 执行所需的跨平台命令请求与结果契约。
 //!
-//! Platform adapters implement the `SandboxBackend` boundary; this crate owns the portable
-//! permission modes, capability checks, cancellation semantics, and fail-closed result mapping.
+//! 平台 adapter 实现 `SandboxBackend` 边界；本 crate 负责可移植的权限模式、能力检查、
+//! 取消语义和 fail-closed 结果映射。
 
 use std::path::Path;
 #[cfg(windows)]
@@ -81,7 +81,7 @@ const SENSITIVE_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"]
 #[cfg(windows)]
 const SENSITIVE_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
 
-/// Filesystem permission requested for a command.
+/// 命令请求的文件系统权限。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxFilesystemMode {
@@ -90,7 +90,7 @@ pub enum SandboxFilesystemMode {
     DangerFullAccess,
 }
 
-/// Network permission requested for a command.
+/// 命令请求的网络权限。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxNetworkMode {
@@ -98,20 +98,20 @@ pub enum SandboxNetworkMode {
     Allowed,
 }
 
-/// Filesystem policy paired with the workspace root used by a command request.
+/// 与命令请求使用的 workspace 根目录配对的文件系统策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxFilesystemPolicy {
     pub mode: SandboxFilesystemMode,
     pub workspace_root: String,
 }
 
-/// Network policy applied by the selected sandbox backend.
+/// 由选定 sandbox backend 应用的网络策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxNetworkPolicy {
     pub mode: SandboxNetworkMode,
 }
 
-/// Whether execution completed, was denied, cancelled, timed out, or unavailable.
+/// 执行是已完成、被拒绝、已取消、超时还是不可用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandExecutionStatus {
@@ -125,7 +125,7 @@ pub enum CommandExecutionStatus {
     BackendError,
 }
 
-/// Domain meaning of a command result, kept separate from backend execution status.
+/// 命令结果的领域语义，与 backend 执行状态分开保存。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandSemanticStatus {
@@ -139,7 +139,7 @@ pub enum CommandSemanticStatus {
     Cancelled,
 }
 
-/// Controls which host environment variables are allowed into a child command.
+/// 控制哪些宿主环境变量可以传入子命令。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandEnvironmentPolicy {
@@ -148,7 +148,7 @@ pub enum CommandEnvironmentPolicy {
     EvaluationIsolated,
 }
 
-/// Complete portable command request handed to a sandbox backend.
+/// 交给 sandbox backend 的完整可移植命令请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandRequest {
     pub command_id: String,
@@ -193,7 +193,7 @@ impl CommandRequest {
     }
 }
 
-/// Strength of enforcement actually provided by a backend.
+/// backend 实际提供的强制执行强度。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxBackendEnforcement {
@@ -202,7 +202,7 @@ pub enum SandboxBackendEnforcement {
     Unavailable,
 }
 
-/// Safe execution metadata used to distinguish strict, restricted, and unavailable backends.
+/// 用于区分 strict、restricted 和 unavailable backend 的安全执行元数据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxExecutionMetadata {
     pub backend: String,
@@ -228,7 +228,7 @@ impl SandboxExecutionMetadata {
     }
 }
 
-/// Bounded command result with redacted previews and backend enforcement metadata.
+/// 带脱敏预览和 backend 强制执行元数据的有界命令结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandResult {
     pub command_id: String,
@@ -244,14 +244,14 @@ pub struct CommandResult {
     pub sandbox: SandboxExecutionMetadata,
 }
 
-/// Bounded text preview returned by output-limiting helpers.
+/// 输出限制辅助函数返回的有界文本预览。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct BoundedCommandOutput {
     pub preview: String,
     pub truncated: bool,
 }
 
-/// Bounds command output without exposing unbounded stdout or stderr to callers.
+/// 限制命令输出，避免向调用方暴露无界的 stdout 或 stderr。
 pub fn bound_command_output(output: &str, max_chars: usize) -> BoundedCommandOutput {
     let preview = output.chars().take(max_chars).collect::<String>();
     let truncated = output.chars().count() > preview.chars().count();
@@ -418,7 +418,7 @@ fn command_output_contains_sensitive_marker(output: &str) -> bool {
     contains_sensitive_text(output)
 }
 
-/// Capabilities a backend must expose before command execution is considered available.
+/// backend 必须提供、命令执行才可视为可用的能力。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxCapabilities {
     pub filesystem_isolation: bool,
@@ -479,7 +479,7 @@ impl SandboxCapabilities {
         }
     }
 
-    /// Returns whether the capability set is sufficient for the strict command contract.
+    /// 判断能力集合是否足以满足严格命令契约。
     pub fn supports_command_execution(&self) -> bool {
         self.env_isolation
             && self.path_admission
@@ -490,7 +490,7 @@ impl SandboxCapabilities {
                 || (self.restricted_token && self.job_object))
     }
 
-    /// Projects capabilities into the enforcement level recorded on command results.
+    /// 将能力投影为记录在命令结果中的强制执行级别。
     pub fn enforcement(&self) -> SandboxBackendEnforcement {
         if !self.supports_command_execution() {
             SandboxBackendEnforcement::Unavailable
@@ -522,16 +522,16 @@ impl SandboxCapabilities {
     }
 }
 
-/// Backend boundary for strict command execution and cancellation propagation.
+/// 严格命令执行和取消传播的 backend 边界。
 pub trait SandboxBackend {
-    /// Stable backend name used in capability and execution metadata.
+    /// 用于能力和执行元数据的稳定 backend 名称。
     fn name(&self) -> &'static str;
-    /// Reports the controls this backend can enforce for the current platform.
+    /// 报告该 backend 在当前平台能够强制执行的控制项。
     fn capabilities(&self) -> SandboxCapabilities;
-    /// Executes one request; unavailable or unsupported backends must return a blocked result.
+    /// 执行一个请求；不可用或不支持的 backend 必须返回 blocked 结果。
     fn execute(&self, request: &CommandRequest) -> CommandResult;
 
-    /// Executes with cancellation, defaulting to a pre-execution cancellation check.
+    /// 执行并支持取消，默认先进行执行前取消检查。
     fn execute_cancellable(
         &self,
         request: &CommandRequest,
@@ -574,7 +574,7 @@ impl SandboxBackend for WindowsSandboxBackend {
     }
 }
 
-/// Converts argv into the stable permission resource used by policy and audit records.
+/// 将 argv 转换为策略和审计记录使用的稳定权限资源标识。
 pub fn command_permission_resource(argv: &[String]) -> String {
     if argv.is_empty() {
         return String::new();

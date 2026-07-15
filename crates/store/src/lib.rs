@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! SQLite-backed session, turn, approval, trace, artifact, and recovery state.
+//! 由 SQLite 支持的 session、turn、approval、trace、artifact 和 recovery 状态。
 //!
-//! Mutating operations use transactions and explicit bindings so approval checkpoints, turn
-//! outcomes, and execution ownership can be recovered without replaying an unknown side effect.
+//! 变更操作使用事务和显式绑定，使 approval checkpoint、turn 结果和执行所有权能够恢复，
+//! 且无需重放未知的外部副作用。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -72,7 +72,7 @@ const APPROVAL_CHECKPOINT_TOOL_CALL_MISMATCH: &str =
 const PENDING_APPROVAL_ALLOW_REQUIRES_ACTIVE_THREAD: &str =
     "pending approval allow requires an active thread";
 
-/// Errors that preserve storage, integrity, binding, and execution-ownership causes.
+/// 保留存储、完整性、绑定和执行所有权原因的错误。
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -99,10 +99,10 @@ pub enum StoreError {
     WorkspaceHasNonterminalTurn { thread_id: String, turn_id: String },
 }
 
-/// Result type returned by all session-store operations.
+/// 所有 session store 操作返回的结果类型。
 pub type StoreResult<T> = Result<T, StoreError>;
 
-/// Public description of the SQLite store and its supported schema version.
+/// SQLite store 的公开描述及其支持的 schema 版本。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStoreDescriptor {
     pub backend: String,
@@ -110,14 +110,14 @@ pub struct SessionStoreDescriptor {
     pub schema_version: u32,
 }
 
-/// A page of completed conversation history ordered for model reconstruction.
+/// 按模型重建所需顺序排列的一页已完成对话历史。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadHistoryPage {
     pub messages: Vec<ConversationMessage>,
     pub next_before_turn_sequence: Option<u64>,
 }
 
-/// Atomic result of creating a turn, its user item, trace, and initial history page.
+/// 创建 turn、用户 item、trace 和初始历史页后得到的原子结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StartedTurn {
     pub turn: Turn,
@@ -126,7 +126,7 @@ pub struct StartedTurn {
     pub history: ThreadHistoryPage,
 }
 
-/// Atomic turn outcome together with any durable plan, assistant item, and trace.
+/// turn 的原子结果，以及相关的持久化 plan、assistant item 和 trace（如有）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTurnOutcome {
     pub turn: Turn,
@@ -135,14 +135,14 @@ pub struct CommittedTurnOutcome {
     pub trace: TraceEvent,
 }
 
-/// Durable SQLite store that owns turn lifecycle, approvals, traces, artifacts, and recovery.
+/// 负责 turn 生命周期、approval、trace、artifact 和 recovery 的持久化 SQLite store。
 pub struct SessionStore {
     connection: Connection,
     descriptor: SessionStoreDescriptor,
     runtime_path: Option<PathBuf>,
 }
 
-/// Process-held ownership guard that serializes execution for a thread or workspace.
+/// 由进程持有、用于串行化 thread 或 workspace 执行的所有权 guard。
 pub struct WorkspaceExecutionGuard {
     execution_scope: WorkspaceExecutionScope,
     store_path: PathBuf,
@@ -154,7 +154,7 @@ enum WorkspaceExecutionScope {
     Thread(String),
 }
 
-/// Approval decision plus the checkpoint and trace data needed by the AppServer.
+/// approval 决定，以及 AppServer 所需的 checkpoint 和 trace 数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordedApprovalDecision {
     pub request: ApprovalRequest,
@@ -163,7 +163,7 @@ pub struct RecordedApprovalDecision {
     pub trace: TraceEvent,
 }
 
-/// Inputs for registering a redacted, content-addressed artifact reference.
+/// 注册脱敏、内容寻址 artifact 引用的输入。
 pub struct RegisterArtifactRefParams<'a> {
     pub run_id: &'a str,
     pub item_id: Option<&'a str>,
@@ -174,7 +174,7 @@ pub struct RegisterArtifactRefParams<'a> {
     pub metadata: Value,
 }
 
-/// Durable fields committed for one terminal, interrupted, or approval-blocked turn outcome.
+/// 为一个终止、已中断或 approval 阻塞的 turn 结果提交的持久化字段。
 pub struct CommitTurnOutcomeParams<'a> {
     pub status: TurnStatus,
     pub agent_loop_status: &'a str,
@@ -184,7 +184,7 @@ pub struct CommitTurnOutcomeParams<'a> {
 }
 
 impl SessionStore {
-    /// Opens a SQLite store, configures fail-closed pragmas, and applies schema checks/migrations.
+    /// 打开 SQLite store，配置 fail-closed pragma，并执行 schema 检查/迁移。
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
         let path = path.as_ref();
         let _initialization_lock = acquire_store_initialization_lock(path)?;
@@ -212,7 +212,7 @@ impl SessionStore {
         &self.descriptor
     }
 
-    /// Attempts to claim execution ownership and recovers abandoned work before returning it.
+    /// 尝试认领执行所有权，并在返回前恢复已遗弃的工作。
     pub fn try_begin_workspace_execution(
         &self,
         thread_id: &str,
@@ -253,7 +253,7 @@ impl SessionStore {
         }
     }
 
-    /// Reclaims persisted non-terminal work whose process owner is no longer present.
+    /// 重新认领进程所有者已不存在的持久化非终态工作。
     pub fn recover_unowned_workspace_executions(&self) -> StoreResult<()> {
         let mut statement = self.connection.prepare(
             "select thread_id from turns
@@ -455,7 +455,7 @@ impl SessionStore {
         Ok((started.turn, started.item, started.trace))
     }
 
-    /// Atomically creates a turn, sanitizes its input, records its trace, and reads prior history.
+    /// 原子地创建 turn、清理其输入、记录 trace，并读取此前的历史。
     pub fn create_turn_with_input_trace_and_history(
         &self,
         thread_id: &str,
@@ -590,7 +590,7 @@ impl SessionStore {
         self.get_turn(turn_id)
     }
 
-    /// Commits a turn state and its durable items and trace in one transaction.
+    /// 在一个事务中提交 turn 状态及其持久化 item 和 trace。
     pub fn commit_turn_outcome(
         &self,
         turn_id: &str,
@@ -691,7 +691,7 @@ impl SessionStore {
         })
     }
 
-    /// Records cancellation while preserving the distinction between pending approval and work in flight.
+    /// 记录取消，同时保留 pending approval 与执行中工作之间的区别。
     pub fn request_turn_cancellation(
         &self,
         turn_id: &str,
@@ -918,7 +918,7 @@ impl SessionStore {
         self.create_approval_with_pending_tool_call_and_trace(request, None, component, summary)
     }
 
-    /// Stores an approval request and optional checkpoint while binding it to a blocked turn.
+    /// 保存 approval 请求和可选 checkpoint，并将其绑定到阻塞的 turn。
     pub fn create_approval_with_pending_tool_call_and_trace(
         &self,
         request: &ApprovalRequest,
@@ -1027,7 +1027,7 @@ impl SessionStore {
         Ok(decisions)
     }
 
-    /// Validates and records an approval outcome, deferring or claiming its pending execution.
+    /// 校验并记录 approval 结果，延后或认领其待执行操作。
     pub fn record_approval_decision(
         &self,
         decision: &ApprovalDecision,
@@ -1248,7 +1248,7 @@ impl SessionStore {
         })
     }
 
-    /// Atomically resolves an executing approval with its turn outcome and next checkpoint(s).
+    /// 原子地用 turn 结果和后续 checkpoint（如有）解决执行中的 approval。
     pub fn commit_turn_outcome_and_resolve_pending_execution(
         &self,
         request_id: &str,
@@ -1327,7 +1327,7 @@ impl SessionStore {
         Ok(committed)
     }
 
-    /// Reconciles executing approvals without replaying their unknown external side effect.
+    /// 对执行中的 approval 进行协调，而不重放其未知的外部副作用。
     fn recover_incomplete_approval_executions_for_thread(
         transaction: &Connection,
         thread_id: &str,
@@ -1633,7 +1633,7 @@ impl SessionStore {
         Ok(recovered)
     }
 
-    /// Applies ownership-loss recovery to every thread covered by an execution guard.
+    /// 对执行 guard 覆盖的每个 thread 应用所有权丢失恢复。
     fn recover_abandoned_workspace_execution(
         &self,
         guard: &WorkspaceExecutionGuard,
@@ -2208,7 +2208,7 @@ impl SessionStore {
         }
     }
 
-    /// Initializes or validates the schema while failing closed on partial or future versions.
+    /// 初始化或校验 schema；遇到不完整版本或未来版本时保持 fail-closed。
     fn init_schema(&self) -> StoreResult<()> {
         self.connection.execute_batch(
             "

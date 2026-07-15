@@ -1,11 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! The AgentLoop state machine for model turns, tool execution, approval checkpoints, and
-//! completion verification.
+//! 负责模型 turn、tool 执行、approval checkpoint 和 completion 校验的 AgentLoop 状态机。
 //!
-//! The loop keeps provider-visible history separate from canonical executable calls, routes every
-//! side effect through the ToolBroker, and fails closed when completion or recovery invariants are
-//! not satisfied.
+//! loop 将 Provider 可见历史与规范化可执行调用分离，所有副作用都经由 ToolBroker，
+//! 并在 completion 或 recovery 不变量不满足时保持 fail-closed。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::ControlFlow;
@@ -85,7 +83,7 @@ const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan
 const EXACT_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: required verification commands are incomplete";
 
-/// The externally observable lifecycle state of one AgentLoop run.
+/// 一次 AgentLoop 运行的外部可观察生命周期状态。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -124,7 +122,7 @@ impl From<&str> for AgentStatus {
     }
 }
 
-/// Evidence collected by the completion gate after workspace changes or required checks.
+/// workspace 变更或必要检查后由 completion gate 收集的证据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 pub struct AgentVerification {
     pub required: bool,
@@ -135,7 +133,7 @@ pub struct AgentVerification {
     pub unresolved_failures: Vec<String>,
 }
 
-/// One exact command-scope requirement that must be satisfied before finalization.
+/// 完成 finalization 前必须满足的一项精确命令范围要求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentVerificationRequirement {
@@ -152,7 +150,7 @@ impl AgentVerificationRequirement {
     }
 }
 
-/// Lifecycle state for one user-visible execution-plan step.
+/// 一个用户可见执行计划步骤的生命周期状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPlanStepStatus {
@@ -161,7 +159,7 @@ pub enum AgentPlanStepStatus {
     Completed,
 }
 
-/// A plan step and its current lifecycle state.
+/// 一个计划步骤及其当前生命周期状态。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPlanStep {
@@ -169,7 +167,7 @@ pub struct AgentPlanStep {
     pub status: AgentPlanStepStatus,
 }
 
-/// The complete plan; validation keeps it bounded, unique, and unambiguous.
+/// 完整计划；校验确保其有界、唯一且无歧义。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPlan {
@@ -257,7 +255,7 @@ impl AgentPlan {
     }
 }
 
-/// Returns the exclusive control tools used to update a plan or route a model tool call.
+/// 返回用于更新计划或路由模型 tool call 的独占控制 tool。
 pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec::new(
@@ -315,7 +313,7 @@ pub fn agent_control_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// The model input for replacing the current execution plan.
+/// 用于替换当前执行计划的模型输入。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentPlanUpdateInput {
@@ -337,7 +335,7 @@ impl AgentPlanUpdateInput {
     }
 }
 
-/// Counters for invalid calls, repair attempts, and rejected completion attempts.
+/// 无效调用、修复尝试和被拒 completion 尝试的计数器。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRecoveryMetrics {
     pub invalid_tool_call_count: u32,
@@ -346,7 +344,7 @@ pub struct AgentRecoveryMetrics {
     pub completion_rejection_count: u32,
 }
 
-/// Public run state derived from the loop, including gate evidence and safe diagnostics.
+/// 从 loop 派生的公开运行状态，包括 gate 证据和安全诊断信息。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunStatus {
     pub status: AgentStatus,
@@ -425,7 +423,7 @@ impl AgentRunStatus {
     }
 }
 
-/// Availability and blocker information for the AgentLoop's required execution backend.
+/// AgentLoop 所需执行 backend 的可用性和阻塞信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopCapability {
     pub available: bool,
@@ -454,7 +452,7 @@ impl AgentLoopCapability {
     }
 }
 
-/// Inputs for a run, including current-turn context, safe history, grants, and verification rules.
+/// 一次运行的输入，包括当前 turn 上下文、安全历史、授权 grant 和校验规则。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopInput {
     pub thread_id: String,
@@ -532,7 +530,7 @@ impl AgentLoopInput {
     }
 }
 
-/// A previously approved tool invocation bound to its request, tool, and resource set.
+/// 已获批准的 tool 调用，并绑定到其请求、tool 和资源集合。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ApprovalGrant {
     pub request_id: String,
@@ -560,7 +558,7 @@ impl ApprovalGrant {
     }
 }
 
-/// The full result of a run, including pending approval checkpoints and tool results.
+/// 一次运行的完整结果，包括待处理 approval checkpoint 和 tool 结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopResult {
     pub status: AgentStatus,
@@ -643,7 +641,7 @@ impl AgentLoopResult {
     }
 }
 
-/// Canonical executable tool-call data retained while approval pauses a run.
+/// approval 暂停运行期间保留的规范化可执行 tool-call 数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct PendingToolCall {
     pub request_id: String,
@@ -677,7 +675,7 @@ impl PendingToolCall {
     }
 }
 
-/// Completion-gate state shared across tool results and approval checkpoints.
+/// 由 tool 结果和 approval checkpoint 共享的 completion gate 状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct CompletionTracker {
     workspace_mutated: bool,
@@ -900,7 +898,7 @@ impl CheckpointToolResult {
     }
 }
 
-/// Serializable pause state used to resume an approval-gated tool call safely.
+/// 用于安全恢复 approval-gated tool call 的可序列化暂停状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentLoopCheckpoint {
     #[serde(flatten)]
@@ -933,7 +931,7 @@ struct AgentLoopCheckpoint {
     last_repair_failure: Option<RepairFailureState>,
 }
 
-/// Mutable state accumulated across provider turns before it becomes an `AgentLoopResult`.
+/// 在形成 `AgentLoopResult` 前跨 Provider turn 累积的可变状态。
 struct AgentLoopState {
     messages: Vec<ModelMessage>,
     tool_results: Vec<ToolResult>,
@@ -1250,7 +1248,7 @@ enum ToolBatchControl {
     Cancelled,
 }
 
-/// Orchestrates provider turns, policy decisions, sandboxed tools, approvals, and finalization.
+/// 编排 Provider turn、策略决策、sandbox tool、approval 和 finalization。
 pub struct AgentLoop<P> {
     provider: P,
     tool_broker: ToolBroker,
@@ -1283,7 +1281,7 @@ where
         self
     }
 
-    /// Runs a new turn until it completes, blocks for approval, is cancelled, or fails closed.
+    /// 运行一个新 turn，直到完成、因 approval 阻塞、被取消或 fail-closed 失败。
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
         let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
@@ -1328,7 +1326,7 @@ where
         self.continue_run(input, &budget, &capabilities, max_tool_calls, state, 0)
     }
 
-    /// Advances the state machine after each provider response or tool result.
+    /// 在每次 Provider 响应或 tool 结果后推进状态机。
     fn continue_run(
         &self,
         input: &AgentLoopInput,
@@ -1599,7 +1597,7 @@ where
         )
     }
 
-    /// Restores a validated approval checkpoint, executes the approved call, and continues the run.
+    /// 恢复已校验的 approval checkpoint，执行已批准调用，并继续运行。
     pub fn resume_pending_tool_call(
         &self,
         input: &AgentLoopInput,
@@ -1750,7 +1748,7 @@ where
         )
     }
 
-    /// Negotiates provider capabilities and records the result before building model context.
+    /// 协商 Provider 能力并记录结果，然后构建模型上下文。
     fn negotiate_tool_capabilities(
         &self,
         input: &AgentLoopInput,
@@ -1892,7 +1890,7 @@ where
         })
     }
 
-    /// Preflights, authorizes, executes, or checkpoints the provider's tool-call batch.
+    /// 对 Provider 的 tool-call 批次执行 preflight、授权、执行或 checkpoint。
     fn process_tool_calls(
         &self,
         input: &AgentLoopInput,
@@ -2000,7 +1998,7 @@ where
         self.record_tool_results(input, state, vec![(prepared, result)], false)
     }
 
-    /// Canonicalizes one model call and validates its executable input before policy evaluation.
+    /// 在策略评估前规范化一个模型调用，并校验其可执行输入。
     fn prepare_tool_call(
         &self,
         execution_call: &ModelToolCall,
@@ -2249,7 +2247,7 @@ where
             .collect()
     }
 
-    /// Feeds tool outcomes into completion and repair state while preserving failure categories.
+    /// 将 tool 结果送入 completion 和修复状态，同时保留失败类别。
     fn record_tool_results(
         &self,
         input: &AgentLoopInput,
@@ -2434,7 +2432,7 @@ enum AgentLoopToolError {
     Workspace(#[from] WorkspaceToolError),
 }
 
-/// Priority used when selecting public context for a provider request.
+/// 为 Provider 请求选择公开上下文时使用的优先级。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum AgentContextItemPriority {
     System,
@@ -2454,7 +2452,7 @@ impl AgentContextItemPriority {
     }
 }
 
-/// A context item that may be projected into model history when its visibility permits it.
+/// 在可见性允许时可以投影到模型历史中的上下文项。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentContextItem {
     pub item_id: String,
@@ -2600,7 +2598,7 @@ fn effective_max_tool_calls(capabilities: &ProviderProtocolContract) -> u32 {
     }
 }
 
-/// Computes the request budget after reserving output, instructions, tools, and framing overhead.
+/// 预留输出、指令、tool 和封装开销后计算请求预算。
 fn context_budget(
     input: &AgentLoopInput,
     loop_tools: &ToolBroker,
@@ -2710,7 +2708,7 @@ struct ContextCompactionOutcome {
     after_tokens: u32,
 }
 
-/// Compacts prior model messages while retaining current control and verification evidence.
+/// 压缩此前的模型消息，同时保留当前控制信息和校验证据。
 fn compact_model_messages(
     tools: &[ModelToolSchema],
     state: &AgentLoopState,
@@ -2899,7 +2897,7 @@ fn compaction_control_instructions(state: &AgentLoopState) -> Vec<String> {
     instructions
 }
 
-/// Selects public current-turn items and newest history that fit the requested token budget.
+/// 选择符合请求 token 预算的公开当前 turn 项和最新历史。
 pub fn assemble_context_items(items: &[AgentContextItem], max_tokens: u32) -> ContextBundle {
     let budget = ContextBudget::for_public_assembly(max_tokens);
     assemble_context_items_with_budget(items, &budget)
@@ -2996,7 +2994,7 @@ fn current_turn_excluded(input: &AgentLoopInput, context: &ContextBundle) -> boo
     })
 }
 
-/// Restores and re-canonicalizes a checkpoint before an approved call can execute.
+/// 在已批准调用执行前恢复并重新规范化 checkpoint。
 fn restore_checkpoint(
     input: &AgentLoopInput,
     pending: &PendingToolCall,
@@ -3223,7 +3221,7 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
     }
 }
 
-/// Provider-ready context messages plus inclusion metadata for trace and diagnostics.
+/// 可直接交给 Provider 的上下文消息，以及用于 trace 和诊断的纳入元数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ContextBundle {
     pub messages: Vec<Value>,
@@ -3232,7 +3230,7 @@ pub struct ContextBundle {
     pub budget: Value,
 }
 
-/// Trace-safe context selection and compaction counters persisted with a run.
+/// 随运行持久化的 trace 安全上下文选择和压缩计数器。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentContextTrace {
     pub included_item_ids: Vec<String>,
