@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use singularity_core::{CancellationToken, contains_sensitive_text};
 pub use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
-    CommandSemanticStatus, DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend,
+    CommandScriptRequest, CommandSemanticStatus, DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
     command_permission_resource,
 };
@@ -43,6 +43,7 @@ const MAX_LIST_MAX_DEPTH: usize = 64;
 const DEFAULT_GREP_MAX_MATCHES: usize = 200;
 const MAX_GREP_MAX_MATCHES: usize = 10_000;
 const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
+const MAX_COMMAND_SCRIPT_CHARS: usize = 8_000;
 const LARGE_OUTPUT_ARTIFACT_THRESHOLD: usize = 4_096;
 const DEFAULT_RESULT_PREVIEW_MAX_CHARS: usize = 4_096;
 const BINARY_CONTENT_PREVIEW: &str = "[binary content omitted]";
@@ -363,10 +364,10 @@ fn validate_patch_tool_input(input: &Value) -> Result<(), ToolInputValidationErr
 }
 
 fn command_input_validation_code(input: &Value) -> &'static str {
-    match input.get("argv") {
-        None => "missing_argv",
-        Some(Value::Array(_)) => "invalid_command_arguments",
-        Some(_) => "argv_not_array",
+    match input.get("command") {
+        None => "missing_command",
+        Some(Value::String(_)) => "invalid_command_arguments",
+        Some(_) => "command_not_string",
     }
 }
 
@@ -374,7 +375,6 @@ fn validate_command_model_input(input: &Value) -> Result<(), ToolInputValidation
     let validation_code = command_input_validation_code(input);
     let input: CommandModelInput = deserialize_tool_input(input, validation_code)?;
     input
-        .into_execution_input()
         .validate()
         .map_err(|_| ToolInputValidationError::new(validation_code))
 }
@@ -501,15 +501,11 @@ pub fn workspace_tool_specs() -> Vec<ToolSpec> {
             json!({
                 "type": "object",
                 "properties": {
-                    "argv": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1
-                    },
+                    "command": {"type": "string", "minLength": 1, "maxLength": MAX_COMMAND_SCRIPT_CHARS},
                     "cwd": {"type": "string", "minLength": 1},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_COMMAND_TIMEOUT_SECONDS}
                 },
-                "required": ["argv"],
+                "required": ["command"],
                 "additionalProperties": false
             }),
             ToolExecutionMode::Exclusive,
@@ -1562,38 +1558,29 @@ impl WorkspaceTools {
         if !capabilities.supports_command_execution() {
             return Err(WorkspaceToolError::SandboxUnavailable);
         }
-        let filesystem_mode = input.sandbox_mode();
-        let network_mode = input.network_access();
         let requested_cwd = input.cwd.as_deref().unwrap_or(".");
         let command_cwd = self.resolve_workspace_path(requested_cwd, false)?;
-        let mut request = CommandRequest::project_verification(
+        let mut request = CommandScriptRequest::agent_requested(
             next_command_id(),
-            input.argv,
+            input.command,
             command_cwd.to_string_lossy().into_owned(),
             self.workspace_root.to_string_lossy().into_owned(),
         );
-        request.filesystem.mode = filesystem_mode.clone();
-        request.network.mode = network_mode.clone();
         request.environment = self.command_environment.clone();
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }
-        let scope_digest = command_scope_digest(
-            &request.argv,
-            &request.cwd,
-            request.timeout_seconds,
-            &request.filesystem.mode,
-            &request.network.mode,
-        );
-        let result = backend.execute_cancellable(&request, cancellation);
+        let scope_digest =
+            command_script_scope_digest(&request.script, &request.cwd, request.timeout_seconds);
+        let result = backend.execute_script_cancellable(&request, cancellation);
         let execution = result.sandbox.clone();
         let mut output = command_tool_output(result);
         output.metadata["result_id"] = json!(scope_digest);
         output.metadata["audit"] = json!({
             "cwd": request.cwd,
             "timeout_seconds": request.timeout_seconds,
-            "sandbox_mode": filesystem_mode,
-            "network_access": network_mode,
+            "sandbox_mode": request.filesystem.mode,
+            "network_access": request.network.mode,
             "sandbox_backend": execution.backend,
             "sandbox_enforcement": execution.enforcement,
             "local_process_fallback": execution.local_process_fallback,
@@ -1900,45 +1887,47 @@ fn metadata_is_reparse_point(_metadata: &Metadata) -> bool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommandModelInput {
-    argv: Vec<String>,
+    command: String,
     cwd: Option<String>,
     timeout_seconds: Option<u64>,
 }
 
 impl CommandModelInput {
-    fn into_execution_input(self) -> CommandToolInput {
+    fn validate(&self) -> Result<(), WorkspaceToolError> {
         CommandToolInput {
-            argv: self.argv,
-            cwd: self.cwd,
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
             timeout_seconds: self.timeout_seconds,
-            sandbox_mode: None,
-            network_access: None,
         }
+        .validate()
     }
 }
 
-/// 面向模型的命令输入；沙箱和网络模式稍后由执行路径应用。
+/// 面向模型的命令输入；执行策略由受信任的 sandbox 路径固定提供。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CommandToolInput {
-    pub argv: Vec<String>,
+    pub command: String,
     pub cwd: Option<String>,
     pub timeout_seconds: Option<u64>,
-    pub sandbox_mode: Option<SandboxFilesystemMode>,
-    pub network_access: Option<SandboxNetworkMode>,
 }
 
 impl CommandToolInput {
     fn validate(&self) -> Result<(), WorkspaceToolError> {
-        if self.argv.is_empty() {
+        if self.command.trim().is_empty() {
             return Err(WorkspaceToolError::InvalidInput(
-                "argv must contain at least one argument".to_string(),
+                "command must not be empty".to_string(),
             ));
         }
-        if self.argv[0].trim().is_empty() {
+        if self.command.contains('\0') {
             return Err(WorkspaceToolError::InvalidInput(
-                "argv[0] must not be empty".to_string(),
+                "command must not contain NUL".to_string(),
             ));
+        }
+        if self.command.chars().count() > MAX_COMMAND_SCRIPT_CHARS {
+            return Err(WorkspaceToolError::InvalidInput(format!(
+                "command must not exceed {MAX_COMMAND_SCRIPT_CHARS} characters"
+            )));
         }
         if self.cwd.as_deref().is_some_and(|cwd| cwd.trim().is_empty()) {
             return Err(WorkspaceToolError::InvalidInput(
@@ -1968,18 +1957,6 @@ impl CommandToolInput {
     pub fn effective_timeout_seconds(&self) -> u64 {
         self.timeout_seconds
             .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS)
-    }
-
-    pub fn sandbox_mode(&self) -> SandboxFilesystemMode {
-        self.sandbox_mode
-            .clone()
-            .unwrap_or(SandboxFilesystemMode::ReadOnly)
-    }
-
-    pub fn network_access(&self) -> SandboxNetworkMode {
-        self.network_access
-            .clone()
-            .unwrap_or(SandboxNetworkMode::Denied)
     }
 }
 
@@ -2048,6 +2025,45 @@ pub fn command_scope_digest(
     network_access: &SandboxNetworkMode,
 ) -> String {
     CommandScope::new(argv, cwd, timeout_seconds, sandbox_mode, network_access).digest()
+}
+
+#[derive(Serialize)]
+struct CommandScriptScope<'a> {
+    command: &'a str,
+    cwd: &'a str,
+    timeout_seconds: u64,
+    sandbox_mode: SandboxFilesystemMode,
+    network_access: SandboxNetworkMode,
+}
+
+impl<'a> CommandScriptScope<'a> {
+    fn new(command: &'a str, cwd: &'a str, timeout_seconds: u64) -> Self {
+        Self {
+            command,
+            cwd,
+            timeout_seconds,
+            sandbox_mode: SandboxFilesystemMode::ReadOnly,
+            network_access: SandboxNetworkMode::Denied,
+        }
+    }
+
+    fn digest(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("command script scope is serializable");
+        format!("sha256:{:x}", Sha256::digest(encoded))
+    }
+}
+
+/// 对模型 command string 及其固定的只读、离线执行范围计算哈希。
+pub fn command_script_scope_digest(command: &str, cwd: &str, timeout_seconds: u64) -> String {
+    CommandScriptScope::new(command, cwd, timeout_seconds).digest()
+}
+
+/// 返回不包含原始 command 内容的脚本权限资源摘要。
+pub fn command_script_scope_resource(command: &str, cwd: &str, timeout_seconds: u64) -> String {
+    format!(
+        "command_script;scope_digest:{}",
+        command_script_scope_digest(command, cwd, timeout_seconds)
+    )
 }
 
 fn validate_tool_name(name: &str) -> Result<(), String> {

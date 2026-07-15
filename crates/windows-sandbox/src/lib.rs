@@ -367,6 +367,8 @@ pub use windows_impl::run_windows_sandbox_capture_with_filesystem_overrides;
 #[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_restricted_token_preflight;
 #[cfg(target_os = "windows")]
+pub use winutil::powershell_encoded_command_argv;
+#[cfg(target_os = "windows")]
 pub use winutil::quote_windows_arg;
 #[cfg(target_os = "windows")]
 pub use winutil::string_from_sid_bytes;

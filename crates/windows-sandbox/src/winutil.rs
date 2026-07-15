@@ -1,6 +1,8 @@
 use anyhow::Result;
+use base64::Engine;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HLOCAL;
@@ -71,6 +73,34 @@ pub fn argv_to_command_line(argv: &[String]) -> String {
         .map(|arg| quote_windows_arg(arg))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// 将不可信 PowerShell script 投影为彼此独立的进程参数。
+///
+/// script 使用 UTF-16LE 编码后传给 `-EncodedCommand`，不会拼接进第二个 shell 命令字符串。
+pub fn powershell_encoded_command_argv(
+    executable: PathBuf,
+    script: &str,
+) -> Result<Vec<String>, String> {
+    if script.is_empty() || script.contains('\0') {
+        return Err("PowerShell script must be non-empty and NUL-free".to_string());
+    }
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    if encoded.len() > 24_000 {
+        return Err("PowerShell encoded command exceeds the Windows argument limit".to_string());
+    }
+    Ok(vec![
+        executable.to_string_lossy().into_owned(),
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-EncodedCommand".to_string(),
+        encoded,
+    ])
 }
 
 // Produce a readable description for a Win32 error code.
@@ -207,8 +237,10 @@ fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::argv_to_command_line;
+    use super::{argv_to_command_line, powershell_encoded_command_argv};
+    use base64::Engine;
     use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
 
     #[test]
     fn argv_to_command_line_quotes_each_argument_independently() {
@@ -237,5 +269,23 @@ mod tests {
             argv_to_command_line(&argv),
             "pwsh.exe -Command \"Write-Output \\\"hello world\\\"\""
         );
+    }
+
+    #[test]
+    fn powershell_script_is_encoded_as_an_independent_argument() {
+        let script = "Write-Output \"hello & world\"";
+        let argv = powershell_encoded_command_argv(PathBuf::from("powershell.exe"), script)
+            .expect("encoded command");
+        assert_eq!(argv[0], "powershell.exe");
+        assert_eq!(argv[4], "-EncodedCommand");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&argv[5])
+            .expect("base64");
+        let utf16 = decoded
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(String::from_utf16(&utf16).expect("UTF-16"), script);
+        assert!(!argv_to_command_line(&argv).contains(script));
     }
 }

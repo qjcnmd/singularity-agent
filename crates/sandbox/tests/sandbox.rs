@@ -1,7 +1,9 @@
 use schemars::schema_for;
+use singularity_core::CancellationToken;
 use singularity_sandbox::{
-    CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus, SandboxBackend,
-    SandboxBackendEnforcement, SandboxCapabilities, WindowsSandboxBackend, bound_command_output,
+    CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
+    CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
+    WindowsSandboxBackend, bound_command_output,
 };
 #[cfg(windows)]
 use singularity_sandbox::{SandboxFilesystemMode, SandboxNetworkMode};
@@ -91,6 +93,21 @@ fn command_executor_fails_closed_when_sandbox_is_required_without_backend() {
     );
     assert_eq!(result.semantic_status, CommandSemanticStatus::PolicyBlocked);
     assert!(result.stderr_preview.contains("sandbox-required"));
+}
+
+#[test]
+fn direct_argv_backend_returns_typed_unsupported_for_model_script() {
+    let backend = DirectArgvOnlyBackend;
+    let request =
+        CommandScriptRequest::agent_requested("script_unsupported", "cargo test", ".", "C:/repo");
+    let result = backend.execute_script(&request);
+    assert_eq!(result.execution_status, CommandExecutionStatus::Unsupported);
+    assert_eq!(result.semantic_status, CommandSemanticStatus::Unsupported);
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let result = backend.execute_script_cancellable(&request, &cancellation);
+    assert_eq!(result.execution_status, CommandExecutionStatus::Cancelled);
 }
 
 #[test]
@@ -394,4 +411,20 @@ fn windows_backend_is_unavailable_off_windows() {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
+}
+
+struct DirectArgvOnlyBackend;
+
+impl SandboxBackend for DirectArgvOnlyBackend {
+    fn name(&self) -> &'static str {
+        "direct_argv_only"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, "direct argv")
+    }
 }

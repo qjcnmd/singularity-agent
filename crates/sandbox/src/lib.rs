@@ -19,8 +19,11 @@ const SANDBOX_BACKEND_UNAVAILABLE: &str = "sandbox-required command has no sandb
 const COMMAND_EXECUTABLE_UNAVAILABLE: &str = "sandbox command executable unavailable";
 const COMMAND_TIMED_OUT: &str = "sandbox command timed out";
 const COMMAND_CANCELLED: &str = "sandbox command cancelled";
+const COMMAND_SCRIPT_UNSUPPORTED: &str = "sandbox command script is unsupported on this platform";
 #[cfg(windows)]
 const COMMAND_EMPTY_ARGV: &str = "sandbox command argv is empty";
+#[cfg(windows)]
+const COMMAND_EMPTY_SCRIPT: &str = "sandbox command script is empty";
 #[cfg(windows)]
 const COMMAND_CWD_OUTSIDE_WORKSPACE: &str = "sandbox command cwd is outside workspace";
 #[cfg(windows)]
@@ -190,6 +193,48 @@ impl CommandRequest {
 
     pub fn permission_resource(&self) -> String {
         command_permission_resource(&self.argv)
+    }
+}
+
+/// 交给 sandbox backend 的模型命令脚本请求；它与可信内部 `argv` 请求保持类型隔离。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandScriptRequest {
+    pub command_id: String,
+    pub script: String,
+    pub cwd: String,
+    pub timeout_seconds: u64,
+    pub network: SandboxNetworkPolicy,
+    pub filesystem: SandboxFilesystemPolicy,
+    pub environment: CommandEnvironmentPolicy,
+}
+
+impl CommandScriptRequest {
+    /// 创建使用只读文件系统和拒绝网络的模型命令请求。
+    pub fn agent_requested(
+        command_id: impl Into<String>,
+        script: impl Into<String>,
+        cwd: impl Into<String>,
+        workspace_root: impl Into<String>,
+    ) -> Self {
+        Self {
+            command_id: command_id.into(),
+            script: script.into(),
+            cwd: cwd.into(),
+            timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            network: SandboxNetworkPolicy {
+                mode: SandboxNetworkMode::Denied,
+            },
+            filesystem: SandboxFilesystemPolicy {
+                mode: SandboxFilesystemMode::ReadOnly,
+                workspace_root: workspace_root.into(),
+            },
+            environment: CommandEnvironmentPolicy::default(),
+        }
+    }
+
+    /// 模型脚本始终要求经过 sandbox backend 执行。
+    pub fn requires_sandbox(&self) -> bool {
+        true
     }
 }
 
@@ -531,6 +576,11 @@ pub trait SandboxBackend {
     /// 执行一个请求；不可用或不支持的 backend 必须返回阻塞结果。
     fn execute(&self, request: &CommandRequest) -> CommandResult;
 
+    /// 执行模型提交的 shell script；不支持的平台必须返回 typed unsupported。
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        CommandResult::unsupported(&request.command_id, COMMAND_SCRIPT_UNSUPPORTED)
+    }
+
     /// 执行并支持取消，默认先进行执行前取消检查。
     fn execute_cancellable(
         &self,
@@ -541,6 +591,18 @@ pub trait SandboxBackend {
             return CommandResult::cancelled(&request.command_id, 0);
         }
         self.execute(request)
+    }
+
+    /// 执行模型 script 并支持取消；默认实现保持 fail closed。
+    fn execute_script_cancellable(
+        &self,
+        request: &CommandScriptRequest,
+        cancellation: &CancellationToken,
+    ) -> CommandResult {
+        if cancellation.is_cancelled() {
+            return CommandResult::cancelled(&request.command_id, 0);
+        }
+        self.execute_script(request)
     }
 }
 
@@ -616,6 +678,13 @@ fn command_reference_tokens(request: &CommandRequest) -> Vec<String> {
     {
         collect_command_tokens(&command_permission_resource(&request.argv), &mut tokens);
     }
+    tokens
+}
+
+#[cfg(windows)]
+fn script_reference_tokens(script: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    collect_command_tokens(script, &mut tokens);
     tokens
 }
 
@@ -887,6 +956,104 @@ fn command_request_denial(request: &CommandRequest) -> Option<CommandResult> {
 }
 
 #[cfg(windows)]
+fn script_has_read_only_write_intent(script: &str) -> bool {
+    command_has_file_redirection(script)
+        || script_reference_tokens(script).iter().any(|token| {
+            let lower = token.to_ascii_lowercase();
+            WRITE_COMMAND_WORDS
+                .iter()
+                .any(|write_command| lower == *write_command)
+        })
+}
+
+#[cfg(windows)]
+fn command_script_request_denial(request: &CommandScriptRequest) -> Option<CommandResult> {
+    if request.script.trim().is_empty() {
+        return Some(CommandResult::policy_denied(
+            &request.command_id,
+            COMMAND_EMPTY_SCRIPT,
+        ));
+    }
+    let workspace = match std::fs::canonicalize(&request.filesystem.workspace_root) {
+        Ok(path) => normalize_path(&path),
+        Err(_) => {
+            return Some(CommandResult::policy_denied(
+                &request.command_id,
+                COMMAND_PATH_OUTSIDE_WORKSPACE,
+            ));
+        }
+    };
+    let cwd = match resolve_existing_command_path(&workspace, &request.cwd) {
+        Some(path) => path,
+        None => {
+            return Some(CommandResult::policy_denied(
+                &request.command_id,
+                COMMAND_CWD_UNAVAILABLE,
+            ));
+        }
+    };
+    if path_has_sensitive_component(&cwd) {
+        return Some(CommandResult::policy_denied(
+            &request.command_id,
+            COMMAND_SENSITIVE_PATH_DENIED,
+        ));
+    }
+    let workspace_bound = matches!(
+        request.filesystem.mode,
+        SandboxFilesystemMode::ReadOnly | SandboxFilesystemMode::WorkspaceWrite
+    );
+    if workspace_bound && !cwd.starts_with(&workspace) {
+        return Some(CommandResult::policy_denied(
+            &request.command_id,
+            COMMAND_CWD_OUTSIDE_WORKSPACE,
+        ));
+    }
+    let command_tokens = script_reference_tokens(&request.script);
+    if command_tokens
+        .iter()
+        .any(|token| command_token_has_sensitive_path_marker(token))
+    {
+        return Some(CommandResult::policy_denied(
+            &request.command_id,
+            COMMAND_SENSITIVE_PATH_DENIED,
+        ));
+    }
+    for token in command_tokens
+        .iter()
+        .filter(|token| command_token_references_path(&cwd, token))
+    {
+        if command_token_has_env_reference(token) {
+            return Some(CommandResult::unsupported(
+                &request.command_id,
+                COMMAND_ENV_PATH_UNSUPPORTED,
+            ));
+        }
+        let resolved = resolve_existing_or_parent_command_path(&cwd, token);
+        if path_has_sensitive_component(&resolved) {
+            return Some(CommandResult::policy_denied(
+                &request.command_id,
+                COMMAND_SENSITIVE_PATH_DENIED,
+            ));
+        }
+        if workspace_bound && !resolved.starts_with(&workspace) {
+            return Some(CommandResult::policy_denied(
+                &request.command_id,
+                COMMAND_PATH_OUTSIDE_WORKSPACE,
+            ));
+        }
+    }
+    if matches!(request.filesystem.mode, SandboxFilesystemMode::ReadOnly)
+        && script_has_read_only_write_intent(&request.script)
+    {
+        return Some(CommandResult::policy_denied(
+            &request.command_id,
+            COMMAND_READ_ONLY_WRITE_DENIED,
+        ));
+    }
+    None
+}
+
+#[cfg(windows)]
 fn resolve_command_path(workspace: &Path, path: &str) -> PathBuf {
     let candidate = Path::new(path);
     let joined = if candidate.is_absolute() {
@@ -970,10 +1137,10 @@ mod windows_backend {
 
     use super::{
         COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
-        CommandExecutionStatus, CommandRequest, CommandResult, CommandSemanticStatus,
-        SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode,
-        SandboxNetworkMode, command_request_denial, is_secret_env_name,
-        path_has_sensitive_component,
+        CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
+        CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
+        SandboxFilesystemMode, SandboxNetworkMode, command_request_denial,
+        command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
     };
 
     const BACKEND_NAME: &str = "windows";
@@ -1067,7 +1234,46 @@ mod windows_backend {
                         );
                 }
             };
-            match execute_windows_sandbox(request, cancellation, prepared) {
+            match execute_windows_sandbox(&request.command_id, cancellation, prepared) {
+                Ok(result) => result,
+                Err(error) => CommandResult::backend_error(&request.command_id, error)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
+            }
+        }
+
+        fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+            self.execute_script_cancellable(request, &CancellationToken::new())
+        }
+
+        fn execute_script_cancellable(
+            &self,
+            request: &CommandScriptRequest,
+            cancellation: &CancellationToken,
+        ) -> CommandResult {
+            if cancellation.is_cancelled() {
+                return CommandResult::cancelled(&request.command_id, 0)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
+            if let Some(denied) = command_script_request_denial(request) {
+                return denied
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
+            }
+            let prepared = match PreparedCommand::from_script_request(request) {
+                Ok(prepared) => prepared,
+                Err(PrepareCommandError::Executable(error)) => {
+                    return error
+                        .into_command_result(&request.command_id)
+                        .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+                }
+                Err(PrepareCommandError::Backend(error)) => {
+                    return CommandResult::backend_error(&request.command_id, error)
+                        .with_sandbox_execution(
+                            self.name(),
+                            SandboxBackendEnforcement::Unavailable,
+                        );
+                }
+            };
+            match execute_windows_sandbox(&request.command_id, cancellation, prepared) {
                 Ok(result) => result,
                 Err(error) => CommandResult::backend_error(&request.command_id, error)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
@@ -1144,10 +1350,79 @@ mod windows_backend {
                 read_roots: resolved.read_roots,
             })
         }
+
+        fn from_script_request(
+            request: &CommandScriptRequest,
+        ) -> Result<Self, PrepareCommandError> {
+            let workspace_root = canonical_directory(Path::new(&request.filesystem.workspace_root))
+                .map_err(PrepareCommandError::Backend)?;
+            let cwd = canonical_directory(Path::new(&request.cwd))
+                .map_err(PrepareCommandError::Backend)?;
+            let env_map = child_environment(&request.environment);
+            let powershell = system_powershell(&env_map).ok_or_else(|| {
+                PrepareCommandError::Executable(ExecutableResolutionError::Unavailable(
+                    "required Windows PowerShell executable was not found".to_string(),
+                ))
+            })?;
+            let argv = singularity_windows_sandbox::powershell_encoded_command_argv(
+                powershell.clone(),
+                &request.script,
+            )
+            .map_err(|error| {
+                PrepareCommandError::Executable(ExecutableResolutionError::Unsupported(error))
+            })?;
+            let workspace_root = AbsolutePathBuf::from_absolute_path_checked(&workspace_root)
+                .map_err(|error| {
+                    PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
+                })?;
+            let workspace_roots = vec![workspace_root];
+            let network = match request.network.mode {
+                SandboxNetworkMode::Denied => NetworkSandboxPolicy::Restricted,
+                SandboxNetworkMode::Allowed => NetworkSandboxPolicy::Enabled,
+            };
+            let permission_profile = match request.filesystem.mode {
+                SandboxFilesystemMode::ReadOnly => PermissionProfile::Managed {
+                    file_system: ManagedFileSystemPermissions::Restricted {
+                        entries: FileSystemSandboxPolicy::read_only().entries,
+                        glob_scan_max_depth: None,
+                    },
+                    network,
+                },
+                SandboxFilesystemMode::WorkspaceWrite => {
+                    PermissionProfile::workspace_write_with(&[], network, false, false)
+                }
+                SandboxFilesystemMode::DangerFullAccess => {
+                    return Err(PrepareCommandError::Backend(
+                        DANGER_FULL_ACCESS_UNSUPPORTED.to_string(),
+                    ));
+                }
+            };
+            let restricted_token_fallback = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                &permission_profile,
+                &workspace_roots,
+            )
+            .map_err(|error| {
+                PrepareCommandError::Backend(format!(
+                    "invalid Windows sandbox permissions: {error}"
+                ))
+            })?
+            .supports_restricted_token_fallback();
+            Ok(Self {
+                permission_profile,
+                workspace_roots,
+                sandbox_home: sandbox_home().map_err(PrepareCommandError::Backend)?,
+                cwd,
+                env_map,
+                timeout_ms: request.timeout_seconds.saturating_mul(1_000),
+                restricted_token_fallback,
+                argv,
+                read_roots: executable_read_roots(&powershell),
+            })
+        }
     }
 
     fn execute_windows_sandbox(
-        request: &CommandRequest,
+        command_id: &str,
         cancellation: &CancellationToken,
         prepared: PreparedCommand,
     ) -> Result<CommandResult, String> {
@@ -1171,7 +1446,7 @@ mod windows_backend {
             elevated
         });
         match elevated {
-            Ok(capture) => Ok(command_result_from_capture(request, capture, started)
+            Ok(capture) => Ok(command_result_from_capture(command_id, capture, started)
                 .with_sandbox_execution(ELEVATED_BACKEND_NAME, SandboxBackendEnforcement::Strict)),
             Err(elevated_error) if prepared.restricted_token_fallback => {
                 let elevated_error = windows_error_summary(&elevated_error);
@@ -1192,12 +1467,11 @@ mod windows_backend {
                         "{ELEVATED_FAILURE_PREFIX}: {elevated_error}; {RESTRICTED_FAILURE_PREFIX}: {restricted_error}"
                     )
                 })?;
-                Ok(
-                    command_result_from_capture(request, capture, started).with_sandbox_execution(
+                Ok(command_result_from_capture(command_id, capture, started)
+                    .with_sandbox_execution(
                         RESTRICTED_TOKEN_BACKEND_NAME,
                         SandboxBackendEnforcement::RestrictedToken,
-                    ),
-                )
+                    ))
             }
             Err(error) => Err(format!(
                 "{ELEVATED_FAILURE_PREFIX}: {}",
@@ -1214,14 +1488,14 @@ mod windows_backend {
     }
 
     fn command_result_from_capture(
-        request: &CommandRequest,
+        command_id: &str,
         capture: singularity_windows_sandbox::CaptureResult,
         started: Instant,
     ) -> CommandResult {
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         if capture.cancelled {
             return interrupted_command_result(
-                request,
+                command_id,
                 &capture,
                 duration_ms,
                 CommandExecutionStatus::Cancelled,
@@ -1231,7 +1505,7 @@ mod windows_backend {
         }
         if capture.timed_out {
             return interrupted_command_result(
-                request,
+                command_id,
                 &capture,
                 duration_ms,
                 CommandExecutionStatus::TimedOut,
@@ -1240,7 +1514,7 @@ mod windows_backend {
             );
         }
         CommandResult::executed(
-            &request.command_id,
+            command_id,
             capture.exit_code,
             duration_ms,
             String::from_utf8_lossy(&capture.stdout),
@@ -1250,7 +1524,7 @@ mod windows_backend {
     }
 
     fn interrupted_command_result(
-        request: &CommandRequest,
+        command_id: &str,
         capture: &singularity_windows_sandbox::CaptureResult,
         duration_ms: u64,
         execution_status: CommandExecutionStatus,
@@ -1258,7 +1532,7 @@ mod windows_backend {
         fallback_message: &str,
     ) -> CommandResult {
         let mut result = CommandResult::executed(
-            &request.command_id,
+            command_id,
             capture.exit_code,
             duration_ms,
             String::from_utf8_lossy(&capture.stdout),
@@ -1359,6 +1633,20 @@ mod windows_backend {
             return None;
         }
         canonical_executable(&system_root.join("System32").join("cmd.exe"))
+    }
+
+    fn system_powershell(env_map: &HashMap<String, String>) -> Option<PathBuf> {
+        let system_root = PathBuf::from(env_value(env_map, "SystemRoot")?);
+        if !system_root.is_absolute() {
+            return None;
+        }
+        canonical_executable(
+            &system_root
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+        )
     }
 
     fn batch_argv(

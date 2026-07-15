@@ -1,13 +1,14 @@
 use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
-    SandboxBackend, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
+    CommandScriptRequest, SandboxBackend, SandboxCapabilities, SandboxFilesystemMode,
+    SandboxNetworkMode,
 };
 use singularity_tools::{
     CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
     ToolBrokerDecision, ToolCallRequest, ToolExecutionMode, ToolFailureKind,
     ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspacePatch,
     WorkspacePatchChange, WorkspaceToolError, WorkspaceTools, command_scope_digest,
-    workspace_tool_specs,
+    command_script_scope_digest, command_script_scope_resource, workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -946,19 +947,13 @@ fn exact_tool_inputs_drive_both_projected_schema_and_local_admission() {
 }
 
 #[test]
-fn command_bindings_separate_model_and_execution_contracts() {
+fn command_contract_rejects_policy_fields() {
     let model_input = serde_json::json!({
-        "argv": ["cargo", "test"],
+        "command": "cargo test",
         "cwd": ".",
         "timeout_seconds": 60,
     });
-    let execution_input = serde_json::json!({
-        "argv": ["cargo", "test"],
-        "cwd": ".",
-        "timeout_seconds": 60,
-        "sandbox_mode": "workspace_write",
-        "network_access": "denied",
-    });
+    let execution_input = model_input.clone();
     let mut command = workspace_tool_specs()
         .into_iter()
         .find(|spec| spec.name == "builtin_command")
@@ -967,7 +962,7 @@ fn command_bindings_separate_model_and_execution_contracts() {
     assert_eq!(
         command
             .prepare_model_input(&serde_json::json!({
-                "argv": ["cargo", "test"],
+                "command": "cargo test",
                 "cwd": ".",
                 "timeout_seconds": 60,
                 "network_access": "denied",
@@ -991,15 +986,14 @@ fn command_bindings_separate_model_and_execution_contracts() {
     assert_eq!(
         command
             .validate_execution_input(&serde_json::json!({
-                "argv": ["cargo", "test"],
+                "command": "cargo test",
                 "cwd": ".",
                 "timeout_seconds": 60,
-                "sandbox_mode": "workspace_write",
                 "network_access": "allowed",
             }))
             .expect_err("tampered execution policy")
             .code,
-        "input_not_allowed"
+        "invalid_command_arguments"
     );
     assert!(
         !serde_json::to_string(&command.input_schema)
@@ -1013,10 +1007,9 @@ fn command_bindings_separate_model_and_execution_contracts() {
         "call_1",
         "builtin_command",
         serde_json::json!({
-            "argv": ["cargo", "test"],
+            "command": "cargo test",
             "cwd": ".",
             "timeout_seconds": 60,
-            "sandbox_mode": "workspace_write",
             "network_access": "allowed",
         })
         .to_string(),
@@ -1114,9 +1107,34 @@ fn workspace_tool_specs_share_the_runtime_navigation_contract() {
     assert_eq!(grep["max_matches"]["maximum"], 10_000);
 
     let command = schema("builtin_command");
+    assert!(command.contains_key("command"));
+    assert!(!command.contains_key("argv"));
     assert_eq!(command["timeout_seconds"]["maximum"], 3_600);
     assert!(!command.contains_key("sandbox_mode"));
     assert!(!command.contains_key("network_access"));
+}
+
+#[test]
+fn command_tool_model_contract_uses_a_single_command_string() {
+    let command = workspace_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "builtin_command")
+        .expect("command spec");
+    let properties = command.input_schema["properties"]
+        .as_object()
+        .expect("command properties");
+
+    assert!(properties["command"].is_object());
+    assert!(!properties.contains_key("argv"));
+    assert_eq!(
+        command.input_schema["required"],
+        serde_json::json!(["command"])
+    );
+    assert!(
+        command
+            .prepare_model_input(&serde_json::json!({"argv": ["git", "status"]}))
+            .is_err()
+    );
 }
 
 #[test]
@@ -1138,7 +1156,7 @@ fn workspace_tool_schemas_keep_optional_inputs_optional_and_provider_portable() 
             &["pattern"],
             &["path", "max_matches", "case_sensitive"],
         ),
-        ("builtin_command", &["argv"], &["cwd", "timeout_seconds"]),
+        ("builtin_command", &["command"], &["cwd", "timeout_seconds"]),
     ];
 
     for (tool_name, expected_required, optional_fields) in cases {
@@ -1214,7 +1232,7 @@ fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
         }))
         .is_err(),
         serde_json::from_value::<CommandToolInput>(serde_json::json!({
-            "argv": ["git", "status"],
+            "command": "git status",
             "unknown": true
         }))
         .is_err(),
@@ -1283,41 +1301,33 @@ fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
     ));
     assert!(matches!(
         tools.command(CommandToolInput {
-            argv: Vec::new(),
+            command: String::new(),
             cwd: None,
             timeout_seconds: None,
-            sandbox_mode: None,
-            network_access: None,
         }),
         Err(WorkspaceToolError::InvalidInput(_))
     ));
     assert!(matches!(
         tools.command(CommandToolInput {
-            argv: vec![String::new()],
+            command: String::new(),
             cwd: None,
             timeout_seconds: None,
-            sandbox_mode: None,
-            network_access: None,
         }),
         Err(WorkspaceToolError::InvalidInput(_))
     ));
     assert!(matches!(
         tools.command(CommandToolInput {
-            argv: vec!["git".to_string()],
+            command: "git status".to_string(),
             cwd: Some(" ".to_string()),
             timeout_seconds: None,
-            sandbox_mode: None,
-            network_access: None,
         }),
         Err(WorkspaceToolError::InvalidInput(_))
     ));
     assert!(matches!(
         tools.command(CommandToolInput {
-            argv: vec!["git".to_string()],
+            command: "git status".to_string(),
             cwd: None,
             timeout_seconds: Some(3_601),
-            sandbox_mode: None,
-            network_access: None,
         }),
         Err(WorkspaceToolError::InvalidInput(_))
     ));
@@ -1741,16 +1751,14 @@ fn broker_ask_decision_blocks_execution_with_safe_approval_tool_result() {
 }
 
 #[test]
-fn command_tool_defaults_to_read_only_filesystem_and_denied_network() {
+fn command_tool_defaults_to_bounded_cwd_and_timeout() {
     let input: CommandToolInput = serde_json::from_value(serde_json::json!({
-        "argv": ["git", "status"]
+        "command": "git status"
     }))
     .expect("command input");
 
     assert_eq!(input.effective_cwd(), ".");
     assert_eq!(input.effective_timeout_seconds(), 30);
-    assert_eq!(input.sandbox_mode(), SandboxFilesystemMode::ReadOnly);
-    assert_eq!(input.network_access(), SandboxNetworkMode::Denied);
 }
 
 #[test]
@@ -1759,11 +1767,9 @@ fn workspace_command_tool_fails_closed_without_sandbox_backend() {
     let tools = WorkspaceTools::new(&workspace);
 
     let result = tools.command(CommandToolInput {
-        argv: test_command("must-not-run"),
+        command: "must-not-run".to_string(),
         cwd: None,
         timeout_seconds: Some(5),
-        sandbox_mode: None,
-        network_access: None,
     });
 
     assert!(matches!(
@@ -1779,11 +1785,9 @@ fn workspace_command_tool_rejects_non_strict_backend_without_execution() {
     let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(NonStrictSandboxBackend);
 
     let result = tools.command(CommandToolInput {
-        argv: test_command("must-not-run"),
+        command: "must-not-run".to_string(),
         cwd: None,
         timeout_seconds: Some(5),
-        sandbox_mode: None,
-        network_access: None,
     });
 
     assert!(matches!(
@@ -1800,11 +1804,9 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
 
     let result = tools
         .command(CommandToolInput {
-            argv: test_command("success"),
+            command: "success".to_string(),
             cwd: None,
             timeout_seconds: Some(5),
-            sandbox_mode: None,
-            network_access: None,
         })
         .expect("command");
 
@@ -1839,23 +1841,23 @@ fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
 
 #[test]
 fn tool_result_payload_preserves_safe_structured_content() {
-    let envelope = ToolCallRequest::new("call_1", "builtin_command", r#"{"argv":"cargo test"}"#);
+    let envelope = ToolCallRequest::new("call_1", "builtin_command", r#"{"command":17}"#);
     let result = ToolOutput::failure(
         "invalid_tool_arguments",
         serde_json::json!({
-            "summary": "argv must be an array",
-            "validation_code": "argv_not_array",
-            "retry_inputs": [{"argv": ["cargo", "test"]}],
+            "summary": "command must be a string",
+            "validation_code": "command_not_string",
+            "retry_inputs": [{"command": "cargo test"}],
         }),
     );
 
     let tool_result = ToolResult::from_result(&envelope, &result);
     let payload = tool_result.to_message_payload();
 
-    assert_eq!(payload["content"]["validation_code"], "argv_not_array");
+    assert_eq!(payload["content"]["validation_code"], "command_not_string");
     assert_eq!(
-        payload["content"]["retry_inputs"][0]["argv"],
-        serde_json::json!(["cargo", "test"])
+        payload["content"]["retry_inputs"][0]["command"],
+        "cargo test"
     );
     assert!(payload.get("preview").is_none());
     assert!(
@@ -1874,11 +1876,9 @@ fn workspace_command_tool_propagates_evaluation_environment_policy() {
 
     let result = tools
         .command(CommandToolInput {
-            argv: test_command("success"),
+            command: "success".to_string(),
             cwd: None,
             timeout_seconds: Some(5),
-            sandbox_mode: None,
-            network_access: None,
         })
         .expect("command");
 
@@ -1887,26 +1887,21 @@ fn workspace_command_tool_propagates_evaluation_environment_policy() {
 }
 
 #[test]
-fn workspace_command_tool_records_audit_for_explicit_danger_full_access() {
-    let workspace = test_workspace("command-danger-audit");
+fn workspace_command_tool_records_fixed_read_only_offline_audit() {
+    let workspace = test_workspace("command-read-only-audit");
     let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(DangerAuditSandboxBackend);
 
     let result = tools
         .command(CommandToolInput {
-            argv: test_command("success"),
+            command: "success".to_string(),
             cwd: None,
             timeout_seconds: Some(5),
-            sandbox_mode: Some(SandboxFilesystemMode::DangerFullAccess),
-            network_access: Some(SandboxNetworkMode::Allowed),
         })
         .expect("command");
 
     assert!(result.ok);
-    assert_eq!(
-        result.metadata["audit"]["sandbox_mode"],
-        "danger_full_access"
-    );
-    assert_eq!(result.metadata["audit"]["network_access"], "allowed");
+    assert_eq!(result.metadata["audit"]["sandbox_mode"], "read_only");
+    assert_eq!(result.metadata["audit"]["network_access"], "denied");
     assert_eq!(result.metadata["audit"]["sandbox_backend"], "danger_audit");
     assert_eq!(result.metadata["audit"]["sandbox_enforcement"], "strict");
     assert_eq!(result.metadata["audit"]["local_process_fallback"], false);
@@ -2017,6 +2012,21 @@ fn command_scope_digest_binds_exact_argv_cwd_and_timeout() {
     );
 }
 
+#[test]
+fn command_script_scope_digest_binds_script_without_exposing_it() {
+    let script = "cargo test --workspace";
+    let base = command_script_scope_digest(script, "C:/workspace", 5);
+    assert_ne!(
+        base,
+        command_script_scope_digest("cargo check", "C:/workspace", 5)
+    );
+    assert_ne!(base, command_script_scope_digest(script, "C:/other", 5));
+    assert_ne!(base, command_script_scope_digest(script, "C:/workspace", 6));
+    let resource = command_script_scope_resource(script, "C:/workspace", 5);
+    assert!(resource.contains("scope_digest:"));
+    assert!(!resource.contains(script));
+}
+
 struct RecordingSandboxBackend;
 
 impl SandboxBackend for RecordingSandboxBackend {
@@ -2029,6 +2039,15 @@ impl SandboxBackend for RecordingSandboxBackend {
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
+        assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
+        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
+            self.name(),
+            singularity_tools::SandboxBackendEnforcement::Strict,
+        )
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        assert_eq!(request.filesystem.mode, SandboxFilesystemMode::ReadOnly);
         assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
         CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
             self.name(),
@@ -2058,6 +2077,17 @@ impl SandboxBackend for EvaluationEnvironmentBackend {
             singularity_tools::SandboxBackendEnforcement::Strict,
         )
     }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        assert_eq!(
+            request.environment,
+            CommandEnvironmentPolicy::EvaluationIsolated
+        );
+        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
+            self.name(),
+            singularity_tools::SandboxBackendEnforcement::Strict,
+        )
+    }
 }
 
 struct DangerAuditSandboxBackend;
@@ -2071,12 +2101,13 @@ impl SandboxBackend for DangerAuditSandboxBackend {
         SandboxCapabilities::strict()
     }
 
-    fn execute(&self, request: &CommandRequest) -> CommandResult {
-        assert_eq!(
-            request.filesystem.mode,
-            SandboxFilesystemMode::DangerFullAccess
-        );
-        assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
+    fn execute(&self, _request: &CommandRequest) -> CommandResult {
+        panic!("direct argv command backend must not execute")
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        assert_eq!(request.filesystem.mode, SandboxFilesystemMode::ReadOnly);
+        assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
         CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
             self.name(),
             singularity_tools::SandboxBackendEnforcement::Strict,
@@ -2116,10 +2147,6 @@ fn remove_workspace(path: &Path) {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
-}
-
-fn test_command(argument: &str) -> Vec<String> {
-    vec!["test-program".to_string(), argument.to_string()]
 }
 
 #[cfg(windows)]
