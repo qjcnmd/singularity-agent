@@ -1,3 +1,5 @@
+//! 验证 SessionStore 的 schema、绑定、恢复、历史、trace 与事务不变量。
+
 use schemars::schema_for;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_protocol::{ItemKind, ThreadStatus, TraceEvent, TurnStatus};
@@ -7,6 +9,7 @@ use singularity_store::{
 };
 use std::sync::{Arc, Barrier};
 
+// 验证 thread、turn、item、trace 与 approval 的基础持久化闭环。
 #[test]
 fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -79,6 +82,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     assert!(store.show_trace("missing").is_err());
 }
 
+// 验证 schema 元数据和 SQLite WAL pragma 在新库中正确写入。
 #[test]
 fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -101,6 +105,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 }
 
+// 验证未来 schema 版本会被 fail closed 拒绝打开。
 #[test]
 fn sqlite_store_rejects_future_schema_version() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -125,6 +130,7 @@ fn sqlite_store_rejects_future_schema_version() {
     ));
 }
 
+// 验证迁移后关键表重新建立完整外键约束。
 #[test]
 fn migrated_schema_rebuilds_foreign_key_tables() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -228,6 +234,7 @@ fn migrated_schema_rebuilds_foreign_key_tables() {
         .is_err());
 }
 
+// 验证新 schema 拒绝孤儿 turn 与 pending tool call。
 #[test]
 fn fresh_schema_rejects_orphan_turn_and_pending_tool_call_rows() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -260,6 +267,7 @@ fn fresh_schema_rejects_orphan_turn_and_pending_tool_call_rows() {
         .is_err());
 }
 
+// 验证缺失 thread、turn、trace run 和 artifact 时统一返回 NotFound。
 #[test]
 fn missing_thread_turn_event_and_artifact_refs_fail_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -283,6 +291,7 @@ fn missing_thread_turn_event_and_artifact_refs_fail_closed() {
     ));
 }
 
+// 验证 pending tool call 的 request_id 必须绑定 approval。
 #[test]
 fn pending_tool_call_binding_rejects_request_mismatch() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -318,6 +327,7 @@ fn pending_tool_call_binding_rejects_request_mismatch() {
     assert!(store.list_pending_approvals().expect("pending").is_empty());
 }
 
+// 验证 approval 必须显式绑定已有 thread 与 turn。
 #[test]
 fn approval_creation_requires_explicit_existing_thread_turn_binding() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -339,6 +349,7 @@ fn approval_creation_requires_explicit_existing_thread_turn_binding() {
     ));
 }
 
+// 验证 approval 不得引用属于另一 thread 的 turn。
 #[test]
 fn approval_creation_rejects_turn_bound_to_another_thread() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -362,6 +373,7 @@ fn approval_creation_rejects_turn_bound_to_another_thread() {
     ));
 }
 
+// 验证 pending tool call 必须提供与 approval 一致的 tool_call_id。
 #[test]
 fn pending_tool_call_binding_requires_request_tool_call_id() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -405,6 +417,7 @@ fn pending_tool_call_binding_requires_request_tool_call_id() {
     ));
 }
 
+// 验证缺少 checkpoint 的 pending approval 会整体回滚。
 #[test]
 fn pending_tool_call_requires_checkpoint_and_rolls_back_atomically() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -448,6 +461,7 @@ fn pending_tool_call_requires_checkpoint_and_rolls_back_atomically() {
     ));
 }
 
+// 验证创建 pending approval 不会覆盖已请求取消的 turn。
 #[test]
 fn pending_approval_creation_does_not_overwrite_cancel_requested_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -508,6 +522,7 @@ fn pending_approval_creation_does_not_overwrite_cancel_requested_turn() {
     assert_eq!(cancelled.agent_loop_status, "cancel_requested");
 }
 
+// 验证 pending tool call 必须绑定已存在的 turn。
 #[test]
 fn pending_tool_call_binding_requires_existing_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -538,6 +553,7 @@ fn pending_tool_call_binding_requires_existing_turn() {
     ));
 }
 
+// 验证 approval 决定拒绝跨 turn 的 pending tool call 绑定。
 #[test]
 fn approval_decision_rejects_pending_tool_call_turn_mismatch() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -600,6 +616,7 @@ fn approval_decision_rejects_pending_tool_call_turn_mismatch() {
     ));
 }
 
+// 验证终态 turn 不会被后续状态更新覆盖。
 #[test]
 fn terminal_turn_status_is_not_overwritten_by_later_updates() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -633,6 +650,7 @@ fn terminal_turn_status_is_not_overwritten_by_later_updates() {
     );
 }
 
+// 验证取消请求与晚到 completion 之间保持原子边界。
 #[test]
 fn cancellation_request_is_atomic_and_rejects_late_completion() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -703,6 +721,7 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
     assert_eq!(trace_ids, vec!["trace_cancel_requested", "trace_cancelled"]);
 }
 
+// 验证 approval 决定只写入一次且保留在 decision ledger。
 #[test]
 fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
     for outcome in [
@@ -778,6 +797,7 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
     }
 }
 
+// 验证进程恢复会中断 executing approval，且不会重放外部副作用。
 #[test]
 fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -859,6 +879,7 @@ fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
     );
 }
 
+// 验证旧 handoff 半完成时恢复 pending successor 而不丢失执行上下文。
 #[test]
 fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -979,6 +1000,7 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
     );
 }
 
+// 验证 turn 恢复失败时 approval reconciliation 整体回滚。
 #[test]
 fn process_recovery_rolls_back_approval_reconciliation_when_turn_recovery_fails() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1119,6 +1141,7 @@ fn process_recovery_rolls_back_approval_reconciliation_when_turn_recovery_fails(
     );
 }
 
+// 验证恢复拒绝缺失或游离 decision ledger，并保持数据库不变。
 #[test]
 fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutation() {
     for corruption in ["missing", "stray"] {
@@ -1227,6 +1250,7 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
     }
 }
 
+// 验证未带 checkpoint 的 unresolved tool approval 无法恢复。
 #[test]
 fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1255,6 +1279,7 @@ fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
     ));
 }
 
+// 验证 approval execution handoff 原子替换旧 checkpoint 与新 approval。
 #[test]
 fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_approval() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1377,6 +1402,7 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
     assert_eq!(blocked.agent_loop_status, "blocked");
 }
 
+// 验证 deny with checkpoint 会终止 turn 并移除 checkpoint。
 #[test]
 fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1433,6 +1459,7 @@ fn deny_with_checkpoint_atomically_terminalizes_turn_and_removes_checkpoint() {
     );
 }
 
+// 验证 allow claim 在 store 事务内重新检查 active thread。
 #[test]
 fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1511,6 +1538,7 @@ fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
     );
 }
 
+// 验证删除 thread 会级联清理 approval、decision、trace 与相关数据。
 #[test]
 fn thread_delete_removes_bound_approvals_decisions_and_traces() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1594,6 +1622,7 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
     ));
 }
 
+// 读取指定表的外键父表名称，供迁移断言复用。
 fn foreign_key_parents(connection: &rusqlite::Connection, table: &str) -> Vec<String> {
     let query = format!("pragma foreign_key_list({table})");
     let mut statement = connection.prepare(&query).expect("foreign key list");
@@ -1604,6 +1633,7 @@ fn foreign_key_parents(connection: &rusqlite::Connection, table: &str) -> Vec<St
         .collect()
 }
 
+// 验证 turn user input 可供 approval resume 读取。
 #[test]
 fn turn_user_input_can_be_read_for_approval_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1632,6 +1662,7 @@ fn turn_user_input_can_be_read_for_approval_resume() {
     ));
 }
 
+// 验证 turn start 在 trace insert 失败时回滚全部副作用。
 #[test]
 fn transactional_turn_start_rolls_back_when_trace_insert_fails() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1674,6 +1705,7 @@ fn transactional_turn_start_rolls_back_when_trace_insert_fails() {
     assert!(store.get_turn(&successful.0.turn_id).is_ok());
 }
 
+// 验证终态 turn、assistant item 与 trace 在同一事务提交。
 #[test]
 fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1745,6 +1777,7 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
     );
 }
 
+// 验证终态提交的 trace 失败会回滚状态与 item。
 #[test]
 fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1822,6 +1855,7 @@ fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
     assert_eq!(assistant_count, 0);
 }
 
+// 验证 trace 列表支持分页与尾部窗口读取。
 #[test]
 fn trace_list_supports_pagination_and_tail() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1859,6 +1893,7 @@ fn trace_list_supports_pagination_and_tail() {
     );
 }
 
+// 验证 trace payload 递归脱敏并按 canonical JSON 计算 hash。
 #[test]
 fn trace_storage_redacts_recursively_and_hashes_canonical_payload() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1908,6 +1943,7 @@ fn trace_storage_redacts_recursively_and_hashes_canonical_payload() {
     assert!(!serialized.contains("sentinel-secret-value"));
 }
 
+// 验证被篡改的 trace payload hash 会 fail closed。
 #[test]
 fn tampered_trace_payload_hash_fails_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1946,6 +1982,7 @@ fn tampered_trace_payload_hash_fails_closed() {
     assert!(error.to_string().contains("trace integrity"));
 }
 
+// 验证 trace tail 返回有界且按时间正序排列的最新窗口。
 #[test]
 fn trace_tail_returns_the_bounded_latest_window_in_chronological_order() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1971,6 +2008,7 @@ fn trace_tail_returns_the_bounded_latest_window_in_chronological_order() {
     );
 }
 
+// 验证 artifact ref 持久化并脱敏 secret-like metadata。
 #[test]
 fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2006,6 +2044,7 @@ fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
     );
 }
 
+// 验证 v5 数据库重开时补齐稳定的 turn/item sequence。
 #[test]
 fn v5_reopen_backfills_stable_explicit_turn_and_item_sequences() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2071,6 +2110,7 @@ fn v5_reopen_backfills_stable_explicit_turn_and_item_sequences() {
     }
 }
 
+// 验证并发连接会串行化 v5 history migration。
 #[test]
 fn concurrent_connections_serialize_the_v5_history_migration() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2106,6 +2146,7 @@ fn concurrent_connections_serialize_the_v5_history_migration() {
     );
 }
 
+// 验证缺失 migration marker 的完整 history schema 会重新脱敏。
 #[test]
 fn complete_history_schema_without_migration_marker_is_resanitized() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2156,6 +2197,7 @@ fn complete_history_schema_without_migration_marker_is_resanitized() {
     assert!(redacted);
 }
 
+// 验证已完成 history 可持久化、排序并按 turn 分页。
 #[test]
 fn completed_history_is_durable_ordered_and_paged_by_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2255,6 +2297,7 @@ fn completed_history_is_durable_ordered_and_paged_by_turn() {
     );
 }
 
+// 验证 history 排除非 completed turn 与非 conversation item。
 #[test]
 fn history_excludes_non_completed_turns_and_non_conversation_items() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2390,6 +2433,7 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
     assert_eq!(history.messages[1].content, "safe assistant");
 }
 
+// 验证 user 与 assistant 文本存储和 history 投影都会脱敏。
 #[test]
 fn item_storage_and_history_redact_sensitive_user_and_assistant_text() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2467,6 +2511,7 @@ fn item_storage_and_history_redact_sensitive_user_and_assistant_text() {
     assert_eq!(stored_items[2].0, "{\"redacted\":true}");
 }
 
+// 验证 malformed conversation payload 会 fail closed。
 #[test]
 fn malformed_conversation_payload_fails_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2492,6 +2537,7 @@ fn malformed_conversation_payload_fails_closed() {
     ));
 }
 
+// 验证 archived thread 不能启动新 turn。
 #[test]
 fn archived_thread_cannot_start_a_turn() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2518,6 +2564,7 @@ fn archived_thread_cannot_start_a_turn() {
     ));
 }
 
+// 验证 turn 与 item 的唯一 sequence 索引拒绝重复值。
 #[test]
 fn turn_and_item_sequence_unique_indexes_reject_duplicates() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2560,6 +2607,7 @@ fn turn_and_item_sequence_unique_indexes_reject_duplicates() {
         .is_err());
 }
 
+// 验证并发连接只允许一个 turn，并分配唯一 item sequence。
 #[test]
 fn concurrent_connections_admit_one_turn_and_allocate_unique_item_sequences() {
     const WORKERS: usize = 12;
@@ -2638,6 +2686,7 @@ fn concurrent_connections_admit_one_turn_and_allocate_unique_item_sequences() {
     );
 }
 
+// 验证共享 workspace 的执行 guard 串行化并在 owner 丢失后释放。
 #[test]
 fn workspace_execution_guard_serializes_shared_workspace_and_releases_after_owner_loss() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2695,6 +2744,7 @@ fn workspace_execution_guard_serializes_shared_workspace_and_releases_after_owne
     drop(recovered_guard);
 }
 
+// 验证 atomic turn start 返回同一边界之前的历史。
 #[test]
 fn started_turn_returns_prior_history_from_the_same_atomic_start_boundary() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2727,6 +2777,7 @@ fn started_turn_returns_prior_history_from_the_same_atomic_start_boundary() {
     assert_eq!(started.trace.session_id, started.turn.turn_id);
 }
 
+// 追加一条 completed conversation，供 history 测试构造数据。
 fn append_completed_conversation(
     store: &SessionStore,
     thread_id: &str,
@@ -2755,6 +2806,7 @@ fn append_completed_conversation(
     turn.turn_id
 }
 
+// 创建用于 v5 migration 测试的历史数据库。
 fn create_v5_history_database(path: &std::path::Path) {
     let connection = rusqlite::Connection::open(path).expect("open v5 sqlite");
     connection
@@ -2811,6 +2863,7 @@ fn create_v5_history_database(path: &std::path::Path) {
 
 type HistorySequences = (Vec<(String, u64)>, Vec<(String, u64, bool)>);
 
+// 读取历史数据库中的显式 sequence，供迁移前后比较。
 fn read_history_sequences(path: &std::path::Path) -> HistorySequences {
     let connection = rusqlite::Connection::open(path).expect("open sqlite");
     let turns = connection

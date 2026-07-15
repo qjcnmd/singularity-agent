@@ -21,6 +21,7 @@ use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
 use singularity_protocol::{
     ArtifactRef, Item, ItemKind, ItemStatus, Thread, ThreadStatus, TraceEvent, Turn, TurnStatus,
 };
+/// 供上层重建 conversation history 的 protocol 类型。
 pub use singularity_protocol::{ConversationMessage, ConversationRole};
 use thiserror::Error;
 use uuid::Uuid;
@@ -75,26 +76,37 @@ const PENDING_APPROVAL_ALLOW_REQUIRES_ACTIVE_THREAD: &str =
 /// 保留存储、完整性、绑定和执行所有权原因的错误。
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// SQLite 底层操作失败。
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// 持久化 JSON 编解码失败。
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// 请求的持久化记录不存在。
     #[error("record not found: {0}")]
     NotFound(String),
+    /// 要创建的记录已存在。
     #[error("record already exists: {0}")]
     AlreadyExists(String),
+    /// 数据库 schema 版本高于当前实现支持的版本。
     #[error("unsupported schema version {found}; supported version is {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
+    /// trace payload 与持久化完整性校验不一致。
     #[error("trace integrity check failed: {0}")]
     TraceIntegrity(String),
+    /// 数据违反 store 的绑定或状态不变量。
     #[error("invalid store state: {0}")]
     InvalidState(String),
+    /// 初始化锁无法获取或使用。
     #[error("store initialization lock error: {0}")]
     InitializationLock(#[source] std::io::Error),
+    /// workspace 执行所有权锁无法获取或使用。
     #[error("workspace execution lock error: {0}")]
     ExecutionLock(#[source] std::io::Error),
+    /// thread 已有另一个非终态 turn。
     #[error("thread {thread_id} already has non-terminal turn {turn_id}")]
     ThreadHasNonterminalTurn { thread_id: String, turn_id: String },
+    /// workspace 已有另一个非终态 turn。
     #[error("workspace already has non-terminal turn {turn_id} in thread {thread_id}")]
     WorkspaceHasNonterminalTurn { thread_id: String, turn_id: String },
 }
@@ -105,33 +117,46 @@ pub type StoreResult<T> = Result<T, StoreError>;
 /// SQLite 存储的公开描述及其支持的模式版本。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStoreDescriptor {
+    /// 存储后端名称。
     pub backend: String,
+    /// 数据库路径或 SQLite 特殊路径。
     pub path: String,
+    /// 当前支持的 schema 版本。
     pub schema_version: u32,
 }
 
 /// 按模型重建所需顺序排列的一页已完成对话历史。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadHistoryPage {
+    /// 按 turn 顺序排列的 conversation message。
     pub messages: Vec<ConversationMessage>,
+    /// 下一页查询使用的 exclusive turn sequence。
     pub next_before_turn_sequence: Option<u64>,
 }
 
 /// 创建 turn、用户条目、追踪和初始历史页后得到的原子结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StartedTurn {
+    /// 新建的 turn。
     pub turn: Turn,
+    /// 清理后的 user input item。
     pub item: Item,
+    /// 与创建操作绑定的 trace event。
     pub trace: TraceEvent,
+    /// 创建边界之前可供模型重建的历史页。
     pub history: ThreadHistoryPage,
 }
 
 /// turn 的原子结果，以及相关的持久化计划、助手条目和追踪（如有）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommittedTurnOutcome {
+    /// 提交后的 turn 状态。
     pub turn: Turn,
+    /// 可选的持久化 plan item。
     pub plan_item: Option<Item>,
+    /// 可选的持久化 assistant item。
     pub assistant_item: Option<Item>,
+    /// 与结果提交绑定的 trace event。
     pub trace: TraceEvent,
 }
 
@@ -149,40 +174,60 @@ pub struct WorkspaceExecutionGuard {
     _lock_file: File,
 }
 
+// 执行所有权锁的粒度：优先 workspace，缺少 cwd 时使用 thread。
 enum WorkspaceExecutionScope {
+    // 以 canonical workspace 路径作为跨 thread 的执行锁范围。
     Workspace(String),
+    // 无 workspace 时退化为 thread 级执行锁范围。
     Thread(String),
 }
 
 /// approval 决定，以及 `AppServer` 所需的检查点和追踪数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordedApprovalDecision {
+    /// 被决定的 approval 请求。
     pub request: ApprovalRequest,
+    /// 已记录的 approval decision。
     pub decision: ApprovalDecision,
+    /// 允许继续执行时保留的 pending tool call checkpoint。
     pub pending_tool_call: Option<Value>,
+    /// 记录决定的 trace event。
     pub trace: TraceEvent,
 }
 
 /// 注册脱敏、内容寻址产物引用的输入。
 pub struct RegisterArtifactRefParams<'a> {
+    /// artifact 所属 run。
     pub run_id: &'a str,
+    /// 可选的来源 item。
     pub item_id: Option<&'a str>,
+    /// artifact 类型。
     pub kind: &'a str,
+    /// artifact URI。
     pub uri: &'a str,
+    /// 内容摘要。
     pub content_digest: &'a str,
+    /// 面向用户的摘要。
     pub summary: &'a str,
+    /// 需要持久化并按规则脱敏的 metadata。
     pub metadata: Value,
 }
 
 /// 为一个终止、已中断或 approval 阻塞的 turn 结果提交的持久化字段。
 pub struct CommitTurnOutcomeParams<'a> {
+    /// turn 的目标终态。
     pub status: TurnStatus,
+    /// AgentLoop 的目标状态。
     pub agent_loop_status: &'a str,
+    /// 可选的 assistant 增量。
     pub assistant_delta: Option<&'a str>,
+    /// 可选的 plan payload。
     pub plan: Option<&'a Value>,
+    /// 与提交绑定的 trace event。
     pub trace: &'a TraceEvent,
 }
 
+// SessionStore 的公开生命周期、恢复、历史、trace、approval 与 artifact 边界。
 impl SessionStore {
     /// 打开 SQLite 存储，配置安全失败的 `pragma`，并执行模式检查/迁移。
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
@@ -208,6 +253,7 @@ impl SessionStore {
         Ok(store)
     }
 
+    /// 返回存储后端及 schema 版本描述。
     pub fn descriptor(&self) -> &SessionStoreDescriptor {
         &self.descriptor
     }
@@ -279,12 +325,14 @@ impl SessionStore {
         Ok(())
     }
 
+    /// 创建 thread 并持久化其初始状态。
     pub fn create_thread(&self, model: Option<&str>, cwd: Option<&str>) -> StoreResult<Thread> {
         let thread = Self::new_thread(model, cwd);
         Self::insert_thread(&self.connection, &thread)?;
         Ok(thread)
     }
 
+    /// 按持久化顺序列出所有 thread。
     pub fn list_threads(&self) -> StoreResult<Vec<Thread>> {
         let mut statement = self
             .connection
@@ -297,6 +345,7 @@ impl SessionStore {
         Ok(threads)
     }
 
+    /// 读取指定 thread，不存在时返回 NotFound。
     pub fn get_thread(&self, thread_id: &str) -> StoreResult<Thread> {
         self.connection
             .query_row(
@@ -312,6 +361,7 @@ impl SessionStore {
             })
     }
 
+    /// 原子更新 thread 状态，并在归档前检查非终态 turn。
     pub fn update_thread_status(
         &self,
         thread_id: &str,
@@ -333,10 +383,12 @@ impl SessionStore {
         self.get_thread(thread_id)
     }
 
+    /// 删除 thread 及其绑定的 turn、item、trace、approval 和 artifact。
     pub fn delete_thread(&self, thread_id: &str) -> StoreResult<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         Self::ensure_thread_has_no_nonterminal_turn(&transaction, thread_id)?;
+        // 先收集所有显式或 checkpoint 绑定的 approval request。
         let mut approval_request_ids = BTreeSet::new();
         {
             let mut statement = transaction.prepare("select request_id, payload from approvals")?;
@@ -360,6 +412,7 @@ impl SessionStore {
                 approval_request_ids.insert(row?);
             }
         }
+        // 再按依赖顺序删除 ledger、checkpoint 和 approval。
         for request_id in approval_request_ids {
             transaction.execute(
                 "delete from approval_decisions where request_id = ?1",
@@ -374,6 +427,7 @@ impl SessionStore {
                 params![request_id],
             )?;
         }
+        // 最后清理 thread 的 turn、item、trace、artifact 和自身记录。
         transaction.execute(
             "delete from pending_tool_calls where turn_id in (select turn_id from turns where thread_id = ?1)",
             params![thread_id],
@@ -402,6 +456,7 @@ impl SessionStore {
         Ok(())
     }
 
+    /// 原子创建 thread 及其初始 trace。
     pub fn create_thread_with_trace(
         &self,
         model: Option<&str>,
@@ -424,6 +479,7 @@ impl SessionStore {
         Ok((thread, trace))
     }
 
+    /// 创建一个受 thread 与 workspace 并发约束的 turn。
     pub fn create_turn(&self, thread_id: &str, agent_loop_status: &str) -> StoreResult<Turn> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -436,6 +492,7 @@ impl SessionStore {
         Ok(turn)
     }
 
+    /// 创建 turn、user input 和 trace，不返回历史页。
     pub fn create_turn_with_input_and_trace(
         &self,
         thread_id: &str,
@@ -495,6 +552,7 @@ impl SessionStore {
         })
     }
 
+    /// 读取指定 thread 的 completed conversation 历史页。
     pub fn read_thread_history(
         &self,
         thread_id: &str,
@@ -519,6 +577,7 @@ impl SessionStore {
         Ok(history)
     }
 
+    /// 在指定 turn sequence 之前读取一页历史。
     pub fn read_thread_history_before_turn(
         &self,
         thread_id: &str,
@@ -548,6 +607,7 @@ impl SessionStore {
         Ok(history)
     }
 
+    /// 读取指定 turn，不存在时返回 NotFound。
     pub fn get_turn(&self, turn_id: &str) -> StoreResult<Turn> {
         self.connection
             .query_row(
@@ -561,6 +621,7 @@ impl SessionStore {
             })
     }
 
+    /// 更新 turn status，并拒绝覆盖已终态的 turn。
     pub fn update_turn_status(&self, turn_id: &str, status: TurnStatus) -> StoreResult<Turn> {
         self.ensure_turn_status_update_allowed(turn_id, &status, None)?;
         let changed = self.connection.execute(
@@ -573,6 +634,7 @@ impl SessionStore {
         self.get_turn(turn_id)
     }
 
+    /// 在不产生附加 item/trace 的情况下更新 turn 与 AgentLoop 状态。
     pub fn update_turn_state(
         &self,
         turn_id: &str,
@@ -603,6 +665,7 @@ impl SessionStore {
         Ok(committed)
     }
 
+    // 在既有事务中写入 turn 终态、附加 items 和 trace。
     fn commit_turn_outcome_in_transaction(
         &self,
         transaction: &Transaction<'_>,
@@ -760,6 +823,7 @@ impl SessionStore {
         Ok(turn)
     }
 
+    // 删除尚未开始外部执行的 pending approval 及其 checkpoint。
     fn delete_unresolved_pending_approvals(
         transaction: &Transaction<'_>,
         turn_id: &str,
@@ -790,6 +854,7 @@ impl SessionStore {
         Ok(pending_request_ids.len())
     }
 
+    /// 清理 payload 后向 turn 追加一个 item。
     pub fn append_item(&self, turn_id: &str, kind: ItemKind, payload: Value) -> StoreResult<Item> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -808,6 +873,7 @@ impl SessionStore {
         Ok(item)
     }
 
+    /// 读取 turn 的 user input payload，供 approval resume 重建上下文。
     pub fn get_turn_user_input(&self, turn_id: &str) -> StoreResult<Value> {
         let payload: String = self
             .connection
@@ -824,15 +890,18 @@ impl SessionStore {
             })?;
         Ok(serde_json::from_str(&payload)?)
     }
+    /// 脱敏并追加一条带完整性校验的 trace event。
     pub fn append_trace(&self, event: &TraceEvent) -> StoreResult<()> {
         let _ = Self::insert_trace(&self.connection, event)?;
         Ok(())
     }
 
+    /// 读取 run 的全部 trace，并校验每条事件完整性。
     pub fn list_trace(&self, run_id: &str) -> StoreResult<Vec<TraceEvent>> {
         self.list_trace_page(run_id, None, None)
     }
 
+    /// 按 rowid 游标分页读取 run trace。
     pub fn list_trace_page(
         &self,
         run_id: &str,
@@ -862,6 +931,7 @@ impl SessionStore {
         Ok(events)
     }
 
+    /// 读取 run trace 的有界最新窗口并恢复时间顺序。
     pub fn tail_trace(
         &self,
         run_id: &str,
@@ -887,6 +957,7 @@ impl SessionStore {
         Ok(events)
     }
 
+    /// 读取单条 trace event 并校验完整性。
     pub fn show_trace(&self, event_id: &str) -> StoreResult<TraceEvent> {
         let payload: String = self
             .connection
@@ -904,11 +975,13 @@ impl SessionStore {
         decode_trace_payload(&payload)
     }
 
+    /// 校验绑定后保存一个不带 checkpoint 的 approval 请求。
     pub fn create_approval(&self, request: &ApprovalRequest) -> StoreResult<()> {
         insert_approval(&self.connection, request)?;
         Ok(())
     }
 
+    /// 原子保存 approval 请求及其 trace。
     pub fn create_approval_with_trace(
         &self,
         request: &ApprovalRequest,
@@ -978,6 +1051,7 @@ impl SessionStore {
         Ok(trace)
     }
 
+    /// 列出尚未记录最终决定的 approval 请求。
     pub fn list_pending_approvals(&self) -> StoreResult<Vec<ApprovalRequest>> {
         let mut statement = self.connection.prepare(
             "select payload from approvals where decision_outcome is null order by rowid",
@@ -990,6 +1064,7 @@ impl SessionStore {
         Ok(approvals)
     }
 
+    /// 读取指定 request_id 的 pending approval。
     pub fn get_pending_approval(&self, request_id: &str) -> StoreResult<ApprovalRequest> {
         let payload: String = self
             .connection
@@ -1007,6 +1082,7 @@ impl SessionStore {
         Ok(serde_json::from_str(&payload)?)
     }
 
+    /// 判断 approval 是否仍绑定 pending tool call。
     pub fn has_pending_tool_call(&self, request_id: &str) -> StoreResult<bool> {
         Self::exists_in_transaction(
             &self.connection,
@@ -1015,6 +1091,7 @@ impl SessionStore {
         )
     }
 
+    /// 按持久化顺序列出已记录的 approval decisions。
     pub fn list_approval_decisions(&self) -> StoreResult<Vec<ApprovalDecision>> {
         let mut statement = self
             .connection
@@ -1036,6 +1113,7 @@ impl SessionStore {
     ) -> StoreResult<RecordedApprovalDecision> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        // 读取尚未决定的 approval，并恢复其持久化绑定。
         let request_payload: String = transaction
             .query_row(
                 "select payload from approvals where request_id = ?1 and decision_outcome is null",
@@ -1049,6 +1127,7 @@ impl SessionStore {
                 other => StoreError::Sqlite(other),
             })?;
         let request: ApprovalRequest = serde_json::from_str(&request_payload)?;
+        // 校验 pending tool call 与 approval 的 thread、turn 和 call id 一致。
         let pending_tool_call = match transaction
             .query_row(
                 "select thread_id, turn_id, tool_call_id, payload from pending_tool_calls where request_id = ?1",
@@ -1125,6 +1204,7 @@ impl SessionStore {
                 Some(&request.turn_id),
             )?;
         }
+        // Defer 只记录 trace，保留 approval 与 checkpoint 以便后续恢复。
         if decision.outcome == ApprovalOutcome::Defer {
             let trace = TraceEvent {
                 task_id: Some(request.turn_id.clone()),
@@ -1150,6 +1230,7 @@ impl SessionStore {
                 trace,
             });
         }
+        // 其他 outcome 写入 decision ledger，并推进或清理执行状态。
         let changed = transaction.execute(
             "update approvals set decision_outcome = ?1, decision_reason = ?2 where request_id = ?3 and decision_outcome is null",
             params![
@@ -1222,6 +1303,7 @@ impl SessionStore {
                 Self::insert_trace(&transaction, &terminal_trace)?;
             }
         }
+        // 将最终决定与其绑定的 turn trace 一并提交。
         let trace = TraceEvent::new(
             format!("trace_{}", decision.decision_id),
             request.thread_id.clone(),
@@ -1276,8 +1358,10 @@ impl SessionStore {
                 )),
                 other => StoreError::Sqlite(other),
             })?;
+        // 先提交当前 executing approval 的 turn 结果。
         let committed =
             self.commit_turn_outcome_in_transaction(&transaction, &bound_turn_id, params)?;
+        // 原子移除已解决 checkpoint，再写入 successor approvals。
         let deleted = transaction.execute(
             "delete from pending_tool_calls where request_id = ?1 and execution_state = 'executing'",
             params![request_id],
@@ -1332,6 +1416,7 @@ impl SessionStore {
         transaction: &Connection,
         thread_id: &str,
     ) -> StoreResult<Vec<String>> {
+        // approval 与 pending execution 的联合恢复行。
         struct RecoveryRow {
             approval_rowid: i64,
             request: ApprovalRequest,
@@ -1350,6 +1435,7 @@ impl SessionStore {
              left join pending_tool_calls p on p.request_id = a.request_id
              order by a.rowid",
         )?;
+        // 先读取 approval、decision 与 pending execution 的联合快照。
         let persisted_rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1369,6 +1455,7 @@ impl SessionStore {
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
 
+        // 再将快照解码为可逐行校验和修复的恢复记录。
         let mut rows = Vec::with_capacity(persisted_rows.len());
         for (
             approval_rowid,
@@ -1645,6 +1732,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 查询执行锁覆盖的 thread 集合。
     fn workspace_execution_thread_ids(
         &self,
         execution_scope: &WorkspaceExecutionScope,
@@ -1663,6 +1751,7 @@ impl SessionStore {
         }
     }
 
+    // 恢复单个 thread 的 abandoned execution。
     fn recover_abandoned_thread_execution(&self, thread_id: &str) -> StoreResult<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -1672,6 +1761,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 将 thread 中遗留的非终态 turn 收敛为可恢复状态。
     fn recover_abandoned_turns_for_thread(
         transaction: &Connection,
         thread_id: &str,
@@ -1756,6 +1846,7 @@ impl SessionStore {
         Ok(recovered)
     }
 
+    // 确认 guard 仍属于当前 store 和正确的执行范围。
     fn validate_workspace_execution_guard(
         &self,
         guard: &WorkspaceExecutionGuard,
@@ -1768,6 +1859,7 @@ impl SessionStore {
         Ok(())
     }
 
+    /// 读取指定 decision_id 的 approval decision。
     pub fn get_approval_decision(&self, decision_id: &str) -> StoreResult<ApprovalDecision> {
         let payload: String = self
             .connection
@@ -1785,6 +1877,7 @@ impl SessionStore {
         Ok(serde_json::from_str(&payload)?)
     }
 
+    /// 脱敏并持久化一个 content-addressed artifact ref。
     pub fn register_artifact_ref(
         &self,
         params: RegisterArtifactRefParams<'_>,
@@ -1826,6 +1919,7 @@ impl SessionStore {
         Ok(artifact)
     }
 
+    /// 读取指定 artifact ref。
     pub fn get_artifact_ref(&self, artifact_id: &str) -> StoreResult<ArtifactRef> {
         self.connection
             .query_row(
@@ -1841,6 +1935,7 @@ impl SessionStore {
             })
     }
 
+    /// 列出 run 关联的 artifact refs。
     pub fn list_artifact_refs(&self, run_id: &str) -> StoreResult<Vec<ArtifactRef>> {
         let mut statement = self.connection.prepare(
             "select artifact_id, run_id, item_id, kind, uri, content_digest, summary, metadata, redacted from artifact_refs where run_id = ?1 order by rowid",
@@ -1853,6 +1948,7 @@ impl SessionStore {
         Ok(artifacts)
     }
 
+    /// 返回已应用 migration id 的持久化顺序。
     pub fn applied_migrations(&self) -> StoreResult<Vec<String>> {
         let mut statement = self
             .connection
@@ -1865,6 +1961,7 @@ impl SessionStore {
         Ok(migrations)
     }
 
+    // 在给定事务边界内读取并投影 completed conversation history。
     fn read_thread_history_from(
         connection: &Connection,
         thread_id: &str,
@@ -2046,6 +2143,7 @@ impl SessionStore {
         })
     }
 
+    // 拒绝向不存在或已归档 thread 创建可执行 turn。
     fn ensure_active_thread(connection: &Connection, thread_id: &str) -> StoreResult<()> {
         let status = connection
             .query_row(
@@ -2070,6 +2168,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 检查 thread 是否存在未终态 turn。
     fn ensure_thread_has_no_nonterminal_turn(
         connection: &Connection,
         thread_id: &str,
@@ -2097,6 +2196,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 检查共享 workspace 是否已被其他 thread 的 turn 占用。
     fn ensure_workspace_has_no_nonterminal_turn(
         connection: &Connection,
         thread_id: &str,
@@ -2143,6 +2243,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 为 thread 分配下一个稳定且单调的 turn sequence。
     fn next_turn_sequence(connection: &Connection, thread_id: &str) -> StoreResult<u64> {
         let current = connection.query_row(
             "select max(turn_sequence) from turns where thread_id = ?1",
@@ -2152,6 +2253,7 @@ impl SessionStore {
         next_sequence(current, "turn sequence")
     }
 
+    // 为 turn 分配下一个稳定且单调的 item sequence。
     fn next_item_sequence(connection: &Connection, turn_id: &str) -> StoreResult<u64> {
         let current = connection.query_row(
             "select max(item_sequence) from items where turn_id = ?1",
@@ -2160,6 +2262,7 @@ impl SessionStore {
         )?;
         next_sequence(current, "item sequence")
     }
+    // 判断 run 是否至少拥有一条 trace event。
     fn trace_run_exists(&self, run_id: &str) -> StoreResult<bool> {
         self.exists(
             "select 1 from trace_events where run_id = ?1 limit 1",
@@ -2167,6 +2270,7 @@ impl SessionStore {
         )
     }
 
+    // 将 threads 行解码为 protocol Thread。
     fn thread_from_row(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         let status: String = row.get(3)?;
         Ok(Thread {
@@ -2183,6 +2287,7 @@ impl SessionStore {
         })
     }
 
+    // 将 turns 行解码为 protocol Turn。
     fn turn_from_row(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
         let status: String = row.get(2)?;
         Ok(Turn {
@@ -2199,6 +2304,7 @@ impl SessionStore {
         })
     }
 
+    // 执行单参数存在性查询，统一处理空结果。
     fn exists(&self, query: &str, value: &str) -> StoreResult<bool> {
         let result = self.connection.query_row(query, params![value], |_| Ok(()));
         match result {
@@ -2316,6 +2422,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 将 approval execution schema 迁移到显式 checkpoint 状态。
     fn migrate_approval_execution_schema(&self) -> StoreResult<()> {
         self.connection
             .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "OFF")?;
@@ -2385,6 +2492,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 增加并填充稳定 conversation history 所需的 schema 与 sequence。
     fn migrate_conversation_history(&self) -> StoreResult<()> {
         self.connection
             .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "OFF")?;
@@ -2520,6 +2628,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 读取 schema_meta 并拒绝未来版本数据库。
     fn fail_closed_on_future_schema(&self) -> StoreResult<()> {
         let schema_version = self
             .connection
@@ -2539,6 +2648,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 确保 trace_events 具备 session_id 绑定列。
     fn ensure_trace_session_id_column(&self) -> StoreResult<()> {
         let mut statement = self.connection.prepare("pragma table_info(trace_events)")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -2554,6 +2664,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 确保 pending_tool_calls 具备 tool_call_id 绑定列。
     fn ensure_pending_tool_call_tool_call_id_column(&self) -> StoreResult<()> {
         let mut statement = self
             .connection
@@ -2571,6 +2682,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 确保 pending_tool_calls 具备 thread_id 绑定列。
     fn ensure_pending_tool_call_thread_id_column(&self) -> StoreResult<()> {
         if self.table_has_column("pending_tool_calls", "thread_id")? {
             return Ok(());
@@ -2592,6 +2704,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 确保 pending_tool_calls 具备显式 execution_state 列。
     fn ensure_pending_execution_state_column(&self) -> StoreResult<()> {
         if self.table_has_column("pending_tool_calls", "execution_state")? {
             return Ok(());
@@ -2603,6 +2716,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 校验 schema 中所有必须存在的外键关系。
     fn ensure_required_foreign_keys(&self) -> StoreResult<()> {
         if self.table_references("turns", "threads")?
             && self.table_references("items", "turns")?
@@ -2617,6 +2731,7 @@ impl SessionStore {
         self.fail_closed_on_foreign_key_violations()
     }
 
+    // 以完整外键定义重建历史 schema 中缺失约束的表。
     fn rebuild_foreign_key_tables(&self) -> StoreResult<()> {
         self.connection
             .pragma_update(None, SQLITE_FOREIGN_KEYS_PRAGMA, "OFF")?;
@@ -2709,10 +2824,12 @@ impl SessionStore {
         foreign_keys_result?;
         Ok(())
     }
+    // 扫描现有数据库并拒绝遗留外键孤儿行。
     fn fail_closed_on_foreign_key_violations(&self) -> StoreResult<()> {
         fail_closed_on_foreign_key_violations(&self.connection)
     }
 
+    // 判断表是否声明了指向指定父表的外键。
     fn table_references(&self, table: &str, parent: &str) -> StoreResult<bool> {
         let query = format!("pragma foreign_key_list({table})");
         let mut statement = self.connection.prepare(&query)?;
@@ -2725,10 +2842,12 @@ impl SessionStore {
         Ok(false)
     }
 
+    // 判断表是否已有指定列。
     fn table_has_column(&self, table: &str, column: &str) -> StoreResult<bool> {
         table_has_column(&self.connection, table, column)
     }
 
+    // 校验 turn 状态迁移是否允许覆盖当前状态。
     fn ensure_turn_status_update_allowed(
         &self,
         turn_id: &str,
@@ -2739,6 +2858,7 @@ impl SessionStore {
         validate_turn_status_update(&current, next_status, next_agent_loop_status)
     }
 
+    // 构造带新 id 和初始 active 状态的 Thread。
     fn new_thread(model: Option<&str>, cwd: Option<&str>) -> Thread {
         Thread {
             thread_id: format!("thread_{}", short_id()),
@@ -2748,6 +2868,7 @@ impl SessionStore {
         }
     }
 
+    // 构造绑定 thread 的 running Turn。
     fn new_turn(thread_id: &str, agent_loop_status: &str) -> Turn {
         Turn {
             turn_id: format!("turn_{}", short_id()),
@@ -2757,6 +2878,7 @@ impl SessionStore {
         }
     }
 
+    // 构造绑定 turn 的 pending Item。
     fn new_item(turn_id: &str, kind: ItemKind, payload: Value) -> Item {
         Item {
             item_id: format!("item_{}", short_id()),
@@ -2767,6 +2889,7 @@ impl SessionStore {
         }
     }
 
+    // 将 Thread 编码后写入 threads 表。
     fn insert_thread(connection: &Connection, thread: &Thread) -> StoreResult<()> {
         connection.execute(
             "insert into threads(thread_id, model, cwd, status) values(?1, ?2, ?3, ?4)",
@@ -2780,6 +2903,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 将 Turn 与显式 sequence 写入 turns 表。
     fn insert_turn(connection: &Connection, turn: &Turn, turn_sequence: u64) -> StoreResult<()> {
         connection.execute(
             "insert into turns(turn_id, thread_id, turn_sequence, status, agent_loop_status) values(?1, ?2, ?3, ?4, ?5)",
@@ -2794,6 +2918,7 @@ impl SessionStore {
         Ok(())
     }
 
+    // 将已脱敏 Item 与显式 sequence 写入 items 表。
     fn insert_item(
         connection: &Connection,
         item: &Item,
@@ -2814,6 +2939,7 @@ impl SessionStore {
         )?;
         Ok(())
     }
+    // 脱敏、哈希并写入 trace event，返回持久化投影。
     fn insert_trace(connection: &Connection, event: &TraceEvent) -> StoreResult<TraceEvent> {
         let event = sanitize_trace_event(event);
         connection.execute(
@@ -2828,6 +2954,7 @@ impl SessionStore {
         Ok(event)
     }
 
+    // 在调用方事务中执行单参数存在性查询。
     fn exists_in_transaction(
         connection: &Connection,
         query: &str,
@@ -2842,6 +2969,7 @@ impl SessionStore {
     }
 }
 
+// 配置 SQLite 的并发、外键、WAL 与安全删除 pragma。
 fn configure_connection(connection: &Connection) -> StoreResult<()> {
     connection.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
     connection.pragma_update(None, SQLITE_SECURE_DELETE_PRAGMA, "ON")?;
@@ -2850,6 +2978,7 @@ fn configure_connection(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+// 根据 thread cwd 选择 workspace 或 thread 级执行锁范围。
 fn workspace_execution_scope(thread: &Thread) -> WorkspaceExecutionScope {
     match thread.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
         Some(cwd) => WorkspaceExecutionScope::Workspace(cwd.to_string()),
@@ -2857,6 +2986,7 @@ fn workspace_execution_scope(thread: &Thread) -> WorkspaceExecutionScope {
     }
 }
 
+// 生成执行所有权锁文件的稳定路径。
 fn workspace_execution_lock_path(
     store_path: &Path,
     execution_scope: &WorkspaceExecutionScope,
@@ -2871,6 +3001,7 @@ fn workspace_execution_lock_path(
     PathBuf::from(lock_path)
 }
 
+// 在 schema 初始化期间以独占文件锁串行化同一数据库。
 fn acquire_store_initialization_lock(path: &Path) -> StoreResult<Option<File>> {
     if path == Path::new(":memory:") {
         return Ok(None);
@@ -2905,6 +3036,7 @@ fn acquire_store_initialization_lock(path: &Path) -> StoreResult<Option<File>> {
     }
 }
 
+// 将当前 schema 版本写入 schema_meta。
 fn write_schema_version(connection: &Connection) -> StoreResult<()> {
     connection.execute("delete from schema_meta", [])?;
     connection.execute(
@@ -2914,12 +3046,14 @@ fn write_schema_version(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+// 以安全删除模式重写 SQLite 数据库页。
 fn secure_rewrite_database(connection: &Connection) -> StoreResult<()> {
     truncate_wal(connection)?;
     connection.execute_batch("vacuum")?;
     truncate_wal(connection)
 }
 
+// 在迁移完成后截断 WAL，避免保留旧页内容。
 fn truncate_wal(connection: &Connection) -> StoreResult<()> {
     let busy: i64 =
         connection.query_row("pragma wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
@@ -2931,6 +3065,7 @@ fn truncate_wal(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
+// 以 pragma 查询表列是否存在。
 fn table_has_column(connection: &Connection, table: &str, column: &str) -> StoreResult<bool> {
     let query = format!("pragma table_info({table})");
     let mut statement = connection.prepare(&query)?;
@@ -2943,6 +3078,7 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> Store
     Ok(false)
 }
 
+// 将可选 SQL sequence 安全转换为下一个 u64 sequence。
 fn next_sequence(current: Option<i64>, label: &str) -> StoreResult<u64> {
     let current = current
         .map(|sequence| sequence_from_sql(sequence, label))
@@ -2953,16 +3089,19 @@ fn next_sequence(current: Option<i64>, label: &str) -> StoreResult<u64> {
         .ok_or_else(|| StoreError::InvalidState(format!("{label} overflow")))
 }
 
+// 将 u64 sequence 转换为 SQLite 可存储的 i64。
 fn sequence_to_sql(sequence: u64, label: &str) -> StoreResult<i64> {
     i64::try_from(sequence)
         .map_err(|_| StoreError::InvalidState(format!("{label} exceeds sqlite integer range")))
 }
 
+// 将 SQLite sequence 解码为非负 u64。
 fn sequence_from_sql(sequence: i64, label: &str) -> StoreResult<u64> {
     u64::try_from(sequence)
         .map_err(|_| StoreError::InvalidState(format!("{label} must be non-negative")))
 }
 
+// 重写历史 item payload，使迁移后的存储满足当前脱敏规则。
 fn sanitize_migrated_items(connection: &Connection) -> StoreResult<()> {
     let items = {
         let mut statement = connection
@@ -2987,6 +3126,7 @@ fn sanitize_migrated_items(connection: &Connection) -> StoreResult<()> {
     }
     Ok(())
 }
+// 按 item kind 清理敏感内容并返回是否发生脱敏。
 fn sanitize_item_payload(kind: &ItemKind, mut payload: Value) -> StoreResult<(Value, bool)> {
     match kind {
         ItemKind::UserMessage => {
@@ -3068,6 +3208,7 @@ fn sanitize_item_payload(kind: &ItemKind, mut payload: Value) -> StoreResult<(Va
     }
 }
 
+// 将持久化 item 投影为模型可消费的 conversation message。
 fn conversation_projection(
     kind: &ItemKind,
     payload: &Value,
@@ -3104,6 +3245,7 @@ fn conversation_projection(
     }
 }
 
+// 执行 SQLite foreign_key_check，并拒绝已有违反项。
 fn fail_closed_on_foreign_key_violations(connection: &Connection) -> StoreResult<()> {
     let violation = connection
         .query_row("pragma foreign_key_check", [], |row| {
@@ -3120,6 +3262,7 @@ fn fail_closed_on_foreign_key_violations(connection: &Connection) -> StoreResult
     Ok(())
 }
 
+// 校验 checkpoint 并提取唯一的 pending tool call id。
 fn pending_tool_call_id(
     connection: &Connection,
     request: &ApprovalRequest,
@@ -3235,6 +3378,7 @@ fn pending_tool_call_id(
     Ok(tool_call_id.to_string())
 }
 
+// 校验 approval request 的显式 thread/turn 绑定。
 fn ensure_approval_request_binding(
     connection: &Connection,
     request: &ApprovalRequest,
@@ -3247,6 +3391,7 @@ fn ensure_approval_request_binding(
     ensure_request_turn_binding(connection, request)
 }
 
+// 校验 pending checkpoint 与 request 的 turn 绑定。
 fn ensure_request_turn_binding(
     connection: &Connection,
     request: &ApprovalRequest,
@@ -3271,6 +3416,7 @@ fn ensure_request_turn_binding(
     Ok(())
 }
 
+// 判断 turn status 是否已经不可再推进。
 fn is_terminal_turn_status(status: &TurnStatus) -> bool {
     matches!(
         status,
@@ -3278,6 +3424,7 @@ fn is_terminal_turn_status(status: &TurnStatus) -> bool {
     )
 }
 
+// 校验状态更新没有覆盖终态或制造非法迁移。
 fn validate_turn_status_update(
     current: &Turn,
     next_status: &TurnStatus,
@@ -3303,6 +3450,7 @@ fn validate_turn_status_update(
     Ok(())
 }
 
+// 将 approval request 编码并写入 approvals 表。
 fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreResult<()> {
     ensure_approval_request_binding(connection, request)?;
     connection
@@ -3321,10 +3469,12 @@ fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreR
     Ok(())
 }
 
+// 生成用于持久化记录的短随机 id。
 fn short_id() -> String {
     Uuid::new_v4().simple().to_string()[..12].to_string()
 }
 
+// 将 artifact_refs 行解码为 ArtifactRef。
 fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRef> {
     let metadata: String = row.get(7)?;
     Ok(ArtifactRef {
@@ -3346,6 +3496,7 @@ fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRef> {
     })
 }
 
+// 解码 trace payload 并恢复完整性校验所需对象。
 fn decode_trace_payload(payload: &str) -> StoreResult<TraceEvent> {
     let event: TraceEvent = serde_json::from_str(payload)?;
     if !event.redaction_applied {
@@ -3363,6 +3514,7 @@ fn decode_trace_payload(payload: &str) -> StoreResult<TraceEvent> {
     Ok(event)
 }
 
+// 对 trace 的 payload 与可见文本执行脱敏投影。
 fn sanitize_trace_event(event: &TraceEvent) -> TraceEvent {
     let mut sanitized = event.clone();
     sanitized.summary = redact_secret_like_text(&sanitized.summary);
@@ -3377,12 +3529,14 @@ fn sanitize_trace_event(event: &TraceEvent) -> TraceEvent {
     sanitized
 }
 
+// 对 canonical payload 计算带前缀的 SHA-256 摘要。
 fn trace_payload_hash(payload: &Value) -> String {
     let canonical = canonical_json(payload);
     let digest = Sha256::digest(canonical.as_bytes());
     format!("{TRACE_HASH_PREFIX}{digest:x}")
 }
 
+// 以稳定 key 顺序序列化 JSON，作为哈希输入。
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
@@ -3414,6 +3568,7 @@ fn canonical_json(value: &Value) -> String {
     }
 }
 
+// 递归识别并替换 secret-like JSON 值。
 fn redact_secret_like_value(value: Value) -> Value {
     match value {
         Value::String(text) => Value::String(redact_secret_like_text(&text)),
@@ -3436,12 +3591,14 @@ fn redact_secret_like_value(value: Value) -> Value {
     }
 }
 
+// 判断 artifact URI、摘要或 metadata 是否触发脱敏。
 fn artifact_needs_redaction(uri: &str, summary: &str, metadata: &Value) -> bool {
     contains_secret_like(uri)
         || contains_secret_like(summary)
         || value_contains_secret_like(metadata)
 }
 
+// 递归判断 JSON 值是否包含 secret-like 内容。
 fn value_contains_secret_like(value: &Value) -> bool {
     match value {
         Value::String(text) => contains_secret_like(text),
@@ -3453,6 +3610,7 @@ fn value_contains_secret_like(value: &Value) -> bool {
     }
 }
 
+// 将文本中的 secret-like 片段替换为统一占位符。
 fn redact_secret_like_text(text: &str) -> String {
     if contains_secret_like(text) {
         REDACTED_ARTIFACT_VALUE.to_string()
@@ -3461,6 +3619,7 @@ fn redact_secret_like_text(text: &str) -> String {
     }
 }
 
+// 判断文本是否命中敏感 marker 或 core 敏感文本规则。
 fn contains_secret_like(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     contains_sensitive_text(text)
@@ -3470,9 +3629,11 @@ fn contains_secret_like(text: &str) -> bool {
 }
 
 #[cfg(test)]
+// store crate 内部的 SQLite pragma 单元测试。
 mod tests {
     use super::*;
 
+    // 验证新连接启用外键、WAL、busy timeout 与 secure delete pragma。
     #[test]
     fn open_configures_sqlite_connection_pragmas() {
         let dir = tempfile::tempdir().expect("temp dir");

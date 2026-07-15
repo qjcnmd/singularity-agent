@@ -1,3 +1,5 @@
+//! 按 JSON scenario 驱动 fake app-server，用于 CLI 协议测试。
+
 mod shared;
 
 use serde_json::Value;
@@ -8,6 +10,7 @@ use std::path::Path;
 use std::process;
 use std::time::Duration;
 
+// 读取 scenario、处理请求循环，并执行对应的 fake action。
 fn main() {
     let Some(scenario_path) = std::env::var_os(shared::SCENARIO_ENV) else {
         return;
@@ -19,6 +22,7 @@ fn main() {
     }
 }
 
+// 加载 scenario 并按 method/调用次数分发交互。
 fn run(scenario_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let scenario: Value = serde_json::from_reader(File::open(scenario_path)?)?;
     let mut stdout = io::stdout().lock();
@@ -65,6 +69,7 @@ fn run(scenario_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// 执行响应、通知、捕获、延时和退出等测试动作。
 fn execute_actions(
     actions: &[Value],
     request: &Value,
@@ -119,12 +124,14 @@ fn execute_actions(
     Ok(())
 }
 
+// 将 JSON 响应写成一行并立即刷新 stdout。
 fn write_json(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *stdout, value)?;
     stdout.write_all(b"\n")?;
     stdout.flush()
 }
 
+// 追加写入 method trace 或其他测试文本文件。
 fn append_text(path: &Path, text: &str) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(text.as_bytes())

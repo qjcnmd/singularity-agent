@@ -1,3 +1,5 @@
+//! `sg` 的命令行入口：通过 stdio JSON-RPC 调用 app-server 并渲染结果。
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
@@ -27,12 +29,14 @@ const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Debug, Parser)]
 #[command(name = "sg")]
 #[command(about = "Singularity coding agent")]
+// 命令行顶层参数及其子命令入口。
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
+// 面向终端用户的 CLI 命令集合。
 enum Command {
     /// Start a thread, submit a goal, and render protocol events.
     Run {
@@ -79,12 +83,14 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+// 配置与运行时诊断命令。
 enum ConfigCommand {
     /// Print app-server client diagnostics.
     Doctor,
 }
 
 #[derive(Debug, Subcommand)]
+// Evaluation 的 CLI 子命令。
 enum EvalCommand {
     /// Validate and run an evaluation manifest.
     Run {
@@ -97,6 +103,7 @@ enum EvalCommand {
 }
 
 #[derive(Debug, Subcommand)]
+// turn 查询与中断命令。
 enum TurnCommand {
     /// Print the current turn status.
     Status { turn_id: String },
@@ -105,6 +112,7 @@ enum TurnCommand {
 }
 
 #[derive(Debug, Parser)]
+// trace 查询参数；无子命令时按 run_id 读取尾部事件。
 struct TraceArgs {
     #[command(subcommand)]
     command: Option<TraceCommand>,
@@ -114,19 +122,23 @@ struct TraceArgs {
 }
 
 #[derive(Debug, Subcommand)]
+// trace 的单事件操作。
 enum TraceCommand {
     /// Show one trace event by id.
     Show { event_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+// approval 决定在 CLI 中的受控枚举表示。
 enum ApprovalDecisionArg {
     Allow,
     Deny,
     Defer,
 }
 
+// approval CLI 枚举到协议 outcome 的转换边界。
 impl ApprovalDecisionArg {
+    // 将 CLI 枚举映射为 app-server 协议值。
     fn as_str(self) -> &'static str {
         match self {
             Self::Allow => "allow",
@@ -136,6 +148,7 @@ impl ApprovalDecisionArg {
     }
 }
 
+// 解析命令、驱动 app-server 客户端，并将错误转换为进程失败。
 fn main() {
     if let Err(error) = run_cli(Cli::parse()) {
         eprintln!("{error}");
@@ -143,6 +156,7 @@ fn main() {
     }
 }
 
+// 按命令编排 app-server 请求和面向用户的输出。
 fn run_cli(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Run { goal, model, json } => {
@@ -254,6 +268,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
     }
 }
 
+// 在启动新 turn 前确认 AgentLoop 已完成且无 blocker。
 fn ensure_agent_loop_available(client: &mut AppServerClient) -> Result<(), String> {
     let capability = client.agent_capability()?;
     let agent_loop = &capability["agentLoop"];
@@ -268,6 +283,7 @@ fn ensure_agent_loop_available(client: &mut AppServerClient) -> Result<(), Strin
     ))
 }
 
+// 将 capability 中的 blocker 列表压缩为稳定的诊断文本。
 fn agent_loop_blockers(agent_loop: &Value) -> String {
     let blockers = agent_loop["blockers"]
         .as_array()
@@ -286,6 +302,7 @@ fn agent_loop_blockers(agent_loop: &Value) -> String {
     }
 }
 
+// 输出 app-server、AgentLoop 与 provider 的脱敏就绪状态。
 fn print_readiness() -> Result<(), String> {
     let mut client = AppServerClient::spawn()?;
     client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
@@ -300,6 +317,7 @@ fn print_readiness() -> Result<(), String> {
     print_provider_configuration(&capability["providerConfiguration"])
 }
 
+// 校验并输出 provider capability，始终只暴露字段存在性。
 fn print_provider_configuration(provider: &Value) -> Result<(), String> {
     let source = match provider["source"].as_str() {
         Some("process_env") => "process_env",
@@ -347,6 +365,7 @@ fn print_provider_configuration(provider: &Value) -> Result<(), String> {
     Ok(())
 }
 
+// 通过 app-server 校验并执行指定 evaluation manifest。
 fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), String> {
     if !manifest.exists() {
         return Err(format!("eval manifest not found: {}", manifest.display()));
@@ -375,6 +394,7 @@ fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), St
     }
 }
 
+// 维护 app-server 子进程及其 JSON-RPC stdio 通道。
 struct AppServerClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -384,7 +404,9 @@ struct AppServerClient {
     next_id: i64,
 }
 
+// AppServerClient 的生命周期与 JSON-RPC 操作实现。
 impl AppServerClient {
+    // 定位并启动 app-server，随后建立异步 stdout reader。
     fn spawn() -> Result<Self, String> {
         let mut command = ProcessCommand::new(app_server_bin()?);
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -413,12 +435,14 @@ impl AppServerClient {
         })
     }
 
+    // 完成 JSON-RPC initialize/initialized 握手。
     fn initialize(&mut self) -> Result<(), String> {
         let id = self.next_request_id();
         self.request(initialize_request(id))?;
         self.notify(Method::Initialized, json!({}))
     }
 
+    // 创建 thread，并可选地渲染启动事件。
     fn thread_start(
         &mut self,
         model: Option<String>,
@@ -438,6 +462,7 @@ impl AppServerClient {
         Ok((result, responses))
     }
 
+    // 提交 evaluation manifest，并返回 app-server 的结果对象。
     fn eval_run(&mut self, manifest: &Path, run_id: &str) -> Result<Value, String> {
         let id = self.next_request_id();
         let mut params = json!({"manifest": manifest.to_string_lossy(), "runId": run_id});
@@ -449,6 +474,7 @@ impl AppServerClient {
         first_result(responses)
     }
 
+    // 恢复现有 thread，不向 app-server 上传历史。
     fn thread_resume(&mut self, thread_id: &str) -> Result<Value, String> {
         let id = self.next_request_id();
         first_result(self.request(JsonRpcMessage::request(
@@ -458,6 +484,7 @@ impl AppServerClient {
         ))?)
     }
 
+    // 读取 AgentLoop capability 快照。
     fn agent_capability(&mut self) -> Result<Value, String> {
         let id = self.next_request_id();
         first_result(self.request(JsonRpcMessage::request(
@@ -467,6 +494,7 @@ impl AppServerClient {
         ))?)
     }
 
+    // 启动 turn、渲染事件，并在必要时轮询到终态。
     fn turn_start(
         &mut self,
         thread_id: &str,
@@ -495,6 +523,7 @@ impl AppServerClient {
         Ok((turn, responses))
     }
 
+    // 按固定间隔查询 running turn，直到出现终态。
     fn wait_for_turn_terminal(&mut self, turn_id: &str, render: bool) -> Result<TurnView, String> {
         loop {
             thread::sleep(TURN_STATUS_POLL_INTERVAL);
@@ -516,6 +545,7 @@ impl AppServerClient {
         }
     }
 
+    // 将 turn/status 响应投影为 CLI 所需的最小视图。
     fn fetch_turn_status(&mut self, turn_id: &str) -> Result<TurnView, String> {
         let id = self.next_request_id();
         let result = first_result(self.request(JsonRpcMessage::request(
@@ -531,6 +561,7 @@ impl AppServerClient {
         })
     }
 
+    // 请求并打印持久化 thread 列表。
     fn thread_list(&mut self) -> Result<(), String> {
         let id = self.next_request_id();
         let result = first_result(self.request(JsonRpcMessage::request(
@@ -550,6 +581,7 @@ impl AppServerClient {
         Ok(())
     }
 
+    // 请求并渲染单个 turn 的状态。
     fn turn_status(&mut self, turn_id: &str) -> Result<(), String> {
         let id = self.next_request_id();
         let result = first_result(self.request(JsonRpcMessage::request(
@@ -561,6 +593,7 @@ impl AppServerClient {
         Ok(())
     }
 
+    // 请求中断 turn，并打印服务端返回的状态。
     fn turn_interrupt(&mut self, turn_id: &str) -> Result<(), String> {
         let id = self.next_request_id();
         let result = first_result(self.request(JsonRpcMessage::request(
@@ -577,6 +610,7 @@ impl AppServerClient {
         Ok(())
     }
 
+    // 请求并按顺序渲染 run 的 trace 尾部。
     fn trace_tail(&mut self, run_id: &str, limit: usize) -> Result<(), String> {
         let id = self.next_request_id();
         let result = first_result(self.request(JsonRpcMessage::request(
@@ -592,6 +626,7 @@ impl AppServerClient {
         Ok(())
     }
 
+    // 请求并渲染指定 trace event。
     fn trace_show(&mut self, event_id: &str) -> Result<(), String> {
         let id = self.next_request_id();
         let result = first_result(self.request(JsonRpcMessage::request(
@@ -603,6 +638,7 @@ impl AppServerClient {
         Ok(())
     }
 
+    // 请求并打印当前 pending approval 列表。
     fn approvals(&mut self) -> Result<(), String> {
         let id = self.next_request_id();
         let result = first_result(self.request(JsonRpcMessage::request(
@@ -622,6 +658,7 @@ impl AppServerClient {
         Ok(())
     }
 
+    // 提交 approval 决定并打印已记录的结果。
     fn approval_decision(
         &mut self,
         request_id: &str,
@@ -649,6 +686,7 @@ impl AppServerClient {
         Ok(())
     }
 
+    // 发送请求并只接收匹配 id 的响应，同时保留通知事件。
     fn request(&mut self, message: JsonRpcMessage) -> Result<Vec<Value>, String> {
         let id = message
             .id
@@ -671,11 +709,13 @@ impl AppServerClient {
         }
     }
 
+    // 向 app-server 发送 JSON-RPC notification。
     fn notify(&mut self, method: Method, params: Value) -> Result<(), String> {
         let message = JsonRpcMessage::notification(method.as_str(), params);
         self.write_message(&message)
     }
 
+    // 序列化、写入并 flush 一条 JSON-RPC 消息。
     fn write_message(&mut self, message: &JsonRpcMessage) -> Result<(), String> {
         let stdin = self
             .stdin
@@ -688,6 +728,7 @@ impl AppServerClient {
             .map_err(|error| format!("failed to flush app-server request: {error}"))
     }
 
+    // 从 stdout reader 读取一条消息，并区分超时、断开与非法 JSON。
     fn read_message(&mut self, timeout: Duration) -> Result<Value, String> {
         let line =
             match self.stdout.recv_timeout(timeout) {
@@ -713,6 +754,7 @@ impl AppServerClient {
             .map_err(|error| format!("invalid app-server json: {error}"))
     }
 
+    // 分配本地递增的 JSON-RPC request id。
     fn next_request_id(&mut self) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -720,7 +762,9 @@ impl AppServerClient {
     }
 }
 
+// 负责 graceful shutdown 与子进程资源回收。
 impl Drop for AppServerClient {
+    // 先请求服务端 shutdown，再在超时后回收子进程与 reader。
     fn drop(&mut self) {
         if self.stdin.is_some() {
             let id = self.next_request_id();
@@ -751,6 +795,7 @@ impl Drop for AppServerClient {
     }
 }
 
+// 将 app-server stdout 按行转发到客户端接收队列。
 fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
@@ -775,6 +820,7 @@ fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<Result<String, String>>
     (receiver, handle)
 }
 
+// 获取并规范化当前工作目录，作为 thread/start 的 cwd。
 fn canonical_current_dir() -> Result<String, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("failed to read current directory: {error}"))?
@@ -784,6 +830,7 @@ fn canonical_current_dir() -> Result<String, String> {
         .map(str::to_string)
         .ok_or_else(|| "current directory is not valid UTF-8".to_string())
 }
+// 构造 CLI 使用的 initialize 请求。
 fn initialize_request(id: i64) -> JsonRpcMessage {
     JsonRpcMessage::request(
         Method::Initialize,
@@ -796,6 +843,7 @@ fn initialize_request(id: i64) -> JsonRpcMessage {
     )
 }
 
+// 从响应集合中取出首个 result。
 fn first_result(messages: Vec<Value>) -> Result<Value, String> {
     messages
         .into_iter()
@@ -803,6 +851,7 @@ fn first_result(messages: Vec<Value>) -> Result<Value, String> {
         .ok_or_else(|| "app-server response did not include result".to_string())
 }
 
+// 以借用形式从响应集合中取出首个 result。
 fn first_result_ref(messages: &[Value]) -> Result<&Value, String> {
     messages
         .iter()
@@ -810,6 +859,7 @@ fn first_result_ref(messages: &[Value]) -> Result<&Value, String> {
         .ok_or_else(|| "app-server response did not include result".to_string())
 }
 
+// 过滤并脱敏可公开渲染的协议事件。
 fn protocol_events(messages: Vec<Value>) -> Vec<Value> {
     messages
         .into_iter()
@@ -817,6 +867,7 @@ fn protocol_events(messages: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
+// 将单条协议通知投影为不泄露 raw payload 的事件。
 fn safe_protocol_event(message: Value) -> Option<Value> {
     let method = message["method"].as_str()?;
     let item_id = message["params"]["item"]["item_id"].as_str().unwrap_or("");
@@ -836,6 +887,7 @@ fn safe_protocol_event(message: Value) -> Option<Value> {
     }
 }
 
+// 按协议 method 渲染 thread、turn 与 item 事件。
 fn render_messages(messages: &[Value], render_assistant_summary: bool) {
     for message in messages {
         if let Some(method) = message["method"].as_str() {
@@ -872,11 +924,13 @@ fn render_messages(messages: &[Value], render_assistant_summary: bool) {
     }
 }
 
+// 判断是否应额外输出已完成的 assistant 摘要。
 fn should_render_assistant_summary(turn: &Value) -> bool {
     turn["status"].as_str() == Some("completed")
         && turn["agent_loop_status"].as_str() == Some("completed")
 }
 
+// 判断 running turn 是否仍可通过轮询等待终态。
 fn should_poll_running_turn(turn: &Value) -> bool {
     turn["status"].as_str() == Some("running")
         && matches!(
@@ -885,6 +939,7 @@ fn should_poll_running_turn(turn: &Value) -> bool {
         )
 }
 
+// 渲染 turn 的稳定状态行。
 fn render_turn(turn: &Value) {
     let turn_id = turn["turn_id"].as_str().unwrap_or("");
     if turn_id.is_empty() {
@@ -898,6 +953,7 @@ fn render_turn(turn: &Value) {
     );
 }
 
+// 从响应对象提取可选的 AgentLoop 状态后缀。
 fn agent_loop_status_suffix(value: &Value) -> String {
     value["agent_loop_status"]
         .as_str()
@@ -905,6 +961,7 @@ fn agent_loop_status_suffix(value: &Value) -> String {
         .unwrap_or_default()
 }
 
+// 渲染 trace event 的公开摘要字段。
 fn render_trace_event(event: &Value) {
     println!(
         "trace {} {} {}",
@@ -914,6 +971,7 @@ fn render_trace_event(event: &Value) {
     );
 }
 
+// 将失败、blocked 或未能安全轮询的 turn 映射为 CLI 错误。
 fn fail_for_failed_turn(turn: &Value) -> Result<(), String> {
     let status = turn["status"].as_str().unwrap_or("");
     let agent_loop_status = turn["agent_loop_status"].as_str().unwrap_or("");
@@ -934,12 +992,14 @@ fn fail_for_failed_turn(turn: &Value) -> Result<(), String> {
 }
 
 #[derive(Debug)]
+// 轮询过程中用于判断 turn 终态的最小字段集合。
 struct TurnView {
     turn_id: String,
     status: String,
     agent_loop_status: Option<String>,
 }
 
+// 从 JSON 路径读取必需的字符串字段。
 fn required_str<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str, String> {
     let mut current = value;
     for key in path {
@@ -950,6 +1010,7 @@ fn required_str<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str, String> 
         .ok_or_else(|| format!("missing string field {}", path.join(".")))
 }
 
+// 解析显式 app-server 路径或相邻的默认二进制。
 fn app_server_bin() -> Result<String, String> {
     if let Ok(path) = std::env::var(APP_SERVER_BIN_ENV) {
         return Ok(path);
@@ -963,11 +1024,13 @@ fn app_server_bin() -> Result<String, String> {
         })
 }
 
+// 返回诊断输出使用的 app-server 数据库路径。
 fn app_server_db_display() -> String {
     std::env::var(APP_SERVER_DB_ENV)
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string())
 }
 
+// 查找与当前 CLI 可执行文件同目录的 app-server。
 fn sibling_app_server_bin() -> Option<PathBuf> {
     let mut path = std::env::current_exe().ok()?;
     path.pop();

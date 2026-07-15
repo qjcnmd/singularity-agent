@@ -1,3 +1,5 @@
+//! 验证 CLI 仅通过 app-server 协议工作，并保持输出与失败边界稳定。
+
 mod support;
 
 use assert_cmd::Command;
@@ -18,12 +20,14 @@ const JSON_RPC_SERVER_ERROR_CODE: i64 = -32000;
 const NON_MATCHING_RESPONSE_ID: i64 = 999;
 const POST_RESPONSE_DELAY_MS: u64 = 25;
 
+// 确认 CLI 能启动并暴露 app-server 协议模式。
 #[test]
 fn cli_exposes_app_server_protocol_mode_without_direct_core_runtime() {
     let mut command = Command::cargo_bin("sg").expect("binary");
     command.arg("--help").assert().success();
 }
 
+// 确认必须提供终端用户命令且不暴露内部调试命令。
 #[test]
 fn cli_requires_an_end_user_command_and_hides_protocol_debug_commands() {
     let output = Command::cargo_bin("sg")
@@ -45,6 +49,7 @@ fn cli_requires_an_end_user_command_and_hides_protocol_debug_commands() {
     }
 }
 
+// 确认 run 帮助不提供已移除的 agent host 选择器。
 #[test]
 fn cli_help_does_not_expose_agent_host_selector() {
     let output = Command::cargo_bin("sg")
@@ -57,6 +62,7 @@ fn cli_help_does_not_expose_agent_host_selector() {
     assert!(!stdout(&output).contains("--agent-host"));
 }
 
+// 验证 run、continue、threads、trace、approval 与 doctor 共用 app-server 协议。
 #[test]
 fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -143,6 +149,7 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
     assert!(stdout(&doctor).contains("client=protocol-only"));
 }
 
+// 验证 doctor 输出脱敏的 AgentLoop 与 provider readiness。
 #[test]
 fn cli_config_doctor_reports_redacted_agent_loop_and_eval_readiness() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -217,6 +224,7 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_eval_readiness() {
     }
 }
 
+// 验证存在相邻 app-server 时优先使用它而非 PATH 中的同名程序。
 #[test]
 fn cli_prefers_sibling_app_server_over_path_lookup() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -259,6 +267,7 @@ stderr={}",
     assert!(!stderr(&output).contains("old app-server should not run"));
 }
 
+// 验证未配置显式或相邻 app-server 时保持 fail closed。
 #[test]
 fn cli_fails_closed_without_explicit_or_sibling_app_server() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -292,6 +301,7 @@ fn cli_fails_closed_without_explicit_or_sibling_app_server() {
     assert!(!stderr.contains("stale PATH app-server should not run"));
 }
 
+// 验证 AgentLoop 被禁用时 run 不会发出 turn/start。
 #[test]
 fn cli_rejects_run_when_agent_loop_capability_is_disabled() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -329,6 +339,7 @@ fn cli_rejects_run_when_agent_loop_capability_is_disabled() {
     assert!(!trace.contains("turn/start"));
 }
 
+// 验证 capability 尚未到 completed 即使无 blocker 也不能启动 run。
 #[test]
 fn cli_rejects_nonterminal_agent_loop_capability_without_blockers() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -359,6 +370,7 @@ fn cli_rejects_nonterminal_agent_loop_capability_without_blockers() {
     assert!(!trace.contains("turn/start"));
 }
 
+// 验证 capability 允许后 turn/start 不再携带 agent host。
 #[test]
 fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -393,6 +405,7 @@ fn cli_sends_turn_start_without_agent_host_after_capability_allows_it() {
     assert_eq!(params["threadId"], "thread_agent");
 }
 
+// 验证缺少可确认的 AgentLoop 终态时拒绝 turn。
 #[test]
 fn cli_rejects_turn_without_agent_loop_terminal_status() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -422,6 +435,7 @@ fn cli_rejects_turn_without_agent_loop_terminal_status() {
     assert!(stderr(&output).contains("error running: turn running"));
 }
 
+// 验证 JSON 模式只输出脱敏结果与允许公开的事件摘要。
 #[test]
 fn cli_run_json_outputs_turn_result_without_human_rendering() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -467,6 +481,7 @@ fn cli_run_json_outputs_turn_result_without_human_rendering() {
     assert!(!stdout(&output).contains("turn turn_json completed"));
 }
 
+// 验证 JSON 模式保留 blocked 状态并以失败退出。
 #[test]
 fn cli_run_json_preserves_fail_closed_turn_status() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -498,6 +513,7 @@ fn cli_run_json_preserves_fail_closed_turn_status() {
     assert_eq!(value["turn"]["agent_loop_status"], "blocked");
 }
 
+// 验证部分 capability 在 blocker 清除前仍不能启动 turn。
 #[test]
 fn cli_rejects_partial_agent_loop_capability_until_blockers_clear() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -531,6 +547,7 @@ fn cli_rejects_partial_agent_loop_capability_until_blockers_clear() {
     assert!(!trace.contains("turn/start"));
 }
 
+// 验证 eval 命令可脚本化校验 manifest 并拒绝缺失文件。
 #[test]
 fn cli_eval_command_is_script_friendly_and_validates_manifest() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -571,6 +588,7 @@ fn cli_eval_command_is_script_friendly_and_validates_manifest() {
     assert!(stderr(&invalid).contains("invalid eval manifest"));
 }
 
+// 验证 eval run 通过 app-server 返回并渲染 verification 结果。
 #[test]
 fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -682,6 +700,7 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     assert_eq!(params["outputRoot"], path_str(&eval_output));
 }
 
+// 验证完成的 turn 会渲染 AgentLoop 状态与 assistant answer。
 #[test]
 fn cli_renders_agent_loop_status_and_answer() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -723,6 +742,7 @@ fn cli_renders_agent_loop_status_and_answer() {
     assert!(stdout.contains("assistant agent loop completed"));
 }
 
+// 验证失败 turn 退出非零且不泄露 raw payload。
 #[test]
 fn cli_exits_nonzero_for_failed_turn_without_raw_payload() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -753,16 +773,19 @@ fn cli_exits_nonzero_for_failed_turn_without_raw_payload() {
     assert!(!stdout(&output).to_lowercase().contains("raw_prompt"));
 }
 
+// 验证立即 blocked 的 turn 以非零状态退出。
 #[test]
 fn cli_exits_nonzero_for_immediate_blocked_turn() {
     assert_immediate_terminal_turn_exits_nonzero("blocked", "blocked");
 }
 
+// 验证立即 interrupted 的 turn 以非零状态退出。
 #[test]
 fn cli_exits_nonzero_for_immediate_interrupted_turn() {
     assert_immediate_terminal_turn_exits_nonzero("interrupted", "cancelled");
 }
 
+// 验证 turn、approval 与 trace 查询都通过 app-server 协议渲染。
 #[test]
 fn cli_turn_status_interrupt_approval_decision_and_trace_show_use_protocol() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -862,6 +885,7 @@ fn cli_turn_status_interrupt_approval_decision_and_trace_show_use_protocol() {
     assert!(stdout(&trace_show).contains("trace event_fake agent_loop agent trace"));
 }
 
+// 验证 turn 生命周期查询和中断输出 AgentLoop 状态。
 #[test]
 fn cli_turn_lifecycle_status_and_interrupt_render_agent_loop_status() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -902,6 +926,7 @@ fn cli_turn_lifecycle_status_and_interrupt_render_agent_loop_status() {
     );
 }
 
+// 验证 app-server 拒绝 turn interrupt 时 CLI 以非零退出。
 #[test]
 fn cli_turn_interrupt_error_exits_nonzero() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -924,6 +949,7 @@ fn cli_turn_interrupt_error_exits_nonzero() {
     assert!(stderr(&interrupt).contains("cancel failed"));
 }
 
+// 验证 CLI drop 前先向 app-server 请求 shutdown。
 #[test]
 fn cli_requests_server_shutdown_before_process_teardown() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -956,6 +982,7 @@ fn cli_requests_server_shutdown_before_process_teardown() {
     );
 }
 
+// 验证 continue 只恢复 thread 并发送新输入，不上传历史。
 #[test]
 fn cli_continue_resumes_thread_and_does_not_upload_history() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1003,6 +1030,7 @@ fn cli_continue_resumes_thread_and_does_not_upload_history() {
     assert_eq!(params["input"][0]["text"], "continue safely");
     assert!(params.get("history").is_none());
 }
+// 验证无效 thread id 由 app-server 错误原样归因。
 #[test]
 fn cli_continue_rejects_invalid_thread_id_through_app_server() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1033,6 +1061,7 @@ fn cli_continue_rejects_invalid_thread_id_through_app_server() {
     );
 }
 
+// 验证 app-server 在响应前退出时 CLI 报告不可用。
 #[test]
 fn cli_reports_interrupted_app_server_process() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1048,6 +1077,7 @@ fn cli_reports_interrupted_app_server_process() {
     assert_app_server_unavailable_error(&output);
 }
 
+// 验证没有 notification 的 turn 响应仍能正常完成。
 #[test]
 fn cli_run_returns_when_turn_response_has_no_notifications() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1077,6 +1107,7 @@ fn cli_run_returns_when_turn_response_has_no_notifications() {
     assert!(stdout(&output).contains("thread thread_fake"));
 }
 
+// 验证匹配响应到达后不等待其后的无关消息。
 #[test]
 fn cli_run_does_not_wait_for_post_response_messages() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1107,6 +1138,7 @@ fn cli_run_does_not_wait_for_post_response_messages() {
     assert!(stdout(&output).contains("thread thread_fake"));
 }
 
+// 验证 running turn 在关闭 app-server 前轮询到终态。
 #[test]
 fn cli_run_polls_running_turn_before_shutdown() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1144,6 +1176,7 @@ fn cli_run_polls_running_turn_before_shutdown() {
     assert!(stdout(&output).contains("turn turn_active completed agent_loop_status=completed"));
 }
 
+// 验证轮询期间进入 interrupted 的 turn 以非零退出。
 #[test]
 fn cli_run_polling_exits_nonzero_for_interrupted_turn() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1175,6 +1208,7 @@ fn cli_run_polling_exits_nonzero_for_interrupted_turn() {
     assert!(stderr(&output).contains("turn turn_active interrupted"));
 }
 
+// 验证 JSON-RPC error 不被吞掉并传递到 CLI stderr。
 #[test]
 fn cli_reports_json_rpc_error_without_swallowing_it() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1193,6 +1227,7 @@ fn cli_reports_json_rpc_error_without_swallowing_it() {
     assert!(stderr(&output).contains("forced failure"));
 }
 
+// 验证非匹配成功响应会被忽略，随后继续等待匹配响应。
 #[test]
 fn cli_ignores_non_matching_response_before_next_matching_response() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1232,6 +1267,7 @@ fn cli_ignores_non_matching_response_before_next_matching_response() {
     assert!(!stdout(&output).contains("wrong_turn"));
 }
 
+// 验证非匹配错误响应不会污染后续匹配请求。
 #[test]
 fn cli_ignores_non_matching_error_before_next_matching_response() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1273,6 +1309,7 @@ fn cli_ignores_non_matching_error_before_next_matching_response() {
     assert!(stdout(&output).contains("thread thread_fake"));
 }
 
+// 验证 app-server 在请求响应前退出时返回稳定错误。
 #[test]
 fn cli_reports_app_server_exit_before_response() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1292,6 +1329,7 @@ fn cli_reports_app_server_exit_before_response() {
     assert!(is_app_server_unavailable_error(&stderr), "stderr={stderr}");
 }
 
+// 验证 CLI manifest 不直接依赖核心 runtime crate。
 #[test]
 fn cli_manifest_does_not_depend_on_core_runtime_crates() {
     let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
@@ -1310,6 +1348,7 @@ fn cli_manifest_does_not_depend_on_core_runtime_crates() {
     assert!(manifest.contains("singularity_protocol"));
 }
 
+// 构造指向指定 app-server 和数据库的 CLI 命令。
 fn cli_with_app_server(app_server_bin: &str, db_path: &std::path::Path) -> Command {
     let mut command = Command::cargo_bin("sg").expect("binary");
     command.env(APP_SERVER_BIN_ENV, app_server_bin);
@@ -1317,12 +1356,14 @@ fn cli_with_app_server(app_server_bin: &str, db_path: &std::path::Path) -> Comma
     command
 }
 
+// 构造并配置使用 fake app-server 的 CLI 命令。
 fn cli_with_fake_app_server(fake_server: &FakeAppServer, db_path: &Path) -> Command {
     let mut command = cli_with_app_server(path_str(fake_server.binary()), db_path);
     fake_server.configure(&mut command);
     command
 }
 
+// 复用统一场景断言立即终态会导致 CLI 非零退出。
 fn assert_immediate_terminal_turn_exits_nonzero(status: &str, agent_loop_status: &str) {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
@@ -1351,6 +1392,7 @@ fn assert_immediate_terminal_turn_exits_nonzero(status: &str, agent_loop_status:
     assert!(stderr(&output).contains(&format!("turn {status}")));
 }
 
+// 返回当前平台预期的 AgentLoop 状态。
 fn expected_agent_loop_status() -> &'static str {
     if cfg!(windows) {
         "completed"
@@ -1359,10 +1401,12 @@ fn expected_agent_loop_status() -> &'static str {
     }
 }
 
+// 将测试路径转换为 fake server 可消费的 UTF-8 字符串。
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }
 
+// 将当前 CLI 二进制复制到隔离目录。
 fn copy_current_cli_to(dir: &Path) -> PathBuf {
     let source = assert_cmd::cargo::cargo_bin("sg");
     let target = dir.join(format!("sg{}", std::env::consts::EXE_SUFFIX));
@@ -1380,6 +1424,7 @@ fn copy_current_cli_to(dir: &Path) -> PathBuf {
     target
 }
 
+// 从测试 crate manifest 推导 workspace 根目录。
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1388,24 +1433,29 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+// 断言 stderr 属于 app-server 进程不可用错误。
 fn assert_app_server_unavailable_error(output: &std::process::Output) {
     let stderr = stderr(output);
     assert!(is_app_server_unavailable_error(&stderr), "stderr={stderr}");
 }
 
+// 判断 stderr 是否表示 app-server 在响应前关闭。
 fn is_app_server_unavailable_error(stderr: &str) -> bool {
     stderr.contains("app-server exited before response")
         || stderr.contains("app-server closed stdout")
 }
 
+// 解码 CLI stdout，便于测试断言。
 fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+// 解码 CLI stderr，便于测试断言。
 fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+// 定位或构建 app-server 二进制供生命周期测试使用。
 fn app_server_bin() -> String {
     std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
         ensure_app_server_binary();
@@ -1423,6 +1473,7 @@ fn app_server_bin() -> String {
     })
 }
 
+// 只构建一次 app-server 二进制，供集成测试复用。
 fn ensure_app_server_binary() {
     static BUILD_APP_SERVER: Once = Once::new();
     BUILD_APP_SERVER.call_once(|| {
