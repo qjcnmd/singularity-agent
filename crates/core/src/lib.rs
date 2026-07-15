@@ -156,6 +156,7 @@ impl From<String> for RequestId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// RFC 3339 时间戳。
 pub struct Timestamp(OffsetDateTime);
 
 impl Timestamp {
