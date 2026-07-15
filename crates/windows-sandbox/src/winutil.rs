@@ -288,4 +288,18 @@ mod tests {
         assert_eq!(String::from_utf16(&utf16).expect("UTF-16"), script);
         assert!(!argv_to_command_line(&argv).contains(script));
     }
+
+    #[test]
+    fn powershell_script_rejects_empty_nul_and_oversized_inputs() {
+        for script in ["", "Write-Output bad\0script"] {
+            assert!(
+                powershell_encoded_command_argv(PathBuf::from("powershell.exe"), script).is_err()
+            );
+        }
+
+        let oversized = "x".repeat(18_001);
+        let error = powershell_encoded_command_argv(PathBuf::from("powershell.exe"), &oversized)
+            .expect_err("oversized script must be rejected");
+        assert!(error.contains("argument limit"));
+    }
 }

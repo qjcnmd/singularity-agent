@@ -682,13 +682,6 @@ fn command_reference_tokens(request: &CommandRequest) -> Vec<String> {
 }
 
 #[cfg(windows)]
-fn script_reference_tokens(script: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    collect_command_tokens(script, &mut tokens);
-    tokens
-}
-
-#[cfg(windows)]
 fn is_shell_executable(value: &str) -> bool {
     matches!(
         command_executable_name(&value.replace('\\', "/").to_ascii_lowercase()).as_str(),
@@ -956,17 +949,6 @@ fn command_request_denial(request: &CommandRequest) -> Option<CommandResult> {
 }
 
 #[cfg(windows)]
-fn script_has_read_only_write_intent(script: &str) -> bool {
-    command_has_file_redirection(script)
-        || script_reference_tokens(script).iter().any(|token| {
-            let lower = token.to_ascii_lowercase();
-            WRITE_COMMAND_WORDS
-                .iter()
-                .any(|write_command| lower == *write_command)
-        })
-}
-
-#[cfg(windows)]
 fn command_script_request_denial(request: &CommandScriptRequest) -> Option<CommandResult> {
     if request.script.trim().is_empty() {
         return Some(CommandResult::policy_denied(
@@ -1008,48 +990,8 @@ fn command_script_request_denial(request: &CommandScriptRequest) -> Option<Comma
             COMMAND_CWD_OUTSIDE_WORKSPACE,
         ));
     }
-    let command_tokens = script_reference_tokens(&request.script);
-    if command_tokens
-        .iter()
-        .any(|token| command_token_has_sensitive_path_marker(token))
-    {
-        return Some(CommandResult::policy_denied(
-            &request.command_id,
-            COMMAND_SENSITIVE_PATH_DENIED,
-        ));
-    }
-    for token in command_tokens
-        .iter()
-        .filter(|token| command_token_references_path(&cwd, token))
-    {
-        if command_token_has_env_reference(token) {
-            return Some(CommandResult::unsupported(
-                &request.command_id,
-                COMMAND_ENV_PATH_UNSUPPORTED,
-            ));
-        }
-        let resolved = resolve_existing_or_parent_command_path(&cwd, token);
-        if path_has_sensitive_component(&resolved) {
-            return Some(CommandResult::policy_denied(
-                &request.command_id,
-                COMMAND_SENSITIVE_PATH_DENIED,
-            ));
-        }
-        if workspace_bound && !resolved.starts_with(&workspace) {
-            return Some(CommandResult::policy_denied(
-                &request.command_id,
-                COMMAND_PATH_OUTSIDE_WORKSPACE,
-            ));
-        }
-    }
-    if matches!(request.filesystem.mode, SandboxFilesystemMode::ReadOnly)
-        && script_has_read_only_write_intent(&request.script)
-    {
-        return Some(CommandResult::policy_denied(
-            &request.command_id,
-            COMMAND_READ_ONLY_WRITE_DENIED,
-        ));
-    }
+    // model script 已是独立字符串；这里只绑定请求自己的 cwd 和 workspace 边界。
+    // script 内的 shell 语义、路径访问和写入由 policy、approval 与严格 backend 负责。
     None
 }
 
@@ -2131,6 +2073,87 @@ mod windows_backend {
                     .execution_status,
                 CommandExecutionStatus::PolicyDenied
             );
+        }
+
+        #[test]
+        fn model_script_with_shell_syntax_and_sensitive_text_reaches_backend_boundary() {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let request = CommandScriptRequest::agent_requested(
+                "script_boundary",
+                r#"Write-Output 'C:\Users\runner\.ssh\id_rsa' & echo ready > NUL"#,
+                workspace.path().to_string_lossy(),
+                workspace.path().to_string_lossy(),
+            );
+
+            assert!(command_script_request_denial(&request).is_none());
+        }
+
+        #[test]
+        fn model_script_cancellation_is_typed_before_backend_execution() {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let request = CommandScriptRequest::agent_requested(
+                "script_cancelled",
+                "Write-Output cancelled",
+                workspace.path().to_string_lossy(),
+                workspace.path().to_string_lossy(),
+            );
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+
+            let result =
+                WindowsSandboxBackend::new().execute_script_cancellable(&request, &cancellation);
+
+            assert_eq!(result.execution_status, CommandExecutionStatus::Cancelled);
+            assert_eq!(result.semantic_status, CommandSemanticStatus::Cancelled);
+            assert_eq!(result.exit_code, None);
+            assert_eq!(result.sandbox.backend, BACKEND_NAME);
+            assert_eq!(
+                result.sandbox.enforcement,
+                SandboxBackendEnforcement::Strict
+            );
+        }
+
+        #[test]
+        fn interrupted_capture_maps_to_typed_cancel_and_timeout_results() {
+            let cases = [
+                (
+                    true,
+                    false,
+                    CommandExecutionStatus::Cancelled,
+                    CommandSemanticStatus::Cancelled,
+                    "cancelled",
+                ),
+                (
+                    false,
+                    true,
+                    CommandExecutionStatus::TimedOut,
+                    CommandSemanticStatus::TimedOut,
+                    "timed out",
+                ),
+            ];
+
+            for (index, (cancelled, timed_out, execution, semantic, message)) in
+                cases.into_iter().enumerate()
+            {
+                let result = command_result_from_capture(
+                    &format!("script_interrupt_{index}"),
+                    singularity_windows_sandbox::CaptureResult {
+                        exit_code: 1,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        timed_out,
+                        cancelled,
+                        output_truncated: false,
+                    },
+                    Instant::now(),
+                );
+
+                assert_eq!(result.execution_status, execution);
+                assert_eq!(result.semantic_status, semantic);
+                assert_eq!(result.exit_code, None);
+                assert_eq!(result.timed_out, timed_out);
+                assert!(result.stderr_preview.contains(message));
+            }
         }
     }
 }
