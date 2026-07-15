@@ -795,6 +795,43 @@ fn agent_loop_returns_unknown_native_tool_to_model_without_execution() {
 }
 
 #[test]
+fn direct_tool_mode_rejects_hidden_router_before_policy_or_execution() {
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(invoke_tool_call(
+        "invoke_1",
+        "builtin_read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+
+    let result = agent_loop_with_capabilities(
+        vec![response],
+        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract {
+            tool_definition_mode: ProviderToolDefinitionMode::Direct,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read").with_max_turns(1));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(
+        result.tool_results[0].failure_kind,
+        Some(ToolFailureKind::Visibility)
+    );
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("tool_not_visible")
+    );
+    assert!(result.approval_requests.is_empty());
+    assert!(result.pending_tool_calls.is_empty());
+    let audit = result.to_run_status().audit_events[0].clone();
+    assert_eq!(audit["policy_evaluated"], false);
+    assert_eq!(audit["executor_started"], false);
+}
+
+#[test]
 fn agent_loop_ask_decision_blocks_without_executing_tool() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello");
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");

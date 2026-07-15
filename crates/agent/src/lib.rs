@@ -1355,6 +1355,7 @@ where
                     }
                 }
             };
+            let visible_tool_names = tool_view.visible_tool_names.clone();
             if !model_request_fits_context(&tool_view.tools, &state.messages, budget) {
                 let Some(compaction) = compact_model_messages(&tool_view.tools, &state, budget)
                 else {
@@ -1502,7 +1503,7 @@ where
             }
             let routed = provider_tool_names.as_slice() == [BUILTIN_INVOKE_TOOL];
             let execution_tool_calls =
-                resolve_routed_tool_calls(&response.tool_calls, routed, &self.tool_broker);
+                resolve_model_tool_calls(&response.tool_calls, routed, &visible_tool_names);
             let execution_tool_names = execution_tool_calls
                 .iter()
                 .map(|call| call.tool_name.clone())
@@ -3235,6 +3236,7 @@ impl AgentContextTrace {
 
 struct ModelToolView {
     tools: Vec<ModelToolSchema>,
+    visible_tool_names: Vec<String>,
     max_tool_calls: u32,
 }
 
@@ -3242,6 +3244,7 @@ impl ModelToolView {
     fn finalization() -> Self {
         Self {
             tools: Vec::new(),
+            visible_tool_names: Vec::new(),
             max_tool_calls: 0,
         }
     }
@@ -3350,6 +3353,10 @@ fn model_tool_view(
         return Err("provider tool-definition limit must be greater than zero".to_string());
     }
     let visible_tools = visible_model_tool_schemas(loop_tools);
+    let visible_tool_names = visible_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
     match capabilities.tool_definition_mode {
         ProviderToolDefinitionMode::Direct => {
             if visible_tools.len() > capabilities.max_tools_per_request as usize {
@@ -3361,6 +3368,7 @@ fn model_tool_view(
             }
             Ok(ModelToolView {
                 tools: visible_tools,
+                visible_tool_names,
                 max_tool_calls,
             })
         }
@@ -3368,45 +3376,47 @@ fn model_tool_view(
             let router = router_model_tool_schema(loop_tools, &visible_tools)?;
             Ok(ModelToolView {
                 tools: vec![router],
+                visible_tool_names,
                 max_tool_calls: 1,
             })
         }
     }
 }
 
-fn resolve_routed_tool_calls(
+fn resolve_model_tool_calls(
     provider_calls: &[ModelToolCall],
     router_enabled: bool,
-    loop_tools: &ToolBroker,
+    visible_tool_names: &[String],
 ) -> Vec<ModelToolCall> {
-    if !router_enabled {
-        return provider_calls.to_vec();
-    }
-    let visible_tool_names = visible_model_tool_schemas(loop_tools)
-        .into_iter()
-        .map(|tool| tool.name)
-        .collect::<BTreeSet<_>>();
     provider_calls
         .iter()
         .map(|call| {
             if call.parse_status != ModelToolParseStatus::Valid {
                 return call.clone();
             }
-            if call.tool_name != BUILTIN_INVOKE_TOOL {
-                let mut resolved = call.clone();
-                resolved.parse_status = ModelToolParseStatus::UnknownTool;
-                return resolved;
-            }
-            let Ok(invocation) = invoke_tool_input(&call.arguments) else {
-                return call.clone();
+            let mut resolved = if router_enabled {
+                if call.tool_name != BUILTIN_INVOKE_TOOL {
+                    let mut resolved = call.clone();
+                    resolved.parse_status = ModelToolParseStatus::UnknownTool;
+                    resolved
+                } else {
+                    let Ok(invocation) = invoke_tool_input(&call.arguments) else {
+                        return call.clone();
+                    };
+                    let mut resolved = call.clone();
+                    resolved.tool_name = invocation.tool_name;
+                    resolved.raw_arguments = serde_json::to_string(&invocation.arguments)
+                        .expect("model tool arguments serialize");
+                    resolved.arguments = invocation.arguments;
+                    resolved
+                }
+            } else {
+                call.clone()
             };
-            let mut resolved = call.clone();
-            resolved.tool_name = invocation.tool_name;
-            resolved.raw_arguments = serde_json::to_string(&invocation.arguments)
-                .expect("model tool arguments serialize");
-            resolved.arguments = invocation.arguments;
-            if resolved.tool_name == BUILTIN_INVOKE_TOOL
-                || !visible_tool_names.contains(&resolved.tool_name)
+            if resolved.parse_status == ModelToolParseStatus::Valid
+                && !visible_tool_names
+                    .iter()
+                    .any(|tool_name| tool_name == &resolved.tool_name)
             {
                 resolved.parse_status = ModelToolParseStatus::UnknownTool;
             }
