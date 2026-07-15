@@ -3691,6 +3691,52 @@ fn request_and_response_validation_helpers_reject_empty_or_mismatched_envelopes(
 }
 
 #[test]
+fn model_turn_response_validation_rejects_text_tool_envelope_after_tool_history() {
+    let mut request = ModelTurnRequest::new(
+        "request_finalization",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    request
+        .messages
+        .push(ModelMessage::assistant_tool_calls(vec![tool_call(
+            "call_read",
+            "builtin_read",
+        )]));
+    let mut tool_result = ModelMessage::text(ModelRole::Tool, r#"{"ok":true}"#);
+    tool_result.tool_call_id = Some("call_read".to_string());
+    request.messages.push(tool_result);
+    request.tool_choice = ToolChoicePolicy {
+        mode: ToolChoiceMode::None,
+        max_tool_calls: 0,
+        strict_tool_schema: false,
+    };
+
+    let envelope = "<tool_call><function=builtin_read></function></tool_call>";
+    let response = ModelTurnResponse::completed(
+        request.request_id.clone(),
+        "response_finalization",
+        envelope,
+    );
+    let result = validate_model_turn_response(&request, &response, &[], None);
+
+    assert!(!result.valid);
+    assert_eq!(result.errors, vec!["text_tool_call_envelope_not_supported"]);
+
+    let direct_request = ModelTurnRequest::new(
+        "request_direct",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let direct_response = ModelTurnResponse::completed(
+        direct_request.request_id.clone(),
+        "response_direct",
+        envelope,
+    );
+    let direct_result = validate_model_turn_response(&direct_request, &direct_response, &[], None);
+
+    assert!(direct_result.valid);
+}
+
+#[test]
 fn model_error_serializes_redacted_boundary_fields() {
     let mut failure = ModelError::new(ModelErrorKind::Timeout, "provider transport failed")
         .with_provider("openai_compatible")

@@ -3725,12 +3725,13 @@ pub fn validate_model_turn_response(
     available_tool_names: &[String],
     capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
-    let mut result = validate_model_response(
+    let mut result = validate_model_response_with_protocol_context(
         response.assistant_message.as_ref(),
         &response.tool_calls,
         &request.tool_choice,
         available_tool_names,
         capabilities,
+        request_uses_tool_protocol(request),
     );
     if response.request_id != request.request_id {
         result
@@ -3765,6 +3766,24 @@ pub fn validate_model_response(
     available_tool_names: &[String],
     capabilities: Option<&ProviderProtocolContract>,
 ) -> ModelValidationResult {
+    validate_model_response_with_protocol_context(
+        assistant_message,
+        tool_calls,
+        tool_choice,
+        available_tool_names,
+        capabilities,
+        !available_tool_names.is_empty(),
+    )
+}
+
+fn validate_model_response_with_protocol_context(
+    assistant_message: Option<&ModelMessage>,
+    tool_calls: &[ModelToolCall],
+    tool_choice: &ToolChoicePolicy,
+    available_tool_names: &[String],
+    capabilities: Option<&ProviderProtocolContract>,
+    tool_protocol_active: bool,
+) -> ModelValidationResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
@@ -3774,7 +3793,7 @@ pub fn validate_model_response(
         }
         Some(message)
             if tool_calls.is_empty()
-                && !available_tool_names.is_empty()
+                && tool_protocol_active
                 && is_text_tool_call_envelope(message_text(message)) =>
         {
             errors.push(TEXT_TOOL_CALL_ENVELOPE_ERROR.to_string());
