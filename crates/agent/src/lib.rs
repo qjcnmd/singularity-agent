@@ -1705,6 +1705,11 @@ where
         }
         let tool_call_fingerprint = tool_call_fingerprint(&call);
         let tool_result = self.execute_tool(&call, decision, &mut state);
+        let tool_result = if self.is_cancelled(input) && tool_result.ok {
+            cancelled_tool_result(&call)
+        } else {
+            tool_result
+        };
         let failed_tool_result = !tool_result.ok;
         let recovery_feedback = state.observe_tool_result(&tool_result, &tool_call_fingerprint);
         state.messages.push(tool_result_message(&tool_result, None));
@@ -2254,6 +2259,11 @@ where
         let mut failure = None;
         let mut repairable_failure = None;
         for (prepared, result) in results {
+            let result = if self.is_cancelled(input) && result.ok {
+                cancelled_tool_result(&prepared.call)
+            } else {
+                result
+            };
             let recoverable = is_repairable_tool_result(&result)
                 || (approval_is_recoverable
                     && result.failure_kind == Some(ToolFailureKind::Approval));
@@ -2379,12 +2389,21 @@ fn execute_workspace_tool_call(
         );
     };
     let result = match call.tool_name.as_str() {
-        TOOL_READ => read_tool_input(&call.arguments)
-            .and_then(|input| workspace_tools.read(input).map_err(Into::into)),
-        TOOL_LIST => list_tool_input(&call.arguments)
-            .and_then(|input| workspace_tools.list(input).map_err(Into::into)),
-        TOOL_GREP => grep_tool_input(&call.arguments)
-            .and_then(|input| workspace_tools.grep(input).map_err(Into::into)),
+        TOOL_READ => read_tool_input(&call.arguments).and_then(|input| {
+            workspace_tools
+                .read_cancellable(input, cancellation)
+                .map_err(Into::into)
+        }),
+        TOOL_LIST => list_tool_input(&call.arguments).and_then(|input| {
+            workspace_tools
+                .list_cancellable(input, cancellation)
+                .map_err(Into::into)
+        }),
+        TOOL_GREP => grep_tool_input(&call.arguments).and_then(|input| {
+            workspace_tools
+                .grep_cancellable(input, cancellation)
+                .map_err(Into::into)
+        }),
         TOOL_EDIT => edit_tool_input(&call.arguments)
             .and_then(|input| workspace_tools.edit(input, decision).map_err(Into::into)),
         TOOL_PATCH => patch_tool_input(&call.arguments)
@@ -4135,6 +4154,15 @@ fn invalid_tool_arguments(error: serde_json::Error) -> AgentLoopToolError {
     AgentLoopToolError::InvalidArguments(error.to_string())
 }
 
+fn cancelled_tool_result(call: &ModelToolCall) -> ToolResult {
+    ToolResult::failed_with_kind(
+        &tool_call_request(call),
+        ToolFailureKind::Cancelled,
+        "tool_cancelled",
+        "tool execution cancelled",
+    )
+}
+
 fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
     let (failure_kind, error_code) = match &error {
         AgentLoopToolError::InvalidArguments(_) => {
@@ -4148,6 +4176,9 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         }
         AgentLoopToolError::Workspace(WorkspaceToolError::SandboxUnavailable) => {
             (ToolFailureKind::Sandbox, "sandbox_unavailable")
+        }
+        AgentLoopToolError::Workspace(WorkspaceToolError::Cancelled) => {
+            (ToolFailureKind::Cancelled, "tool_cancelled")
         }
         AgentLoopToolError::Workspace(WorkspaceToolError::BinaryPattern) => {
             (ToolFailureKind::Execution, "binary_pattern")
@@ -4180,6 +4211,7 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         AgentLoopToolError::Workspace(WorkspaceToolError::SandboxUnavailable) => {
             "strict sandbox backend is unavailable"
         }
+        AgentLoopToolError::Workspace(WorkspaceToolError::Cancelled) => "tool execution cancelled",
         AgentLoopToolError::Workspace(WorkspaceToolError::RollbackFailed(_)) => {
             "workspace rollback failed"
         }
@@ -4334,5 +4366,43 @@ mod audit_projection_tests {
         successful.result_id = Some(digest.to_string());
         tracker.observe(&successful);
         assert!(tracker.verification_satisfied());
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_cancellation_maps_to_stable_tool_result() {
+        let output =
+            workspace_tool_failure(AgentLoopToolError::Workspace(WorkspaceToolError::Cancelled));
+        assert!(!output.ok);
+        assert_eq!(output.error_code.as_deref(), Some("tool_cancelled"));
+        assert_eq!(output.failure_kind, Some(ToolFailureKind::Cancelled));
+
+        let envelope = ToolCallRequest::new("call_1", TOOL_READ, "{}");
+        let result = ToolResult::from_result(&envelope, &output);
+        assert!(!result.ok);
+        assert_eq!(result.error_code.as_deref(), Some("tool_cancelled"));
+        assert_eq!(result.failure_kind, Some(ToolFailureKind::Cancelled));
+        assert_eq!(result.to_message_payload()["ok"], false);
+    }
+
+    #[test]
+    fn late_success_is_replaced_by_cancellation_result() {
+        let call = ModelToolCall {
+            tool_call_id: "call_1".to_string(),
+            tool_name: TOOL_READ.to_string(),
+            raw_arguments: "{}".to_string(),
+            arguments: json!({}),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        };
+
+        let result = cancelled_tool_result(&call);
+        assert!(!result.ok);
+        assert_eq!(result.error_code.as_deref(), Some("tool_cancelled"));
+        assert_eq!(result.failure_kind, Some(ToolFailureKind::Cancelled));
     }
 }

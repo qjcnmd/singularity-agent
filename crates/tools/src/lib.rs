@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +47,7 @@ const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_COMMAND_SCRIPT_CHARS: usize = 8_000;
 const LARGE_OUTPUT_ARTIFACT_THRESHOLD: usize = 4_096;
 const DEFAULT_RESULT_PREVIEW_MAX_CHARS: usize = 4_096;
+const FILE_READ_CHUNK_SIZE: usize = 8 * 1024;
 const BINARY_CONTENT_PREVIEW: &str = "[binary content omitted]";
 const DIFF_ARTIFACT_PREFIX: &str = "artifact://diff/";
 const RESULT_ARTIFACT_PREFIX: &str = "artifact://result/";
@@ -1052,6 +1053,7 @@ pub enum WorkspaceToolError {
     OutsideWorkspace(String),
     ProtectedPath(String),
     SandboxUnavailable,
+    Cancelled,
     BinaryPattern,
     ReadFailed(String),
     RollbackFailed(String),
@@ -1067,6 +1069,7 @@ impl fmt::Display for WorkspaceToolError {
                 write!(formatter, "protected path requires approval: {path}")
             }
             Self::SandboxUnavailable => write!(formatter, "strict sandbox backend unavailable"),
+            Self::Cancelled => write!(formatter, "workspace tool execution cancelled"),
             Self::BinaryPattern => write!(formatter, "grep pattern must be valid utf-8 text"),
             Self::ReadFailed(message) => write!(formatter, "workspace tool read failed: {message}"),
             Self::RollbackFailed(message) => {
@@ -1333,14 +1336,36 @@ impl WorkspaceTools {
 
     /// 在工作区内读取有界文件内容。
     pub fn read(&self, input: ReadToolInput) -> Result<ToolOutput, WorkspaceToolError> {
+        self.read_cancellable(input, &CancellationToken::new())
+    }
+
+    /// 在工作区内读取有界文件内容，并在文件系统边界传播取消。
+    pub fn read_cancellable(
+        &self,
+        input: ReadToolInput,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolOutput, WorkspaceToolError> {
+        self.read_with_cancellation_check(input, &|| cancellation.is_cancelled())
+    }
+
+    fn read_with_cancellation_check(
+        &self,
+        input: ReadToolInput,
+        cancellation: &dyn Fn() -> bool,
+    ) -> Result<ToolOutput, WorkspaceToolError> {
+        check_cancelled(cancellation)?;
         input.validate()?;
+        check_cancelled(cancellation)?;
         let max_chars = input.max_chars.unwrap_or(DEFAULT_READ_MAX_CHARS);
         let line_start = input.line_start.unwrap_or(1);
         let line_end = input.line_end.unwrap_or(usize::MAX);
         let target = self.resolve_workspace_path(&input.path, false)?;
+        check_cancelled(cancellation)?;
         let relative = self.relative_path(&target);
+        check_cancelled(cancellation)?;
         let file = File::open(&target).map_err(io_error)?;
-        let mut reader = BufReader::new(file);
+        check_cancelled(cancellation)?;
+        let mut reader = CancellableLineReader::new(file);
         let mut line = Vec::new();
         let mut preview = String::new();
         let mut preview_truncated = false;
@@ -1351,14 +1376,17 @@ impl WorkspaceTools {
         let mut last_line_partial = false;
 
         loop {
+            check_cancelled(cancellation)?;
             line.clear();
-            let bytes_read = reader.read_until(b'\n', &mut line).map_err(io_error)?;
+            let bytes_read = reader.read_until(b'\n', &mut line, cancellation)?;
+            check_cancelled(cancellation)?;
             if bytes_read == 0 {
                 break;
             }
             total_lines = total_lines.saturating_add(1);
             total_bytes = total_bytes.saturating_add(bytes_read);
             if is_binary(&line) {
+                check_cancelled(cancellation)?;
                 return Ok(ToolOutput::success(json!({
                     "path": relative,
                     "binary": true,
@@ -1395,6 +1423,7 @@ impl WorkspaceTools {
             }
         }
 
+        check_cancelled(cancellation)?;
         let next_line_start = actual_line_end.and_then(|line_end| {
             if last_line_partial {
                 None
@@ -1423,13 +1452,34 @@ impl WorkspaceTools {
         if let Some(next_line_start) = next_line_start {
             output["next_line_start"] = json!(next_line_start);
         }
+        check_cancelled(cancellation)?;
         Ok(ToolOutput::success(output))
     }
 
     /// 列出工作区内的有界目录内容。
     pub fn list(&self, input: ListToolInput) -> Result<ToolOutput, WorkspaceToolError> {
+        self.list_cancellable(input, &CancellationToken::new())
+    }
+
+    /// 列出工作区内的有界目录内容，并在目录递归边界传播取消。
+    pub fn list_cancellable(
+        &self,
+        input: ListToolInput,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolOutput, WorkspaceToolError> {
+        self.list_with_cancellation_check(input, &|| cancellation.is_cancelled())
+    }
+
+    fn list_with_cancellation_check(
+        &self,
+        input: ListToolInput,
+        cancellation: &dyn Fn() -> bool,
+    ) -> Result<ToolOutput, WorkspaceToolError> {
+        check_cancelled(cancellation)?;
         input.validate()?;
+        check_cancelled(cancellation)?;
         let target = self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
+        check_cancelled(cancellation)?;
         let max_entries = input.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
         let max_depth = input.max_depth.unwrap_or(DEFAULT_LIST_MAX_DEPTH);
         let mut state = ListState {
@@ -1440,12 +1490,14 @@ impl WorkspaceTools {
             recursive: input.recursive,
             max_depth,
         };
-        self.collect_list_entries(&target, 0, &mut state)?;
+        self.collect_list_entries(&target, 0, &mut state, cancellation)?;
+        check_cancelled(cancellation)?;
         state
             .entries
             .sort_by(|left, right| left.relative.cmp(&right.relative));
         let truncated_by_count = state.entries.len() > max_entries;
         state.entries.truncate(max_entries);
+        check_cancelled(cancellation)?;
         Ok(ToolOutput::success(json!({
             "entries": state
                 .entries
@@ -1462,9 +1514,29 @@ impl WorkspaceTools {
 
     /// 在工作区内执行有界文本搜索。
     pub fn grep(&self, input: GrepToolInput) -> Result<ToolOutput, WorkspaceToolError> {
+        self.grep_cancellable(input, &CancellationToken::new())
+    }
+
+    /// 在工作区内执行有界文本搜索，并在递归和文件读取边界传播取消。
+    pub fn grep_cancellable(
+        &self,
+        input: GrepToolInput,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolOutput, WorkspaceToolError> {
+        self.grep_with_cancellation_check(input, &|| cancellation.is_cancelled())
+    }
+
+    fn grep_with_cancellation_check(
+        &self,
+        input: GrepToolInput,
+        cancellation: &dyn Fn() -> bool,
+    ) -> Result<ToolOutput, WorkspaceToolError> {
+        check_cancelled(cancellation)?;
         input.validate()?;
+        check_cancelled(cancellation)?;
         let root = self
             .resolve_workspace_path(input.path.as_deref().unwrap_or("."), input.path.is_none())?;
+        check_cancelled(cancellation)?;
         let max_matches = input.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
         let mut matches = Vec::new();
         let collection_limit = max_matches.saturating_add(1);
@@ -1474,8 +1546,11 @@ impl WorkspaceTools {
             input.case_sensitive,
             collection_limit,
             &mut matches,
+            cancellation,
         )?;
+        check_cancelled(cancellation)?;
         matches.truncate(max_matches);
+        check_cancelled(cancellation)?;
         Ok(ToolOutput::success(json!({
             "matches": matches,
             "truncated": truncated,
@@ -1650,12 +1725,16 @@ impl WorkspaceTools {
         directory: &Path,
         depth: usize,
         state: &mut ListState,
+        cancellation: &dyn Fn() -> bool,
     ) -> Result<(), WorkspaceToolError> {
+        check_cancelled(cancellation)?;
         if state.entries.len() >= state.collection_limit {
             state.truncated = true;
             return Ok(());
         }
-        for entry in self.sorted_directory_entries(directory)? {
+        let entries = self.sorted_directory_entries(directory, cancellation)?;
+        for entry in entries {
+            check_cancelled(cancellation)?;
             if is_protected_path(&entry.relative) {
                 state.redacted_entries = state.redacted_entries.saturating_add(1);
                 continue;
@@ -1666,16 +1745,18 @@ impl WorkspaceTools {
             state.entries.push(entry.clone());
             if state.entries.len() >= state.collection_limit {
                 state.truncated = true;
+                check_cancelled(cancellation)?;
                 return Ok(());
             }
             if state.recursive && entry.is_dir {
                 if depth < state.max_depth {
-                    self.collect_list_entries(&entry.path, depth + 1, state)?;
+                    self.collect_list_entries(&entry.path, depth + 1, state, cancellation)?;
                 } else {
-                    self.mark_depth_boundary(&entry.path, state)?;
+                    self.mark_depth_boundary(&entry.path, state, cancellation)?;
                 }
             }
         }
+        check_cancelled(cancellation)?;
         Ok(())
     }
 
@@ -1683,34 +1764,54 @@ impl WorkspaceTools {
         &self,
         directory: &Path,
         state: &mut ListState,
+        cancellation: &dyn Fn() -> bool,
     ) -> Result<(), WorkspaceToolError> {
-        for entry in self.sorted_directory_entries(directory)? {
+        check_cancelled(cancellation)?;
+        let entries = self.sorted_directory_entries(directory, cancellation)?;
+        for entry in entries {
+            check_cancelled(cancellation)?;
             if is_protected_path(&entry.relative) {
                 state.redacted_entries = state.redacted_entries.saturating_add(1);
             } else if !entry.is_symlink_or_reparse {
                 state.truncated = true;
             }
         }
+        check_cancelled(cancellation)?;
         Ok(())
     }
 
     fn sorted_directory_entries(
         &self,
         directory: &Path,
+        cancellation: &dyn Fn() -> bool,
     ) -> Result<Vec<DirectoryEntry>, WorkspaceToolError> {
+        check_cancelled(cancellation)?;
         let mut entries = Vec::new();
-        for entry in std::fs::read_dir(directory).map_err(io_error)? {
+        let mut directory_entries = std::fs::read_dir(directory).map_err(io_error)?;
+        check_cancelled(cancellation)?;
+        loop {
+            check_cancelled(cancellation)?;
+            let Some(entry) = directory_entries.next() else {
+                break;
+            };
+            check_cancelled(cancellation)?;
             let entry = entry.map_err(io_error)?;
             let path = entry.path();
+            check_cancelled(cancellation)?;
             let metadata = std::fs::symlink_metadata(&path).map_err(io_error)?;
+            check_cancelled(cancellation)?;
+            let relative = self.relative_path(&path);
+            check_cancelled(cancellation)?;
             entries.push(DirectoryEntry {
-                relative: self.relative_path(&path),
+                relative,
                 is_dir: metadata.is_dir(),
                 is_symlink_or_reparse: metadata_is_symlink_or_reparse(&metadata),
                 path,
             });
         }
+        check_cancelled(cancellation)?;
         entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+        check_cancelled(cancellation)?;
         Ok(entries)
     }
 
@@ -1721,20 +1822,27 @@ impl WorkspaceTools {
         case_sensitive: bool,
         collection_limit: usize,
         matches: &mut Vec<Value>,
+        cancellation: &dyn Fn() -> bool,
     ) -> Result<bool, WorkspaceToolError> {
+        check_cancelled(cancellation)?;
         if matches.len() >= collection_limit {
             return Ok(true);
         }
+        check_cancelled(cancellation)?;
         let metadata = std::fs::symlink_metadata(root).map_err(io_error)?;
+        check_cancelled(cancellation)?;
         if metadata_is_symlink_or_reparse(&metadata) {
             return Ok(false);
         }
         let relative = self.relative_path(root);
+        check_cancelled(cancellation)?;
         if is_protected_path(&relative) {
             return Ok(false);
         }
         if metadata.is_dir() {
-            for entry in self.sorted_directory_entries(root)? {
+            let entries = self.sorted_directory_entries(root, cancellation)?;
+            for entry in entries {
+                check_cancelled(cancellation)?;
                 if is_protected_path(&entry.relative) || entry.is_symlink_or_reparse {
                     continue;
                 }
@@ -1744,28 +1852,35 @@ impl WorkspaceTools {
                     case_sensitive,
                     collection_limit,
                     matches,
+                    cancellation,
                 )? {
                     return Ok(true);
                 }
             }
+            check_cancelled(cancellation)?;
             return Ok(false);
         }
         if !metadata.is_file() {
             return Ok(false);
         }
+        check_cancelled(cancellation)?;
         let file = File::open(root).map_err(io_error)?;
-        let mut reader = BufReader::new(file);
+        check_cancelled(cancellation)?;
+        let mut reader = CancellableLineReader::new(file);
         let mut raw_line = Vec::new();
         let mut file_matches = Vec::new();
         let folded_pattern = (!case_sensitive).then(|| pattern.to_lowercase());
         let mut line_number = 0usize;
         loop {
+            check_cancelled(cancellation)?;
             raw_line.clear();
-            let bytes_read = reader.read_until(b'\n', &mut raw_line).map_err(io_error)?;
+            let bytes_read = reader.read_until(b'\n', &mut raw_line, cancellation)?;
+            check_cancelled(cancellation)?;
             if bytes_read == 0 {
                 break;
             }
             if is_binary(&raw_line) {
+                check_cancelled(cancellation)?;
                 return Ok(false);
             }
             let line = std::str::from_utf8(&raw_line)
@@ -1776,6 +1891,7 @@ impl WorkspaceTools {
                 |folded| line.to_lowercase().contains(folded),
             );
             if matches_pattern {
+                check_cancelled(cancellation)?;
                 let line = line.trim_end_matches(['\n', '\r']);
                 let (preview, _) = bounded_text(line, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
                 file_matches.push(json!({
@@ -1789,10 +1905,12 @@ impl WorkspaceTools {
                             .into_iter()
                             .take(collection_limit.saturating_sub(matches.len())),
                     );
+                    check_cancelled(cancellation)?;
                     return Ok(true);
                 }
             }
         }
+        check_cancelled(cancellation)?;
         matches.extend(file_matches);
         Ok(false)
     }
@@ -1851,6 +1969,65 @@ where
 {
     serde_json::from_value(input.clone())
         .map_err(|_| WorkspaceToolError::InvalidInput("invalid tool input".to_string()))
+}
+
+fn check_cancelled(cancellation: &dyn Fn() -> bool) -> Result<(), WorkspaceToolError> {
+    if cancellation() {
+        Err(WorkspaceToolError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+struct CancellableLineReader<R> {
+    reader: R,
+    chunk: [u8; FILE_READ_CHUNK_SIZE],
+    chunk_start: usize,
+    chunk_end: usize,
+}
+
+impl<R: Read> CancellableLineReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            chunk: [0; FILE_READ_CHUNK_SIZE],
+            chunk_start: 0,
+            chunk_end: 0,
+        }
+    }
+
+    fn read_until(
+        &mut self,
+        delimiter: u8,
+        output: &mut Vec<u8>,
+        cancellation: &dyn Fn() -> bool,
+    ) -> Result<usize, WorkspaceToolError> {
+        output.clear();
+        loop {
+            check_cancelled(cancellation)?;
+            if self.chunk_start == self.chunk_end {
+                let bytes_read = self.reader.read(&mut self.chunk).map_err(io_error)?;
+                check_cancelled(cancellation)?;
+                self.chunk_start = 0;
+                self.chunk_end = bytes_read;
+                if bytes_read == 0 {
+                    return Ok(output.len());
+                }
+            }
+
+            let available = &self.chunk[self.chunk_start..self.chunk_end];
+            if let Some(delimiter_index) = available.iter().position(|byte| *byte == delimiter) {
+                let end = delimiter_index.saturating_add(1);
+                output.extend_from_slice(&available[..end]);
+                self.chunk_start = self.chunk_start.saturating_add(end);
+                check_cancelled(cancellation)?;
+                return Ok(output.len());
+            }
+            output.extend_from_slice(available);
+            self.chunk_start = self.chunk_end;
+            check_cancelled(cancellation)?;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2401,5 +2578,119 @@ fn command_error_code(result: &CommandResult) -> &'static str {
             CommandSemanticStatus::TimedOut => "command_timed_out",
             CommandSemanticStatus::Cancelled => "command_cancelled",
         },
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn test_workspace(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "singularity-tools-cancellation-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create test workspace");
+        path
+    }
+
+    fn remove_workspace(path: &Path) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    fn cancel_after(checks: &AtomicUsize, threshold: usize) -> impl Fn() -> bool + '_ {
+        move || checks.fetch_add(1, Ordering::SeqCst).saturating_add(1) >= threshold
+    }
+
+    #[test]
+    fn cancellable_read_stops_after_a_file_chunk_boundary() {
+        let workspace = test_workspace("read-boundary");
+        let content = "x".repeat(FILE_READ_CHUNK_SIZE.saturating_mul(3));
+        std::fs::write(workspace.join("lines.txt"), content).expect("write lines");
+        let tools = WorkspaceTools::new(&workspace);
+        let checks = AtomicUsize::new(0);
+
+        let result = tools.read_with_cancellation_check(
+            ReadToolInput {
+                path: "lines.txt".to_string(),
+                max_chars: None,
+                line_start: None,
+                line_end: None,
+            },
+            &cancel_after(&checks, 9),
+        );
+
+        assert!(matches!(result, Err(WorkspaceToolError::Cancelled)));
+        assert!(checks.load(Ordering::SeqCst) >= 9);
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn cancellable_recursive_list_stops_at_an_entry_boundary() {
+        let workspace = test_workspace("list-boundary");
+        for directory_index in 0..4 {
+            let directory = workspace.join(format!("dir-{directory_index}"));
+            std::fs::create_dir_all(directory.join("nested")).expect("create nested directory");
+            for file_index in 0..4 {
+                std::fs::write(
+                    directory.join(format!("file-{file_index}.txt")),
+                    "content\n",
+                )
+                .expect("write nested file");
+            }
+            std::fs::write(directory.join("nested").join("deep.txt"), "deep\n")
+                .expect("write deep file");
+        }
+        let tools = WorkspaceTools::new(&workspace);
+        let checks = AtomicUsize::new(0);
+
+        let result = tools.list_with_cancellation_check(
+            ListToolInput {
+                path: None,
+                max_entries: Some(1_000),
+                recursive: true,
+                max_depth: Some(8),
+            },
+            &cancel_after(&checks, 45),
+        );
+
+        assert!(matches!(result, Err(WorkspaceToolError::Cancelled)));
+        assert!(checks.load(Ordering::SeqCst) >= 45);
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn cancellable_recursive_grep_stops_at_a_file_boundary() {
+        let workspace = test_workspace("grep-boundary");
+        for directory_index in 0..4 {
+            let directory = workspace.join(format!("dir-{directory_index}"));
+            std::fs::create_dir_all(&directory).expect("create directory");
+            for file_index in 0..4 {
+                std::fs::write(
+                    directory.join(format!("file-{file_index}.txt")),
+                    "no match\nno match\n",
+                )
+                .expect("write grep file");
+            }
+        }
+        let tools = WorkspaceTools::new(&workspace);
+        let checks = AtomicUsize::new(0);
+
+        let result = tools.grep_with_cancellation_check(
+            GrepToolInput {
+                path: None,
+                pattern: "needle".to_string(),
+                max_matches: Some(1_000),
+                case_sensitive: true,
+            },
+            &cancel_after(&checks, 45),
+        );
+
+        assert!(matches!(result, Err(WorkspaceToolError::Cancelled)));
+        assert!(checks.load(Ordering::SeqCst) >= 45);
+        remove_workspace(&workspace);
     }
 }

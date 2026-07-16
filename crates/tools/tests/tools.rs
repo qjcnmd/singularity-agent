@@ -1,5 +1,6 @@
 //! Direct workspace tool schema、整批 preflight、approval 和结果脱敏测试。
 
+use singularity_core::CancellationToken;
 use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, SandboxBackend, SandboxCapabilities, SandboxFilesystemMode,
@@ -604,6 +605,53 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
             .unwrap()
             .is_empty()
     );
+
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_read_list_and_grep_pre_cancelled_skip_io() {
+    let workspace = test_workspace("pre-cancelled-read-list-grep");
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let tools = WorkspaceTools::new(&workspace);
+
+    assert!(matches!(
+        tools.read_cancellable(
+            ReadToolInput {
+                path: "missing.txt".to_string(),
+                max_chars: None,
+                line_start: None,
+                line_end: None,
+            },
+            &cancellation,
+        ),
+        Err(WorkspaceToolError::Cancelled)
+    ));
+    assert!(matches!(
+        tools.list_cancellable(
+            ListToolInput {
+                path: Some("missing-directory".to_string()),
+                max_entries: None,
+                recursive: true,
+                max_depth: None,
+            },
+            &cancellation,
+        ),
+        Err(WorkspaceToolError::Cancelled)
+    ));
+    assert!(matches!(
+        tools.grep_cancellable(
+            GrepToolInput {
+                path: Some("missing-directory".to_string()),
+                pattern: "needle".to_string(),
+                max_matches: None,
+                case_sensitive: true,
+            },
+            &cancellation,
+        ),
+        Err(WorkspaceToolError::Cancelled)
+    ));
 
     remove_workspace(&workspace);
 }
