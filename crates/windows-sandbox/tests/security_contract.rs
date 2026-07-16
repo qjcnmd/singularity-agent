@@ -1,3 +1,5 @@
+#![cfg(target_os = "windows")]
+
 use singularity_windows_sandbox::{
     AbsolutePathBuf, ManagedFileSystemPermissions, NetworkSandboxPolicy, PermissionProfile,
     ResolvedWindowsSandboxPermissions, run_windows_sandbox_capture_with_filesystem_overrides,
