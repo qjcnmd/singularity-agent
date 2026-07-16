@@ -6,35 +6,55 @@ use crate::acl::revoke_deny_read_ace_with_fingerprint;
 use crate::path_normalization::lexical_path_key;
 use anyhow::Context;
 use anyhow::Result;
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
-use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+use cap_std::fs::Dir;
 use dunce::canonicalize;
 use serde::Deserialize;
 use serde::Serialize;
 use singularity_core::PROTECTED_GIT_DIR_NAME;
 use std::collections::HashSet;
 use std::error::Error;
-use std::ffi::c_void;
+use std::ffi::{OsStr, c_void};
 use std::fmt;
-use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::AsRawHandle;
-use std::path::{Component, Path, PathBuf};
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::path::{Component, Path, PathBuf, Prefix};
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+};
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::ERROR_DIR_NOT_EMPTY;
+use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+use windows_sys::Win32::Foundation::STATUS_SUCCESS;
+use windows_sys::Win32::Foundation::UNICODE_STRING;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_FLAG_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO_EX;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FileDispositionInfoEx;
 use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
+use windows_sys::Win32::System::WindowsProgramming::FILE_CREATED;
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
@@ -119,13 +139,27 @@ impl MaterializedDirectory {
 fn absolute_path_components(path: &Path) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
     let mut anchor = PathBuf::new();
     let mut descendants = Vec::new();
+    let mut has_filesystem_prefix = false;
     let mut rooted = false;
     for component in path.components() {
         match component {
-            Component::Prefix(_) if !rooted && descendants.is_empty() => {
+            Component::Prefix(prefix) if !rooted && descendants.is_empty() => {
+                if !matches!(
+                    prefix.kind(),
+                    Prefix::Disk(_)
+                        | Prefix::VerbatimDisk(_)
+                        | Prefix::UNC(_, _)
+                        | Prefix::VerbatimUNC(_, _)
+                ) {
+                    anyhow::bail!(
+                        "deny path must use a disk or UNC filesystem prefix: {}",
+                        path.display()
+                    );
+                }
                 anchor.push(component.as_os_str());
+                has_filesystem_prefix = true;
             }
-            Component::RootDir if !rooted && descendants.is_empty() => {
+            Component::RootDir if has_filesystem_prefix && !rooted && descendants.is_empty() => {
                 anchor.push(component.as_os_str());
                 rooted = true;
             }
@@ -136,46 +170,155 @@ fn absolute_path_components(path: &Path) -> Result<(PathBuf, Vec<std::ffi::OsStr
             ),
         }
     }
-    if !rooted || descendants.is_empty() {
+    if !has_filesystem_prefix || !rooted || descendants.is_empty() {
         anyhow::bail!("deny path must name a directory below a filesystem root");
     }
     Ok((anchor, descendants))
 }
 
-fn open_acl_directory(parent: &Dir, name: &std::ffi::OsStr) -> Result<std::fs::File> {
-    let mut options = OpenOptions::new();
-    options
-        .access_mode(DELETE | READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(true);
-    let file = parent
-        .open_with(name, &options)
-        .with_context(|| {
-            format!(
-                "open materialized deny directory {}",
-                name.to_string_lossy()
-            )
-        })?
-        .into_std();
+fn validate_plain_directory(file: &std::fs::File) -> Result<()> {
     let metadata = file
         .metadata()
         .context("inspect pinned materialized deny directory")?;
     if !metadata.is_dir() || is_reparse_point_attributes(metadata.file_attributes()) {
         anyhow::bail!("materialized deny target is not a plain directory");
     }
+    Ok(())
+}
+
+fn open_filesystem_root(anchor: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options
+        .open(anchor)
+        .with_context(|| format!("open deny path filesystem root {}", anchor.display()))?;
+    validate_plain_directory(&file)?;
     Ok(file)
 }
 
-fn ancestor_has_git_marker(directory: &Dir) -> Result<bool> {
-    match directory.symlink_metadata(PROTECTED_GIT_DIR_NAME) {
+fn relative_name(name: &OsStr) -> Result<(Vec<u16>, UNICODE_STRING)> {
+    let mut wide = name.encode_wide().collect::<Vec<_>>();
+    if wide.is_empty() || wide.iter().any(|value| matches!(*value, 0 | 47 | 58 | 92)) {
+        anyhow::bail!("invalid relative deny path component");
+    }
+    let byte_length = wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| anyhow::anyhow!("relative deny path component is too long"))?;
+    let name = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: wide.as_mut_ptr(),
+    };
+    Ok((wide, name))
+}
+
+/// Opens one validated component relative to a stable parent kernel handle.
+///
+/// `NtCreateFile.RootDirectory` provides the Windows handle-relative primitive that Win32
+/// `CreateDirectoryW` lacks. Delete sharing stays disabled so the parent or returned object cannot
+/// be replaced before the next traversal, ACL, or cleanup operation.
+fn nt_open_relative(
+    parent: &std::fs::File,
+    name: &OsStr,
+    desired_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+) -> std::io::Result<(std::fs::File, usize)> {
+    let (_wide, mut name) =
+        relative_name(name).map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle() as HANDLE,
+        ObjectName: &mut name,
+        Attributes: OBJ_CASE_INSENSITIVE as u32,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle = INVALID_HANDLE_VALUE;
+    let mut io_status = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            desired_access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &attributes,
+            &mut io_status,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            create_disposition,
+            create_options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        if handle != 0 && handle != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+        return Err(std::io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ));
+    }
+    if handle == 0 || handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::other(
+            "NtCreateFile succeeded without a valid handle",
+        ));
+    }
+    let file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+    Ok((file, io_status.Information))
+}
+
+fn open_or_create_directory_at(
+    parent: &std::fs::File,
+    name: &OsStr,
+    desired_access: u32,
+) -> Result<(std::fs::File, bool)> {
+    let (file, information) = nt_open_relative(
+        parent,
+        name,
+        desired_access,
+        FILE_OPEN_IF,
+        FILE_DIRECTORY_FILE,
+    )
+    .with_context(|| {
+        format!(
+            "open or create deny path component {}",
+            name.to_string_lossy()
+        )
+    })?;
+    validate_plain_directory(&file)?;
+    Ok((file, information == FILE_CREATED as usize))
+}
+
+fn ancestor_has_git_marker(directory: &std::fs::File) -> Result<bool> {
+    match nt_open_relative(
+        directory,
+        OsStr::new(PROTECTED_GIT_DIR_NAME),
+        0,
+        FILE_OPEN,
+        0,
+    ) {
         Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error)
+            if matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+            ) =>
+        {
+            Ok(false)
+        }
         Err(error) => Err(error).context("inspect ancestor Git marker"),
     }
 }
 
-/// Creates or opens an absolute directory through pinned, no-follow capabilities.
+/// Creates or opens an absolute directory through pinned, no-follow native handles.
 pub fn ensure_directory_materialized(path: &Path) -> Result<MaterializedDirectory> {
     ensure_directory_materialized_with_hook(path, || {})
 }
@@ -185,8 +328,7 @@ fn ensure_directory_materialized_with_hook(
     before_final_create: impl FnOnce(),
 ) -> Result<MaterializedDirectory> {
     let (anchor, descendants) = absolute_path_components(path)?;
-    let mut current = Dir::open_ambient_dir(&anchor, ambient_authority())
-        .with_context(|| format!("open deny path filesystem root {}", anchor.display()))?;
+    let mut current = open_filesystem_root(&anchor)?;
     let mut current_path = anchor;
     let check_git_ancestors = is_missing_git_marker(path);
     let mut before_final_create = Some(before_final_create);
@@ -204,32 +346,19 @@ fn ensure_directory_materialized_with_hook(
                 },
             ));
         }
-        let created = match current.create_dir(component) {
-            Ok(()) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("create deny path component {}", component.to_string_lossy())
-                });
-            }
-        };
         if is_final {
-            if created {
-                // The capability-relative create already completed; the hook is placed before the
-                // final object open so tests can prove a pathname replacement cannot redirect it.
-                before_final_create.take().expect("single final hook")();
-            }
+            before_final_create.take().expect("single final hook")();
+            let (file, created_by_runtime) = open_or_create_directory_at(
+                &current,
+                component,
+                DELETE | READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY,
+            )?;
             return Ok(MaterializedDirectory {
-                file: open_acl_directory(&current, component)?,
-                created_by_runtime: created,
+                file,
+                created_by_runtime,
             });
         }
-        current = current.open_dir_nofollow(component).with_context(|| {
-            format!(
-                "open deny path component without following reparse points {}",
-                component.to_string_lossy()
-            )
-        })?;
+        current = open_or_create_directory_at(&current, component, FILE_LIST_DIRECTORY)?.0;
         current_path.push(component);
     }
     unreachable!("absolute path parser requires at least one descendant")
@@ -469,7 +598,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::HashSet;
     use std::os::windows::process::CommandExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
@@ -530,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_materialization_cannot_be_redirected_after_create() {
+    fn parent_replacement_cannot_redirect_handle_relative_create() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
         let moved = tmp.path().join("workspace-moved");
@@ -539,16 +668,30 @@ mod tests {
         std::fs::create_dir(&outside).expect("create outside");
         let sentinel = workspace.join(".singularity");
         let rename_failed = std::cell::Cell::new(false);
+        let existed_before_atomic_create = std::cell::Cell::new(false);
 
         let materialized = ensure_directory_materialized_with_hook(&sentinel, || {
+            existed_before_atomic_create.set(sentinel.exists());
             rename_failed.set(std::fs::rename(&workspace, &moved).is_err());
         })
         .expect("materialize through pinned parent");
 
+        assert!(
+            !existed_before_atomic_create.get(),
+            "hook must run before the atomic final create"
+        );
         assert!(rename_failed.get(), "pinned parent must reject replacement");
         assert!(sentinel.is_dir());
         assert!(!outside.join(".singularity").exists());
         materialized.cleanup_if_empty().expect("cleanup sentinel");
+    }
+
+    #[test]
+    fn materialization_rejects_non_filesystem_absolute_prefixes() {
+        assert!(
+            ensure_directory_materialized(Path::new(r"\rooted-without-drive\sentinel")).is_err()
+        );
+        assert!(ensure_directory_materialized(Path::new(r"\\.\PIPE\sentinel")).is_err());
     }
 
     #[test]
