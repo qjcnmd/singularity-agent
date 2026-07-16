@@ -1,4 +1,5 @@
-use crate::path_normalization::normalized_path_text;
+use crate::path_safety::ensure_case_insensitive_directory;
+use crate::path_safety::open_existing_acl_target;
 use crate::winutil::to_wide;
 use anyhow::Result;
 use serde::Deserialize;
@@ -6,7 +7,9 @@ use serde::Serialize;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
+use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 use std::path::Path;
+#[cfg(test)]
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::ERROR_INVALID_DATA;
@@ -44,19 +47,14 @@ use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
-use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
-use windows_sys::Win32::Storage::FileSystem::FILE_NAME_NORMALIZED;
-use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
-use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
@@ -103,7 +101,6 @@ pub enum AclOperation {
     OpenTarget,
     ReparseTargetUnsupported,
     QueryTargetIdentity,
-    TargetIdentityMismatch,
     GetSecurityInfo,
     GetAclInformation,
     GetAce,
@@ -160,96 +157,51 @@ impl Drop for AclTarget {
 }
 
 unsafe fn open_acl_target(path: &Path, desired_access: u32, object_type: i32) -> Result<AclTarget> {
-    open_acl_target_with_flags(
-        path,
-        desired_access,
-        object_type,
-        FILE_FLAG_BACKUP_SEMANTICS,
-    )
-}
-
-unsafe fn open_acl_target_with_flags(
-    path: &Path,
-    desired_access: u32,
-    object_type: i32,
-    flags_and_attributes: u32,
-) -> Result<AclTarget> {
-    if object_type == 1 && path_contains_reparse_component(path)? {
+    if object_type != 1 {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::OpenTarget,
+            ERROR_INVALID_DATA,
+        )));
+    }
+    let file = match open_existing_acl_target(path, desired_access) {
+        Ok(file) => file,
+        Err(error) => {
+            let native_code = error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    .map(|code| code as u32)
+            });
+            if let Some(code) = native_code {
+                return Err(anyhow::Error::new(WindowsAclError::new(
+                    AclOperation::OpenTarget,
+                    code,
+                ))
+                .context(error));
+            }
+            return Err(error);
+        }
+    };
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+    if windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(handle, &mut info) == 0 {
+        let code = GetLastError();
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::QueryTargetIdentity,
+            code,
+        )));
+    }
+    if info.dwFileAttributes & 0x0000_0400 != 0 {
         return Err(anyhow::Error::new(WindowsAclError::new(
             AclOperation::ReparseTargetUnsupported,
             50, // ERROR_NOT_SUPPORTED
         )));
     }
-    let expected_identity = if object_type == 1 {
-        Some(dunce::canonicalize(path).map_err(|err| {
-            anyhow::Error::new(WindowsAclError::new(
-                AclOperation::QueryTargetIdentity,
-                ERROR_INVALID_DATA,
-            ))
-            .context(format!("canonicalize ACL target {}: {err}", path.display()))
-        })?)
-    } else {
-        None
-    };
-    let wpath = to_wide(path);
-    let flags_and_attributes = if object_type == 1 {
-        flags_and_attributes | FILE_FLAG_OPEN_REPARSE_POINT
-    } else {
-        flags_and_attributes
-    };
-    let handle = CreateFileW(
-        wpath.as_ptr(),
-        desired_access,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        std::ptr::null_mut(),
-        OPEN_EXISTING,
-        flags_and_attributes,
-        0,
-    );
-    if handle == 0 || handle == INVALID_HANDLE_VALUE {
-        return Err(anyhow::Error::new(WindowsAclError::new(
-            AclOperation::OpenTarget,
-            GetLastError(),
-        )));
+    let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if is_directory {
+        ensure_case_insensitive_directory(&file, path)?;
     }
-    let mut is_directory = false;
-    if object_type == 1 {
-        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
-        if windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(handle, &mut info)
-            == 0
-        {
-            let code = GetLastError();
-            CloseHandle(handle);
-            return Err(anyhow::Error::new(WindowsAclError::new(
-                AclOperation::QueryTargetIdentity,
-                code,
-            )));
-        }
-        if info.dwFileAttributes & 0x0000_0400 != 0 {
-            CloseHandle(handle);
-            return Err(anyhow::Error::new(WindowsAclError::new(
-                AclOperation::ReparseTargetUnsupported,
-                50, // ERROR_NOT_SUPPORTED
-            )));
-        }
-        is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-        if path_contains_reparse_component(path)? {
-            CloseHandle(handle);
-            return Err(anyhow::Error::new(WindowsAclError::new(
-                AclOperation::ReparseTargetUnsupported,
-                50, // ERROR_NOT_SUPPORTED
-            )));
-        }
-        if let Err(error) = verify_target_identity_against(
-            handle,
-            expected_identity
-                .as_deref()
-                .expect("file ACL target has an expected identity"),
-        ) {
-            CloseHandle(handle);
-            return Err(error);
-        }
-    }
+    let handle = file.into_raw_handle() as HANDLE;
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetSecurityInfo(
@@ -330,60 +282,7 @@ unsafe fn borrow_acl_directory(handle: HANDLE) -> Result<AclTarget> {
     })
 }
 
-unsafe fn final_path_from_handle(handle: HANDLE) -> Result<PathBuf> {
-    let mut buffer = vec![0u16; 512];
-    loop {
-        let length = GetFinalPathNameByHandleW(
-            handle,
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-            FILE_NAME_NORMALIZED,
-        );
-        if length == 0 {
-            return Err(anyhow::Error::new(WindowsAclError::new(
-                AclOperation::QueryTargetIdentity,
-                GetLastError(),
-            )));
-        }
-        if (length as usize) < buffer.len() {
-            let text = String::from_utf16(&buffer[..length as usize]).map_err(|_| {
-                anyhow::Error::new(WindowsAclError::new(
-                    AclOperation::QueryTargetIdentity,
-                    ERROR_INVALID_DATA,
-                ))
-            })?;
-            return Ok(PathBuf::from(text));
-        }
-        if buffer.len() >= 32 * 1024 {
-            return Err(anyhow::Error::new(WindowsAclError::new(
-                AclOperation::QueryTargetIdentity,
-                ERROR_INVALID_DATA,
-            )));
-        }
-        buffer.resize(buffer.len() * 2, 0);
-    }
-}
-
-fn normalized_identity(path: &Path) -> String {
-    normalized_path_text(path).to_ascii_lowercase()
-}
-
-pub(crate) unsafe fn verify_target_identity_against(handle: HANDLE, expected: &Path) -> Result<()> {
-    let actual = final_path_from_handle(handle)?;
-    if normalized_identity(expected) != normalized_identity(&actual) {
-        return Err(anyhow::Error::new(WindowsAclError::new(
-            AclOperation::TargetIdentityMismatch,
-            ERROR_INVALID_DATA,
-        ))
-        .context(format!(
-            "ACL target identity changed: expected {}, opened {}",
-            expected.display(),
-            actual.display()
-        )));
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 pub(crate) fn path_contains_reparse_component(path: &Path) -> Result<bool> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -1268,6 +1167,7 @@ mod tests {
     use super::TRUSTEE_IS_UNKNOWN;
     use super::TRUSTEE_W;
     use super::WindowsAclError;
+    use super::add_allow_ace;
     use super::add_deny_read_ace;
     use super::add_deny_write_ace;
     use super::dacl_has_read_deny_for_sid;
@@ -1278,6 +1178,8 @@ mod tests {
     use super::path_contains_reparse_component;
     use super::revoke_deny_read_ace;
     use super::set_target_dacl;
+    use crate::path_safety::ProtectedMetadataError;
+    use crate::path_safety::enable_case_sensitive_directory_for_test;
     use crate::token::LocalSid;
     use std::ffi::c_void;
     use std::fs::OpenOptions;
@@ -1363,6 +1265,28 @@ mod tests {
             ),
             "unexpected ACL query operation: {:?}",
             typed.operation
+        );
+    }
+
+    #[test]
+    fn common_acl_open_rejects_a_case_sensitive_parent() {
+        let tmp = TempDir::new().expect("tempdir");
+        let parent = tmp.path().join("case-sensitive-parent");
+        let target = parent.join("target.txt");
+        std::fs::create_dir(&parent).expect("create parent");
+        if !enable_case_sensitive_directory_for_test(&parent) {
+            return;
+        }
+        std::fs::write(&target, "fixture").expect("write target");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+
+        let error = unsafe { add_allow_ace(&target, sid.as_ptr()) }
+            .expect_err("all path-based ACL entry points must share the path-safety guard");
+
+        assert_eq!(
+            error.downcast_ref::<ProtectedMetadataError>(),
+            Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported { path: parent })
         );
     }
 

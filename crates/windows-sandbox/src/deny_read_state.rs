@@ -2,9 +2,11 @@ use crate::acl::deny_read_acl_fingerprint;
 use crate::acl::revoke_deny_read_ace_with_fingerprint;
 use crate::deny_read_acl::ManagedDenyReadAcl;
 use crate::deny_read_acl::apply_deny_read_acls_with_ownership_before_set;
-use crate::deny_read_acl::ensure_case_insensitive_path_ancestors;
+use crate::deny_read_acl::plan_deny_read_acl_paths;
 use crate::path_normalization::canonical_path_key_allow_missing;
 use crate::path_normalization::lexical_path_key;
+use crate::path_safety::ensure_case_insensitive_acl_path;
+use crate::path_safety::ensure_case_insensitive_state_path;
 use crate::setup::sandbox_dir;
 use crate::token::current_user_sid_bytes;
 use crate::winutil::resolve_sid;
@@ -161,6 +163,7 @@ fn wait_raw_named_mutex(name: &str, timeout_ms: u32) -> Result<Option<StateMutex
 }
 
 fn wait_named_mutex(prefix: &str, path: &Path, timeout_ms: u32) -> Result<Option<StateMutex>> {
+    ensure_case_insensitive_state_path(path)?;
     wait_raw_named_mutex(&mutex_name(prefix, path), timeout_ms)
 }
 
@@ -498,6 +501,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
     desired_paths: &[PathBuf],
     psid: *mut c_void,
 ) -> Result<Vec<PathBuf>> {
+    drop(plan_deny_read_acl_paths(desired_paths)?);
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
     let _lock = lock_state(&state_path)?;
     let mut state = load_state(&state_path)?;
@@ -514,7 +518,15 @@ pub unsafe fn sync_persistent_deny_read_acls(
                 .flatten(),
         )
     {
-        ensure_case_insensitive_path_ancestors(&managed.path)?;
+        ensure_case_insensitive_acl_path(&managed.path)?;
+    }
+    for path in state
+        .legacy_unmanaged_principals
+        .get(principal_sid)
+        .into_iter()
+        .flatten()
+    {
+        ensure_case_insensitive_acl_path(path)?;
     }
     if unsafe { recover_pending_principal(&mut state, principal_sid, psid) }? {
         store_state(&state_path, &state).context("commit recovered pending deny-read ownership")?;
@@ -694,6 +706,9 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                 Some(version) if version == u64::from(DENY_READ_ACL_STATE_VERSION) => {
                     let state: PersistentDenyReadAclState = serde_json::from_value(value)
                         .with_context(|| format!("parse deny-read ACL state {}", path.display()))?;
+                    validate_state_paths(&state).with_context(|| {
+                        format!("validate deny-read ACL state paths {}", path.display())
+                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate deny-read ACL state {}", path.display())
                     })?;
@@ -716,6 +731,12 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         active_runner_leases: previous.active_runner_leases,
                         ..PersistentDenyReadAclState::default()
                     };
+                    validate_state_paths(&state).with_context(|| {
+                        format!(
+                            "validate version 3 deny-read ACL state paths {}",
+                            path.display()
+                        )
+                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate version 3 deny-read ACL state {}", path.display())
                     })?;
@@ -739,6 +760,12 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         ),
                         ..PersistentDenyReadAclState::default()
                     };
+                    validate_state_paths(&state).with_context(|| {
+                        format!(
+                            "validate version 2 deny-read ACL state paths {}",
+                            path.display()
+                        )
+                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate version 2 deny-read ACL state {}", path.display())
                     })?;
@@ -757,6 +784,12 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         legacy_unmanaged_principals: legacy.principals,
                         ..PersistentDenyReadAclState::default()
                     };
+                    validate_state_paths(&state).with_context(|| {
+                        format!(
+                            "validate legacy deny-read ACL state paths {}",
+                            path.display()
+                        )
+                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate legacy deny-read ACL state {}", path.display())
                     })?;
@@ -783,10 +816,24 @@ fn merge_legacy_principals(
         current.extend(paths);
     }
     for current in merged.values_mut() {
-        current.sort_by_key(|path| lexical_path_key(path));
-        current.dedup_by(|left, right| lexical_path_key(left) == lexical_path_key(right));
+        current.sort();
+        current.dedup();
     }
     merged
+}
+
+fn validate_state_paths(state: &PersistentDenyReadAclState) -> Result<()> {
+    for path in state
+        .principals
+        .values()
+        .flatten()
+        .chain(state.pending_principals.values().flatten())
+        .map(|managed| &managed.path)
+        .chain(state.legacy_unmanaged_principals.values().flatten())
+    {
+        ensure_case_insensitive_acl_path(path)?;
+    }
+    Ok(())
 }
 
 fn validate_state(state: &PersistentDenyReadAclState) -> Result<()> {
@@ -826,6 +873,7 @@ fn validate_state(state: &PersistentDenyReadAclState) -> Result<()> {
 }
 
 fn store_state(path: &Path, state: &PersistentDenyReadAclState) -> Result<()> {
+    validate_state_paths(state)?;
     validate_state(state)?;
     let bytes = serde_json::to_vec_pretty(state).context("serialize deny-read ACL state")?;
     atomic_store(path, &bytes)
@@ -837,6 +885,7 @@ mod tests {
     use super::ManagedDenyReadAcl;
     use super::PersistentDenyReadAclState;
     use super::load_state;
+    use super::lock_state;
     use super::merge_tracked_paths;
     use super::reconcile_runner_leases;
     use super::register_runner_lease;
@@ -852,6 +901,8 @@ mod tests {
     use crate::acl::fetch_dacl_handle;
     use crate::acl::revoke_deny_read_ace;
     use crate::path_normalization::lexical_path_key;
+    use crate::path_safety::ProtectedMetadataError;
+    use crate::path_safety::enable_case_sensitive_directory_for_test;
     use crate::token::LocalSid;
     use std::os::windows::process::CommandExt;
     use std::path::Path;
@@ -891,6 +942,27 @@ mod tests {
     fn state_mutex_uses_global_namespace_for_cross_session_state() {
         let name = state_mutex_name(Path::new(r"C:\sandbox\.sandbox\deny_read_acl_state.json"));
         assert!(name.starts_with(r"Global\"), "mutex name was {name}");
+    }
+
+    #[test]
+    fn state_mutex_rejects_case_sensitive_identity_before_lowercase_keying() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if !enable_case_sensitive_directory_for_test(tmp.path()) {
+            return;
+        }
+        let state_path = tmp.path().join(DENY_READ_ACL_STATE_FILE);
+
+        let error = match lock_state(&state_path) {
+            Ok(_) => panic!("case-sensitive state identity must fail before mutex naming"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.downcast_ref::<ProtectedMetadataError>(),
+            Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
+                path: tmp.path().to_path_buf(),
+            })
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::acl::add_deny_write_ace;
-use crate::deny_read_acl::ensure_case_insensitive_path_ancestors;
 use crate::deny_read_acl::ensure_directory_materialized;
 use crate::path_normalization::canonicalize_path;
+use crate::path_safety::ensure_case_insensitive_acl_path;
 use crate::product_identity::PROTECTED_METADATA_DIR_NAME;
 use anyhow::Result;
 use singularity_core::PROTECTED_AGENTS_DIR_NAME;
@@ -26,7 +26,7 @@ pub unsafe fn protect_workspace_agents_dir(cwd: &Path, psid: *mut c_void) -> Res
 
 unsafe fn protect_workspace_subdir(cwd: &Path, psid: *mut c_void, subdir: &str) -> Result<bool> {
     let path = cwd.join(subdir);
-    ensure_case_insensitive_path_ancestors(&path)?;
+    ensure_case_insensitive_acl_path(&path)?;
     let materialized = match std::fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.is_dir() => {
             // The generic deny-path pass protects an existing file with the reserved name.

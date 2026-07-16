@@ -1,6 +1,7 @@
 use crate::deny_read_state::lock_state;
 use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
+use crate::path_safety::ensure_case_insensitive_acl_path;
 use crate::product_identity::CAPABILITY_SID_FILE_NAME;
 use anyhow::Context;
 use anyhow::Result;
@@ -101,6 +102,7 @@ pub fn load_or_create_cap_sids(sandbox_home: &Path) -> Result<CapSids> {
 
 /// Returns the workspace-specific capability SID for `cwd`, creating and persisting it if missing.
 pub fn workspace_cap_sid_for_cwd(sandbox_home: &Path, cwd: &Path) -> Result<String> {
+    ensure_case_insensitive_acl_path(cwd)?;
     let path = cap_sid_file(sandbox_home);
     let _lock = lock_state(&path)?;
     let mut caps = load_or_create_cap_sids_unlocked(sandbox_home)?;
@@ -116,6 +118,7 @@ pub fn workspace_cap_sid_for_cwd(sandbox_home: &Path, cwd: &Path) -> Result<Stri
 
 /// Returns the capability SID for an additional writable root, creating and persisting it if missing.
 pub fn writable_root_cap_sid_for_path(sandbox_home: &Path, root: &Path) -> Result<String> {
+    ensure_case_insensitive_acl_path(root)?;
     let path = cap_sid_file(sandbox_home);
     let _lock = lock_state(&path)?;
     let mut caps = load_or_create_cap_sids_unlocked(sandbox_home)?;
@@ -134,6 +137,8 @@ pub fn workspace_write_cap_sid_for_root(
     cwd: &Path,
     root: &Path,
 ) -> Result<String> {
+    ensure_case_insensitive_acl_path(cwd)?;
+    ensure_case_insensitive_acl_path(root)?;
     if canonical_path_key(root) == canonical_path_key(cwd) {
         workspace_cap_sid_for_cwd(sandbox_home, cwd)
     } else {

@@ -32,12 +32,8 @@ pub fn canonical_path_key(path: &Path) -> String {
     lexical_path_key(&canonicalize_path(path))
 }
 
-/// Returns a canonical identity for a state path whose final components may not exist yet.
-///
-/// State files are often locked before their parent directory or file is created. Resolve the
-/// nearest existing ancestor so ordinary, verbatim, and junction spellings still share one
-/// cross-process identity, then append the missing tail without following it.
-pub fn canonical_path_key_allow_missing(path: &Path) -> String {
+/// Resolves the nearest existing ancestor while preserving any missing final components.
+pub fn canonicalize_path_allow_missing(path: &Path) -> PathBuf {
     let mut cursor = path.to_path_buf();
     let mut missing_tail = Vec::new();
     loop {
@@ -45,17 +41,26 @@ pub fn canonical_path_key_allow_missing(path: &Path) -> String {
             for component in missing_tail.iter().rev() {
                 canonical.push(component);
             }
-            return lexical_path_key(&canonical);
+            return canonical;
         }
         let Some(file_name) = cursor.file_name().map(ToOwned::to_owned) else {
-            return lexical_path_key(path);
+            return path.to_path_buf();
         };
         let Some(parent) = cursor.parent() else {
-            return lexical_path_key(path);
+            return path.to_path_buf();
         };
         missing_tail.push(file_name);
         cursor = parent.to_path_buf();
     }
+}
+
+/// Returns a canonical identity for a state path whose final components may not exist yet.
+///
+/// State files are often locked before their parent directory or file is created. Resolve the
+/// nearest existing ancestor so ordinary, verbatim, and junction spellings still share one
+/// cross-process identity, then append the missing tail without following it.
+pub fn canonical_path_key_allow_missing(path: &Path) -> String {
+    lexical_path_key(&canonicalize_path_allow_missing(path))
 }
 
 #[cfg(test)]

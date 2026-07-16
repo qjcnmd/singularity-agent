@@ -147,6 +147,8 @@ mod logging;
 #[cfg(target_os = "windows")]
 mod path_normalization;
 #[cfg(target_os = "windows")]
+mod path_safety;
+#[cfg(target_os = "windows")]
 mod process;
 mod resolved_permissions;
 #[cfg(target_os = "windows")]
@@ -231,11 +233,7 @@ pub use cap::workspace_write_root_overlaps_path;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::MaterializedDirectory;
 #[cfg(target_os = "windows")]
-pub use deny_read_acl::ProtectedMetadataError;
-#[cfg(target_os = "windows")]
 pub use deny_read_acl::apply_deny_read_acls;
-#[cfg(target_os = "windows")]
-pub use deny_read_acl::ensure_case_insensitive_path_ancestors;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::ensure_directory_materialized;
 #[cfg(target_os = "windows")]
@@ -306,6 +304,12 @@ pub use logging::log_note;
 pub use logging::log_writer;
 #[cfg(target_os = "windows")]
 pub use path_normalization::canonicalize_path;
+#[cfg(target_os = "windows")]
+pub use path_safety::ProtectedMetadataError;
+#[cfg(target_os = "windows")]
+pub use path_safety::ensure_case_insensitive_acl_path;
+#[cfg(target_os = "windows")]
+pub use path_safety::ensure_case_insensitive_path_ancestors;
 #[cfg(target_os = "windows")]
 pub use process::JobObject;
 #[cfg(target_os = "windows")]

@@ -3,9 +3,9 @@ use crate::acl::path_mask_allows;
 use crate::cap::workspace_cap_sid_for_cwd;
 use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
-use crate::deny_read_acl::ensure_case_insensitive_path_ancestors;
 use crate::logging::log_note;
-use crate::path_normalization::canonical_path_key;
+use crate::path_normalization::canonicalize_path;
+use crate::path_safety::ensure_case_insensitive_acl_path;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::setup::effective_write_roots_for_permissions;
 use crate::token::LocalSid;
@@ -109,7 +109,7 @@ pub fn audit_everyone_writable(
 ) -> Result<Vec<PathBuf>> {
     let start = Instant::now();
     let mut flagged: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut checked = 0usize;
     let check_world_writable = |path: &Path| -> Result<bool> {
         unsafe { path_has_world_write_allow(path) }.with_context(|| {
@@ -143,7 +143,7 @@ pub fn audit_everyone_writable(
         checked += 1;
         let has = check_world_writable(&p)?;
         if has {
-            let key = canonical_path_key(&p);
+            let key = canonicalize_path(&p);
             if seen.insert(key) {
                 flagged.push(p);
             }
@@ -156,7 +156,7 @@ pub fn audit_everyone_writable(
         checked += 1;
         let has_root = check_world_writable(&root)?;
         if has_root {
-            let key = canonical_path_key(&root);
+            let key = canonicalize_path(&root);
             if seen.insert(key) {
                 flagged.push(root.clone());
             }
@@ -194,7 +194,7 @@ pub fn audit_everyone_writable(
                     checked += 1;
                     let has_child = check_world_writable(&p)?;
                     if has_child {
-                        let key = canonical_path_key(&p);
+                        let key = canonicalize_path(&p);
                         if seen.insert(key) {
                             flagged.push(p);
                         }
@@ -259,39 +259,50 @@ fn apply_capability_denies_for_world_writable_for_permissions(
     if flagged.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(sandbox_home)?;
     if !permissions.is_enforceable_by_windows_sandbox() {
         return Ok(());
     }
-    let (active_sids, workspace_roots): (Vec<LocalSid>, Vec<PathBuf>) =
-        if permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
-            let roots = effective_write_roots_for_permissions(
-                permissions,
-                cwd,
-                env_map,
-                sandbox_home,
-                /*write_roots_override*/ None,
-            );
-            let active_sids = roots
+    let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
+    let workspace_roots = if uses_write_capabilities {
+        effective_write_roots_for_permissions(
+            permissions,
+            cwd,
+            env_map,
+            sandbox_home,
+            /*write_roots_override*/ None,
+        )
+    } else {
+        Vec::new()
+    };
+    let paths_to_deny = flagged
+        .iter()
+        .filter(|path| {
+            !workspace_roots
                 .iter()
-                .map(|root| {
-                    workspace_write_cap_sid_for_root(sandbox_home, cwd, root)
-                        .and_then(|sid| LocalSid::from_string(&sid))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (active_sids, roots)
-        } else {
-            let sid = workspace_cap_sid_for_cwd(sandbox_home, cwd)?;
-            (vec![LocalSid::from_string(&sid)?], Vec::new())
-        };
-    for path in flagged {
-        if workspace_roots
+                .any(|root| workspace_write_root_contains_path(root, path))
+        })
+        .collect::<Vec<_>>();
+    for path in &paths_to_deny {
+        ensure_case_insensitive_acl_path(path)?;
+    }
+    ensure_case_insensitive_acl_path(cwd)?;
+    for root in &workspace_roots {
+        ensure_case_insensitive_acl_path(root)?;
+    }
+    std::fs::create_dir_all(sandbox_home)?;
+    let active_sids = if uses_write_capabilities {
+        workspace_roots
             .iter()
-            .any(|root| workspace_write_root_contains_path(root, path))
-        {
-            continue;
-        }
-        ensure_case_insensitive_path_ancestors(path)?;
+            .map(|root| {
+                workspace_write_cap_sid_for_root(sandbox_home, cwd, root)
+                    .and_then(|sid| LocalSid::from_string(&sid))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let sid = workspace_cap_sid_for_cwd(sandbox_home, cwd)?;
+        vec![LocalSid::from_string(&sid)?]
+    };
+    for path in paths_to_deny {
         for active_sid in &active_sids {
             let res = unsafe { add_deny_write_ace(path, active_sid.as_ptr()) };
             match res {

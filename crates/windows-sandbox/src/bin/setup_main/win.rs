@@ -18,7 +18,7 @@ use singularity_windows_sandbox::canonicalize_path;
 use singularity_windows_sandbox::convert_string_sid_to_sid;
 use singularity_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use singularity_windows_sandbox::ensure_allow_write_aces;
-use singularity_windows_sandbox::ensure_case_insensitive_path_ancestors;
+use singularity_windows_sandbox::ensure_case_insensitive_acl_path;
 use singularity_windows_sandbox::ensure_missing_protected_path_materialized;
 use singularity_windows_sandbox::extract_setup_failure;
 use singularity_windows_sandbox::hide_newly_created_users;
@@ -27,6 +27,7 @@ use singularity_windows_sandbox::is_command_cwd_root;
 use singularity_windows_sandbox::log_note;
 use singularity_windows_sandbox::log_writer;
 use singularity_windows_sandbox::path_mask_allows;
+use singularity_windows_sandbox::plan_deny_read_acl_paths;
 use singularity_windows_sandbox::product_identity::SANDBOX_HOME_ENV;
 use singularity_windows_sandbox::sandbox_bin_dir;
 use singularity_windows_sandbox::sandbox_dir;
@@ -446,6 +447,7 @@ fn real_main() -> Result<()> {
             ),
         )));
     }
+    validate_payload_acl_paths(&payload)?;
     let sbx_dir = sandbox_dir(&payload.sandbox_home);
     std::fs::create_dir_all(&sbx_dir).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -504,6 +506,31 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
             &payload.proxy_ports,
             payload.allow_local_binding,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_payload_acl_paths(payload: &Payload) -> Result<()> {
+    ensure_case_insensitive_acl_path(&payload.sandbox_home)?;
+    match payload.mode {
+        SetupMode::ProvisionOnly => {}
+        SetupMode::ReadAclsOnly => {
+            for path in &payload.read_roots {
+                ensure_case_insensitive_acl_path(path)?;
+            }
+        }
+        SetupMode::Full => {
+            drop(plan_deny_read_acl_paths(&payload.deny_read_paths)?);
+            ensure_case_insensitive_acl_path(&payload.command_cwd)?;
+            for path in payload
+                .read_roots
+                .iter()
+                .chain(&payload.write_roots)
+                .chain(&payload.deny_write_paths)
+            {
+                ensure_case_insensitive_acl_path(path)?;
+            }
+        }
     }
     Ok(())
 }
@@ -952,8 +979,6 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         if !seen_deny_paths.insert(path.clone()) {
             continue;
         }
-        ensure_case_insensitive_path_ancestors(path)?;
-
         // Deny ACEs attach to filesystem objects. Materialize only missing carveouts without
         // following a reparse point in any ancestor so a child cannot create the path later.
         let mut materialized = match std::fs::symlink_metadata(path) {

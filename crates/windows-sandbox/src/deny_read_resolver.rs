@@ -1,5 +1,7 @@
 use crate::absolute_path::AbsolutePathBuf;
 use crate::path_normalization::lexical_path_key;
+use crate::path_safety::ensure_case_insensitive_directory_path;
+use crate::path_safety::ensure_case_insensitive_path_ancestors;
 use crate::permissions::FileSystemAccessMode;
 use crate::permissions::FileSystemPath;
 use crate::permissions::FileSystemSandboxEntry;
@@ -73,9 +75,17 @@ pub fn resolve_windows_deny_read_paths(
 
     let scan_boundary = dunce::canonicalize(cwd.as_path())
         .map_err(|_| "deny_read_resolution_workspace_unavailable".to_string())?;
+    ensure_case_insensitive_directory_path(&scan_boundary)
+        .map_err(|_| "deny_read_resolution_case_sensitive_directory".to_string())?;
     let mut scan_plans = Vec::new();
     for pattern in unreadable_globs {
-        let scan_plan = glob_scan_plan(&pattern, file_system_sandbox_policy.glob_scan_max_depth);
+        let mut scan_plan =
+            glob_scan_plan(&pattern, file_system_sandbox_policy.glob_scan_max_depth);
+        if !scan_plan.root.is_absolute() {
+            scan_plan.root = cwd.as_path().join(&scan_plan.root);
+        }
+        ensure_case_insensitive_path_ancestors(&scan_plan.root)
+            .map_err(|_| "deny_read_resolution_case_sensitive_directory".to_string())?;
         merge_scan_plan(&mut scan_plans, scan_plan);
     }
 
@@ -126,6 +136,8 @@ fn collect_existing_glob_matches(
             return Ok(());
         }
     };
+    ensure_case_insensitive_path_ancestors(&canonical)
+        .map_err(|_| "deny_read_resolution_case_sensitive_directory".to_string())?;
     if !path_is_within(&canonical, context.scan_boundary) {
         // workspace 外的 reparse target 是未知子树：只 deny 词法入口，不跟随越界 target。
         push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
@@ -152,6 +164,8 @@ fn collect_existing_glob_matches(
     if !target_metadata.is_dir() {
         return Ok(());
     }
+    ensure_case_insensitive_directory_path(&canonical)
+        .map_err(|_| "deny_read_resolution_case_sensitive_directory".to_string())?;
 
     // canonical directory key 防止 symlink/junction cycle 无限递归；词法路径交给
     // ACL planner，使其同时记录现有 reparse point 的 canonical target。
@@ -324,6 +338,8 @@ mod tests {
     use super::path_is_within;
     use super::resolve_windows_deny_read_paths;
     use crate::absolute_path::AbsolutePathBuf;
+    #[cfg(windows)]
+    use crate::path_safety::enable_case_sensitive_directory_for_test;
     use crate::permissions::FileSystemAccessMode;
     use crate::permissions::FileSystemPath;
     use crate::permissions::FileSystemSandboxEntry;
@@ -509,6 +525,26 @@ mod tests {
         );
         assert!(err.contains("invalid range"), "unexpected error: {err}");
         assert!(!err.contains(tmp.path().to_string_lossy().as_ref()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_sensitive_scan_directory_is_rejected_before_lowercase_cycle_keys() {
+        let tmp = TempDir::new().expect("tempdir");
+        if !enable_case_sensitive_directory_for_test(tmp.path()) {
+            return;
+        }
+        std::fs::write(tmp.path().join("secret.env"), "secret").expect("write secret");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/**/*.env",
+            tmp.path().display()
+        ))]);
+
+        let error = resolve_windows_deny_read_paths(&policy, &cwd)
+            .expect_err("case-sensitive scan root must fail closed");
+
+        assert_eq!(error, "deny_read_resolution_case_sensitive_directory");
     }
 
     #[test]
