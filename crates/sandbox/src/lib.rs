@@ -146,6 +146,16 @@ pub struct CommandRequest {
     pub filesystem: SandboxFilesystemPolicy,
     #[serde(default)]
     pub environment: CommandEnvironmentPolicy,
+    #[serde(skip)]
+    #[schemars(skip)]
+    protected_path_enforcement: ProtectedPathEnforcement,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ProtectedPathEnforcement {
+    #[default]
+    Enforced,
+    TrustedWorkspacePreparation,
 }
 
 impl CommandRequest {
@@ -169,7 +179,31 @@ impl CommandRequest {
                 workspace_root: workspace_root.into(),
             },
             environment: CommandEnvironmentPolicy::default(),
+            protected_path_enforcement: ProtectedPathEnforcement::Enforced,
         }
+    }
+
+    /// 构造产品控制面固定操作使用的工作区准备请求。
+    ///
+    /// 该来源只存在于进程内 Rust API，不参与序列化或 schema；反序列化后的请求始终恢复
+    /// protected-path enforcement，模型脚本和 Evaluation manifest 命令无法选择该来源。
+    pub fn trusted_workspace_preparation(
+        command_id: impl Into<String>,
+        argv: Vec<String>,
+        cwd: impl Into<String>,
+        workspace_root: impl Into<String>,
+    ) -> Self {
+        let mut request = Self::project_verification(command_id, argv, cwd, workspace_root);
+        request.protected_path_enforcement = ProtectedPathEnforcement::TrustedWorkspacePreparation;
+        request
+    }
+
+    /// 判断请求是否来自仅限进程内的可信工作区准备边界。
+    pub fn is_trusted_workspace_preparation(&self) -> bool {
+        matches!(
+            self.protected_path_enforcement,
+            ProtectedPathEnforcement::TrustedWorkspacePreparation
+        )
     }
 
     /// 判断请求是否必须经过 sandbox。
@@ -1327,6 +1361,7 @@ mod windows_backend {
         read_roots: Vec<PathBuf>,
         protected_deny_read_paths: Vec<AbsolutePathBuf>,
         protected_deny_write_paths: Vec<AbsolutePathBuf>,
+        protect_workspace_metadata: bool,
     }
 
     impl PreparedCommand {
@@ -1345,7 +1380,8 @@ mod windows_backend {
             let protected_deny_write_paths = if matches!(
                 request.filesystem.mode,
                 SandboxFilesystemMode::WorkspaceWrite
-            ) {
+            ) && !request.is_trusted_workspace_preparation()
+            {
                 resolve_existing_protected_paths(&workspace_root)
                     .map_err(PrepareCommandError::ProtectedPaths)?
             } else {
@@ -1373,6 +1409,7 @@ mod windows_backend {
                     ));
                 }
             };
+            let protect_workspace_metadata = !request.is_trusted_workspace_preparation();
             let restricted_token_fallback = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 &permission_profile,
                 &workspace_roots,
@@ -1382,7 +1419,8 @@ mod windows_backend {
                     "invalid Windows sandbox permissions: {error}"
                 ))
             })?
-            .supports_restricted_token_fallback();
+            .supports_restricted_token_fallback()
+                && protect_workspace_metadata;
             Ok(Self {
                 permission_profile,
                 workspace_roots,
@@ -1395,6 +1433,7 @@ mod windows_backend {
                 read_roots: resolved.read_roots,
                 protected_deny_read_paths: Vec::new(),
                 protected_deny_write_paths,
+                protect_workspace_metadata,
             })
         }
 
@@ -1477,6 +1516,7 @@ mod windows_backend {
                 read_roots: executable_read_roots(&powershell),
                 protected_deny_read_paths,
                 protected_deny_write_paths,
+                protect_workspace_metadata: true,
             })
         }
     }
@@ -1499,6 +1539,7 @@ mod windows_backend {
         elevated.additional_read_roots = &prepared.read_roots;
         elevated.deny_read_paths_override = &prepared.protected_deny_read_paths;
         elevated.deny_write_paths_override = &prepared.protected_deny_write_paths;
+        elevated.protect_workspace_metadata = prepared.protect_workspace_metadata;
         elevated
     }
 
@@ -2256,6 +2297,34 @@ mod windows_backend {
                 elevated.deny_write_paths_override,
                 prepared.protected_deny_write_paths.as_slice()
             );
+        }
+
+        #[test]
+        fn trusted_workspace_preparation_does_not_project_protected_paths() {
+            let workspace = tempfile::tempdir().expect("workspace");
+            fs::create_dir(workspace.path().join(".git")).expect("git directory");
+            fs::create_dir(workspace.path().join(".agents")).expect("agents directory");
+            fs::create_dir(workspace.path().join(".singularity")).expect("singularity directory");
+            let comspec = std::env::var_os("ComSpec").expect("ComSpec");
+            let request = CommandRequest::trusted_workspace_preparation(
+                "trusted_workspace_preparation",
+                vec![
+                    PathBuf::from(comspec).to_string_lossy().into_owned(),
+                    "/c".to_string(),
+                    "echo ready".to_string(),
+                ],
+                workspace.path().to_string_lossy(),
+                workspace.path().to_string_lossy(),
+            );
+
+            let prepared =
+                PreparedCommand::from_request(&request).expect("trusted workspace preparation");
+
+            assert!(request.is_trusted_workspace_preparation());
+            assert!(prepared.protected_deny_read_paths.is_empty());
+            assert!(prepared.protected_deny_write_paths.is_empty());
+            assert!(!prepared.protect_workspace_metadata);
+            assert!(!prepared.restricted_token_fallback);
         }
 
         #[test]

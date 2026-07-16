@@ -21,6 +21,7 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub write_roots_override: Option<&'a [PathBuf]>,
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
     pub deny_write_paths_override: &'a [AbsolutePathBuf],
+    pub protect_workspace_metadata: bool,
 }
 
 impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
@@ -49,6 +50,7 @@ impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
             write_roots_override: None,
             deny_read_paths_override: &[],
             deny_write_paths_override: &[],
+            protect_workspace_metadata: true,
         }
     }
 }
@@ -160,6 +162,7 @@ mod windows_impl {
             write_roots_override,
             deny_read_paths_override,
             deny_write_paths_override,
+            protect_workspace_metadata,
         } = request;
         if cancellation
             .as_ref()
@@ -167,11 +170,11 @@ mod windows_impl {
         {
             return Ok(cancelled_capture_result());
         }
-        let permissions =
-            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-                permission_profile,
-                workspace_roots,
-            )?;
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots_with_protected_metadata(
+            permission_profile,
+            workspace_roots,
+            protect_workspace_metadata,
+        )?;
         let merged_read_roots = if additional_read_roots.is_empty() {
             None
         } else {
@@ -267,7 +270,7 @@ mod windows_impl {
             return Ok(cancelled_capture_result());
         }
         unsafe {
-            allow_null_device(sid_for_null.as_ptr())?;
+            allow_null_device(sid_for_null.as_ptr());
         }
         if cancellation
             .as_ref()

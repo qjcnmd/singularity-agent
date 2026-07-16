@@ -20,6 +20,7 @@ use std::path::PathBuf;
 pub struct ResolvedWindowsSandboxPermissions {
     file_system: FileSystemSandboxPolicy,
     network: NetworkSandboxPolicy,
+    protect_workspace_metadata: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +76,7 @@ impl ResolvedWindowsSandboxPermissions {
         Ok(Self {
             file_system,
             network,
+            protect_workspace_metadata: true,
         })
     }
 
@@ -84,10 +86,26 @@ impl ResolvedWindowsSandboxPermissions {
         permission_profile: &PermissionProfile,
         workspace_roots: &[AbsolutePathBuf],
     ) -> Result<Self> {
+        Self::try_from_permission_profile_for_workspace_roots_with_protected_metadata(
+            permission_profile,
+            workspace_roots,
+            true,
+        )
+    }
+
+    /// Resolves a managed profile while controlling only generated workspace metadata defaults.
+    ///
+    /// Explicit deny entries remain part of the resolved filesystem policy.
+    pub fn try_from_permission_profile_for_workspace_roots_with_protected_metadata(
+        permission_profile: &PermissionProfile,
+        workspace_roots: &[AbsolutePathBuf],
+        protect_workspace_metadata: bool,
+    ) -> Result<Self> {
         let mut permissions = Self::try_from_permission_profile(permission_profile)?;
         permissions.file_system = permissions
             .file_system
             .materialize_project_roots_with_workspace_roots(workspace_roots);
+        permissions.protect_workspace_metadata = protect_workspace_metadata;
         Ok(permissions)
     }
 
@@ -156,7 +174,10 @@ impl ResolvedWindowsSandboxPermissions {
             });
 
         let mut roots = file_system
-            .get_writable_roots_with_cwd(cwd)
+            .get_writable_roots_with_cwd_and_protected_metadata(
+                cwd,
+                self.protect_workspace_metadata,
+            )
             .into_iter()
             .map(|root| WindowsWritableRoot {
                 root: root.root.into_path_buf(),
@@ -170,10 +191,14 @@ impl ResolvedWindowsSandboxPermissions {
 
         if self.has_writable_tmpdir_entry() {
             roots.extend(windows_temp_env_roots(env_map).into_iter().map(|root| {
-                let read_only_subpaths = PROTECTED_METADATA_PATH_NAMES
-                    .iter()
-                    .map(|name| root.join(name))
-                    .collect();
+                let read_only_subpaths = if self.protect_workspace_metadata {
+                    PROTECTED_METADATA_PATH_NAMES
+                        .iter()
+                        .map(|name| root.join(name))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 WindowsWritableRoot {
                     root,
                     read_only_subpaths,
@@ -257,6 +282,45 @@ mod tests {
         .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(expected_roots, roots);
+    }
+
+    #[test]
+    fn trusted_preparation_omits_generated_metadata_but_keeps_explicit_denies() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        let explicit_git_deny = cwd.join(".git");
+        let mut entries = FileSystemSandboxPolicy::workspace_write(&[], true, true).entries;
+        entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: AbsolutePathBuf::from_absolute_path(&explicit_git_deny)
+                    .expect("absolute explicit deny"),
+            },
+            access: FileSystemAccessMode::Deny,
+        });
+        let profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries,
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots_with_protected_metadata(
+            &profile,
+            workspace_roots_for(&cwd).as_slice(),
+            false,
+        )
+        .expect("trusted preparation permissions");
+
+        let root = permissions
+            .writable_roots_for_cwd(&cwd, &HashMap::new())
+            .into_iter()
+            .find(|root| root.root == dunce::canonicalize(&cwd).expect("canonical cwd"))
+            .expect("workspace writable root");
+
+        assert_eq!(root.read_only_subpaths, vec![explicit_git_deny]);
+        assert!(!root.read_only_subpaths.contains(&cwd.join(".agents")));
+        assert!(!root.read_only_subpaths.contains(&cwd.join(".singularity")));
     }
 
     #[test]

@@ -122,12 +122,44 @@ pub(super) fn run_raw_command(
 ) -> CommandResult {
     let workspace = canonical_or_original(workspace);
     let cwd = canonical_or_original(cwd);
-    let mut request = CommandRequest::project_verification(
+    let request = CommandRequest::project_verification(
         next_command_id(),
         argv,
         cwd.to_string_lossy().into_owned(),
         workspace.to_string_lossy().into_owned(),
     );
+    execute_command_request(request, timeout_seconds, network, sandbox_backend)
+}
+
+/// 执行产品控制面固定的工作区准备操作。
+///
+/// 该边界仅用于 clone/checkout/init 等 Evaluation 内部步骤；manifest 命令和模型脚本仍走
+/// protected-path enforcement 完整开启的普通路径。
+pub(super) fn run_workspace_preparation_command(
+    workspace: &Path,
+    cwd: &Path,
+    argv: Vec<String>,
+    timeout_seconds: u64,
+    network: SandboxNetworkMode,
+    sandbox_backend: SharedSandboxBackend,
+) -> CommandResult {
+    let workspace = canonical_or_original(workspace);
+    let cwd = canonical_or_original(cwd);
+    let request = CommandRequest::trusted_workspace_preparation(
+        next_command_id(),
+        argv,
+        cwd.to_string_lossy().into_owned(),
+        workspace.to_string_lossy().into_owned(),
+    );
+    execute_command_request(request, timeout_seconds, network, sandbox_backend)
+}
+
+fn execute_command_request(
+    mut request: CommandRequest,
+    timeout_seconds: u64,
+    network: SandboxNetworkMode,
+    sandbox_backend: SharedSandboxBackend,
+) -> CommandResult {
     request.timeout_seconds = timeout_seconds;
     request.network.mode = network;
     request.filesystem.mode = SandboxFilesystemMode::WorkspaceWrite;
@@ -249,6 +281,7 @@ mod tests {
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
+            assert!(!request.is_trusted_workspace_preparation());
             assert_eq!(
                 request.environment,
                 CommandEnvironmentPolicy::EvaluationIsolated
@@ -268,6 +301,43 @@ mod tests {
             30,
             SandboxNetworkMode::Denied,
             Arc::new(EnvironmentCaptureBackend),
+        );
+
+        assert!(command_succeeded(&result));
+    }
+
+    struct WorkspacePreparationCaptureBackend;
+
+    impl SandboxBackend for WorkspacePreparationCaptureBackend {
+        fn name(&self) -> &'static str {
+            "workspace_preparation_capture"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            assert!(request.is_trusted_workspace_preparation());
+            assert_eq!(
+                request.environment,
+                CommandEnvironmentPolicy::EvaluationIsolated
+            );
+            CommandResult::completed(&request.command_id, "ok")
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    #[test]
+    fn workspace_preparation_commands_use_internal_trusted_origin() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = run_workspace_preparation_command(
+            workspace.path(),
+            workspace.path(),
+            vec!["git".to_string(), "init".to_string()],
+            30,
+            SandboxNetworkMode::Denied,
+            Arc::new(WorkspacePreparationCaptureBackend),
         );
 
         assert!(command_succeeded(&result));

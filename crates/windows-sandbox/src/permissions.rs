@@ -358,6 +358,14 @@ impl FileSystemSandboxPolicy {
     }
 
     pub fn get_writable_roots_with_cwd(&self, cwd: &Path) -> Vec<WritableRoot> {
+        self.get_writable_roots_with_cwd_and_protected_metadata(cwd, true)
+    }
+
+    pub(crate) fn get_writable_roots_with_cwd_and_protected_metadata(
+        &self,
+        cwd: &Path,
+        protect_workspace_metadata: bool,
+    ) -> Vec<WritableRoot> {
         let resolved = self.resolved_exact_entries(cwd);
         let write_roots = resolved
             .iter()
@@ -378,18 +386,24 @@ impl FileSystemSandboxPolicy {
                     .filter(|path| path.as_path().starts_with(root.as_path()))
                     .cloned()
                     .collect::<Vec<_>>();
-                read_only_subpaths.extend(
-                    PROTECTED_METADATA_PATH_NAMES
-                        .iter()
-                        .map(|name| root.join(name)),
-                );
+                if protect_workspace_metadata {
+                    read_only_subpaths.extend(
+                        PROTECTED_METADATA_PATH_NAMES
+                            .iter()
+                            .map(|name| root.join(name)),
+                    );
+                }
                 WritableRoot {
                     root,
                     read_only_subpaths: dedup_paths(read_only_subpaths),
-                    protected_metadata_names: PROTECTED_METADATA_PATH_NAMES
-                        .iter()
-                        .map(|name| (*name).to_string())
-                        .collect(),
+                    protected_metadata_names: if protect_workspace_metadata {
+                        PROTECTED_METADATA_PATH_NAMES
+                            .iter()
+                            .map(|name| (*name).to_string())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                 }
             })
             .collect()

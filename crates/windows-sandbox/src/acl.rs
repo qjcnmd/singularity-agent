@@ -1,3 +1,4 @@
+use crate::path_normalization::normalized_path_text;
 use crate::winutil::to_wide;
 use anyhow::Result;
 use std::error::Error;
@@ -279,16 +280,7 @@ unsafe fn final_path_from_handle(handle: HANDLE) -> Result<PathBuf> {
 }
 
 fn normalized_identity(path: &Path) -> String {
-    let mut text = path.to_string_lossy().replace('/', "\\");
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        text = format!(r"\\{}", rest);
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        text = rest.to_string();
-    }
-    while text.len() > 3 && text.ends_with('\\') {
-        text.pop();
-    }
-    text.to_ascii_lowercase()
+    normalized_path_text(path).to_ascii_lowercase()
 }
 
 pub(crate) unsafe fn verify_target_identity_against(handle: HANDLE, expected: &Path) -> Result<()> {
@@ -311,6 +303,12 @@ pub(crate) fn path_contains_reparse_component(path: &Path) -> Result<bool> {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
+        // A Windows prefix such as `\\?\D:` is not itself a valid filesystem
+        // target. Preserve the verbatim form for long-path support, but only
+        // query metadata after the disk or UNC root is complete.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if std::os::windows::fs::MetadataExt::file_attributes(&metadata) & 0x0000_0400 != 0
@@ -848,17 +846,39 @@ pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<()> {
     set_result
 }
 
-/// Grants RX to the null device for the given SID to support stdout/stderr redirection.
+/// Best-effort grant of RX to the null device for stdout/stderr redirection compatibility.
 ///
 /// # Safety
 /// Caller must ensure `psid` is a valid SID pointer.
-pub unsafe fn allow_null_device(psid: *mut c_void) -> Result<()> {
-    let target = open_acl_target_with_flags(
-        Path::new(r"\\.\NUL"),
+pub unsafe fn allow_null_device(psid: *mut c_void) {
+    let handle = CreateFileW(
+        to_wide(r"\\.\NUL").as_ptr(),
         READ_CONTROL | WRITE_DAC,
-        SE_KERNEL_OBJECT as i32,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        std::ptr::null_mut(),
+        OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
-    )?;
+        0,
+    );
+    if handle == 0 || handle == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetSecurityInfo(
+        handle,
+        SE_KERNEL_OBJECT as i32,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        CloseHandle(handle);
+        return;
+    }
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
         MultipleTrusteeOperation: 0,
@@ -872,18 +892,25 @@ pub unsafe fn allow_null_device(psid: *mut c_void) -> Result<()> {
     explicit.grfInheritance = 0;
     explicit.Trustee = trustee;
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-    let code = SetEntriesInAclW(1, &explicit, target.p_dacl, &mut p_new_dacl);
-    if code != ERROR_SUCCESS {
-        return Err(anyhow::Error::new(WindowsAclError::new(
-            AclOperation::SetEntriesInAcl,
-            code,
-        )));
+    let set_entries = SetEntriesInAclW(1, &explicit, dacl, &mut p_new_dacl);
+    if set_entries == ERROR_SUCCESS {
+        let _ = SetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT as i32,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            p_new_dacl,
+            std::ptr::null_mut(),
+        );
     }
-    let set_result = set_target_dacl(&target, p_new_dacl, SE_KERNEL_OBJECT as i32);
     if !p_new_dacl.is_null() {
         LocalFree(p_new_dacl as HLOCAL);
     }
-    set_result
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    CloseHandle(handle);
 }
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
@@ -905,11 +932,13 @@ mod tests {
     use super::dacl_has_write_deny_for_sid;
     use super::fetch_dacl_handle;
     use super::open_acl_target;
+    use super::path_contains_reparse_component;
     use super::set_target_dacl;
     use crate::token::LocalSid;
     use std::ffi::c_void;
     use std::fs::OpenOptions;
     use std::os::windows::process::CommandExt;
+    use std::path::PathBuf;
     use tempfile::TempDir;
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
@@ -1030,5 +1059,18 @@ mod tests {
             .expect("typed Windows ACL error");
         assert_eq!(typed.operation, AclOperation::ReparseTargetUnsupported);
         assert_eq!(typed.code, 50);
+    }
+
+    #[test]
+    fn verbatim_disk_prefix_is_not_probed_as_a_standalone_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ordinary = tmp.path().join("ordinary.txt");
+        std::fs::write(&ordinary, b"payload").expect("write fixture");
+        let verbatim = PathBuf::from(format!(r"\\?\{}", ordinary.display()));
+
+        assert!(
+            !path_contains_reparse_component(&verbatim).expect("inspect verbatim path"),
+            "ordinary file must not be treated as a reparse target"
+        );
     }
 }

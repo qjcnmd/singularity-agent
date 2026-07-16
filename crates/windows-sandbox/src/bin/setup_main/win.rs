@@ -34,11 +34,9 @@ use singularity_windows_sandbox::set_dacl_for_path;
 use singularity_windows_sandbox::string_from_sid_bytes;
 use singularity_windows_sandbox::sync_persistent_deny_read_acls;
 use singularity_windows_sandbox::to_wide;
-use singularity_windows_sandbox::workspace_cap_sid_for_cwd;
 use singularity_windows_sandbox::workspace_write_cap_sid_for_root;
 use singularity_windows_sandbox::workspace_write_root_overlaps_path;
 use singularity_windows_sandbox::write_setup_error_report;
-use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
@@ -74,6 +72,7 @@ const WRITE_ROOT_ALLOW_MASK: u32 =
 mod sandbox_users;
 mod setup_runtime_bin;
 use read_acl_mutex::acquire_read_acl_mutex;
+use read_acl_mutex::read_acl_mutex_exists;
 use sandbox_users::commit_setup_marker;
 use sandbox_users::prepare_setup_marker;
 use sandbox_users::provision_sandbox_users;
@@ -187,23 +186,19 @@ fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> 
     let payload_json = serde_json::to_vec(&read_payload)?;
     let payload_b64 = BASE64.encode(payload_json);
     let exe = std::env::current_exe().context("locate setup helper")?;
-    let status = Command::new(&exe)
+    Command::new(&exe)
         .arg(payload_b64)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .status()
-        .context("run read ACL helper")?;
-    if !status.success() {
-        anyhow::bail!("read ACL helper exited with status {status}");
-    }
+        .spawn()
+        .context("spawn read ACL helper")?;
     Ok(())
 }
 
 struct ReadAclSubjects<'a> {
     sandbox_group_psid: *mut c_void,
-    workspace_capability_psid: *mut c_void,
     rx_psids: &'a [*mut c_void],
 }
 
@@ -223,44 +218,6 @@ fn apply_read_acls(
                 &format!("{access_label} root {} missing; skipping", root.display()),
             )?;
             continue;
-        }
-        let capability_has = read_mask_allows_or_log(
-            root,
-            &[subjects.workspace_capability_psid],
-            Some("workspace_capability"),
-            access_mask,
-            access_label,
-            refresh_errors,
-            log,
-        )?;
-        if !capability_has {
-            log_line(
-                log,
-                &format!(
-                    "granting {access_label} ACE to {} for workspace capability",
-                    root.display()
-                ),
-            )?;
-            if let Err(err) = unsafe {
-                ensure_allow_mask_aces_with_inheritance(
-                    root,
-                    &[subjects.workspace_capability_psid],
-                    access_mask,
-                    inheritance,
-                )
-            } {
-                refresh_errors.push(format!(
-                    "grant {access_label} ACE failed on {} for workspace_capability: {err}",
-                    root.display()
-                ));
-                log_line(
-                    log,
-                    &format!(
-                        "grant {access_label} ACE failed on {} for workspace_capability: {err}",
-                        root.display()
-                    ),
-                )?;
-            }
         }
         let builtin_has = read_mask_allows_or_log(
             root,
@@ -551,7 +508,13 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
 }
 
 fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
-    let _read_acl_guard = acquire_read_acl_mutex()?;
+    let _read_acl_guard = match acquire_read_acl_mutex()? {
+        Some(guard) => guard,
+        None => {
+            log_line(log, "read ACL helper already running; skipping")?;
+            return Ok(());
+        }
+    };
     log_line(log, "read-acl-only mode: applying read ACLs")?;
     let sandbox_group_sid = resolve_sandbox_users_group_sid()?;
     let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid)?;
@@ -563,16 +526,9 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
         let auth_psid = sid_bytes_to_psid(&auth_sid)?;
         let everyone_sid = resolve_sid("Everyone")?;
         let everyone_psid = sid_bytes_to_psid(&everyone_sid)?;
-        let workspace_cap_sid =
-            workspace_cap_sid_for_cwd(&payload.sandbox_home, &payload.command_cwd)?;
-        let workspace_cap_psid = unsafe {
-            convert_string_sid_to_sid(&workspace_cap_sid)
-                .ok_or_else(|| anyhow::anyhow!("convert workspace capability SID failed"))?
-        };
         let rx_psids = vec![users_psid, auth_psid, everyone_psid];
         let subjects = ReadAclSubjects {
             sandbox_group_psid,
-            workspace_capability_psid: workspace_cap_psid,
             rx_psids: &rx_psids,
         };
         apply_read_acls(
@@ -593,9 +549,6 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
             }
             if !everyone_psid.is_null() {
                 LocalFree(everyone_psid as HLOCAL);
-            }
-            if !workspace_cap_psid.is_null() {
-                LocalFree(workspace_cap_psid as HLOCAL);
             }
         }
     }
@@ -816,64 +769,56 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
     }
 
-    // Deny-read ACEs must be present before the sandboxed command starts. Bind them to the
-    // per-workspace capability SID(s), never the shared Sandbox Users group, and apply them
-    // synchronously before any child can start.
-    let mut deny_read_by_sid: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    if payload.write_roots.is_empty() {
-        let sid = workspace_cap_sid_for_cwd(&payload.sandbox_home, &payload.command_cwd)?;
-        deny_read_by_sid.insert(sid, payload.deny_read_paths.clone());
-    } else {
-        for path in &payload.deny_read_paths {
-            for sid in workspace_write_cap_sids_for_path(
-                &payload.sandbox_home,
-                &payload.command_cwd,
-                &payload.write_roots,
-                path,
-            )? {
-                deny_read_by_sid.entry(sid).or_default().push(path.clone());
-            }
-        }
+    // Codex uses the dedicated Sandbox Users group as the authoritative read principal.
+    // Apply deny-read ACLs to that same principal before any child starts. The persistent state
+    // layer serializes updates and keeps a conservative union so concurrent workspaces cannot
+    // revoke one another's protection.
+    let applied_deny_read_paths = unsafe {
+        sync_persistent_deny_read_acls(
+            &payload.sandbox_home,
+            &sandbox_group_sid_str,
+            &payload.deny_read_paths,
+            sandbox_group_psid,
+        )
     }
-    let mut applied_deny_read_count = 0;
-    for (principal_sid, paths) in deny_read_by_sid {
-        if paths.is_empty() {
-            continue;
-        }
-        let principal_psid = unsafe {
-            convert_string_sid_to_sid(&principal_sid)
-                .ok_or_else(|| anyhow::anyhow!("convert deny-read capability SID failed"))?
-        };
-        let applied = unsafe {
-            sync_persistent_deny_read_acls(
-                &payload.sandbox_home,
-                &principal_sid,
-                &paths,
-                principal_psid,
-            )
-        }
-        .context("apply deny-read ACLs")?;
-        applied_deny_read_count += applied.len();
-        unsafe {
-            LocalFree(principal_psid as HLOCAL);
-        }
-    }
-    if applied_deny_read_count != 0 {
+    .context("apply deny-read ACLs")?;
+    if !applied_deny_read_paths.is_empty() {
         log_line(
             log,
-            &format!("applied {applied_deny_read_count} deny-read ACLs"),
+            &format!("applied {} deny-read ACLs", applied_deny_read_paths.len()),
         )?;
     }
 
     if payload.read_roots.is_empty() {
         log_line(log, "no read roots to grant; skipping read ACL helper")?;
     } else {
-        spawn_read_acl_helper(payload, log).map_err(|err| {
-            anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperReadAclHelperSpawnFailed,
-                format!("run read ACL helper failed: {err}"),
-            ))
-        })?;
+        match read_acl_mutex_exists() {
+            Ok(true) => {
+                log_line(log, "read ACL helper already running; skipping spawn")?;
+            }
+            Ok(false) => {
+                spawn_read_acl_helper(payload, log).map_err(|err| {
+                    anyhow::Error::new(SetupFailure::new(
+                        SetupErrorCode::HelperReadAclHelperSpawnFailed,
+                        format!("spawn read ACL helper failed: {err}"),
+                    ))
+                })?;
+            }
+            Err(err) => {
+                log_line(
+                    log,
+                    &format!("read ACL mutex check failed: {err}; spawning anyway"),
+                )?;
+                spawn_read_acl_helper(payload, log).map_err(|spawn_err| {
+                    anyhow::Error::new(SetupFailure::new(
+                        SetupErrorCode::HelperReadAclHelperSpawnFailed,
+                        format!(
+                            "spawn read ACL helper failed after mutex error {err}: {spawn_err}"
+                        ),
+                    ))
+                })?;
+            }
+        }
     }
 
     if refresh_only {

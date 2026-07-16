@@ -65,6 +65,39 @@ fn command_request_and_result_are_schema_backed_boundaries() {
 }
 
 #[test]
+fn trusted_workspace_preparation_is_not_serializable_authority() {
+    let trusted = CommandRequest::trusted_workspace_preparation(
+        "trusted_workspace_preparation",
+        vec!["git".to_string(), "init".to_string()],
+        ".",
+        "C:/repo",
+    );
+
+    assert!(trusted.is_trusted_workspace_preparation());
+    let value = serde_json::to_value(&trusted).expect("serialize command request");
+    assert!(
+        value.get("protected_path_enforcement").is_none(),
+        "trusted control-plane authority must not enter the command protocol"
+    );
+
+    let restored: CommandRequest =
+        serde_json::from_value(value).expect("deserialize command request");
+    assert!(
+        !restored.is_trusted_workspace_preparation(),
+        "deserialized requests must restore protected-path enforcement"
+    );
+    assert!(
+        !schema_for!(CommandRequest)
+            .schema
+            .object
+            .expect("command request object schema")
+            .properties
+            .contains_key("protected_path_enforcement"),
+        "trusted control-plane authority must not enter the JSON schema"
+    );
+}
+
+#[test]
 fn command_resource_normalization_belongs_to_command_boundary() {
     let request = CommandRequest::project_verification(
         "command_1",

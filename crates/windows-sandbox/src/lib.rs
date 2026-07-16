@@ -689,7 +689,7 @@ mod windows_impl {
         {
             return Ok(cancelled_capture_result());
         }
-        allow_null_device_for_workspace_write(uses_write_capabilities)?;
+        allow_null_device_for_workspace_write(uses_write_capabilities);
         if cancellation
             .as_ref()
             .is_some_and(WindowsSandboxCancellationToken::is_cancelled)

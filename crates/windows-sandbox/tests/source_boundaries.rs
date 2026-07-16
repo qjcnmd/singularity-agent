@@ -48,6 +48,60 @@ fn product_identity_literals_are_centralized() {
 }
 
 #[test]
+fn read_acl_and_deny_read_follow_codex_principal_boundaries() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let setup_source =
+        fs::read_to_string(source_root.join("bin").join("setup_main").join("win.rs"))
+            .expect("read setup helper");
+    let library_source = fs::read_to_string(source_root.join("lib.rs")).expect("read library");
+
+    assert!(
+        !setup_source.contains("workspace_capability_psid")
+            && !setup_source.contains("granting {access_label} ACE to {} for workspace capability"),
+        "Codex read grants must not be projected onto per-workspace capability SIDs"
+    );
+    assert!(
+        setup_source.contains(
+            "Codex uses the dedicated Sandbox Users group as the authoritative read principal."
+        ) && setup_source.contains("&sandbox_group_sid_str")
+            && setup_source.contains("read_acl_mutex_exists()"),
+        "elevated read grants and deny-read ACLs must use the Codex Sandbox Users boundary"
+    );
+    assert!(
+        library_source.contains("WRITE_RESTRICTED tokens consult restricting SIDs only for writes")
+            && library_source
+                .contains("deny-read overrides require the elevated Windows sandbox backend"),
+        "restricted-token fallback must reject deny-read overrides"
+    );
+}
+
+#[test]
+fn null_device_compatibility_grant_is_best_effort_like_codex() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let acl_source = fs::read_to_string(source_root.join("acl.rs")).expect("read ACL source");
+    let elevated_source =
+        fs::read_to_string(source_root.join("elevated_impl.rs")).expect("read elevated source");
+    let runner_source = fs::read_to_string(
+        source_root
+            .join("bin")
+            .join("command_runner")
+            .join("win.rs"),
+    )
+    .expect("read command runner");
+
+    assert!(
+        acl_source.contains("pub unsafe fn allow_null_device(psid: *mut c_void) {")
+            && acl_source.contains("if handle == 0 || handle == INVALID_HANDLE_VALUE"),
+        "NUL compatibility must remain a best-effort Codex helper"
+    );
+    assert!(
+        !elevated_source.contains("allow_null_device(sid_for_null.as_ptr())?")
+            && !runner_source.contains("allow_null_device(cap_psid_ptrs[0])?"),
+        "NUL WRITE_DAC availability must not decide whether strict sandbox enforcement exists"
+    );
+}
+
+#[test]
 fn restricted_children_are_job_bound_before_they_can_run() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let process_source = fs::read_to_string(source_root.join("process.rs")).expect("read process");

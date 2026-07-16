@@ -1,5 +1,5 @@
 use crate::deny_read_acl::apply_deny_read_acls;
-use crate::deny_read_acl::lexical_path_key;
+use crate::path_normalization::lexical_path_key;
 use crate::setup::sandbox_dir;
 use crate::winutil::to_wide;
 use anyhow::Context;
@@ -129,13 +129,13 @@ pub(crate) fn atomic_store(path: &Path, bytes: &[u8]) -> Result<()> {
     write_result
 }
 
-/// Reconciles the persistent deny-read ACEs for one workspace capability SID.
+/// Reconciles persistent deny-read ACEs for one sandbox principal.
 ///
 /// ACLs are intentionally monotonic: a later workspace invocation never revokes an older
 /// deny-read path because another process or an outliving descendant may still depend on it.
 /// The union is serialized by a per-state-path mutex and committed with an atomic replace.
-/// This removes the old shared Sandbox Users last-writer-wins/revoke race while preserving a
-/// conservative fail-closed ACL set.
+/// This lets the Codex-style shared Sandbox Users read principal remain authoritative without
+/// reintroducing its historical last-writer-wins/revoke race.
 ///
 /// # Safety
 /// Caller must pass a valid SID pointer matching `principal_sid`.
@@ -207,7 +207,7 @@ mod tests {
     use super::sync_persistent_deny_read_acls;
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
-    use crate::deny_read_acl::lexical_path_key;
+    use crate::path_normalization::lexical_path_key;
     use crate::token::LocalSid;
     use std::path::Path;
     use std::path::PathBuf;

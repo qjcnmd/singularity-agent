@@ -238,20 +238,20 @@ fn deny_root_capabilities_for_path<'a>(
     }
 }
 
-pub(crate) fn allow_null_device_for_workspace_write(is_workspace_write: bool) -> Result<()> {
+pub(crate) fn allow_null_device_for_workspace_write(is_workspace_write: bool) {
     if !is_workspace_write {
-        return Ok(());
+        return;
     }
 
     unsafe {
-        let base = get_current_token_for_restriction()?;
-        let result = (|| -> Result<()> {
-            let mut bytes = get_logon_sid_bytes(base)?;
-            let psid = bytes.as_mut_ptr() as *mut c_void;
-            allow_null_device(psid)
-        })();
-        CloseHandle(base);
-        result
+        if let Ok(base) = get_current_token_for_restriction() {
+            if let Ok(bytes) = get_logon_sid_bytes(base) {
+                let mut bytes = bytes;
+                let psid = bytes.as_mut_ptr() as *mut c_void;
+                allow_null_device(psid);
+            }
+            CloseHandle(base);
+        }
     }
 }
 
@@ -329,10 +329,10 @@ pub(crate) fn apply_restricted_token_acl_rules(
             }
         }
         for root_sid in acl_sids.write_root_sids {
-            allow_null_device(root_sid.sid.as_ptr())?;
+            allow_null_device(root_sid.sid.as_ptr());
         }
         if let Some(readonly_sid) = acl_sids.readonly_sid {
-            allow_null_device(readonly_sid.as_ptr())?;
+            allow_null_device(readonly_sid.as_ptr());
         }
         if !acl_sids.write_root_sids.is_empty()
             && let Some(workspace_sid) =

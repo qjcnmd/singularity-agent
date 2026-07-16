@@ -1,4 +1,5 @@
 use crate::absolute_path::AbsolutePathBuf;
+use crate::path_normalization::lexical_path_key;
 use crate::permissions::FileSystemAccessMode;
 use crate::permissions::FileSystemPath;
 use crate::permissions::FileSystemSandboxEntry;
@@ -292,12 +293,7 @@ fn sanitize_glob_error(error: &str) -> String {
 }
 
 fn path_key(path: &Path) -> String {
-    let value = path.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        value.to_ascii_lowercase()
-    } else {
-        value
-    }
+    lexical_path_key(path)
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -325,6 +321,7 @@ fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::glob_scan_plan;
+    use super::path_is_within;
     use super::resolve_windows_deny_read_paths;
     use crate::absolute_path::AbsolutePathBuf;
     use crate::permissions::FileSystemAccessMode;
@@ -344,6 +341,18 @@ mod tests {
             path: FileSystemPath::GlobPattern { pattern },
             access: FileSystemAccessMode::Deny,
         }
+    }
+
+    #[test]
+    fn verbatim_paths_remain_within_their_ordinary_workspace() {
+        assert!(path_is_within(
+            std::path::Path::new(r"\\?\D:\work\repo\child"),
+            std::path::Path::new(r"D:\work\repo")
+        ));
+        assert!(path_is_within(
+            std::path::Path::new(r"\\?\UNC\server\share\repo\child"),
+            std::path::Path::new(r"\\server\share\repo")
+        ));
     }
 
     fn unreadable_path_entry(path: PathBuf) -> FileSystemSandboxEntry {

@@ -2,6 +2,7 @@ use crate::acl::add_deny_read_ace;
 use crate::acl::path_contains_reparse_component;
 use crate::acl::revoke_ace;
 use crate::acl::verify_target_identity_against;
+use crate::path_normalization::lexical_path_key;
 use crate::winutil::to_wide;
 use anyhow::Context;
 use anyhow::Result;
@@ -63,13 +64,6 @@ fn push_planned_path(planned: &mut Vec<PathBuf>, seen: &mut HashSet<String>, pat
     if seen.insert(lexical_path_key(&path)) {
         planned.push(path);
     }
-}
-
-pub(crate) fn lexical_path_key(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
 }
 
 fn is_reparse_point(metadata: &Metadata) -> bool {

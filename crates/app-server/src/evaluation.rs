@@ -49,7 +49,7 @@ mod workspace;
 
 use command::{
     CommandDiagnostic, command_blocker, command_succeeded, infrastructure_blocker,
-    run_command_spec, run_raw_command, sandbox_network_mode,
+    run_command_spec, run_workspace_preparation_command, sandbox_network_mode,
 };
 use evidence::{
     agent_command_observation, build_evaluation_evidence, content_digest, safe_command_scope_digest,
@@ -73,6 +73,7 @@ const AGENT_DIR: &str = "agent";
 const PUBLIC_DIR: &str = "public";
 const HIDDEN_DIR: &str = "hidden";
 const EVALUATOR_PATCH_FILE: &str = ".singularity-evaluator.patch";
+const EVALUATOR_GIT_DIR: &str = ".singularity-evaluator-git";
 const RESULT_FILE: &str = "result.json";
 const REPORT_FILE: &str = "report.json";
 const EVIDENCE_FILE: &str = "evidence.json";
@@ -801,7 +802,7 @@ fn prepare_source(
             })?;
         }
         PlannedWorkspaceSource::RemoteGit { repository, commit } => {
-            let clone = run_raw_command(
+            let clone = run_workspace_preparation_command(
                 task_dir,
                 task_dir,
                 vec![
@@ -826,7 +827,7 @@ fn prepare_source(
                     commands,
                 ));
             }
-            let checkout = run_raw_command(
+            let checkout = run_workspace_preparation_command(
                 task_dir,
                 task_dir,
                 vec![
@@ -1092,112 +1093,152 @@ fn apply_evaluator_patch(
     })?;
     drop(file);
 
-    let init_result = run_raw_command(
-        workspace,
-        workspace,
-        vec!["git".to_string(), "init".to_string(), "--quiet".to_string()],
-        DEFAULT_COMMAND_TIMEOUT_SECONDS,
-        SandboxNetworkMode::Denied,
-        Arc::clone(&sandbox_backend),
-    );
-    diagnostics.push(CommandDiagnostic::new("evaluator.git_init", &init_result));
-    if !command_succeeded(&init_result) {
-        return Err(command_blocker(
-            &init_result,
+    let git_dir = workspace.join(EVALUATOR_GIT_DIR);
+    if let Err(error) = fs::create_dir(&git_dir) {
+        let cleanup = fs::remove_file(&patch_path);
+        let message = match cleanup {
+            Ok(()) => format!("failed to create isolated evaluator git metadata: {error}"),
+            Err(cleanup_error) => format!(
+                "failed to create isolated evaluator git metadata: {error}; failed to remove evaluator patch file: {cleanup_error}"
+            ),
+        };
+        return Err(evaluation_blocker(
             BlockerKind::WorkspacePreparation,
-            "failed to isolate evaluator patch workspace",
+            message,
         ));
     }
 
-    let check_result = run_raw_command(
-        workspace,
-        workspace,
-        vec![
-            "git".to_string(),
-            "apply".to_string(),
-            "--check".to_string(),
-            "--whitespace=nowarn".to_string(),
-            EVALUATOR_PATCH_FILE.to_string(),
-        ],
-        DEFAULT_COMMAND_TIMEOUT_SECONDS,
-        SandboxNetworkMode::Denied,
-        Arc::clone(&sandbox_backend),
-    );
-    diagnostics.push(CommandDiagnostic::new(
-        "evaluator.apply_check",
-        &check_result,
-    ));
-    if !command_succeeded(&check_result) {
-        return Err(command_blocker(
-            &check_result,
-            BlockerKind::WorkspacePreparation,
-            "evaluator patch validation failed",
-        ));
-    }
-
-    let result = run_raw_command(
-        workspace,
-        workspace,
-        vec![
-            "git".to_string(),
-            "apply".to_string(),
-            "--whitespace=nowarn".to_string(),
-            EVALUATOR_PATCH_FILE.to_string(),
-        ],
-        DEFAULT_COMMAND_TIMEOUT_SECONDS,
-        SandboxNetworkMode::Denied,
-        Arc::clone(&sandbox_backend),
-    );
-    diagnostics.push(CommandDiagnostic::new("evaluator.apply_patch", &result));
-    if !command_succeeded(&result) {
-        return Err(command_blocker(
-            &result,
-            BlockerKind::WorkspacePreparation,
-            "failed to apply evaluator patch",
-        ));
-    }
-    let reverse_check = run_raw_command(
-        workspace,
-        workspace,
-        vec![
-            "git".to_string(),
-            "apply".to_string(),
-            "--reverse".to_string(),
-            "--check".to_string(),
-            "--whitespace=nowarn".to_string(),
-            EVALUATOR_PATCH_FILE.to_string(),
-        ],
-        DEFAULT_COMMAND_TIMEOUT_SECONDS,
-        SandboxNetworkMode::Denied,
-        sandbox_backend,
-    );
-    diagnostics.push(CommandDiagnostic::new(
-        "evaluator.reverse_check",
-        &reverse_check,
-    ));
-    if !command_succeeded(&reverse_check) {
-        return Err(command_blocker(
-            &reverse_check,
-            BlockerKind::WorkspacePreparation,
-            "evaluator patch did not materialize in stage workspace",
-        ));
-    }
-    let remove_result = fs::remove_file(&patch_path);
-    let git_dir = workspace.join(".git");
-    if git_dir.exists() {
-        fs::remove_dir_all(&git_dir).map_err(|error| {
-            evaluation_blocker(
+    let operation = (|| {
+        let init_result = run_workspace_preparation_command(
+            workspace,
+            workspace,
+            evaluator_git_argv(&["init", "--quiet"]),
+            DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            SandboxNetworkMode::Denied,
+            Arc::clone(&sandbox_backend),
+        );
+        diagnostics.push(CommandDiagnostic::new("evaluator.git_init", &init_result));
+        if !command_succeeded(&init_result) {
+            return Err(command_blocker(
+                &init_result,
                 BlockerKind::WorkspacePreparation,
-                format!("failed to remove evaluator git metadata: {error}"),
-            )
-        })?;
+                "failed to isolate evaluator patch workspace",
+            ));
+        }
+
+        let check_result = run_workspace_preparation_command(
+            workspace,
+            workspace,
+            evaluator_git_argv(&[
+                "apply",
+                "--check",
+                "--whitespace=nowarn",
+                EVALUATOR_PATCH_FILE,
+            ]),
+            DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            SandboxNetworkMode::Denied,
+            Arc::clone(&sandbox_backend),
+        );
+        diagnostics.push(CommandDiagnostic::new(
+            "evaluator.apply_check",
+            &check_result,
+        ));
+        if !command_succeeded(&check_result) {
+            return Err(command_blocker(
+                &check_result,
+                BlockerKind::WorkspacePreparation,
+                "evaluator patch validation failed",
+            ));
+        }
+
+        let result = run_workspace_preparation_command(
+            workspace,
+            workspace,
+            evaluator_git_argv(&["apply", "--whitespace=nowarn", EVALUATOR_PATCH_FILE]),
+            DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            SandboxNetworkMode::Denied,
+            Arc::clone(&sandbox_backend),
+        );
+        diagnostics.push(CommandDiagnostic::new("evaluator.apply_patch", &result));
+        if !command_succeeded(&result) {
+            return Err(command_blocker(
+                &result,
+                BlockerKind::WorkspacePreparation,
+                "failed to apply evaluator patch",
+            ));
+        }
+        let reverse_check = run_workspace_preparation_command(
+            workspace,
+            workspace,
+            evaluator_git_argv(&[
+                "apply",
+                "--reverse",
+                "--check",
+                "--whitespace=nowarn",
+                EVALUATOR_PATCH_FILE,
+            ]),
+            DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            SandboxNetworkMode::Denied,
+            sandbox_backend,
+        );
+        diagnostics.push(CommandDiagnostic::new(
+            "evaluator.reverse_check",
+            &reverse_check,
+        ));
+        if !command_succeeded(&reverse_check) {
+            return Err(command_blocker(
+                &reverse_check,
+                BlockerKind::WorkspacePreparation,
+                "evaluator patch did not materialize in stage workspace",
+            ));
+        }
+        Ok(())
+    })();
+    let cleanup = cleanup_evaluator_control_files(&patch_path, &git_dir);
+    match (operation, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(blocker), Ok(())) => Err(blocker),
+        (Ok(()), Err(blocker)) => Err(blocker),
+        (Err(primary), Err(cleanup)) => Err(evaluation_blocker(
+            primary.kind,
+            format!("{}; {}", primary.message, cleanup.message),
+        )),
     }
-    remove_result.map_err(|error| {
-        evaluation_blocker(
+}
+
+fn evaluator_git_argv(arguments: &[&str]) -> Vec<String> {
+    let mut argv = vec![
+        "git".to_string(),
+        format!("--git-dir={EVALUATOR_GIT_DIR}"),
+        "--work-tree=.".to_string(),
+    ];
+    argv.extend(arguments.iter().map(|argument| (*argument).to_string()));
+    argv
+}
+
+fn cleanup_evaluator_control_files(
+    patch_path: &Path,
+    git_dir: &Path,
+) -> Result<(), EvaluationBlocker> {
+    let mut errors = Vec::new();
+    if let Err(error) = fs::remove_dir_all(git_dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        errors.push(format!("failed to remove evaluator git metadata: {error}"));
+    }
+    if let Err(error) = fs::remove_file(patch_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        errors.push(format!("failed to remove evaluator patch file: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(evaluation_blocker(
             BlockerKind::WorkspacePreparation,
-            format!("failed to remove evaluator patch file: {error}"),
-        )
-    })
+            errors.join("; "),
+        ))
+    }
 }
 fn run_agent_stage(
     run_id: &RunId,
@@ -2196,6 +2237,7 @@ mod tests {
     use singularity_tools::{
         CommandRequest, CommandResult, SandboxBackendEnforcement, SandboxCapabilities,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn command(argv: &[&str]) -> CommandSpec {
         CommandSpec {
@@ -2765,6 +2807,10 @@ mod tests {
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
+            assert!(
+                request.is_trusted_workspace_preparation(),
+                "source clone and checkout are fixed Evaluation control-plane operations"
+            );
             if request.argv.get(1).map(String::as_str) == Some("clone") {
                 let source = Path::new(&request.cwd).join(SOURCE_DIR);
                 fs::create_dir(&source).expect("source directory");
@@ -2779,6 +2825,113 @@ mod tests {
             CommandResult::completed(&request.command_id, "ok")
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
+    }
+
+    struct EvaluatorPatchSandboxBackend {
+        calls: AtomicUsize,
+    }
+
+    impl SandboxBackend for EvaluatorPatchSandboxBackend {
+        fn name(&self) -> &'static str {
+            "evaluator_patch_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                request.argv.get(1).map(String::as_str),
+                Some("--git-dir=.singularity-evaluator-git")
+            );
+            assert_eq!(
+                request.argv.get(2).map(String::as_str),
+                Some("--work-tree=.")
+            );
+            if call == 0 {
+                assert_eq!(
+                    request.argv.get(3).map(String::as_str),
+                    Some("init"),
+                    "the first evaluator patch command must create the isolated Git metadata"
+                );
+                assert!(request.is_trusted_workspace_preparation());
+            } else {
+                assert_eq!(request.argv.get(3).map(String::as_str), Some("apply"));
+                assert!(
+                    request.is_trusted_workspace_preparation(),
+                    "fixed evaluator Git operations share the internal workspace-preparation boundary"
+                );
+            }
+            CommandResult::completed(&request.command_id, "ok")
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    #[test]
+    fn evaluator_patch_uses_only_fixed_trusted_git_operations() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let patch: singularity_evaluation::EvaluatorTestPatch =
+            serde_json::from_value(serde_json::json!({
+                "format": "unified_diff",
+                "content": "--- a/example.txt\n+++ b/example.txt\n"
+            }))
+            .expect("test patch");
+        let backend = Arc::new(EvaluatorPatchSandboxBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let mut diagnostics = Vec::new();
+
+        apply_evaluator_patch(workspace.path(), &patch, backend.clone(), &mut diagnostics)
+            .expect("apply evaluator patch");
+
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "evaluator.git_init",
+                "evaluator.apply_check",
+                "evaluator.apply_patch",
+                "evaluator.reverse_check",
+            ]
+        );
+        assert!(!workspace.path().join(".git").exists());
+        assert!(!workspace.path().join(EVALUATOR_GIT_DIR).exists());
+        assert!(!workspace.path().join(EVALUATOR_PATCH_FILE).exists());
+    }
+
+    #[test]
+    fn evaluator_patch_rejects_a_preexisting_control_git_directory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let git_dir = workspace.path().join(EVALUATOR_GIT_DIR);
+        fs::create_dir(&git_dir).expect("preexisting control directory");
+        fs::write(git_dir.join("owned.txt"), "source content").expect("source content");
+        let patch: singularity_evaluation::EvaluatorTestPatch =
+            serde_json::from_value(serde_json::json!({
+                "format": "unified_diff",
+                "content": "--- a/example.txt\n+++ b/example.txt\n"
+            }))
+            .expect("test patch");
+        let backend = Arc::new(EvaluatorPatchSandboxBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let mut diagnostics = Vec::new();
+
+        let blocker =
+            apply_evaluator_patch(workspace.path(), &patch, backend.clone(), &mut diagnostics)
+                .expect_err("control path collision must fail closed");
+
+        assert_eq!(blocker.kind, BlockerKind::WorkspacePreparation);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read_to_string(git_dir.join("owned.txt")).expect("preserved source content"),
+            "source content"
+        );
+        assert!(!workspace.path().join(EVALUATOR_PATCH_FILE).exists());
     }
 
     struct PathBudgetSandboxBackend;
