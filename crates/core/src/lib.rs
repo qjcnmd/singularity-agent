@@ -41,11 +41,24 @@ const GOOGLE_API_KEY_BODY_MIN_CHARS: usize = 30;
 const GOOGLE_API_KEY_BODY_MAX_CHARS: usize = 45;
 const JWT_MIN_PARTS: usize = 3;
 const JWT_MIN_PART_CHARS: usize = 8;
+/// Protected metadata directories whose names are reserved by the workspace/runtime contract.
+///
+/// Keep this list in `core` so tools, sandbox policy resolution, and the Windows enforcement
+/// adapter cannot silently diverge. `.git` is intentionally recognized without creating a
+/// missing sentinel: Git uses its ancestor marker for workspace discovery.
+pub const PROTECTED_GIT_DIR_NAME: &str = ".git";
+pub const PROTECTED_AGENTS_DIR_NAME: &str = ".agents";
+pub const PROTECTED_METADATA_DIR_NAME: &str = ".singularity";
+pub const PROTECTED_METADATA_PATH_NAMES: [&str; 3] = [
+    PROTECTED_GIT_DIR_NAME,
+    PROTECTED_AGENTS_DIR_NAME,
+    PROTECTED_METADATA_DIR_NAME,
+];
+
 /// Protected path components that must be denied wherever they occur in a workspace.
-pub const PROTECTED_PATH_EXACT_MARKERS: [&str; 13] = [
+pub const PROTECTED_PATH_EXACT_MARKERS: [&str; 12] = [
     ".aws",
     ".azure",
-    ".git",
     ".gnupg",
     ".ssh",
     "credentials",
@@ -294,7 +307,8 @@ pub fn is_protected_path(path: &str) -> bool {
         .split('/')
         .map(str::to_ascii_lowercase)
         .any(|component| {
-            PROTECTED_PATH_EXACT_MARKERS.contains(&component.as_str())
+            PROTECTED_METADATA_PATH_NAMES.contains(&component.as_str())
+                || PROTECTED_PATH_EXACT_MARKERS.contains(&component.as_str())
                 || PROTECTED_PATH_PREFIXES.iter().any(|prefix| {
                     component == *prefix
                         || component
@@ -404,6 +418,8 @@ mod tests {
     fn protected_path_policy_covers_exact_prefix_and_suffix_markers() {
         for path in [
             ".git/config",
+            ".agents/runtime.json",
+            ".singularity/state.json",
             "nested/.env.local",
             "nested/private-key.pem",
             "nested/backup.p12",

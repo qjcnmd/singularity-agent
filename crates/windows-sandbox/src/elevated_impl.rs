@@ -57,7 +57,7 @@ mod windows_impl {
     use super::ElevatedSandboxProfileCaptureRequest;
     use crate::absolute_path::AbsolutePathBuf;
     use crate::acl::allow_null_device;
-    use crate::cap::load_or_create_cap_sids;
+    use crate::cap::workspace_cap_sid_for_cwd;
     use crate::cap::workspace_write_cap_sid_for_root;
     use crate::env::ensure_non_interactive_pager;
     use crate::env::inherit_path_env;
@@ -93,6 +93,17 @@ mod windows_impl {
     use std::time::Duration;
 
     pub use crate::windows_impl::CaptureResult;
+
+    fn cancelled_capture_result() -> CaptureResult {
+        CaptureResult {
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+            cancelled: true,
+            output_truncated: false,
+        }
+    }
 
     /// Polls for cancellation and sends the runner's terminate IPC frame when requested.
     ///
@@ -150,6 +161,12 @@ mod windows_impl {
             deny_read_paths_override,
             deny_write_paths_override,
         } = request;
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 permission_profile,
@@ -191,6 +208,12 @@ mod windows_impl {
 
         let logs_base_dir: Option<&Path> = Some(sandbox_base.as_path());
         log_start(&command, logs_base_dir);
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
         let sandbox_creds = require_logon_sandbox_creds(
             &permissions,
             cwd,
@@ -204,8 +227,16 @@ mod windows_impl {
             proxy_enforced,
             crate::WindowsSandboxProxySettingsMode::Reconcile,
         )?;
-        // Build capability SID for ACL grants.
-        let caps = load_or_create_cap_sids(sandbox_home)?;
+        // Setup refresh/elevation is a synchronous external operation and cannot be interrupted
+        // safely from this call. Do not continue into ACL mutation or runner creation if it
+        // completes after the caller has cancelled.
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
+        // Build per-workspace capability SIDs for ACL grants.
         let (sid_for_null, cap_sids) = if permissions.uses_write_capabilities_for_cwd(cwd, &env_map)
         {
             let write_roots = effective_write_roots_for_permissions(
@@ -224,12 +255,25 @@ mod windows_impl {
             }
             (LocalSid::from_string(&cap_sids[0])?, cap_sids)
         } else {
-            let sid = LocalSid::from_string(&caps.readonly)?;
-            (sid, vec![caps.readonly])
+            let sid_str = workspace_cap_sid_for_cwd(sandbox_home, cwd)?;
+            let sid = LocalSid::from_string(&sid_str)?;
+            (sid, vec![sid_str])
         };
 
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
         unsafe {
-            allow_null_device(sid_for_null.as_ptr());
+            allow_null_device(sid_for_null.as_ptr())?;
+        }
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
         }
 
         (|| -> Result<CaptureResult> {
@@ -245,10 +289,16 @@ mod windows_impl {
                 timeout_ms,
                 use_private_desktop,
             };
-            let transport = retry_runner_spawn_once(
+            let transport = match retry_runner_spawn_once(
                 sandbox_creds,
                 &spawn_request.command,
                 |sandbox_creds| {
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+                    {
+                        anyhow::bail!("sandbox capture cancelled before runner spawn");
+                    }
                     spawn_runner_transport(
                         sandbox_home,
                         cwd,
@@ -258,6 +308,12 @@ mod windows_impl {
                     )
                 },
                 || {
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+                    {
+                        anyhow::bail!("sandbox capture cancelled before credential refresh");
+                    }
                     refresh_logon_sandbox_creds(
                         &permissions,
                         cwd,
@@ -272,7 +328,17 @@ mod windows_impl {
                         crate::WindowsSandboxProxySettingsMode::Reconcile,
                     )
                 },
-            )?;
+            ) {
+                Ok(transport) => transport,
+                Err(_error)
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled) =>
+                {
+                    return Ok(cancelled_capture_result());
+                }
+                Err(error) => return Err(error),
+            };
             let (pipe_write, mut pipe_read) = transport.into_files();
             let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
 
@@ -335,6 +401,35 @@ mod windows_impl {
                 output_truncated: stdout_truncated || stderr_truncated,
             })
         })()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::ElevatedSandboxProfileCaptureRequest;
+        use crate::WindowsSandboxCancellationToken;
+        use crate::permissions::PermissionProfile;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        #[test]
+        fn cancellation_before_elevated_setup_returns_without_spawning() {
+            let profile = PermissionProfile::workspace_write();
+            let mut request = ElevatedSandboxProfileCaptureRequest::new(
+                &profile,
+                &[],
+                Path::new("."),
+                vec!["cmd.exe".to_string()],
+                Path::new("."),
+                HashMap::new(),
+            );
+            request.cancellation = Some(WindowsSandboxCancellationToken::new(|| true));
+
+            let result = super::run_windows_sandbox_capture_for_permission_profile(request)
+                .expect("cancelled capture result");
+            assert!(result.cancelled);
+            assert!(result.stdout.is_empty());
+            assert!(result.stderr.is_empty());
+        }
     }
 }
 

@@ -1555,6 +1555,9 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
         "TOKEN=secret"
     );
     for protected_path in [
+        ".git/config",
+        ".agents/runtime.json",
+        ".singularity/state.json",
         ".aws/credentials",
         ".azure/token",
         ".env.local",

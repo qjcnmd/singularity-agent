@@ -193,6 +193,10 @@ pub(crate) use elevated::runner_client;
 pub(crate) use elevated::runner_pipe;
 
 #[cfg(target_os = "windows")]
+pub use acl::AclOperation;
+#[cfg(target_os = "windows")]
+pub use acl::WindowsAclError;
+#[cfg(target_os = "windows")]
 pub use acl::add_deny_read_ace;
 #[cfg(target_os = "windows")]
 pub use acl::add_deny_write_ace;
@@ -210,6 +214,8 @@ pub use acl::fetch_dacl_handle;
 #[cfg(target_os = "windows")]
 pub use acl::path_mask_allows;
 #[cfg(target_os = "windows")]
+pub use acl::set_dacl_for_path;
+#[cfg(target_os = "windows")]
 pub use audit::apply_world_writable_scan_and_denies_for_permissions;
 #[cfg(target_os = "windows")]
 pub use cap::load_or_create_cap_sids;
@@ -223,6 +229,10 @@ pub use cap::workspace_write_root_contains_path;
 pub use cap::workspace_write_root_overlaps_path;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::apply_deny_read_acls;
+#[cfg(target_os = "windows")]
+pub use deny_read_acl::cleanup_empty_runtime_sentinel;
+#[cfg(target_os = "windows")]
+pub use deny_read_acl::ensure_directory_materialized;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::plan_deny_read_acl_paths;
 pub use deny_read_resolver::resolve_windows_deny_read_paths;
@@ -552,6 +562,17 @@ mod windows_impl {
         pub output_truncated: bool,
     }
 
+    fn cancelled_capture_result() -> CaptureResult {
+        CaptureResult {
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            timed_out: false,
+            cancelled: true,
+            output_truncated: false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_windows_sandbox_capture(
         permission_profile: &PermissionProfile,
@@ -593,6 +614,12 @@ mod windows_impl {
         additional_deny_write_paths: &[AbsolutePathBuf],
         use_private_desktop: bool,
     ) -> Result<CaptureResult> {
+        if cancellation
+            .as_ref()
+            .is_some_and(WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
         let requested_permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 permission_profile,
@@ -628,6 +655,12 @@ mod windows_impl {
         let current_dir = common.current_dir;
         let logs_base_dir = common.logs_base_dir.as_deref();
         let uses_write_capabilities = common.uses_write_capabilities;
+        if cancellation
+            .as_ref()
+            .is_some_and(WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
         if !permissions.has_full_disk_read_access() {
             anyhow::bail!(
                 "Restricted read-only access requires the elevated Windows sandbox backend"
@@ -646,7 +679,19 @@ mod windows_impl {
             cwd,
             capability_roots,
         )?;
-        allow_null_device_for_workspace_write(uses_write_capabilities);
+        if cancellation
+            .as_ref()
+            .is_some_and(WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
+        allow_null_device_for_workspace_write(uses_write_capabilities)?;
+        if cancellation
+            .as_ref()
+            .is_some_and(WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
         apply_restricted_token_acl_rules(
             &permissions,
             sandbox_home,
@@ -660,6 +705,12 @@ mod windows_impl {
                 write_root_sids: &security.write_root_sids,
             },
         )?;
+        if cancellation
+            .as_ref()
+            .is_some_and(WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok(cancelled_capture_result());
+        }
         let (stdin_pair, stdout_pair, stderr_pair) = unsafe { setup_stdio_pipes()? };
         let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) = (stdin_pair, stdout_pair, stderr_pair);
         let spawn_res = unsafe {
@@ -857,6 +908,29 @@ mod windows_impl {
                 )
                 .expect("unsupported profiles do not need ACL preflight");
             }
+        }
+
+        #[test]
+        fn cancellation_before_restricted_setup_returns_without_spawning() {
+            let cancellation = super::super::WindowsSandboxCancellationToken::new(|| true);
+            let result = super::run_windows_sandbox_capture_with_filesystem_overrides(
+                &PermissionProfile::workspace_write(),
+                &[],
+                Path::new("."),
+                vec!["cmd.exe".to_string()],
+                Path::new("."),
+                HashMap::new(),
+                Some(1_000),
+                Some(cancellation),
+                &[],
+                &[],
+                false,
+            )
+            .expect("cancelled capture result");
+
+            assert!(result.cancelled);
+            assert!(result.stdout.is_empty());
+            assert!(result.stderr.is_empty());
         }
     }
 }

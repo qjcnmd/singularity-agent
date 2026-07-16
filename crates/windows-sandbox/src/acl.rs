@@ -1,10 +1,15 @@
 use crate::winutil::to_wide;
 use anyhow::Result;
-use anyhow::anyhow;
+use std::error::Error;
 use std::ffi::c_void;
+use std::fmt;
 use std::path::Path;
+use std::path::PathBuf;
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::ERROR_INVALID_DATA;
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::Foundation::GetLastError;
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LocalFree;
@@ -15,10 +20,8 @@ use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::ACL_SIZE_INFORMATION;
 use windows_sys::Win32::Security::AclSizeInformation;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
-use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
-use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_UNKNOWN;
@@ -29,6 +32,7 @@ use windows_sys::Win32::Security::GENERIC_MAPPING;
 use windows_sys::Win32::Security::GetAce;
 use windows_sys::Win32::Security::GetAclInformation;
 use windows_sys::Win32::Security::MapGenericMask;
+use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
@@ -36,17 +40,21 @@ use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_NAME_NORMALIZED;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
+use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 const SE_KERNEL_OBJECT: u32 = 6;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -55,29 +63,157 @@ const GENERIC_READ_MASK: u32 = 0x8000_0000;
 const GENERIC_WRITE_MASK: u32 = 0x4000_0000;
 const DENY_ACCESS: i32 = 3;
 
-/// Fetch DACL via handle-based query; caller must LocalFree the returned SD.
-///
-/// # Safety
-/// Caller must free the returned security descriptor with `LocalFree` and pass an existing path.
-pub unsafe fn fetch_dacl_handle(path: &Path) -> Result<(*mut ACL, *mut c_void)> {
+/// The Win32 operation that failed while reading or writing a DACL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AclOperation {
+    OpenTarget,
+    ReparseTargetUnsupported,
+    QueryTargetIdentity,
+    TargetIdentityMismatch,
+    GetSecurityInfo,
+    SetEntriesInAcl,
+    SetSecurityInfo,
+}
+
+/// Preserves the native error code so callers can fail closed without reducing an ACL failure
+/// to a best-effort log message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowsAclError {
+    pub operation: AclOperation,
+    pub code: u32,
+}
+
+impl WindowsAclError {
+    fn new(operation: AclOperation, code: u32) -> Self {
+        Self { operation, code }
+    }
+}
+
+impl fmt::Display for WindowsAclError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Windows ACL {:?} failed with error {}",
+            self.operation, self.code
+        )
+    }
+}
+
+impl Error for WindowsAclError {}
+
+struct AclTarget {
+    handle: HANDLE,
+    p_dacl: *mut ACL,
+    p_sd: *mut c_void,
+}
+
+impl Drop for AclTarget {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.p_sd.is_null() {
+                LocalFree(self.p_sd as HLOCAL);
+            }
+            if self.handle != 0 && self.handle != INVALID_HANDLE_VALUE {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+unsafe fn open_acl_target(path: &Path, desired_access: u32, object_type: i32) -> Result<AclTarget> {
+    open_acl_target_with_flags(
+        path,
+        desired_access,
+        object_type,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    )
+}
+
+unsafe fn open_acl_target_with_flags(
+    path: &Path,
+    desired_access: u32,
+    object_type: i32,
+    flags_and_attributes: u32,
+) -> Result<AclTarget> {
+    if object_type == 1 && path_contains_reparse_component(path)? {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::ReparseTargetUnsupported,
+            50, // ERROR_NOT_SUPPORTED
+        )));
+    }
+    let expected_identity = if object_type == 1 {
+        Some(dunce::canonicalize(path).map_err(|err| {
+            anyhow::Error::new(WindowsAclError::new(
+                AclOperation::QueryTargetIdentity,
+                ERROR_INVALID_DATA,
+            ))
+            .context(format!("canonicalize ACL target {}: {err}", path.display()))
+        })?)
+    } else {
+        None
+    };
     let wpath = to_wide(path);
-    let h = CreateFileW(
+    let flags_and_attributes = if object_type == 1 {
+        flags_and_attributes | FILE_FLAG_OPEN_REPARSE_POINT
+    } else {
+        flags_and_attributes
+    };
+    let handle = CreateFileW(
         wpath.as_ptr(),
-        READ_CONTROL,
+        desired_access,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         std::ptr::null_mut(),
         OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
+        flags_and_attributes,
         0,
     );
-    if h == INVALID_HANDLE_VALUE {
-        return Err(anyhow!("CreateFileW failed for {}", path.display()));
+    if handle == 0 || handle == INVALID_HANDLE_VALUE {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::OpenTarget,
+            GetLastError(),
+        )));
+    }
+    if object_type == 1 {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(handle, &mut info)
+            == 0
+        {
+            let code = GetLastError();
+            CloseHandle(handle);
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::QueryTargetIdentity,
+                code,
+            )));
+        }
+        if info.dwFileAttributes & 0x0000_0400 != 0 {
+            CloseHandle(handle);
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::ReparseTargetUnsupported,
+                50, // ERROR_NOT_SUPPORTED
+            )));
+        }
+        if path_contains_reparse_component(path)? {
+            CloseHandle(handle);
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::ReparseTargetUnsupported,
+                50, // ERROR_NOT_SUPPORTED
+            )));
+        }
+        if let Err(error) = verify_target_identity_against(
+            handle,
+            expected_identity
+                .as_deref()
+                .expect("file ACL target has an expected identity"),
+        ) {
+            CloseHandle(handle);
+            return Err(error);
+        }
     }
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetSecurityInfo(
-        h,
-        1, // SE_FILE_OBJECT
+        handle,
+        object_type,
         DACL_SECURITY_INFORMATION,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -85,14 +221,161 @@ pub unsafe fn fetch_dacl_handle(path: &Path) -> Result<(*mut ACL, *mut c_void)> 
         std::ptr::null_mut(),
         &mut p_sd,
     );
-    CloseHandle(h);
     if code != ERROR_SUCCESS {
-        return Err(anyhow!(
-            "GetSecurityInfo failed for {}: {}",
-            path.display(),
-            code
-        ));
+        CloseHandle(handle);
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::GetSecurityInfo,
+            code,
+        )));
     }
+    Ok(AclTarget {
+        handle,
+        p_dacl,
+        p_sd,
+    })
+}
+
+unsafe fn final_path_from_handle(handle: HANDLE) -> Result<PathBuf> {
+    let mut buffer = vec![0u16; 512];
+    loop {
+        let length = GetFinalPathNameByHandleW(
+            handle,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED,
+        );
+        if length == 0 {
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::QueryTargetIdentity,
+                GetLastError(),
+            )));
+        }
+        if (length as usize) < buffer.len() {
+            let text = String::from_utf16(&buffer[..length as usize]).map_err(|_| {
+                anyhow::Error::new(WindowsAclError::new(
+                    AclOperation::QueryTargetIdentity,
+                    ERROR_INVALID_DATA,
+                ))
+            })?;
+            return Ok(PathBuf::from(text));
+        }
+        if buffer.len() >= 32 * 1024 {
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::QueryTargetIdentity,
+                ERROR_INVALID_DATA,
+            )));
+        }
+        buffer.resize(buffer.len() * 2, 0);
+    }
+}
+
+fn normalized_identity(path: &Path) -> String {
+    let mut text = path.to_string_lossy().replace('/', "\\");
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        text = format!(r"\\{}", rest);
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        text = rest.to_string();
+    }
+    while text.len() > 3 && text.ends_with('\\') {
+        text.pop();
+    }
+    text.to_ascii_lowercase()
+}
+
+pub(crate) unsafe fn verify_target_identity_against(handle: HANDLE, expected: &Path) -> Result<()> {
+    let actual = final_path_from_handle(handle)?;
+    if normalized_identity(expected) != normalized_identity(&actual) {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::TargetIdentityMismatch,
+            ERROR_INVALID_DATA,
+        ))
+        .context(format!(
+            "ACL target identity changed: expected {}, opened {}",
+            expected.display(),
+            actual.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn path_contains_reparse_component(path: &Path) -> Result<bool> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if std::os::windows::fs::MetadataExt::file_attributes(&metadata) & 0x0000_0400 != 0
+                {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let code = error
+                    .raw_os_error()
+                    .map_or(ERROR_INVALID_DATA, |code| code as u32);
+                return Err(anyhow::Error::new(WindowsAclError::new(
+                    AclOperation::QueryTargetIdentity,
+                    code,
+                ))
+                .context(format!(
+                    "inspect ACL target reparse state {}: {error}",
+                    current.display()
+                )));
+            }
+        }
+    }
+    Ok(false)
+}
+
+unsafe fn set_target_dacl(target: &AclTarget, p_dacl: *mut ACL, object_type: i32) -> Result<()> {
+    let code = SetSecurityInfo(
+        target.handle,
+        object_type,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        p_dacl,
+        std::ptr::null_mut(),
+    );
+    if code != ERROR_SUCCESS {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::SetSecurityInfo,
+            code,
+        )));
+    }
+    Ok(())
+}
+
+/// Replaces a file-object DACL through a stable handle rather than a path-based setter.
+///
+/// # Safety
+/// Caller must pass a valid DACL pointer and an existing non-reparse path.
+pub unsafe fn set_dacl_for_path(path: &Path, p_dacl: *mut ACL) -> Result<()> {
+    let target = open_acl_target(path, READ_CONTROL | WRITE_DAC, 1)?;
+    set_target_dacl(&target, p_dacl, 1)
+}
+
+fn is_missing_target_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<WindowsAclError>()
+        .is_some_and(|error| {
+            matches!(error.operation, AclOperation::OpenTarget) && matches!(error.code, 2 | 3 | 267)
+        })
+}
+
+/// Fetch DACL via handle-based query; caller must LocalFree the returned SD.
+///
+/// # Safety
+/// Caller must free the returned security descriptor with `LocalFree` and pass an existing path.
+pub unsafe fn fetch_dacl_handle(path: &Path) -> Result<(*mut ACL, *mut c_void)> {
+    let mut target = open_acl_target(path, READ_CONTROL, 1)?;
+    let p_dacl = target.p_dacl;
+    let p_sd = target.p_sd;
+    let handle = target.handle;
+    target.p_sd = std::ptr::null_mut();
+    target.handle = 0;
+    CloseHandle(handle);
     Ok((p_dacl, p_sd))
 }
 
@@ -314,17 +597,20 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     disallow_mask: u32,
     inheritance: u32,
 ) -> Result<bool> {
-    let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
+    let target = open_acl_target(path, READ_CONTROL | WRITE_DAC, 1)?;
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     for sid in sids {
-        if dacl_mask_allows(p_dacl, &[*sid], allow_mask, /*require_all_bits*/ true)
-            && !dacl_mask_allows(
-                p_dacl,
-                &[*sid],
-                disallow_mask,
-                /*require_all_bits*/ false,
-            )
-        {
+        if dacl_mask_allows(
+            target.p_dacl,
+            &[*sid],
+            allow_mask,
+            /*require_all_bits*/ true,
+        ) && !dacl_mask_allows(
+            target.p_dacl,
+            &[*sid],
+            disallow_mask,
+            /*require_all_bits*/ false,
+        ) {
             continue;
         }
         entries.push(EXPLICIT_ACCESS_W {
@@ -346,42 +632,21 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
         let code2 = SetEntriesInAclW(
             entries.len() as u32,
             entries.as_ptr(),
-            p_dacl,
+            target.p_dacl,
             &mut p_new_dacl,
         );
-        if code2 == ERROR_SUCCESS {
-            let code3 = SetNamedSecurityInfoW(
-                to_wide(path).as_ptr() as *mut u16,
-                1,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                p_new_dacl,
-                std::ptr::null_mut(),
-            );
-            if code3 == ERROR_SUCCESS {
-                added = true;
-                if !p_new_dacl.is_null() {
-                    LocalFree(p_new_dacl as HLOCAL);
-                }
-            } else {
-                if !p_new_dacl.is_null() {
-                    LocalFree(p_new_dacl as HLOCAL);
-                }
-                if !p_sd.is_null() {
-                    LocalFree(p_sd as HLOCAL);
-                }
-                return Err(anyhow!("SetNamedSecurityInfoW failed: {code3}"));
-            }
-        } else {
-            if !p_sd.is_null() {
-                LocalFree(p_sd as HLOCAL);
-            }
-            return Err(anyhow!("SetEntriesInAclW failed: {code2}"));
+        if code2 != ERROR_SUCCESS {
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::SetEntriesInAcl,
+                code2,
+            )));
         }
-    }
-    if !p_sd.is_null() {
-        LocalFree(p_sd as HLOCAL);
+        let set_result = set_target_dacl(&target, p_new_dacl, 1);
+        if !p_new_dacl.is_null() {
+            LocalFree(p_new_dacl as HLOCAL);
+        }
+        set_result?;
+        added = true;
     }
     Ok(added)
 }
@@ -444,29 +709,11 @@ pub unsafe fn ensure_allow_write_aces(path: &Path, sids: &[*mut c_void]) -> Resu
 /// # Safety
 /// Caller must ensure `psid` points to a valid SID and `path` refers to an existing file or directory.
 pub unsafe fn add_allow_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
-    let mut p_sd: *mut c_void = std::ptr::null_mut();
-    let mut p_dacl: *mut ACL = std::ptr::null_mut();
-    let code = GetNamedSecurityInfoW(
-        to_wide(path).as_ptr(),
-        1,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        &mut p_dacl,
-        std::ptr::null_mut(),
-        &mut p_sd,
-    );
-    if code != ERROR_SUCCESS {
-        return Err(anyhow!("GetNamedSecurityInfoW failed: {code}"));
-    }
+    let target = open_acl_target(path, READ_CONTROL | WRITE_DAC, 1)?;
     // Already has write? Skip costly DACL rewrite.
-    if dacl_has_write_allow_for_sid(p_dacl, psid) {
-        if !p_sd.is_null() {
-            LocalFree(p_sd as HLOCAL);
-        }
+    if dacl_has_write_allow_for_sid(target.p_dacl, psid) {
         return Ok(false);
     }
-    let mut added = false;
     // Always ensure write is present: if an allow ACE exists without write, add one with write+RX.
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
@@ -481,28 +728,19 @@ pub unsafe fn add_allow_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
     explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
     explicit.Trustee = trustee;
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-    let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-    if code2 == ERROR_SUCCESS {
-        let code3 = SetNamedSecurityInfoW(
-            to_wide(path).as_ptr() as *mut u16,
-            1,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            p_new_dacl,
-            std::ptr::null_mut(),
-        );
-        if code3 == ERROR_SUCCESS {
-            added = !dacl_has_write_allow_for_sid(p_dacl, psid);
-        }
-        if !p_new_dacl.is_null() {
-            LocalFree(p_new_dacl as HLOCAL);
-        }
+    let code2 = SetEntriesInAclW(1, &explicit, target.p_dacl, &mut p_new_dacl);
+    if code2 != ERROR_SUCCESS {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::SetEntriesInAcl,
+            code2,
+        )));
     }
-    if !p_sd.is_null() {
-        LocalFree(p_sd as HLOCAL);
+    let set_result = set_target_dacl(&target, p_new_dacl, 1);
+    if !p_new_dacl.is_null() {
+        LocalFree(p_new_dacl as HLOCAL);
     }
-    Ok(added)
+    set_result?;
+    Ok(true)
 }
 
 /// Adds a deny ACE to prevent write/append/delete for the given SID on the target path.
@@ -545,23 +783,8 @@ impl DenyAceKind {
 }
 
 unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Result<bool> {
-    let mut p_sd: *mut c_void = std::ptr::null_mut();
-    let mut p_dacl: *mut ACL = std::ptr::null_mut();
-    let code = GetNamedSecurityInfoW(
-        to_wide(path).as_ptr(),
-        1,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        &mut p_dacl,
-        std::ptr::null_mut(),
-        &mut p_sd,
-    );
-    if code != ERROR_SUCCESS {
-        return Err(anyhow!("GetNamedSecurityInfoW failed: {code}"));
-    }
-    let mut added = false;
-    if !kind.already_present(p_dacl, psid) {
+    let target = open_acl_target(path, READ_CONTROL | WRITE_DAC, 1)?;
+    if !kind.already_present(target.p_dacl, psid) {
         let trustee = TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: 0,
@@ -575,29 +798,21 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
         explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
         explicit.Trustee = trustee;
         let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-        let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-        if code2 == ERROR_SUCCESS {
-            let code3 = SetNamedSecurityInfoW(
-                to_wide(path).as_ptr() as *mut u16,
-                1,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                p_new_dacl,
-                std::ptr::null_mut(),
-            );
-            if code3 == ERROR_SUCCESS {
-                added = true;
-            }
-            if !p_new_dacl.is_null() {
-                LocalFree(p_new_dacl as HLOCAL);
-            }
+        let code2 = SetEntriesInAclW(1, &explicit, target.p_dacl, &mut p_new_dacl);
+        if code2 != ERROR_SUCCESS {
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::SetEntriesInAcl,
+                code2,
+            )));
         }
+        let set_result = set_target_dacl(&target, p_new_dacl, 1);
+        if !p_new_dacl.is_null() {
+            LocalFree(p_new_dacl as HLOCAL);
+        }
+        set_result?;
+        return Ok(true);
     }
-    if !p_sd.is_null() {
-        LocalFree(p_sd as HLOCAL);
-    }
-    Ok(added)
+    Ok(false)
 }
 
 /// Adds a deny ACE to prevent reads for the given SID on the target path.
@@ -613,25 +828,12 @@ pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> 
     add_deny_ace(path, psid, DenyAceKind::Read)
 }
 
-pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
-    let mut p_sd: *mut c_void = std::ptr::null_mut();
-    let mut p_dacl: *mut ACL = std::ptr::null_mut();
-    let code = GetNamedSecurityInfoW(
-        to_wide(path).as_ptr(),
-        1,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        &mut p_dacl,
-        std::ptr::null_mut(),
-        &mut p_sd,
-    );
-    if code != ERROR_SUCCESS {
-        if !p_sd.is_null() {
-            LocalFree(p_sd as HLOCAL);
-        }
-        return;
-    }
+pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<()> {
+    let target = match open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) {
+        Ok(target) => target,
+        Err(error) if is_missing_target_error(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
         MultipleTrusteeOperation: 0,
@@ -645,91 +847,91 @@ pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
     explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
     explicit.Trustee = trustee;
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-    let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-    if code2 == ERROR_SUCCESS {
-        let _ = SetNamedSecurityInfoW(
-            to_wide(path).as_ptr() as *mut u16,
-            1,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            p_new_dacl,
-            std::ptr::null_mut(),
-        );
-        if !p_new_dacl.is_null() {
-            LocalFree(p_new_dacl as HLOCAL);
-        }
+    let code2 = SetEntriesInAclW(1, &explicit, target.p_dacl, &mut p_new_dacl);
+    if code2 != ERROR_SUCCESS {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::SetEntriesInAcl,
+            code2,
+        )));
     }
-    if !p_sd.is_null() {
-        LocalFree(p_sd as HLOCAL);
+    let set_result = set_target_dacl(&target, p_new_dacl, 1);
+    if !p_new_dacl.is_null() {
+        LocalFree(p_new_dacl as HLOCAL);
     }
+    set_result
 }
 
 /// Grants RX to the null device for the given SID to support stdout/stderr redirection.
 ///
 /// # Safety
 /// Caller must ensure `psid` is a valid SID pointer.
-pub unsafe fn allow_null_device(psid: *mut c_void) {
-    let desired = 0x00020000 | 0x00040000; // READ_CONTROL | WRITE_DAC
-    let h = CreateFileW(
-        to_wide(r"\\\\.\\NUL").as_ptr(),
-        desired,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        std::ptr::null_mut(),
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        0,
-    );
-    if h == 0 || h == INVALID_HANDLE_VALUE {
-        return;
-    }
-    let mut p_sd: *mut c_void = std::ptr::null_mut();
-    let mut p_dacl: *mut ACL = std::ptr::null_mut();
-    let code = GetSecurityInfo(
-        h,
+pub unsafe fn allow_null_device(psid: *mut c_void) -> Result<()> {
+    let target = open_acl_target_with_flags(
+        Path::new(r"\\.\NUL"),
+        READ_CONTROL | WRITE_DAC,
         SE_KERNEL_OBJECT as i32,
-        DACL_SECURITY_INFORMATION,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        &mut p_dacl,
-        std::ptr::null_mut(),
-        &mut p_sd,
-    );
-    if code == ERROR_SUCCESS {
-        let trustee = TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: psid as *mut u16,
-        };
-        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-        explicit.grfAccessPermissions =
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
-        explicit.grfAccessMode = 2; // SET_ACCESS
-        explicit.grfInheritance = 0;
-        explicit.Trustee = trustee;
-        let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-        let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-        if code2 == ERROR_SUCCESS {
-            let _ = SetSecurityInfo(
-                h,
-                SE_KERNEL_OBJECT as i32,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                p_new_dacl,
-                std::ptr::null_mut(),
-            );
-            if !p_new_dacl.is_null() {
-                LocalFree(p_new_dacl as HLOCAL);
-            }
-        }
+        FILE_ATTRIBUTE_NORMAL,
+    )?;
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: psid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+    explicit.grfAccessMode = 2; // SET_ACCESS
+    explicit.grfInheritance = 0;
+    explicit.Trustee = trustee;
+    let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
+    let code = SetEntriesInAclW(1, &explicit, target.p_dacl, &mut p_new_dacl);
+    if code != ERROR_SUCCESS {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::SetEntriesInAcl,
+            code,
+        )));
     }
-    if !p_sd.is_null() {
-        LocalFree(p_sd as HLOCAL);
+    let set_result = set_target_dacl(&target, p_new_dacl, SE_KERNEL_OBJECT as i32);
+    if !p_new_dacl.is_null() {
+        LocalFree(p_new_dacl as HLOCAL);
     }
-    CloseHandle(h);
+    set_result
 }
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
+
+#[cfg(test)]
+mod tests {
+    use super::AclOperation;
+    use super::WindowsAclError;
+    use super::fetch_dacl_handle;
+    use std::os::windows::process::CommandExt;
+    use tempfile::TempDir;
+
+    #[test]
+    fn reparse_acl_target_returns_typed_unsupported_error() {
+        let tmp = TempDir::new().expect("tempdir");
+        let target = tmp.path().join("target");
+        let alias = tmp.path().join("alias");
+        std::fs::create_dir(&target).expect("create target");
+        let link = format!("\"{}\"", alias.display());
+        let target_arg = format!("\"{}\"", target.display());
+        let junction_created = std::process::Command::new("cmd.exe")
+            .raw_arg("/c")
+            .raw_arg("mklink")
+            .raw_arg("/J")
+            .raw_arg(&link)
+            .raw_arg(&target_arg)
+            .output()
+            .is_ok_and(|output| output.status.success() && alias.exists());
+        assert!(junction_created, "junction fixture must be available");
+
+        let error = unsafe { fetch_dacl_handle(&alias) }.expect_err("reparse target rejected");
+        let typed = error
+            .downcast_ref::<WindowsAclError>()
+            .expect("typed Windows ACL error");
+        assert_eq!(typed.operation, AclOperation::ReparseTargetUnsupported);
+        assert_eq!(typed.code, 50);
+    }
+}

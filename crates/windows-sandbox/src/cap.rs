@@ -1,3 +1,4 @@
+use crate::deny_read_state::lock_state;
 use crate::path_normalization::canonical_path_key;
 use crate::path_normalization::canonicalize_path;
 use crate::product_identity::CAPABILITY_SID_FILE_NAME;
@@ -51,21 +52,27 @@ fn persist_caps(path: &Path, caps: &CapSids) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("create cap sid dir {}", dir.display()))?;
     }
     let json = serde_json::to_string(caps)?;
-    fs::write(path, json).with_context(|| format!("write cap sid file {}", path.display()))?;
+    crate::deny_read_state::atomic_store(path, json.as_bytes())?;
     Ok(())
 }
 
-pub fn load_or_create_cap_sids(sandbox_home: &Path) -> Result<CapSids> {
+fn load_or_create_cap_sids_unlocked(sandbox_home: &Path) -> Result<CapSids> {
     let path = cap_sid_file(sandbox_home);
     if path.exists() {
         let txt = fs::read_to_string(&path)
             .with_context(|| format!("read cap sid file {}", path.display()))?;
         let t = txt.trim();
-        if t.starts_with('{') && t.ends_with('}') {
-            if let Ok(obj) = serde_json::from_str::<CapSids>(t) {
-                return Ok(obj);
+        if t.starts_with('{') || t.ends_with('}') {
+            return serde_json::from_str::<CapSids>(t)
+                .with_context(|| format!("parse cap sid file {}", path.display()));
+        }
+        if !t.is_empty() {
+            // Keep the existing single-SID input readable, but do not treat arbitrary
+            // corruption as a capability. A malformed state file must stop setup rather than
+            // silently rotate the SID set and make the on-disk ACL ownership ambiguous.
+            if !t.starts_with("S-") {
+                anyhow::bail!("invalid cap sid file {}", path.display());
             }
-        } else if !t.is_empty() {
             let caps = CapSids {
                 workspace: t.to_string(),
                 readonly: make_random_cap_sid_string(),
@@ -75,6 +82,7 @@ pub fn load_or_create_cap_sids(sandbox_home: &Path) -> Result<CapSids> {
             persist_caps(&path, &caps)?;
             return Ok(caps);
         }
+        anyhow::bail!("empty cap sid file {}", path.display());
     }
     let caps = CapSids {
         workspace: make_random_cap_sid_string(),
@@ -86,10 +94,16 @@ pub fn load_or_create_cap_sids(sandbox_home: &Path) -> Result<CapSids> {
     Ok(caps)
 }
 
+pub fn load_or_create_cap_sids(sandbox_home: &Path) -> Result<CapSids> {
+    let _lock = lock_state(&cap_sid_file(sandbox_home))?;
+    load_or_create_cap_sids_unlocked(sandbox_home)
+}
+
 /// Returns the workspace-specific capability SID for `cwd`, creating and persisting it if missing.
 pub fn workspace_cap_sid_for_cwd(sandbox_home: &Path, cwd: &Path) -> Result<String> {
     let path = cap_sid_file(sandbox_home);
-    let mut caps = load_or_create_cap_sids(sandbox_home)?;
+    let _lock = lock_state(&path)?;
+    let mut caps = load_or_create_cap_sids_unlocked(sandbox_home)?;
     let key = canonical_path_key(cwd);
     if let Some(sid) = caps.workspace_by_cwd.get(&key) {
         return Ok(sid.clone());
@@ -103,7 +117,8 @@ pub fn workspace_cap_sid_for_cwd(sandbox_home: &Path, cwd: &Path) -> Result<Stri
 /// Returns the capability SID for an additional writable root, creating and persisting it if missing.
 pub fn writable_root_cap_sid_for_path(sandbox_home: &Path, root: &Path) -> Result<String> {
     let path = cap_sid_file(sandbox_home);
-    let mut caps = load_or_create_cap_sids(sandbox_home)?;
+    let _lock = lock_state(&path)?;
+    let mut caps = load_or_create_cap_sids_unlocked(sandbox_home)?;
     let key = canonical_path_key(root);
     if let Some(sid) = caps.writable_root_by_path.get(&key) {
         return Ok(sid.clone());
@@ -201,5 +216,43 @@ mod tests {
         let caps = load_or_create_cap_sids(&sandbox_home).expect("load caps");
         assert_eq!(caps.workspace_by_cwd.len(), 1);
         assert_eq!(caps.writable_root_by_path.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_workspace_sid_updates_preserve_both_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let first_workspace = temp.path().join("first-workspace");
+        let second_workspace = temp.path().join("second-workspace");
+        std::fs::create_dir_all(&sandbox_home).expect("create singularity home");
+        std::fs::create_dir_all(&first_workspace).expect("create first workspace");
+        std::fs::create_dir_all(&second_workspace).expect("create second workspace");
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| workspace_cap_sid_for_cwd(&sandbox_home, &first_workspace));
+            let second =
+                scope.spawn(|| workspace_cap_sid_for_cwd(&sandbox_home, &second_workspace));
+            first.join().expect("first SID update").expect("first SID");
+            second
+                .join()
+                .expect("second SID update")
+                .expect("second SID");
+        });
+
+        let caps = load_or_create_cap_sids(&sandbox_home).expect("load caps");
+        assert_eq!(caps.workspace_by_cwd.len(), 2);
+    }
+
+    #[test]
+    fn malformed_cap_state_fails_closed() {
+        for contents in ["{not-json", ""] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sandbox_home = temp.path().join("singularity-home");
+            std::fs::create_dir_all(&sandbox_home).expect("create singularity home");
+            std::fs::write(super::cap_sid_file(&sandbox_home), contents)
+                .expect("write malformed cap state");
+
+            assert!(load_or_create_cap_sids(&sandbox_home).is_err());
+        }
     }
 }

@@ -1090,8 +1090,8 @@ mod windows_backend {
         command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
     };
     use singularity_core::{
-        PROTECTED_PATH_CONTAINS_MARKERS, PROTECTED_PATH_EXACT_MARKERS, PROTECTED_PATH_PREFIXES,
-        PROTECTED_PATH_SUFFIXES,
+        PROTECTED_METADATA_PATH_NAMES, PROTECTED_PATH_CONTAINS_MARKERS,
+        PROTECTED_PATH_EXACT_MARKERS, PROTECTED_PATH_PREFIXES, PROTECTED_PATH_SUFFIXES,
     };
     use singularity_windows_sandbox::{
         AbsolutePathBuf, ElevatedSandboxProfileCaptureRequest, FileSystemAccessMode,
@@ -1271,6 +1271,9 @@ mod windows_backend {
         workspace_root: &AbsolutePathBuf,
     ) -> Vec<FileSystemSandboxEntry> {
         let mut patterns = Vec::new();
+        for marker in PROTECTED_METADATA_PATH_NAMES {
+            patterns.push(format_workspace_protected_glob(workspace_root, marker));
+        }
         for marker in PROTECTED_PATH_EXACT_MARKERS {
             patterns.push(format_workspace_protected_glob(workspace_root, marker));
         }
@@ -2229,6 +2232,8 @@ mod windows_backend {
             let nested = workspace.path().join("nested");
             fs::create_dir_all(&nested).expect("nested directory");
             fs::create_dir(workspace.path().join(".git")).expect("git directory");
+            fs::create_dir(workspace.path().join(".agents")).expect("agents directory");
+            fs::create_dir(workspace.path().join(".singularity")).expect("singularity directory");
             create_test_file(&workspace.path().join(".env.local"), "opaque");
             create_test_file(&nested.join("private-key.pem"), "opaque");
             create_test_file(&nested.join("client.p12"), "opaque");
@@ -2256,6 +2261,8 @@ mod windows_backend {
                 protected_paths,
                 [
                     workspace.path().join(".git"),
+                    workspace.path().join(".agents"),
+                    workspace.path().join(".singularity"),
                     workspace.path().join(".env.local"),
                     nested.join("private-key.pem"),
                     nested.join("client.p12"),

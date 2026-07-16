@@ -1,3 +1,5 @@
+use crate::acl::AclOperation;
+use crate::acl::WindowsAclError;
 use crate::logging;
 use crate::product_identity::PRIVATE_DESKTOP_PREFIX;
 use crate::token::get_current_token_for_restriction;
@@ -156,9 +158,10 @@ unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> R
             &format!("SetEntriesInAclW failed for private desktop: {set_entries_code}"),
             logs_base_dir,
         );
-        return Err(anyhow::anyhow!(
-            "SetEntriesInAclW failed for private desktop: {set_entries_code}"
-        ));
+        return Err(anyhow::Error::new(WindowsAclError {
+            operation: AclOperation::SetEntriesInAcl,
+            code: set_entries_code,
+        }));
     }
 
     let set_security_code = SetSecurityInfo(
@@ -178,9 +181,10 @@ unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> R
             &format!("SetSecurityInfo failed for private desktop: {set_security_code}"),
             logs_base_dir,
         );
-        return Err(anyhow::anyhow!(
-            "SetSecurityInfo failed for private desktop: {set_security_code}"
-        ));
+        return Err(anyhow::Error::new(WindowsAclError {
+            operation: AclOperation::SetSecurityInfo,
+            code: set_security_code,
+        }));
     }
 
     Ok(())

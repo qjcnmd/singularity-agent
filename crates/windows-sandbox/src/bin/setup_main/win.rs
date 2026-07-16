@@ -7,15 +7,18 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 use serde::Serialize;
+use singularity_windows_sandbox::AclOperation;
 use singularity_windows_sandbox::SETUP_VERSION;
 use singularity_windows_sandbox::SetupErrorCode;
 use singularity_windows_sandbox::SetupErrorReport;
 use singularity_windows_sandbox::SetupFailure;
+use singularity_windows_sandbox::WindowsAclError;
 use singularity_windows_sandbox::add_deny_write_ace;
 use singularity_windows_sandbox::canonicalize_path;
 use singularity_windows_sandbox::convert_string_sid_to_sid;
 use singularity_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use singularity_windows_sandbox::ensure_allow_write_aces;
+use singularity_windows_sandbox::ensure_directory_materialized;
 use singularity_windows_sandbox::extract_setup_failure;
 use singularity_windows_sandbox::hide_newly_created_users;
 use singularity_windows_sandbox::install_wfp_filters;
@@ -27,12 +30,15 @@ use singularity_windows_sandbox::product_identity::SANDBOX_HOME_ENV;
 use singularity_windows_sandbox::sandbox_bin_dir;
 use singularity_windows_sandbox::sandbox_dir;
 use singularity_windows_sandbox::sandbox_secrets_dir;
+use singularity_windows_sandbox::set_dacl_for_path;
 use singularity_windows_sandbox::string_from_sid_bytes;
 use singularity_windows_sandbox::sync_persistent_deny_read_acls;
 use singularity_windows_sandbox::to_wide;
+use singularity_windows_sandbox::workspace_cap_sid_for_cwd;
 use singularity_windows_sandbox::workspace_write_cap_sid_for_root;
 use singularity_windows_sandbox::workspace_write_root_overlaps_path;
 use singularity_windows_sandbox::write_setup_error_report;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
@@ -50,13 +56,10 @@ use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
-use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
-use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::CONTAINER_INHERIT_ACE;
-use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::OBJECT_INHERIT_ACE;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
@@ -71,7 +74,6 @@ const WRITE_ROOT_ALLOW_MASK: u32 =
 mod sandbox_users;
 mod setup_runtime_bin;
 use read_acl_mutex::acquire_read_acl_mutex;
-use read_acl_mutex::read_acl_mutex_exists;
 use sandbox_users::commit_setup_marker;
 use sandbox_users::prepare_setup_marker;
 use sandbox_users::provision_sandbox_users;
@@ -156,6 +158,8 @@ fn workspace_write_cap_sids_for_path(
             }
         }
     }
+    sid_strs.sort();
+    sid_strs.dedup();
     Ok(sid_strs)
 }
 
@@ -183,19 +187,23 @@ fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> 
     let payload_json = serde_json::to_vec(&read_payload)?;
     let payload_b64 = BASE64.encode(payload_json);
     let exe = std::env::current_exe().context("locate setup helper")?;
-    Command::new(&exe)
+    let status = Command::new(&exe)
         .arg(payload_b64)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .spawn()
-        .context("spawn read ACL helper")?;
+        .status()
+        .context("run read ACL helper")?;
+    if !status.success() {
+        anyhow::bail!("read ACL helper exited with status {status}");
+    }
     Ok(())
 }
 
 struct ReadAclSubjects<'a> {
     sandbox_group_psid: *mut c_void,
+    workspace_capability_psid: *mut c_void,
     rx_psids: &'a [*mut c_void],
 }
 
@@ -215,6 +223,44 @@ fn apply_read_acls(
                 &format!("{access_label} root {} missing; skipping", root.display()),
             )?;
             continue;
+        }
+        let capability_has = read_mask_allows_or_log(
+            root,
+            &[subjects.workspace_capability_psid],
+            Some("workspace_capability"),
+            access_mask,
+            access_label,
+            refresh_errors,
+            log,
+        )?;
+        if !capability_has {
+            log_line(
+                log,
+                &format!(
+                    "granting {access_label} ACE to {} for workspace capability",
+                    root.display()
+                ),
+            )?;
+            if let Err(err) = unsafe {
+                ensure_allow_mask_aces_with_inheritance(
+                    root,
+                    &[subjects.workspace_capability_psid],
+                    access_mask,
+                    inheritance,
+                )
+            } {
+                refresh_errors.push(format!(
+                    "grant {access_label} ACE failed on {} for workspace_capability: {err}",
+                    root.display()
+                ));
+                log_line(
+                    log,
+                    &format!(
+                        "grant {access_label} ACE failed on {} for workspace_capability: {err}",
+                        root.display()
+                    ),
+                )?;
+            }
         }
         let builtin_has = read_mask_allows_or_log(
             root,
@@ -373,25 +419,12 @@ fn lock_sandbox_dir(
             &mut new_dacl,
         );
         if set != 0 {
-            return Err(anyhow::anyhow!(
-                "SetEntriesInAclW sandbox dir failed: {set}",
-            ));
+            return Err(anyhow::Error::new(WindowsAclError {
+                operation: AclOperation::SetEntriesInAcl,
+                code: set,
+            }));
         }
-        let path_w = to_wide(dir.as_os_str());
-        let res = SetNamedSecurityInfoW(
-            path_w.as_ptr() as *mut u16,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            new_dacl,
-            std::ptr::null_mut(),
-        );
-        if res != 0 {
-            return Err(anyhow::anyhow!(
-                "SetNamedSecurityInfoW sandbox dir failed: {res}",
-            ));
-        }
+        let set_result = set_dacl_for_path(dir, new_dacl);
         if !new_dacl.is_null() {
             LocalFree(new_dacl as HLOCAL);
         }
@@ -400,6 +433,7 @@ fn lock_sandbox_dir(
                 LocalFree(sid as HLOCAL);
             }
         }
+        set_result?;
     }
     Ok(())
 }
@@ -517,13 +551,7 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
 }
 
 fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
-    let _read_acl_guard = match acquire_read_acl_mutex()? {
-        Some(guard) => guard,
-        None => {
-            log_line(log, "read ACL helper already running; skipping")?;
-            return Ok(());
-        }
-    };
+    let _read_acl_guard = acquire_read_acl_mutex()?;
     log_line(log, "read-acl-only mode: applying read ACLs")?;
     let sandbox_group_sid = resolve_sandbox_users_group_sid()?;
     let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid)?;
@@ -535,9 +563,16 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
         let auth_psid = sid_bytes_to_psid(&auth_sid)?;
         let everyone_sid = resolve_sid("Everyone")?;
         let everyone_psid = sid_bytes_to_psid(&everyone_sid)?;
+        let workspace_cap_sid =
+            workspace_cap_sid_for_cwd(&payload.sandbox_home, &payload.command_cwd)?;
+        let workspace_cap_psid = unsafe {
+            convert_string_sid_to_sid(&workspace_cap_sid)
+                .ok_or_else(|| anyhow::anyhow!("convert workspace capability SID failed"))?
+        };
         let rx_psids = vec![users_psid, auth_psid, everyone_psid];
         let subjects = ReadAclSubjects {
             sandbox_group_psid,
+            workspace_capability_psid: workspace_cap_psid,
             rx_psids: &rx_psids,
         };
         apply_read_acls(
@@ -559,6 +594,9 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
             if !everyone_psid.is_null() {
                 LocalFree(everyone_psid as HLOCAL);
             }
+            if !workspace_cap_psid.is_null() {
+                LocalFree(workspace_cap_psid as HLOCAL);
+            }
         }
     }
     unsafe {
@@ -571,9 +609,7 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
             log,
             &format!("read ACL run completed with errors: {refresh_errors:?}"),
         )?;
-        if payload.refresh_only {
-            anyhow::bail!("read ACL run had errors");
-        }
+        anyhow::bail!("read ACL run had errors");
     }
     log_line(log, "read ACL run completed")?;
     Ok(())
@@ -780,55 +816,64 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
     }
 
-    // Deny-read ACEs must be present before the sandboxed command starts. Apply
-    // them synchronously here instead of delegating them to the background
-    // helper used for read grants.
-    let applied_deny_read_paths = unsafe {
-        sync_persistent_deny_read_acls(
-            &payload.sandbox_home,
-            &sandbox_group_sid_str,
-            &payload.deny_read_paths,
-            sandbox_group_psid,
-        )
+    // Deny-read ACEs must be present before the sandboxed command starts. Bind them to the
+    // per-workspace capability SID(s), never the shared Sandbox Users group, and apply them
+    // synchronously before any child can start.
+    let mut deny_read_by_sid: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    if payload.write_roots.is_empty() {
+        let sid = workspace_cap_sid_for_cwd(&payload.sandbox_home, &payload.command_cwd)?;
+        deny_read_by_sid.insert(sid, payload.deny_read_paths.clone());
+    } else {
+        for path in &payload.deny_read_paths {
+            for sid in workspace_write_cap_sids_for_path(
+                &payload.sandbox_home,
+                &payload.command_cwd,
+                &payload.write_roots,
+                path,
+            )? {
+                deny_read_by_sid.entry(sid).or_default().push(path.clone());
+            }
+        }
     }
-    .context("apply deny-read ACLs")?;
-    if !applied_deny_read_paths.is_empty() {
+    let mut applied_deny_read_count = 0;
+    for (principal_sid, paths) in deny_read_by_sid {
+        if paths.is_empty() {
+            continue;
+        }
+        let principal_psid = unsafe {
+            convert_string_sid_to_sid(&principal_sid)
+                .ok_or_else(|| anyhow::anyhow!("convert deny-read capability SID failed"))?
+        };
+        let applied = unsafe {
+            sync_persistent_deny_read_acls(
+                &payload.sandbox_home,
+                &principal_sid,
+                &paths,
+                principal_psid,
+            )
+        }
+        .context("apply deny-read ACLs")?;
+        applied_deny_read_count += applied.len();
+        unsafe {
+            LocalFree(principal_psid as HLOCAL);
+        }
+    }
+    if applied_deny_read_count != 0 {
         log_line(
             log,
-            &format!("applied {} deny-read ACLs", applied_deny_read_paths.len()),
+            &format!("applied {applied_deny_read_count} deny-read ACLs"),
         )?;
     }
 
     if payload.read_roots.is_empty() {
         log_line(log, "no read roots to grant; skipping read ACL helper")?;
     } else {
-        match read_acl_mutex_exists() {
-            Ok(true) => {
-                log_line(log, "read ACL helper already running; skipping spawn")?;
-            }
-            Ok(false) => {
-                spawn_read_acl_helper(payload, log).map_err(|err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperReadAclHelperSpawnFailed,
-                        format!("spawn read ACL helper failed: {err}"),
-                    ))
-                })?;
-            }
-            Err(err) => {
-                log_line(
-                    log,
-                    &format!("read ACL mutex check failed: {err}; spawning anyway"),
-                )?;
-                spawn_read_acl_helper(payload, log).map_err(|spawn_err| {
-                    anyhow::Error::new(SetupFailure::new(
-                        SetupErrorCode::HelperReadAclHelperSpawnFailed,
-                        format!(
-                            "spawn read ACL helper failed after mutex error {err}: {spawn_err}"
-                        ),
-                    ))
-                })?;
-            }
-        }
+        spawn_read_acl_helper(payload, log).map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperReadAclHelperSpawnFailed,
+                format!("run read ACL helper failed: {err}"),
+            ))
+        })?;
     }
 
     if refresh_only {
@@ -962,19 +1007,9 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             continue;
         }
 
-        // These are deny-write carveouts, not deny-read paths. They may come from explicit
-        // read-only-under-a-writable-root carveouts in the transformed sandbox policy, or from
-        // legacy protected children such as `.git`, `.singularity`, and `.agents`.
-        //
-        // Deny ACEs attach to filesystem objects; if an explicit policy carveout does not exist
-        // during setup, the sandbox could otherwise create it later under a writable parent and
-        // bypass the carveout. Materialize missing carveouts as directories so the deny-write ACL
-        // is present before the command starts. Legacy protected children are filtered before
-        // payload creation, so this should not create sentinel directories in a workspace.
-        if !path.exists() {
-            std::fs::create_dir_all(path)
-                .with_context(|| format!("failed to create deny-write path {}", path.display()))?;
-        }
+        // Deny ACEs attach to filesystem objects. Materialize missing carveouts without
+        // following a reparse point in any ancestor so a child cannot create the path later.
+        let created_by_setup = ensure_directory_materialized(path)?;
 
         let deny_sid_strs = workspace_write_cap_sids_for_path(
             &payload.sandbox_home,
@@ -998,6 +1033,19 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 Ok(false) => {}
                 Err(err) => {
                     refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
+                    if created_by_setup
+                        && let Err(cleanup) =
+                            singularity_windows_sandbox::cleanup_empty_runtime_sentinel(
+                                path,
+                                path.parent().unwrap_or(path),
+                                true,
+                            )
+                    {
+                        refresh_errors.push(format!(
+                            "deny ACE sentinel cleanup failed on {}: {cleanup}",
+                            path.display()
+                        ));
+                    }
                     log_line(
                         log,
                         &format!("deny ACE failed on {}: {err}", path.display()),
@@ -1031,7 +1079,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             LocalFree(sandbox_group_psid as HLOCAL);
         }
     }
-    if refresh_only && !refresh_errors.is_empty() {
+    if !refresh_errors.is_empty() {
         log_line(
             log,
             &format!("setup refresh completed with errors: {refresh_errors:?}"),
@@ -1212,6 +1260,8 @@ mod tests {
         )
         .expect("deny sids");
 
-        assert_eq!(deny_sids, vec![workspace_sid, nested_sid]);
+        let mut expected = vec![workspace_sid, nested_sid];
+        expected.sort();
+        assert_eq!(deny_sids, expected);
     }
 }

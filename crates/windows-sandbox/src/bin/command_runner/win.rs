@@ -289,9 +289,9 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     unsafe {
         // These ACL adjustments need the raw SID values, but ownership stays with `cap_psids`.
         // We do not manually `LocalFree` anything here; the wrappers handle every return path.
-        allow_null_device(cap_psid_ptrs[0]);
+        allow_null_device(cap_psid_ptrs[0])?;
         for psid in &cap_psid_ptrs {
-            allow_null_device(*psid);
+            allow_null_device(*psid)?;
         }
     }
 

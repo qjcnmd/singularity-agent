@@ -1,3 +1,5 @@
+use crate::acl::AclOperation;
+use crate::acl::WindowsAclError;
 use crate::winutil::to_wide;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -80,7 +82,10 @@ unsafe fn set_default_dacl(h_token: HANDLE, sids: &[*mut c_void]) -> Result<()> 
         &mut p_new_dacl,
     );
     if res != ERROR_SUCCESS {
-        return Err(anyhow!("SetEntriesInAclW failed: {res}"));
+        return Err(anyhow::Error::new(WindowsAclError {
+            operation: AclOperation::SetEntriesInAcl,
+            code: res,
+        }));
     }
     let mut info = TokenDefaultDaclInfo {
         default_dacl: p_new_dacl,

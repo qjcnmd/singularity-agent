@@ -1,5 +1,7 @@
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use dunce::canonicalize;
+use singularity_core::PROTECTED_GIT_DIR_NAME;
+use singularity_core::PROTECTED_METADATA_PATH_NAMES;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -24,17 +26,26 @@ pub(crate) fn compute_allow_paths_for_permissions(
             allow.insert(p);
         }
     };
-    let mut add_deny_path = |p: PathBuf| {
-        if p.exists() {
-            deny.insert(p);
-        }
-    };
-
     for writable_root in permissions.writable_roots_for_cwd(command_cwd, env_map) {
         let canonical = canonicalize(&writable_root.root).unwrap_or(writable_root.root);
         add_allow_path(canonical);
         for read_only_subpath in writable_root.read_only_subpaths {
-            add_deny_path(read_only_subpath);
+            let missing_metadata_sentinel = read_only_subpath
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    !name.eq_ignore_ascii_case(PROTECTED_GIT_DIR_NAME)
+                        && PROTECTED_METADATA_PATH_NAMES
+                            .iter()
+                            .any(|marker| marker.eq_ignore_ascii_case(name))
+                });
+            if missing_metadata_sentinel || read_only_subpath.exists() {
+                // `.agents` and `.singularity` are runtime-owned directories. Their empty
+                // sentinels are materialized and ACL-protected before the child starts. A
+                // missing `.git` marker is deliberately not materialized because project-root
+                // discovery must continue walking ancestors.
+                deny.insert(read_only_subpath);
+            }
         }
     }
 
@@ -93,7 +104,7 @@ mod tests {
         let writable_roots = vec![AbsolutePathBuf::try_from(extra_root.as_path()).unwrap()];
         let permission_profile = workspace_write_profile(
             &writable_roots,
-            /*exclude_tmpdir_env_var*/ false,
+            /*exclude_tmpdir_env_var*/ true,
             /*exclude_slash_tmp*/ false,
         );
         let workspace_roots = workspace_roots_for(command_cwd.as_path());
@@ -115,7 +126,15 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&extra_root).unwrap())
         );
-        assert!(paths.deny.is_empty(), "no deny paths expected");
+        let expected_deny: HashSet<PathBuf> = [
+            command_cwd.join(".agents"),
+            command_cwd.join(".singularity"),
+            extra_root.join(".agents"),
+            extra_root.join(".singularity"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected_deny, paths.deny);
     }
 
     #[test]
@@ -149,7 +168,13 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&command_cwd).unwrap())
         );
-        assert!(paths.deny.is_empty(), "no deny paths expected");
+        let expected_deny: HashSet<PathBuf> = [
+            workspace_root.join(".agents"),
+            workspace_root.join(".singularity"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected_deny, paths.deny);
     }
 
     #[test]
@@ -187,7 +212,13 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&temp_dir).unwrap())
         );
-        assert!(paths.deny.is_empty(), "no deny paths expected");
+        let expected_deny: HashSet<PathBuf> = [
+            command_cwd.join(".agents"),
+            command_cwd.join(".singularity"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected_deny, paths.deny);
     }
 
     #[test]
@@ -223,7 +254,15 @@ mod tests {
         .collect();
 
         assert_eq!(expected_allow, paths.allow);
-        assert!(paths.deny.is_empty(), "no deny paths expected");
+        let expected_deny: HashSet<PathBuf> = [
+            command_cwd.join(".agents"),
+            command_cwd.join(".singularity"),
+            temp_dir.join(".agents"),
+            temp_dir.join(".singularity"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected_deny, paths.deny);
     }
 
     #[test]
@@ -250,7 +289,13 @@ mod tests {
             .collect();
 
         assert_eq!(expected_allow, paths.allow);
-        assert!(paths.deny.is_empty(), "no deny paths expected");
+        let expected_deny: HashSet<PathBuf> = [
+            command_cwd.join(".agents"),
+            command_cwd.join(".singularity"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected_deny, paths.deny);
     }
 
     #[test]
@@ -276,9 +321,13 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
-        let expected_deny: HashSet<PathBuf> = [dunce::canonicalize(&git_dir).unwrap()]
-            .into_iter()
-            .collect();
+        let expected_deny: HashSet<PathBuf> = [
+            dunce::canonicalize(&git_dir).unwrap(),
+            command_cwd.join(".agents"),
+            command_cwd.join(".singularity"),
+        ]
+        .into_iter()
+        .collect();
 
         assert_eq!(expected_allow, paths.allow);
         assert_eq!(expected_deny, paths.deny);
@@ -308,9 +357,13 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
-        let expected_deny: HashSet<PathBuf> = [dunce::canonicalize(&git_file).unwrap()]
-            .into_iter()
-            .collect();
+        let expected_deny: HashSet<PathBuf> = [
+            dunce::canonicalize(&git_file).unwrap(),
+            command_cwd.join(".agents"),
+            command_cwd.join(".singularity"),
+        ]
+        .into_iter()
+        .collect();
 
         assert_eq!(expected_allow, paths.allow);
         assert_eq!(expected_deny, paths.deny);
@@ -353,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_protected_subdirs_when_missing() {
+    fn reserves_runtime_metadata_subdirs_when_missing() {
         let tmp = TempDir::new().expect("tempdir");
         let command_cwd = tmp.path().join("workspace");
         let _ = fs::create_dir_all(&command_cwd);
@@ -372,9 +425,13 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(paths.allow.len(), 1);
-        assert!(
-            paths.deny.is_empty(),
-            "no deny when protected dirs are absent"
-        );
+        let expected_deny: HashSet<PathBuf> = [
+            command_cwd.join(".agents"),
+            command_cwd.join(".singularity"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(expected_deny, paths.deny);
+        assert!(!paths.deny.contains(&command_cwd.join(".git")));
     }
 }

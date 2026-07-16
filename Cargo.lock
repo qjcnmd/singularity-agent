@@ -1542,6 +1542,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "singularity_core",
  "tempfile",
  "tracing-appender",
  "windows",

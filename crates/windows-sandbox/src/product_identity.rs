@@ -11,7 +11,7 @@ pub const ONLINE_ACCOUNT_NAME: &str = "SgSandboxOnline";
 pub const SANDBOX_USERS_GROUP_NAME: &str = "SingularitySandboxUsers";
 pub const SANDBOX_USERS_GROUP_COMMENT: &str = "Singularity sandbox internal group (managed)";
 
-pub const PROTECTED_METADATA_DIR_NAME: &str = ".singularity";
+pub use singularity_core::PROTECTED_METADATA_DIR_NAME;
 pub const SANDBOX_HOME_ENV: &str = "SINGULARITY_HOME";
 pub const SANDBOX_STATE_DIR_NAME: &str = ".sandbox";
 pub const SANDBOX_BIN_DIR_NAME: &str = ".sandbox-bin";

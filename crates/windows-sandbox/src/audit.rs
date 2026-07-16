@@ -1,7 +1,6 @@
 use crate::acl::add_deny_write_ace;
 use crate::acl::path_mask_allows;
-use crate::cap::cap_sid_file;
-use crate::cap::load_or_create_cap_sids;
+use crate::cap::workspace_cap_sid_for_cwd;
 use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
 use crate::logging::log_note;
@@ -260,9 +259,6 @@ fn apply_capability_denies_for_world_writable_for_permissions(
         return Ok(());
     }
     std::fs::create_dir_all(sandbox_home)?;
-    let cap_path = cap_sid_file(sandbox_home);
-    let caps = load_or_create_cap_sids(sandbox_home)?;
-    std::fs::write(&cap_path, serde_json::to_string(&caps)?)?;
     if !permissions.is_enforceable_by_windows_sandbox() {
         return Ok(());
     }
@@ -284,7 +280,8 @@ fn apply_capability_denies_for_world_writable_for_permissions(
                 .collect::<Result<Vec<_>>>()?;
             (active_sids, roots)
         } else {
-            (vec![LocalSid::from_string(&caps.readonly)?], Vec::new())
+            let sid = workspace_cap_sid_for_cwd(sandbox_home, cwd)?;
+            (vec![LocalSid::from_string(&sid)?], Vec::new())
         };
     for path in flagged {
         if workspace_roots

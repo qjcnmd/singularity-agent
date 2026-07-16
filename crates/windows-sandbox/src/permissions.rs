@@ -1,14 +1,12 @@
 use crate::absolute_path::AbsolutePathBuf;
-use crate::product_identity::PROTECTED_METADATA_DIR_NAME;
 use serde::Deserialize;
 use serde::Serialize;
+use singularity_core::PROTECTED_METADATA_PATH_NAMES;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 
 const PROJECT_ROOTS_GLOB_PATTERN_PREFIX: &str = "singularity-project-roots://";
-const PROTECTED_METADATA_PATH_NAMES: &[&str] = &[".git", ".agents", PROTECTED_METADATA_DIR_NAME];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkSandboxPolicy {

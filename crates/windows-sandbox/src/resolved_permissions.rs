@@ -6,6 +6,7 @@ use crate::permissions::FileSystemSandboxPolicy;
 use crate::permissions::NetworkSandboxPolicy;
 use crate::permissions::PermissionProfile;
 use anyhow::Result;
+use singularity_core::PROTECTED_METADATA_PATH_NAMES;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -169,9 +170,13 @@ impl ResolvedWindowsSandboxPermissions {
 
         if self.has_writable_tmpdir_entry() {
             roots.extend(windows_temp_env_roots(env_map).into_iter().map(|root| {
+                let read_only_subpaths = PROTECTED_METADATA_PATH_NAMES
+                    .iter()
+                    .map(|name| root.join(name))
+                    .collect();
                 WindowsWritableRoot {
                     root,
-                    read_only_subpaths: Vec::new(),
+                    read_only_subpaths,
                 }
             }));
         }

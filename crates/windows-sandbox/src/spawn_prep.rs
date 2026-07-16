@@ -5,11 +5,12 @@ use crate::acl::allow_null_device;
 use crate::acl::ensure_allow_write_aces;
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
-use crate::cap::load_or_create_cap_sids;
+use crate::cap::workspace_cap_sid_for_cwd;
 use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
 use crate::cap::workspace_write_root_overlaps_path;
 use crate::cap::workspace_write_root_specificity;
+use crate::deny_read_acl::ensure_directory_materialized;
 use crate::deny_read_state::sync_persistent_deny_read_acls;
 use crate::env::apply_no_network_to_env;
 use crate::env::ensure_non_interactive_pager;
@@ -30,7 +31,6 @@ use crate::token::get_logon_sid_bytes;
 use crate::workspace_acl::is_command_cwd_root;
 use crate::workspace_acl::protect_workspace_agents_dir;
 use crate::workspace_acl::protect_workspace_singularity_dir;
-use anyhow::Context;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -141,7 +141,6 @@ pub(crate) fn prepare_restricted_token_security(
     cwd: &Path,
     capability_roots: impl IntoIterator<Item = PathBuf>,
 ) -> Result<RestrictedTokenSecurity> {
-    let caps = load_or_create_cap_sids(sandbox_home)?;
     let (h_token, readonly_sid, readonly_sid_str, write_root_sids) = unsafe {
         if uses_write_capabilities {
             let write_root_sids = root_capability_sids(sandbox_home, cwd, capability_roots)?;
@@ -158,9 +157,10 @@ pub(crate) fn prepare_restricted_token_security(
             let h_token = h_token?;
             (h_token, None, None, write_root_sids)
         } else {
-            let psid = LocalSid::from_string(&caps.readonly)?;
+            let sid_str = workspace_cap_sid_for_cwd(sandbox_home, cwd)?;
+            let psid = LocalSid::from_string(&sid_str)?;
             let (h_token, _psid) = create_readonly_token_with_cap(psid.as_ptr())?;
-            (h_token, Some(psid), Some(caps.readonly), Vec::new())
+            (h_token, Some(psid), Some(sid_str), Vec::new())
         }
     };
 
@@ -238,20 +238,20 @@ fn deny_root_capabilities_for_path<'a>(
     }
 }
 
-pub(crate) fn allow_null_device_for_workspace_write(is_workspace_write: bool) {
+pub(crate) fn allow_null_device_for_workspace_write(is_workspace_write: bool) -> Result<()> {
     if !is_workspace_write {
-        return;
+        return Ok(());
     }
 
     unsafe {
-        if let Ok(base) = get_current_token_for_restriction() {
-            if let Ok(bytes) = get_logon_sid_bytes(base) {
-                let mut tmp = bytes;
-                let psid = tmp.as_mut_ptr() as *mut c_void;
-                allow_null_device(psid);
-            }
-            CloseHandle(base);
-        }
+        let base = get_current_token_for_restriction()?;
+        let result = (|| -> Result<()> {
+            let mut bytes = get_logon_sid_bytes(base)?;
+            let psid = bytes.as_mut_ptr() as *mut c_void;
+            allow_null_device(psid)
+        })();
+        CloseHandle(base);
+        result
     }
 }
 
@@ -267,31 +267,33 @@ pub(crate) fn apply_restricted_token_acl_rules(
 ) -> Result<()> {
     let AllowDenyPaths { allow, mut deny } =
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
-    unsafe {
-        for path in additional_deny_write_paths {
-            // Explicit carveouts must exist before the command starts so the
-            // sandbox cannot create them under a writable parent first.
-            if !path.exists() {
-                std::fs::create_dir_all(path)
-                    .with_context(|| format!("create deny-write path {}", path.display()))?;
-            }
-            deny.insert(path.clone());
+    for path in additional_deny_write_paths {
+        // Explicit carveouts must exist before the command starts so the sandbox cannot create
+        // them under a writable parent first. The helper rejects reparse-point ancestors.
+        ensure_directory_materialized(path)?;
+        deny.insert(path.clone());
+    }
+    for path in &deny {
+        if std::fs::symlink_metadata(path).is_err() {
+            ensure_directory_materialized(path)?;
         }
+    }
+    unsafe {
         if let Some(readonly_sid) = acl_sids.readonly_sid {
             for p in &allow {
-                let _ = add_allow_ace(p, readonly_sid.as_ptr());
+                add_allow_ace(p, readonly_sid.as_ptr())?;
             }
         } else {
             for p in &allow {
                 let Some(root_sid) = matching_root_capability(p, acl_sids.write_root_sids) else {
                     continue;
                 };
-                let _ = ensure_allow_write_aces(p, &[root_sid.sid.as_ptr()]);
+                ensure_allow_write_aces(p, &[root_sid.sid.as_ptr()])?;
             }
         }
         for p in &deny {
             for root_sid in deny_root_capabilities_for_path(p, acl_sids.write_root_sids) {
-                let _ = add_deny_write_ace(p, root_sid.sid.as_ptr());
+                add_deny_write_ace(p, root_sid.sid.as_ptr())?;
             }
         }
         if !additional_deny_read_paths.is_empty() {
@@ -317,10 +319,10 @@ pub(crate) fn apply_restricted_token_acl_rules(
             }
         }
         for root_sid in acl_sids.write_root_sids {
-            allow_null_device(root_sid.sid.as_ptr());
+            allow_null_device(root_sid.sid.as_ptr())?;
         }
         if let Some(readonly_sid) = acl_sids.readonly_sid {
-            allow_null_device(readonly_sid.as_ptr());
+            allow_null_device(readonly_sid.as_ptr())?;
         }
         if !acl_sids.write_root_sids.is_empty()
             && let Some(workspace_sid) =
@@ -328,8 +330,8 @@ pub(crate) fn apply_restricted_token_acl_rules(
         {
             let canonical_cwd = canonicalize_path(current_dir);
             if is_command_cwd_root(&workspace_sid.root, &canonical_cwd) {
-                let _ = protect_workspace_singularity_dir(current_dir, workspace_sid.sid.as_ptr());
-                let _ = protect_workspace_agents_dir(current_dir, workspace_sid.sid.as_ptr());
+                protect_workspace_singularity_dir(current_dir, workspace_sid.sid.as_ptr())?;
+                protect_workspace_agents_dir(current_dir, workspace_sid.sid.as_ptr())?;
             }
         }
     }
