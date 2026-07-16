@@ -235,6 +235,8 @@ pub use deny_read_acl::ProtectedMetadataError;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::apply_deny_read_acls;
 #[cfg(target_os = "windows")]
+pub use deny_read_acl::ensure_case_insensitive_path_ancestors;
+#[cfg(target_os = "windows")]
 pub use deny_read_acl::ensure_directory_materialized;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::ensure_missing_protected_path_materialized;

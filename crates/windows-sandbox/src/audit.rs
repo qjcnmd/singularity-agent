@@ -3,6 +3,7 @@ use crate::acl::path_mask_allows;
 use crate::cap::workspace_cap_sid_for_cwd;
 use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
+use crate::deny_read_acl::ensure_case_insensitive_path_ancestors;
 use crate::logging::log_note;
 use crate::path_normalization::canonical_path_key;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
@@ -290,6 +291,7 @@ fn apply_capability_denies_for_world_writable_for_permissions(
         {
             continue;
         }
+        ensure_case_insensitive_path_ancestors(path)?;
         for active_sid in &active_sids {
             let res = unsafe { add_deny_write_ace(path, active_sid.as_ptr()) };
             match res {

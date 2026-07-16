@@ -10,6 +10,7 @@ use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
 use crate::cap::workspace_write_root_overlaps_path;
 use crate::cap::workspace_write_root_specificity;
+use crate::deny_read_acl::ensure_case_insensitive_path_ancestors;
 use crate::deny_read_acl::ensure_missing_protected_path_materialized;
 use crate::deny_read_state::sync_persistent_deny_read_acls;
 use crate::env::apply_no_network_to_env;
@@ -270,6 +271,7 @@ pub(crate) fn apply_restricted_token_acl_rules(
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
     let mut materialized = HashMap::new();
     for path in additional_deny_write_paths {
+        ensure_case_insensitive_path_ancestors(path)?;
         // Explicit carveouts must exist before the command starts so the sandbox cannot create
         // them under a writable parent first. The helper rejects reparse-point ancestors.
         match std::fs::symlink_metadata(path) {
@@ -285,6 +287,7 @@ pub(crate) fn apply_restricted_token_acl_rules(
         deny.insert(path.clone());
     }
     for path in &deny {
+        ensure_case_insensitive_path_ancestors(path)?;
         match std::fs::symlink_metadata(path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

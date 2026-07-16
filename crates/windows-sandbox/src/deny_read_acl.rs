@@ -46,14 +46,18 @@ use windows_sys::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY;
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FileCaseSensitiveInfo;
 use windows_sys::Win32::Storage::FileSystem::FileDispositionInfoEx;
 use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
+use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
+use windows_sys::Win32::System::WindowsProgramming::FILE_CASE_SENSITIVE_INFO;
 use windows_sys::Win32::System::WindowsProgramming::FILE_CREATED;
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -176,14 +180,47 @@ fn absolute_path_components(path: &Path) -> Result<(PathBuf, Vec<std::ffi::OsStr
     Ok((anchor, descendants))
 }
 
-fn validate_plain_directory(file: &std::fs::File) -> Result<()> {
+fn reject_case_sensitive_directory(flags: u32, path: &Path) -> Result<()> {
+    if flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0 {
+        return Err(anyhow::Error::new(
+            ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
+                path: path.to_path_buf(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_case_insensitive_directory(file: &std::fs::File, path: &Path) -> Result<()> {
+    let mut information = FILE_CASE_SENSITIVE_INFO { Flags: 0 };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileCaseSensitiveInfo,
+            &mut information as *mut _ as *mut c_void,
+            std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+        )
+    } == 0
+    {
+        let code = unsafe { GetLastError() };
+        return Err(anyhow::Error::new(
+            ProtectedMetadataError::CaseSensitivityQueryFailed {
+                path: path.to_path_buf(),
+                code,
+            },
+        ));
+    }
+    reject_case_sensitive_directory(information.Flags, path)
+}
+
+fn validate_plain_directory(file: &std::fs::File, path: &Path) -> Result<()> {
     let metadata = file
         .metadata()
         .context("inspect pinned materialized deny directory")?;
     if !metadata.is_dir() || is_reparse_point_attributes(metadata.file_attributes()) {
         anyhow::bail!("materialized deny target is not a plain directory");
     }
-    Ok(())
+    ensure_case_insensitive_directory(file, path)
 }
 
 fn open_filesystem_root(anchor: &Path) -> Result<std::fs::File> {
@@ -195,7 +232,7 @@ fn open_filesystem_root(anchor: &Path) -> Result<std::fs::File> {
     let file = options
         .open(anchor)
         .with_context(|| format!("open deny path filesystem root {}", anchor.display()))?;
-    validate_plain_directory(&file)?;
+    validate_plain_directory(&file, anchor)?;
     Ok(file)
 }
 
@@ -279,6 +316,7 @@ fn open_or_create_directory_at(
     parent: &std::fs::File,
     name: &OsStr,
     desired_access: u32,
+    path: &Path,
 ) -> Result<(std::fs::File, bool)> {
     let (file, information) = nt_open_relative(
         parent,
@@ -293,8 +331,38 @@ fn open_or_create_directory_at(
             name.to_string_lossy()
         )
     })?;
-    validate_plain_directory(&file)?;
+    validate_plain_directory(&file, path)?;
     Ok((file, information == FILE_CREATED as usize))
+}
+
+fn open_existing_directory_at(
+    parent: &std::fs::File,
+    name: &OsStr,
+    path: &Path,
+) -> Result<Option<std::fs::File>> {
+    let file = match nt_open_relative(
+        parent,
+        name,
+        FILE_LIST_DIRECTORY,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
+    ) {
+        Ok((file, _)) => file,
+        Err(error)
+            if matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("open existing deny path parent {}", path.display()));
+        }
+    };
+    validate_plain_directory(&file, path)?;
+    Ok(Some(file))
 }
 
 fn ancestor_has_git_marker(directory: &std::fs::File) -> Result<bool> {
@@ -316,6 +384,24 @@ fn ancestor_has_git_marker(directory: &std::fs::File) -> Result<bool> {
         }
         Err(error) => Err(error).context("inspect ancestor Git marker"),
     }
+}
+
+/// Rejects a path whose existing parent chain uses NTFS per-directory case sensitivity.
+///
+/// The sandbox's path keys and Windows ACL opens are intentionally case-insensitive. Admitting a
+/// case-sensitive parent would let distinct names collapse into one policy/state entry.
+pub fn ensure_case_insensitive_path_ancestors(path: &Path) -> Result<()> {
+    let (anchor, descendants) = absolute_path_components(path)?;
+    let mut current = open_filesystem_root(&anchor)?;
+    let mut current_path = anchor;
+    for component in descendants.iter().take(descendants.len() - 1) {
+        current_path.push(component);
+        let Some(next) = open_existing_directory_at(&current, component, &current_path)? else {
+            return Ok(());
+        };
+        current = next;
+    }
+    Ok(())
 }
 
 /// Creates or opens an absolute directory through pinned, no-follow native handles.
@@ -348,18 +434,22 @@ fn ensure_directory_materialized_with_hook(
         }
         if is_final {
             before_final_create.take().expect("single final hook")();
+            let final_path = current_path.join(component);
             let (file, created_by_runtime) = open_or_create_directory_at(
                 &current,
                 component,
                 DELETE | READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY,
+                &final_path,
             )?;
+            ensure_case_insensitive_directory(&current, &current_path)?;
             return Ok(MaterializedDirectory {
                 file,
                 created_by_runtime,
             });
         }
-        current = open_or_create_directory_at(&current, component, FILE_LIST_DIRECTORY)?.0;
         current_path.push(component);
+        current =
+            open_or_create_directory_at(&current, component, FILE_LIST_DIRECTORY, &current_path)?.0;
     }
     unreachable!("absolute path parser requires at least one descendant")
 }
@@ -429,6 +519,13 @@ pub enum ProtectedMetadataError {
         path: PathBuf,
         ancestor_git_marker: PathBuf,
     },
+    CaseSensitiveDirectoryUnsupported {
+        path: PathBuf,
+    },
+    CaseSensitivityQueryFailed {
+        path: PathBuf,
+        code: u32,
+    },
 }
 
 impl fmt::Display for ProtectedMetadataError {
@@ -442,6 +539,16 @@ impl fmt::Display for ProtectedMetadataError {
                 "unsupported_nested_git_marker: {} (ancestor={})",
                 path.display(),
                 ancestor_git_marker.display()
+            ),
+            Self::CaseSensitiveDirectoryUnsupported { path } => write!(
+                f,
+                "unsupported_case_sensitive_directory: {}",
+                path.display()
+            ),
+            Self::CaseSensitivityQueryFailed { path, code } => write!(
+                f,
+                "case_sensitivity_query_failed: {} (code={code})",
+                path.display()
             ),
         }
     }
@@ -502,6 +609,9 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership_before_set(
     psid: *mut c_void,
     before_set: &mut dyn FnMut(&ManagedDenyReadAcl) -> Result<()>,
 ) -> Result<AppliedDenyReadAcls> {
+    for path in paths {
+        ensure_case_insensitive_path_ancestors(path)?;
+    }
     let planned = plan_deny_read_acl_paths(paths);
     let mut applied = Vec::new();
     let mut seen = HashSet::new();
@@ -591,17 +701,29 @@ mod tests {
     use super::ensure_directory_materialized;
     use super::ensure_directory_materialized_with_hook;
     use super::plan_deny_read_acl_paths;
+    use super::reject_case_sensitive_directory;
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
     use crate::acl::revoke_deny_read_ace;
     use crate::token::LocalSid;
     use pretty_assertions::assert_eq;
     use std::collections::HashSet;
+    use std::ffi::c_void;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::FileCaseSensitiveInfo;
+    use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+    use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
+    use windows_sys::Win32::System::WindowsProgramming::FILE_CASE_SENSITIVE_INFO;
 
     #[test]
     fn plan_preserves_missing_paths() {
@@ -692,6 +814,62 @@ mod tests {
             ensure_directory_materialized(Path::new(r"\rooted-without-drive\sentinel")).is_err()
         );
         assert!(ensure_directory_materialized(Path::new(r"\\.\PIPE\sentinel")).is_err());
+    }
+
+    #[test]
+    fn case_sensitive_flag_is_typed_unsupported() {
+        let path = Path::new(r"C:\workspace");
+        reject_case_sensitive_directory(0, path).expect("ordinary directory");
+        let error = reject_case_sensitive_directory(FILE_CS_FLAG_CASE_SENSITIVE_DIR, path)
+            .expect_err("case-sensitive directory must fail closed");
+        assert_eq!(
+            error.downcast_ref::<ProtectedMetadataError>(),
+            Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
+                path: path.to_path_buf(),
+            })
+        );
+    }
+
+    #[test]
+    fn enabled_case_sensitive_directory_is_rejected_before_acl_planning() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("case-sensitive-workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        let directory = options.open(&workspace).expect("open workspace attributes");
+        let information = FILE_CASE_SENSITIVE_INFO {
+            Flags: FILE_CS_FLAG_CASE_SENSITIVE_DIR,
+        };
+        if unsafe {
+            SetFileInformationByHandle(
+                directory.as_raw_handle() as _,
+                FileCaseSensitiveInfo,
+                &information as *const _ as *const c_void,
+                std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+            )
+        } == 0
+        {
+            // Enabling the NTFS flag requires an elevated token on some hosts. The pure flag test
+            // above still fixes the contract; CI or elevated environments exercise this path.
+            return;
+        }
+        drop(directory);
+        let protected = workspace.join("secret.pem");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+
+        let error = unsafe { apply_deny_read_acls(std::slice::from_ref(&protected), sid.as_ptr()) }
+            .expect_err("enabled case-sensitive parent must fail closed");
+
+        assert_eq!(
+            error.downcast_ref::<ProtectedMetadataError>(),
+            Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported { path: workspace })
+        );
+        assert!(!protected.exists(), "failure must precede materialization");
     }
 
     #[test]

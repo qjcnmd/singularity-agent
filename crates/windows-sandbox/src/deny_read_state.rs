@@ -2,6 +2,7 @@ use crate::acl::deny_read_acl_fingerprint;
 use crate::acl::revoke_deny_read_ace_with_fingerprint;
 use crate::deny_read_acl::ManagedDenyReadAcl;
 use crate::deny_read_acl::apply_deny_read_acls_with_ownership_before_set;
+use crate::deny_read_acl::ensure_case_insensitive_path_ancestors;
 use crate::path_normalization::canonical_path_key_allow_missing;
 use crate::path_normalization::lexical_path_key;
 use crate::setup::sandbox_dir;
@@ -500,6 +501,21 @@ pub unsafe fn sync_persistent_deny_read_acls(
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
     let _lock = lock_state(&state_path)?;
     let mut state = load_state(&state_path)?;
+    for managed in state
+        .principals
+        .get(principal_sid)
+        .into_iter()
+        .flatten()
+        .chain(
+            state
+                .pending_principals
+                .get(principal_sid)
+                .into_iter()
+                .flatten(),
+        )
+    {
+        ensure_case_insensitive_path_ancestors(&managed.path)?;
+    }
     if unsafe { recover_pending_principal(&mut state, principal_sid, psid) }? {
         store_state(&state_path, &state).context("commit recovered pending deny-read ownership")?;
     }

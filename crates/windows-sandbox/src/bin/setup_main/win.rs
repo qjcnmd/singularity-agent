@@ -18,6 +18,7 @@ use singularity_windows_sandbox::canonicalize_path;
 use singularity_windows_sandbox::convert_string_sid_to_sid;
 use singularity_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use singularity_windows_sandbox::ensure_allow_write_aces;
+use singularity_windows_sandbox::ensure_case_insensitive_path_ancestors;
 use singularity_windows_sandbox::ensure_missing_protected_path_materialized;
 use singularity_windows_sandbox::extract_setup_failure;
 use singularity_windows_sandbox::hide_newly_created_users;
@@ -951,6 +952,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         if !seen_deny_paths.insert(path.clone()) {
             continue;
         }
+        ensure_case_insensitive_path_ancestors(path)?;
 
         // Deny ACEs attach to filesystem objects. Materialize only missing carveouts without
         // following a reparse point in any ancestor so a child cannot create the path later.
