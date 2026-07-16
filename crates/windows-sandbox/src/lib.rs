@@ -160,6 +160,7 @@ mod winutil;
 #[cfg(target_os = "windows")]
 mod workspace_acl;
 
+#[cfg(target_os = "windows")]
 mod deny_read_resolver;
 
 #[cfg(target_os = "windows")]
@@ -239,6 +240,7 @@ pub use deny_read_acl::ensure_directory_materialized;
 pub use deny_read_acl::ensure_missing_protected_path_materialized;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::plan_deny_read_acl_paths;
+#[cfg(target_os = "windows")]
 pub use deny_read_resolver::resolve_windows_deny_read_paths;
 #[cfg(target_os = "windows")]
 pub use deny_read_state::acquire_registered_runner_lease;
