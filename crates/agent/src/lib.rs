@@ -3639,11 +3639,7 @@ pub fn project_audit_event(metadata: &Value) -> Value {
                 "unavailable",
             ],
         ),
-        approval_policy: allowed_label(
-            object,
-            "approval_policy",
-            &["never", "on-request", "untrusted"],
-        ),
+        approval_policy: allowed_label(object, "approval_policy", &["never", "on-request"]),
         command_provenance: allowed_label(object, "command_provenance", &["agent_requested"]),
         command_scope_digest: object
             .and_then(|fields| fields.get("command_scope_digest"))
@@ -3674,12 +3670,7 @@ pub fn project_audit_event(metadata: &Value) -> Value {
         sandbox_mode: allowed_label(
             object,
             "sandbox_mode",
-            &[
-                "danger_full_access",
-                "read_only",
-                "unknown",
-                "workspace_write",
-            ],
+            &["read_only", "unknown", "workspace_write"],
         ),
         timeout_seconds: object
             .and_then(|fields| fields.get("timeout_seconds"))
@@ -3942,7 +3933,6 @@ fn effective_command_policy(
     let session_filesystem = match profile.profile {
         PermissionProfileName::ReadOnly => SandboxFilesystemMode::ReadOnly,
         PermissionProfileName::WorkspaceWrite => SandboxFilesystemMode::WorkspaceWrite,
-        PermissionProfileName::DangerFullAccess => SandboxFilesystemMode::DangerFullAccess,
     };
     let session_network = match profile.network_access {
         NetworkAccess::Denied => SandboxNetworkMode::Denied,
@@ -4048,12 +4038,12 @@ fn update_plan_tool_input(arguments: &Value) -> Result<AgentPlan, AgentLoopToolE
 
 fn permission_failure_kind(cause: &PermissionDecisionCause) -> ToolFailureKind {
     match cause {
+        PermissionDecisionCause::FilesystemProfile => ToolFailureKind::PermissionProfile,
         PermissionDecisionCause::NetworkProfile => ToolFailureKind::PermissionProfile,
         PermissionDecisionCause::ProtectedResource => ToolFailureKind::ProtectedPath,
         PermissionDecisionCause::ApprovalPolicy => ToolFailureKind::Approval,
         PermissionDecisionCause::Explicit
         | PermissionDecisionCause::Rule
-        | PermissionDecisionCause::Hook
         | PermissionDecisionCause::NoMatchingRule => ToolFailureKind::Policy,
     }
 }

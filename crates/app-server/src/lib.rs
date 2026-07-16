@@ -26,7 +26,8 @@ use singularity_core::{
 use singularity_model::{Provider, ProviderConfigSnapshot};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecisionOutcome,
-    PermissionOperation, PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
+    PermissionOperation, PermissionProfile, PermissionProfileName, PermissionRule, PolicyEngine,
+    SettingsScope,
 };
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams,
@@ -430,9 +431,13 @@ impl AppServer {
             Ok(cwd) => cwd,
             Err(error) => return invalid_request_response(message.id, error),
         };
-        let (thread, _trace) = self.store.create_thread_with_trace(
+        let (thread, _trace) = self.store.create_thread_with_trace_and_policy(
             params.model.as_deref(),
             Some(&cwd),
+            params
+                .sandbox_mode
+                .unwrap_or(PermissionProfileName::WorkspaceWrite),
+            params.approval_policy.unwrap_or(ApprovalPolicy::OnRequest),
             "app_server",
             "thread started",
         )?;
@@ -472,9 +477,11 @@ impl AppServer {
             Ok(cwd) => cwd,
             Err(error) => return invalid_request_response(message.id, error),
         };
-        let thread = self.store.create_thread(
+        let thread = self.store.create_thread_with_policy(
             params.model.as_deref().or(source.model.as_deref()),
             Some(&cwd),
+            params.sandbox_mode.unwrap_or(source.sandbox_mode),
+            params.approval_policy.unwrap_or(source.approval_policy),
         )?;
         Ok(vec![
             JsonRpcMessage::response(
@@ -709,7 +716,9 @@ impl AppServer {
                 let category = error.error.category();
                 let turn_id = &request.turn_id;
                 let turn = self.store.get_turn(turn_id)?;
+                let thread = self.store.get_thread(&request.thread_id)?;
                 let mut run_status = approval_terminal_status(
+                    &thread,
                     decision,
                     pending_tool_call.as_ref(),
                     AgentStatus::Failed,
@@ -751,6 +760,7 @@ impl AppServer {
         {
             return Ok(None);
         }
+        let thread = self.store.get_thread(&turn.thread_id)?;
         let Some(pending_tool_call) = pending_tool_call else {
             return Ok(None);
         };
@@ -758,6 +768,7 @@ impl AppServer {
             Ok(pending) => pending,
             Err(error) => {
                 let run_status = approval_terminal_status(
+                    &thread,
                     decision,
                     Some(&pending_tool_call),
                     AgentStatus::Failed,
@@ -769,6 +780,7 @@ impl AppServer {
         };
         if pending.request_id != request.request_id {
             let run_status = approval_terminal_status(
+                &thread,
                 decision,
                 Some(&pending_tool_call),
                 AgentStatus::Failed,
@@ -777,7 +789,6 @@ impl AppServer {
             );
             return Ok(Some((turn, run_status, Vec::new())));
         }
-        let thread = self.store.get_thread(&turn.thread_id)?;
         if thread.status != singularity_protocol::ThreadStatus::Active {
             return Ok(None);
         }
@@ -785,6 +796,7 @@ impl AppServer {
             Ok(workspace_root) => workspace_root,
             Err(error) => {
                 let run_status = approval_terminal_status(
+                    &thread,
                     decision,
                     Some(&pending_tool_call),
                     AgentStatus::Failed,
@@ -811,7 +823,11 @@ impl AppServer {
         )?;
         let registry = workspace_tool_registry();
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
-        let policy = workspace_policy(workspace_root_display);
+        let policy = workspace_policy(
+            workspace_root_display,
+            thread.sandbox_mode,
+            thread.approval_policy,
+        );
         let loop_input = match agent_loop_input(
             &thread,
             &params,
@@ -822,6 +838,7 @@ impl AppServer {
             Ok(input) => input.with_approval_grant(grant),
             Err(error) => {
                 let run_status = approval_terminal_status(
+                    &thread,
                     decision,
                     Some(&pending_tool_call),
                     AgentStatus::Failed,
@@ -851,6 +868,7 @@ impl AppServer {
         };
         if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
             let audit_status = approval_terminal_status(
+                &thread,
                 decision,
                 Some(&pending_tool_call),
                 run_status.status.clone(),
@@ -880,7 +898,11 @@ impl AppServer {
         let registry = workspace_tool_registry();
         let workspace_root = workspace_root(thread).map_err(AppServerError::Workspace)?;
         let workspace_root_display = workspace_root.to_string_lossy().into_owned();
-        let policy = workspace_policy(workspace_root_display);
+        let policy = workspace_policy(
+            workspace_root_display,
+            thread.sandbox_mode,
+            thread.approval_policy,
+        );
         let loop_input = agent_loop_input(thread, params, turn_id, &workspace_root, history)?;
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
             .with_workspace_tools(workspace_tools(
@@ -1332,7 +1354,9 @@ impl AppServer {
                 "approval continuation failed: {continuation_error}; failed to load claimed turn for terminalization: {error}"
             )))
         })?;
+        let thread = self.store.get_thread(&turn.thread_id)?;
         let fallback_status = approval_terminal_status(
+            &thread,
             decision,
             pending_tool_call,
             AgentStatus::Failed,
@@ -1369,6 +1393,7 @@ impl AppServer {
         pending_tool_call: Option<&Value>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
         let turn = self.store.get_turn(&request.turn_id)?;
+        let thread = self.store.get_thread(&turn.thread_id)?;
         if pending_tool_call.is_none() {
             return Ok(None);
         }
@@ -1410,8 +1435,14 @@ impl AppServer {
                 ApprovalOutcome::Defer => (AgentStatus::Blocked, "deferred", "approval deferred"),
             }
         };
-        let run_status =
-            approval_terminal_status(decision, pending_tool_call, status, audit_decision, message);
+        let run_status = approval_terminal_status(
+            &thread,
+            decision,
+            pending_tool_call,
+            status,
+            audit_decision,
+            message,
+        );
         Ok(Some((turn, run_status)))
     }
 
@@ -1594,6 +1625,7 @@ fn cancellation_monitor(
 }
 
 fn approval_terminal_status(
+    thread: &Thread,
     decision: &ApprovalDecision,
     pending_tool_call: Option<&Value>,
     status: AgentStatus,
@@ -1603,13 +1635,13 @@ fn approval_terminal_status(
     let mut run_status = AgentRunStatus::failed(message).with_status(status);
     run_status.approval_count = 1;
     let mut audit_event = json!({
-        "approval_policy": ApprovalPolicy::OnRequest,
+        "approval_policy": thread.approval_policy,
         "approval_decision": audit_decision,
         "approval_request_id": decision.request_id,
         "approval_decision_id": decision.decision_id,
         "command_provenance": "agent_requested",
     });
-    if let Some(command_audit) = pending_command_audit_metadata(pending_tool_call) {
+    if let Some(command_audit) = pending_command_audit_metadata(pending_tool_call, thread) {
         merge_json_object(&mut audit_event, command_audit);
     }
     run_status
@@ -1618,7 +1650,10 @@ fn approval_terminal_status(
     run_status
 }
 
-fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<Value> {
+fn pending_command_audit_metadata(
+    pending_tool_call: Option<&Value>,
+    thread: &Thread,
+) -> Option<Value> {
     let pending_value = pending_tool_call?;
     let tool_name = pending_value.get("tool_name").and_then(Value::as_str)?;
     if tool_name != TOOL_COMMAND {
@@ -1635,8 +1670,8 @@ fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<V
     let audit = json!({
         "sandbox_backend": "not_executed",
         "sandbox_enforcement": "not_executed",
-        "sandbox_mode": "unknown",
-        "network_access": "unknown",
+        "sandbox_mode": sandbox_mode_audit_label(thread.sandbox_mode),
+        "network_access": "denied",
         "command_scope_digest": scope_digest.unwrap_or("unavailable"),
         "policy_scope_binding": if scope_digest.is_some() {
             "bound"
@@ -1831,10 +1866,26 @@ fn agent_loop_unavailable_message(capability: &AgentLoopCapability) -> String {
         capability.status.as_str()
     )
 }
-fn workspace_policy(workspace_root: String) -> PolicyEngine {
-    PolicyEngine::new(PermissionProfile::workspace_write(workspace_root))
+fn workspace_policy(
+    workspace_root: String,
+    sandbox_mode: PermissionProfileName,
+    approval_policy: ApprovalPolicy,
+) -> PolicyEngine {
+    let mut profile = match sandbox_mode {
+        PermissionProfileName::ReadOnly => PermissionProfile::read_only(workspace_root),
+        PermissionProfileName::WorkspaceWrite => PermissionProfile::workspace_write(workspace_root),
+    };
+    profile.approval_policy = approval_policy;
+    PolicyEngine::new(profile)
         .with_rule(workspace_read_tool_rule())
         .with_rule(sandbox_command_rule())
+}
+
+fn sandbox_mode_audit_label(mode: PermissionProfileName) -> &'static str {
+    match mode {
+        PermissionProfileName::ReadOnly => "read_only",
+        PermissionProfileName::WorkspaceWrite => "workspace_write",
+    }
 }
 
 fn workspace_read_tool_rule() -> PermissionRule {
@@ -2691,6 +2742,129 @@ mod tests {
     }
 
     #[test]
+    fn approval_resume_uses_stored_policy_snapshot_instead_of_defaults() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let file_path = workspace.join("README.md");
+        std::fs::write(&file_path, "before").expect("write readme");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread_with_policy(
+                Some("gpt-test"),
+                Some(&workspace.to_string_lossy()),
+                PermissionProfileName::WorkspaceWrite,
+                ApprovalPolicy::Never,
+            )
+            .expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Blocked.as_str(),
+                json!([{"type": "text", "text": "edit readme"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        store
+            .update_turn_state(
+                &turn.turn_id,
+                TurnStatus::Blocked,
+                AgentStatus::Blocked.as_str(),
+            )
+            .expect("blocked turn");
+
+        let request = ApprovalRequest::new(
+            format!("approval_{}_call_1", turn.turn_id),
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            TOOL_EDIT,
+        )
+        .with_tool_call_id("call_1")
+        .with_resources(["README.md"]);
+        let arguments = json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        });
+        let pending = PendingToolCall {
+            request_id: request.request_id.clone(),
+            tool_call_id: "call_1".to_string(),
+            tool_name: TOOL_EDIT.to_string(),
+            raw_arguments: arguments.to_string(),
+            resources: request.resources.clone(),
+        };
+        let pending_payload = json!({
+            "request_id": pending.request_id,
+            "thread_id": thread.thread_id,
+            "turn_id": turn.turn_id,
+            "tool_call_id": pending.tool_call_id,
+            "tool_name": pending.tool_name,
+            "raw_arguments": pending.raw_arguments,
+            "resources": pending.resources,
+            "checkpoint_version": 1,
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "tool_call_id": "call_1",
+                    "tool_name": TOOL_EDIT,
+                    "arguments": arguments.clone(),
+                    "raw_arguments": arguments.to_string(),
+                    "parse_status": "valid",
+                    "validation_errors": []
+                }]
+            }],
+            "tool_results": [],
+            "used_approval_grants": [],
+            "approval_count": 1,
+            "model_turns": 1,
+            "completion": {
+                "workspace_mutated": false,
+                "verified_after_last_mutation": false,
+                "successful_command_count": 0,
+                "required_command_counts": {},
+                "satisfied_command_counts": {},
+                "unresolved_failures": []
+            },
+            "last_completion_error": null
+        });
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let resumed = app_server(store)
+            .resume_agent_loop_after_gate(
+                &request,
+                &decision,
+                Some(pending_payload),
+                StaticProvider {
+                    responses: vec![ModelTurnResponse::completed(
+                        "model_request_turn_1_0",
+                        "response_1",
+                        "done",
+                    )],
+                    seen_requests: Arc::clone(&seen_requests),
+                },
+                &CancellationToken::new(),
+            )
+            .expect("resume")
+            .expect("terminal status");
+
+        assert_eq!(resumed.1.status, AgentStatus::Failed);
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read readme"),
+            "before"
+        );
+        assert!(
+            seen_requests.lock().expect("seen requests").len() <= 1,
+            "the denied continuation must not execute or continue through another model turn"
+        );
+    }
+
+    #[test]
     fn agent_loop_approval_no_resume_status_records_session_and_command_audit() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
@@ -2746,8 +2920,11 @@ mod tests {
             .expect("status")
             .expect("terminal status");
 
-        assert_eq!(run_status.audit_events[0]["sandbox_mode"], "unknown");
-        assert_eq!(run_status.audit_events[0]["network_access"], "unknown");
+        assert_eq!(
+            run_status.audit_events[0]["sandbox_mode"],
+            "workspace_write"
+        );
+        assert_eq!(run_status.audit_events[0]["network_access"], "denied");
         assert_eq!(
             run_status.audit_events[0]["sandbox_backend"],
             "not_executed"

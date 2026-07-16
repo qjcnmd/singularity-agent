@@ -1,7 +1,9 @@
 //! 验证 SessionStore 的 schema、绑定、恢复、历史、trace 与事务不变量。
 
 use schemars::schema_for;
-use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
+use singularity_policy::{
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
+};
 use singularity_protocol::{ItemKind, ThreadStatus, TraceEvent, TurnStatus};
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
@@ -17,7 +19,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 8);
+    assert_eq!(descriptor.schema_version, 9);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
@@ -27,7 +29,8 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
             "0005_store_hardening".to_string(),
             "0006_conversation_history".to_string(),
             "0007_pending_execution_state".to_string(),
-            "0008_approval_execution_recovery".to_string()
+            "0008_approval_execution_recovery".to_string(),
+            "0009_thread_policy_snapshot".to_string()
         ]
     );
     assert_eq!(
@@ -101,7 +104,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
         .query_row("pragma journal_mode", [], |row| row.get(0))
         .expect("journal mode");
 
-    assert_eq!(schema_version, 8);
+    assert_eq!(schema_version, 9);
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 }
 
@@ -125,8 +128,140 @@ fn sqlite_store_rejects_future_schema_version() {
         SessionStore::open(&db_path),
         Err(StoreError::UnsupportedSchema {
             found: 999,
-            supported: 8
+            supported: 9
         })
+    ));
+}
+
+// 验证 thread policy 快照在 create/get/list 和 reopen 路径保持一致。
+#[test]
+fn thread_policy_snapshot_persists_and_reopens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let created = store
+        .create_thread_with_policy(
+            Some("gpt-test"),
+            Some("C:/repo"),
+            PermissionProfileName::ReadOnly,
+            ApprovalPolicy::Never,
+        )
+        .expect("create thread with policy");
+    assert_eq!(created.sandbox_mode, PermissionProfileName::ReadOnly);
+    assert_eq!(created.approval_policy, ApprovalPolicy::Never);
+    assert_eq!(
+        store.get_thread(&created.thread_id).expect("get thread"),
+        created
+    );
+    assert_eq!(
+        store.list_threads().expect("list threads"),
+        vec![created.clone()]
+    );
+    drop(store);
+
+    let reopened = SessionStore::open(&db_path).expect("reopen store");
+    let restored = reopened
+        .get_thread(&created.thread_id)
+        .expect("restore thread");
+    assert_eq!(restored.sandbox_mode, PermissionProfileName::ReadOnly);
+    assert_eq!(restored.approval_policy, ApprovalPolicy::Never);
+}
+
+// 验证 v8 threads 在同一初始化事务中填充安全默认快照并升级到 v9。
+#[test]
+fn v8_threads_migrate_to_policy_snapshot_defaults() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("create current store");
+    store
+        .create_thread(Some("gpt-test"), Some("C:/repo"))
+        .expect("create legacy thread");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "pragma foreign_keys = off;
+             create table threads_v8(
+                 thread_id text primary key,
+                 model text,
+                 cwd text,
+                 status text not null
+             );
+             insert into threads_v8(thread_id, model, cwd, status)
+                 select thread_id, model, cwd, status from threads;
+             drop table threads;
+             alter table threads_v8 rename to threads;
+             delete from schema_migrations where migration_id = '0009_thread_policy_snapshot';
+             update schema_meta set schema_version = 8;",
+        )
+        .expect("prepare v8 schema");
+    drop(connection);
+
+    let migrated = SessionStore::open(&db_path).expect("migrate v8 store");
+    assert_eq!(migrated.descriptor().schema_version, 9);
+    let thread_id = migrated
+        .list_threads()
+        .expect("migrated threads")
+        .into_iter()
+        .next()
+        .expect("migrated thread")
+        .thread_id;
+    let thread = migrated.get_thread(&thread_id).expect("migrated thread");
+    assert_eq!(thread.sandbox_mode, PermissionProfileName::WorkspaceWrite);
+    assert_eq!(thread.approval_policy, ApprovalPolicy::OnRequest);
+    assert!(
+        migrated
+            .applied_migrations()
+            .expect("migrations")
+            .iter()
+            .any(|migration| migration == "0009_thread_policy_snapshot")
+    );
+}
+
+// 验证 marker 或列只完成一半时，store 不会猜测并继续运行。
+#[test]
+fn partial_thread_policy_migration_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("create current store");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute("alter table threads drop column approval_policy", [])
+        .expect("remove one policy column");
+    drop(connection);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(message))
+            if message.contains("migration is recorded")
+                || message.contains("partially migrated")
+    ));
+}
+
+// 验证已经标记完成的 schema 也不会接受未知或伪造的持久化 policy 值。
+#[test]
+fn invalid_thread_policy_snapshot_value_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("create current store");
+    store.create_thread(None, None).expect("thread");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            r#"update threads set sandbox_mode = '"danger-full-access"'"#,
+            [],
+        )
+        .expect("tamper sandbox mode");
+    drop(connection);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(message)) if message.contains("unknown sandbox policy snapshot")
     ));
 }
 

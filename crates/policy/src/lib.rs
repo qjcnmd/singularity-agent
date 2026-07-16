@@ -17,7 +17,6 @@ const REASON_PROTECTED_RESOURCE_DENIED: &str = "protected resource is denied by 
 pub enum PermissionProfileName {
     ReadOnly,
     WorkspaceWrite,
-    DangerFullAccess,
 }
 
 /// 当前会话是否允许网络访问。
@@ -32,7 +31,6 @@ pub enum NetworkAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalPolicy {
-    Untrusted,
     OnRequest,
     Never,
 }
@@ -81,6 +79,18 @@ pub struct PermissionProfile {
 }
 
 impl PermissionProfile {
+    /// 创建只读权限档位。
+    pub fn read_only(workspace_root: impl Into<String>) -> Self {
+        Self {
+            profile: PermissionProfileName::ReadOnly,
+            workspace_roots: vec![workspace_root.into()],
+            additional_writable_directories: Vec::new(),
+            network_access: NetworkAccess::Denied,
+            approval_policy: ApprovalPolicy::OnRequest,
+            protected_paths_enforced: true,
+        }
+    }
+
     /// 创建 workspace-write 权限档位。
     pub fn workspace_write(workspace_root: impl Into<String>) -> Self {
         Self {
@@ -202,7 +212,7 @@ fn resource_matches_prefix(resource: &str, prefix: &str) -> bool {
 pub enum PermissionDecisionCause {
     Explicit,
     Rule,
-    Hook,
+    FilesystemProfile,
     NetworkProfile,
     ProtectedResource,
     NoMatchingRule,
@@ -247,29 +257,11 @@ impl PermissionDecision {
     }
 }
 
-/// 在 Policy 评估前可介入的工具 hook。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct PreToolUseHook {
-    pub hook_id: String,
-    pub decision: PermissionDecision,
-}
-
-impl PreToolUseHook {
-    /// 创建一个 pre-tool hook。
-    pub fn new(hook_id: impl Into<String>, decision: PermissionDecision) -> Self {
-        Self {
-            hook_id: hook_id.into(),
-            decision,
-        }
-    }
-}
-
-/// 聚合 profile、规则和 hooks 的 Policy evaluator。
+/// 聚合 profile 与规则的 Policy evaluator。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PolicyEngine {
     pub profile: PermissionProfile,
     pub rules: Vec<PermissionRule>,
-    pub hooks: Vec<PreToolUseHook>,
 }
 
 impl PolicyEngine {
@@ -278,7 +270,6 @@ impl PolicyEngine {
         Self {
             profile,
             rules: Vec::new(),
-            hooks: Vec::new(),
         }
     }
 
@@ -288,14 +279,7 @@ impl PolicyEngine {
         self
     }
 
-    /// 添加 pre-tool hook。
-    pub fn with_hook(mut self, mut hook: PreToolUseHook) -> Self {
-        hook.decision.cause = PermissionDecisionCause::Hook;
-        self.hooks.push(hook);
-        self
-    }
-
-    /// 对请求执行规则、hook 和 approval 策略评估。
+    /// 对请求执行 profile、规则和 approval 策略评估。
     pub fn evaluate(&self, request: &PermissionRequest) -> PermissionDecision {
         if request.operation == PermissionOperation::Network
             && self.profile.network_access == NetworkAccess::Denied
@@ -306,11 +290,24 @@ impl PolicyEngine {
             )
             .with_cause(PermissionDecisionCause::NetworkProfile);
         }
-        let hook_decision = self
-            .hooks
-            .iter()
-            .find(|hook| !matches!(hook.decision.outcome, PermissionDecisionOutcome::Allow))
-            .map(|hook| hook.decision.clone());
+
+        if request.operation == PermissionOperation::Write {
+            if self.profile.profile == PermissionProfileName::ReadOnly {
+                return PermissionDecision::new(
+                    PermissionDecisionOutcome::Deny,
+                    "write access is denied by the read-only profile",
+                )
+                .with_cause(PermissionDecisionCause::FilesystemProfile);
+            }
+            if !write_resource_is_workspace_scoped(&request.resource, &self.profile.workspace_roots)
+            {
+                return PermissionDecision::new(
+                    PermissionDecisionOutcome::Deny,
+                    "write resource is outside the workspace-write profile",
+                )
+                .with_cause(PermissionDecisionCause::FilesystemProfile);
+            }
+        }
 
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Deny) {
             return decision;
@@ -321,9 +318,6 @@ impl PolicyEngine {
                 REASON_PROTECTED_RESOURCE_DENIED,
             )
             .with_cause(PermissionDecisionCause::ProtectedResource);
-        }
-        if let Some(decision) = hook_decision {
-            return self.apply_approval_policy(decision);
         }
         if let Some(decision) = self.first_matching_rule(request, PermissionDecisionOutcome::Ask) {
             return self.apply_approval_policy(decision);
@@ -355,7 +349,7 @@ impl PolicyEngine {
             return decision;
         }
         match self.profile.approval_policy {
-            ApprovalPolicy::Untrusted | ApprovalPolicy::OnRequest => decision,
+            ApprovalPolicy::OnRequest => decision,
             ApprovalPolicy::Never => PermissionDecision {
                 outcome: PermissionDecisionOutcome::Deny,
                 cause: PermissionDecisionCause::ApprovalPolicy,
@@ -365,6 +359,40 @@ impl PolicyEngine {
             },
         }
     }
+}
+
+fn write_resource_is_workspace_scoped(resource: &str, workspace_roots: &[String]) -> bool {
+    let normalized_resource = normalize_resource_path(resource);
+    if normalized_resource
+        .split('/')
+        .any(|component| component == "..")
+    {
+        return false;
+    }
+    if !is_absolute_resource(&normalized_resource) {
+        return true;
+    }
+    workspace_roots.iter().any(|root| {
+        let normalized_root = normalize_resource_path(root);
+        normalized_resource == normalized_root
+            || normalized_resource
+                .strip_prefix(&normalized_root)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+fn normalize_resource_path(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn is_absolute_resource(value: &str) -> bool {
+    std::path::Path::new(value).is_absolute()
+        || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+        || value.starts_with('/')
 }
 
 /// approval 请求的持久化决定。

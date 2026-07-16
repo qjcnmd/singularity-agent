@@ -43,6 +43,10 @@ enum Command {
         goal: String,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long, value_enum)]
+        sandbox_mode: Option<SandboxModeArg>,
+        #[arg(long, value_enum)]
+        approval_policy: Option<ApprovalPolicyArg>,
         #[arg(long)]
         json: bool,
     },
@@ -136,6 +140,38 @@ enum ApprovalDecisionArg {
     Defer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+// thread/start 可选择的受控 sandbox 快照。
+enum SandboxModeArg {
+    ReadOnly,
+    WorkspaceWrite,
+}
+
+impl SandboxModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+// thread/start 可选择的受控 approval 快照。
+enum ApprovalPolicyArg {
+    OnRequest,
+    Never,
+}
+
+impl ApprovalPolicyArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OnRequest => "on-request",
+            Self::Never => "never",
+        }
+    }
+}
+
 // approval CLI 枚举到协议 outcome 的转换边界。
 impl ApprovalDecisionArg {
     // 将 CLI 枚举映射为 app-server 协议值。
@@ -159,17 +195,29 @@ fn main() {
 // 按命令编排 app-server 请求和面向用户的输出。
 fn run_cli(cli: Cli) -> Result<(), String> {
     match cli.command {
-        Command::Run { goal, model, json } => {
+        Command::Run {
+            goal,
+            model,
+            sandbox_mode,
+            approval_policy,
+            json,
+        } => {
             let mut client = AppServerClient::spawn()?;
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
             ensure_agent_loop_available(&mut client)?;
-            let (thread, thread_events) = client.thread_start(model, !json)?;
+            let (thread, thread_events) = client.thread_start(
+                model,
+                sandbox_mode.map(SandboxModeArg::as_str),
+                approval_policy.map(ApprovalPolicyArg::as_str),
+                !json,
+            )?;
             if !json {
                 println!(
                     "thread {}",
                     required_str(&thread, &["thread", "thread_id"])?
                 );
+                render_thread_policy(&thread)?;
             }
             let (turn, turn_events) = client.turn_start(
                 required_str(&thread, &["thread", "thread_id"])?,
@@ -199,8 +247,9 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
             client.initialize()?;
             ensure_agent_loop_available(&mut client)?;
-            client.thread_resume(&thread_id)?;
+            let thread = client.thread_resume(&thread_id)?;
             println!("thread {thread_id}");
+            render_thread_policy(&thread)?;
             let (turn, _events) = client.turn_start(&thread_id, &instruction, true)?;
             fail_for_failed_turn(&turn["turn"])?;
             Ok(())
@@ -446,14 +495,23 @@ impl AppServerClient {
     fn thread_start(
         &mut self,
         model: Option<String>,
+        sandbox_mode: Option<&str>,
+        approval_policy: Option<&str>,
         render: bool,
     ) -> Result<(Value, Vec<Value>), String> {
         let id = self.next_request_id();
         let cwd = canonical_current_dir()?;
+        let mut params = json!({"model": model, "cwd": cwd});
+        if let Some(sandbox_mode) = sandbox_mode {
+            params["sandboxMode"] = json!(sandbox_mode);
+        }
+        if let Some(approval_policy) = approval_policy {
+            params["approvalPolicy"] = json!(approval_policy);
+        }
         let responses = self.request(JsonRpcMessage::request(
             Method::ThreadStart,
             json!(id),
-            json!({"model": model, "cwd": cwd}),
+            params,
         ))?;
         if render {
             render_messages(&responses, false);
@@ -576,6 +634,7 @@ impl AppServerClient {
                     thread["thread_id"].as_str().unwrap_or(""),
                     thread["status"].as_str().unwrap_or("")
                 );
+                render_thread_policy_value(thread)?;
             }
         }
         Ok(())
@@ -830,6 +889,28 @@ fn canonical_current_dir() -> Result<String, String> {
         .map(str::to_string)
         .ok_or_else(|| "current directory is not valid UTF-8".to_string())
 }
+
+// 渲染 thread 实际持久化的安全策略快照；旧的协议响应不带该摘要时保持兼容显示。
+fn render_thread_policy(envelope: &Value) -> Result<(), String> {
+    if let Some(thread) = envelope.get("thread") {
+        render_thread_policy_value(thread)?;
+    }
+    Ok(())
+}
+
+fn render_thread_policy_value(thread: &Value) -> Result<(), String> {
+    let sandbox_mode = thread.get("sandboxMode").and_then(Value::as_str);
+    let approval_policy = thread.get("approvalPolicy").and_then(Value::as_str);
+    match (sandbox_mode, approval_policy) {
+        (Some(sandbox_mode), Some(approval_policy)) => {
+            println!("thread_policy sandbox_mode={sandbox_mode} approval_policy={approval_policy}");
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => Err("thread response has an incomplete policy snapshot".to_string()),
+    }
+}
+
 // 构造 CLI 使用的 initialize 请求。
 fn initialize_request(id: i64) -> JsonRpcMessage {
     JsonRpcMessage::request(

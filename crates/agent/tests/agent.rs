@@ -15,7 +15,7 @@ use singularity_model::{
 };
 use singularity_policy::{
     NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
-    PermissionProfileName, PermissionRule, PolicyEngine, SettingsScope,
+    PermissionRule, PolicyEngine, SettingsScope,
 };
 use singularity_tools::{
     CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend, SandboxCapabilities,
@@ -3074,7 +3074,6 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
     let mut profile = PermissionProfile::workspace_write("C:/repo");
-    profile.profile = PermissionProfileName::DangerFullAccess;
     profile.network_access = NetworkAccess::Allowed;
     let policy = PolicyEngine::new(profile)
         .with_rule(
@@ -3111,7 +3110,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     assert_eq!(run_status.audit_events.len(), 1);
     assert_eq!(
         run_status.audit_events[0]["sandbox_mode"],
-        "danger_full_access"
+        "workspace_write"
     );
     assert!(run_status.audit_events[0].get("cwd").is_none());
     assert_eq!(run_status.audit_events[0]["timeout_seconds"], 5);
@@ -3128,7 +3127,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
             &test_command_script("success"),
             &command_cwd,
             5,
-            SandboxFilesystemMode::DangerFullAccess,
+            SandboxFilesystemMode::WorkspaceWrite,
             SandboxNetworkMode::Allowed,
         )
     );

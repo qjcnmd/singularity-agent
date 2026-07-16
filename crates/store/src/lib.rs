@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_core::contains_sensitive_text;
-use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
+use singularity_policy::{
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
+};
 use singularity_protocol::{
     ArtifactRef, Item, ItemKind, ItemStatus, Thread, ThreadStatus, TraceEvent, Turn, TurnStatus,
 };
@@ -26,7 +28,8 @@ pub use singularity_protocol::{ConversationMessage, ConversationRole};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
+const PREVIOUS_SCHEMA_VERSION: u32 = 8;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 const DURABLE_LEDGER_SCHEMA_MIGRATION: &str = "0002_durable_ledger";
 const PENDING_TOOL_CALL_SCHEMA_MIGRATION: &str = "0004_pending_tool_calls";
@@ -34,6 +37,7 @@ const STORE_HARDENING_SCHEMA_MIGRATION: &str = "0005_store_hardening";
 const CONVERSATION_HISTORY_SCHEMA_MIGRATION: &str = "0006_conversation_history";
 const PENDING_EXECUTION_STATE_SCHEMA_MIGRATION: &str = "0007_pending_execution_state";
 const APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION: &str = "0008_approval_execution_recovery";
+const THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION: &str = "0009_thread_policy_snapshot";
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const STORE_INITIALIZATION_LOCK_RETRY_MS: u64 = 10;
 const SQLITE_FOREIGN_KEYS_PRAGMA: &str = "foreign_keys";
@@ -327,16 +331,33 @@ impl SessionStore {
 
     /// 创建 thread 并持久化其初始状态。
     pub fn create_thread(&self, model: Option<&str>, cwd: Option<&str>) -> StoreResult<Thread> {
-        let thread = Self::new_thread(model, cwd);
+        self.create_thread_with_policy(
+            model,
+            cwd,
+            PermissionProfileName::WorkspaceWrite,
+            ApprovalPolicy::OnRequest,
+        )
+    }
+
+    /// 创建带有不可变 sandbox/approval 快照的 thread。
+    pub fn create_thread_with_policy(
+        &self,
+        model: Option<&str>,
+        cwd: Option<&str>,
+        sandbox_mode: PermissionProfileName,
+        approval_policy: ApprovalPolicy,
+    ) -> StoreResult<Thread> {
+        let thread = Self::new_thread(model, cwd, sandbox_mode, approval_policy);
         Self::insert_thread(&self.connection, &thread)?;
         Ok(thread)
     }
 
     /// 按持久化顺序列出所有 thread。
     pub fn list_threads(&self) -> StoreResult<Vec<Thread>> {
-        let mut statement = self
-            .connection
-            .prepare("select thread_id, model, cwd, status from threads order by rowid")?;
+        let mut statement = self.connection.prepare(
+            "select thread_id, model, cwd, status, sandbox_mode, approval_policy
+                 from threads order by rowid",
+        )?;
         let rows = statement.query_map([], |row| self.thread_from_row(row))?;
         let mut threads = Vec::new();
         for row in rows {
@@ -349,7 +370,8 @@ impl SessionStore {
     pub fn get_thread(&self, thread_id: &str) -> StoreResult<Thread> {
         self.connection
             .query_row(
-                "select thread_id, model, cwd, status from threads where thread_id = ?1",
+                "select thread_id, model, cwd, status, sandbox_mode, approval_policy
+                 from threads where thread_id = ?1",
                 params![thread_id],
                 |row| self.thread_from_row(row),
             )
@@ -464,8 +486,28 @@ impl SessionStore {
         component: &str,
         summary: &str,
     ) -> StoreResult<(Thread, TraceEvent)> {
+        self.create_thread_with_trace_and_policy(
+            model,
+            cwd,
+            PermissionProfileName::WorkspaceWrite,
+            ApprovalPolicy::OnRequest,
+            component,
+            summary,
+        )
+    }
+
+    /// 原子创建带有 policy 快照的 thread 及其初始 trace。
+    pub fn create_thread_with_trace_and_policy(
+        &self,
+        model: Option<&str>,
+        cwd: Option<&str>,
+        sandbox_mode: PermissionProfileName,
+        approval_policy: ApprovalPolicy,
+        component: &str,
+        summary: &str,
+    ) -> StoreResult<(Thread, TraceEvent)> {
         let transaction = self.connection.unchecked_transaction()?;
-        let thread = Self::new_thread(model, cwd);
+        let thread = Self::new_thread(model, cwd, sandbox_mode, approval_policy);
         Self::insert_thread(&transaction, &thread)?;
         let trace = TraceEvent::new(
             format!("trace_{}", thread.thread_id),
@@ -2270,9 +2312,11 @@ impl SessionStore {
         )
     }
 
-    // 将 threads 行解码为 protocol Thread。
+    // 将包含安全策略快照的 threads 行解码为 protocol Thread。
     fn thread_from_row(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         let status: String = row.get(3)?;
+        let sandbox_mode: String = row.get(4)?;
+        let approval_policy: String = row.get(5)?;
         Ok(Thread {
             thread_id: row.get(0)?,
             model: row.get(1)?,
@@ -2280,6 +2324,20 @@ impl SessionStore {
             status: serde_json::from_str(&status).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            sandbox_mode: serde_json::from_str(&sandbox_mode).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+            approval_policy: serde_json::from_str(&approval_policy).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
@@ -2334,7 +2392,9 @@ impl SessionStore {
                 thread_id text primary key,
                 model text,
                 cwd text,
-                status text not null
+                status text not null,
+                sandbox_mode text not null default '\"workspace-write\"',
+                approval_policy text not null default '\"on-request\"'
             );
             create table if not exists turns(
                 turn_id text primary key,
@@ -2418,6 +2478,7 @@ impl SessionStore {
         self.migrate_conversation_history()?;
         self.ensure_required_foreign_keys()?;
         self.migrate_approval_execution_schema()?;
+        self.migrate_thread_policy_snapshot_schema()?;
         self.fail_closed_on_foreign_key_violations()?;
         Ok(())
     }
@@ -2478,7 +2539,7 @@ impl SessionStore {
                     "insert into schema_migrations(migration_id) values(?1)",
                     params![APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION],
                 )?;
-                write_schema_version(&transaction)?;
+                write_schema_version(&transaction, PREVIOUS_SCHEMA_VERSION)?;
             }
             transaction.commit()?;
             Ok(())
@@ -2489,6 +2550,98 @@ impl SessionStore {
             .map_err(StoreError::Sqlite);
         migration_result?;
         foreign_keys_result?;
+        Ok(())
+    }
+
+    // 将每个 thread 的 sandbox/approval 选择原子升级为不可变快照。
+    fn migrate_thread_policy_snapshot_schema(&self) -> StoreResult<()> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let applied = Self::exists_in_transaction(
+            &transaction,
+            "select 1 from schema_migrations where migration_id = ?1",
+            THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION,
+        )?;
+        let schema_version: Option<u32> = transaction
+            .query_row("select max(schema_version) from schema_meta", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        let has_sandbox_mode = table_has_column(&transaction, "threads", "sandbox_mode")?;
+        let has_approval_policy = table_has_column(&transaction, "threads", "approval_policy")?;
+        let has_complete_schema = has_sandbox_mode && has_approval_policy;
+        let has_partial_schema = has_sandbox_mode != has_approval_policy;
+
+        if applied && (!has_complete_schema || schema_version != Some(SCHEMA_VERSION)) {
+            return Err(StoreError::InvalidState(
+                "thread policy migration is recorded but schema is incomplete".to_string(),
+            ));
+        }
+        if !applied && schema_version == Some(SCHEMA_VERSION) {
+            return Err(StoreError::InvalidState(
+                "thread policy schema version is advanced without migration marker".to_string(),
+            ));
+        }
+        if has_partial_schema {
+            return Err(StoreError::InvalidState(
+                "thread policy schema is partially migrated".to_string(),
+            ));
+        }
+        if !has_complete_schema {
+            transaction.execute(
+                "alter table threads add column sandbox_mode text not null default '\"workspace-write\"'",
+                [],
+            )?;
+            transaction.execute(
+                "alter table threads add column approval_policy text not null default '\"on-request\"'",
+                [],
+            )?;
+        }
+
+        let mut statement = transaction.prepare(
+            "select thread_id, sandbox_mode, approval_policy from threads order by rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (thread_id, sandbox_mode, approval_policy) = row?;
+            let sandbox_mode = sandbox_mode.ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "thread {thread_id} has incomplete sandbox policy snapshot"
+                ))
+            })?;
+            let approval_policy = approval_policy.ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "thread {thread_id} has incomplete approval policy snapshot"
+                ))
+            })?;
+            serde_json::from_str::<PermissionProfileName>(&sandbox_mode).map_err(|_| {
+                StoreError::InvalidState(format!(
+                    "thread {thread_id} has unknown sandbox policy snapshot"
+                ))
+            })?;
+            serde_json::from_str::<ApprovalPolicy>(&approval_policy).map_err(|_| {
+                StoreError::InvalidState(format!(
+                    "thread {thread_id} has unknown approval policy snapshot"
+                ))
+            })?;
+        }
+        drop(statement);
+
+        if !applied {
+            transaction.execute(
+                "insert into schema_migrations(migration_id) values(?1)",
+                params![THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION],
+            )?;
+        }
+        write_schema_version(&transaction, SCHEMA_VERSION)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2600,7 +2753,15 @@ impl SessionStore {
             )?;
             fail_closed_on_foreign_key_violations(&transaction)?;
             if migration_applied {
-                write_schema_version(&transaction)?;
+                let current_schema_version: Option<u32> = transaction
+                    .query_row("select max(schema_version) from schema_meta", [], |row| {
+                        row.get(0)
+                    })
+                    .optional()?
+                    .flatten();
+                if current_schema_version.is_none_or(|version| version < PREVIOUS_SCHEMA_VERSION) {
+                    write_schema_version(&transaction, PREVIOUS_SCHEMA_VERSION)?;
+                }
             }
             transaction.commit()?;
             Ok((migration_applied, needs_secure_rewrite))
@@ -2622,7 +2783,15 @@ impl SessionStore {
                 "insert into schema_migrations(migration_id) values(?1)",
                 params![CONVERSATION_HISTORY_SCHEMA_MIGRATION],
             )?;
-            write_schema_version(&transaction)?;
+            let current_schema_version: Option<u32> = transaction
+                .query_row("select max(schema_version) from schema_meta", [], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten();
+            if current_schema_version.is_none_or(|version| version < PREVIOUS_SCHEMA_VERSION) {
+                write_schema_version(&transaction, PREVIOUS_SCHEMA_VERSION)?;
+            }
             transaction.commit()?;
         }
         Ok(())
@@ -2858,13 +3027,20 @@ impl SessionStore {
         validate_turn_status_update(&current, next_status, next_agent_loop_status)
     }
 
-    // 构造带新 id 和初始 active 状态的 Thread。
-    fn new_thread(model: Option<&str>, cwd: Option<&str>) -> Thread {
+    // 构造带新 id、初始 active 状态和安全策略快照的 Thread。
+    fn new_thread(
+        model: Option<&str>,
+        cwd: Option<&str>,
+        sandbox_mode: PermissionProfileName,
+        approval_policy: ApprovalPolicy,
+    ) -> Thread {
         Thread {
             thread_id: format!("thread_{}", short_id()),
             model: model.map(str::to_string),
             cwd: cwd.map(str::to_string),
             status: ThreadStatus::Active,
+            sandbox_mode,
+            approval_policy,
         }
     }
 
@@ -2892,12 +3068,16 @@ impl SessionStore {
     // 将 Thread 编码后写入 threads 表。
     fn insert_thread(connection: &Connection, thread: &Thread) -> StoreResult<()> {
         connection.execute(
-            "insert into threads(thread_id, model, cwd, status) values(?1, ?2, ?3, ?4)",
+            "insert into threads(
+                thread_id, model, cwd, status, sandbox_mode, approval_policy
+            ) values(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 thread.thread_id,
                 thread.model,
                 thread.cwd,
-                serde_json::to_string(&thread.status)?
+                serde_json::to_string(&thread.status)?,
+                serde_json::to_string(&thread.sandbox_mode)?,
+                serde_json::to_string(&thread.approval_policy)?,
             ],
         )?;
         Ok(())
@@ -3037,11 +3217,11 @@ fn acquire_store_initialization_lock(path: &Path) -> StoreResult<Option<File>> {
 }
 
 // 将当前 schema 版本写入 schema_meta。
-fn write_schema_version(connection: &Connection) -> StoreResult<()> {
+fn write_schema_version(connection: &Connection, version: u32) -> StoreResult<()> {
     connection.execute("delete from schema_meta", [])?;
     connection.execute(
         "insert into schema_meta(schema_version) values(?1)",
-        params![SCHEMA_VERSION],
+        params![version],
     )?;
     Ok(())
 }

@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use singularity_core::{ClientInfo, ErrorCode};
+use singularity_policy::{ApprovalPolicy, PermissionProfileName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// JSON-RPC 方法名。
@@ -246,10 +247,15 @@ pub struct TransportCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// 创建 thread 的参数。
 pub struct ThreadStartParams {
     pub model: Option<String>,
     pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<PermissionProfileName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<ApprovalPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -268,12 +274,16 @@ pub struct ThreadReadParams {
     pub limit: Option<u32>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// fork thread 的参数。
 pub struct ThreadForkParams {
-    #[serde(rename = "threadId")]
     pub thread_id: String,
     pub model: Option<String>,
     pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<PermissionProfileName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<ApprovalPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -283,6 +293,10 @@ pub struct Thread {
     pub model: Option<String>,
     pub cwd: Option<String>,
     pub status: ThreadStatus,
+    #[serde(rename = "sandboxMode")]
+    pub sandbox_mode: PermissionProfileName,
+    #[serde(rename = "approvalPolicy")]
+    pub approval_policy: ApprovalPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

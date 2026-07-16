@@ -157,10 +157,12 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     );
 
     let thread = server
-        .handle_json(r#"{"method":"thread/start","id":4,"params":{"model":"gpt-test"}}"#)
+        .handle_json(r#"{"method":"thread/start","id":4,"params":{"model":"gpt-test","sandboxMode":"read-only","approvalPolicy":"never"}}"#)
         .unwrap();
     let thread_result = result_message(&thread);
     let thread_id = thread_result["thread"]["thread_id"].as_str().unwrap();
+    assert_eq!(thread_result["thread"]["sandboxMode"], "read-only");
+    assert_eq!(thread_result["thread"]["approvalPolicy"], "never");
     assert_eq!(
         thread_result["thread"]["cwd"],
         std::env::current_dir()
@@ -272,6 +274,8 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         ))
         .unwrap();
     assert_eq!(resumed[0]["result"]["thread"]["status"], "active");
+    assert_eq!(resumed[0]["result"]["thread"]["sandboxMode"], "read-only");
+    assert_eq!(resumed[0]["result"]["thread"]["approvalPolicy"], "never");
 
     let forked = server
         .handle_json(&format!(
@@ -284,10 +288,26 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         forked[0]["result"]["thread"]["cwd"],
         thread_result["thread"]["cwd"]
     );
+    assert_eq!(forked[0]["result"]["thread"]["sandboxMode"], "read-only");
+    assert_eq!(forked[0]["result"]["thread"]["approvalPolicy"], "never");
+
+    let overridden_fork = server
+        .handle_json(&format!(
+            r#"{{"method":"thread/fork","id":45,"params":{{"threadId":"{thread_id}","sandboxMode":"workspace-write","approvalPolicy":"on-request"}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(
+        overridden_fork[0]["result"]["thread"]["sandboxMode"],
+        "workspace-write"
+    );
+    assert_eq!(
+        overridden_fork[0]["result"]["thread"]["approvalPolicy"],
+        "on-request"
+    );
 
     let deleted = server
         .handle_json(&format!(
-            r#"{{"method":"thread/delete","id":45,"params":{{"threadId":"{thread_id}"}}}}"#
+            r#"{{"method":"thread/delete","id":46,"params":{{"threadId":"{thread_id}"}}}}"#
         ))
         .unwrap();
     assert_eq!(deleted[0]["result"]["deleted"], true);

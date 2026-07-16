@@ -60,6 +60,57 @@ fn cli_help_does_not_expose_agent_host_selector() {
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
     assert!(!stdout(&output).contains("--agent-host"));
+    assert!(!stdout(&output).contains("danger-full-access"));
+    assert!(!stdout(&output).contains("untrusted"));
+}
+
+// 验证 CLI 只发送受控的 thread sandbox/approval 枚举，并渲染服务端快照。
+#[test]
+fn cli_run_sends_and_renders_thread_policy_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let params_path = temp.path().join("thread_start_params.json");
+    let mut thread = fake_thread("thread_policy");
+    thread["sandboxMode"] = json!("read-only");
+    thread["approvalPolicy"] = json!("never");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .agent_loop_ready()
+            .interaction(
+                "thread/start",
+                vec![
+                    capture_params(&params_path),
+                    respond(json!({"thread": thread})),
+                ],
+            )
+            .respond(
+                "turn/start",
+                json!({"turn": fake_turn("turn_policy", "thread_policy", "completed", "completed")}),
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args([
+            "run",
+            "write tests",
+            "--sandbox-mode",
+            "read-only",
+            "--approval-policy",
+            "never",
+        ])
+        .output()
+        .expect("run cli");
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    assert!(stdout(&output).contains("thread_policy sandbox_mode=read-only approval_policy=never"));
+
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(params_path).expect("thread params"))
+            .expect("thread params json");
+    assert_eq!(params["sandboxMode"], "read-only");
+    assert_eq!(params["approvalPolicy"], "never");
 }
 
 // 验证 run、continue、threads、trace、approval 与 doctor 共用 app-server 协议。

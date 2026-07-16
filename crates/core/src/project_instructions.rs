@@ -5,8 +5,13 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
 /// 项目指令文件名。
 pub const PROJECT_INSTRUCTIONS_FILE_NAME: &str = "AGENTS.md";
+/// 当前层级可覆盖普通项目指令的文件名。
+pub const PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME: &str = "AGENTS.override.md";
 /// 单个项目指令文件的最大字节数。
 pub const PROJECT_INSTRUCTIONS_MAX_FILE_BYTES: usize = 32 * 1024;
 /// 合并项目指令的最大总字节数。
@@ -14,11 +19,24 @@ pub const PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES: usize = 64 * 1024;
 const PROJECT_INSTRUCTIONS_SEPARATOR: &str = "\n\n";
 const PROJECT_ROOT_MARKER: &str = ".git";
 
-/// 当前 workspace 读取到的项目指令集合。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 单个项目指令来源的 workspace-relative provenance。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInstructionSource {
+    /// 相对于 workspace root 的稳定 POSIX 风格路径。
+    pub path: String,
+    /// 文件原始 UTF-8 字节的 SHA-256 摘要。
+    pub content_digest: String,
+}
+
+/// 当前 workspace 读取到的项目指令集合及其可验证来源。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectInstructions {
+    /// 按 workspace root 到 cwd 顺序合并、且唯一发送给模型的正文。
     pub content: String,
-    pub sources: Vec<PathBuf>,
+    /// 按正文合并顺序排列的来源 provenance。
+    pub sources: Vec<ProjectInstructionSource>,
+    /// 对合并正文和有序 `sources` 列表计算的稳定 SHA-256 摘要。
+    pub aggregate_digest: String,
 }
 
 /// 项目指令读取失败的稳定原因分类。
@@ -157,9 +175,14 @@ pub fn load_project_instructions(
     let mut sources = Vec::new();
     let mut total_bytes = 0usize;
     for directory in instruction_search_directories(&workspace_root, &cwd) {
+        let override_candidate = directory.join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME);
         let candidate = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
-        let Some(instruction_file) = read_project_instruction_file(&workspace_root, &candidate)?
-        else {
+        let instruction_file =
+            match read_project_instruction_file(&workspace_root, &override_candidate)? {
+                Some(instruction_file) => Some(instruction_file),
+                None => read_project_instruction_file(&workspace_root, &candidate)?,
+            };
+        let Some(instruction_file) = instruction_file else {
             continue;
         };
         total_bytes = total_bytes
@@ -173,7 +196,7 @@ pub fn load_project_instructions(
         if total_bytes > PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES {
             return Err(ProjectInstructionError::at_path(
                 ProjectInstructionErrorCode::TotalTooLarge,
-                instruction_file.relative_path,
+                instruction_file.relative_path.clone(),
             ));
         }
         if instruction_file.text.trim().is_empty() {
@@ -183,13 +206,24 @@ pub fn load_project_instructions(
             content.push_str(PROJECT_INSTRUCTIONS_SEPARATOR);
         }
         content.push_str(&instruction_file.text);
-        sources.push(instruction_file.relative_path);
+        sources.push(ProjectInstructionSource {
+            path: workspace_relative_path(&instruction_file.relative_path),
+            content_digest: instruction_file.content_digest,
+        });
     }
 
     if sources.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(ProjectInstructions { content, sources }))
+        let aggregate_digest = sha256_digest(
+            &serde_json::to_vec(&(content.as_str(), &sources))
+                .expect("project instruction aggregate serialize"),
+        );
+        Ok(Some(ProjectInstructions {
+            content,
+            sources,
+            aggregate_digest,
+        }))
     }
 }
 
@@ -197,6 +231,7 @@ struct ProjectInstructionFile {
     relative_path: PathBuf,
     text: String,
     byte_len: usize,
+    content_digest: String,
 }
 
 fn read_project_instruction_file(
@@ -260,6 +295,7 @@ fn read_project_instruction_file(
         ));
     }
     let byte_len = bytes.len();
+    let content_digest = sha256_digest(&bytes);
     let text = String::from_utf8(bytes).map_err(|_| {
         ProjectInstructionError::at_path(
             ProjectInstructionErrorCode::InvalidUtf8,
@@ -270,7 +306,16 @@ fn read_project_instruction_file(
         relative_path,
         text,
         byte_len,
+        content_digest,
     }))
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn workspace_relative_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn canonicalize_directory(

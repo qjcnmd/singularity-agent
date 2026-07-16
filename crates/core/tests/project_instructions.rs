@@ -82,13 +82,21 @@ fn loads_agents_files_from_workspace_root_to_nested_cwd() {
         .expect("instructions present");
 
     assert_eq!(
-        loaded.sources,
-        vec![
-            Path::new("AGENTS.md").to_path_buf(),
-            Path::new("crates/AGENTS.md").to_path_buf(),
-            Path::new("crates/agent/AGENTS.md").to_path_buf(),
-        ]
+        loaded
+            .sources
+            .iter()
+            .map(|source| source.path.as_str())
+            .collect::<Vec<_>>(),
+        ["AGENTS.md", "crates/AGENTS.md", "crates/agent/AGENTS.md"]
     );
+    assert!(
+        loaded
+            .sources
+            .iter()
+            .all(|source| source.content_digest.starts_with("sha256:")
+                && source.content_digest.len() == "sha256:".len() + 64)
+    );
+    assert!(loaded.aggregate_digest.starts_with("sha256:"));
     assert_eq!(
         loaded.content,
         "root instructions\n\ncrate instructions\n\nagent instructions"
@@ -111,11 +119,12 @@ fn discovers_git_workspace_root_from_nested_cwd() {
         .expect("instructions present");
 
     assert_eq!(
-        loaded.sources,
-        vec![
-            Path::new("AGENTS.md").to_path_buf(),
-            Path::new("src/nested/AGENTS.md").to_path_buf(),
-        ]
+        loaded
+            .sources
+            .iter()
+            .map(|source| source.path.as_str())
+            .collect::<Vec<_>>(),
+        ["AGENTS.md", "src/nested/AGENTS.md"]
     );
     assert_eq!(loaded.content, "root instructions\n\nnested instructions");
 }
@@ -131,6 +140,56 @@ fn missing_agents_files_are_not_an_error() {
         load_project_instructions(&workspace, &cwd).expect("missing is valid"),
         None
     );
+}
+
+#[test]
+fn override_file_wins_once_per_hierarchy_layer() {
+    let temp = TestDir::new();
+    let workspace = temp.path().join("workspace");
+    let cwd = workspace.join("src");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    std::fs::write(workspace.join("AGENTS.md"), "root ordinary").expect("root agents");
+    std::fs::write(workspace.join("AGENTS.override.md"), "root override").expect("root override");
+    std::fs::write(cwd.join("AGENTS.md"), "cwd ordinary").expect("cwd agents");
+    std::fs::write(cwd.join("AGENTS.override.md"), "cwd override").expect("cwd override");
+
+    let loaded = load_project_instructions(&workspace, &cwd)
+        .expect("load project instructions")
+        .expect("instructions present");
+
+    assert_eq!(loaded.content, "root override\n\ncwd override");
+    assert_eq!(
+        loaded
+            .sources
+            .iter()
+            .map(|source| source.path.as_str())
+            .collect::<Vec<_>>(),
+        ["AGENTS.override.md", "src/AGENTS.override.md"]
+    );
+}
+
+#[test]
+fn source_and_aggregate_digests_change_when_instruction_content_changes() {
+    let temp = TestDir::new();
+    let workspace = temp.path().join("workspace");
+    let cwd = workspace.join("src");
+    std::fs::create_dir_all(&cwd).expect("nested cwd");
+    let agents = cwd.join("AGENTS.md");
+    std::fs::write(&agents, "first instructions").expect("agents");
+
+    let first = load_project_instructions(&workspace, &cwd)
+        .expect("load first instructions")
+        .expect("first instructions present");
+    std::fs::write(&agents, "second instructions").expect("updated agents");
+    let second = load_project_instructions(&workspace, &cwd)
+        .expect("load second instructions")
+        .expect("second instructions present");
+
+    assert_ne!(
+        first.sources[0].content_digest,
+        second.sources[0].content_digest
+    );
+    assert_ne!(first.aggregate_digest, second.aggregate_digest);
 }
 
 #[test]

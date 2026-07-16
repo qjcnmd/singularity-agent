@@ -1,6 +1,7 @@
 //! JSON-RPC 请求、响应、事件和参数 schema 的协议测试。
 
 use singularity_core::ClientInfo;
+use singularity_policy::{ApprovalPolicy, PermissionProfileName};
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ArtifactFetchParams, ArtifactRef, ConversationMessage,
     ConversationRole, EventSubscribeParams, InitializeParams, InitializeResult, ItemKind,
@@ -22,6 +23,36 @@ fn json_rpc_accepts_omitted_jsonrpc_header_and_keeps_camel_case_params() {
 }
 
 #[test]
+fn thread_policy_params_round_trip_and_reject_unknown_public_values() {
+    let params: ThreadStartParams = serde_json::from_value(serde_json::json!({
+        "model": "gpt-test",
+        "cwd": "C:/workspace",
+        "sandboxMode": "read-only",
+        "approvalPolicy": "never"
+    }))
+    .expect("thread/start policy params");
+    assert_eq!(params.sandbox_mode, Some(PermissionProfileName::ReadOnly));
+    assert_eq!(params.approval_policy, Some(ApprovalPolicy::Never));
+    assert_eq!(
+        serde_json::to_value(params).expect("serialize thread/start policy params"),
+        serde_json::json!({
+            "model": "gpt-test",
+            "cwd": "C:/workspace",
+            "sandboxMode": "read-only",
+            "approvalPolicy": "never"
+        })
+    );
+
+    for value in [
+        serde_json::json!({"sandboxMode": "danger-full-access"}),
+        serde_json::json!({"approvalPolicy": "untrusted"}),
+    ] {
+        let result = serde_json::from_value::<ThreadStartParams>(value);
+        assert!(result.is_err(), "unknown policy value was accepted");
+    }
+}
+
+#[test]
 fn thread_read_uses_typed_paginated_safe_conversation_history() {
     let params: ThreadReadParams = serde_json::from_value(serde_json::json!({
         "threadId": "thread_1",
@@ -39,6 +70,8 @@ fn thread_read_uses_typed_paginated_safe_conversation_history() {
             model: Some("gpt-test".to_string()),
             cwd: Some("C:/workspace".to_string()),
             status: singularity_protocol::ThreadStatus::Active,
+            sandbox_mode: PermissionProfileName::WorkspaceWrite,
+            approval_policy: ApprovalPolicy::OnRequest,
         },
         messages: vec![ConversationMessage {
             item_id: "item_1".to_string(),
@@ -59,7 +92,9 @@ fn thread_read_uses_typed_paginated_safe_conversation_history() {
                 "thread_id": "thread_1",
                 "model": "gpt-test",
                 "cwd": "C:/workspace",
-                "status": "active"
+                "status": "active",
+                "sandboxMode": "workspace-write",
+                "approvalPolicy": "on-request"
             },
             "messages": [{
                 "itemId": "item_1",
@@ -104,8 +139,18 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
     let thread = ThreadStartParams {
         model: Some("gpt-test".to_string()),
         cwd: Some("C:/repo".to_string()),
+        sandbox_mode: Some(PermissionProfileName::ReadOnly),
+        approval_policy: Some(ApprovalPolicy::Never),
     };
-    assert_eq!(serde_json::to_value(thread).unwrap()["model"], "gpt-test");
+    assert_eq!(
+        serde_json::to_value(thread).unwrap(),
+        serde_json::json!({
+            "model": "gpt-test",
+            "cwd": "C:/repo",
+            "sandboxMode": "read-only",
+            "approvalPolicy": "never"
+        })
+    );
 
     assert_eq!(
         AppEvent::item_completed("item_1").method(),

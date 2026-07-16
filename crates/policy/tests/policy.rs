@@ -2,9 +2,8 @@
 
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess,
-    PermissionDecision, PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation,
-    PermissionProfile, PermissionProfileName, PermissionRequest, PermissionRule, PolicyEngine,
-    PreToolUseHook, SettingsScope,
+    PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
+    PermissionProfileName, PermissionRequest, PermissionRule, PolicyEngine, SettingsScope,
 };
 
 fn rule(
@@ -117,7 +116,7 @@ fn allowed_profile_network_still_requires_a_matching_rule() {
 }
 
 #[test]
-fn policy_engine_evaluates_hooks_and_rules_in_fail_closed_order() {
+fn policy_engine_evaluates_rules_in_fail_closed_order() {
     let request = PermissionRequest::new("shell", PermissionOperation::Execute, "cargo test");
     let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
         .with_rule(rule(
@@ -140,17 +139,6 @@ fn policy_engine_evaluates_hooks_and_rules_in_fail_closed_order() {
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
     assert_eq!(decision.cause, PermissionDecisionCause::Rule);
     assert_eq!(decision.rule_id.as_deref(), Some("deny_test"));
-
-    let hook_decision = PermissionDecision::new(
-        PermissionDecisionOutcome::Ask,
-        "pre tool-use hook requires approval",
-    );
-    let hooked = engine.with_hook(PreToolUseHook::new("hook_1", hook_decision.clone()));
-
-    let hooked_decision = hooked.evaluate(&request);
-
-    assert_eq!(hooked_decision.outcome, PermissionDecisionOutcome::Deny);
-    assert_eq!(hooked_decision.rule_id.as_deref(), Some("deny_test"));
 }
 
 #[test]
@@ -240,42 +228,31 @@ fn approval_policy_never_turns_approval_requests_into_deny() {
 }
 
 #[test]
-fn approval_policy_untrusted_preserves_approval_requests() {
-    let mut profile = PermissionProfile::workspace_write("C:/repo");
-    profile.approval_policy = ApprovalPolicy::Untrusted;
-
-    let decision = PolicyEngine::new(profile)
-        .with_rule(rule(
-            "ask_tests",
-            SettingsScope::Project,
-            PermissionDecisionOutcome::Ask,
-            PermissionOperation::Execute,
-            "cargo test",
-        ))
-        .evaluate(&PermissionRequest::new(
-            "shell",
-            PermissionOperation::Execute,
-            "cargo test",
-        ));
-
-    assert_eq!(decision.outcome, PermissionDecisionOutcome::Ask);
-    assert_eq!(decision.rule_id.as_deref(), Some("ask_tests"));
-}
-
-#[test]
-fn explicit_danger_full_access_profile_does_not_bypass_approval_policy() {
-    let mut profile = PermissionProfile::workspace_write("C:/repo");
-    profile.profile = PermissionProfileName::DangerFullAccess;
-    profile.approval_policy = ApprovalPolicy::Never;
+fn read_only_profile_hard_denies_write_even_with_an_allow_rule() {
+    let profile = PermissionProfile::read_only("C:/repo");
 
     let decision = PolicyEngine::new(profile).evaluate(&PermissionRequest::new(
-        "command",
-        PermissionOperation::Execute,
-        "cargo test",
+        "edit",
+        PermissionOperation::Write,
+        "README.md",
     ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
-    assert_eq!(decision.reason, "approval policy forbids approval requests");
+    assert_eq!(decision.cause, PermissionDecisionCause::FilesystemProfile);
+    assert_eq!(
+        decision.reason,
+        "write access is denied by the read-only profile"
+    );
+}
+
+#[test]
+fn workspace_write_rejects_absolute_resources_outside_the_canonical_root() {
+    let decision = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).evaluate(
+        &PermissionRequest::new("edit", PermissionOperation::Write, "C:/other/README.md"),
+    );
+
+    assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
+    assert_eq!(decision.cause, PermissionDecisionCause::FilesystemProfile);
 }
 
 #[test]
@@ -313,29 +290,4 @@ fn equivalent_shell_forms_are_not_a_policy_special_case() {
         engine.evaluate(&normalized).outcome,
         PermissionDecisionOutcome::Deny
     );
-}
-
-#[test]
-fn pre_tool_hook_denies_before_lower_priority_allow_rule() {
-    let request = PermissionRequest::new("patch", PermissionOperation::Write, "README.md");
-    let hook = PreToolUseHook::new(
-        "hook_1",
-        PermissionDecision::new(PermissionDecisionOutcome::Deny, "hook denied write"),
-    );
-    let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
-        .with_hook(hook)
-        .with_rule(rule(
-            "allow_readme",
-            SettingsScope::Project,
-            PermissionDecisionOutcome::Allow,
-            PermissionOperation::Write,
-            "README.md",
-        ));
-
-    let decision = engine.evaluate(&request);
-
-    assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
-    assert_eq!(decision.cause, PermissionDecisionCause::Hook);
-    assert_eq!(decision.reason, "hook denied write");
-    assert_eq!(decision.rule_id, None);
 }
