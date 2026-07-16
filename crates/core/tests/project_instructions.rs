@@ -209,7 +209,7 @@ fn rejects_cwd_outside_workspace() {
 }
 
 #[test]
-fn rejects_agents_path_that_resolves_outside_workspace() {
+fn rejects_linked_agents_path_without_following_it() {
     let temp = TestDir::new();
     let workspace = temp.path().join("workspace");
     let cwd = workspace.join("src");
@@ -221,11 +221,28 @@ fn rejects_agents_path_that_resolves_outside_workspace() {
 
     let error = load_project_instructions(&workspace, &cwd).expect_err("escape rejected");
 
+    assert_eq!(error.code, ProjectInstructionErrorCode::UnsupportedFileType);
+    assert_eq!(error.path.as_deref(), Some(Path::new("src/AGENTS.md")));
+}
+
+#[test]
+fn rejects_hardlinked_agents_file_before_reading_it() {
+    let temp = TestDir::new();
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&outside).expect("outside");
+    let outside_agents = outside.join("AGENTS.md");
+    std::fs::write(&outside_agents, "outside instructions").expect("outside agents");
+    std::fs::hard_link(&outside_agents, workspace.join("AGENTS.md")).expect("agents hardlink");
+
+    let error = load_project_instructions(&workspace, &workspace).expect_err("hardlink rejected");
+
     assert_eq!(
         error.code,
-        ProjectInstructionErrorCode::PathOutsideWorkspace
+        ProjectInstructionErrorCode::UnsupportedFileIdentity
     );
-    assert_eq!(error.path.as_deref(), Some(Path::new("src/AGENTS.md")));
+    assert_eq!(error.path.as_deref(), Some(Path::new("AGENTS.md")));
 }
 
 #[test]

@@ -116,8 +116,9 @@ sg run <goal>
 普通 Thread runtime 不向上寻找 `.git`：AppServer 使用持久化且已 canonicalize 的 `Thread.cwd` 同时作为 workspace root 与 cwd，调用显式边界的 `core::load_project_instructions(thread.cwd, thread.cwd)`。core 的 `load_project_instructions_from_cwd` 仅保留给有界的独立调用；显式 root→cwd API 按 root 到 cwd 的顺序读取每层的一个项目指令文件：若存在 `AGENTS.override.md` 则选择它，否则选择 `AGENTS.md`：
 
 - 单文件最大 32 KiB，总计最大 64 KiB。
-- 文件必须是 workspace 内的普通 UTF-8 文件。
-- symlink/junction 解析到 workspace 外、I/O 失败、非法 UTF-8 或超限都关闭失败。
+- canonical workspace 通过文件系统根 capability 逐分量 `nofollow` 打开，root→cwd 的每层目录都由父目录句柄相对打开；路径解析后插入的 symlink/junction/reparse point 不会成为新的 ambient 逃逸。
+- 每个候选文件以目录 capability 相对 `nofollow` 打开，文件类型、hard-link count、长度和正文都从同一个已打开句柄取得；symlink/junction、非普通文件、多 hard-link 对象、I/O 失败、非法 UTF-8 或超限都关闭失败。
+- 文件路径在打开后即使被替换，本轮仍只读取已经验证的原对象；来源摘要和 aggregate digest 均基于该次有界读取的实际字节。
 - 合并结果作为 developer message 注入，不修改 user goal；只把合并后的正文发送给模型。
 - 内部 `ProjectInstructions` 同时保存 workspace-relative source path、每个文件的 SHA-256 和按合并正文及来源顺序计算的 aggregate SHA-256。`AgentLoopInput` 在本轮固定该 aggregate digest；若产生 pending approval，内部 checkpoint 保存同一 digest，resume 只接受重新加载的同一 bounded snapshot，文件、来源顺序或 override 选择变化会在执行批准工具前以稳定错误 fail closed；绝对路径、原始 source metadata 与原始正文不进入普通 trace、CLI 或模型工具 payload。
 

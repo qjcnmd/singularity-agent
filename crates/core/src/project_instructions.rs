@@ -1,10 +1,12 @@
 //! 从 workspace 层级读取并限制项目指令的安全实现。
 
 use std::fmt::{Display, Formatter};
-use std::fs::File;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, File, OpenOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -49,8 +51,8 @@ pub enum ProjectInstructionErrorCode {
     WorkingDirectoryOutsideWorkspace,
     MetadataReadFailed,
     PathResolutionFailed,
-    PathOutsideWorkspace,
     UnsupportedFileType,
+    UnsupportedFileIdentity,
     FileTooLarge,
     TotalTooLarge,
     FileReadFailed,
@@ -74,8 +76,8 @@ impl ProjectInstructionErrorCode {
             }
             Self::MetadataReadFailed => "project_instruction_metadata_read_failed",
             Self::PathResolutionFailed => "project_instruction_path_resolution_failed",
-            Self::PathOutsideWorkspace => "project_instruction_path_outside_workspace",
             Self::UnsupportedFileType => "project_instruction_unsupported_file_type",
+            Self::UnsupportedFileIdentity => "project_instruction_unsupported_file_identity",
             Self::FileTooLarge => "project_instruction_file_too_large",
             Self::TotalTooLarge => "project_instruction_total_too_large",
             Self::FileReadFailed => "project_instruction_file_read_failed",
@@ -155,13 +157,21 @@ pub fn load_project_instructions(
     workspace_root: impl AsRef<Path>,
     cwd: impl AsRef<Path>,
 ) -> Result<Option<ProjectInstructions>, ProjectInstructionError> {
+    load_project_instructions_with_hook(workspace_root.as_ref(), cwd.as_ref(), || {})
+}
+
+fn load_project_instructions_with_hook(
+    workspace_root: &Path,
+    cwd: &Path,
+    after_path_resolution: impl FnOnce(),
+) -> Result<Option<ProjectInstructions>, ProjectInstructionError> {
     let workspace_root = canonicalize_directory(
-        workspace_root.as_ref(),
+        workspace_root,
         ProjectInstructionErrorCode::WorkspaceRootUnavailable,
         ProjectInstructionErrorCode::WorkspaceRootNotDirectory,
     )?;
     let cwd = canonicalize_directory(
-        cwd.as_ref(),
+        cwd,
         ProjectInstructionErrorCode::WorkingDirectoryUnavailable,
         ProjectInstructionErrorCode::WorkingDirectoryNotDirectory,
     )?;
@@ -171,17 +181,28 @@ pub fn load_project_instructions(
         ));
     }
 
+    after_path_resolution();
+    let directories = open_instruction_directories(&workspace_root, &cwd)?;
     let mut content = String::new();
     let mut sources = Vec::new();
     let mut total_bytes = 0usize;
-    for directory in instruction_search_directories(&workspace_root, &cwd) {
-        let override_candidate = directory.join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME);
-        let candidate = directory.join(PROJECT_INSTRUCTIONS_FILE_NAME);
-        let instruction_file =
-            match read_project_instruction_file(&workspace_root, &override_candidate)? {
-                Some(instruction_file) => Some(instruction_file),
-                None => read_project_instruction_file(&workspace_root, &candidate)?,
-            };
+    for directory in directories {
+        let override_relative = directory
+            .relative_path
+            .join(PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME);
+        let ordinary_relative = directory.relative_path.join(PROJECT_INSTRUCTIONS_FILE_NAME);
+        let instruction_file = match read_project_instruction_file(
+            &directory.dir,
+            Path::new(PROJECT_INSTRUCTIONS_OVERRIDE_FILE_NAME),
+            &override_relative,
+        )? {
+            Some(instruction_file) => Some(instruction_file),
+            None => read_project_instruction_file(
+                &directory.dir,
+                Path::new(PROJECT_INSTRUCTIONS_FILE_NAME),
+                &ordinary_relative,
+            )?,
+        };
         let Some(instruction_file) = instruction_file else {
             continue;
         };
@@ -234,64 +255,185 @@ struct ProjectInstructionFile {
     content_digest: String,
 }
 
-fn read_project_instruction_file(
+struct InstructionDirectory {
+    dir: Dir,
+    relative_path: PathBuf,
+}
+
+/// Opens the workspace and every cwd component as capabilities without following directory links.
+fn open_instruction_directories(
     workspace_root: &Path,
-    candidate: &Path,
-) -> Result<Option<ProjectInstructionFile>, ProjectInstructionError> {
-    let relative_path = candidate
+    cwd: &Path,
+) -> Result<Vec<InstructionDirectory>, ProjectInstructionError> {
+    let mut current = open_absolute_directory_nofollow(
+        workspace_root,
+        ProjectInstructionErrorCode::WorkspaceRootUnavailable,
+    )?;
+
+    let mut directories = vec![InstructionDirectory {
+        dir: current.try_clone().map_err(|error| {
+            ProjectInstructionError::with_io_kind(
+                ProjectInstructionErrorCode::PathResolutionFailed,
+                Some(PathBuf::new()),
+                &error,
+            )
+        })?,
+        relative_path: PathBuf::new(),
+    }];
+    let relative_cwd = cwd
         .strip_prefix(workspace_root)
-        .expect("instruction candidate is within workspace")
-        .to_path_buf();
-    match std::fs::symlink_metadata(candidate) {
-        Ok(_) => {}
+        .expect("cwd boundary checked before capability traversal");
+    let mut relative_path = PathBuf::new();
+    for component in relative_cwd.components() {
+        let Component::Normal(component) = component else {
+            return Err(ProjectInstructionError::at_path(
+                ProjectInstructionErrorCode::PathResolutionFailed,
+                relative_path,
+            ));
+        };
+        relative_path.push(component);
+        current = current.open_dir_nofollow(component).map_err(|error| {
+            ProjectInstructionError::with_io_kind(
+                ProjectInstructionErrorCode::PathResolutionFailed,
+                Some(relative_path.clone()),
+                &error,
+            )
+        })?;
+        directories.push(InstructionDirectory {
+            dir: current.try_clone().map_err(|error| {
+                ProjectInstructionError::with_io_kind(
+                    ProjectInstructionErrorCode::PathResolutionFailed,
+                    Some(relative_path.clone()),
+                    &error,
+                )
+            })?,
+            relative_path: relative_path.clone(),
+        });
+    }
+    Ok(directories)
+}
+
+/// Opens an absolute directory through a stable filesystem-root capability.
+///
+/// The input is already canonical, so every named component must be an actual
+/// directory when opened. A symlink or reparse point inserted after
+/// canonicalization is rejected instead of becoming a new ambient escape.
+fn open_absolute_directory_nofollow(
+    path: &Path,
+    error_code: ProjectInstructionErrorCode,
+) -> Result<Dir, ProjectInstructionError> {
+    let mut anchor = PathBuf::new();
+    let mut descendants = Vec::new();
+    let mut rooted = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) if !rooted && descendants.is_empty() => {
+                anchor.push(component.as_os_str());
+            }
+            Component::RootDir if !rooted && descendants.is_empty() => {
+                anchor.push(component.as_os_str());
+                rooted = true;
+            }
+            Component::Normal(component) if rooted => descendants.push(component.to_os_string()),
+            _ => {
+                return Err(ProjectInstructionError::new(
+                    ProjectInstructionErrorCode::PathResolutionFailed,
+                ));
+            }
+        }
+    }
+    if !rooted {
+        return Err(ProjectInstructionError::new(
+            ProjectInstructionErrorCode::PathResolutionFailed,
+        ));
+    }
+
+    let mut current = Dir::open_ambient_dir(&anchor, ambient_authority())
+        .map_err(|error| ProjectInstructionError::with_io_kind(error_code, None, &error))?;
+    for component in descendants {
+        current = current
+            .open_dir_nofollow(&component)
+            .map_err(|error| ProjectInstructionError::with_io_kind(error_code, None, &error))?;
+    }
+    Ok(current)
+}
+
+fn read_project_instruction_file(
+    directory: &Dir,
+    candidate_name: &Path,
+    relative_path: &Path,
+) -> Result<Option<ProjectInstructionFile>, ProjectInstructionError> {
+    let metadata = match directory.symlink_metadata(candidate_name) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(ProjectInstructionError::with_io_kind(
                 ProjectInstructionErrorCode::MetadataReadFailed,
-                Some(relative_path),
+                Some(relative_path.to_path_buf()),
                 &error,
             ));
         }
-    }
-
-    let resolved_path = std::fs::canonicalize(candidate).map_err(|error| {
-        ProjectInstructionError::with_io_kind(
-            ProjectInstructionErrorCode::PathResolutionFailed,
-            Some(relative_path.clone()),
-            &error,
-        )
-    })?;
-    if !resolved_path.starts_with(workspace_root) {
+    };
+    if metadata.is_symlink() || !metadata.is_file() {
         return Err(ProjectInstructionError::at_path(
-            ProjectInstructionErrorCode::PathOutsideWorkspace,
-            relative_path,
+            ProjectInstructionErrorCode::UnsupportedFileType,
+            relative_path.to_path_buf(),
         ));
     }
-    let metadata = std::fs::metadata(&resolved_path).map_err(|error| {
+    read_project_instruction_file_with_hook(directory, candidate_name, relative_path, || {})
+        .map(Some)
+}
+
+fn read_project_instruction_file_with_hook(
+    directory: &Dir,
+    candidate_name: &Path,
+    relative_path: &Path,
+    after_open: impl FnOnce(),
+) -> Result<ProjectInstructionFile, ProjectInstructionError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    let mut file = directory
+        .open_with(candidate_name, &options)
+        .map_err(|error| {
+            ProjectInstructionError::with_io_kind(
+                ProjectInstructionErrorCode::FileReadFailed,
+                Some(relative_path.to_path_buf()),
+                &error,
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
         ProjectInstructionError::with_io_kind(
             ProjectInstructionErrorCode::MetadataReadFailed,
-            Some(relative_path.clone()),
+            Some(relative_path.to_path_buf()),
             &error,
         )
     })?;
     if !metadata.is_file() {
         return Err(ProjectInstructionError::at_path(
             ProjectInstructionErrorCode::UnsupportedFileType,
-            relative_path,
+            relative_path.to_path_buf(),
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(ProjectInstructionError::at_path(
+            ProjectInstructionErrorCode::UnsupportedFileIdentity,
+            relative_path.to_path_buf(),
         ));
     }
     if metadata.len() > PROJECT_INSTRUCTIONS_MAX_FILE_BYTES as u64 {
         return Err(ProjectInstructionError::at_path(
             ProjectInstructionErrorCode::FileTooLarge,
-            relative_path,
+            relative_path.to_path_buf(),
         ));
     }
 
-    let bytes = read_bounded_file(&resolved_path, &relative_path)?;
+    after_open();
+    let bytes = read_bounded_file(&mut file, relative_path)?;
     if bytes.len() > PROJECT_INSTRUCTIONS_MAX_FILE_BYTES {
         return Err(ProjectInstructionError::at_path(
             ProjectInstructionErrorCode::FileTooLarge,
-            relative_path,
+            relative_path.to_path_buf(),
         ));
     }
     let byte_len = bytes.len();
@@ -299,15 +441,15 @@ fn read_project_instruction_file(
     let text = String::from_utf8(bytes).map_err(|_| {
         ProjectInstructionError::at_path(
             ProjectInstructionErrorCode::InvalidUtf8,
-            relative_path.clone(),
+            relative_path.to_path_buf(),
         )
     })?;
-    Ok(Some(ProjectInstructionFile {
-        relative_path,
+    Ok(ProjectInstructionFile {
+        relative_path: relative_path.to_path_buf(),
         text,
         byte_len,
         content_digest,
-    }))
+    })
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
@@ -350,30 +492,10 @@ fn find_workspace_root(cwd: &Path) -> Result<PathBuf, ProjectInstructionError> {
     Ok(cwd.to_path_buf())
 }
 
-fn instruction_search_directories(workspace_root: &Path, cwd: &Path) -> Vec<PathBuf> {
-    let relative_cwd = cwd
-        .strip_prefix(workspace_root)
-        .expect("cwd boundary checked before directory construction");
-    let mut current = workspace_root.to_path_buf();
-    let mut directories = vec![current.clone()];
-    for component in relative_cwd.components() {
-        current.push(component);
-        directories.push(current.clone());
-    }
-    directories
-}
-
 fn read_bounded_file(
-    resolved_path: &Path,
+    file: &mut File,
     relative_path: &Path,
 ) -> Result<Vec<u8>, ProjectInstructionError> {
-    let file = File::open(resolved_path).map_err(|error| {
-        ProjectInstructionError::with_io_kind(
-            ProjectInstructionErrorCode::FileReadFailed,
-            Some(relative_path.to_path_buf()),
-            &error,
-        )
-    })?;
     let mut bytes = Vec::new();
     file.take((PROJECT_INSTRUCTIONS_MAX_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -385,4 +507,103 @@ fn read_bounded_file(
             )
         })?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ProjectInstructionErrorCode, load_project_instructions_with_hook,
+        read_project_instruction_file_with_hook,
+    };
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+    use std::path::Path;
+
+    #[test]
+    fn verified_handle_does_not_follow_a_replaced_instruction_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside.txt");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let candidate = workspace.join("AGENTS.md");
+        let original = workspace.join("original-agents.md");
+        std::fs::write(&candidate, "trusted instructions").expect("candidate");
+        std::fs::write(&outside, "outside secret").expect("outside");
+        let directory =
+            Dir::open_ambient_dir(&workspace, ambient_authority()).expect("workspace capability");
+
+        let loaded = read_project_instruction_file_with_hook(
+            &directory,
+            Path::new("AGENTS.md"),
+            Path::new("AGENTS.md"),
+            || {
+                std::fs::rename(&candidate, &original).expect("move original path");
+                std::fs::hard_link(&outside, &candidate).expect("replace with outside hardlink");
+            },
+        )
+        .expect("read opened instruction object");
+
+        assert_eq!(loaded.text, "trusted instructions");
+        assert_eq!(
+            std::fs::read_to_string(&candidate).expect("replacement contents"),
+            "outside secret"
+        );
+    }
+
+    #[test]
+    fn resolved_workspace_cannot_be_replaced_with_a_directory_link_before_open() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        let original = temp.path().join("original-workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::write(outside.join("AGENTS.md"), "outside secret").expect("outside agents");
+
+        let error = load_project_instructions_with_hook(&workspace, &workspace, || {
+            std::fs::rename(&workspace, &original).expect("move workspace");
+            create_directory_link(&outside, &workspace);
+        })
+        .expect_err("replacement directory link must not be followed");
+
+        assert_eq!(
+            error.code,
+            ProjectInstructionErrorCode::WorkspaceRootUnavailable
+        );
+        remove_directory_link(&workspace);
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("workspace symlink");
+    }
+
+    #[cfg(unix)]
+    fn remove_directory_link(link: &Path) {
+        std::fs::remove_file(link).expect("remove workspace symlink");
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &Path, link: &Path) {
+        let output = std::process::Command::new("cmd.exe")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                link.to_str().expect("workspace link path"),
+                target.to_str().expect("workspace link target"),
+            ])
+            .output()
+            .expect("create workspace junction");
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    fn remove_directory_link(link: &Path) {
+        std::fs::remove_dir(link).expect("remove workspace junction");
+    }
 }
