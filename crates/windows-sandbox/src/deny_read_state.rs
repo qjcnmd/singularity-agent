@@ -844,6 +844,14 @@ mod tests {
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
 
+    fn create_acl_target(path: &Path, is_directory: bool) {
+        if is_directory {
+            std::fs::create_dir(path).expect("create ACL target directory");
+        } else {
+            std::fs::write(path, b"protected").expect("create ACL target file");
+        }
+    }
+
     const CHILD_ENV: &str = "SINGULARITY_DENY_READ_STATE_CHILD";
     const EXECUTION_CHILD_ENV: &str = "SINGULARITY_DENY_READ_EXECUTION_CHILD";
     const EXECUTION_ACQUIRED_ENV: &str = "SINGULARITY_DENY_READ_EXECUTION_ACQUIRED";
@@ -1059,51 +1067,107 @@ mod tests {
     }
 
     #[test]
-    fn pending_applied_ownership_is_promoted_after_interrupted_commit() {
+    fn pending_applied_file_and_directory_ownership_is_promoted_after_interrupted_commit() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let sandbox_home = temp.path().join("sandbox-home");
-        let protected = temp.path().join("protected");
-        std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
-        std::fs::create_dir(&protected).expect("create protected path");
         let principal = "S-1-5-21-1-2-3-4";
         let sid = LocalSid::from_string(principal).expect("test SID");
-        assert!(
-            unsafe { add_deny_read_ace(&protected, sid.as_ptr()) }
-                .expect("seed interrupted runtime deny")
-        );
-        let fingerprint = unsafe { deny_read_acl_fingerprint(&protected, sid.as_ptr()) }
-            .expect("fingerprint interrupted deny");
-        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-        let mut state = PersistentDenyReadAclState::default();
-        state.pending_principals.insert(
-            principal.to_string(),
-            vec![ManagedDenyReadAcl {
-                path: protected.clone(),
-                fingerprint,
-            }],
-        );
-        store_state(&state_path, &state).expect("store interrupted pending state");
+        for (label, is_directory) in [("file", false), ("directory", true)] {
+            let sandbox_home = temp.path().join(format!("{label}-sandbox-home"));
+            let protected = temp.path().join(format!("{label}-protected"));
+            std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+            create_acl_target(&protected, is_directory);
+            assert!(
+                unsafe { add_deny_read_ace(&protected, sid.as_ptr()) }
+                    .expect("seed interrupted runtime deny")
+            );
+            let fingerprint = unsafe { deny_read_acl_fingerprint(&protected, sid.as_ptr()) }
+                .expect("fingerprint interrupted deny");
+            let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+            let mut state = PersistentDenyReadAclState::default();
+            state.pending_principals.insert(
+                principal.to_string(),
+                vec![ManagedDenyReadAcl {
+                    path: protected.clone(),
+                    fingerprint,
+                }],
+            );
+            store_state(&state_path, &state).expect("store interrupted pending state");
 
-        unsafe {
-            sync_persistent_deny_read_acls(
-                &sandbox_home,
-                principal,
-                std::slice::from_ref(&protected),
-                sid.as_ptr(),
-            )
+            unsafe {
+                sync_persistent_deny_read_acls(
+                    &sandbox_home,
+                    principal,
+                    std::slice::from_ref(&protected),
+                    sid.as_ptr(),
+                )
+            }
+            .expect("recover pending ownership");
+
+            let recovered = load_state(&state_path).expect("load recovered state");
+            assert!(recovered.pending_principals.is_empty());
+            assert_eq!(
+                recovered
+                    .principals
+                    .get(principal)
+                    .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect()),
+                Some(vec![protected.clone()])
+            );
+            unsafe {
+                revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore protected ACL")
+            };
         }
-        .expect("recover pending ownership");
+    }
 
-        let recovered = load_state(&state_path).expect("load recovered state");
-        assert!(recovered.pending_principals.is_empty());
-        assert_eq!(
-            recovered
+    #[test]
+    fn runtime_owned_file_and_directory_fingerprints_revoke_cleanly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+        for (label, is_directory) in [("file", false), ("directory", true)] {
+            let sandbox_home = temp.path().join(format!("{label}-sandbox-home"));
+            let protected = temp.path().join(format!("{label}-protected"));
+            std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+            create_acl_target(&protected, is_directory);
+
+            unsafe {
+                sync_persistent_deny_read_acls(
+                    &sandbox_home,
+                    principal,
+                    std::slice::from_ref(&protected),
+                    sid.as_ptr(),
+                )
+            }
+            .expect("apply managed deny-read ACL");
+
+            let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+            let state = load_state(&state_path).expect("load managed state");
+            let managed = state
                 .principals
                 .get(principal)
-                .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect()),
-            Some(vec![protected.clone()])
-        );
-        unsafe { revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore protected ACL") };
+                .and_then(|entries| entries.first())
+                .expect("runtime-owned fingerprint");
+            assert_eq!(
+                managed.fingerprint,
+                unsafe { deny_read_acl_fingerprint(&protected, sid.as_ptr()) }
+                    .expect("read applied fingerprint"),
+                "{label}"
+            );
+
+            unsafe { sync_persistent_deny_read_acls(&sandbox_home, principal, &[], sid.as_ptr()) }
+                .expect("revoke managed deny-read ACL");
+
+            let state = load_state(&state_path).expect("load revoked state");
+            assert!(!state.principals.contains_key(principal), "{label}");
+            let (dacl, security_descriptor) =
+                unsafe { fetch_dacl_handle(&protected).expect("read revoked DACL") };
+            assert!(
+                !unsafe { dacl_has_read_deny_for_sid(dacl, sid.as_ptr()) },
+                "{label}"
+            );
+            unsafe {
+                LocalFree(security_descriptor as HLOCAL);
+            }
+        }
     }
 
     #[test]

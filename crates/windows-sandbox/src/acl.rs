@@ -921,17 +921,17 @@ impl DenyAceKind {
     }
 }
 
-fn runtime_owned_read_fingerprint() -> DenyReadAclFingerprint {
-    let mut entries = vec![
-        DenyAceFingerprintEntry {
-            flags: 0,
-            mask: effective_file_access_mask(DENY_READ_MASK),
-        },
-        DenyAceFingerprintEntry {
+fn runtime_owned_read_fingerprint(is_directory: bool) -> DenyReadAclFingerprint {
+    let mut entries = vec![DenyAceFingerprintEntry {
+        flags: 0,
+        mask: effective_file_access_mask(DENY_READ_MASK),
+    }];
+    if is_directory {
+        entries.push(DenyAceFingerprintEntry {
             flags: (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | u32::from(INHERIT_ONLY_ACE)) as u8,
             mask: DENY_READ_MASK,
-        },
-    ];
+        });
+    }
     entries.sort();
     DenyReadAclFingerprint { entries }
 }
@@ -986,7 +986,7 @@ unsafe fn add_deny_ace_to_target(
             )));
         }
         let fingerprint = (!had_any_deny && matches!(kind, DenyAceKind::Read))
-            .then(runtime_owned_read_fingerprint);
+            .then(|| runtime_owned_read_fingerprint(target.is_directory));
         let before_set_result = match (before_set.as_mut(), fingerprint.as_ref()) {
             (Some(before_set), Some(fingerprint)) => before_set(fingerprint),
             _ => Ok(()),
