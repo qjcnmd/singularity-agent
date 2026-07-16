@@ -954,10 +954,10 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 
         // Deny ACEs attach to filesystem objects. Materialize only missing carveouts without
         // following a reparse point in any ancestor so a child cannot create the path later.
-        let created_by_setup = match std::fs::symlink_metadata(path) {
-            Ok(_) => false,
+        let mut materialized = match std::fs::symlink_metadata(path) {
+            Ok(_) => None,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ensure_missing_protected_path_materialized(path)?
+                Some(ensure_missing_protected_path_materialized(path)?)
             }
             Err(error) => return Err(error.into()),
         };
@@ -974,7 +974,11 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                     .ok_or_else(|| anyhow::anyhow!("convert deny capability SID failed"))?
             };
 
-            match unsafe { add_deny_write_ace(path, deny_psid) } {
+            let result = match &materialized {
+                Some(materialized) => unsafe { materialized.add_deny_write_ace(deny_psid) },
+                None => unsafe { add_deny_write_ace(path, deny_psid) },
+            };
+            match result {
                 Ok(true) => {
                     log_line(
                         log,
@@ -984,13 +988,8 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 Ok(false) => {}
                 Err(err) => {
                     refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
-                    if created_by_setup
-                        && let Err(cleanup) =
-                            singularity_windows_sandbox::cleanup_empty_runtime_sentinel(
-                                path,
-                                path.parent().unwrap_or(path),
-                                true,
-                            )
+                    if let Some(materialized) = materialized.take()
+                        && let Err(cleanup) = materialized.cleanup_if_empty()
                     {
                         refresh_errors.push(format!(
                             "deny ACE sentinel cleanup failed on {}: {cleanup}",

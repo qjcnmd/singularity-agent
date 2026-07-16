@@ -1320,10 +1320,7 @@ fn run_agent_stage(
     .with_max_turns(DEFAULT_AGENT_MAX_TURNS)
     .with_verification_requirements(verification_requirements);
     if let Some(instructions) = project_instructions {
-        input = input.with_project_instructions_snapshot(
-            instructions.content,
-            instructions.aggregate_digest,
-        );
+        input = input.with_project_instructions(instructions);
     }
     let agent_started = Instant::now();
     let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)

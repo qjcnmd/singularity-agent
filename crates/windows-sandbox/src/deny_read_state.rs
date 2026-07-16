@@ -1,6 +1,7 @@
+use crate::acl::deny_read_acl_fingerprint;
 use crate::acl::revoke_deny_read_ace_with_fingerprint;
 use crate::deny_read_acl::ManagedDenyReadAcl;
-use crate::deny_read_acl::apply_deny_read_acls_with_ownership;
+use crate::deny_read_acl::apply_deny_read_acls_with_ownership_before_set;
 use crate::path_normalization::canonical_path_key_allow_missing;
 use crate::path_normalization::lexical_path_key;
 use crate::setup::sandbox_dir;
@@ -47,7 +48,7 @@ use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const DENY_READ_ACL_STATE_FILE: &str = "deny_read_acl_state.json";
-const DENY_READ_ACL_STATE_VERSION: u32 = 3;
+const DENY_READ_ACL_STATE_VERSION: u32 = 4;
 const STATE_MUTEX_PREFIX: &str = "SingularityDenyReadState";
 const EXECUTION_MUTEX_PREFIX: &str = "SingularityDenyReadExecution";
 const RUNNER_LEASE_MUTEX_PREFIX: &str = r"Global\SingularityDenyReadRunner_";
@@ -60,6 +61,8 @@ struct PersistentDenyReadAclState {
     version: u32,
     principals: BTreeMap<String, Vec<ManagedDenyReadAcl>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_principals: BTreeMap<String, Vec<ManagedDenyReadAcl>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     legacy_unmanaged_principals: BTreeMap<String, Vec<PathBuf>>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     active_runner_leases: BTreeSet<String>,
@@ -70,6 +73,7 @@ impl Default for PersistentDenyReadAclState {
         Self {
             version: DENY_READ_ACL_STATE_VERSION,
             principals: BTreeMap::new(),
+            pending_principals: BTreeMap::new(),
             legacy_unmanaged_principals: BTreeMap::new(),
             active_runner_leases: BTreeSet::new(),
         }
@@ -89,6 +93,17 @@ struct VersionTwoPersistentDenyReadAclState {
     principals: BTreeMap<String, Vec<PathBuf>>,
     #[serde(default)]
     legacy_unmanaged_principals: BTreeMap<String, Vec<PathBuf>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionThreePersistentDenyReadAclState {
+    version: u32,
+    principals: BTreeMap<String, Vec<ManagedDenyReadAcl>>,
+    #[serde(default)]
+    legacy_unmanaged_principals: BTreeMap<String, Vec<PathBuf>>,
+    #[serde(default)]
+    active_runner_leases: BTreeSet<String>,
 }
 
 pub(crate) struct StateMutex {
@@ -339,6 +354,70 @@ fn remove_runner_lease(sandbox_home: &Path, lease_name: &str) -> Result<()> {
     Ok(())
 }
 
+unsafe fn recover_pending_principal(
+    state: &mut PersistentDenyReadAclState,
+    principal_sid: &str,
+    psid: *mut c_void,
+) -> Result<bool> {
+    let Some(pending) = state.pending_principals.get(principal_sid).cloned() else {
+        return Ok(false);
+    };
+    let mut managed = state
+        .principals
+        .get(principal_sid)
+        .cloned()
+        .unwrap_or_default();
+    for entry in pending {
+        let current = match std::fs::symlink_metadata(&entry.path) {
+            Ok(_) => {
+                unsafe { deny_read_acl_fingerprint(&entry.path, psid) }.with_context(|| {
+                    format!(
+                        "recover pending deny-read ACL fingerprint {}",
+                        entry.path.display()
+                    )
+                })?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect pending deny-read ACL target {}",
+                        entry.path.display()
+                    )
+                });
+            }
+        };
+        if current == entry.fingerprint {
+            upsert_managed_path(&mut managed, entry);
+        } else if !current.is_empty() {
+            anyhow::bail!(
+                "pending deny-read ACL fingerprint changed for {}",
+                entry.path.display()
+            );
+        }
+    }
+    state.pending_principals.remove(principal_sid);
+    if managed.is_empty() {
+        state.principals.remove(principal_sid);
+    } else {
+        managed.sort_by_key(|entry| lexical_path_key(&entry.path));
+        state.principals.insert(principal_sid.to_string(), managed);
+    }
+    Ok(true)
+}
+
+fn upsert_managed_path(entries: &mut Vec<ManagedDenyReadAcl>, candidate: ManagedDenyReadAcl) {
+    let key = lexical_path_key(&candidate.path);
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|entry| lexical_path_key(&entry.path) == key)
+    {
+        *existing = candidate;
+    } else {
+        entries.push(candidate);
+    }
+}
+
 fn validate_runner_lease_name(lease_name: &str) -> Result<()> {
     let Some(nonce) = lease_name.strip_prefix(RUNNER_LEASE_MUTEX_PREFIX) else {
         anyhow::bail!("invalid deny-read runner lease name");
@@ -421,12 +500,45 @@ pub unsafe fn sync_persistent_deny_read_acls(
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
     let _lock = lock_state(&state_path)?;
     let mut state = load_state(&state_path)?;
+    if unsafe { recover_pending_principal(&mut state, principal_sid, psid) }? {
+        store_state(&state_path, &state).context("commit recovered pending deny-read ownership")?;
+    }
     let previous_managed = state
         .principals
         .get(principal_sid)
         .cloned()
         .unwrap_or_default();
-    let application = unsafe { apply_deny_read_acls_with_ownership(desired_paths, psid) }?;
+    let application_result = unsafe {
+        apply_deny_read_acls_with_ownership_before_set(desired_paths, psid, &mut |pending| {
+            upsert_managed_path(
+                state
+                    .pending_principals
+                    .entry(principal_sid.to_string())
+                    .or_default(),
+                pending.clone(),
+            );
+            store_state(&state_path, &state)
+                .context("journal pending deny-read ownership before ACL mutation")
+        })
+    };
+    let application = match application_result {
+        Ok(application) => application,
+        Err(error) => {
+            let recovery = unsafe { recover_pending_principal(&mut state, principal_sid, psid) }
+                .and_then(|changed| {
+                    changed
+                        .then(|| store_state(&state_path, &state))
+                        .transpose()
+                        .map(|_| ())
+                });
+            return match recovery {
+                Ok(()) => Err(error),
+                Err(recovery_error) => Err(error.context(format!(
+                    "pending deny-read ownership recovery failed: {recovery_error}"
+                ))),
+            };
+        }
+    };
     let desired_keys = application
         .enforced_paths
         .iter()
@@ -467,6 +579,26 @@ pub unsafe fn sync_persistent_deny_read_acls(
                 continue;
             }
         }
+        let current_fingerprint = match unsafe { deny_read_acl_fingerprint(&managed.path, psid) } {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                revoke_errors.push(format!("{}: {error}", managed.path.display()));
+                retained_stale.push(managed);
+                continue;
+            }
+        };
+        if current_fingerprint.is_empty() {
+            continue;
+        }
+        if current_fingerprint != managed.fingerprint {
+            revoke_errors.push(format!(
+                "{}: ownership fingerprint changed (current={current_fingerprint:?}, expected={:?})",
+                managed.path.display(),
+                managed.fingerprint
+            ));
+            retained_stale.push(managed);
+            continue;
+        }
         if let Err(error) = unsafe {
             revoke_deny_read_ace_with_fingerprint(&managed.path, psid, &managed.fingerprint)
         } {
@@ -483,6 +615,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
             .principals
             .insert(principal_sid.to_string(), tracked_paths);
     }
+    state.pending_principals.remove(principal_sid);
     let managed_keys = state
         .principals
         .get(principal_sid)
@@ -547,6 +680,28 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         .with_context(|| format!("parse deny-read ACL state {}", path.display()))?;
                     validate_state(&state).with_context(|| {
                         format!("validate deny-read ACL state {}", path.display())
+                    })?;
+                    Ok(state)
+                }
+                Some(3) => {
+                    let previous: VersionThreePersistentDenyReadAclState =
+                        serde_json::from_value(value).with_context(|| {
+                            format!("parse version 3 deny-read ACL state {}", path.display())
+                        })?;
+                    if previous.version != 3 {
+                        anyhow::bail!(
+                            "invalid version 3 deny-read ACL state in {}",
+                            path.display()
+                        );
+                    }
+                    let state = PersistentDenyReadAclState {
+                        principals: previous.principals,
+                        legacy_unmanaged_principals: previous.legacy_unmanaged_principals,
+                        active_runner_leases: previous.active_runner_leases,
+                        ..PersistentDenyReadAclState::default()
+                    };
+                    validate_state(&state).with_context(|| {
+                        format!("validate version 3 deny-read ACL state {}", path.display())
                     })?;
                     Ok(state)
                 }
@@ -631,7 +786,11 @@ fn validate_state(state: &PersistentDenyReadAclState) -> Result<()> {
     for lease_name in &state.active_runner_leases {
         validate_runner_lease_name(lease_name)?;
     }
-    for entries in state.principals.values() {
+    for entries in state
+        .principals
+        .values()
+        .chain(state.pending_principals.values())
+    {
         let mut keys = BTreeSet::new();
         for managed in entries {
             if !managed.path.is_absolute()
@@ -660,17 +819,20 @@ fn store_state(path: &Path, state: &PersistentDenyReadAclState) -> Result<()> {
 mod tests {
     use super::DENY_READ_ACL_STATE_FILE;
     use super::ManagedDenyReadAcl;
+    use super::PersistentDenyReadAclState;
     use super::load_state;
     use super::merge_tracked_paths;
     use super::reconcile_runner_leases;
     use super::register_runner_lease;
     use super::sandbox_dir;
     use super::state_mutex_name;
+    use super::store_state;
     use super::sync_persistent_deny_read_acls;
     use super::try_lock_deny_read_execution;
     use crate::acl::add_deny_read_ace;
     use crate::acl::add_deny_write_ace;
     use crate::acl::dacl_has_read_deny_for_sid;
+    use crate::acl::deny_read_acl_fingerprint;
     use crate::acl::fetch_dacl_handle;
     use crate::acl::revoke_deny_read_ace;
     use crate::path_normalization::lexical_path_key;
@@ -897,6 +1059,172 @@ mod tests {
     }
 
     #[test]
+    fn pending_applied_ownership_is_promoted_after_interrupted_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("sandbox-home");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+        std::fs::create_dir(&protected).expect("create protected path");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+        assert!(
+            unsafe { add_deny_read_ace(&protected, sid.as_ptr()) }
+                .expect("seed interrupted runtime deny")
+        );
+        let fingerprint = unsafe { deny_read_acl_fingerprint(&protected, sid.as_ptr()) }
+            .expect("fingerprint interrupted deny");
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        let mut state = PersistentDenyReadAclState::default();
+        state.pending_principals.insert(
+            principal.to_string(),
+            vec![ManagedDenyReadAcl {
+                path: protected.clone(),
+                fingerprint,
+            }],
+        );
+        store_state(&state_path, &state).expect("store interrupted pending state");
+
+        unsafe {
+            sync_persistent_deny_read_acls(
+                &sandbox_home,
+                principal,
+                std::slice::from_ref(&protected),
+                sid.as_ptr(),
+            )
+        }
+        .expect("recover pending ownership");
+
+        let recovered = load_state(&state_path).expect("load recovered state");
+        assert!(recovered.pending_principals.is_empty());
+        assert_eq!(
+            recovered
+                .principals
+                .get(principal)
+                .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect()),
+            Some(vec![protected.clone()])
+        );
+        unsafe { revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore protected ACL") };
+    }
+
+    #[test]
+    fn pending_unapplied_ownership_is_dropped_after_interrupted_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("sandbox-home");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+        std::fs::create_dir(&protected).expect("create protected path");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+        assert!(
+            unsafe { add_deny_read_ace(&protected, sid.as_ptr()) }
+                .expect("seed expected pending deny")
+        );
+        let expected = unsafe { deny_read_acl_fingerprint(&protected, sid.as_ptr()) }
+            .expect("fingerprint expected pending deny");
+        unsafe { revoke_deny_read_ace(&protected, sid.as_ptr()).expect("remove unapplied deny") };
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        let mut state = PersistentDenyReadAclState::default();
+        state.pending_principals.insert(
+            principal.to_string(),
+            vec![ManagedDenyReadAcl {
+                path: protected,
+                fingerprint: expected,
+            }],
+        );
+        store_state(&state_path, &state).expect("store unapplied pending state");
+
+        unsafe { sync_persistent_deny_read_acls(&sandbox_home, principal, &[], sid.as_ptr()) }
+            .expect("drop unapplied pending ownership");
+
+        let recovered = load_state(&state_path).expect("load recovered state");
+        assert!(recovered.pending_principals.is_empty());
+        assert!(!recovered.principals.contains_key(principal));
+    }
+
+    #[test]
+    fn changed_pending_acl_fingerprint_fails_closed_and_retains_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("sandbox-home");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+        std::fs::create_dir(&protected).expect("create protected path");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+        assert!(
+            unsafe { add_deny_read_ace(&protected, sid.as_ptr()) }
+                .expect("seed expected pending deny")
+        );
+        let expected = unsafe { deny_read_acl_fingerprint(&protected, sid.as_ptr()) }
+            .expect("fingerprint expected pending deny");
+        assert!(
+            unsafe { add_deny_write_ace(&protected, sid.as_ptr()) }
+                .expect("change pending ACL fingerprint")
+        );
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        let mut state = PersistentDenyReadAclState::default();
+        state.pending_principals.insert(
+            principal.to_string(),
+            vec![ManagedDenyReadAcl {
+                path: protected.clone(),
+                fingerprint: expected,
+            }],
+        );
+        store_state(&state_path, &state).expect("store changed pending state");
+
+        let error =
+            unsafe { sync_persistent_deny_read_acls(&sandbox_home, principal, &[], sid.as_ptr()) }
+                .expect_err("changed pending fingerprint must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("pending deny-read ACL fingerprint changed"),
+            "{error:#}"
+        );
+        let retained = load_state(&state_path).expect("load retained pending state");
+        assert_eq!(
+            retained
+                .pending_principals
+                .get(principal)
+                .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect()),
+            Some(vec![protected.clone()])
+        );
+        unsafe {
+            revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore pending read ACE")
+        };
+    }
+
+    #[test]
+    fn already_revoked_stale_ownership_is_removed_after_interrupted_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("sandbox-home");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+        std::fs::create_dir(&protected).expect("create protected path");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+        unsafe {
+            sync_persistent_deny_read_acls(
+                &sandbox_home,
+                principal,
+                std::slice::from_ref(&protected),
+                sid.as_ptr(),
+            )
+        }
+        .expect("apply managed deny");
+        unsafe {
+            revoke_deny_read_ace(&protected, sid.as_ptr()).expect("simulate completed revoke")
+        };
+
+        unsafe { sync_persistent_deny_read_acls(&sandbox_home, principal, &[], sid.as_ptr()) }
+            .expect("recover interrupted revoke commit");
+
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        let recovered = load_state(&state_path).expect("load recovered state");
+        assert!(!recovered.principals.contains_key(principal));
+    }
+
+    #[test]
     fn changed_managed_acl_fingerprint_is_retained_and_revoke_fails_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sandbox_home = temp.path().join("singularity-home");
@@ -1027,6 +1355,47 @@ mod tests {
             LocalFree(security_descriptor as HLOCAL);
             revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore version two test ACE");
         }
+    }
+
+    #[test]
+    fn version_three_fingerprinted_ownership_migrates_without_loss() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let protected = temp.path().join("version-three-protected");
+        let principal = "S-1-5-21-1-2-3-4";
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        std::fs::create_dir_all(state_path.parent().expect("state parent"))
+            .expect("create state directory");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 3,
+                "principals": {
+                    principal: [{
+                        "path": protected.clone(),
+                        "fingerprint": {
+                            "entries": [{"flags": 0, "mask": 1}]
+                        }
+                    }]
+                },
+                "legacy_unmanaged_principals": {},
+                "active_runner_leases": []
+            }))
+            .expect("serialize version three state"),
+        )
+        .expect("write version three state");
+
+        let state = load_state(&state_path).expect("load migrated version three state");
+
+        assert_eq!(state.version, super::DENY_READ_ACL_STATE_VERSION);
+        assert_eq!(
+            state
+                .principals
+                .get(principal)
+                .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect()),
+            Some(vec![protected])
+        );
+        assert!(state.pending_principals.is_empty());
     }
 
     #[test]

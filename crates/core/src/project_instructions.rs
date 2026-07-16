@@ -31,14 +31,36 @@ pub struct ProjectInstructionSource {
 }
 
 /// 当前 workspace 读取到的项目指令集合及其可验证来源。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectInstructions {
     /// 按 workspace root 到 cwd 顺序合并、且唯一发送给模型的正文。
-    pub content: String,
+    content: String,
     /// 按正文合并顺序排列的来源 provenance。
-    pub sources: Vec<ProjectInstructionSource>,
+    sources: Vec<ProjectInstructionSource>,
     /// 对合并正文和有序 `sources` 列表计算的稳定 SHA-256 摘要。
-    pub aggregate_digest: String,
+    aggregate_digest: String,
+}
+
+impl ProjectInstructions {
+    /// Returns the model-visible merged instruction text.
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    /// Returns the ordered workspace-relative provenance records.
+    pub fn sources(&self) -> &[ProjectInstructionSource] {
+        &self.sources
+    }
+
+    /// Returns the aggregate digest that binds content and provenance.
+    pub fn aggregate_digest(&self) -> &str {
+        &self.aggregate_digest
+    }
+
+    /// Consumes the verified aggregate into the model text and its binding digest.
+    pub fn into_snapshot(self) -> (String, String) {
+        (self.content, self.aggregate_digest)
+    }
 }
 
 /// 项目指令读取失败的稳定原因分类。

@@ -1,5 +1,4 @@
 use crate::acl::add_deny_write_ace;
-use crate::deny_read_acl::cleanup_empty_runtime_sentinel;
 use crate::deny_read_acl::ensure_directory_materialized;
 use crate::path_normalization::canonicalize_path;
 use crate::product_identity::PROTECTED_METADATA_DIR_NAME;
@@ -26,21 +25,27 @@ pub unsafe fn protect_workspace_agents_dir(cwd: &Path, psid: *mut c_void) -> Res
 
 unsafe fn protect_workspace_subdir(cwd: &Path, psid: *mut c_void, subdir: &str) -> Result<bool> {
     let path = cwd.join(subdir);
-    let created = match std::fs::symlink_metadata(&path) {
+    let materialized = match std::fs::symlink_metadata(&path) {
         Ok(metadata) if !metadata.is_dir() => {
             // The generic deny-path pass protects an existing file with the reserved name.
             return Ok(false);
         }
-        Ok(_) => false,
+        Ok(_) => None,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            ensure_directory_materialized(&path)?
+            Some(ensure_directory_materialized(&path)?)
         }
         Err(err) => return Err(err.into()),
     };
-    match add_deny_write_ace(&path, psid) {
+    let result = match &materialized {
+        Some(materialized) => unsafe { materialized.add_deny_write_ace(psid) },
+        None => unsafe { add_deny_write_ace(&path, psid) },
+    };
+    match result {
         Ok(added) => Ok(added),
         Err(err) => {
-            if created && let Err(cleanup) = cleanup_empty_runtime_sentinel(&path, cwd, true) {
+            if let Some(materialized) = materialized
+                && let Err(cleanup) = materialized.cleanup_if_empty()
+            {
                 return Err(err.context(format!("cleanup failed: {cleanup}")));
             }
             Err(err)

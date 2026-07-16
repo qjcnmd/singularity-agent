@@ -5,7 +5,7 @@ use singularity_agent::{
     AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentStatus,
     AgentVerificationRequirement, ApprovalGrant, agent_control_tool_specs, assemble_context_items,
 };
-use singularity_core::CancellationToken;
+use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelPreferences,
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
@@ -42,6 +42,15 @@ struct FinalizationAwareProvider {
     cancel_on_finalization: bool,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
     capabilities: ProviderProtocolContract,
+}
+
+fn project_instruction_snapshot(content: &str) -> ProjectInstructions {
+    let workspace = tempfile::tempdir().expect("project instruction workspace");
+    std::fs::write(workspace.path().join("AGENTS.md"), content)
+        .expect("write project instructions");
+    load_project_instructions(workspace.path(), workspace.path())
+        .expect("load project instructions")
+        .expect("project instructions present")
 }
 
 impl Provider for FinalizationAwareProvider {
@@ -651,10 +660,7 @@ fn agent_loop_cancels_while_waiting_for_provider_and_discards_late_completion() 
 fn agent_loop_rejects_final_after_mutation_without_verification() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "before").expect("write file");
-    let input = AgentLoopInput {
-        max_turns: 2,
-        ..AgentLoopInput::new("thread_1", "turn_1", "change the file")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "change the file").with_max_turns(2);
     let mut edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     edit.tool_calls.push(tool_call(
         "call_1",
@@ -709,10 +715,7 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
 fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "ready").expect("write fixture");
-    let input = AgentLoopInput {
-        max_turns: 3,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(3);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
@@ -1416,7 +1419,7 @@ fn agent_loop_resume_rejects_tampered_completion_checkpoint() {
 fn agent_loop_sends_project_instructions_as_developer_message_without_serializing_them() {
     let project_instructions = "root instructions\n\nchild instructions";
     let input = AgentLoopInput::new("thread_1", "turn_1", "user goal")
-        .with_project_instructions(project_instructions);
+        .with_project_instructions(project_instruction_snapshot(project_instructions));
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
 
     let result = agent_loop_with_response_and_requests(
@@ -1465,7 +1468,7 @@ fn agent_loop_sends_project_instructions_as_developer_message_without_serializin
 fn agent_loop_model_request_orders_developer_history_and_current_turn() {
     let project_instructions = "root instructions";
     let input = AgentLoopInput::new("thread_1", "turn_1", "current user")
-        .with_project_instructions(project_instructions)
+        .with_project_instructions(project_instruction_snapshot(project_instructions))
         .with_history([
             AgentContextItem::history_user("history_user_1", "previous user"),
             AgentContextItem::history_assistant("history_assistant_1", "previous assistant"),
@@ -1688,10 +1691,7 @@ fn agent_loop_rejects_zero_tool_definition_capacity_before_provider() {
 fn agent_loop_executes_workspace_read_tool_with_safe_tool_result() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "hello from workspace").expect("write readme");
-    let input = AgentLoopInput {
-        max_turns: 1,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
@@ -1718,10 +1718,7 @@ fn agent_loop_executes_workspace_read_tool_with_safe_tool_result() {
 fn agent_loop_rechecks_context_budget_before_each_model_request() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "small tool result").expect("write readme");
-    let input = AgentLoopInput {
-        max_turns: 2,
-        ..AgentLoopInput::new("thread_1", "turn_1", "read the file")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "read the file").with_max_turns(2);
     let mut oversized_call = tool_call(
         "call_1",
         "read",
@@ -2168,12 +2165,13 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "before").expect("write file");
-    let input = AgentLoopInput {
-        max_turns: 3,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "edit", ["README.md"]),
-        )
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
+        .with_approval_grant(ApprovalGrant::allow(
+            "approval_turn_1_call_1",
+            "edit",
+            ["README.md"],
+        ))
+        .with_max_turns(3);
     let mut tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "before edit");
     tool_response.tool_calls.push(tool_call(
@@ -2244,10 +2242,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "before").expect("write file");
-    let input = AgentLoopInput {
-        max_turns: 4,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(4);
     let mut failing_tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     failing_tool_response.tool_calls.push(tool_call(
@@ -2346,10 +2341,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
 #[test]
 fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let input = AgentLoopInput {
-        max_turns: 4,
-        ..AgentLoopInput::new("thread_1", "turn_1", "run verification")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run verification").with_max_turns(4);
     let mut malformed_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     malformed_response.tool_calls.push(tool_call(
@@ -2456,10 +2448,8 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
 fn agent_loop_validates_patch_arguments_before_policy() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "content").expect("write file");
-    let input = AgentLoopInput {
-        max_turns: 1,
-        ..AgentLoopInput::new("thread_1", "turn_1", "inspect the workspace")
-    };
+    let input =
+        AgentLoopInput::new("thread_1", "turn_1", "inspect the workspace").with_max_turns(1);
     let mut malformed_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     malformed_response.tool_calls.push(tool_call(
@@ -2499,10 +2489,7 @@ fn agent_loop_validates_patch_arguments_before_policy() {
 #[test]
 fn agent_loop_command_fails_closed_without_sandbox_backend() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let input = AgentLoopInput {
-        max_turns: 2,
-        ..AgentLoopInput::new("thread_1", "turn_1", "run command")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run command").with_max_turns(2);
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
@@ -2571,10 +2558,7 @@ fn agent_loop_command_fails_closed_without_sandbox_backend() {
 #[test]
 fn agent_loop_command_uses_strict_sandbox_backend_when_injected() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let input = AgentLoopInput {
-        max_turns: 2,
-        ..AgentLoopInput::new("thread_1", "turn_1", "run command")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run command").with_max_turns(2);
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
@@ -2614,10 +2598,7 @@ fn agent_loop_command_uses_strict_sandbox_backend_when_injected() {
 #[test]
 fn agent_loop_returns_command_nonzero_to_model_for_repair() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let input = AgentLoopInput {
-        max_turns: 3,
-        ..AgentLoopInput::new("thread_1", "turn_1", "run command")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run command").with_max_turns(3);
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
@@ -2691,10 +2672,7 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
 #[test]
 fn agent_loop_returns_unavailable_executable_to_model_for_repair() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let input = AgentLoopInput {
-        max_turns: 3,
-        ..AgentLoopInput::new("thread_1", "turn_1", "run command")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run command").with_max_turns(3);
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
@@ -2822,12 +2800,13 @@ fn agent_loop_rejects_model_selected_network_before_approval() {
         SandboxFilesystemMode::ReadOnly,
         SandboxNetworkMode::Allowed,
     );
-    let input = AgentLoopInput {
-        max_turns: 1,
-        ..AgentLoopInput::new("thread_1", "turn_1", "run network command").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "command", [resource.clone()]),
-        )
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run network command")
+        .with_approval_grant(ApprovalGrant::allow(
+            "approval_turn_1_call_1",
+            "command",
+            [resource.clone()],
+        ))
+        .with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
@@ -2966,12 +2945,13 @@ fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume(
         SandboxFilesystemMode::WorkspaceWrite,
         SandboxNetworkMode::Denied,
     );
-    let input = AgentLoopInput {
-        max_turns: 2,
-        ..AgentLoopInput::new("thread_1", "turn_1", "run command").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "command", [mismatched_resource]),
-        )
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run command")
+        .with_approval_grant(ApprovalGrant::allow(
+            "approval_turn_1_call_1",
+            "command",
+            [mismatched_resource],
+        ))
+        .with_max_turns(2);
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     let model_input = serde_json::json!({
@@ -3055,10 +3035,7 @@ fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume(
 #[test]
 fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let input = AgentLoopInput {
-        max_turns: 2,
-        ..AgentLoopInput::new("thread_1", "turn_1", "run command")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run command").with_max_turns(2);
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
@@ -3336,11 +3313,9 @@ fn agent_loop_approval_grant_matches_request_id_and_is_single_use() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "one").expect("write file");
-    let input = AgentLoopInput {
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "edit", ["README.md"]),
-        )
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
+        ApprovalGrant::allow("approval_turn_1_call_1", "edit", ["README.md"]),
+    );
     let mut first_tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     first_tool_response.tool_calls.push(tool_call(
@@ -3397,12 +3372,13 @@ fn agent_loop_approval_grant_does_not_override_sensitive_resource_deny() {
             std::fs::create_dir_all(parent).expect("create sensitive parent");
         }
         std::fs::write(&target, "TOKEN=secret").expect("write sensitive file");
-        let input = AgentLoopInput {
-            max_turns: 1,
-            ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-                ApprovalGrant::allow("approval_turn_1_call_1", "edit", [sensitive_path]),
-            )
-        };
+        let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
+            .with_approval_grant(ApprovalGrant::allow(
+                "approval_turn_1_call_1",
+                "edit",
+                [sensitive_path],
+            ))
+            .with_max_turns(1);
         let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
         response.tool_calls.push(tool_call(
             "call_1",
@@ -3444,12 +3420,13 @@ fn agent_loop_patch_grant_does_not_override_sensitive_resource_deny() {
     let dir = tempfile::tempdir().expect("temp dir");
     let env_path = dir.path().join(".env");
     std::fs::write(&env_path, "TOKEN=secret").expect("write env");
-    let input = AgentLoopInput {
-        max_turns: 1,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "patch", [".env"]),
-        )
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
+        .with_approval_grant(ApprovalGrant::allow(
+            "approval_turn_1_call_1",
+            "patch",
+            [".env"],
+        ))
+        .with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
@@ -3492,10 +3469,7 @@ fn agent_loop_patch_policy_checks_every_change_path_before_writing() {
     let second_path = dir.path().join("second.md");
     std::fs::write(&first_path, "one").expect("write first");
     std::fs::write(&second_path, "two").expect("write second");
-    let input = AgentLoopInput {
-        max_turns: 1,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
@@ -3561,10 +3535,7 @@ fn agent_loop_patch_approval_request_covers_unapproved_change_path() {
     let second_path = dir.path().join("second.md");
     std::fs::write(&first_path, "one").expect("write first");
     std::fs::write(&second_path, "two").expect("write second");
-    let input = AgentLoopInput {
-        max_turns: 1,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
@@ -3630,12 +3601,13 @@ fn agent_loop_approval_grant_requires_exact_resource_set() {
     let second_path = dir.path().join("second.md");
     std::fs::write(&first_path, "one").expect("write first");
     std::fs::write(&second_path, "two").expect("write second");
-    let input = AgentLoopInput {
-        max_turns: 1,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-            ApprovalGrant::allow("approval_turn_1_call_1", "patch", ["first.md"]),
-        )
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
+        .with_approval_grant(ApprovalGrant::allow(
+            "approval_turn_1_call_1",
+            "patch",
+            ["first.md"],
+        ))
+        .with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",
@@ -3683,10 +3655,7 @@ fn agent_loop_approval_grant_requires_exact_resource_set() {
 fn agent_loop_denies_sensitive_workspace_tool_before_execution() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join(".env"), "TOKEN=secret").expect("write env");
-    let input = AgentLoopInput {
-        max_turns: 1,
-        ..AgentLoopInput::new("thread_1", "turn_1", "hello")
-    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
         "call_1",

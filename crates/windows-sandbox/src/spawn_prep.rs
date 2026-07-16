@@ -18,6 +18,7 @@ use crate::env::inherit_path_env;
 use crate::env::normalize_null_device_env;
 use crate::logging::log_start;
 use crate::path_normalization::canonicalize_path;
+use crate::path_normalization::lexical_path_key;
 use crate::permissions::PermissionProfile;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::sandbox_utils::ensure_sandbox_home_exists;
@@ -267,13 +268,17 @@ pub(crate) fn apply_restricted_token_acl_rules(
 ) -> Result<()> {
     let AllowDenyPaths { allow, mut deny } =
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
+    let mut materialized = HashMap::new();
     for path in additional_deny_write_paths {
         // Explicit carveouts must exist before the command starts so the sandbox cannot create
         // them under a writable parent first. The helper rejects reparse-point ancestors.
         match std::fs::symlink_metadata(path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ensure_missing_protected_path_materialized(path)?;
+                materialized.insert(
+                    lexical_path_key(path),
+                    ensure_missing_protected_path_materialized(path)?,
+                );
             }
             Err(error) => return Err(error.into()),
         }
@@ -283,7 +288,10 @@ pub(crate) fn apply_restricted_token_acl_rules(
         match std::fs::symlink_metadata(path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ensure_missing_protected_path_materialized(path)?;
+                materialized.insert(
+                    lexical_path_key(path),
+                    ensure_missing_protected_path_materialized(path)?,
+                );
             }
             Err(error) => return Err(error.into()),
         }
@@ -303,7 +311,11 @@ pub(crate) fn apply_restricted_token_acl_rules(
         }
         for p in &deny {
             for root_sid in deny_root_capabilities_for_path(p, acl_sids.write_root_sids) {
-                add_deny_write_ace(p, root_sid.sid.as_ptr())?;
+                if let Some(materialized) = materialized.get(&lexical_path_key(p)) {
+                    materialized.add_deny_write_ace(root_sid.sid.as_ptr())?;
+                } else {
+                    add_deny_write_ace(p, root_sid.sid.as_ptr())?;
+                }
             }
         }
         if !additional_deny_read_paths.is_empty() {

@@ -1,13 +1,14 @@
 use crate::acl::DenyReadAclFingerprint;
-use crate::acl::add_deny_read_ace_with_ownership;
-use crate::acl::deny_read_acl_fingerprint;
-use crate::acl::path_contains_reparse_component;
+use crate::acl::add_deny_read_ace_with_ownership_before_set;
+use crate::acl::add_deny_read_ace_with_ownership_to_handle_before_set;
+use crate::acl::add_deny_write_ace_to_handle;
 use crate::acl::revoke_deny_read_ace_with_fingerprint;
-use crate::acl::verify_target_identity_against;
 use crate::path_normalization::lexical_path_key;
-use crate::winutil::to_wide;
 use anyhow::Context;
 use anyhow::Result;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 use dunce::canonicalize;
 use serde::Deserialize;
 use serde::Serialize;
@@ -16,30 +17,24 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
-use std::fs::Metadata;
-use std::path::Path;
-use std::path::PathBuf;
-use windows_sys::Win32::Foundation::CloseHandle;
+use std::os::windows::fs::MetadataExt;
+use std::os::windows::io::AsRawHandle;
+use std::path::{Component, Path, PathBuf};
 use windows_sys::Win32::Foundation::ERROR_DIR_NOT_EMPTY;
 use windows_sys::Win32::Foundation::GetLastError;
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_FLAG_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO_EX;
-use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY;
-use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FileDispositionInfoEx;
 use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
-use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
@@ -70,150 +65,183 @@ fn push_planned_path(planned: &mut Vec<PathBuf>, seen: &mut HashSet<String>, pat
     }
 }
 
-fn is_reparse_point(metadata: &Metadata) -> bool {
-    std::os::windows::fs::MetadataExt::file_attributes(metadata) & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
 fn is_reparse_point_attributes(attributes: u32) -> bool {
     attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-fn validate_materialized_directory(path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("inspect materialized directory {}", path.display()))?;
-    if !metadata.is_dir() {
-        anyhow::bail!("deny path is not a directory: {}", path.display());
-    }
-    if is_reparse_point(&metadata) {
-        anyhow::bail!(
-            "refusing to materialize through reparse directory {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-/// Creates a missing directory path without following a reparse point in any ancestor.
-///
-/// The returned flag is true only when this call created at least one component. Callers may
-/// use it to attempt conservative cleanup after a later ACL failure.
-pub fn ensure_directory_materialized(path: &Path) -> Result<bool> {
-    if path_contains_reparse_component(path)? {
-        anyhow::bail!(
-            "refusing to materialize through reparse path {}",
-            path.display()
-        );
-    }
-    let mut missing = Vec::new();
-    let mut cursor = path.to_path_buf();
-    loop {
-        match std::fs::symlink_metadata(&cursor) {
-            Ok(_) => {
-                validate_materialized_directory(&cursor)?;
-                break;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(cursor.clone());
-                let Some(parent) = cursor.parent() else {
-                    anyhow::bail!("cannot resolve parent of deny path {}", path.display());
-                };
-                cursor = parent.to_path_buf();
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "inspect parent of materialized directory {}",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-
-    let mut created = false;
-    for directory in missing.iter().rev() {
-        match std::fs::create_dir(directory) {
-            Ok(()) => {
-                created = true;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("create deny path directory {}", directory.display())
-                });
-            }
-        }
-        validate_materialized_directory(directory)?;
-        if path_contains_reparse_component(directory)? {
-            anyhow::bail!(
-                "reparse state changed while materializing deny path {}",
-                directory.display()
-            );
-        }
-    }
-    Ok(created)
-}
-
-/// Removes only a runtime-created, empty, non-reparse sentinel directly below `expected_parent`.
-///
-/// Any uncertainty about ownership, identity, reparse state, or emptiness leaves the path in
-/// place and returns an error where continuing could hide a failed security setup.
-pub fn cleanup_empty_runtime_sentinel(
-    path: &Path,
-    expected_parent: &Path,
+/// A protected directory pinned to the exact object created or opened during materialization.
+pub struct MaterializedDirectory {
+    file: std::fs::File,
     created_by_runtime: bool,
-) -> Result<()> {
-    if !created_by_runtime {
-        return Ok(());
-    }
-    let parent = std::fs::canonicalize(expected_parent)
-        .with_context(|| format!("canonicalize sentinel parent {}", expected_parent.display()))?;
-    let path_parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("sentinel has no parent: {}", path.display()))?;
-    let canonical_path_parent = std::fs::canonicalize(path_parent).with_context(|| {
-        format!(
-            "canonicalize sentinel path parent {}",
-            path_parent.display()
-        )
-    })?;
-    if canonical_path_parent != parent {
-        anyhow::bail!("sentinel parent changed: {}", path.display());
-    }
-    let expected_identity = canonicalize(path)
-        .with_context(|| format!("canonicalize runtime sentinel {}", path.display()))?;
-    unsafe { remove_empty_runtime_sentinel_by_handle(path, &expected_identity) }
 }
 
-/// Deletes only the object whose identity was checked on an open handle.
-///
-/// `remove_dir(path)` would re-resolve the path after the emptiness check and could delete a
-/// replacement or reparse point. The handle disposition keeps cleanup bound to the runtime-created
-/// directory; a concurrent child insertion makes the disposition fail with `ERROR_DIR_NOT_EMPTY`.
-unsafe fn remove_empty_runtime_sentinel_by_handle(
+impl MaterializedDirectory {
+    /// Returns whether this operation created the final directory object.
+    pub fn created_by_runtime(&self) -> bool {
+        self.created_by_runtime
+    }
+
+    fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+    }
+
+    /// Applies deny-write through the pinned object rather than resolving its path again.
+    ///
+    /// # Safety
+    /// Caller must ensure `psid` points to a valid SID.
+    pub unsafe fn add_deny_write_ace(&self, psid: *mut c_void) -> Result<bool> {
+        unsafe { add_deny_write_ace_to_handle(self.handle(), psid) }
+    }
+
+    unsafe fn add_deny_read_ace_with_ownership_before_set(
+        &self,
+        psid: *mut c_void,
+        before_set: &mut dyn FnMut(&DenyReadAclFingerprint) -> Result<()>,
+    ) -> Result<crate::acl::DenyAceAddResult> {
+        unsafe {
+            add_deny_read_ace_with_ownership_to_handle_before_set(self.handle(), psid, before_set)
+        }
+    }
+
+    /// Removes this object only when this call created it and it is still empty.
+    pub fn cleanup_if_empty(self) -> Result<()> {
+        self.cleanup_if_empty_with_hook(|| {})
+    }
+
+    fn cleanup_if_empty_with_hook(self, before_delete: impl FnOnce()) -> Result<()> {
+        if !self.created_by_runtime {
+            return Ok(());
+        }
+        unsafe { remove_empty_runtime_sentinel_by_handle(&self.file, before_delete) }
+    }
+}
+
+fn absolute_path_components(path: &Path) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
+    let mut anchor = PathBuf::new();
+    let mut descendants = Vec::new();
+    let mut rooted = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) if !rooted && descendants.is_empty() => {
+                anchor.push(component.as_os_str());
+            }
+            Component::RootDir if !rooted && descendants.is_empty() => {
+                anchor.push(component.as_os_str());
+                rooted = true;
+            }
+            Component::Normal(component) if rooted => descendants.push(component.to_os_string()),
+            _ => anyhow::bail!(
+                "deny path must be an absolute normalized path: {}",
+                path.display()
+            ),
+        }
+    }
+    if !rooted || descendants.is_empty() {
+        anyhow::bail!("deny path must name a directory below a filesystem root");
+    }
+    Ok((anchor, descendants))
+}
+
+fn open_acl_directory(parent: &Dir, name: &std::ffi::OsStr) -> Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(DELETE | READ_CONTROL | WRITE_DAC | FILE_LIST_DIRECTORY)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    let file = parent
+        .open_with(name, &options)
+        .with_context(|| {
+            format!(
+                "open materialized deny directory {}",
+                name.to_string_lossy()
+            )
+        })?
+        .into_std();
+    let metadata = file
+        .metadata()
+        .context("inspect pinned materialized deny directory")?;
+    if !metadata.is_dir() || is_reparse_point_attributes(metadata.file_attributes()) {
+        anyhow::bail!("materialized deny target is not a plain directory");
+    }
+    Ok(file)
+}
+
+fn ancestor_has_git_marker(directory: &Dir) -> Result<bool> {
+    match directory.symlink_metadata(PROTECTED_GIT_DIR_NAME) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspect ancestor Git marker"),
+    }
+}
+
+/// Creates or opens an absolute directory through pinned, no-follow capabilities.
+pub fn ensure_directory_materialized(path: &Path) -> Result<MaterializedDirectory> {
+    ensure_directory_materialized_with_hook(path, || {})
+}
+
+fn ensure_directory_materialized_with_hook(
     path: &Path,
-    expected_identity: &Path,
+    before_final_create: impl FnOnce(),
+) -> Result<MaterializedDirectory> {
+    let (anchor, descendants) = absolute_path_components(path)?;
+    let mut current = Dir::open_ambient_dir(&anchor, ambient_authority())
+        .with_context(|| format!("open deny path filesystem root {}", anchor.display()))?;
+    let mut current_path = anchor;
+    let check_git_ancestors = is_missing_git_marker(path);
+    let mut before_final_create = Some(before_final_create);
+    let mut ancestor_git_marker = None;
+    for (index, component) in descendants.iter().enumerate() {
+        let is_final = index + 1 == descendants.len();
+        if check_git_ancestors && !is_final && ancestor_has_git_marker(&current)? {
+            ancestor_git_marker = Some(current_path.join(PROTECTED_GIT_DIR_NAME));
+        }
+        if is_final && let Some(ancestor_git_marker) = ancestor_git_marker {
+            return Err(anyhow::Error::new(
+                ProtectedMetadataError::NestedGitMarkerUnsupported {
+                    path: path.to_path_buf(),
+                    ancestor_git_marker,
+                },
+            ));
+        }
+        let created = match current.create_dir(component) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create deny path component {}", component.to_string_lossy())
+                });
+            }
+        };
+        if is_final {
+            if created {
+                // The capability-relative create already completed; the hook is placed before the
+                // final object open so tests can prove a pathname replacement cannot redirect it.
+                before_final_create.take().expect("single final hook")();
+            }
+            return Ok(MaterializedDirectory {
+                file: open_acl_directory(&current, component)?,
+                created_by_runtime: created,
+            });
+        }
+        current = current.open_dir_nofollow(component).with_context(|| {
+            format!(
+                "open deny path component without following reparse points {}",
+                component.to_string_lossy()
+            )
+        })?;
+        current_path.push(component);
+    }
+    unreachable!("absolute path parser requires at least one descendant")
+}
+
+/// Deletes only the pinned object created by this runtime.
+unsafe fn remove_empty_runtime_sentinel_by_handle(
+    file: &std::fs::File,
+    before_delete: impl FnOnce(),
 ) -> Result<()> {
-    if path_contains_reparse_component(path)? {
-        anyhow::bail!("refusing to clean a reparse sentinel {}", path.display());
-    }
-    let wpath = to_wide(path);
-    let handle = CreateFileW(
-        wpath.as_ptr(),
-        DELETE | READ_CONTROL | FILE_LIST_DIRECTORY,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        std::ptr::null_mut(),
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        0,
-    );
-    if handle == 0 || handle == INVALID_HANDLE_VALUE {
-        anyhow::bail!(
-            "open runtime sentinel for safe cleanup failed: {}",
-            GetLastError()
-        );
-    }
-    let result = (|| -> Result<()> {
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    (|| -> Result<()> {
         let mut info = std::mem::zeroed();
         if GetFileInformationByHandle(handle, &mut info) == 0 {
             anyhow::bail!(
@@ -224,23 +252,19 @@ unsafe fn remove_empty_runtime_sentinel_by_handle(
         if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
             || is_reparse_point_attributes(info.dwFileAttributes)
         {
-            anyhow::bail!(
-                "refusing to clean non-directory or reparse sentinel {}",
-                path.display()
-            );
+            anyhow::bail!("refusing to clean non-directory or reparse sentinel");
         }
-        if path_contains_reparse_component(path)? {
-            anyhow::bail!(
-                "sentinel reparse state changed during cleanup: {}",
-                path.display()
-            );
-        }
-        verify_target_identity_against(handle, expected_identity)?;
-        let mut entries = std::fs::read_dir(path)
-            .with_context(|| format!("inspect sentinel contents {}", path.display()))?;
+        let directory = Dir::from_std_file(
+            file.try_clone()
+                .context("clone pinned runtime sentinel handle")?,
+        );
+        let mut entries = directory
+            .entries()
+            .context("inspect pinned runtime sentinel contents")?;
         if entries.next().is_some() {
             return Ok(());
         }
+        before_delete();
 
         let disposition = FILE_DISPOSITION_INFO_EX {
             Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
@@ -259,14 +283,7 @@ unsafe fn remove_empty_runtime_sentinel_by_handle(
             anyhow::bail!("remove empty sentinel by handle failed: {code}");
         }
         Ok(())
-    })();
-    CloseHandle(handle);
-    result
-}
-
-fn canonical_identity(path: &Path) -> Result<PathBuf> {
-    std::fs::canonicalize(path)
-        .with_context(|| format!("resolve ACL target identity {}", path.display()))
+    })()
 }
 
 fn is_missing_git_marker(path: &Path) -> bool {
@@ -303,41 +320,9 @@ impl fmt::Display for ProtectedMetadataError {
 
 impl Error for ProtectedMetadataError {}
 
-fn existing_git_ancestor_for_missing_marker(path: &Path) -> Result<Option<PathBuf>> {
-    let parent = path.parent().ok_or_else(|| {
-        anyhow::anyhow!("protected metadata path has no parent: {}", path.display())
-    })?;
-    for ancestor in parent.ancestors().skip(1) {
-        let marker = ancestor.join(PROTECTED_GIT_DIR_NAME);
-        match std::fs::symlink_metadata(&marker) {
-            Ok(_) => return Ok(Some(marker)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "inspect ancestor Git marker while materializing {}",
-                        path.display()
-                    )
-                });
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// Materializes a missing protected path, rejecting a nested `.git` sentinel under an existing
 /// ancestor repository so Git's ancestor discovery remains unchanged.
-pub fn ensure_missing_protected_path_materialized(path: &Path) -> Result<bool> {
-    if is_missing_git_marker(path)
-        && let Some(ancestor_git_marker) = existing_git_ancestor_for_missing_marker(path)?
-    {
-        return Err(anyhow::Error::new(
-            ProtectedMetadataError::NestedGitMarkerUnsupported {
-                path: path.to_path_buf(),
-                ancestor_git_marker,
-            },
-        ));
-    }
+pub fn ensure_missing_protected_path_materialized(path: &Path) -> Result<MaterializedDirectory> {
     ensure_directory_materialized(path)
 }
 
@@ -376,45 +361,67 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership(
     paths: &[PathBuf],
     psid: *mut c_void,
 ) -> Result<AppliedDenyReadAcls> {
+    unsafe { apply_deny_read_acls_with_ownership_before_set(paths, psid, &mut |_| Ok(())) }
+}
+
+/// Applies deny-read ACLs after journaling every new runtime-owned fingerprint.
+///
+/// # Safety
+/// Caller must pass a valid SID pointer for the sandbox principal being denied.
+pub(crate) unsafe fn apply_deny_read_acls_with_ownership_before_set(
+    paths: &[PathBuf],
+    psid: *mut c_void,
+    before_set: &mut dyn FnMut(&ManagedDenyReadAcl) -> Result<()>,
+) -> Result<AppliedDenyReadAcls> {
     let planned = plan_deny_read_acl_paths(paths);
     let mut applied = Vec::new();
     let mut seen = HashSet::new();
     let mut added_in_this_call: Vec<ManagedDenyReadAcl> = Vec::new();
+    let mut pinned_materialized = Vec::new();
     for path in planned {
-        let result = (|| -> Result<Option<ManagedDenyReadAcl>> {
-            match std::fs::symlink_metadata(&path) {
-                Ok(_) => {}
+        let result = (|| -> Result<(Option<ManagedDenyReadAcl>, Option<MaterializedDirectory>)> {
+            let materialized = match std::fs::symlink_metadata(&path) {
+                Ok(_) => None,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    ensure_missing_protected_path_materialized(&path)?;
+                    Some(ensure_missing_protected_path_materialized(&path)?)
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
                         format!("inspect deny-read ACL target {}", path.display())
                     });
                 }
-            }
-            let before = canonical_identity(&path)?;
-            let mutation = add_deny_read_ace_with_ownership(&path, psid)
-                .with_context(|| format!("apply deny-read ACE to {}", path.display()))?;
-            let after = canonical_identity(&path)?;
-            if before != after {
-                anyhow::bail!(
-                    "ACL target identity changed while applying deny-read ACE: {}",
-                    path.display()
-                );
-            }
-            if mutation.runtime_owned {
-                return Ok(Some(ManagedDenyReadAcl {
+            };
+            let mut journal = |fingerprint: &DenyReadAclFingerprint| {
+                before_set(&ManagedDenyReadAcl {
                     path: path.clone(),
-                    fingerprint: unsafe { deny_read_acl_fingerprint(&path, psid) }.with_context(
-                        || format!("fingerprint managed deny-read ACEs on {}", path.display()),
-                    )?,
-                }));
+                    fingerprint: fingerprint.clone(),
+                })
+            };
+            let mutation = match &materialized {
+                Some(materialized) => unsafe {
+                    materialized.add_deny_read_ace_with_ownership_before_set(psid, &mut journal)
+                },
+                None => unsafe {
+                    add_deny_read_ace_with_ownership_before_set(&path, psid, &mut journal)
+                },
             }
-            Ok(None)
+            .with_context(|| format!("apply deny-read ACE to {}", path.display()))?;
+            if mutation.runtime_owned {
+                let fingerprint = mutation.fingerprint.ok_or_else(|| {
+                    anyhow::anyhow!("managed deny-read mutation omitted its ownership fingerprint")
+                })?;
+                return Ok((
+                    Some(ManagedDenyReadAcl {
+                        path: path.clone(),
+                        fingerprint,
+                    }),
+                    materialized,
+                ));
+            }
+            Ok((None, materialized))
         })();
-        let managed = match result {
-            Ok(managed) => managed,
+        let (managed, materialized) = match result {
+            Ok(result) => result,
             Err(err) => {
                 for added_path in &added_in_this_call {
                     if let Err(rollback_err) = unsafe {
@@ -436,6 +443,9 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership(
         if let Some(managed) = managed {
             added_in_this_call.push(managed);
         }
+        if let Some(materialized) = materialized {
+            pinned_materialized.push(materialized);
+        }
         push_planned_path(&mut applied, &mut seen, path);
     }
     Ok(AppliedDenyReadAcls {
@@ -448,8 +458,9 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership(
 mod tests {
     use super::ProtectedMetadataError;
     use super::apply_deny_read_acls;
-    use super::cleanup_empty_runtime_sentinel;
+    use super::apply_deny_read_acls_with_ownership_before_set;
     use super::ensure_directory_materialized;
+    use super::ensure_directory_materialized_with_hook;
     use super::plan_deny_read_acl_paths;
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
@@ -500,16 +511,68 @@ mod tests {
         std::fs::create_dir(&parent).expect("create parent");
         let sentinel = parent.join(".singularity");
 
-        assert!(ensure_directory_materialized(&sentinel).expect("materialize sentinel"));
+        let materialized = ensure_directory_materialized(&sentinel).expect("materialize sentinel");
+        assert!(materialized.created_by_runtime());
         assert!(sentinel.is_dir());
-        cleanup_empty_runtime_sentinel(&sentinel, &parent, true).expect("cleanup empty sentinel");
+        materialized
+            .cleanup_if_empty()
+            .expect("cleanup empty sentinel");
         assert!(!sentinel.exists());
 
-        assert!(ensure_directory_materialized(&sentinel).expect("materialize sentinel again"));
+        let materialized =
+            ensure_directory_materialized(&sentinel).expect("materialize sentinel again");
+        assert!(materialized.created_by_runtime());
         std::fs::write(sentinel.join("user-state"), b"keep").expect("write child");
-        cleanup_empty_runtime_sentinel(&sentinel, &parent, true)
+        materialized
+            .cleanup_if_empty()
             .expect("non-empty sentinel is left in place");
         assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn pinned_materialization_cannot_be_redirected_after_create() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let moved = tmp.path().join("workspace-moved");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        std::fs::create_dir(&outside).expect("create outside");
+        let sentinel = workspace.join(".singularity");
+        let rename_failed = std::cell::Cell::new(false);
+
+        let materialized = ensure_directory_materialized_with_hook(&sentinel, || {
+            rename_failed.set(std::fs::rename(&workspace, &moved).is_err());
+        })
+        .expect("materialize through pinned parent");
+
+        assert!(rename_failed.get(), "pinned parent must reject replacement");
+        assert!(sentinel.is_dir());
+        assert!(!outside.join(".singularity").exists());
+        materialized.cleanup_if_empty().expect("cleanup sentinel");
+    }
+
+    #[test]
+    fn pinned_cleanup_cannot_delete_a_replacement_object() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let replacement = workspace.join(".singularity-replacement");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        let sentinel = workspace.join(".singularity");
+        let materialized = ensure_directory_materialized(&sentinel).expect("materialize sentinel");
+        let replacement_failed = std::cell::Cell::new(false);
+
+        materialized
+            .cleanup_if_empty_with_hook(|| {
+                replacement_failed.set(std::fs::rename(&sentinel, &replacement).is_err());
+            })
+            .expect("cleanup pinned sentinel");
+
+        assert!(
+            replacement_failed.get(),
+            "pinned sentinel must reject replacement before deletion"
+        );
+        assert!(!sentinel.exists());
+        assert!(!replacement.exists());
     }
 
     #[test]
@@ -558,6 +621,36 @@ mod tests {
     }
 
     #[test]
+    fn journal_failure_prevents_deny_read_acl_mutation() {
+        let tmp = TempDir::new().expect("tempdir");
+        let protected = tmp.path().join("protected");
+        std::fs::create_dir(&protected).expect("create protected path");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+        let result = unsafe {
+            apply_deny_read_acls_with_ownership_before_set(
+                std::slice::from_ref(&protected),
+                sid.as_ptr(),
+                &mut |_| anyhow::bail!("injected ownership journal failure"),
+            )
+        };
+        let error = match result {
+            Ok(_) => panic!("journal failure must abort before ACL mutation"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("injected ownership journal failure"),
+            "{error:#}"
+        );
+        let (p_dacl, p_sd) = unsafe { fetch_dacl_handle(&protected) }.expect("fetch unchanged ACL");
+        assert!(!unsafe { dacl_has_read_deny_for_sid(p_dacl, sid.as_ptr()) });
+        unsafe {
+            LocalFree(p_sd as HLOCAL);
+        }
+    }
+
+    #[test]
     fn missing_protected_marker_is_materialized_and_acl_protected() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
@@ -579,9 +672,6 @@ mod tests {
             LocalFree(p_sd as HLOCAL);
             revoke_deny_read_ace(&missing_marker, sid.as_ptr()).expect("restore marker ACL");
         }
-        cleanup_empty_runtime_sentinel(&missing_marker, &workspace, true)
-            .expect("cleanup runtime-created marker");
-        assert!(!missing_marker.exists());
     }
 
     #[test]

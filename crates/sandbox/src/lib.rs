@@ -1424,7 +1424,8 @@ mod windows_backend {
                 ))
             })?
             .supports_restricted_token_fallback()
-                && protected_deny_read_paths.is_empty();
+                && protected_deny_read_paths.is_empty()
+                && protect_workspace_metadata;
             Ok(Self {
                 permission_profile,
                 workspace_roots,
@@ -2321,7 +2322,7 @@ mod windows_backend {
             fs::create_dir(workspace.path().join(".agents")).expect("agents directory");
             fs::create_dir(workspace.path().join(".singularity")).expect("singularity directory");
             let comspec = std::env::var_os("ComSpec").expect("ComSpec");
-            let request = CommandRequest::trusted_workspace_preparation(
+            let mut request = CommandRequest::trusted_workspace_preparation(
                 "trusted_workspace_preparation",
                 vec![
                     PathBuf::from(comspec).to_string_lossy().into_owned(),
@@ -2331,6 +2332,7 @@ mod windows_backend {
                 workspace.path().to_string_lossy(),
                 workspace.path().to_string_lossy(),
             );
+            request.network.mode = SandboxNetworkMode::Allowed;
 
             let prepared =
                 PreparedCommand::from_request(&request).expect("trusted workspace preparation");
@@ -2388,6 +2390,7 @@ mod windows_backend {
             fs::create_dir(workspace.path().join(".singularity")).expect("singularity directory");
             create_test_file(&workspace.path().join(".env.local"), "opaque");
             create_test_file(&nested.join("private-key.pem"), "opaque");
+            create_test_file(&nested.join("server.pem"), "opaque");
             create_test_file(&nested.join("client.p12"), "opaque");
             create_test_file(&nested.join("client-secret.txt"), "opaque");
             let request = CommandScriptRequest::agent_requested_with_policy(
@@ -2418,6 +2421,7 @@ mod windows_backend {
                     workspace.path().join(".singularity"),
                     workspace.path().join(".env.local"),
                     nested.join("private-key.pem"),
+                    nested.join("server.pem"),
                     nested.join("client.p12"),
                     nested.join("client-secret.txt"),
                 ]

@@ -73,15 +73,15 @@ pub const PROTECTED_PATH_EXACT_MARKERS: [&str; 12] = [
 ];
 /// Protected component prefixes; only the prefix itself or a dotted variant matches.
 pub const PROTECTED_PATH_PREFIXES: [&str; 3] = [".env", "credential", "private-key"];
-/// Protected component suffixes.
+/// Protected component suffixes that can carry private keys or credential containers.
 ///
-/// A bare `.pem` suffix is intentionally not sufficient: PEM also carries public certificate
-/// bundles such as Python/pip's `cacert.pem`. Private PEMs remain covered by the exact, prefix,
-/// and contains markers (`id_*`, `private-key`, `secret`) or by a secret-bearing companion name.
-pub const PROTECTED_PATH_SUFFIXES: [&str; 3] = [".key", ".p12", ".pfx"];
+/// PEM also carries public certificates, but a filename alone cannot prove that the content is
+/// public. Keep the default fail-closed; any future certificate exception must validate content
+/// at the trust boundary instead of globally allowing the ambiguous suffix.
+pub const PROTECTED_PATH_SUFFIXES: [&str; 4] = [".key", ".pem", ".p12", ".pfx"];
 /// Substrings that identify protected components.
 pub const PROTECTED_PATH_CONTAINS_MARKERS: [&str; 1] = ["secret"];
-const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
+const SENSITIVE_TEXT_MARKERS: [&str; 27] = [
     ".aws",
     ".azure",
     ".env",
@@ -97,6 +97,7 @@ const SENSITIVE_TEXT_MARKERS: [&str; 26] = [
     "id_rsa",
     "password",
     "private-key",
+    "private key-----",
     "\"provider\"",
     "provider:",
     "provider_payload",
@@ -427,17 +428,14 @@ mod tests {
             ".singularity/state.json",
             "nested/.env.local",
             "nested/private-key.pem",
+            "nested/server.pem",
+            "nested/tls.pem",
             "nested/backup.p12",
             "nested/client-secret.txt",
         ] {
             assert!(is_protected_path(path), "{path} should be protected");
         }
-        for path in [
-            "src/main.rs",
-            "config/example.env.sample",
-            "notes/key.txt",
-            ".venv/Lib/site-packages/certifi/cacert.pem",
-        ] {
+        for path in ["src/main.rs", "config/example.env.sample", "notes/key.txt"] {
             assert!(!is_protected_path(path), "{path} should be allowed");
         }
     }

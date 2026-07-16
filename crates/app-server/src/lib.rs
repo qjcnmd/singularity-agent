@@ -1805,10 +1805,7 @@ fn agent_loop_input(
         .with_history(history)
         .with_model_name(thread.model.clone());
     if let Some(instructions) = load_project_instructions(workspace_root, workspace_root)? {
-        input = input.with_project_instructions_snapshot(
-            instructions.content,
-            instructions.aggregate_digest,
-        );
+        input = input.with_project_instructions(instructions);
     }
     Ok(input)
 }

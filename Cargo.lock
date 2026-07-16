@@ -1633,6 +1633,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "dirs-next",
  "dunce",

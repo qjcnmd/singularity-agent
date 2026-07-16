@@ -30,6 +30,9 @@ fn sensitive_text_detects_common_secret_label_formats() {
         "token: abcdefgh",
         "--api-key abcdefgh",
         "--token abcdefgh",
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
     ] {
         assert!(contains_sensitive_text(text), "{text} should be sensitive");
     }

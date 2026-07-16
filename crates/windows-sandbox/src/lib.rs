@@ -229,11 +229,11 @@ pub use cap::workspace_write_root_contains_path;
 #[cfg(target_os = "windows")]
 pub use cap::workspace_write_root_overlaps_path;
 #[cfg(target_os = "windows")]
+pub use deny_read_acl::MaterializedDirectory;
+#[cfg(target_os = "windows")]
 pub use deny_read_acl::ProtectedMetadataError;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::apply_deny_read_acls;
-#[cfg(target_os = "windows")]
-pub use deny_read_acl::cleanup_empty_runtime_sentinel;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::ensure_directory_materialized;
 #[cfg(target_os = "windows")]

@@ -83,7 +83,7 @@ fn loads_agents_files_from_workspace_root_to_nested_cwd() {
 
     assert_eq!(
         loaded
-            .sources
+            .sources()
             .iter()
             .map(|source| source.path.as_str())
             .collect::<Vec<_>>(),
@@ -91,17 +91,17 @@ fn loads_agents_files_from_workspace_root_to_nested_cwd() {
     );
     assert!(
         loaded
-            .sources
+            .sources()
             .iter()
             .all(|source| source.content_digest.starts_with("sha256:")
                 && source.content_digest.len() == "sha256:".len() + 64)
     );
-    assert!(loaded.aggregate_digest.starts_with("sha256:"));
+    assert!(loaded.aggregate_digest().starts_with("sha256:"));
     assert_eq!(
-        loaded.content,
+        loaded.content(),
         "root instructions\n\ncrate instructions\n\nagent instructions"
     );
-    assert!(!loaded.content.contains("must not load"));
+    assert!(!loaded.content().contains("must not load"));
 }
 
 #[test]
@@ -120,13 +120,13 @@ fn discovers_git_workspace_root_from_nested_cwd() {
 
     assert_eq!(
         loaded
-            .sources
+            .sources()
             .iter()
             .map(|source| source.path.as_str())
             .collect::<Vec<_>>(),
         ["AGENTS.md", "src/nested/AGENTS.md"]
     );
-    assert_eq!(loaded.content, "root instructions\n\nnested instructions");
+    assert_eq!(loaded.content(), "root instructions\n\nnested instructions");
 }
 
 #[test]
@@ -157,10 +157,10 @@ fn override_file_wins_once_per_hierarchy_layer() {
         .expect("load project instructions")
         .expect("instructions present");
 
-    assert_eq!(loaded.content, "root override\n\ncwd override");
+    assert_eq!(loaded.content(), "root override\n\ncwd override");
     assert_eq!(
         loaded
-            .sources
+            .sources()
             .iter()
             .map(|source| source.path.as_str())
             .collect::<Vec<_>>(),
@@ -186,10 +186,10 @@ fn source_and_aggregate_digests_change_when_instruction_content_changes() {
         .expect("second instructions present");
 
     assert_ne!(
-        first.sources[0].content_digest,
-        second.sources[0].content_digest
+        first.sources()[0].content_digest,
+        second.sources()[0].content_digest
     );
-    assert_ne!(first.aggregate_digest, second.aggregate_digest);
+    assert_ne!(first.aggregate_digest(), second.aggregate_digest());
 }
 
 #[test]

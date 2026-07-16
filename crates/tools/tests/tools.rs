@@ -489,6 +489,11 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
     let workspace = test_workspace("read-list-grep");
     std::fs::write(workspace.join("README.md"), "alpha\nbeta\nalpha beta\n").expect("write readme");
     std::fs::write(workspace.join(".env"), "TOKEN=secret").expect("write env");
+    std::fs::write(
+        workspace.join("server.pem"),
+        "-----BEGIN PRIVATE KEY-----\nNEUTRAL_PEM_SECRET\n",
+    )
+    .expect("write neutral pem");
     std::fs::create_dir(workspace.join("nested")).expect("create nested dir");
     std::fs::write(workspace.join("nested").join(".env"), "TOKEN=nested")
         .expect("write nested env");
@@ -545,6 +550,24 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
     ));
     assert!(matches!(
         tools.read(ReadToolInput {
+            path: "server.pem".to_string(),
+            max_chars: None,
+            line_start: None,
+            line_end: None,
+        }),
+        Err(WorkspaceToolError::ProtectedPath(_))
+    ));
+    assert!(matches!(
+        tools.grep(GrepToolInput {
+            path: Some("server.pem".to_string()),
+            pattern: "NEUTRAL_PEM_SECRET".to_string(),
+            max_matches: Some(10),
+            case_sensitive: true,
+        }),
+        Err(WorkspaceToolError::ProtectedPath(_))
+    ));
+    assert!(matches!(
+        tools.read(ReadToolInput {
             path: "nested/.env".to_string(),
             max_chars: None,
             line_start: None,
@@ -573,7 +596,8 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
     let entries = listed.content["entries"].as_array().expect("entries");
     assert!(entries.iter().any(|entry| entry["path"] == "README.md"));
     assert!(!entries.iter().any(|entry| entry["path"] == ".env"));
-    assert_eq!(listed.content["redacted_entries"], 1);
+    assert!(!entries.iter().any(|entry| entry["path"] == "server.pem"));
+    assert_eq!(listed.content["redacted_entries"], 2);
 
     let matches = tools
         .grep(GrepToolInput {
@@ -1567,6 +1591,7 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
         "credential",
         "credentials.json",
         "private-key.pem",
+        "server.pem",
         "deploy.key",
         "id_ecdsa",
         "secret.txt",

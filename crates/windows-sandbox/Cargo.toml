@@ -53,6 +53,10 @@ windows = { version = "0.58", features = [
     "Win32_System_Variant",
 ] }
 
+[target.'cfg(windows)'.dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.52"
 features = [

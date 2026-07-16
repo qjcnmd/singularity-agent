@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use singularity_core::{CancellationToken, contains_sensitive_text};
+use singularity_core::{CancellationToken, ProjectInstructions, contains_sensitive_text};
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
@@ -441,10 +441,10 @@ pub struct AgentLoopInput {
     pub model_preferences: ModelPreferences,
     #[serde(skip)]
     #[schemars(skip)]
-    pub project_instructions: Option<String>,
+    project_instructions: Option<String>,
     #[serde(skip)]
     #[schemars(skip)]
-    pub project_instructions_digest: Option<String>,
+    project_instructions_digest: Option<String>,
     pub input: Vec<AgentContextItem>,
     pub interrupted: bool,
     pub max_turns: u32,
@@ -497,23 +497,11 @@ impl AgentLoopInput {
         self
     }
 
-    /// 附加项目指令文本。
-    pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
-        let instructions = instructions.into();
-        self.project_instructions = (!instructions.trim().is_empty()).then_some(instructions);
-        self.project_instructions_digest = None;
-        self
-    }
-
-    /// 附加本轮项目指令正文及其不可公开的来源聚合摘要。
-    pub fn with_project_instructions_snapshot(
-        mut self,
-        instructions: impl Into<String>,
-        aggregate_digest: impl Into<String>,
-    ) -> Self {
-        let instructions = instructions.into();
-        self.project_instructions = (!instructions.trim().is_empty()).then_some(instructions);
-        self.project_instructions_digest = Some(aggregate_digest.into());
+    /// Binds a verified project-instruction aggregate to this turn.
+    pub fn with_project_instructions(mut self, instructions: ProjectInstructions) -> Self {
+        let (content, aggregate_digest) = instructions.into_snapshot();
+        self.project_instructions = Some(content);
+        self.project_instructions_digest = Some(aggregate_digest);
         self
     }
 
