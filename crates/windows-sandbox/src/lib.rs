@@ -413,7 +413,6 @@ mod windows_impl {
     use super::WindowsSandboxCancellationToken;
     use super::logging::log_failure;
     use super::logging::log_success;
-    use super::path_normalization::canonicalize_path_allow_missing;
     use super::process::create_process_as_user;
     use super::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use super::sandbox_utils::ensure_sandbox_home_exists;
@@ -421,10 +420,9 @@ mod windows_impl {
     use super::spawn_prep::SpawnPrepOptions;
     use super::spawn_prep::allow_null_device_for_workspace_write;
     use super::spawn_prep::apply_restricted_token_acl_rules;
-    use super::spawn_prep::plan_restricted_token_acl_rules;
+    use super::spawn_prep::preflight_restricted_token;
     use super::spawn_prep::prepare_restricted_token_security;
     use super::spawn_prep::prepare_restricted_token_spawn_context;
-    use super::spawn_prep::restricted_token_capability_roots;
     use super::spawn_prep::root_capability_sids;
     use crate::absolute_path::AbsolutePathBuf;
     use crate::permissions::PermissionProfile;
@@ -636,10 +634,6 @@ mod windows_impl {
         {
             return Ok(cancelled_capture_result());
         }
-        // Keep capability state, ACL setup, and process cleanup on one resolved home identity even
-        // if the caller supplied a junction that changes while the sandbox is running.
-        let canonical_sandbox_home = canonicalize_path_allow_missing(sandbox_home);
-        let sandbox_home = canonical_sandbox_home.as_path();
         let requested_permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 permission_profile,
@@ -669,13 +663,19 @@ mod windows_impl {
         if !additional_deny_read_paths.is_empty() {
             anyhow::bail!("deny-read overrides require the elevated Windows sandbox backend");
         }
-        let acl_plan = plan_restricted_token_acl_rules(
+        let preflight = preflight_restricted_token(
             &requested_permissions,
             cwd,
             &env_map,
+            sandbox_home,
             &additional_deny_read_paths,
             &additional_deny_write_paths,
         )?;
+        let sandbox_home_path = preflight.sandbox_home;
+        let uses_write_capabilities = preflight.uses_write_capabilities;
+        let capability_roots = preflight.capability_roots;
+        let acl_plan = preflight.acl_plan;
+        let sandbox_home = sandbox_home_path.as_path();
         let common = prepare_restricted_token_spawn_context(
             permission_profile,
             workspace_roots,
@@ -688,18 +688,14 @@ mod windows_impl {
                 add_git_safe_directory: false,
             },
         )?;
-        let permissions = common.permissions;
         let current_dir = common.current_dir;
         let logs_base_dir = common.logs_base_dir.as_deref();
-        let uses_write_capabilities = common.uses_write_capabilities;
         if cancellation
             .as_ref()
             .is_some_and(WindowsSandboxCancellationToken::is_cancelled)
         {
             return Ok(cancelled_capture_result());
         }
-        let capability_roots =
-            restricted_token_capability_roots(&permissions, &current_dir, &env_map, sandbox_home);
         let security = prepare_restricted_token_security(
             uses_write_capabilities,
             sandbox_home,
@@ -848,14 +844,20 @@ mod windows_impl {
             return Ok(());
         }
 
-        let canonical_sandbox_home = canonicalize_path_allow_missing(sandbox_home);
-        let sandbox_home = canonical_sandbox_home.as_path();
         let current_dir = cwd.to_path_buf();
-        let acl_plan =
-            plan_restricted_token_acl_rules(&permissions, &current_dir, env_map, &[], &[])?;
+        let preflight = preflight_restricted_token(
+            &permissions,
+            &current_dir,
+            env_map,
+            sandbox_home,
+            &[],
+            &[],
+        )?;
+        let sandbox_home_path = preflight.sandbox_home;
+        let capability_roots = preflight.capability_roots;
+        let acl_plan = preflight.acl_plan;
+        let sandbox_home = sandbox_home_path.as_path();
         ensure_sandbox_home_exists(sandbox_home)?;
-        let capability_roots =
-            restricted_token_capability_roots(&permissions, &current_dir, env_map, sandbox_home);
         let write_root_sids = root_capability_sids(sandbox_home, cwd, capability_roots)?;
         apply_restricted_token_acl_rules(
             &acl_plan,
@@ -1009,6 +1011,87 @@ mod windows_impl {
                 !sandbox_home.join(".sandbox").exists(),
                 "failed preflight must not create spawn state or logs"
             );
+        }
+
+        #[test]
+        fn restricted_token_rejects_nested_cwd_before_state_or_spawn_setup() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sandbox_home = temp.path().join("singularity-home");
+            let workspace = temp.path().join("workspace");
+            let nested_cwd = workspace.join("nested");
+            std::fs::create_dir_all(&nested_cwd).expect("create nested cwd");
+            let _case_sensitive = override_case_sensitivity_for_test(
+                &nested_cwd,
+                CaseSensitivityTestOutcome::CaseSensitive,
+            );
+            let workspace_root =
+                AbsolutePathBuf::from_absolute_path(&workspace).expect("absolute workspace");
+
+            let error = match super::run_windows_sandbox_capture_with_filesystem_overrides(
+                &workspace_profile(NetworkSandboxPolicy::Enabled),
+                &[workspace_root],
+                &sandbox_home,
+                vec!["cmd.exe".to_string()],
+                &nested_cwd,
+                HashMap::new(),
+                Some(1_000),
+                None,
+                &[],
+                &[],
+                false,
+            ) {
+                Ok(_) => panic!("invalid cwd must fail during pure preflight"),
+                Err(error) => error,
+            };
+
+            assert_eq!(
+                error.downcast_ref::<ProtectedMetadataError>(),
+                Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
+                    path: nested_cwd,
+                })
+            );
+            assert!(!cap_sid_file(&sandbox_home).exists());
+            assert!(!sandbox_home.join(".sandbox").exists());
+        }
+
+        #[test]
+        fn restricted_token_rejects_home_query_failure_before_state_or_spawn_setup() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sandbox_home = temp.path().join("singularity-home");
+            let workspace = temp.path().join("workspace");
+            std::fs::create_dir(&sandbox_home).expect("create sandbox home fixture");
+            std::fs::create_dir(&workspace).expect("create workspace");
+            let _query_failure = override_case_sensitivity_for_test(
+                &sandbox_home,
+                CaseSensitivityTestOutcome::QueryFailed(5),
+            );
+
+            let error = match super::run_windows_sandbox_capture_with_filesystem_overrides(
+                &workspace_profile(NetworkSandboxPolicy::Enabled),
+                &[],
+                &sandbox_home,
+                vec!["cmd.exe".to_string()],
+                &workspace,
+                HashMap::new(),
+                Some(1_000),
+                None,
+                &[],
+                &[],
+                false,
+            ) {
+                Ok(_) => panic!("invalid sandbox home must fail during pure preflight"),
+                Err(error) => error,
+            };
+
+            assert_eq!(
+                error.downcast_ref::<ProtectedMetadataError>(),
+                Some(&ProtectedMetadataError::CaseSensitivityQueryFailed {
+                    path: sandbox_home.clone(),
+                    code: 5,
+                })
+            );
+            assert!(!cap_sid_file(&sandbox_home).exists());
+            assert!(!sandbox_home.join(".sandbox").exists());
         }
     }
 }

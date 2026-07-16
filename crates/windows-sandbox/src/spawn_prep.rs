@@ -5,6 +5,7 @@ use crate::acl::allow_null_device;
 use crate::acl::ensure_allow_write_aces;
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
+use crate::cap::cap_sid_file;
 use crate::cap::workspace_cap_sid_for_cwd;
 use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
@@ -19,6 +20,7 @@ use crate::env::inherit_path_env;
 use crate::env::normalize_null_device_env;
 use crate::logging::log_start;
 use crate::path_normalization::canonicalize_path;
+use crate::path_normalization::canonicalize_path_allow_missing;
 use crate::path_normalization::lexical_path_key;
 use crate::path_safety::ensure_case_insensitive_acl_path;
 use crate::permissions::PermissionProfile;
@@ -26,6 +28,7 @@ use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
 use crate::sandbox_utils::ensure_sandbox_home_exists;
 use crate::sandbox_utils::inject_git_safe_directory;
 use crate::setup::effective_write_roots_for_permissions;
+use crate::setup::sandbox_dir;
 use crate::token::LocalSid;
 use crate::token::create_readonly_token_with_cap;
 use crate::token::create_workspace_write_token_with_caps_from;
@@ -46,7 +49,6 @@ pub(crate) struct SpawnContext {
     pub(crate) permissions: ResolvedWindowsSandboxPermissions,
     pub(crate) current_dir: PathBuf,
     pub(crate) logs_base_dir: Option<PathBuf>,
-    pub(crate) uses_write_capabilities: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,6 +83,14 @@ pub(crate) struct RestrictedTokenAclPlan {
     deny_read: Vec<PathBuf>,
 }
 
+/// Immutable, side-effect-free inputs shared by restricted-token setup and ACL enforcement.
+pub(crate) struct RestrictedTokenPreflight {
+    pub(crate) sandbox_home: PathBuf,
+    pub(crate) uses_write_capabilities: bool,
+    pub(crate) capability_roots: Vec<PathBuf>,
+    pub(crate) acl_plan: RestrictedTokenAclPlan,
+}
+
 fn prepare_spawn_context_common(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -111,13 +121,10 @@ fn prepare_spawn_context_common(
     let logs_base_dir = Some(sandbox_base);
     log_start(command, logs_base_dir.as_deref());
 
-    let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(cwd, env_map);
-
     Ok(SpawnContext {
         permissions,
         current_dir: cwd.to_path_buf(),
         logs_base_dir,
-        uses_write_capabilities,
     })
 }
 
@@ -203,6 +210,44 @@ pub(crate) fn restricted_token_capability_roots(
     } else {
         allow_paths
     }
+}
+
+pub(crate) fn preflight_restricted_token(
+    permissions: &ResolvedWindowsSandboxPermissions,
+    current_dir: &Path,
+    env_map: &HashMap<String, String>,
+    sandbox_home: &Path,
+    additional_deny_read_paths: &[PathBuf],
+    additional_deny_write_paths: &[PathBuf],
+) -> Result<RestrictedTokenPreflight> {
+    let sandbox_home = canonicalize_path_allow_missing(sandbox_home);
+    let uses_write_capabilities = permissions.uses_write_capabilities_for_cwd(current_dir, env_map);
+    let capability_roots =
+        restricted_token_capability_roots(permissions, current_dir, env_map, &sandbox_home);
+    let acl_plan = plan_restricted_token_acl_rules(
+        permissions,
+        current_dir,
+        env_map,
+        additional_deny_read_paths,
+        additional_deny_write_paths,
+    )?;
+
+    // Validate every path that can fail before spawn setup creates directories, logs, state, SIDs,
+    // materialized sentinels, or ACLs.
+    ensure_case_insensitive_acl_path(&sandbox_home)?;
+    ensure_case_insensitive_acl_path(&sandbox_dir(&sandbox_home))?;
+    ensure_case_insensitive_acl_path(&cap_sid_file(&sandbox_home))?;
+    ensure_case_insensitive_acl_path(current_dir)?;
+    for root in &capability_roots {
+        ensure_case_insensitive_acl_path(root)?;
+    }
+
+    Ok(RestrictedTokenPreflight {
+        sandbox_home,
+        uses_write_capabilities,
+        capability_roots,
+        acl_plan,
+    })
 }
 
 pub(crate) fn root_capability_sids(
@@ -498,7 +543,11 @@ mod tests {
             },
         )
         .expect("preserve existing env prep");
-        assert!(context.uses_write_capabilities);
+        assert!(
+            context
+                .permissions
+                .uses_write_capabilities_for_cwd(cwd.path(), &env_map)
+        );
 
         assert_eq!(env_map.get("SBX_NONET_ACTIVE"), None);
         assert_eq!(
