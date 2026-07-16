@@ -2135,12 +2135,10 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         .expect("approval checkpoint");
     assert_eq!(checkpoint["context_trace"]["compaction_count"], 1);
     assert_eq!(
-        checkpoint["completion"]["satisfied_command_counts"]
-            .as_object()
-            .expect("satisfied command map")
-            .values()
-            .filter(|value| value.as_u64() == Some(1))
-            .count(),
+        checkpoint["completion"]["terminal_command_scope_digests"]
+            .as_array()
+            .expect("terminal command observations")
+            .len(),
         1
     );
 

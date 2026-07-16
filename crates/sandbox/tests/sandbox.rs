@@ -392,7 +392,17 @@ fn windows_backend_rejects_danger_full_access_without_implicit_fallback() {
 #[test]
 #[ignore = "requires first-run Windows UAC sandbox setup"]
 fn windows_elevated_backend_executes_network_denied_command() {
-    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace = if let Some(root) =
+        std::env::var_os("SINGULARITY_WINDOWS_SANDBOX_TEST_ROOT").map(std::path::PathBuf::from)
+    {
+        std::fs::create_dir_all(&root).expect("create live sandbox test root");
+        tempfile::Builder::new()
+            .prefix("singularity-live-")
+            .tempdir_in(root)
+            .expect("workspace")
+    } else {
+        tempfile::tempdir().expect("workspace")
+    };
     let mut request = CommandRequest::project_verification(
         "command_elevated",
         vec![

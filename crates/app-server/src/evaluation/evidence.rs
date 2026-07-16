@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use singularity_agent::{AgentLoopResult, eligible_command_scope_digests};
+use singularity_agent::{AgentLoopResult, terminal_command_scope_digests};
 use singularity_evaluation::{
     CommandSpec, EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationScopeEvidence,
     EvaluationTaskEvidence, EvidenceVerdict, PlannedWorkspaceSource, RunId, WorkspacePlan,
@@ -60,8 +60,11 @@ pub(super) fn content_digest(bytes: &[u8]) -> String {
 }
 
 /// 从 Agent 结果提取 command scope 与未知审计计数。
-pub(super) fn agent_command_observation(result: &AgentLoopResult) -> (Vec<String>, usize) {
-    let observed = eligible_command_scope_digests(&result.tool_results);
+pub(super) fn agent_command_observation(
+    result: &AgentLoopResult,
+    expected_count: usize,
+) -> (Vec<String>, usize) {
+    let observed = terminal_command_scope_digests(&result.tool_results, expected_count);
     let mut unknown_count = 0usize;
     for tool_result in result
         .tool_results

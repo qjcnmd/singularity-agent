@@ -32,13 +32,41 @@ pub fn canonical_path_key(path: &Path) -> String {
     lexical_path_key(&canonicalize_path(path))
 }
 
+/// Returns a canonical identity for a state path whose final components may not exist yet.
+///
+/// State files are often locked before their parent directory or file is created. Resolve the
+/// nearest existing ancestor so ordinary, verbatim, and junction spellings still share one
+/// cross-process identity, then append the missing tail without following it.
+pub fn canonical_path_key_allow_missing(path: &Path) -> String {
+    let mut cursor = path.to_path_buf();
+    let mut missing_tail = Vec::new();
+    loop {
+        if let Ok(mut canonical) = dunce::canonicalize(&cursor) {
+            for component in missing_tail.iter().rev() {
+                canonical.push(component);
+            }
+            return lexical_path_key(&canonical);
+        }
+        let Some(file_name) = cursor.file_name().map(ToOwned::to_owned) else {
+            return lexical_path_key(path);
+        };
+        let Some(parent) = cursor.parent() else {
+            return lexical_path_key(path);
+        };
+        missing_tail.push(file_name);
+        cursor = parent.to_path_buf();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::canonical_path_key;
+    use super::canonical_path_key_allow_missing;
     use super::lexical_path_key;
     use super::normalized_path_text;
     use pretty_assertions::assert_eq;
     use std::path::Path;
+    use std::path::PathBuf;
 
     #[test]
     fn canonical_path_key_normalizes_case_and_separators() {
@@ -64,6 +92,20 @@ mod tests {
         assert_eq!(
             normalized_path_text(Path::new(r"\\?\UNC\server\share\repo")),
             r"\\server\share\repo"
+        );
+    }
+
+    #[test]
+    fn missing_state_leaf_uses_canonical_existing_parent_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir(&state_dir).expect("create state directory");
+        let ordinary = state_dir.join("future.json");
+        let verbatim = PathBuf::from(format!(r"\\?\{}", ordinary.display()));
+
+        assert_eq!(
+            canonical_path_key_allow_missing(&ordinary),
+            canonical_path_key_allow_missing(&verbatim)
         );
     }
 }

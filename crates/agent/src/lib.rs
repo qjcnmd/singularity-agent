@@ -696,12 +696,11 @@ impl PendingToolCall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct CompletionTracker {
     workspace_mutated: bool,
-    verified_after_last_mutation: bool,
     successful_command_count: u32,
     #[serde(default)]
     required_command_counts: BTreeMap<String, u32>,
     #[serde(default)]
-    satisfied_command_counts: BTreeMap<String, u32>,
+    terminal_command_scope_digests: Vec<String>,
     unresolved_failures: BTreeSet<String>,
 }
 
@@ -753,24 +752,15 @@ impl CompletionTracker {
             });
             if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH) {
                 self.workspace_mutated = true;
-                self.verified_after_last_mutation = false;
-                self.satisfied_command_counts.clear();
+                self.terminal_command_scope_digests.clear();
             } else if tool_result.tool_name == TOOL_COMMAND {
                 self.successful_command_count = self.successful_command_count.saturating_add(1);
-                let scope_digest = successful_command_scope_digest(tool_result);
-                if self.required_command_counts.is_empty() && self.workspace_mutated {
-                    self.verified_after_last_mutation = scope_digest.is_some();
-                } else if let Some(result_id) = scope_digest
-                    && let Some(required_count) = self.required_command_counts.get(result_id)
-                {
-                    let satisfied_count = self
-                        .satisfied_command_counts
-                        .entry(result_id.to_string())
-                        .or_insert(0);
-                    if *satisfied_count < *required_count {
-                        *satisfied_count = satisfied_count.saturating_add(1);
-                    }
-                }
+                let window_len = self.terminal_command_window_len();
+                record_terminal_command_observation(
+                    &mut self.terminal_command_scope_digests,
+                    successful_command_scope_digest(tool_result),
+                    window_len,
+                );
             }
         } else if is_repairable_tool_result(tool_result) {
             let error_code = tool_result
@@ -816,7 +806,7 @@ impl CompletionTracker {
         }
         if !self.required_command_counts.is_empty() {
             return format!(
-                "Do not finalize yet. Run every exact verification command required by the task after the latest workspace mutation. {} of {} required successful command results are currently satisfied.",
+                "Do not finalize yet. Run every exact verification command required by the task as the final successful command sequence after the latest workspace mutation. {} of {} required successful command results are currently satisfied.",
                 self.satisfied_command_count(),
                 self.required_command_count()
             );
@@ -841,7 +831,7 @@ impl CompletionTracker {
             satisfied_command_count: if required_command_count > 0 {
                 satisfied_command_count
             } else {
-                u32::from(self.workspace_mutated && self.verified_after_last_mutation)
+                u32::from(self.workspace_mutated && !self.terminal_command_scope_digests.is_empty())
             },
             unresolved_failures: self.unresolved_failures.iter().cloned().collect(),
         }
@@ -849,17 +839,12 @@ impl CompletionTracker {
 
     fn verification_satisfied(&self) -> bool {
         if self.required_command_counts.is_empty() {
-            return !self.workspace_mutated || self.verified_after_last_mutation;
+            return !self.workspace_mutated || !self.terminal_command_scope_digests.is_empty();
         }
-        self.required_command_counts
-            .iter()
-            .all(|(digest, required)| {
-                self.satisfied_command_counts
-                    .get(digest)
-                    .copied()
-                    .unwrap_or(0)
-                    >= *required
-            })
+        usize::try_from(self.required_command_count()).is_ok_and(|required_count| {
+            self.terminal_command_scope_digests.len() == required_count
+                && self.terminal_command_counts() == self.required_command_counts
+        })
     }
 
     fn required_command_count(&self) -> u32 {
@@ -870,16 +855,30 @@ impl CompletionTracker {
     }
 
     fn satisfied_command_count(&self) -> u32 {
+        let terminal_counts = self.terminal_command_counts();
         self.required_command_counts
             .iter()
             .map(|(digest, required)| {
-                self.satisfied_command_counts
+                terminal_counts
                     .get(digest)
                     .copied()
                     .unwrap_or(0)
                     .min(*required)
             })
             .fold(0u32, u32::saturating_add)
+    }
+
+    fn terminal_command_window_len(&self) -> usize {
+        usize::try_from(self.required_command_count().max(1)).unwrap_or(usize::MAX)
+    }
+
+    fn terminal_command_counts(&self) -> BTreeMap<String, u32> {
+        let mut counts = BTreeMap::new();
+        for digest in &self.terminal_command_scope_digests {
+            let count = counts.entry(digest.clone()).or_insert(0u32);
+            *count = count.saturating_add(1);
+        }
+        counts
     }
 }
 
@@ -3588,17 +3587,48 @@ pub fn successful_command_scope_digest(tool_result: &ToolResult) -> Option<&str>
         .filter(|digest| is_sha256_fingerprint(digest))
 }
 
-/// 返回最后一次 workspace mutation 之后、按原始结果顺序保留重复项的 command 观察。
-pub fn eligible_command_scope_digests(tool_results: &[ToolResult]) -> Vec<String> {
+/// 返回最后一次 workspace mutation 之后最后 `max_count` 个成功 command 的精确观察。
+///
+/// 成功 command 的 digest 缺失或非法时清空先前后缀；只有其后重新出现完整的
+/// `max_count` 个合法观察才能恢复终态验证。
+pub fn terminal_command_scope_digests(
+    tool_results: &[ToolResult],
+    max_count: usize,
+) -> Vec<String> {
+    if max_count == 0 {
+        return Vec::new();
+    }
     let first_eligible_result = tool_results
         .iter()
         .rposition(|tool_result| matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH))
         .map_or(0, |index| index + 1);
-    tool_results[first_eligible_result..]
-        .iter()
-        .filter_map(successful_command_scope_digest)
-        .map(str::to_string)
-        .collect()
+    let mut observations = Vec::new();
+    for tool_result in &tool_results[first_eligible_result..] {
+        if tool_result.tool_name == TOOL_COMMAND && tool_result.ok {
+            record_terminal_command_observation(
+                &mut observations,
+                successful_command_scope_digest(tool_result),
+                max_count,
+            );
+        }
+    }
+    observations
+}
+
+fn record_terminal_command_observation(
+    observations: &mut Vec<String>,
+    scope_digest: Option<&str>,
+    max_count: usize,
+) {
+    let Some(scope_digest) = scope_digest else {
+        observations.clear();
+        return;
+    };
+    observations.push(scope_digest.to_string());
+    let excess = observations.len().saturating_sub(max_count);
+    if excess > 0 {
+        observations.drain(..excess);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4343,7 +4373,7 @@ mod audit_projection_tests {
     }
 
     #[test]
-    fn eligible_command_observations_filter_failures_and_pre_mutation_results() {
+    fn terminal_command_observations_filter_failures_and_pre_mutation_results() {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut failed = ToolResult::summary("failed", TOOL_COMMAND, false, "failed");
         failed.result_id = Some(digest.to_string());
@@ -4354,7 +4384,7 @@ mod audit_projection_tests {
         after_mutation.result_id = Some(digest.to_string());
 
         assert_eq!(
-            eligible_command_scope_digests(&[failed, before_mutation, mutation, after_mutation,]),
+            terminal_command_scope_digests(&[failed, before_mutation, mutation, after_mutation], 1),
             vec![digest.to_string()]
         );
     }
@@ -4378,6 +4408,31 @@ mod audit_projection_tests {
         let mut successful = ToolResult::summary("successful", TOOL_COMMAND, true, "ok");
         successful.result_id = Some(digest.to_string());
         tracker.observe(&successful);
+        assert!(tracker.verification_satisfied());
+    }
+
+    #[test]
+    fn exact_completion_requires_required_commands_as_the_terminal_multiset() {
+        let required = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut tracker =
+            CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(required, 2)])
+                .expect("completion tracker");
+        let command = |call_id: &str, digest: &str| {
+            let mut result = ToolResult::summary(call_id, TOOL_COMMAND, true, "ok");
+            result.result_id = Some(digest.to_string());
+            result
+        };
+
+        tracker.observe(&command("smoke-1", required));
+        tracker.observe(&command("smoke-2", required));
+        assert!(tracker.verification_satisfied());
+
+        tracker.observe(&command("write-after-smoke", other));
+        assert!(!tracker.verification_satisfied());
+        tracker.observe(&command("smoke-3", required));
+        assert!(!tracker.verification_satisfied());
+        tracker.observe(&command("smoke-4", required));
         assert!(tracker.verification_satisfied());
     }
 }

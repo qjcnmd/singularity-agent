@@ -2822,10 +2822,9 @@ mod tests {
             "model_turns": 1,
             "completion": {
                 "workspace_mutated": false,
-                "verified_after_last_mutation": false,
                 "successful_command_count": 0,
                 "required_command_counts": {},
-                "satisfied_command_counts": {},
+                "terminal_command_scope_digests": [],
                 "unresolved_failures": []
             },
             "last_completion_error": null

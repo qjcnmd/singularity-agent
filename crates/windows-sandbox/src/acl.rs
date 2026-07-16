@@ -28,6 +28,7 @@ use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_UNKNOWN;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::DeleteAce;
 use windows_sys::Win32::Security::EqualSid;
 use windows_sys::Win32::Security::GENERIC_MAPPING;
 use windows_sys::Win32::Security::GetAce;
@@ -81,6 +82,9 @@ pub enum AclOperation {
     QueryTargetIdentity,
     TargetIdentityMismatch,
     GetSecurityInfo,
+    GetAclInformation,
+    GetAce,
+    DeleteAce,
     SetEntriesInAcl,
     SetSecurityInfo,
 }
@@ -813,37 +817,85 @@ pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> 
     add_deny_ace(path, psid, DenyAceKind::Read)
 }
 
-pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<()> {
+/// Removes the exact inheritable deny-read ACE installed for a sandbox principal.
+///
+/// Win32 `REVOKE_ACCESS` removes allow/audit entries but does not reliably remove deny ACEs.
+/// Rebuild the existing ACL in memory and delete only the exact read-deny entry owned by this
+/// runtime. A combined deny entry is rejected rather than partially weakening another boundary.
+pub unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<()> {
     let target = match open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) {
         Ok(target) => target,
         Err(error) if is_missing_target_error(&error) => return Ok(()),
         Err(error) => return Err(error),
     };
-    let trustee = TRUSTEE_W {
-        pMultipleTrustee: std::ptr::null_mut(),
-        MultipleTrusteeOperation: 0,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_UNKNOWN,
-        ptstrName: psid as *mut u16,
-    };
-    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = 0;
-    explicit.grfAccessMode = 4; // REVOKE_ACCESS
-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-    explicit.Trustee = trustee;
-    let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
-    let code2 = SetEntriesInAclW(1, &explicit, target.p_dacl, &mut p_new_dacl);
-    if code2 != ERROR_SUCCESS {
+    if target.p_dacl.is_null() {
+        return Ok(());
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    if GetAclInformation(
+        target.p_dacl as *const ACL,
+        &mut info as *mut _ as *mut c_void,
+        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+        AclSizeInformation,
+    ) == 0
+    {
         return Err(anyhow::Error::new(WindowsAclError::new(
-            AclOperation::SetEntriesInAcl,
-            code2,
+            AclOperation::GetAclInformation,
+            GetLastError(),
         )));
     }
-    let set_result = set_target_dacl(&target, p_new_dacl, 1);
-    if !p_new_dacl.is_null() {
-        LocalFree(p_new_dacl as HLOCAL);
+    let acl_size = info.AclBytesInUse.saturating_add(info.AclBytesFree) as usize;
+    let word_count = acl_size.div_ceil(std::mem::size_of::<u32>());
+    let mut acl_words = vec![0u32; word_count];
+    std::ptr::copy_nonoverlapping(
+        target.p_dacl as *const u8,
+        acl_words.as_mut_ptr() as *mut u8,
+        acl_size,
+    );
+    let copied_acl = acl_words.as_mut_ptr() as *mut ACL;
+    let mut changed = false;
+    for index in (0..info.AceCount).rev() {
+        let mut p_ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(copied_acl as *const ACL, index, &mut p_ace) == 0 {
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::GetAce,
+                GetLastError(),
+            )));
+        }
+        let header = &*(p_ace as *const ACE_HEADER);
+        if header.AceType != ACCESS_DENIED_ACE_TYPE {
+            continue;
+        }
+        let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
+        let sid_ptr = (p_ace as usize
+            + std::mem::size_of::<ACE_HEADER>()
+            + std::mem::size_of::<u32>()) as *mut c_void;
+        if EqualSid(sid_ptr, psid) == 0 {
+            continue;
+        }
+        let effective_mask = effective_file_access_mask(ace.Mask);
+        let effective_read_mask = effective_file_access_mask(DENY_READ_MASK);
+        if effective_mask != effective_read_mask {
+            if (effective_mask & effective_read_mask) == effective_read_mask {
+                anyhow::bail!(
+                    "refusing to partially revoke a combined deny ACE for {}",
+                    path.display()
+                );
+            }
+            continue;
+        }
+        if DeleteAce(copied_acl, index) == 0 {
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::DeleteAce,
+                GetLastError(),
+            )));
+        }
+        changed = true;
     }
-    set_result
+    if changed {
+        set_target_dacl(&target, copied_acl, 1)?;
+    }
+    Ok(())
 }
 
 /// Best-effort grant of RX to the null device for stdout/stderr redirection compatibility.
@@ -933,6 +985,7 @@ mod tests {
     use super::fetch_dacl_handle;
     use super::open_acl_target;
     use super::path_contains_reparse_component;
+    use super::revoke_deny_read_ace;
     use super::set_target_dacl;
     use crate::token::LocalSid;
     use std::ffi::c_void;
@@ -1008,6 +1061,31 @@ mod tests {
 
         unsafe { set_target_dacl(&target, target.p_dacl, 1).expect("restore original DACL") };
         assert!(write_blocked, "complete deny ACE must block writes");
+    }
+
+    #[test]
+    fn revoke_read_deny_rejects_a_combined_deny_without_weakening_it() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("combined-target");
+        std::fs::create_dir(&path).expect("create fixture");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+        let target = unsafe { open_acl_target(&path, READ_CONTROL | WRITE_DAC, 1) }
+            .expect("open ACL target");
+
+        unsafe {
+            seed_partial_deny(
+                &target,
+                sid.as_ptr(),
+                super::DENY_READ_MASK | super::FILE_WRITE_DATA,
+            )
+        };
+        let error = unsafe { revoke_deny_read_ace(&path, sid.as_ptr()) }
+            .expect_err("combined deny must fail closed");
+        assert!(error.to_string().contains("combined deny ACE"));
+        assert!(unsafe { fetch_has_deny(&path, sid.as_ptr(), false) });
+
+        unsafe { set_target_dacl(&target, target.p_dacl, 1).expect("restore original DACL") };
     }
 
     #[test]

@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics, AgentStatus,
     AgentVerificationRequirement, UPDATE_PLAN_TOOL, agent_control_tool_specs,
-    eligible_command_scope_digests,
+    terminal_command_scope_digests,
 };
 use singularity_core::{contains_sensitive_text, load_project_instructions};
 use singularity_evaluation::{
@@ -1336,7 +1336,7 @@ fn run_agent_stage(
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let run_status = result.to_run_status();
     let (observed_smoke_scope_digests, local_process_fallback_unknown_count) =
-        agent_command_observation(&result);
+        agent_command_observation(&result, projection.smoke_commands.len());
     let trace_path = task_dir.join(AGENT_TRACE_FILE);
     let trace = json!({
         "status": run_status.status,
@@ -1826,16 +1826,22 @@ fn smoke_commands_satisfied(
     projection: &AgentTaskProjection,
     result: &AgentLoopResult,
 ) -> bool {
-    let eligible_results = eligible_command_scope_digests(&result.tool_results);
-    let mut matched_results = vec![false; eligible_results.len()];
-    projection.smoke_commands.iter().all(|command| {
-        let Ok(expected) = smoke_command_scope_digest(workspace, command) else {
-            return false;
-        };
-        let Some(index) = eligible_results
+    let expected_results = projection
+        .smoke_commands
+        .iter()
+        .map(|command| smoke_command_scope_digest(workspace, command))
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(expected_results) = expected_results else {
+        return false;
+    };
+    let observed_results =
+        terminal_command_scope_digests(&result.tool_results, expected_results.len());
+    let mut matched_results = vec![false; observed_results.len()];
+    expected_results.iter().all(|expected| {
+        let Some(index) = observed_results
             .iter()
             .enumerate()
-            .position(|(index, tool_result)| !matched_results[index] && tool_result == &expected)
+            .position(|(index, tool_result)| !matched_results[index] && tool_result == expected)
         else {
             return false;
         };
@@ -2435,6 +2441,19 @@ mod tests {
             &projection,
             &result
         ));
+
+        let other = command(&["touch", "result.txt"]);
+        let other_result = successful_command_result("call-other", &other, workspace.path());
+        let result = completed_agent_result(vec![
+            successful_command_result("call-smoke-1", &smoke, workspace.path()),
+            successful_command_result("call-smoke-2", &smoke, workspace.path()),
+            other_result,
+        ]);
+        assert!(!smoke_commands_satisfied(
+            workspace.path(),
+            &projection,
+            &result
+        ));
     }
 
     #[test]
@@ -2472,6 +2491,37 @@ mod tests {
     }
 
     #[test]
+    fn smoke_commands_must_be_the_terminal_successful_command_suffix() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let smoke = command(&["cargo", "test"]);
+        let write = command(&["touch", "result.txt"]);
+        let projection = AgentTaskProjection {
+            task_id: TaskId::new("task-1").expect("task id"),
+            description: "description".to_string(),
+            instructions: "fix".to_string(),
+            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
+            allowed_tools: vec![ToolName::new(TOOL_COMMAND).expect("tool")],
+            smoke_commands: vec![smoke.clone()],
+        };
+        let smoke_result = successful_command_result("call-smoke", &smoke, workspace.path());
+        let write_result = successful_command_result("call-write", &write, workspace.path());
+
+        let stale = completed_agent_result(vec![smoke_result.clone(), write_result.clone()]);
+        assert!(!smoke_commands_satisfied(
+            workspace.path(),
+            &projection,
+            &stale
+        ));
+
+        let current = completed_agent_result(vec![write_result, smoke_result]);
+        assert!(smoke_commands_satisfied(
+            workspace.path(),
+            &projection,
+            &current
+        ));
+    }
+
+    #[test]
     fn smoke_observation_rejects_failed_result_even_when_digest_matches() {
         let workspace = tempfile::tempdir().expect("workspace");
         let smoke = command(&["cargo", "test"]);
@@ -2479,7 +2529,7 @@ mod tests {
         failed.ok = false;
         let result = completed_agent_result(vec![failed]);
 
-        let (observed, unknown_count) = agent_command_observation(&result);
+        let (observed, unknown_count) = agent_command_observation(&result, 1);
 
         assert!(observed.is_empty());
         assert_eq!(unknown_count, 1);
@@ -2496,7 +2546,7 @@ mod tests {
         let expected = first.result_id.clone().expect("scope digest");
 
         let result = completed_agent_result(vec![mutation, first, second]);
-        let (observed, _) = agent_command_observation(&result);
+        let (observed, _) = agent_command_observation(&result, 2);
 
         assert_eq!(observed, vec![expected.clone(), expected]);
     }

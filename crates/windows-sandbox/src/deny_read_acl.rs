@@ -1,6 +1,6 @@
 use crate::acl::add_deny_read_ace;
 use crate::acl::path_contains_reparse_component;
-use crate::acl::revoke_ace;
+use crate::acl::revoke_deny_read_ace;
 use crate::acl::verify_target_identity_against;
 use crate::path_normalization::lexical_path_key;
 use crate::winutil::to_wide;
@@ -379,7 +379,7 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
             Ok(added) => added,
             Err(err) => {
                 for added_path in &added_in_this_call {
-                    if let Err(rollback_err) = revoke_ace(added_path, psid) {
+                    if let Err(rollback_err) = revoke_deny_read_ace(added_path, psid) {
                         return Err(err.context(format!(
                             "deny-read rollback failed for {}: {rollback_err}",
                             added_path.display()
@@ -406,7 +406,7 @@ mod tests {
     use super::plan_deny_read_acl_paths;
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
-    use crate::acl::revoke_ace;
+    use crate::acl::revoke_deny_read_ace;
     use crate::token::LocalSid;
     use pretty_assertions::assert_eq;
     use std::collections::HashSet;
@@ -506,34 +506,56 @@ mod tests {
         assert!(unsafe { dacl_has_read_deny_for_sid(p_dacl, sid.as_ptr()) });
         unsafe {
             LocalFree(p_sd as HLOCAL);
-            revoke_ace(&existing_git, sid.as_ptr()).expect("restore .git ACL");
+            revoke_deny_read_ace(&existing_git, sid.as_ptr()).expect("restore .git ACL");
         }
     }
 
     #[test]
-    fn missing_git_marker_without_ancestor_is_materialized_and_acl_protected() {
+    fn missing_protected_marker_is_materialized_and_acl_protected() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir(&workspace).expect("create workspace");
-        let missing_git = workspace.join(".git");
+        let missing_marker = workspace.join(".agents");
         let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
             .expect("test capability SID");
 
         let applied =
-            unsafe { apply_deny_read_acls(std::slice::from_ref(&missing_git), sid.as_ptr()) }
-                .expect("materialize and protect missing .git");
+            unsafe { apply_deny_read_acls(std::slice::from_ref(&missing_marker), sid.as_ptr()) }
+                .expect("materialize and protect missing marker");
 
-        assert_eq!(applied, vec![missing_git.clone()]);
-        assert!(missing_git.is_dir());
-        let (p_dacl, p_sd) = unsafe { fetch_dacl_handle(&missing_git) }.expect("fetch .git ACL");
+        assert_eq!(applied, vec![missing_marker.clone()]);
+        assert!(missing_marker.is_dir());
+        let (p_dacl, p_sd) =
+            unsafe { fetch_dacl_handle(&missing_marker) }.expect("fetch marker ACL");
         assert!(unsafe { dacl_has_read_deny_for_sid(p_dacl, sid.as_ptr()) });
         unsafe {
             LocalFree(p_sd as HLOCAL);
-            revoke_ace(&missing_git, sid.as_ptr()).expect("restore .git ACL");
+            revoke_deny_read_ace(&missing_marker, sid.as_ptr()).expect("restore marker ACL");
         }
-        cleanup_empty_runtime_sentinel(&missing_git, &workspace, true)
-            .expect("cleanup runtime-created .git sentinel");
-        assert!(!missing_git.exists());
+        cleanup_empty_runtime_sentinel(&missing_marker, &workspace, true)
+            .expect("cleanup runtime-created marker");
+        assert!(!missing_marker.exists());
+    }
+
+    #[test]
+    fn revoke_removes_an_existing_deny_read_ace() {
+        let tmp = TempDir::new().expect("tempdir");
+        let protected = tmp.path().join("protected");
+        std::fs::create_dir(&protected).expect("create protected path");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+
+        unsafe {
+            apply_deny_read_acls(std::slice::from_ref(&protected), sid.as_ptr())
+                .expect("apply deny-read ACL");
+            revoke_deny_read_ace(&protected, sid.as_ptr()).expect("revoke deny-read ACL");
+        }
+        let (dacl, security_descriptor) =
+            unsafe { fetch_dacl_handle(&protected) }.expect("fetch reconciled ACL");
+        assert!(!unsafe { dacl_has_read_deny_for_sid(dacl, sid.as_ptr()) });
+        unsafe {
+            LocalFree(security_descriptor as HLOCAL);
+        }
     }
 
     #[test]
