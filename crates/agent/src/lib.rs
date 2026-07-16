@@ -740,14 +740,15 @@ impl CompletionTracker {
                 self.satisfied_command_counts.clear();
             } else if tool_result.tool_name == TOOL_COMMAND {
                 self.successful_command_count = self.successful_command_count.saturating_add(1);
+                let scope_digest = successful_command_scope_digest(tool_result);
                 if self.required_command_counts.is_empty() && self.workspace_mutated {
-                    self.verified_after_last_mutation = true;
-                } else if let Some(result_id) = tool_result.result_id.as_ref()
+                    self.verified_after_last_mutation = scope_digest.is_some();
+                } else if let Some(result_id) = scope_digest
                     && let Some(required_count) = self.required_command_counts.get(result_id)
                 {
                     let satisfied_count = self
                         .satisfied_command_counts
-                        .entry(result_id.clone())
+                        .entry(result_id.to_string())
                         .or_insert(0);
                     if *satisfied_count < *required_count {
                         *satisfied_count = satisfied_count.saturating_add(1);
@@ -3530,8 +3531,187 @@ fn tool_call_request(call: &ModelToolCall) -> ToolCallRequest {
 fn audit_events_from_tool_results(tool_results: &[ToolResult]) -> Vec<Value> {
     tool_results
         .iter()
-        .filter_map(|result| result.audit_metadata().cloned())
+        .filter_map(|result| {
+            let audit = project_audit_event(result.audit_metadata()?);
+            (!audit.as_object().is_none_or(serde_json::Map::is_empty)).then_some(audit)
+        })
         .collect()
+}
+
+/// 将内部 command 结果归约为可用于 verification/evaluation 的精确成功观察。
+pub fn successful_command_scope_digest(tool_result: &ToolResult) -> Option<&str> {
+    (tool_result.tool_name == TOOL_COMMAND && tool_result.ok)
+        .then_some(tool_result.result_id.as_deref())
+        .flatten()
+        .filter(|digest| is_sha256_fingerprint(digest))
+}
+
+/// 返回最后一次 workspace mutation 之后、按原始结果顺序保留重复项的 command 观察。
+pub fn eligible_command_scope_digests(tool_results: &[ToolResult]) -> Vec<String> {
+    let first_eligible_result = tool_results
+        .iter()
+        .rposition(|tool_result| matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH))
+        .map_or(0, |index| index + 1);
+    tool_results[first_eligible_result..]
+        .iter()
+        .filter_map(successful_command_scope_digest)
+        .map(str::to_string)
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SafeAuditEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    argument_validation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    argument_validation_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_provenance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_scope_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executor_started: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_process_fallback: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_access: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_evaluated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_scope_binding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_enforcement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<SafeAuditTimeout>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum SafeAuditTimeout {
+    Seconds(u64),
+    Unknown(&'static str),
+}
+
+/// 将内部 WorkspaceTool/approval metadata 投影为普通 trace 可安全持久化的闭集字段。
+///
+/// 该函数构造全新的 typed projection；未知字段、绝对 cwd、raw arguments、reason、ID 和
+/// 其他嵌套 JSON 均不会被复制到普通 trace 或 Evaluation agent-trace。
+pub fn project_audit_event(metadata: &Value) -> Value {
+    let object = metadata.as_object();
+    let projection = SafeAuditEvent {
+        argument_validation: allowed_label(object, "argument_validation", &["failed"]),
+        argument_validation_code: bounded_audit_label(object, "argument_validation_code"),
+        approval_decision: allowed_label(
+            object,
+            "approval_decision",
+            &[
+                "allowed_by_policy",
+                "approved",
+                "approval_required",
+                "denied",
+                "unavailable",
+            ],
+        ),
+        approval_policy: allowed_label(
+            object,
+            "approval_policy",
+            &["never", "on-request", "untrusted"],
+        ),
+        command_provenance: allowed_label(object, "command_provenance", &["agent_requested"]),
+        command_scope_digest: object
+            .and_then(|fields| fields.get("command_scope_digest"))
+            .and_then(Value::as_str)
+            .filter(|digest| *digest == "unavailable" || is_sha256_fingerprint(digest))
+            .map(str::to_string),
+        executor_started: object_bool(object, "executor_started"),
+        local_process_fallback: object_bool(object, "local_process_fallback"),
+        network_access: allowed_label(object, "network_access", &["allowed", "denied", "unknown"]),
+        policy_evaluated: object_bool(object, "policy_evaluated"),
+        policy_scope_binding: allowed_label(
+            object,
+            "policy_scope_binding",
+            &["bound", "unavailable"],
+        ),
+        sandbox_backend: bounded_audit_label(object, "sandbox_backend"),
+        sandbox_enforcement: allowed_label(
+            object,
+            "sandbox_enforcement",
+            &[
+                "not_executed",
+                "restricted_token",
+                "strict",
+                "unavailable",
+                "unknown",
+            ],
+        ),
+        sandbox_mode: allowed_label(
+            object,
+            "sandbox_mode",
+            &[
+                "danger_full_access",
+                "read_only",
+                "unknown",
+                "workspace_write",
+            ],
+        ),
+        timeout_seconds: object
+            .and_then(|fields| fields.get("timeout_seconds"))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .filter(|seconds| *seconds <= 3_600)
+                    .map(SafeAuditTimeout::Seconds)
+                    .or_else(|| {
+                        (value.as_str() == Some("unknown"))
+                            .then_some(SafeAuditTimeout::Unknown("unknown"))
+                    })
+            }),
+    };
+    serde_json::to_value(projection).expect("safe audit projection serializes")
+}
+
+fn object_bool(object: Option<&serde_json::Map<String, Value>>, key: &str) -> Option<bool> {
+    object
+        .and_then(|fields| fields.get(key))
+        .and_then(Value::as_bool)
+}
+
+fn allowed_label(
+    object: Option<&serde_json::Map<String, Value>>,
+    key: &str,
+    allowed: &[&str],
+) -> Option<String> {
+    let value = object
+        .and_then(|fields| fields.get(key))
+        .and_then(Value::as_str)?;
+    allowed.contains(&value).then(|| value.to_string())
+}
+
+fn bounded_audit_label(
+    object: Option<&serde_json::Map<String, Value>>,
+    key: &str,
+) -> Option<String> {
+    let value = object
+        .and_then(|fields| fields.get(key))
+        .and_then(Value::as_str)?;
+    if value.is_empty()
+        || value.len() > 64
+        || contains_sensitive_text(value)
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 fn command_audit_metadata(
@@ -4069,5 +4249,90 @@ mod scheduler_tests {
         });
 
         assert_eq!(results, vec![Some((0, true)), Some((1, true))]);
+    }
+}
+
+#[cfg(test)]
+mod audit_projection_tests {
+    use super::*;
+
+    #[test]
+    fn audit_projection_is_a_closed_typed_allowlist() {
+        let raw = json!({
+            "cwd": "C:/sensitive/workspace",
+            "raw_arguments": {"command": "echo secret"},
+            "approval_reason": "operator reason must not escape",
+            "approval_request_id": "approval-secret",
+            "approval_grant_id": "grant-secret",
+            "extra": {"nested": "must not escape"},
+            "sandbox_mode": "workspace_write",
+            "network_access": "allowed",
+            "sandbox_backend": "test_backend",
+            "sandbox_enforcement": "strict",
+            "local_process_fallback": false,
+            "command_scope_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "command_provenance": "agent_requested",
+            "approval_policy": "on-request",
+            "approval_decision": "approved",
+            "timeout_seconds": 5,
+        });
+
+        let projected = project_audit_event(&raw);
+        assert_eq!(projected["sandbox_mode"], "workspace_write");
+        assert_eq!(
+            projected["command_scope_digest"],
+            raw["command_scope_digest"]
+        );
+        assert!(projected.get("cwd").is_none());
+        let serialized = serde_json::to_string(&projected).expect("serialize audit projection");
+        for forbidden in [
+            "raw_arguments",
+            "sensitive/workspace",
+            "approval-secret",
+            "grant-secret",
+            "operator reason",
+            "must not escape",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn eligible_command_observations_filter_failures_and_pre_mutation_results() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut failed = ToolResult::summary("failed", TOOL_COMMAND, false, "failed");
+        failed.result_id = Some(digest.to_string());
+        let mut before_mutation = ToolResult::summary("before", TOOL_COMMAND, true, "ok");
+        before_mutation.result_id = Some(digest.to_string());
+        let mutation = ToolResult::summary("edit", TOOL_EDIT, true, "changed");
+        let mut after_mutation = ToolResult::summary("after", TOOL_COMMAND, true, "ok");
+        after_mutation.result_id = Some(digest.to_string());
+
+        assert_eq!(
+            eligible_command_scope_digests(&[failed, before_mutation, mutation, after_mutation,]),
+            vec![digest.to_string()]
+        );
+    }
+
+    #[test]
+    fn completion_gate_requires_exact_successful_command_observation_after_mutation() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut tracker = CompletionTracker::default();
+        tracker.observe(&ToolResult::summary("edit", TOOL_EDIT, true, "changed"));
+
+        let mut failed = ToolResult::summary("failed", TOOL_COMMAND, false, "failed");
+        failed.result_id = Some(digest.to_string());
+        tracker.observe(&failed);
+        assert!(!tracker.verification_satisfied());
+
+        let mut malformed = ToolResult::summary("malformed", TOOL_COMMAND, true, "ok");
+        malformed.result_id = Some("sha256:not-a-digest".to_string());
+        tracker.observe(&malformed);
+        assert!(!tracker.verification_satisfied());
+
+        let mut successful = ToolResult::summary("successful", TOOL_COMMAND, true, "ok");
+        successful.result_id = Some(digest.to_string());
+        tracker.observe(&successful);
+        assert!(tracker.verification_satisfied());
     }
 }

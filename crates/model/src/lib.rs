@@ -2307,75 +2307,60 @@ fn capability_probe_profiles(
     let direct_tool_count = DEFAULT_MAX_TOOLS_PER_REQUEST;
     let strict_allowed_arguments =
         vec![strict_arguments.clone(), alternate_strict_arguments.clone()];
-    let mut profiles = Vec::new();
-    profiles.push(CapabilityProbeProfile {
-        profile: ProviderCapabilityProfile::StrictParallel,
-        contract: make_contract(
-            true,
-            true,
-            direct_tool_count,
-        ),
-        request: make_request(
-            probe_tools(direct_tool_count, &tool_schema),
-            ToolChoiceMode::Auto,
-            2,
-            true,
-            "First call singularity_capability_probe_a and singularity_capability_probe_b once each. After both tool results, call singularity_capability_probe_a once more.",
-        ),
-        expected_calls: parallel_expected(strict_allowed_arguments.clone()),
-        single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
-    });
-    profiles.push(CapabilityProbeProfile {
-        profile: ProviderCapabilityProfile::StrictSingle,
-        contract: make_contract(
-            true,
-            false,
-            direct_tool_count,
-        ),
-        request: make_request(
-            probe_tools(direct_tool_count, &tool_schema),
-            ToolChoiceMode::Auto,
-            1,
-            true,
-            "First call singularity_capability_probe_a once. After its tool result, call singularity_capability_probe_a once more.",
-        ),
-        expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, strict_allowed_arguments),
-        single_call_fallback: None,
-    });
-    profiles.push(CapabilityProbeProfile {
-        profile: ProviderCapabilityProfile::NonStrictParallel,
-        contract: make_contract(
-            false,
-            true,
-            direct_tool_count,
-        ),
-        request: make_request(
-            probe_tools(direct_tool_count, &tool_schema),
-            ToolChoiceMode::Auto,
-            2,
-            false,
-            "First call singularity_capability_probe_a and singularity_capability_probe_b once each with exactly {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]} as each arguments object. After both tool results, call singularity_capability_probe_a once more with the same arguments.",
-        ),
-        expected_calls: parallel_expected(Vec::new()),
-        single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
-    });
-    profiles.push(CapabilityProbeProfile {
-        profile: ProviderCapabilityProfile::NonStrictSingle,
-        contract: make_contract(
-            false,
-            false,
-            direct_tool_count,
-        ),
-        request: make_request(
-            probe_tools(direct_tool_count, &tool_schema),
-            ToolChoiceMode::Auto,
-            1,
-            false,
-            "First call singularity_capability_probe_a once with arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}. After its tool result, call singularity_capability_probe_a once more with the same arguments.",
-        ),
-        expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, Vec::new()),
-        single_call_fallback: None,
-    });
+    let profiles = vec![
+        CapabilityProbeProfile {
+            profile: ProviderCapabilityProfile::StrictParallel,
+            contract: make_contract(true, true, direct_tool_count),
+            request: make_request(
+                probe_tools(direct_tool_count, &tool_schema),
+                ToolChoiceMode::Auto,
+                2,
+                true,
+                "First call singularity_capability_probe_a and singularity_capability_probe_b once each. After both tool results, call singularity_capability_probe_a once more.",
+            ),
+            expected_calls: parallel_expected(strict_allowed_arguments.clone()),
+            single_call_fallback: Some(ProviderCapabilityProfile::StrictSingle),
+        },
+        CapabilityProbeProfile {
+            profile: ProviderCapabilityProfile::StrictSingle,
+            contract: make_contract(true, false, direct_tool_count),
+            request: make_request(
+                probe_tools(direct_tool_count, &tool_schema),
+                ToolChoiceMode::Auto,
+                1,
+                true,
+                "First call singularity_capability_probe_a once. After its tool result, call singularity_capability_probe_a once more.",
+            ),
+            expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, strict_allowed_arguments),
+            single_call_fallback: None,
+        },
+        CapabilityProbeProfile {
+            profile: ProviderCapabilityProfile::NonStrictParallel,
+            contract: make_contract(false, true, direct_tool_count),
+            request: make_request(
+                probe_tools(direct_tool_count, &tool_schema),
+                ToolChoiceMode::Auto,
+                2,
+                false,
+                "First call singularity_capability_probe_a and singularity_capability_probe_b once each with exactly {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]} as each arguments object. After both tool results, call singularity_capability_probe_a once more with the same arguments.",
+            ),
+            expected_calls: parallel_expected(Vec::new()),
+            single_call_fallback: Some(ProviderCapabilityProfile::NonStrictSingle),
+        },
+        CapabilityProbeProfile {
+            profile: ProviderCapabilityProfile::NonStrictSingle,
+            contract: make_contract(false, false, direct_tool_count),
+            request: make_request(
+                probe_tools(direct_tool_count, &tool_schema),
+                ToolChoiceMode::Auto,
+                1,
+                false,
+                "First call singularity_capability_probe_a once with arguments {\"probe\":\"schema_sentinel_alpha\",\"values\":[7,7]}. After its tool result, call singularity_capability_probe_a once more with the same arguments.",
+            ),
+            expected_calls: single_expected(CAPABILITY_PROBE_TOOL_A, Vec::new()),
+            single_call_fallback: None,
+        },
+    ];
     profiles
 }
 

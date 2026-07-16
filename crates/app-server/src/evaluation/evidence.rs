@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use singularity_agent::AgentLoopResult;
+use singularity_agent::{AgentLoopResult, eligible_command_scope_digests};
 use singularity_evaluation::{
     CommandSpec, EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationScopeEvidence,
     EvaluationTaskEvidence, EvidenceVerdict, PlannedWorkspaceSource, RunId, WorkspacePlan,
@@ -61,20 +61,19 @@ pub(super) fn content_digest(bytes: &[u8]) -> String {
 
 /// 从 Agent 结果提取 command scope 与未知审计计数。
 pub(super) fn agent_command_observation(result: &AgentLoopResult) -> (Vec<String>, usize) {
-    let mut observed = Vec::new();
+    let observed = eligible_command_scope_digests(&result.tool_results);
     let mut unknown_count = 0usize;
     for tool_result in result
         .tool_results
         .iter()
         .filter(|tool_result| tool_result.tool_name == TOOL_COMMAND)
     {
-        let Some(scope_digest) = safe_command_scope_digest(tool_result) else {
+        let Some(_scope_digest) = safe_command_scope_digest(tool_result) else {
             if tool_result.result_id.is_some() {
                 unknown_count = unknown_count.saturating_add(1);
             }
             continue;
         };
-        observed.push(scope_digest.to_string());
         let observation_complete = tool_result.audit_metadata().is_some_and(|audit| {
             audit
                 .get("local_process_fallback")

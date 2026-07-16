@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult,
     AgentRunStatus, AgentStatus, ApprovalGrant, PendingToolCall, agent_control_tool_specs,
+    project_audit_event,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
@@ -41,9 +42,9 @@ use singularity_protocol::{
 use singularity_sandbox::{SandboxBackend, SandboxBackendEnforcement, WindowsSandboxBackend};
 use singularity_store::{CommitTurnOutcomeParams, CommittedTurnOutcome, SessionStore, StoreError};
 use singularity_tools::{
-    COMMAND_TOOL as TOOL_COMMAND, CommandToolInput, EDIT_TOOL as TOOL_EDIT, GREP_TOOL as TOOL_GREP,
+    COMMAND_TOOL as TOOL_COMMAND, EDIT_TOOL as TOOL_EDIT, GREP_TOOL as TOOL_GREP,
     LIST_TOOL as TOOL_LIST, PATCH_TOOL as TOOL_PATCH, READ_TOOL as TOOL_READ, ToolBroker,
-    ToolRegistry, WorkspaceTools, command_script_scope_digest, workspace_tool_specs,
+    ToolRegistry, WorkspaceTools, workspace_tool_specs,
 };
 use thiserror::Error;
 
@@ -1611,65 +1612,46 @@ fn approval_terminal_status(
     if let Some(command_audit) = pending_command_audit_metadata(pending_tool_call) {
         merge_json_object(&mut audit_event, command_audit);
     }
-    run_status.audit_events.push(audit_event);
+    run_status
+        .audit_events
+        .push(project_audit_event(&audit_event));
     run_status
 }
 
 fn pending_command_audit_metadata(pending_tool_call: Option<&Value>) -> Option<Value> {
     let pending_value = pending_tool_call?;
-    let (tool_name, raw_arguments) =
-        match serde_json::from_value::<PendingToolCall>(pending_value.clone()) {
-            Ok(pending) => (pending.tool_name, Some(pending.raw_arguments)),
-            Err(_error) => (
-                pending_value
-                    .get("tool_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                pending_value
-                    .get("raw_arguments")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            ),
-        };
+    let tool_name = pending_value.get("tool_name").and_then(Value::as_str)?;
     if tool_name != TOOL_COMMAND {
         return None;
     }
-    let mut audit = json!({
+    let resources = serde_json::from_value::<PendingToolCall>(pending_value.clone())
+        .map(|pending| pending.resources)
+        .unwrap_or_default();
+    let scope_digest = resources.iter().find_map(|resource| {
+        resource
+            .strip_prefix("command_script;scope_digest:")
+            .filter(|digest| is_sha256_digest(digest))
+    });
+    let audit = json!({
         "sandbox_backend": "not_executed",
         "sandbox_enforcement": "not_executed",
         "sandbox_mode": "unknown",
         "network_access": "unknown",
+        "command_scope_digest": scope_digest.unwrap_or("unavailable"),
+        "policy_scope_binding": if scope_digest.is_some() {
+            "bound"
+        } else {
+            "unavailable"
+        },
     });
-    let Some(raw_arguments) = raw_arguments else {
-        audit["cwd"] = json!("unknown");
-        audit["timeout_seconds"] = json!("unknown");
-        audit["sandbox_mode"] = json!("unknown");
-        audit["network_access"] = json!("unknown");
-        audit["command_scope_digest"] = json!("unavailable");
-        return Some(audit);
-    };
-    let Ok(input) = serde_json::from_str::<CommandToolInput>(&raw_arguments) else {
-        audit["cwd"] = json!("unknown");
-        audit["timeout_seconds"] = json!("unknown");
-        audit["sandbox_mode"] = json!("unknown");
-        audit["network_access"] = json!("unknown");
-        audit["command_scope_digest"] = json!("unavailable");
-        return Some(audit);
-    };
-    merge_json_object(
-        &mut audit,
-        json!({
-            "cwd": input.effective_cwd(),
-            "timeout_seconds": input.effective_timeout_seconds(),
-            "command_scope_digest": command_script_scope_digest(
-                &input.command,
-                input.effective_cwd(),
-                input.effective_timeout_seconds(),
-            ),
-        }),
-    );
     Some(audit)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn merge_json_object(target: &mut Value, source: Value) {
@@ -2023,12 +2005,73 @@ mod tests {
     };
     use singularity_protocol::ItemKind;
     use singularity_sandbox::CommandScriptRequest;
-    use singularity_tools::{CommandRequest, CommandResult};
+    use singularity_tools::{
+        CommandRequest, CommandResult, SandboxFilesystemMode, SandboxNetworkMode,
+        command_script_scope_resource_with_policy,
+    };
 
     use super::*;
 
     fn app_server(store: SessionStore) -> AppServer {
         AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+    }
+
+    #[test]
+    fn ordinary_and_evaluation_traces_share_safe_audit_projection_and_store_roundtrip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store.create_thread(None, None).expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+            .expect("turn");
+        let mut status = AgentRunStatus::failed("safe failure");
+        status.audit_events.push(project_audit_event(&json!({
+            "cwd": "C:/sensitive/workspace",
+            "raw_arguments": {"command": "echo secret"},
+            "approval_reason": "operator reason",
+            "approval_request_id": "approval-secret",
+            "approval_grant_id": "grant-secret",
+            "sandbox_mode": "workspace_write",
+            "network_access": "allowed",
+            "sandbox_backend": "test_backend",
+            "sandbox_enforcement": "strict",
+            "local_process_fallback": false,
+            "command_scope_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "command_provenance": "agent_requested",
+            "approval_policy": "on-request",
+            "approval_decision": "approved",
+            "timeout_seconds": 5,
+        })));
+
+        let ordinary = agent_loop_trace(&turn, &status);
+        let evaluation = json!({"audit_events": &status.audit_events});
+        for serialized in [
+            serde_json::to_string(&ordinary).expect("ordinary trace JSON"),
+            serde_json::to_string(&evaluation).expect("evaluation trace JSON"),
+        ] {
+            for forbidden in [
+                "C:/sensitive/workspace",
+                "raw_arguments",
+                "operator reason",
+                "approval-secret",
+                "grant-secret",
+            ] {
+                assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+            }
+        }
+
+        store.append_trace(&ordinary).expect("append trace");
+        let restored = store
+            .show_trace(&ordinary.event_id)
+            .expect("roundtrip trace");
+        assert!(restored.redaction_applied);
+        assert_eq!(
+            restored.payload["audit_events"][0]["sandbox_mode"],
+            "workspace_write"
+        );
+        let restored_json = serde_json::to_string(&restored).expect("restored trace JSON");
+        assert!(!restored_json.contains("raw_arguments"));
+        assert!(!restored_json.contains("approval-secret"));
     }
 
     #[test]
@@ -2713,12 +2756,19 @@ mod tests {
             run_status.audit_events[0]["sandbox_enforcement"],
             "not_executed"
         );
-        assert!(
-            run_status.audit_events[0]["command_scope_digest"]
-                .as_str()
-                .expect("command scope digest")
-                .starts_with("sha256:")
+        assert_eq!(
+            run_status.audit_events[0]["command_scope_digest"],
+            "unavailable"
         );
+        assert_eq!(
+            run_status.audit_events[0]["policy_scope_binding"],
+            "unavailable"
+        );
+        let serialized = serde_json::to_string(&run_status.audit_events[0]).expect("audit JSON");
+        assert!(!serialized.contains("raw_arguments"));
+        assert!(!serialized.contains("test-program success"));
+        assert!(!serialized.contains("approval_request_id"));
+        assert!(!serialized.contains("approval_decision_id"));
         assert_eq!(
             run_status.audit_events[0]["approval_decision"],
             "unavailable"
@@ -2970,12 +3020,19 @@ mod tests {
             "timeout_seconds": 5
         })
         .to_string();
+        let bound_resource = command_script_scope_resource_with_policy(
+            "test-program success",
+            ".",
+            5,
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Allowed,
+        );
         let mismatched_pending = PendingToolCall {
             request_id: "approval_other_call_1".to_string(),
             tool_call_id: "call_1".to_string(),
             tool_name: TOOL_COMMAND.to_string(),
             raw_arguments: valid_command.clone(),
-            resources: Vec::new(),
+            resources: vec![bound_resource.clone()],
         };
         let invalid_args_pending = PendingToolCall {
             request_id: request.request_id.clone(),
@@ -3009,11 +3066,15 @@ mod tests {
             mismatch_status.audit_events[0]["sandbox_backend"],
             "not_executed"
         );
-        assert!(
-            mismatch_status.audit_events[0]["command_scope_digest"]
-                .as_str()
-                .expect("command scope digest")
-                .starts_with("sha256:")
+        assert_eq!(
+            mismatch_status.audit_events[0]["command_scope_digest"],
+            bound_resource
+                .strip_prefix("command_script;scope_digest:")
+                .expect("bound scope digest")
+        );
+        assert_eq!(
+            mismatch_status.audit_events[0]["policy_scope_binding"],
+            "bound"
         );
 
         let (_turn, invalid_args_status, _next_approvals) = server

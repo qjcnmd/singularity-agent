@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics, AgentStatus,
     AgentVerificationRequirement, UPDATE_PLAN_TOOL, agent_control_tool_specs,
+    eligible_command_scope_digests,
 };
 use singularity_core::{contains_sensitive_text, load_project_instructions_from_cwd};
 use singularity_evaluation::{
@@ -1781,12 +1782,7 @@ fn smoke_commands_satisfied(
     projection: &AgentTaskProjection,
     result: &AgentLoopResult,
 ) -> bool {
-    let first_eligible_result = result
-        .tool_results
-        .iter()
-        .rposition(|tool_result| matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH))
-        .map_or(0, |index| index + 1);
-    let eligible_results = &result.tool_results[first_eligible_result..];
+    let eligible_results = eligible_command_scope_digests(&result.tool_results);
     let mut matched_results = vec![false; eligible_results.len()];
     projection.smoke_commands.iter().all(|command| {
         let Ok(expected) = smoke_command_scope_digest(workspace, command) else {
@@ -1795,12 +1791,7 @@ fn smoke_commands_satisfied(
         let Some(index) = eligible_results
             .iter()
             .enumerate()
-            .position(|(index, tool_result)| {
-                !matched_results[index]
-                    && tool_result.tool_name == TOOL_COMMAND
-                    && tool_result.ok
-                    && tool_result.result_id.as_deref() == Some(expected.as_str())
-            })
+            .position(|(index, tool_result)| !matched_results[index] && tool_result == &expected)
         else {
             return false;
         };
@@ -2433,6 +2424,36 @@ mod tests {
             &projection,
             &current
         ));
+    }
+
+    #[test]
+    fn smoke_observation_rejects_failed_result_even_when_digest_matches() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let smoke = command(&["cargo", "test"]);
+        let mut failed = successful_command_result("call-failed", &smoke, workspace.path());
+        failed.ok = false;
+        let result = completed_agent_result(vec![failed]);
+
+        let (observed, unknown_count) = agent_command_observation(&result);
+
+        assert!(observed.is_empty());
+        assert_eq!(unknown_count, 1);
+    }
+
+    #[test]
+    fn smoke_observation_preserves_post_mutation_order_and_duplicates() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let smoke = command(&["cargo", "test"]);
+        let mutation =
+            singularity_tools::ToolResult::summary("call-edit", TOOL_EDIT, true, "changed");
+        let first = successful_command_result("call-smoke-1", &smoke, workspace.path());
+        let second = successful_command_result("call-smoke-2", &smoke, workspace.path());
+        let expected = first.result_id.clone().expect("scope digest");
+
+        let result = completed_agent_result(vec![mutation, first, second]);
+        let (observed, _) = agent_command_observation(&result);
+
+        assert_eq!(observed, vec![expected.clone(), expected]);
     }
 
     #[test]

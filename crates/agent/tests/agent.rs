@@ -3113,7 +3113,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         run_status.audit_events[0]["sandbox_mode"],
         "danger_full_access"
     );
-    assert_eq!(run_status.audit_events[0]["cwd"], command_cwd);
+    assert!(run_status.audit_events[0].get("cwd").is_none());
     assert_eq!(run_status.audit_events[0]["timeout_seconds"], 5);
     assert_eq!(run_status.audit_events[0]["network_access"], "allowed");
     assert_eq!(

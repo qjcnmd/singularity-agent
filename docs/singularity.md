@@ -140,6 +140,8 @@ sg run <goal>
 
 checkpoint、pending tool call、原始 prompt、provider payload 和内部 audit metadata 不序列化到 `AgentLoopResult`、CLI response 或普通 trace payload。checkpoint 保存 model usage、provider attempts、completion/plan、context compaction、recovery metrics 和 tool-call fingerprints，但不作为 provider capability 真值。allow-resume 只接受当前 active blocked turn 的一次性 decision，校验 checkpoint 的完整绑定后恢复原 messages、tool results、已消费 grants、approval count 和 model-turn offset，重新协商当前 effective model 的 capabilities，再执行 pending tool 并继续模型循环；取消、失败和 max-turn 返回都保留恢复前的回合计数。
 
+`AgentRunStatus.audit_events` 在 Agent 到 trace 的 seam 通过 typed closed allowlist 生成：只保留受限的验证、approval decision、command scope digest、sandbox enforcement/fallback、policy 与 bounded label 字段；绝对 cwd、raw arguments、原始 reason、grant/request/decision ID 以及未知嵌套 JSON 都被丢弃。普通 `TraceEvent` 与 Evaluation `agent-trace.json` 使用同一投影；pending approval 的 command audit 只读取 `PendingToolCall.resources` 中已绑定的 `command_script` scope digest，缺少或非法 binding 时显式记录 `command_scope_digest=unavailable` 与 `policy_scope_binding=unavailable`，不从 raw arguments 以默认权限重算。
+
 当下一次 model request 超出 context budget 时，AgentLoop 使用确定性的 `compact_model_messages`：保留全部 system 消息、初始 developer 指令、最新 user 消息和最近完整的 assistant/tool 配对，把较早消息和原始 tool output 换成包含 `agent_context_compaction`、压缩数量、失败数量、plan 当前摘要、verification 摘要、recovery 计数，以及当前仍有效的 verification、plan 和 repeated-repair 控制指令的 developer 摘要；保留的 tool 消息只带 `ok`、错误码、截断标记和重新读取提示。只有压缩后 token 数严格下降且仍在窗口内才应用，否则返回 context overflow。`AgentContextTrace` 记录 `compaction_count`、`compacted_message_count`、压缩前后 token 数，并进入普通 agent trace；approval checkpoint 同时保存该 trace、plan、completion tracker、model usage、provider attempts、repair 和 tool-call fingerprint 状态。resume 会校验 checkpoint 的绑定、plan/completion、provider attempt 和 compaction 单调性，再从同一状态继续，损坏或不一致时 fail closed。
 
 completion gate 保持以下不变量：
@@ -147,6 +149,7 @@ completion gate 保持以下不变量：
 - final answer 不能为空。
 - 没有 manifest 指定的 typed verification 时，edit/patch 之后以及最后一次 workspace mutation 之后必须观察到成功 command。
 - typed verification requirement 使用 canonical command scope 的 SHA-256 digest 和大于零的成功次数；所有要求的 digest/count 都必须由独立成功 command result 满足，mutation 会清空此前的满足计数。
+- Evaluation smoke 与 completion gate 共用 Agent 的 command observation：只纳入最后一次 workspace mutation 之后、`ok=true` 且 digest 格式精确的 command，结果按原顺序保留重复项；失败、缺失或非法 digest 不能满足 gate，也不能形成 Passed smoke evidence。
 - 存在未解决的可修复 tool failure 时不能完成。
 - 若已建立 plan，所有 plan step 必须为 `completed`；否则 final answer 被拒绝并要求再次调用 `update_plan`。
 - 普通工作回合达到 turn 上限时，只有在最后一个允许的工作响应处理后已满足 `finalization_ready()` 才允许一次 terminal finalization；该请求的 provider error、取消、空文本或结构化 tool call 仍 fail closed。没有 readiness 时，达到上限仍返回 failed，不改写为 completed。
@@ -283,6 +286,8 @@ turn 创建、输入 item、history page 和 started trace 在一个事务内生
 
 store 在写入 item、trace 和 artifact reference 前执行敏感文本检查。检测到 secret-like 内容时保存固定 redacted 文本；trace 保存 SHA-256 payload hash，并在读取时验证完整性。`artifact/fetch` 当前只返回已经登记且脱敏的 `ArtifactRef`，不直接提供任意文件读取。
 
+Store 只持久化上游已经完成的 audit projection，再对 trace payload 做递归敏感文本脱敏和 hash 完整性校验；读取 roundtrip 不会恢复被投影丢弃的原始字段。
+
 ## 12. Evaluation
 
 `sg eval run` 发送 `eval/run`，app-server 读取 `evaluation.task_set/v4` manifest 并执行 AgentLoop runner。每个 task 必须声明非空且不重复的 `capabilities`；这些标签只用于任务集覆盖审计、`WorkspacePlan` 和 result，不进入 `AgentTaskProjection` 或模型 payload：
@@ -303,6 +308,8 @@ prepare source
 `EvaluationTaskResult` 分开记录 stage status、`agent_completed`、`tests_passed` 和 `evaluation_passed`。`result.json` 使用 `evaluation.result/v5`；每个 task 的稳定 `evidence` 包含 workspace change 数、canonical patch digest、tool-call/model-turn/approval 计数、plan update/completion、invalid/repeated tool call、repair、completion rejection、compaction、typed verification required/satisfied、provider attempt/retry、input/output/cached/reasoning/total token、provider latency、agent duration、post-agent smoke、strict sandbox command、`local_process_fallback_count` 和 `local_process_fallback_unknown_count`。任何已执行 command 缺少明确 sandbox enforcement 或 fallback 观察时，unknown count 非零，不能形成 passed evaluation。`EvaluationRunSummary` 从 task result 重算 task/scored/blocked、agent completed、tests passed、evaluation passed、basis-points success rate 和 80% core threshold，不能由调用方伪造；scored denominator 固定等于 manifest 选择的全部 task，blocked/unknown 只保留 typed 归因并按未通过计入固定分母，不能通过缩小分母提高成功率。该汇总不改变逐任务或整次运行的 `evaluation_passed` 语义。
 
 `report.json` 另保存每个 task 的 source provenance（Local fixture 的 manifest-relative 路径与 materialized source tree SHA-256，RemoteGit 的脱敏 repository、完整 immutable commit 与 materialized source tree SHA-256）、source/baseline/agent/public/hidden 命令诊断及其 command scope digest、逐文件 before/after SHA-256、allowlist 判定、patch evidence 与 agent trace 路径，并可包含脱敏 `provider_diagnostic` 和本地诊断字段；这些 report-only 字段不改变稳定 result evidence 或 gate。`evidence.json` 使用 `evaluation.evidence/v1`，把 manifest SHA-256、从有序 task IDs 重算的 task-selection digest、固定 denominator、source/allowlist/changed-path/patch/trace digest、smoke/baseline/public/hidden 的 expected/observed scope 与 typed verdict，以及 fallback 已知/未知计数绑定到同一 `result.json`。smoke 的 expected scope 与 Agent completion/post-agent smoke 复用同一个模型可见 `command` string scope 事实源；baseline/public/hidden 仍按可信内部 `argv` scope 记录，不在 evidence 阶段交叉重算成另一种合同。只有 evidence 与 result 的 run、task、patch、fallback 和 passed-task 完整性全部一致才发布。Evaluation 直接从内存中的 `AgentLoopResult` 生成 `agent-trace.json`，记录脱敏 context/compaction trace、plan、recovery、model usage、provider attempts、verification、`provider_protocol`、tool outcomes 和 audit events；`provider_protocol` 仅含可选 contract 与 capability metadata，`tool_outcomes` 只投影 tool call/name、`ok`、错误码、截断标记和安全的 command result digest，`audit_events` 只保留脱敏 command scope、approval、sandbox enforcement 和 fallback 摘要。result、report、evidence 和 trace 都不持久化完整 `ToolResult`，也不保存 model 名、prompt、raw response、raw arguments、content、preview、artifact refs、key 或 base_url。
+
+Smoke observed scope 直接来自同一份最后 mutation 后的成功精确 command observation；失败 command 即使携带相同 digest 也不会进入 `observed_scope_digests`，因此不能出现 `result=false` 与 Passed smoke evidence 的矛盾。顺序与重复 command 保持为有序多重集合，Evaluation 不通过 set 去重或另行重算 gate 事实。
 Agent workspace 的 before/after 快照保留完整 materialized tree；仅在生成 agent 变更与 patch evidence 时，Evaluation 才按闭集规则只忽略非 source-owned 且由 verification 常见工具链生成的派生路径（例如 Cargo `target`、Python cache、Node build/cache 目录及明确的 cache 文件）。未知路径以及 pristine source 已存在的路径仍进入 manifest allowlist 判定并 fail closed；该归因过滤不改变 source tree digest、`evaluation.evidence/v1`、`evaluation.result/v5`、固定分母或任何 gate 语义。
 
 默认产物目录为 `work/evaluations/<run-id>`；`result.json` 是稳定 v5 result，`report.json` 是诊断报告，`evidence.json` 是独立安全收据。三项先写临时文件并以 `result.json` 作为最后 commit marker 发布；构建、校验或任一原子发布失败时删除不完整 run 目录。
