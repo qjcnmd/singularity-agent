@@ -61,6 +61,8 @@ mod windows_impl {
     use crate::acl::allow_null_device;
     use crate::cap::workspace_cap_sid_for_cwd;
     use crate::cap::workspace_write_cap_sid_for_root;
+    use crate::deny_read_state::StateMutex;
+    use crate::deny_read_state::try_lock_deny_read_execution;
     use crate::env::ensure_non_interactive_pager;
     use crate::env::inherit_path_env;
     use crate::env::normalize_null_device_env;
@@ -104,6 +106,20 @@ mod windows_impl {
             timed_out: false,
             cancelled: true,
             output_truncated: false,
+        }
+    }
+
+    fn acquire_deny_read_execution_guard(
+        sandbox_home: &Path,
+        cancellation: Option<&crate::WindowsSandboxCancellationToken>,
+    ) -> Result<Option<StateMutex>> {
+        loop {
+            if cancellation.is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled) {
+                return Ok(None);
+            }
+            if let Some(guard) = try_lock_deny_read_execution(sandbox_home, 50)? {
+                return Ok(Some(guard));
+            }
         }
     }
 
@@ -217,6 +233,14 @@ mod windows_impl {
         {
             return Ok(cancelled_capture_result());
         }
+        // The elevated identities share one authoritative read principal. Serialize setup and the
+        // complete Job Object lifetime so a concurrent workspace cannot reconcile that principal
+        // to a different deny-read set while this child is still alive.
+        let Some(_deny_read_execution_guard) =
+            acquire_deny_read_execution_guard(sandbox_home, cancellation.as_ref())?
+        else {
+            return Ok(cancelled_capture_result());
+        };
         let sandbox_creds = require_logon_sandbox_creds(
             &permissions,
             cwd,
@@ -409,10 +433,16 @@ mod windows_impl {
     #[cfg(test)]
     mod tests {
         use super::ElevatedSandboxProfileCaptureRequest;
+        use super::acquire_deny_read_execution_guard;
         use crate::WindowsSandboxCancellationToken;
+        use crate::deny_read_state::try_lock_deny_read_execution;
         use crate::permissions::PermissionProfile;
         use std::collections::HashMap;
         use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
 
         #[test]
         fn cancellation_before_elevated_setup_returns_without_spawning() {
@@ -432,6 +462,40 @@ mod windows_impl {
             assert!(result.cancelled);
             assert!(result.stdout.is_empty());
             assert!(result.stderr.is_empty());
+        }
+
+        #[test]
+        fn cancellation_interrupts_execution_mutex_wait() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sandbox_home = temp.path().join("singularity-home");
+            std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder_home = sandbox_home.clone();
+            let holder = std::thread::spawn(move || {
+                let _held = try_lock_deny_read_execution(&holder_home, u32::MAX)
+                    .expect("lock execution mutex")
+                    .expect("execution mutex acquired");
+                ready_tx.send(()).expect("signal held execution mutex");
+                release_rx.recv().expect("release execution mutex");
+            });
+            ready_rx.recv().expect("wait for held execution mutex");
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let token = WindowsSandboxCancellationToken::new({
+                let cancelled = Arc::clone(&cancelled);
+                move || cancelled.load(Ordering::SeqCst)
+            });
+            let cancel_thread = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                cancelled.store(true, Ordering::SeqCst);
+            });
+
+            let guard = acquire_deny_read_execution_guard(&sandbox_home, Some(&token))
+                .expect("cancelled execution mutex wait");
+            cancel_thread.join().expect("join cancellation thread");
+            assert!(guard.is_none());
+            release_tx.send(()).expect("release held execution mutex");
+            holder.join().expect("join execution mutex holder");
         }
     }
 }

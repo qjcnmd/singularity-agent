@@ -431,6 +431,128 @@ fn windows_elevated_backend_executes_network_denied_command() {
     assert!(!result.sandbox.local_process_fallback);
 }
 
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_elevated_deny_read_is_held_for_overlapping_child_lifetimes() {
+    let root = std::env::var_os("SINGULARITY_WINDOWS_SANDBOX_TEST_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("set SINGULARITY_WINDOWS_SANDBOX_TEST_ROOT outside TEMP");
+    std::fs::create_dir_all(&root).expect("create live sandbox test root");
+    let workspace_a = tempfile::Builder::new()
+        .prefix("singularity-live-a-")
+        .tempdir_in(&root)
+        .expect("workspace A");
+    let workspace_b = tempfile::Builder::new()
+        .prefix("singularity-live-b-")
+        .tempdir_in(&root)
+        .expect("workspace B");
+    std::fs::create_dir(workspace_a.path().join(".git")).expect("create protected metadata A");
+    std::fs::create_dir(workspace_b.path().join(".git")).expect("create protected metadata B");
+    std::fs::write(
+        workspace_a.path().join(".git").join("secret.txt"),
+        b"secret",
+    )
+    .expect("write protected secret A");
+    std::fs::write(
+        workspace_b.path().join(".git").join("secret.txt"),
+        b"secret",
+    )
+    .expect("write protected secret B");
+
+    let workspace_a_path = workspace_a.path().to_path_buf();
+    let mut request_a = CommandRequest::project_verification(
+        "command_overlap_a",
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "$ErrorActionPreference='Stop'; Set-Content -LiteralPath 'a-ready' -Value 'ready'; while (-not (Test-Path -LiteralPath 'probe')) { Start-Sleep -Milliseconds 50 }; $protected=Join-Path ([string]::Concat([char]46,'git')) ([string]::Concat('sec','ret.txt')); try { Get-Content -LiteralPath $protected -ErrorAction Stop | Out-Null; Set-Content -LiteralPath 'a-outcome' -Value 'readable'; exit 9 } catch { Set-Content -LiteralPath 'a-outcome' -Value 'denied'; exit 0 }".to_string(),
+        ],
+        path_str(&workspace_a_path),
+        path_str(&workspace_a_path),
+    );
+    request_a.network.mode = SandboxNetworkMode::Denied;
+    let (a_tx, a_rx) = std::sync::mpsc::channel();
+    let a_handle = std::thread::spawn(move || {
+        let result = WindowsSandboxBackend::new().execute(&request_a);
+        a_tx.send(result).expect("send workspace A result");
+    });
+    let a_ready = workspace_a.path().join("a-ready");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !a_ready.exists() {
+        if let Ok(result) = a_rx.try_recv() {
+            panic!("workspace A exited before its ready marker: {result:#?}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            a_ready.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let workspace_b_path = workspace_b.path().to_path_buf();
+    let mut request_b = CommandRequest::project_verification(
+        "command_overlap_b",
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "Set-Content -LiteralPath 'b-ready' -Value 'ready'".to_string(),
+        ],
+        path_str(&workspace_b_path),
+        path_str(&workspace_b_path),
+    );
+    request_b.network.mode = SandboxNetworkMode::Denied;
+    let b_handle = std::thread::spawn(move || WindowsSandboxBackend::new().execute(&request_b));
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        !workspace_b.path().join("b-ready").exists(),
+        "workspace B child started before workspace A released the shared read principal"
+    );
+    std::fs::write(workspace_a.path().join("probe"), b"probe").expect("release workspace A");
+
+    let result_a = a_rx.recv().expect("receive workspace A result");
+    a_handle.join().expect("join workspace A");
+    let result_b = b_handle.join().expect("join workspace B");
+    assert_eq!(
+        result_a.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result_a:#?}"
+    );
+    let outcome = std::fs::read_to_string(workspace_a.path().join("a-outcome"))
+        .unwrap_or_else(|error| format!("missing:{error}"));
+    assert_eq!(
+        result_a.semantic_status,
+        CommandSemanticStatus::Succeeded,
+        "{result_a:#?}; outcome={outcome:?}"
+    );
+    assert_eq!(result_a.sandbox.backend, "windows_elevated");
+    assert_eq!(
+        result_a.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result_a.sandbox.local_process_fallback);
+    assert_eq!(outcome.trim(), "denied");
+    assert_eq!(
+        result_b.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result_b:#?}"
+    );
+    assert_eq!(result_b.semantic_status, CommandSemanticStatus::Succeeded);
+    assert_eq!(result_b.sandbox.backend, "windows_elevated");
+    assert_eq!(
+        result_b.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result_b.sandbox.local_process_fallback);
+    assert!(workspace_b.path().join("b-ready").exists());
+}
+
 #[cfg(not(windows))]
 #[test]
 fn windows_backend_is_unavailable_off_windows() {

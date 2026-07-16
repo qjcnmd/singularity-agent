@@ -770,9 +770,9 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
     }
 
     // Codex uses the dedicated Sandbox Users group as the authoritative read principal.
-    // Apply deny-read ACLs to that same principal before any child starts. The persistent state
-    // layer serializes updates and keeps a conservative union so concurrent workspaces cannot
-    // revoke one another's protection.
+    // Apply deny-read ACLs to that same principal before any child starts. The product caller
+    // holds the execution mutex across setup and the complete Job Object lifetime; this helper's
+    // state mutex then serializes the ownership-aware current-set reconciliation itself.
     let applied_deny_read_paths = unsafe {
         sync_persistent_deny_read_acls(
             &payload.sandbox_home,

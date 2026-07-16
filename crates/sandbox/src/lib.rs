@@ -1377,13 +1377,18 @@ mod windows_backend {
                 .map_err(|error| {
                     PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
                 })?;
+            let protect_workspace_metadata = !request.is_trusted_workspace_preparation();
+            let protected_deny_read_paths = if protect_workspace_metadata {
+                resolve_existing_protected_paths(&workspace_root)
+                    .map_err(PrepareCommandError::ProtectedPaths)?
+            } else {
+                Vec::new()
+            };
             let protected_deny_write_paths = if matches!(
                 request.filesystem.mode,
                 SandboxFilesystemMode::WorkspaceWrite
-            ) && !request.is_trusted_workspace_preparation()
-            {
-                resolve_existing_protected_paths(&workspace_root)
-                    .map_err(PrepareCommandError::ProtectedPaths)?
+            ) {
+                protected_deny_read_paths.clone()
             } else {
                 Vec::new()
             };
@@ -1409,7 +1414,6 @@ mod windows_backend {
                     ));
                 }
             };
-            let protect_workspace_metadata = !request.is_trusted_workspace_preparation();
             let restricted_token_fallback = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 &permission_profile,
                 &workspace_roots,
@@ -1420,7 +1424,7 @@ mod windows_backend {
                 ))
             })?
             .supports_restricted_token_fallback()
-                && protect_workspace_metadata;
+                && protected_deny_read_paths.is_empty();
             Ok(Self {
                 permission_profile,
                 workspace_roots,
@@ -1431,7 +1435,7 @@ mod windows_backend {
                 restricted_token_fallback,
                 argv: resolved.argv,
                 read_roots: resolved.read_roots,
-                protected_deny_read_paths: Vec::new(),
+                protected_deny_read_paths,
                 protected_deny_write_paths,
                 protect_workspace_metadata,
             })
@@ -2258,7 +2262,7 @@ mod windows_backend {
         }
 
         #[test]
-        fn workspace_write_command_projects_existing_protected_paths_to_deny_write() {
+        fn workspace_write_command_projects_existing_protected_paths_to_read_and_write_denies() {
             let workspace = tempfile::tempdir().expect("workspace");
             let env_file = workspace.path().join(".env");
             create_test_file(&env_file, "opaque");
@@ -2289,10 +2293,21 @@ mod windows_backend {
                     .collect()
             );
             assert!(!missing_env.exists());
-            assert!(prepared.protected_deny_read_paths.is_empty());
+            assert_eq!(
+                prepared
+                    .protected_deny_read_paths
+                    .iter()
+                    .map(|path| path.to_path_buf())
+                    .collect::<std::collections::HashSet<_>>(),
+                protected_paths
+            );
 
             let elevated =
                 elevated_capture_request(&prepared, WindowsSandboxCancellationToken::new(|| false));
+            assert_eq!(
+                elevated.deny_read_paths_override,
+                prepared.protected_deny_read_paths.as_slice()
+            );
             assert_eq!(
                 elevated.deny_write_paths_override,
                 prepared.protected_deny_write_paths.as_slice()

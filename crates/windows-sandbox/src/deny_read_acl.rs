@@ -1,4 +1,4 @@
-use crate::acl::add_deny_read_ace;
+use crate::acl::add_deny_read_ace_with_ownership;
 use crate::acl::path_contains_reparse_component;
 use crate::acl::revoke_deny_read_ace;
 use crate::acl::verify_target_identity_against;
@@ -337,21 +337,40 @@ pub fn ensure_missing_protected_path_materialized(path: &Path) -> Result<bool> {
     ensure_directory_materialized(path)
 }
 
-/// Applies deny-read ACEs to explicit paths. Missing paths are materialized as
-/// directories before the ACE is applied so a sandboxed command cannot create a
-/// previously absent denied path and then read from it in the same run.
-/// If any path fails, deny ACEs applied by this call are revoked before the
-/// error is returned so a one-shot sandbox run does not leave partial state.
+pub(crate) struct AppliedDenyReadAcls {
+    pub(crate) enforced_paths: Vec<PathBuf>,
+    pub(crate) newly_managed_paths: Vec<PathBuf>,
+}
+
+/// Applies deny-read ACEs to explicit paths and returns every enforced path.
+///
+/// Missing paths are materialized as directories before the ACE is applied so a sandboxed command
+/// cannot create a previously absent denied path and then read from it in the same run.
 ///
 /// # Safety
 /// Caller must pass a valid SID pointer for the sandbox principal being denied.
 pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Result<Vec<PathBuf>> {
+    Ok(unsafe { apply_deny_read_acls_with_ownership(paths, psid) }?.enforced_paths)
+}
+
+/// Applies deny-read ACEs and identifies only the paths whose managed ACE was added by this call.
+///
+/// Existing sufficient ACEs still enforce the requested boundary, but they are not claimed as
+/// runtime-owned. If any path fails, only ACEs added by this call are revoked before the error is
+/// returned.
+///
+/// # Safety
+/// Caller must pass a valid SID pointer for the sandbox principal being denied.
+pub(crate) unsafe fn apply_deny_read_acls_with_ownership(
+    paths: &[PathBuf],
+    psid: *mut c_void,
+) -> Result<AppliedDenyReadAcls> {
     let planned = plan_deny_read_acl_paths(paths);
     let mut applied = Vec::new();
     let mut seen = HashSet::new();
     let mut added_in_this_call: Vec<PathBuf> = Vec::new();
     for path in planned {
-        let result = (|| -> Result<bool> {
+        let result = (|| -> Result<crate::acl::DenyAceAddResult> {
             match std::fs::symlink_metadata(&path) {
                 Ok(_) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -364,7 +383,7 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
                 }
             }
             let before = canonical_identity(&path)?;
-            let added = add_deny_read_ace(&path, psid)
+            let mutation = add_deny_read_ace_with_ownership(&path, psid)
                 .with_context(|| format!("apply deny-read ACE to {}", path.display()))?;
             let after = canonical_identity(&path)?;
             if before != after {
@@ -373,10 +392,10 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
                     path.display()
                 );
             }
-            Ok(added)
+            Ok(mutation)
         })();
-        let added = match result {
-            Ok(added) => added,
+        let mutation = match result {
+            Ok(mutation) => mutation,
             Err(err) => {
                 for added_path in &added_in_this_call {
                     if let Err(rollback_err) = revoke_deny_read_ace(added_path, psid) {
@@ -389,12 +408,15 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
                 return Err(err);
             }
         };
-        if added {
+        if mutation.runtime_owned {
             added_in_this_call.push(path.clone());
         }
         push_planned_path(&mut applied, &mut seen, path);
     }
-    Ok(applied)
+    Ok(AppliedDenyReadAcls {
+        enforced_paths: applied,
+        newly_managed_paths: added_in_this_call,
+    })
 }
 
 #[cfg(test)]

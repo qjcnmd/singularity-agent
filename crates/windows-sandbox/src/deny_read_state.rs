@@ -1,5 +1,5 @@
 use crate::acl::revoke_deny_read_ace;
-use crate::deny_read_acl::apply_deny_read_acls;
+use crate::deny_read_acl::apply_deny_read_acls_with_ownership;
 use crate::path_normalization::canonical_path_key_allow_missing;
 use crate::path_normalization::lexical_path_key;
 use crate::setup::sandbox_dir;
@@ -21,6 +21,7 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::WAIT_ABANDONED_0;
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
 use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
@@ -30,9 +31,32 @@ use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const DENY_READ_ACL_STATE_FILE: &str = "deny_read_acl_state.json";
+const DENY_READ_ACL_STATE_VERSION: u32 = 2;
+const STATE_MUTEX_PREFIX: &str = "SingularityDenyReadState";
+const EXECUTION_MUTEX_PREFIX: &str = "SingularityDenyReadExecution";
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PersistentDenyReadAclState {
+    version: u32,
+    principals: BTreeMap<String, Vec<PathBuf>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    legacy_unmanaged_principals: BTreeMap<String, Vec<PathBuf>>,
+}
+
+impl Default for PersistentDenyReadAclState {
+    fn default() -> Self {
+        Self {
+            version: DENY_READ_ACL_STATE_VERSION,
+            principals: BTreeMap::new(),
+            legacy_unmanaged_principals: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPersistentDenyReadAclState {
     principals: BTreeMap<String, Vec<PathBuf>>,
 }
 
@@ -49,31 +73,58 @@ impl Drop for StateMutex {
     }
 }
 
-fn state_mutex_name(path: &Path) -> String {
+fn mutex_name(prefix: &str, path: &Path) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in canonical_path_key_allow_missing(path).as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!(r"Global\SingularityDenyReadState_{hash:016x}")
+    format!(r"Global\{prefix}_{hash:016x}")
 }
 
-pub(crate) fn lock_state(path: &Path) -> Result<StateMutex> {
-    let name = to_wide(state_mutex_name(path));
+#[cfg(test)]
+fn state_mutex_name(path: &Path) -> String {
+    mutex_name(STATE_MUTEX_PREFIX, path)
+}
+
+fn wait_named_mutex(prefix: &str, path: &Path, timeout_ms: u32) -> Result<Option<StateMutex>> {
+    let name = to_wide(mutex_name(prefix, path));
     let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
     if handle == 0 {
         anyhow::bail!("CreateMutexW failed for deny-read state: {}", unsafe {
             GetLastError()
         });
     }
-    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED_0 {
-        unsafe {
-            CloseHandle(handle);
+    let wait = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    match wait {
+        WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(Some(StateMutex { handle })),
+        WAIT_TIMEOUT => {
+            unsafe {
+                CloseHandle(handle);
+            }
+            Ok(None)
         }
-        anyhow::bail!("WaitForSingleObject failed for deny-read state: {wait}");
+        _ => {
+            unsafe {
+                CloseHandle(handle);
+            }
+            anyhow::bail!("WaitForSingleObject failed for deny-read state: {wait}");
+        }
     }
-    Ok(StateMutex { handle })
+}
+
+pub(crate) fn lock_state(path: &Path) -> Result<StateMutex> {
+    wait_named_mutex(STATE_MUTEX_PREFIX, path, INFINITE)?
+        .ok_or_else(|| anyhow::anyhow!("infinite deny-read state mutex wait timed out"))
+}
+
+/// Attempts to hold the shared read principal across one complete sandbox child lifecycle.
+pub(crate) fn try_lock_deny_read_execution(
+    sandbox_home: &Path,
+    timeout_ms: u32,
+) -> Result<Option<StateMutex>> {
+    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+    wait_named_mutex(EXECUTION_MUTEX_PREFIX, &state_path, timeout_ms)
 }
 
 pub(crate) fn atomic_store(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -129,9 +180,11 @@ pub(crate) fn atomic_store(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Reconciles persistent deny-read ACEs for one sandbox principal.
 ///
 /// As in Codex, the current desired set is applied before stale paths owned by the same SID are
-/// revoked. The reconciliation is additionally serialized by a canonical state-path mutex and
-/// committed with an atomic replace. A stale path that cannot be revoked remains tracked for a
-/// later fail-closed retry, but it is never passed back through materialization.
+/// revoked. Only ACEs actually added by this runtime, or already present in the versioned managed
+/// state, may be revoked. The reconciliation is serialized by a canonical state-path mutex and
+/// committed with an atomic replace. Product command callers additionally hold the execution
+/// mutex across setup, child execution, and Job Object cleanup so another workspace cannot revoke
+/// a live child's protection.
 ///
 /// # Safety
 /// Caller must pass a valid SID pointer matching `principal_sid`.
@@ -144,19 +197,38 @@ pub unsafe fn sync_persistent_deny_read_acls(
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
     let _lock = lock_state(&state_path)?;
     let mut state = load_state(&state_path)?;
-    let previous = state
+    let previous_managed = state
         .principals
         .get(principal_sid)
         .cloned()
         .unwrap_or_default();
-    let applied_paths = unsafe { apply_deny_read_acls(desired_paths, psid) }?;
-    let desired_keys = applied_paths
+    let application = unsafe { apply_deny_read_acls_with_ownership(desired_paths, psid) }?;
+    let desired_keys = application
+        .enforced_paths
         .iter()
         .map(|path| lexical_path_key(path))
         .collect::<BTreeSet<_>>();
+    let previous_managed_keys = previous_managed
+        .iter()
+        .map(|path| lexical_path_key(path))
+        .collect::<BTreeSet<_>>();
+    let newly_managed_keys = application
+        .newly_managed_paths
+        .iter()
+        .map(|path| lexical_path_key(path))
+        .collect::<BTreeSet<_>>();
+    let current_managed_paths = application
+        .enforced_paths
+        .iter()
+        .filter(|path| {
+            let key = lexical_path_key(path);
+            previous_managed_keys.contains(&key) || newly_managed_keys.contains(&key)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let mut retained_stale_paths = Vec::new();
     let mut revoke_errors = Vec::new();
-    for path in previous {
+    for path in previous_managed {
         if desired_keys.contains(&lexical_path_key(&path)) {
             continue;
         }
@@ -174,7 +246,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
             revoke_errors.push(format!("{}: {error}", path.display()));
         }
     }
-    let tracked_paths = merge_tracked_paths(&applied_paths, &retained_stale_paths);
+    let tracked_paths = merge_tracked_paths(&current_managed_paths, &retained_stale_paths);
 
     if tracked_paths.is_empty() {
         state.principals.remove(principal_sid);
@@ -183,6 +255,33 @@ pub unsafe fn sync_persistent_deny_read_acls(
             .principals
             .insert(principal_sid.to_string(), tracked_paths);
     }
+    let managed_keys = state
+        .principals
+        .get(principal_sid)
+        .into_iter()
+        .flatten()
+        .map(|path| lexical_path_key(path))
+        .collect::<BTreeSet<_>>();
+    let retained_legacy = state
+        .legacy_unmanaged_principals
+        .remove(principal_sid)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| {
+            if managed_keys.contains(&lexical_path_key(path)) {
+                return false;
+            }
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }
+        })
+        .collect::<Vec<_>>();
+    if !retained_legacy.is_empty() {
+        state
+            .legacy_unmanaged_principals
+            .insert(principal_sid.to_string(), retained_legacy);
+    }
     store_state(&state_path, &state)?;
     if !revoke_errors.is_empty() {
         anyhow::bail!(
@@ -190,7 +289,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
             revoke_errors.join("; ")
         );
     }
-    Ok(applied_paths)
+    Ok(application.enforced_paths)
 }
 
 fn merge_tracked_paths(current: &[PathBuf], retained_stale: &[PathBuf]) -> Vec<PathBuf> {
@@ -207,8 +306,30 @@ fn merge_tracked_paths(current: &[PathBuf], retained_stale: &[PathBuf]) -> Vec<P
 
 fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse deny-read ACL state {}", path.display())),
+        Ok(bytes) => {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse deny-read ACL state {}", path.display()))?;
+            match value.get("version").and_then(serde_json::Value::as_u64) {
+                Some(version) if version == u64::from(DENY_READ_ACL_STATE_VERSION) => {
+                    serde_json::from_value(value)
+                        .with_context(|| format!("parse deny-read ACL state {}", path.display()))
+                }
+                Some(version) => anyhow::bail!(
+                    "unsupported deny-read ACL state version {version} in {}",
+                    path.display()
+                ),
+                None => {
+                    let legacy: LegacyPersistentDenyReadAclState = serde_json::from_value(value)
+                        .with_context(|| {
+                            format!("parse legacy deny-read ACL state {}", path.display())
+                        })?;
+                    Ok(PersistentDenyReadAclState {
+                        legacy_unmanaged_principals: legacy.principals,
+                        ..PersistentDenyReadAclState::default()
+                    })
+                }
+            }
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             Ok(PersistentDenyReadAclState::default())
         }
@@ -231,6 +352,8 @@ mod tests {
     use super::sandbox_dir;
     use super::state_mutex_name;
     use super::sync_persistent_deny_read_acls;
+    use super::try_lock_deny_read_execution;
+    use crate::acl::add_deny_read_ace;
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
     use crate::acl::revoke_deny_read_ace;
@@ -239,10 +362,13 @@ mod tests {
     use std::os::windows::process::CommandExt;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::time::Duration;
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
 
     const CHILD_ENV: &str = "SINGULARITY_DENY_READ_STATE_CHILD";
+    const EXECUTION_CHILD_ENV: &str = "SINGULARITY_DENY_READ_EXECUTION_CHILD";
+    const EXECUTION_ACQUIRED_ENV: &str = "SINGULARITY_DENY_READ_EXECUTION_ACQUIRED";
     const HOME_ENV: &str = "SINGULARITY_DENY_READ_STATE_HOME";
     const PATH_ENV: &str = "SINGULARITY_DENY_READ_STATE_PATH";
 
@@ -285,6 +411,53 @@ mod tests {
     }
 
     #[test]
+    fn execution_mutex_covers_cross_process_child_lifetime() {
+        let sandbox_home =
+            PathBuf::from(std::env::var_os(HOME_ENV).unwrap_or_else(|| "unused".into()));
+        if std::env::var_os(EXECUTION_CHILD_ENV).is_some() {
+            let acquired =
+                PathBuf::from(std::env::var_os(EXECUTION_ACQUIRED_ENV).expect("acquired marker"));
+            let _guard = try_lock_deny_read_execution(&sandbox_home, u32::MAX)
+                .expect("lock execution mutex")
+                .expect("infinite wait acquires execution mutex");
+            std::fs::write(acquired, b"acquired").expect("write acquired marker");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let acquired = temp.path().join("acquired");
+        std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+        let guard = try_lock_deny_read_execution(&sandbox_home, u32::MAX)
+            .expect("lock parent execution mutex")
+            .expect("parent acquires execution mutex");
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut child = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                "deny_read_state::tests::execution_mutex_covers_cross_process_child_lifetime",
+                "--nocapture",
+            ])
+            .env(EXECUTION_CHILD_ENV, "1")
+            .env(HOME_ENV, &sandbox_home)
+            .env(EXECUTION_ACQUIRED_ENV, &acquired)
+            .spawn()
+            .expect("spawn execution-lock child");
+
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            !acquired.exists(),
+            "another process acquired the execution mutex before the active lifetime ended"
+        );
+        drop(guard);
+        assert!(child.wait().expect("wait execution-lock child").success());
+        assert!(
+            acquired.exists(),
+            "child must acquire after the guard drops"
+        );
+    }
+
+    #[test]
     fn removed_historical_path_is_not_rematerialized() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sandbox_home = temp.path().join("singularity-home");
@@ -324,6 +497,87 @@ mod tests {
         );
         unsafe {
             revoke_deny_read_ace(&current, sid.as_ptr()).expect("restore current ACL");
+        }
+    }
+
+    #[test]
+    fn preexisting_exact_deny_is_enforced_but_never_claimed_or_revoked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+        std::fs::create_dir(&protected).expect("create protected path");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+        assert!(
+            unsafe { add_deny_read_ace(&protected, sid.as_ptr()) }
+                .expect("seed external exact deny")
+        );
+
+        unsafe {
+            sync_persistent_deny_read_acls(
+                &sandbox_home,
+                principal,
+                std::slice::from_ref(&protected),
+                sid.as_ptr(),
+            )
+        }
+        .expect("enforce preexisting deny");
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        let state = load_state(&state_path).expect("load managed state");
+        assert!(
+            !state.principals.contains_key(principal),
+            "a sufficient preexisting ACE must not become runtime-owned"
+        );
+
+        unsafe { sync_persistent_deny_read_acls(&sandbox_home, principal, &[], sid.as_ptr()) }
+            .expect("reconcile empty desired set");
+        let (dacl, security_descriptor) =
+            unsafe { fetch_dacl_handle(&protected).expect("read retained DACL") };
+        assert!(unsafe { dacl_has_read_deny_for_sid(dacl, sid.as_ptr()) });
+        unsafe {
+            LocalFree(security_descriptor as HLOCAL);
+            revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore external test ACE");
+        }
+    }
+
+    #[test]
+    fn legacy_state_is_migrated_as_unmanaged_and_not_revoked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let protected = temp.path().join("legacy-protected");
+        std::fs::create_dir_all(&protected).expect("create protected path");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+        assert!(
+            unsafe { add_deny_read_ace(&protected, sid.as_ptr()) }.expect("seed legacy exact deny")
+        );
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        std::fs::create_dir_all(state_path.parent().expect("state parent"))
+            .expect("create state directory");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "principals": { principal: [protected.clone()] }
+            }))
+            .expect("serialize legacy state"),
+        )
+        .expect("write legacy state");
+
+        unsafe { sync_persistent_deny_read_acls(&sandbox_home, principal, &[], sid.as_ptr()) }
+            .expect("migrate legacy state");
+        let state = load_state(&state_path).expect("load migrated state");
+        assert_eq!(state.version, super::DENY_READ_ACL_STATE_VERSION);
+        assert_eq!(
+            state.legacy_unmanaged_principals.get(principal),
+            Some(&vec![protected.clone()])
+        );
+        let (dacl, security_descriptor) =
+            unsafe { fetch_dacl_handle(&protected).expect("read retained legacy DACL") };
+        assert!(unsafe { dacl_has_read_deny_for_sid(dacl, sid.as_ptr()) });
+        unsafe {
+            LocalFree(security_descriptor as HLOCAL);
+            revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore legacy test ACE");
         }
     }
 
