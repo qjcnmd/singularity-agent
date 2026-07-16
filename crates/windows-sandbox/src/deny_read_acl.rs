@@ -1,12 +1,16 @@
+use crate::acl::DenyReadAclFingerprint;
 use crate::acl::add_deny_read_ace_with_ownership;
+use crate::acl::deny_read_acl_fingerprint;
 use crate::acl::path_contains_reparse_component;
-use crate::acl::revoke_deny_read_ace;
+use crate::acl::revoke_deny_read_ace_with_fingerprint;
 use crate::acl::verify_target_identity_against;
 use crate::path_normalization::lexical_path_key;
 use crate::winutil::to_wide;
 use anyhow::Context;
 use anyhow::Result;
 use dunce::canonicalize;
+use serde::Deserialize;
+use serde::Serialize;
 use singularity_core::PROTECTED_GIT_DIR_NAME;
 use std::collections::HashSet;
 use std::error::Error;
@@ -339,7 +343,14 @@ pub fn ensure_missing_protected_path_materialized(path: &Path) -> Result<bool> {
 
 pub(crate) struct AppliedDenyReadAcls {
     pub(crate) enforced_paths: Vec<PathBuf>,
-    pub(crate) newly_managed_paths: Vec<PathBuf>,
+    pub(crate) newly_managed_paths: Vec<ManagedDenyReadAcl>,
+}
+
+/// A deny-read repair whose complete SID fingerprint was created by this runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ManagedDenyReadAcl {
+    pub(crate) path: PathBuf,
+    pub(crate) fingerprint: DenyReadAclFingerprint,
 }
 
 /// Applies deny-read ACEs to explicit paths and returns every enforced path.
@@ -368,9 +379,9 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership(
     let planned = plan_deny_read_acl_paths(paths);
     let mut applied = Vec::new();
     let mut seen = HashSet::new();
-    let mut added_in_this_call: Vec<PathBuf> = Vec::new();
+    let mut added_in_this_call: Vec<ManagedDenyReadAcl> = Vec::new();
     for path in planned {
-        let result = (|| -> Result<crate::acl::DenyAceAddResult> {
+        let result = (|| -> Result<Option<ManagedDenyReadAcl>> {
             match std::fs::symlink_metadata(&path) {
                 Ok(_) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -392,24 +403,38 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership(
                     path.display()
                 );
             }
-            Ok(mutation)
+            if mutation.runtime_owned {
+                return Ok(Some(ManagedDenyReadAcl {
+                    path: path.clone(),
+                    fingerprint: unsafe { deny_read_acl_fingerprint(&path, psid) }.with_context(
+                        || format!("fingerprint managed deny-read ACEs on {}", path.display()),
+                    )?,
+                }));
+            }
+            Ok(None)
         })();
-        let mutation = match result {
-            Ok(mutation) => mutation,
+        let managed = match result {
+            Ok(managed) => managed,
             Err(err) => {
                 for added_path in &added_in_this_call {
-                    if let Err(rollback_err) = revoke_deny_read_ace(added_path, psid) {
+                    if let Err(rollback_err) = unsafe {
+                        revoke_deny_read_ace_with_fingerprint(
+                            &added_path.path,
+                            psid,
+                            &added_path.fingerprint,
+                        )
+                    } {
                         return Err(err.context(format!(
                             "deny-read rollback failed for {}: {rollback_err}",
-                            added_path.display()
+                            added_path.path.display()
                         )));
                     }
                 }
                 return Err(err);
             }
         };
-        if mutation.runtime_owned {
-            added_in_this_call.push(path.clone());
+        if let Some(managed) = managed {
+            added_in_this_call.push(managed);
         }
         push_planned_path(&mut applied, &mut seen, path);
     }

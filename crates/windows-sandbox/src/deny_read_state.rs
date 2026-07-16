@@ -1,11 +1,18 @@
-use crate::acl::revoke_deny_read_ace;
+use crate::acl::revoke_deny_read_ace_with_fingerprint;
+use crate::deny_read_acl::ManagedDenyReadAcl;
 use crate::deny_read_acl::apply_deny_read_acls_with_ownership;
 use crate::path_normalization::canonical_path_key_allow_missing;
 use crate::path_normalization::lexical_path_key;
 use crate::setup::sandbox_dir;
+use crate::token::current_user_sid_bytes;
+use crate::winutil::resolve_sid;
+use crate::winutil::string_from_sid_bytes;
 use crate::winutil::to_wide;
 use anyhow::Context;
 use anyhow::Result;
+use rand::Rng;
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -15,13 +22,22 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::ptr;
+use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::HLOCAL;
+use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Foundation::WAIT_ABANDONED_0;
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
 use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
@@ -31,17 +47,22 @@ use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const DENY_READ_ACL_STATE_FILE: &str = "deny_read_acl_state.json";
-const DENY_READ_ACL_STATE_VERSION: u32 = 2;
+const DENY_READ_ACL_STATE_VERSION: u32 = 3;
 const STATE_MUTEX_PREFIX: &str = "SingularityDenyReadState";
 const EXECUTION_MUTEX_PREFIX: &str = "SingularityDenyReadExecution";
+const RUNNER_LEASE_MUTEX_PREFIX: &str = r"Global\SingularityDenyReadRunner_";
+const MAX_ACTIVE_RUNNER_LEASES: usize = 64;
+const RUNNER_LEASE_NONCE_HEX_LEN: usize = 32;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistentDenyReadAclState {
     version: u32,
-    principals: BTreeMap<String, Vec<PathBuf>>,
+    principals: BTreeMap<String, Vec<ManagedDenyReadAcl>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     legacy_unmanaged_principals: BTreeMap<String, Vec<PathBuf>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    active_runner_leases: BTreeSet<String>,
 }
 
 impl Default for PersistentDenyReadAclState {
@@ -50,6 +71,7 @@ impl Default for PersistentDenyReadAclState {
             version: DENY_READ_ACL_STATE_VERSION,
             principals: BTreeMap::new(),
             legacy_unmanaged_principals: BTreeMap::new(),
+            active_runner_leases: BTreeSet::new(),
         }
     }
 }
@@ -58,6 +80,15 @@ impl Default for PersistentDenyReadAclState {
 #[serde(deny_unknown_fields)]
 struct LegacyPersistentDenyReadAclState {
     principals: BTreeMap<String, Vec<PathBuf>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionTwoPersistentDenyReadAclState {
+    version: u32,
+    principals: BTreeMap<String, Vec<PathBuf>>,
+    #[serde(default)]
+    legacy_unmanaged_principals: BTreeMap<String, Vec<PathBuf>>,
 }
 
 pub(crate) struct StateMutex {
@@ -87,8 +118,8 @@ fn state_mutex_name(path: &Path) -> String {
     mutex_name(STATE_MUTEX_PREFIX, path)
 }
 
-fn wait_named_mutex(prefix: &str, path: &Path, timeout_ms: u32) -> Result<Option<StateMutex>> {
-    let name = to_wide(mutex_name(prefix, path));
+fn wait_raw_named_mutex(name: &str, timeout_ms: u32) -> Result<Option<StateMutex>> {
+    let name = to_wide(name);
     let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
     if handle == 0 {
         anyhow::bail!("CreateMutexW failed for deny-read state: {}", unsafe {
@@ -113,6 +144,10 @@ fn wait_named_mutex(prefix: &str, path: &Path, timeout_ms: u32) -> Result<Option
     }
 }
 
+fn wait_named_mutex(prefix: &str, path: &Path, timeout_ms: u32) -> Result<Option<StateMutex>> {
+    wait_raw_named_mutex(&mutex_name(prefix, path), timeout_ms)
+}
+
 pub(crate) fn lock_state(path: &Path) -> Result<StateMutex> {
     wait_named_mutex(STATE_MUTEX_PREFIX, path, INFINITE)?
         .ok_or_else(|| anyhow::anyhow!("infinite deny-read state mutex wait timed out"))
@@ -125,6 +160,195 @@ pub(crate) fn try_lock_deny_read_execution(
 ) -> Result<Option<StateMutex>> {
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
     wait_named_mutex(EXECUTION_MUTEX_PREFIX, &state_path, timeout_ms)
+}
+
+/// Runner-owned mutex guard that survives loss of the calling parent process.
+pub struct RunnerLeaseGuard {
+    mutex: Option<StateMutex>,
+}
+
+/// Parent registration handle kept alive until the runner confirms child startup.
+pub(crate) struct RegisteredRunnerLease {
+    lease_name: String,
+    handle: HANDLE,
+}
+
+impl RegisteredRunnerLease {
+    pub(crate) fn name(&self) -> &str {
+        &self.lease_name
+    }
+}
+
+impl Drop for RegisteredRunnerLease {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+impl RunnerLeaseGuard {
+    /// Releases the lease only after the runner has completed Job Object cleanup.
+    pub fn release(mut self) {
+        drop(self.mutex.take());
+    }
+}
+
+/// Creates and registers a runner lease before the parent sends a spawn request.
+///
+/// The parent keeps this handle open through `SpawnReady`, preserving the exact DACL that permits
+/// both the real user and the selected sandbox user to open the mutex. The runner then owns the
+/// mutex through Job Object cleanup.
+pub(crate) fn register_runner_lease(
+    sandbox_home: &Path,
+    sandbox_username: &str,
+) -> Result<RegisteredRunnerLease> {
+    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+    let _lock = lock_state(&state_path)?;
+    let mut state = load_state(&state_path)?;
+    if state.active_runner_leases.len() >= MAX_ACTIVE_RUNNER_LEASES {
+        anyhow::bail!(
+            "deny-read runner lease limit reached: {}",
+            state.active_runner_leases.len()
+        );
+    }
+    let current_sid = string_from_sid_bytes(&current_user_sid_bytes()?)
+        .map_err(anyhow::Error::msg)
+        .context("resolve current user SID for deny-read runner lease")?;
+    let sandbox_sid = string_from_sid_bytes(&resolve_sid(sandbox_username)?)
+        .map_err(anyhow::Error::msg)
+        .context("resolve sandbox user SID for deny-read runner lease")?;
+    let sddl = to_wide(format!(
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{current_sid})(A;;GA;;;{sandbox_sid})"
+    ));
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut security_descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        anyhow::bail!(
+            "create deny-read runner lease security descriptor failed: {}",
+            unsafe { GetLastError() }
+        );
+    }
+    let mut security_attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor,
+        bInheritHandle: 0,
+    };
+    let nonce: u128 = SmallRng::from_entropy().r#gen();
+    let lease_name = format!("{RUNNER_LEASE_MUTEX_PREFIX}{nonce:032x}");
+    let wide_name = to_wide(&lease_name);
+    let handle = unsafe {
+        CreateMutexW(
+            &mut security_attributes as *mut SECURITY_ATTRIBUTES,
+            0,
+            wide_name.as_ptr(),
+        )
+    };
+    let create_error = unsafe { GetLastError() };
+    unsafe {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if handle == 0 {
+        anyhow::bail!("CreateMutexW failed for deny-read runner lease: {create_error}");
+    }
+    if create_error == ERROR_ALREADY_EXISTS {
+        unsafe {
+            CloseHandle(handle);
+        }
+        anyhow::bail!("deny-read runner lease collision");
+    }
+    if !state.active_runner_leases.insert(lease_name.clone()) {
+        unsafe {
+            CloseHandle(handle);
+        }
+        anyhow::bail!("deny-read runner lease collision");
+    }
+    if let Err(error) = store_state(&state_path, &state) {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err(error);
+    }
+    Ok(RegisteredRunnerLease { lease_name, handle })
+}
+
+/// Acquires a lease registered by the parent and verifies it still exists before child spawn.
+pub fn acquire_registered_runner_lease(
+    sandbox_home: &Path,
+    lease_name: &str,
+) -> Result<RunnerLeaseGuard> {
+    validate_runner_lease_name(lease_name)?;
+    let mutex = wait_raw_named_mutex(lease_name, INFINITE)?
+        .ok_or_else(|| anyhow::anyhow!("infinite deny-read runner lease wait timed out"))?;
+    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+    let state = load_state(&state_path)?;
+    if !state.active_runner_leases.contains(lease_name) {
+        anyhow::bail!("deny-read runner lease is no longer registered");
+    }
+    Ok(RunnerLeaseGuard { mutex: Some(mutex) })
+}
+
+/// Waits for active runner-owned leases and prunes released or abandoned entries.
+pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> Result<bool> {
+    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+    let deadline = (timeout_ms != INFINITE)
+        .then(|| Instant::now() + Duration::from_millis(u64::from(timeout_ms)));
+    let leases = {
+        let _lock = lock_state(&state_path)?;
+        load_state(&state_path)?
+            .active_runner_leases
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    for lease_name in leases {
+        validate_runner_lease_name(&lease_name)?;
+        let remaining_ms = deadline.map_or(INFINITE, |deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                0
+            } else {
+                remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32
+            }
+        });
+        if remaining_ms == 0 {
+            return Ok(false);
+        }
+        let Some(lease_mutex) = wait_raw_named_mutex(&lease_name, remaining_ms)? else {
+            return Ok(false);
+        };
+        remove_runner_lease(sandbox_home, &lease_name)?;
+        drop(lease_mutex);
+    }
+    Ok(true)
+}
+
+fn remove_runner_lease(sandbox_home: &Path, lease_name: &str) -> Result<()> {
+    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+    let _lock = lock_state(&state_path)?;
+    let mut state = load_state(&state_path)?;
+    if state.active_runner_leases.remove(lease_name) {
+        store_state(&state_path, &state)?;
+    }
+    Ok(())
+}
+
+fn validate_runner_lease_name(lease_name: &str) -> Result<()> {
+    let Some(nonce) = lease_name.strip_prefix(RUNNER_LEASE_MUTEX_PREFIX) else {
+        anyhow::bail!("invalid deny-read runner lease name");
+    };
+    if nonce.len() != RUNNER_LEASE_NONCE_HEX_LEN
+        || !nonce.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        anyhow::bail!("invalid deny-read runner lease name");
+    }
+    Ok(())
 }
 
 pub(crate) fn atomic_store(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -183,8 +407,8 @@ pub(crate) fn atomic_store(path: &Path, bytes: &[u8]) -> Result<()> {
 /// revoked. Only ACEs actually added by this runtime, or already present in the versioned managed
 /// state, may be revoked. The reconciliation is serialized by a canonical state-path mutex and
 /// committed with an atomic replace. Product command callers additionally hold the execution
-/// mutex across setup, child execution, and Job Object cleanup so another workspace cannot revoke
-/// a live child's protection.
+/// mutex across setup and normal child cleanup; a registered runner-owned mutex extends the same
+/// exclusion through Job Object cleanup when the calling parent crashes.
 ///
 /// # Safety
 /// Caller must pass a valid SID pointer matching `principal_sid`.
@@ -208,45 +432,49 @@ pub unsafe fn sync_persistent_deny_read_acls(
         .iter()
         .map(|path| lexical_path_key(path))
         .collect::<BTreeSet<_>>();
-    let previous_managed_keys = previous_managed
-        .iter()
-        .map(|path| lexical_path_key(path))
-        .collect::<BTreeSet<_>>();
-    let newly_managed_keys = application
+    let mut previous_by_key = previous_managed
+        .into_iter()
+        .map(|managed| (lexical_path_key(&managed.path), managed))
+        .collect::<BTreeMap<_, _>>();
+    let mut newly_managed_by_key = application
         .newly_managed_paths
-        .iter()
-        .map(|path| lexical_path_key(path))
-        .collect::<BTreeSet<_>>();
-    let current_managed_paths = application
-        .enforced_paths
-        .iter()
-        .filter(|path| {
-            let key = lexical_path_key(path);
-            previous_managed_keys.contains(&key) || newly_managed_keys.contains(&key)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut retained_stale_paths = Vec::new();
+        .into_iter()
+        .map(|managed| (lexical_path_key(&managed.path), managed))
+        .collect::<BTreeMap<_, _>>();
+    let mut current_managed = Vec::new();
+    for path in &application.enforced_paths {
+        let key = lexical_path_key(path);
+        if let Some(mut managed) = newly_managed_by_key.remove(&key) {
+            managed.path = path.clone();
+            current_managed.push(managed);
+        } else if let Some(mut managed) = previous_by_key.remove(&key) {
+            managed.path = path.clone();
+            current_managed.push(managed);
+        }
+    }
+    let mut retained_stale = Vec::new();
     let mut revoke_errors = Vec::new();
-    for path in previous_managed {
-        if desired_keys.contains(&lexical_path_key(&path)) {
+    for (_, managed) in previous_by_key {
+        if desired_keys.contains(&lexical_path_key(&managed.path)) {
             continue;
         }
-        match std::fs::symlink_metadata(&path) {
+        match std::fs::symlink_metadata(&managed.path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                retained_stale_paths.push(path.clone());
-                revoke_errors.push(format!("{}: {error}", path.display()));
+                revoke_errors.push(format!("{}: {error}", managed.path.display()));
+                retained_stale.push(managed);
                 continue;
             }
         }
-        if let Err(error) = unsafe { revoke_deny_read_ace(&path, psid) } {
-            retained_stale_paths.push(path.clone());
-            revoke_errors.push(format!("{}: {error}", path.display()));
+        if let Err(error) = unsafe {
+            revoke_deny_read_ace_with_fingerprint(&managed.path, psid, &managed.fingerprint)
+        } {
+            revoke_errors.push(format!("{}: {error}", managed.path.display()));
+            retained_stale.push(managed);
         }
     }
-    let tracked_paths = merge_tracked_paths(&current_managed_paths, &retained_stale_paths);
+    let tracked_paths = merge_tracked_paths(&current_managed, &retained_stale);
 
     if tracked_paths.is_empty() {
         state.principals.remove(principal_sid);
@@ -260,7 +488,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
         .get(principal_sid)
         .into_iter()
         .flatten()
-        .map(|path| lexical_path_key(path))
+        .map(|managed| lexical_path_key(&managed.path))
         .collect::<BTreeSet<_>>();
     let retained_legacy = state
         .legacy_unmanaged_principals
@@ -268,7 +496,8 @@ pub unsafe fn sync_persistent_deny_read_acls(
         .unwrap_or_default()
         .into_iter()
         .filter(|path| {
-            if managed_keys.contains(&lexical_path_key(path)) {
+            let key = lexical_path_key(path);
+            if managed_keys.contains(&key) {
                 return false;
             }
             match std::fs::symlink_metadata(path) {
@@ -292,15 +521,18 @@ pub unsafe fn sync_persistent_deny_read_acls(
     Ok(application.enforced_paths)
 }
 
-fn merge_tracked_paths(current: &[PathBuf], retained_stale: &[PathBuf]) -> Vec<PathBuf> {
+fn merge_tracked_paths(
+    current: &[ManagedDenyReadAcl],
+    retained_stale: &[ManagedDenyReadAcl],
+) -> Vec<ManagedDenyReadAcl> {
     let mut keys = BTreeSet::new();
     let mut merged = Vec::new();
-    for path in current.iter().chain(retained_stale) {
-        if keys.insert(lexical_path_key(path)) {
-            merged.push(path.clone());
+    for managed in current.iter().chain(retained_stale) {
+        if keys.insert(lexical_path_key(&managed.path)) {
+            merged.push(managed.clone());
         }
     }
-    merged.sort_by_key(|path| lexical_path_key(path));
+    merged.sort_by_key(|managed| lexical_path_key(&managed.path));
     merged
 }
 
@@ -311,8 +543,35 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                 .with_context(|| format!("parse deny-read ACL state {}", path.display()))?;
             match value.get("version").and_then(serde_json::Value::as_u64) {
                 Some(version) if version == u64::from(DENY_READ_ACL_STATE_VERSION) => {
-                    serde_json::from_value(value)
-                        .with_context(|| format!("parse deny-read ACL state {}", path.display()))
+                    let state: PersistentDenyReadAclState = serde_json::from_value(value)
+                        .with_context(|| format!("parse deny-read ACL state {}", path.display()))?;
+                    validate_state(&state).with_context(|| {
+                        format!("validate deny-read ACL state {}", path.display())
+                    })?;
+                    Ok(state)
+                }
+                Some(2) => {
+                    let previous: VersionTwoPersistentDenyReadAclState =
+                        serde_json::from_value(value).with_context(|| {
+                            format!("parse version 2 deny-read ACL state {}", path.display())
+                        })?;
+                    if previous.version != 2 {
+                        anyhow::bail!(
+                            "invalid version 2 deny-read ACL state in {}",
+                            path.display()
+                        );
+                    }
+                    let state = PersistentDenyReadAclState {
+                        legacy_unmanaged_principals: merge_legacy_principals(
+                            previous.principals,
+                            previous.legacy_unmanaged_principals,
+                        ),
+                        ..PersistentDenyReadAclState::default()
+                    };
+                    validate_state(&state).with_context(|| {
+                        format!("validate version 2 deny-read ACL state {}", path.display())
+                    })?;
+                    Ok(state)
                 }
                 Some(version) => anyhow::bail!(
                     "unsupported deny-read ACL state version {version} in {}",
@@ -323,10 +582,14 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         .with_context(|| {
                             format!("parse legacy deny-read ACL state {}", path.display())
                         })?;
-                    Ok(PersistentDenyReadAclState {
+                    let state = PersistentDenyReadAclState {
                         legacy_unmanaged_principals: legacy.principals,
                         ..PersistentDenyReadAclState::default()
-                    })
+                    };
+                    validate_state(&state).with_context(|| {
+                        format!("validate legacy deny-read ACL state {}", path.display())
+                    })?;
+                    Ok(state)
                 }
             }
         }
@@ -339,7 +602,56 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
     }
 }
 
+fn merge_legacy_principals(
+    first: BTreeMap<String, Vec<PathBuf>>,
+    second: BTreeMap<String, Vec<PathBuf>>,
+) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut merged = first;
+    for (principal, paths) in second {
+        let current = merged.entry(principal).or_default();
+        current.extend(paths);
+    }
+    for current in merged.values_mut() {
+        current.sort_by_key(|path| lexical_path_key(path));
+        current.dedup_by(|left, right| lexical_path_key(left) == lexical_path_key(right));
+    }
+    merged
+}
+
+fn validate_state(state: &PersistentDenyReadAclState) -> Result<()> {
+    if state.version != DENY_READ_ACL_STATE_VERSION {
+        anyhow::bail!("deny-read ACL state version does not match current schema");
+    }
+    if state.active_runner_leases.len() > MAX_ACTIVE_RUNNER_LEASES {
+        anyhow::bail!(
+            "deny-read runner lease limit exceeded: {}",
+            state.active_runner_leases.len()
+        );
+    }
+    for lease_name in &state.active_runner_leases {
+        validate_runner_lease_name(lease_name)?;
+    }
+    for entries in state.principals.values() {
+        let mut keys = BTreeSet::new();
+        for managed in entries {
+            if !managed.path.is_absolute()
+                || managed.fingerprint.is_empty()
+                || !keys.insert(lexical_path_key(&managed.path))
+            {
+                anyhow::bail!("invalid managed deny-read ACL state entry");
+            }
+        }
+    }
+    for path in state.legacy_unmanaged_principals.values().flatten() {
+        if !path.is_absolute() {
+            anyhow::bail!("invalid legacy deny-read ACL state entry");
+        }
+    }
+    Ok(())
+}
+
 fn store_state(path: &Path, state: &PersistentDenyReadAclState) -> Result<()> {
+    validate_state(state)?;
     let bytes = serde_json::to_vec_pretty(state).context("serialize deny-read ACL state")?;
     atomic_store(path, &bytes)
 }
@@ -347,13 +659,17 @@ fn store_state(path: &Path, state: &PersistentDenyReadAclState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::DENY_READ_ACL_STATE_FILE;
+    use super::ManagedDenyReadAcl;
     use super::load_state;
     use super::merge_tracked_paths;
+    use super::reconcile_runner_leases;
+    use super::register_runner_lease;
     use super::sandbox_dir;
     use super::state_mutex_name;
     use super::sync_persistent_deny_read_acls;
     use super::try_lock_deny_read_execution;
     use crate::acl::add_deny_read_ace;
+    use crate::acl::add_deny_write_ace;
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
     use crate::acl::revoke_deny_read_ace;
@@ -372,6 +688,19 @@ mod tests {
     const HOME_ENV: &str = "SINGULARITY_DENY_READ_STATE_HOME";
     const PATH_ENV: &str = "SINGULARITY_DENY_READ_STATE_PATH";
 
+    fn managed(path: PathBuf) -> ManagedDenyReadAcl {
+        serde_json::from_value(serde_json::json!({
+            "path": path,
+            "fingerprint": {
+                "entries": [{
+                    "flags": 0,
+                    "mask": 1
+                }]
+            }
+        }))
+        .expect("deserialize managed deny-read fixture")
+    }
+
     #[test]
     fn state_mutex_uses_global_namespace_for_cross_session_state() {
         let name = state_mutex_name(Path::new(r"C:\sandbox\.sandbox\deny_read_acl_state.json"));
@@ -380,11 +709,14 @@ mod tests {
 
     #[test]
     fn tracked_paths_include_only_current_and_unreconciled_entries() {
-        let current = vec![PathBuf::from(r"C:\workspace\.agents")];
-        let retained_stale = vec![PathBuf::from(r"C:\workspace\.git")];
+        let current = vec![managed(PathBuf::from(r"C:\workspace\.agents"))];
+        let retained_stale = vec![managed(PathBuf::from(r"C:\workspace\.git"))];
         let merged = merge_tracked_paths(&current, &retained_stale);
         assert_eq!(
-            merged,
+            merged
+                .into_iter()
+                .map(|managed| managed.path)
+                .collect::<Vec<_>>(),
             vec![
                 PathBuf::from(r"C:\workspace\.agents"),
                 PathBuf::from(r"C:\workspace\.git")
@@ -458,6 +790,26 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_registration_is_pruned_before_a_late_runner_can_spawn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let username = std::env::var("USERNAME").expect("current Windows username");
+        let registration =
+            register_runner_lease(&sandbox_home, &username).expect("register runner lease");
+        let lease_name = registration.name().to_string();
+        drop(registration);
+
+        assert!(reconcile_runner_leases(&sandbox_home, 1_000).expect("reconcile abandoned lease"));
+        assert!(
+            super::acquire_registered_runner_lease(&sandbox_home, &lease_name).is_err(),
+            "a late runner must not spawn after its registration was reconciled"
+        );
+        let state = load_state(&sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE))
+            .expect("load reconciled lease state");
+        assert!(state.active_runner_leases.is_empty());
+    }
+
+    #[test]
     fn removed_historical_path_is_not_rematerialized() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sandbox_home = temp.path().join("singularity-home");
@@ -492,8 +844,11 @@ mod tests {
         let state = load_state(&sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE))
             .expect("load reconciled deny-read state");
         assert_eq!(
-            state.principals.get("S-1-5-21-1-2-3-4"),
-            Some(&vec![current.clone()])
+            state
+                .principals
+                .get("S-1-5-21-1-2-3-4")
+                .map(|managed| managed.iter().map(|entry| entry.path.clone()).collect()),
+            Some(vec![current.clone()])
         );
         unsafe {
             revoke_deny_read_ace(&current, sid.as_ptr()).expect("restore current ACL");
@@ -542,6 +897,56 @@ mod tests {
     }
 
     #[test]
+    fn changed_managed_acl_fingerprint_is_retained_and_revoke_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let protected = temp.path().join("protected");
+        std::fs::create_dir_all(&sandbox_home).expect("create sandbox home");
+        std::fs::create_dir(&protected).expect("create protected path");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+
+        unsafe {
+            sync_persistent_deny_read_acls(
+                &sandbox_home,
+                principal,
+                std::slice::from_ref(&protected),
+                sid.as_ptr(),
+            )
+        }
+        .expect("apply managed deny-read ACL");
+        assert!(
+            unsafe { add_deny_write_ace(&protected, sid.as_ptr()) }
+                .expect("add concurrent deny-write ACE"),
+            "concurrent ACL fixture must change the SID fingerprint"
+        );
+
+        let error =
+            unsafe { sync_persistent_deny_read_acls(&sandbox_home, principal, &[], sid.as_ptr()) }
+                .expect_err("changed ACL fingerprint must block stale revoke");
+        assert!(
+            error.to_string().contains("ownership fingerprint changed"),
+            "{error:#}"
+        );
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        let state = load_state(&state_path).expect("load retained managed state");
+        assert_eq!(
+            state
+                .principals
+                .get(principal)
+                .map(|entries| entries.iter().map(|entry| entry.path.clone()).collect()),
+            Some(vec![protected.clone()])
+        );
+        let (dacl, security_descriptor) =
+            unsafe { fetch_dacl_handle(&protected).expect("read retained DACL") };
+        assert!(unsafe { dacl_has_read_deny_for_sid(dacl, sid.as_ptr()) });
+        unsafe {
+            LocalFree(security_descriptor as HLOCAL);
+            revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore managed read ACE");
+        }
+    }
+
+    #[test]
     fn legacy_state_is_migrated_as_unmanaged_and_not_revoked() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sandbox_home = temp.path().join("singularity-home");
@@ -578,6 +983,49 @@ mod tests {
         unsafe {
             LocalFree(security_descriptor as HLOCAL);
             revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore legacy test ACE");
+        }
+    }
+
+    #[test]
+    fn version_two_managed_paths_migrate_to_unmanaged_ownership() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let protected = temp.path().join("version-two-protected");
+        std::fs::create_dir_all(&protected).expect("create protected path");
+        let principal = "S-1-5-21-1-2-3-4";
+        let sid = LocalSid::from_string(principal).expect("test SID");
+        assert!(
+            unsafe { add_deny_read_ace(&protected, sid.as_ptr()) }
+                .expect("seed version two exact deny")
+        );
+        let state_path = sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE);
+        std::fs::create_dir_all(state_path.parent().expect("state parent"))
+            .expect("create state directory");
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "principals": { principal: [protected.clone()] },
+                "legacy_unmanaged_principals": {}
+            }))
+            .expect("serialize version two state"),
+        )
+        .expect("write version two state");
+
+        unsafe { sync_persistent_deny_read_acls(&sandbox_home, principal, &[], sid.as_ptr()) }
+            .expect("migrate version two state");
+        let state = load_state(&state_path).expect("load migrated version two state");
+        assert!(!state.principals.contains_key(principal));
+        assert_eq!(
+            state.legacy_unmanaged_principals.get(principal),
+            Some(&vec![protected.clone()])
+        );
+        let (dacl, security_descriptor) =
+            unsafe { fetch_dacl_handle(&protected).expect("read retained version two DACL") };
+        assert!(unsafe { dacl_has_read_deny_for_sid(dacl, sid.as_ptr()) });
+        unsafe {
+            LocalFree(security_descriptor as HLOCAL);
+            revoke_deny_read_ace(&protected, sid.as_ptr()).expect("restore version two test ACE");
         }
     }
 
@@ -641,7 +1089,7 @@ mod tests {
             .get("S-1-5-21-1-2-3-4")
             .expect("reconciled principal state");
         assert_eq!(paths.len(), 1);
-        let active_key = lexical_path_key(&paths[0]);
+        let active_key = lexical_path_key(&paths[0].path);
         assert!(active_key == lexical_path_key(&first) || active_key == lexical_path_key(&second));
 
         for path in [&first, &second] {

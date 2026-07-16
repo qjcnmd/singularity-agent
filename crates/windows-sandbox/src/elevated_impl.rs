@@ -62,6 +62,8 @@ mod windows_impl {
     use crate::cap::workspace_cap_sid_for_cwd;
     use crate::cap::workspace_write_cap_sid_for_root;
     use crate::deny_read_state::StateMutex;
+    use crate::deny_read_state::reconcile_runner_leases;
+    use crate::deny_read_state::register_runner_lease;
     use crate::deny_read_state::try_lock_deny_read_execution;
     use crate::env::ensure_non_interactive_pager;
     use crate::env::inherit_path_env;
@@ -118,7 +120,16 @@ mod windows_impl {
                 return Ok(None);
             }
             if let Some(guard) = try_lock_deny_read_execution(sandbox_home, 50)? {
-                return Ok(Some(guard));
+                loop {
+                    if cancellation
+                        .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+                    {
+                        return Ok(None);
+                    }
+                    if reconcile_runner_leases(sandbox_home, 50)? {
+                        return Ok(Some(guard));
+                    }
+                }
             }
         }
     }
@@ -303,7 +314,7 @@ mod windows_impl {
             return Ok(cancelled_capture_result());
         }
 
-        (|| -> Result<CaptureResult> {
+        let capture_result = (|| -> Result<CaptureResult> {
             let spawn_request = SpawnRequest {
                 command: command.clone(),
                 cwd: cwd.to_path_buf(),
@@ -312,6 +323,7 @@ mod windows_impl {
                 workspace_roots: workspace_roots.to_vec(),
                 sandbox_home: sandbox_base.clone(),
                 real_sandbox_home: sandbox_home.to_path_buf(),
+                deny_read_runner_lease_name: String::new(),
                 cap_sids,
                 timeout_ms,
                 use_private_desktop,
@@ -326,13 +338,19 @@ mod windows_impl {
                     {
                         anyhow::bail!("sandbox capture cancelled before runner spawn");
                     }
-                    spawn_runner_transport(
+                    let registration =
+                        register_runner_lease(sandbox_home, &sandbox_creds.username)?;
+                    let mut request = spawn_request.clone();
+                    request.deny_read_runner_lease_name = registration.name().to_string();
+                    let transport = spawn_runner_transport(
                         sandbox_home,
                         cwd,
                         &sandbox_creds,
                         logs_base_dir,
-                        spawn_request.clone(),
-                    )
+                        request,
+                    )?;
+                    drop(registration);
+                    Ok(transport)
                 },
                 || {
                     if cancellation
@@ -427,7 +445,21 @@ mod windows_impl {
                 cancelled,
                 output_truncated: stdout_truncated || stderr_truncated,
             })
-        })()
+        })();
+        // The runner releases its lease only after Job Object cleanup. Keep the execution mutex
+        // while consuming every released or abandoned registration, including startup and IPC
+        // failures, so this live parent never opens the crash-only reconciliation gap.
+        let lease_cleanup = loop {
+            match reconcile_runner_leases(sandbox_home, 50) {
+                Ok(true) => break Ok(()),
+                Ok(false) => {}
+                Err(error) => break Err(error),
+            }
+        };
+        match (capture_result, lease_cleanup) {
+            (Ok(capture), Ok(())) => Ok(capture),
+            (Err(error), Ok(())) | (_, Err(error)) => Err(error),
+        }
     }
 
     #[cfg(test)]

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 
 /// Protocol version shared by the parent process and elevated command runner.
-pub const IPC_PROTOCOL_VERSION: u8 = 2;
+pub const IPC_PROTOCOL_VERSION: u8 = 3;
 
 /// Length-prefixed, JSON-encoded frame.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -58,6 +58,7 @@ pub struct SpawnRequest {
     pub workspace_roots: Vec<AbsolutePathBuf>,
     pub sandbox_home: PathBuf,
     pub real_sandbox_home: PathBuf,
+    pub deny_read_runner_lease_name: String,
     pub cap_sids: Vec<String>,
     pub timeout_ms: Option<u64>,
     #[serde(default)]
@@ -202,6 +203,9 @@ mod tests {
                     workspace_roots: workspace_roots.clone(),
                     sandbox_home: PathBuf::from(r"C:\singularity"),
                     real_sandbox_home: PathBuf::from(r"C:\Users\singularity"),
+                    deny_read_runner_lease_name:
+                        r"Global\SingularityDenyReadRunner_0123456789abcdef0123456789abcdef"
+                            .to_string(),
                     cap_sids: vec!["S-1-15-3-1024-1".to_string()],
                     timeout_ms: Some(1000),
                     use_private_desktop: crate::product_identity::DEFAULT_USE_PRIVATE_DESKTOP,

@@ -26,6 +26,10 @@ const FORBIDDEN_LOCAL_PROCESS_SURFACES: [&str; 11] = [
     "taskkill",
 ];
 const FORBIDDEN_RELAXED_SANDBOX_CONTRACTS: [&str; 2] = ["HostWorkspace", "Relaxed"];
+#[cfg(windows)]
+const CRASH_CALLER_CHILD_ENV: &str = "SINGULARITY_CRASH_CALLER_CHILD";
+#[cfg(windows)]
+const CRASH_CALLER_WORKSPACE_ENV: &str = "SINGULARITY_CRASH_CALLER_WORKSPACE";
 
 #[test]
 fn command_request_and_result_are_schema_backed_boundaries() {
@@ -551,6 +555,117 @@ fn windows_elevated_deny_read_is_held_for_overlapping_child_lifetimes() {
     );
     assert!(!result_b.sandbox.local_process_fallback);
     assert!(workspace_b.path().join("b-ready").exists());
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_elevated_runner_lease_survives_parent_crash() {
+    if std::env::var_os(CRASH_CALLER_CHILD_ENV).is_some() {
+        let workspace = std::path::PathBuf::from(
+            std::env::var_os(CRASH_CALLER_WORKSPACE_ENV).expect("crash caller workspace"),
+        );
+        let mut request = CommandRequest::project_verification(
+            "command_crash_parent_a",
+            vec![
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "$ErrorActionPreference='Stop'; Set-Content -LiteralPath 'a-ready' -Value 'ready'; $protected=Join-Path ([string]::Concat([char]46,'git')) ([string]::Concat('sec','ret.txt')); while ($true) { try { Get-Content -LiteralPath $protected -ErrorAction Stop | Out-Null; Set-Content -LiteralPath 'escaped' -Value 'readable'; exit 9 } catch { Start-Sleep -Milliseconds 10 } }".to_string(),
+            ],
+            path_str(&workspace),
+            path_str(&workspace),
+        );
+        request.network.mode = SandboxNetworkMode::Denied;
+        let result = WindowsSandboxBackend::new().execute(&request);
+        panic!("crash-caller child returned before its parent was terminated: {result:#?}");
+    }
+
+    let root = std::env::var_os("SINGULARITY_WINDOWS_SANDBOX_TEST_ROOT")
+        .map(std::path::PathBuf::from)
+        .expect("set SINGULARITY_WINDOWS_SANDBOX_TEST_ROOT outside TEMP");
+    std::fs::create_dir_all(&root).expect("create live sandbox test root");
+    let workspace_a = tempfile::Builder::new()
+        .prefix("singularity-crash-a-")
+        .tempdir_in(&root)
+        .expect("workspace A");
+    let workspace_b = tempfile::Builder::new()
+        .prefix("singularity-crash-b-")
+        .tempdir_in(&root)
+        .expect("workspace B");
+    for workspace in [workspace_a.path(), workspace_b.path()] {
+        std::fs::create_dir(workspace.join(".git")).expect("create protected metadata");
+        std::fs::write(workspace.join(".git").join("secret.txt"), b"secret")
+            .expect("write protected secret");
+    }
+
+    let executable = std::env::current_exe().expect("current test executable");
+    let mut caller = std::process::Command::new(executable)
+        .args([
+            "--exact",
+            "windows_elevated_runner_lease_survives_parent_crash",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CRASH_CALLER_CHILD_ENV, "1")
+        .env(CRASH_CALLER_WORKSPACE_ENV, workspace_a.path())
+        .spawn()
+        .expect("spawn crash-caller test process");
+    let ready = workspace_a.path().join("a-ready");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ready.exists() {
+        assert!(
+            caller.try_wait().expect("poll crash caller").is_none(),
+            "crash caller exited before the sandbox child became ready"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            ready.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    caller.kill().expect("terminate sandbox caller process");
+    let caller_status = caller.wait().expect("wait terminated sandbox caller");
+    assert!(
+        !caller_status.success(),
+        "crash caller must be terminated abruptly"
+    );
+
+    let mut request_b = CommandRequest::project_verification(
+        "command_crash_parent_b",
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "Set-Content -LiteralPath 'b-ready' -Value 'ready'".to_string(),
+        ],
+        path_str(workspace_b.path()),
+        path_str(workspace_b.path()),
+    );
+    request_b.network.mode = SandboxNetworkMode::Denied;
+    let result_b = WindowsSandboxBackend::new().execute(&request_b);
+    assert_eq!(
+        result_b.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result_b:#?}"
+    );
+    assert_eq!(result_b.semantic_status, CommandSemanticStatus::Succeeded);
+    assert_eq!(result_b.sandbox.backend, "windows_elevated");
+    assert_eq!(
+        result_b.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result_b.sandbox.local_process_fallback);
+    assert!(workspace_b.path().join("b-ready").exists());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        !workspace_a.path().join("escaped").exists(),
+        "the crashed caller's child outlived Job cleanup and observed revoked protection"
+    );
 }
 
 #[cfg(not(windows))]

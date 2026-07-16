@@ -28,6 +28,7 @@ use singularity_windows_sandbox::SpawnRequest;
 use singularity_windows_sandbox::StderrMode;
 use singularity_windows_sandbox::StdinMode;
 use singularity_windows_sandbox::WindowsSandboxTokenMode;
+use singularity_windows_sandbox::acquire_registered_runner_lease;
 use singularity_windows_sandbox::allow_null_device;
 use singularity_windows_sandbox::create_readonly_token_with_caps_and_user_from;
 use singularity_windows_sandbox::create_workspace_write_token_with_caps_and_user_from;
@@ -454,6 +455,22 @@ pub fn main() -> Result<()> {
         }
     };
 
+    let runner_lease = match acquire_registered_runner_lease(
+        &req.real_sandbox_home,
+        &req.deny_read_runner_lease_name,
+    ) {
+        Ok(lease) => lease,
+        Err(err) => {
+            let _ = send_error(
+                &pipe_write,
+                ErrorStage::SpawnChild,
+                windows_error_code(&err),
+                err.to_string(),
+            );
+            return Err(err);
+        }
+    };
+
     let mut ipc_spawn = match spawn_ipc_process(&req) {
         Ok(value) => value,
         Err(err) => {
@@ -587,6 +604,8 @@ pub fn main() -> Result<()> {
         drop(ipc_spawn);
         anyhow::bail!(message);
     }
+
+    runner_lease.release();
 
     let exit_msg = FramedMessage {
         version: IPC_PROTOCOL_VERSION,

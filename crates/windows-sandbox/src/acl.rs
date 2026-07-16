@@ -1,6 +1,8 @@
 use crate::path_normalization::normalized_path_text;
 use crate::winutil::to_wide;
 use anyhow::Result;
+use serde::Deserialize;
+use serde::Serialize;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
@@ -76,6 +78,24 @@ const DENY_WRITE_MASK: u32 = FILE_GENERIC_WRITE
     | GENERIC_WRITE_MASK
     | DELETE
     | FILE_DELETE_CHILD;
+
+/// Sorted deny-ACE state for one SID on one ACL target.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct DenyReadAclFingerprint {
+    entries: Vec<DenyAceFingerprintEntry>,
+}
+
+impl DenyReadAclFingerprint {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct DenyAceFingerprintEntry {
+    flags: u8,
+    mask: u32,
+}
 
 /// The Win32 operation that failed while reading or writing a DACL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -521,17 +541,22 @@ pub unsafe fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, psid: *mut c_void) 
 
 #[cfg(test)]
 pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
-    dacl_has_deny_mask_for_sid(p_dacl, psid, DENY_WRITE_MASK, false)
+    unsafe { dacl_has_deny_mask_for_sid(p_dacl, psid, DENY_WRITE_MASK, false) }
+        .expect("inspect write deny DACL")
 }
 
 #[cfg(test)]
 pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
-    dacl_has_deny_mask_for_sid(p_dacl, psid, DENY_READ_MASK, false)
+    unsafe { dacl_has_deny_mask_for_sid(p_dacl, psid, DENY_READ_MASK, false) }
+        .expect("inspect read deny DACL")
 }
 
-unsafe fn dacl_has_any_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+unsafe fn deny_aces_for_sid(
+    p_dacl: *mut ACL,
+    psid: *mut c_void,
+) -> Result<Vec<DenyAceFingerprintEntry>> {
     if p_dacl.is_null() {
-        return false;
+        return Ok(Vec::new());
     }
     let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
     if GetAclInformation(
@@ -541,12 +566,19 @@ unsafe fn dacl_has_any_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool
         AclSizeInformation,
     ) == 0
     {
-        return false;
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::GetAclInformation,
+            unsafe { GetLastError() },
+        )));
     }
+    let mut entries = Vec::new();
     for index in 0..info.AceCount {
         let mut p_ace = std::ptr::null_mut();
         if GetAce(p_dacl as *const ACL, index, &mut p_ace) == 0 {
-            continue;
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::GetAce,
+                unsafe { GetLastError() },
+            )));
         }
         let header = &*(p_ace as *const ACE_HEADER);
         if header.AceType != ACCESS_DENIED_ACE_TYPE {
@@ -556,58 +588,61 @@ unsafe fn dacl_has_any_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool
             + std::mem::size_of::<ACE_HEADER>()
             + std::mem::size_of::<u32>()) as *mut c_void;
         if EqualSid(sid_ptr, psid) != 0 {
-            return true;
+            let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
+            entries.push(DenyAceFingerprintEntry {
+                flags: header.AceFlags,
+                mask: ace.Mask,
+            });
         }
     }
-    false
+    entries.sort();
+    Ok(entries)
 }
 
 /// Returns true only when the DACL covers the complete effective mask on the target and, when
 /// requested for a directory, propagates it to both child files and directories. Win32 may encode
 /// those two responsibilities as separate explicit ACEs.
+#[cfg(test)]
 unsafe fn dacl_has_deny_mask_for_sid(
     p_dacl: *mut ACL,
     psid: *mut c_void,
     required_mask: u32,
     require_descendant_inheritance: bool,
+) -> Result<bool> {
+    let entries = unsafe { deny_aces_for_sid(p_dacl, psid) }?;
+    Ok(deny_entries_cover_mask(
+        &entries,
+        required_mask,
+        require_descendant_inheritance,
+    ))
+}
+
+fn deny_entries_cover_mask(
+    entries: &[DenyAceFingerprintEntry],
+    required_mask: u32,
+    require_descendant_inheritance: bool,
 ) -> bool {
-    if p_dacl.is_null() {
-        return false;
-    }
-    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
-    let ok = GetAclInformation(
-        p_dacl as *const ACL,
-        &mut info as *mut _ as *mut c_void,
-        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-        AclSizeInformation,
-    );
-    if ok == 0 {
-        return false;
-    }
     let required_mask = effective_file_access_mask(required_mask);
     let mut protects_target = false;
     let mut protects_descendants = false;
-    for i in 0..info.AceCount {
-        let mut p_ace: *mut c_void = std::ptr::null_mut();
-        if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
-            continue;
-        }
-        let hdr = &*(p_ace as *const ACE_HEADER);
-        if hdr.AceType != ACCESS_DENIED_ACE_TYPE {
-            continue; // ACCESS_DENIED_ACE_TYPE
-        }
-        let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
-        let base = p_ace as usize;
-        let sid_ptr =
-            (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
-        if EqualSid(sid_ptr, psid) != 0
-            && (effective_file_access_mask(ace.Mask) & required_mask) == required_mask
-        {
-            protects_target |= hdr.AceFlags & INHERIT_ONLY_ACE == 0;
-            protects_descendants |= deny_ace_protects_descendants(hdr.AceFlags);
+    for entry in entries {
+        if (effective_file_access_mask(entry.mask) & required_mask) == required_mask {
+            protects_target |= entry.flags & INHERIT_ONLY_ACE == 0;
+            protects_descendants |= deny_ace_protects_descendants(entry.flags);
         }
     }
     protects_target && (!require_descendant_inheritance || protects_descendants)
+}
+
+/// Captures every deny ACE for `psid` on the current target DACL.
+pub(crate) unsafe fn deny_read_acl_fingerprint(
+    path: &Path,
+    psid: *mut c_void,
+) -> Result<DenyReadAclFingerprint> {
+    let target = unsafe { open_acl_target(path, READ_CONTROL, 1) }?;
+    Ok(DenyReadAclFingerprint {
+        entries: unsafe { deny_aces_for_sid(target.p_dacl, psid) }?,
+    })
 }
 
 fn deny_ace_protects_descendants(flags: u8) -> bool {
@@ -631,10 +666,12 @@ fn file_generic_mapping() -> GENERIC_MAPPING {
     }
 }
 
-unsafe fn effective_file_access_mask(mask: u32) -> u32 {
+fn effective_file_access_mask(mask: u32) -> u32 {
     let mut effective = mask;
     let mapping = file_generic_mapping();
-    MapGenericMask(&mut effective, &mapping);
+    unsafe {
+        MapGenericMask(&mut effective, &mapping);
+    }
     effective
 }
 
@@ -824,13 +861,8 @@ impl DenyAceKind {
         }
     }
 
-    unsafe fn already_present(
-        self,
-        p_dacl: *mut ACL,
-        psid: *mut c_void,
-        is_directory: bool,
-    ) -> bool {
-        dacl_has_deny_mask_for_sid(p_dacl, psid, self.mask(), is_directory)
+    fn already_present(self, entries: &[DenyAceFingerprintEntry], is_directory: bool) -> bool {
+        deny_entries_cover_mask(entries, self.mask(), is_directory)
     }
 }
 
@@ -840,8 +872,9 @@ unsafe fn add_deny_ace(
     kind: DenyAceKind,
 ) -> Result<DenyAceAddResult> {
     let target = open_acl_target(path, READ_CONTROL | WRITE_DAC, 1)?;
-    let had_any_deny = dacl_has_any_deny_for_sid(target.p_dacl, psid);
-    if !kind.already_present(target.p_dacl, psid, target.is_directory) {
+    let existing_entries = unsafe { deny_aces_for_sid(target.p_dacl, psid) }?;
+    let had_any_deny = !existing_entries.is_empty();
+    if !kind.already_present(&existing_entries, target.is_directory) {
         let trustee = TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
             MultipleTrusteeOperation: 0,
@@ -908,14 +941,49 @@ pub(crate) unsafe fn add_deny_read_ace_with_ownership(
 /// Rebuild the existing ACL in memory and delete only the exact current-object and inherit-only
 /// propagation entries owned by this runtime. A combined deny entry is rejected rather than
 /// partially weakening another boundary.
-pub unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<()> {
+#[cfg(test)]
+pub(crate) unsafe fn revoke_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<()> {
+    unsafe { revoke_deny_read_ace_impl(path, psid, None) }
+}
+
+/// Revokes runtime-shaped read denies only when the complete SID fingerprint is unchanged.
+pub(crate) unsafe fn revoke_deny_read_ace_with_fingerprint(
+    path: &Path,
+    psid: *mut c_void,
+    expected: &DenyReadAclFingerprint,
+) -> Result<()> {
+    unsafe { revoke_deny_read_ace_impl(path, psid, Some(expected)) }
+}
+
+unsafe fn revoke_deny_read_ace_impl(
+    path: &Path,
+    psid: *mut c_void,
+    expected: Option<&DenyReadAclFingerprint>,
+) -> Result<()> {
     let target = match open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) {
         Ok(target) => target,
         Err(error) if is_missing_target_error(&error) => return Ok(()),
         Err(error) => return Err(error),
     };
     if target.p_dacl.is_null() {
+        if expected.is_some_and(|fingerprint| !fingerprint.entries.is_empty()) {
+            anyhow::bail!(
+                "refusing to revoke deny-read ACL after ownership fingerprint changed for {}",
+                path.display()
+            );
+        }
         return Ok(());
+    }
+    if let Some(expected) = expected {
+        let current = DenyReadAclFingerprint {
+            entries: unsafe { deny_aces_for_sid(target.p_dacl, psid) }?,
+        };
+        if &current != expected {
+            anyhow::bail!(
+                "refusing to revoke deny-read ACL after ownership fingerprint changed for {}",
+                path.display()
+            );
+        }
     }
     let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
     if GetAclInformation(
@@ -1071,6 +1139,7 @@ mod tests {
     use super::add_deny_write_ace;
     use super::dacl_has_read_deny_for_sid;
     use super::dacl_has_write_deny_for_sid;
+    use super::deny_aces_for_sid;
     use super::fetch_dacl_handle;
     use super::open_acl_target;
     use super::path_contains_reparse_component;
@@ -1084,6 +1153,8 @@ mod tests {
     use tempfile::TempDir;
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::ACL;
+    use windows_sys::Win32::Security::InitializeAcl;
     use windows_sys::Win32::Storage::FileSystem::DELETE;
     use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
     use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
@@ -1129,6 +1200,37 @@ mod tests {
         };
         LocalFree(p_sd as HLOCAL);
         has
+    }
+
+    #[test]
+    fn malformed_acl_query_returns_typed_error_instead_of_absence() {
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test SID");
+        let mut storage = [0_u32; 16];
+        let acl = storage.as_mut_ptr() as *mut ACL;
+        assert_ne!(
+            unsafe { InitializeAcl(acl, std::mem::size_of_val(&storage) as u32, 2) },
+            0,
+            "initialize malformed ACL fixture"
+        );
+        unsafe {
+            (*acl).AclRevision = u8::MAX;
+            (*acl).AclSize = 0;
+        }
+
+        let error = unsafe { deny_aces_for_sid(acl, sid.as_ptr()) }
+            .expect_err("ACL query must fail closed");
+        let typed = error
+            .downcast_ref::<WindowsAclError>()
+            .expect("ACL query error must preserve its Win32 operation");
+        assert!(
+            matches!(
+                typed.operation,
+                AclOperation::GetAclInformation | AclOperation::GetAce
+            ),
+            "unexpected ACL query operation: {:?}",
+            typed.operation
+        );
     }
 
     unsafe fn fetch_deny_flags(path: &std::path::Path, sid: *mut c_void) -> Vec<u8> {

@@ -241,6 +241,8 @@ pub use deny_read_acl::ensure_missing_protected_path_materialized;
 pub use deny_read_acl::plan_deny_read_acl_paths;
 pub use deny_read_resolver::resolve_windows_deny_read_paths;
 #[cfg(target_os = "windows")]
+pub use deny_read_state::acquire_registered_runner_lease;
+#[cfg(target_os = "windows")]
 pub use deny_read_state::sync_persistent_deny_read_acls;
 #[cfg(target_os = "windows")]
 pub use desktop::LaunchDesktop;

@@ -48,6 +48,12 @@ const GENERIC_ALL: u32 = 0x1000_0000;
 const WIN_WORLD_SID: i32 = 1;
 const SE_GROUP_LOGON_ID: u32 = 0xC0000000;
 
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(ProcessHandle: HANDLE, DesiredAccess: u32, TokenHandle: *mut HANDLE)
+    -> i32;
+}
+
 #[repr(C)]
 struct TokenDefaultDaclInfo {
     default_dacl: *mut ACL,
@@ -180,20 +186,26 @@ pub unsafe fn get_current_token_for_restriction() -> Result<HANDLE> {
         | TOKEN_ADJUST_DEFAULT
         | TOKEN_ADJUST_SESSIONID
         | TOKEN_ADJUST_PRIVILEGES;
+    unsafe { open_current_process_token(desired) }
+}
+
+unsafe fn open_current_process_token(desired: u32) -> Result<HANDLE> {
     let mut h: HANDLE = 0;
-    #[link(name = "advapi32")]
-    unsafe extern "system" {
-        fn OpenProcessToken(
-            ProcessHandle: HANDLE,
-            DesiredAccess: u32,
-            TokenHandle: *mut HANDLE,
-        ) -> i32;
-    }
     let ok = unsafe { OpenProcessToken(GetCurrentProcess(), desired, &mut h) };
     if ok == 0 {
         return Err(anyhow!("OpenProcessToken failed: {}", GetLastError()));
     }
     Ok(h)
+}
+
+/// Returns the exact user SID from the current process token.
+pub(crate) fn current_user_sid_bytes() -> Result<Vec<u8>> {
+    let token = unsafe { open_current_process_token(TOKEN_QUERY) }?;
+    let result = unsafe { get_user_sid_bytes(token) };
+    unsafe {
+        CloseHandle(token);
+    }
+    result
 }
 
 pub unsafe fn get_logon_sid_bytes(h_token: HANDLE) -> Result<Vec<u8>> {
