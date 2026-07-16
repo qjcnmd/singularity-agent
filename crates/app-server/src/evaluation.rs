@@ -1762,23 +1762,14 @@ fn agent_verification_requirements(
         .iter()
         .enumerate()
         .map(|(index, command)| {
-            let cwd = resolved_smoke_cwd(workspace, command).ok_or_else(|| {
+            let scope_digest = smoke_command_scope_digest(workspace, command).map_err(|_| {
                 format!(
                     "evaluation smoke command {} cwd could not be resolved inside the prepared workspace",
                     index + 1
                 )
             })?;
-            let network = sandbox_network_mode(command.network_access);
             Ok(AgentVerificationRequirement::new(
-                command_script_scope_digest_with_policy(
-                    &command_script_from_argv(command.argv.as_slice()),
-                    &cwd,
-                    command
-                        .timeout_seconds
-                        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-                    SandboxFilesystemMode::WorkspaceWrite,
-                    network,
-                ),
+                scope_digest,
                 1,
             ))
         })
@@ -1798,19 +1789,9 @@ fn smoke_commands_satisfied(
     let eligible_results = &result.tool_results[first_eligible_result..];
     let mut matched_results = vec![false; eligible_results.len()];
     projection.smoke_commands.iter().all(|command| {
-        let network = sandbox_network_mode(command.network_access);
-        let Some(cwd) = resolved_smoke_cwd(workspace, command) else {
+        let Ok(expected) = smoke_command_scope_digest(workspace, command) else {
             return false;
         };
-        let expected = command_script_scope_digest_with_policy(
-            &command_script_from_argv(command.argv.as_slice()),
-            &cwd,
-            command
-                .timeout_seconds
-                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-            SandboxFilesystemMode::WorkspaceWrite,
-            network,
-        );
         let Some(index) = eligible_results
             .iter()
             .enumerate()
@@ -1826,6 +1807,21 @@ fn smoke_commands_satisfied(
         matched_results[index] = true;
         true
     })
+}
+
+// 统一 Agent completion、post-agent smoke 和 evidence 使用的精确 command scope。
+fn smoke_command_scope_digest(workspace: &Path, command: &CommandSpec) -> Result<String, String> {
+    let cwd = resolved_smoke_cwd(workspace, command)
+        .ok_or_else(|| "evaluation smoke command cwd is unavailable".to_string())?;
+    Ok(command_script_scope_digest_with_policy(
+        &command_script_from_argv(command.argv.as_slice()),
+        &cwd,
+        command
+            .timeout_seconds
+            .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
+        SandboxFilesystemMode::WorkspaceWrite,
+        sandbox_network_mode(command.network_access),
+    ))
 }
 
 fn resolved_smoke_cwd(workspace: &Path, command: &CommandSpec) -> Option<String> {

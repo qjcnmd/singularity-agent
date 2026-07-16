@@ -144,11 +144,10 @@ fn build_task_evidence(
         allowed_paths_digest: set_strings_digest("evaluation.allowed_paths/v1", &allowed_paths),
         changed_paths_digest,
         allowlist,
-        smoke: scope_evidence(
+        smoke: smoke_scope_evidence(
             &task_dir.join(AGENT_DIR),
             &plan.agent.projection.smoke_commands,
             &diagnostics.observed_smoke_scope_digests,
-            DEFAULT_COMMAND_TIMEOUT_SECONDS,
         ),
         baseline: scope_evidence(
             &task_dir.join(BASELINE_DIR),
@@ -194,6 +193,27 @@ fn scope_evidence(
     observed_scope_digests: &[String],
     default_timeout_seconds: u64,
 ) -> EvaluationScopeEvidence {
+    scope_evidence_with(commands, observed_scope_digests, |command| {
+        command_scope_digest_for_spec(workspace, command, default_timeout_seconds)
+    })
+}
+
+// smoke 收据必须复用 Agent completion 使用的 command string scope，避免产生第二事实源。
+fn smoke_scope_evidence(
+    workspace: &Path,
+    commands: &[CommandSpec],
+    observed_scope_digests: &[String],
+) -> EvaluationScopeEvidence {
+    scope_evidence_with(commands, observed_scope_digests, |command| {
+        super::smoke_command_scope_digest(workspace, command)
+    })
+}
+
+fn scope_evidence_with(
+    commands: &[CommandSpec],
+    observed_scope_digests: &[String],
+    expected_scope_digest: impl Fn(&CommandSpec) -> Result<String, String>,
+) -> EvaluationScopeEvidence {
     if commands.is_empty() {
         return EvaluationScopeEvidence {
             expectation_known: true,
@@ -204,7 +224,7 @@ fn scope_evidence(
     }
     let expected_scope_digests = commands
         .iter()
-        .map(|command| command_scope_digest_for_spec(workspace, command, default_timeout_seconds))
+        .map(expected_scope_digest)
         .collect::<Result<Vec<_>, _>>();
     let Ok(expected_scope_digests) = expected_scope_digests else {
         return EvaluationScopeEvidence {
@@ -271,4 +291,40 @@ fn is_sha256_digest(value: &str) -> bool {
     value
         .strip_prefix("sha256:")
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+#[cfg(test)]
+mod tests {
+    use singularity_evaluation::{Argv, CommandSpec, EvidenceVerdict};
+    use singularity_policy::NetworkAccess;
+    use singularity_tools::{SandboxFilesystemMode, command_script_scope_digest_with_policy};
+
+    use super::smoke_scope_evidence;
+    use crate::evaluation::command::sandbox_network_mode;
+    use crate::evaluation::{
+        DEFAULT_COMMAND_TIMEOUT_SECONDS, command_script_from_argv, resolved_smoke_cwd,
+    };
+
+    #[test]
+    fn smoke_scope_evidence_uses_the_agent_command_script_contract() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let command = CommandSpec {
+            argv: Argv::new(vec!["python".to_string(), "smoke_test.py".to_string()]).expect("argv"),
+            cwd: None,
+            timeout_seconds: None,
+            network_access: NetworkAccess::Denied,
+        };
+        let cwd = resolved_smoke_cwd(workspace.path(), &command).expect("smoke cwd");
+        let observed = command_script_scope_digest_with_policy(
+            &command_script_from_argv(command.argv.as_slice()),
+            &cwd,
+            DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            SandboxFilesystemMode::WorkspaceWrite,
+            sandbox_network_mode(command.network_access),
+        );
+
+        let evidence = smoke_scope_evidence(workspace.path(), &[command], &[observed]);
+
+        assert_eq!(evidence.required_scopes_satisfied, EvidenceVerdict::Passed);
+    }
 }
