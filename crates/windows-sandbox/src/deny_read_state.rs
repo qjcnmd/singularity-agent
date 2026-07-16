@@ -3,10 +3,9 @@ use crate::acl::revoke_deny_read_ace_with_fingerprint;
 use crate::deny_read_acl::ManagedDenyReadAcl;
 use crate::deny_read_acl::apply_deny_read_acls_with_ownership_before_set;
 use crate::deny_read_acl::plan_deny_read_acl_paths;
-use crate::path_normalization::canonical_path_key_allow_missing;
 use crate::path_normalization::lexical_path_key;
+use crate::path_safety::canonicalize_case_insensitive_state_path;
 use crate::path_safety::ensure_case_insensitive_acl_path;
-use crate::path_safety::ensure_case_insensitive_state_path;
 use crate::setup::sandbox_dir;
 use crate::token::current_user_sid_bytes;
 use crate::winutil::resolve_sid;
@@ -113,6 +112,19 @@ pub(crate) struct StateMutex {
     handle: HANDLE,
 }
 
+/// Couples a state mutex with the exact canonical path identity used to name it.
+pub(crate) struct StateLock {
+    _mutex: StateMutex,
+    path: PathBuf,
+}
+
+impl StateLock {
+    /// Returns the canonical path that must be used for all I/O protected by this lock.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl Drop for StateMutex {
     fn drop(&mut self) {
         unsafe {
@@ -124,7 +136,7 @@ impl Drop for StateMutex {
 
 fn mutex_name(prefix: &str, path: &Path) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in canonical_path_key_allow_missing(path).as_bytes() {
+    for byte in lexical_path_key(path).as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -132,8 +144,9 @@ fn mutex_name(prefix: &str, path: &Path) -> String {
 }
 
 #[cfg(test)]
-fn state_mutex_name(path: &Path) -> String {
-    mutex_name(STATE_MUTEX_PREFIX, path)
+fn state_mutex_name(path: &Path) -> Result<String> {
+    let path = canonicalize_case_insensitive_state_path(path)?;
+    Ok(mutex_name(STATE_MUTEX_PREFIX, &path))
 }
 
 fn wait_raw_named_mutex(name: &str, timeout_ms: u32) -> Result<Option<StateMutex>> {
@@ -163,13 +176,18 @@ fn wait_raw_named_mutex(name: &str, timeout_ms: u32) -> Result<Option<StateMutex
 }
 
 fn wait_named_mutex(prefix: &str, path: &Path, timeout_ms: u32) -> Result<Option<StateMutex>> {
-    ensure_case_insensitive_state_path(path)?;
-    wait_raw_named_mutex(&mutex_name(prefix, path), timeout_ms)
+    let path = canonicalize_case_insensitive_state_path(path)?;
+    wait_raw_named_mutex(&mutex_name(prefix, &path), timeout_ms)
 }
 
-pub(crate) fn lock_state(path: &Path) -> Result<StateMutex> {
-    wait_named_mutex(STATE_MUTEX_PREFIX, path, INFINITE)?
-        .ok_or_else(|| anyhow::anyhow!("infinite deny-read state mutex wait timed out"))
+pub(crate) fn lock_state(path: &Path) -> Result<StateLock> {
+    let path = canonicalize_case_insensitive_state_path(path)?;
+    let mutex = wait_raw_named_mutex(&mutex_name(STATE_MUTEX_PREFIX, &path), INFINITE)?
+        .ok_or_else(|| anyhow::anyhow!("infinite deny-read state mutex wait timed out"))?;
+    Ok(StateLock {
+        _mutex: mutex,
+        path,
+    })
 }
 
 /// Attempts to hold the shared read principal across one complete sandbox child lifecycle.
@@ -223,8 +241,9 @@ pub(crate) fn register_runner_lease(
     sandbox_username: &str,
 ) -> Result<RegisteredRunnerLease> {
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    let _lock = lock_state(&state_path)?;
-    let mut state = load_state(&state_path)?;
+    let lock = lock_state(&state_path)?;
+    let state_path = lock.path();
+    let mut state = load_state(state_path)?;
     if state.active_runner_leases.len() >= MAX_ACTIVE_RUNNER_LEASES {
         anyhow::bail!(
             "deny-read runner lease limit reached: {}",
@@ -289,7 +308,7 @@ pub(crate) fn register_runner_lease(
         }
         anyhow::bail!("deny-read runner lease collision");
     }
-    if let Err(error) = store_state(&state_path, &state) {
+    if let Err(error) = store_state(state_path, &state) {
         unsafe {
             CloseHandle(handle);
         }
@@ -307,7 +326,8 @@ pub fn acquire_registered_runner_lease(
     let mutex = wait_raw_named_mutex(lease_name, INFINITE)?
         .ok_or_else(|| anyhow::anyhow!("infinite deny-read runner lease wait timed out"))?;
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    let state = load_state(&state_path)?;
+    let lock = lock_state(&state_path)?;
+    let state = load_state(lock.path())?;
     if !state.active_runner_leases.contains(lease_name) {
         anyhow::bail!("deny-read runner lease is no longer registered");
     }
@@ -320,8 +340,8 @@ pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> R
     let deadline = (timeout_ms != INFINITE)
         .then(|| Instant::now() + Duration::from_millis(u64::from(timeout_ms)));
     let leases = {
-        let _lock = lock_state(&state_path)?;
-        load_state(&state_path)?
+        let lock = lock_state(&state_path)?;
+        load_state(lock.path())?
             .active_runner_leases
             .into_iter()
             .collect::<Vec<_>>()
@@ -350,10 +370,11 @@ pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> R
 
 fn remove_runner_lease(sandbox_home: &Path, lease_name: &str) -> Result<()> {
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    let _lock = lock_state(&state_path)?;
-    let mut state = load_state(&state_path)?;
+    let lock = lock_state(&state_path)?;
+    let state_path = lock.path();
+    let mut state = load_state(state_path)?;
     if state.active_runner_leases.remove(lease_name) {
-        store_state(&state_path, &state)?;
+        store_state(state_path, &state)?;
     }
     Ok(())
 }
@@ -503,8 +524,9 @@ pub unsafe fn sync_persistent_deny_read_acls(
 ) -> Result<Vec<PathBuf>> {
     drop(plan_deny_read_acl_paths(desired_paths)?);
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    let _lock = lock_state(&state_path)?;
-    let mut state = load_state(&state_path)?;
+    let lock = lock_state(&state_path)?;
+    let state_path = lock.path();
+    let mut state = load_state(state_path)?;
     for managed in state
         .principals
         .get(principal_sid)
@@ -529,7 +551,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
         ensure_case_insensitive_acl_path(path)?;
     }
     if unsafe { recover_pending_principal(&mut state, principal_sid, psid) }? {
-        store_state(&state_path, &state).context("commit recovered pending deny-read ownership")?;
+        store_state(state_path, &state).context("commit recovered pending deny-read ownership")?;
     }
     let previous_managed = state
         .principals
@@ -545,7 +567,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
                     .or_default(),
                 pending.clone(),
             );
-            store_state(&state_path, &state)
+            store_state(state_path, &state)
                 .context("journal pending deny-read ownership before ACL mutation")
         })
     };
@@ -555,7 +577,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
             let recovery = unsafe { recover_pending_principal(&mut state, principal_sid, psid) }
                 .and_then(|changed| {
                     changed
-                        .then(|| store_state(&state_path, &state))
+                        .then(|| store_state(state_path, &state))
                         .transpose()
                         .map(|_| ())
                 });
@@ -672,7 +694,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
             .legacy_unmanaged_principals
             .insert(principal_sid.to_string(), retained_legacy);
     }
-    store_state(&state_path, &state)?;
+    store_state(state_path, &state)?;
     if !revoke_errors.is_empty() {
         anyhow::bail!(
             "failed to revoke stale deny-read ACLs: {}",
@@ -901,8 +923,9 @@ mod tests {
     use crate::acl::fetch_dacl_handle;
     use crate::acl::revoke_deny_read_ace;
     use crate::path_normalization::lexical_path_key;
+    use crate::path_safety::CaseSensitivityTestOutcome;
     use crate::path_safety::ProtectedMetadataError;
-    use crate::path_safety::enable_case_sensitive_directory_for_test;
+    use crate::path_safety::override_case_sensitivity_for_test;
     use crate::token::LocalSid;
     use std::os::windows::process::CommandExt;
     use std::path::Path;
@@ -940,16 +963,18 @@ mod tests {
 
     #[test]
     fn state_mutex_uses_global_namespace_for_cross_session_state() {
-        let name = state_mutex_name(Path::new(r"C:\sandbox\.sandbox\deny_read_acl_state.json"));
+        let name = state_mutex_name(Path::new(r"C:\sandbox\.sandbox\deny_read_acl_state.json"))
+            .expect("validated state mutex name");
         assert!(name.starts_with(r"Global\"), "mutex name was {name}");
     }
 
     #[test]
     fn state_mutex_rejects_case_sensitive_identity_before_lowercase_keying() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        if !enable_case_sensitive_directory_for_test(tmp.path()) {
-            return;
-        }
+        let _case_sensitive = override_case_sensitivity_for_test(
+            tmp.path(),
+            CaseSensitivityTestOutcome::CaseSensitive,
+        );
         let state_path = tmp.path().join(DENY_READ_ACL_STATE_FILE);
 
         let error = match lock_state(&state_path) {
@@ -994,10 +1019,42 @@ mod tests {
         let verbatim = PathBuf::from(format!(r"\\?\{}", ordinary.display()));
 
         assert_eq!(
-            state_mutex_name(&ordinary),
-            state_mutex_name(&through_alias)
+            state_mutex_name(&ordinary).expect("ordinary mutex name"),
+            state_mutex_name(&through_alias).expect("alias mutex name")
         );
-        assert_eq!(state_mutex_name(&ordinary), state_mutex_name(&verbatim));
+        assert_eq!(
+            state_mutex_name(&ordinary).expect("ordinary mutex name"),
+            state_mutex_name(&verbatim).expect("verbatim mutex name")
+        );
+    }
+
+    #[test]
+    fn state_lock_keeps_mutex_and_io_on_one_canonical_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_home = temp.path().join("first-home");
+        let second_home = temp.path().join("second-home");
+        let alias = temp.path().join("home-alias");
+        std::fs::create_dir_all(sandbox_dir(&first_home)).expect("create first state directory");
+        std::fs::create_dir_all(sandbox_dir(&second_home)).expect("create second state directory");
+        create_junction(&alias, &first_home);
+        let alias_state = sandbox_dir(&alias).join(DENY_READ_ACL_STATE_FILE);
+        let first_state = sandbox_dir(&first_home).join(DENY_READ_ACL_STATE_FILE);
+        let second_state = sandbox_dir(&second_home).join(DENY_READ_ACL_STATE_FILE);
+
+        let lock = lock_state(&alias_state).expect("lock first canonical state identity");
+        std::fs::remove_dir(&alias).expect("remove first junction");
+        create_junction(&alias, &second_home);
+        store_state(lock.path(), &PersistentDenyReadAclState::default())
+            .expect("store through locked canonical identity");
+
+        assert!(
+            first_state.exists(),
+            "locked identity must receive state I/O"
+        );
+        assert!(
+            !second_state.exists(),
+            "retargeted alias must not redirect state I/O"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::absolute_path::AbsolutePathBuf;
 use crate::path_normalization::lexical_path_key;
+use crate::path_safety::ProtectedMetadataError;
 use crate::path_safety::ensure_case_insensitive_directory_path;
 use crate::path_safety::ensure_case_insensitive_path_ancestors;
 use crate::permissions::FileSystemAccessMode;
@@ -39,7 +40,7 @@ struct GlobScanContext<'a> {
 ///
 /// Windows ACL 不直接理解 glob；exact 路径原样保留，glob 只对现有条目做一次有界快照
 /// 展开。无法安全检查的子树会把其词法路径加入 deny-read，不静默放行；reparse target
-/// 仅在 workspace 边界内跟随，ACL 层随后同时保留词法路径和 canonical target。
+/// 仅在 workspace 边界内用于有界扫描，最终 ACL preflight 对 reparse 路径 fail closed。
 pub fn resolve_windows_deny_read_paths(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
@@ -76,7 +77,7 @@ pub fn resolve_windows_deny_read_paths(
     let scan_boundary = dunce::canonicalize(cwd.as_path())
         .map_err(|_| "deny_read_resolution_workspace_unavailable".to_string())?;
     ensure_case_insensitive_directory_path(&scan_boundary)
-        .map_err(|_| "deny_read_resolution_case_sensitive_directory".to_string())?;
+        .map_err(|error| sanitize_path_safety_error(&error))?;
     let mut scan_plans = Vec::new();
     for pattern in unreadable_globs {
         let mut scan_plan =
@@ -85,7 +86,7 @@ pub fn resolve_windows_deny_read_paths(
             scan_plan.root = cwd.as_path().join(&scan_plan.root);
         }
         ensure_case_insensitive_path_ancestors(&scan_plan.root)
-            .map_err(|_| "deny_read_resolution_case_sensitive_directory".to_string())?;
+            .map_err(|error| sanitize_path_safety_error(&error))?;
         merge_scan_plan(&mut scan_plans, scan_plan);
     }
 
@@ -137,7 +138,7 @@ fn collect_existing_glob_matches(
         }
     };
     ensure_case_insensitive_path_ancestors(&canonical)
-        .map_err(|_| "deny_read_resolution_case_sensitive_directory".to_string())?;
+        .map_err(|error| sanitize_path_safety_error(&error))?;
     if !path_is_within(&canonical, context.scan_boundary) {
         // workspace 外的 reparse target 是未知子树：只 deny 词法入口，不跟随越界 target。
         push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
@@ -165,10 +166,10 @@ fn collect_existing_glob_matches(
         return Ok(());
     }
     ensure_case_insensitive_directory_path(&canonical)
-        .map_err(|_| "deny_read_resolution_case_sensitive_directory".to_string())?;
+        .map_err(|error| sanitize_path_safety_error(&error))?;
 
     // canonical directory key 防止 symlink/junction cycle 无限递归；词法路径交给
-    // ACL planner，使其同时记录现有 reparse point 的 canonical target。
+    // ACL planner，并由其统一拒绝无法 no-follow enforcement 的 reparse 路径。
     let scan_key = path_key(&canonical);
     if !context.seen_scan_dirs.insert(scan_key) {
         return Ok(());
@@ -306,6 +307,18 @@ fn sanitize_glob_error(error: &str) -> String {
     format!("invalid deny-read glob pattern: {reason}")
 }
 
+fn sanitize_path_safety_error(error: &anyhow::Error) -> String {
+    match error.downcast_ref::<ProtectedMetadataError>() {
+        Some(ProtectedMetadataError::CaseSensitiveDirectoryUnsupported { .. }) => {
+            "deny_read_resolution_case_sensitive_directory".to_string()
+        }
+        Some(ProtectedMetadataError::CaseSensitivityQueryFailed { .. }) => {
+            "deny_read_resolution_case_sensitivity_query_failed".to_string()
+        }
+        _ => "deny_read_resolution_path_validation_failed".to_string(),
+    }
+}
+
 fn path_key(path: &Path) -> String {
     lexical_path_key(path)
 }
@@ -337,9 +350,12 @@ mod tests {
     use super::glob_scan_plan;
     use super::path_is_within;
     use super::resolve_windows_deny_read_paths;
+    use super::sanitize_path_safety_error;
     use crate::absolute_path::AbsolutePathBuf;
     #[cfg(windows)]
-    use crate::path_safety::enable_case_sensitive_directory_for_test;
+    use crate::path_safety::CaseSensitivityTestOutcome;
+    #[cfg(windows)]
+    use crate::path_safety::override_case_sensitivity_for_test;
     use crate::permissions::FileSystemAccessMode;
     use crate::permissions::FileSystemPath;
     use crate::permissions::FileSystemSandboxEntry;
@@ -531,9 +547,10 @@ mod tests {
     #[test]
     fn case_sensitive_scan_directory_is_rejected_before_lowercase_cycle_keys() {
         let tmp = TempDir::new().expect("tempdir");
-        if !enable_case_sensitive_directory_for_test(tmp.path()) {
-            return;
-        }
+        let _case_sensitive = override_case_sensitivity_for_test(
+            tmp.path(),
+            CaseSensitivityTestOutcome::CaseSensitive,
+        );
         std::fs::write(tmp.path().join("secret.env"), "secret").expect("write secret");
         let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
         let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
@@ -545,6 +562,37 @@ mod tests {
             .expect_err("case-sensitive scan root must fail closed");
 
         assert_eq!(error, "deny_read_resolution_case_sensitive_directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_sensitivity_query_failure_keeps_a_distinct_sanitized_category() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _query_failure = override_case_sensitivity_for_test(
+            tmp.path(),
+            CaseSensitivityTestOutcome::QueryFailed(5),
+        );
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/**/*.env",
+            tmp.path().display()
+        ))]);
+
+        let error = resolve_windows_deny_read_paths(&policy, &cwd)
+            .expect_err("case-sensitivity query failure must fail closed");
+
+        assert_eq!(error, "deny_read_resolution_case_sensitivity_query_failed");
+        assert!(!error.contains(tmp.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn unrelated_path_validation_failure_keeps_a_generic_sanitized_category() {
+        let error = anyhow::anyhow!("raw infrastructure detail");
+
+        assert_eq!(
+            sanitize_path_safety_error(&error),
+            "deny_read_resolution_path_validation_failed"
+        );
     }
 
     #[test]

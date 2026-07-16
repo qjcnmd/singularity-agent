@@ -15,7 +15,6 @@ use crate::path_safety::validate_plain_directory;
 use anyhow::Context;
 use anyhow::Result;
 use cap_std::fs::Dir;
-use dunce::canonicalize;
 use serde::Deserialize;
 use serde::Serialize;
 use singularity_core::PROTECTED_GIT_DIR_NAME;
@@ -43,23 +42,14 @@ use windows_sys::Win32::System::WindowsProgramming::FILE_CREATED;
 
 /// Build the exact ACL paths that should receive a deny-read ACE.
 ///
-/// We keep both the lexical policy path and, when it already exists, the
-/// canonical target. The lexical path covers the path users configured and lets
-/// missing exact denies be materialized later; the canonical path also covers
-/// an existing reparse-point target so a sandbox cannot read the same object
-/// through the resolved location.
+/// Missing exact denies remain eligible for later materialization. Existing reparse targets are
+/// rejected during preflight because pathname ACL enforcement intentionally never follows them.
 pub fn plan_deny_read_acl_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut planned = Vec::new();
     let mut seen = HashSet::new();
     for path in paths {
         ensure_case_insensitive_acl_path(path)?;
         push_planned_path(&mut planned, &mut seen, path.to_path_buf());
-        if std::fs::symlink_metadata(path).is_ok()
-            && let Ok(canonical) = canonicalize(path)
-        {
-            ensure_case_insensitive_acl_path(&canonical)?;
-            push_planned_path(&mut planned, &mut seen, canonical);
-        }
     }
     Ok(planned)
 }
@@ -429,15 +419,14 @@ mod tests {
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
     use crate::acl::revoke_deny_read_ace;
+    use crate::path_safety::CaseSensitivityTestOutcome;
     use crate::path_safety::ProtectedMetadataError;
-    use crate::path_safety::enable_case_sensitive_directory_for_test;
+    use crate::path_safety::override_case_sensitivity_for_test;
     use crate::path_safety::reject_case_sensitive_directory;
     use crate::token::LocalSid;
     use pretty_assertions::assert_eq;
-    use singularity_core::PROTECTED_GIT_DIR_NAME;
-    use std::collections::HashSet;
     use std::os::windows::process::CommandExt;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use tempfile::TempDir;
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
@@ -455,23 +444,16 @@ mod tests {
     }
 
     #[test]
-    fn plan_includes_existing_canonical_targets() {
+    fn plan_preserves_existing_plain_paths() {
         let tmp = TempDir::new().expect("tempdir");
         let existing = tmp.path().join("secret.env");
         std::fs::write(&existing, "secret").expect("write secret");
 
-        let planned: HashSet<PathBuf> = plan_deny_read_acl_paths(std::slice::from_ref(&existing))
-            .expect("plan existing target")
-            .into_iter()
-            .collect();
-        let expected: HashSet<PathBuf> = [
-            existing.clone(),
-            dunce::canonicalize(&existing).expect("canonical path"),
-        ]
-        .into_iter()
-        .collect();
-
-        assert_eq!(planned, expected);
+        assert_eq!(
+            plan_deny_read_acl_paths(std::slice::from_ref(&existing))
+                .expect("plan existing target"),
+            vec![existing]
+        );
     }
 
     #[test]
@@ -554,11 +536,10 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("case-sensitive-workspace");
         std::fs::create_dir(&workspace).expect("create workspace");
-        if !enable_case_sensitive_directory_for_test(&workspace) {
-            // Enabling the NTFS flag requires an elevated token on some hosts. The pure flag test
-            // above still fixes the contract; CI or elevated environments exercise this path.
-            return;
-        }
+        let _case_sensitive = override_case_sensitivity_for_test(
+            &workspace,
+            CaseSensitivityTestOutcome::CaseSensitive,
+        );
         let protected = workspace.join("secret.pem");
         let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
             .expect("test capability SID");
@@ -574,17 +555,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_reparse_target_under_case_sensitive_parent_is_rejected() {
+    fn final_reparse_target_is_rejected_during_acl_planning() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
-        let case_sensitive_parent = tmp.path().join("case-sensitive-targets");
-        let target = case_sensitive_parent.join("target");
+        let target = tmp.path().join("target");
         let alias = workspace.join("alias");
         std::fs::create_dir(&workspace).expect("create workspace");
-        std::fs::create_dir(&case_sensitive_parent).expect("create target parent");
-        if !enable_case_sensitive_directory_for_test(&case_sensitive_parent) {
-            return;
-        }
         std::fs::create_dir(&target).expect("create target");
         let junction_created = std::process::Command::new("cmd.exe")
             .raw_arg("/c")
@@ -595,41 +571,29 @@ mod tests {
             .output()
             .is_ok_and(|output| output.status.success() && alias.exists());
         assert!(junction_created, "junction fixture must be available");
-        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
-            .expect("test capability SID");
-
-        let result = unsafe { apply_deny_read_acls(std::slice::from_ref(&alias), sid.as_ptr()) };
-        if let Ok(applied) = &result {
-            for path in applied {
-                unsafe {
-                    revoke_deny_read_ace(path, sid.as_ptr()).expect("restore unexpected test ACE");
-                }
-            }
-        }
-        let error = result.expect_err("canonical target must be validated before ACL planning");
+        let error = plan_deny_read_acl_paths(std::slice::from_ref(&alias))
+            .expect_err("reparse target must be rejected before ACL side effects");
 
         assert_eq!(
             error.downcast_ref::<ProtectedMetadataError>(),
-            Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
-                path: case_sensitive_parent,
-            })
+            Some(&ProtectedMetadataError::ReparseTargetUnsupported { path: alias })
         );
     }
 
     #[test]
-    fn final_parent_recheck_failure_rolls_back_created_git_marker() {
+    fn final_parent_recheck_failure_rolls_back_created_sentinel() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
-        let sentinel = workspace.join(PROTECTED_GIT_DIR_NAME);
+        let sentinel = workspace.join(".singularity");
         std::fs::create_dir(&workspace).expect("create workspace");
-        let case_sensitivity_enabled = std::cell::Cell::new(false);
+        let case_sensitivity_override = std::cell::RefCell::new(None);
 
         let result = ensure_directory_materialized_with_hook(&sentinel, || {
-            case_sensitivity_enabled.set(enable_case_sensitive_directory_for_test(&workspace));
+            case_sensitivity_override.replace(Some(override_case_sensitivity_for_test(
+                &workspace,
+                CaseSensitivityTestOutcome::CaseSensitive,
+            )));
         });
-        if !case_sensitivity_enabled.get() {
-            return;
-        }
         let error = match result {
             Ok(materialized) => {
                 materialized
@@ -819,31 +783,5 @@ mod tests {
             }
         );
         assert!(!nested_git.exists());
-    }
-
-    #[test]
-    fn plan_includes_lexical_and_canonical_reparse_targets() {
-        let tmp = TempDir::new().expect("tempdir");
-        let target = tmp.path().join("target");
-        let alias = tmp.path().join("protected-link");
-        std::fs::create_dir(&target).expect("create target");
-        let link = format!("\"{}\"", alias.display());
-        let target_arg = format!("\"{}\"", target.display());
-        let junction_created = std::process::Command::new("cmd.exe")
-            .raw_arg("/c")
-            .raw_arg("mklink")
-            .raw_arg("/J")
-            .raw_arg(&link)
-            .raw_arg(&target_arg)
-            .output()
-            .is_ok_and(|output| output.status.success() && alias.exists());
-        assert!(junction_created, "junction fixture must be available");
-
-        let planned: HashSet<PathBuf> = plan_deny_read_acl_paths(std::slice::from_ref(&alias))
-            .expect("plan reparse target")
-            .into_iter()
-            .collect();
-        assert!(planned.contains(&alias));
-        assert!(planned.contains(&dunce::canonicalize(target).expect("canonical target")));
     }
 }

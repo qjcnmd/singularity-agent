@@ -1,6 +1,10 @@
 use crate::path_normalization::canonicalize_path_allow_missing;
+#[cfg(test)]
+use crate::path_normalization::lexical_path_key;
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::error::Error;
 use std::ffi::{OsStr, c_void};
 use std::fmt;
@@ -43,6 +47,9 @@ pub enum ProtectedMetadataError {
         path: PathBuf,
         code: u32,
     },
+    ReparseTargetUnsupported {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for ProtectedMetadataError {
@@ -67,11 +74,66 @@ impl fmt::Display for ProtectedMetadataError {
                 "case_sensitivity_query_failed: {} (code={code})",
                 path.display()
             ),
+            Self::ReparseTargetUnsupported { path } => {
+                write!(f, "unsupported_reparse_acl_target: {}", path.display())
+            }
         }
     }
 }
 
 impl Error for ProtectedMetadataError {}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaseSensitivityTestOutcome {
+    CaseSensitive,
+    QueryFailed(u32),
+}
+
+#[cfg(test)]
+thread_local! {
+    static CASE_SENSITIVITY_TEST_OVERRIDE:
+        RefCell<Option<(String, CaseSensitivityTestOutcome)>> = const { RefCell::new(None) };
+}
+
+/// Restores the previous thread-local case-sensitivity query seam when a test completes.
+#[cfg(test)]
+pub(crate) struct CaseSensitivityTestGuard {
+    previous: Option<(String, CaseSensitivityTestOutcome)>,
+}
+
+#[cfg(test)]
+impl Drop for CaseSensitivityTestGuard {
+    fn drop(&mut self) {
+        CASE_SENSITIVITY_TEST_OVERRIDE.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
+}
+
+/// Overrides one path's handle-based case-sensitivity query on the current test thread.
+#[cfg(test)]
+pub(crate) fn override_case_sensitivity_for_test(
+    path: &Path,
+    outcome: CaseSensitivityTestOutcome,
+) -> CaseSensitivityTestGuard {
+    let key = lexical_path_key(&canonicalize_path_allow_missing(path));
+    let previous =
+        CASE_SENSITIVITY_TEST_OVERRIDE.with(|current| current.replace(Some((key, outcome))));
+    CaseSensitivityTestGuard { previous }
+}
+
+#[cfg(test)]
+fn case_sensitivity_test_override(path: &Path) -> Option<CaseSensitivityTestOutcome> {
+    let key = lexical_path_key(&canonicalize_path_allow_missing(path));
+    CASE_SENSITIVITY_TEST_OVERRIDE.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .filter(|(override_key, _)| *override_key == key)
+            .map(|(_, outcome)| *outcome)
+    })
+}
 
 pub(crate) fn absolute_path_components(path: &Path) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
     let mut anchor = PathBuf::new();
@@ -125,6 +187,21 @@ pub(crate) fn reject_case_sensitive_directory(flags: u32, path: &Path) -> Result
 }
 
 pub(crate) fn ensure_case_insensitive_directory(file: &std::fs::File, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if let Some(outcome) = case_sensitivity_test_override(path) {
+        return match outcome {
+            CaseSensitivityTestOutcome::CaseSensitive => {
+                reject_case_sensitive_directory(FILE_CS_FLAG_CASE_SENSITIVE_DIR, path)
+            }
+            CaseSensitivityTestOutcome::QueryFailed(code) => Err(anyhow::Error::new(
+                ProtectedMetadataError::CaseSensitivityQueryFailed {
+                    path: path.to_path_buf(),
+                    code,
+                },
+            )),
+        };
+    }
+
     let mut information = FILE_CASE_SENSITIVE_INFO { Flags: 0 };
     if unsafe {
         GetFileInformationByHandleEx(
@@ -147,15 +224,13 @@ pub(crate) fn ensure_case_insensitive_directory(file: &std::fs::File, path: &Pat
 }
 
 #[cfg(test)]
-pub(crate) fn enable_case_sensitive_directory_for_test(path: &Path) -> bool {
+pub(crate) fn enable_case_sensitive_directory_for_test(path: &Path) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options
         .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-    let Ok(directory) = options.open(path) else {
-        return false;
-    };
+    let directory = options.open(path)?;
     let information = FILE_CASE_SENSITIVE_INFO {
         Flags: FILE_CS_FLAG_CASE_SENSITIVE_DIR,
     };
@@ -167,12 +242,11 @@ pub(crate) fn enable_case_sensitive_directory_for_test(path: &Path) -> bool {
             std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
         ) != 0
     };
-    if !enabled {
-        eprintln!("case-sensitive directory fixture unavailable: {}", unsafe {
-            GetLastError()
-        });
+    if enabled {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    enabled
 }
 
 pub(crate) fn validate_plain_directory(file: &std::fs::File, path: &Path) -> Result<()> {
@@ -317,24 +391,21 @@ pub fn ensure_case_insensitive_path_ancestors(path: &Path) -> Result<()> {
 
 /// Preflights an ACL path before a batch performs any SID, state, or filesystem side effect.
 pub fn ensure_case_insensitive_acl_path(path: &Path) -> Result<()> {
-    ensure_case_insensitive_path_ancestors(path)?;
     match std::fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.is_dir()
-                && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 =>
-        {
-            ensure_case_insensitive_directory_path(path)
+        Ok(_) => open_existing_acl_target(path, 0).map(drop),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure_case_insensitive_path_ancestors(path)
         }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error)
             .with_context(|| format!("inspect ACL path before side effects {}", path.display())),
     }
 }
 
-/// Validates the canonical identity used for mutex/state paths that may contain safe aliases.
-pub(crate) fn ensure_case_insensitive_state_path(path: &Path) -> Result<()> {
-    ensure_case_insensitive_acl_path(&canonicalize_path_allow_missing(path))
+/// Resolves and validates the one identity used for both state locking and state-file I/O.
+pub(crate) fn canonicalize_case_insensitive_state_path(path: &Path) -> Result<PathBuf> {
+    let canonical = canonicalize_path_allow_missing(path);
+    ensure_case_insensitive_acl_path(&canonical)?;
+    Ok(canonical)
 }
 
 /// Rejects an existing directory if it or any parent uses per-directory case sensitivity.
@@ -371,8 +442,48 @@ pub(crate) fn open_existing_acl_target(path: &Path, desired_access: u32) -> Resu
     let (file, _) = nt_open_relative(&current, final_component, desired_access, FILE_OPEN, 0)
         .with_context(|| format!("open ACL target {}", path.display()))?;
 
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect pinned ACL target {}", path.display()))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(anyhow::Error::new(
+            ProtectedMetadataError::ReparseTargetUnsupported {
+                path: path.to_path_buf(),
+            },
+        ));
+    }
+    if metadata.is_dir() {
+        ensure_case_insensitive_directory(&file, path)?;
+    }
+
     // Close the only check/open race before any ACL read or write occurs. The target handle is
     // already pinned, so a later pathname change cannot redirect the operation.
     ensure_case_insensitive_directory(&current, &current_path)?;
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProtectedMetadataError;
+    use super::enable_case_sensitive_directory_for_test;
+    use super::ensure_case_insensitive_acl_path;
+
+    #[test]
+    #[ignore = "requires permission to enable an NTFS per-directory case-sensitive flag"]
+    fn real_ntfs_case_sensitive_directory_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        enable_case_sensitive_directory_for_test(temp.path())
+            .expect("enable real NTFS case-sensitive directory fixture");
+        let protected = temp.path().join("protected");
+
+        let error = ensure_case_insensitive_acl_path(&protected)
+            .expect_err("real case-sensitive directory must fail closed");
+
+        assert_eq!(
+            error.downcast_ref::<ProtectedMetadataError>(),
+            Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
+                path: temp.path().to_path_buf(),
+            })
+        );
+    }
 }

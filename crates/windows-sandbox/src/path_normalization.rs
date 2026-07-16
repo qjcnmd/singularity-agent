@@ -54,19 +54,10 @@ pub fn canonicalize_path_allow_missing(path: &Path) -> PathBuf {
     }
 }
 
-/// Returns a canonical identity for a state path whose final components may not exist yet.
-///
-/// State files are often locked before their parent directory or file is created. Resolve the
-/// nearest existing ancestor so ordinary, verbatim, and junction spellings still share one
-/// cross-process identity, then append the missing tail without following it.
-pub fn canonical_path_key_allow_missing(path: &Path) -> String {
-    lexical_path_key(&canonicalize_path_allow_missing(path))
-}
-
 #[cfg(test)]
 mod tests {
     use super::canonical_path_key;
-    use super::canonical_path_key_allow_missing;
+    use super::canonicalize_path_allow_missing;
     use super::lexical_path_key;
     use super::normalized_path_text;
     use pretty_assertions::assert_eq;
@@ -109,8 +100,8 @@ mod tests {
         let verbatim = PathBuf::from(format!(r"\\?\{}", ordinary.display()));
 
         assert_eq!(
-            canonical_path_key_allow_missing(&ordinary),
-            canonical_path_key_allow_missing(&verbatim)
+            lexical_path_key(&canonicalize_path_allow_missing(&ordinary)),
+            lexical_path_key(&canonicalize_path_allow_missing(&verbatim))
         );
     }
 }

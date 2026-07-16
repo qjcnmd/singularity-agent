@@ -57,10 +57,9 @@ fn persist_caps(path: &Path, caps: &CapSids) -> Result<()> {
     Ok(())
 }
 
-fn load_or_create_cap_sids_unlocked(sandbox_home: &Path) -> Result<CapSids> {
-    let path = cap_sid_file(sandbox_home);
+fn load_or_create_cap_sids_unlocked(path: &Path) -> Result<CapSids> {
     if path.exists() {
-        let txt = fs::read_to_string(&path)
+        let txt = fs::read_to_string(path)
             .with_context(|| format!("read cap sid file {}", path.display()))?;
         let t = txt.trim();
         if t.starts_with('{') || t.ends_with('}') {
@@ -80,7 +79,7 @@ fn load_or_create_cap_sids_unlocked(sandbox_home: &Path) -> Result<CapSids> {
                 workspace_by_cwd: HashMap::new(),
                 writable_root_by_path: HashMap::new(),
             };
-            persist_caps(&path, &caps)?;
+            persist_caps(path, &caps)?;
             return Ok(caps);
         }
         anyhow::bail!("empty cap sid file {}", path.display());
@@ -91,28 +90,29 @@ fn load_or_create_cap_sids_unlocked(sandbox_home: &Path) -> Result<CapSids> {
         workspace_by_cwd: HashMap::new(),
         writable_root_by_path: HashMap::new(),
     };
-    persist_caps(&path, &caps)?;
+    persist_caps(path, &caps)?;
     Ok(caps)
 }
 
 pub fn load_or_create_cap_sids(sandbox_home: &Path) -> Result<CapSids> {
-    let _lock = lock_state(&cap_sid_file(sandbox_home))?;
-    load_or_create_cap_sids_unlocked(sandbox_home)
+    let lock = lock_state(&cap_sid_file(sandbox_home))?;
+    load_or_create_cap_sids_unlocked(lock.path())
 }
 
 /// Returns the workspace-specific capability SID for `cwd`, creating and persisting it if missing.
 pub fn workspace_cap_sid_for_cwd(sandbox_home: &Path, cwd: &Path) -> Result<String> {
     ensure_case_insensitive_acl_path(cwd)?;
     let path = cap_sid_file(sandbox_home);
-    let _lock = lock_state(&path)?;
-    let mut caps = load_or_create_cap_sids_unlocked(sandbox_home)?;
+    let lock = lock_state(&path)?;
+    let path = lock.path();
+    let mut caps = load_or_create_cap_sids_unlocked(path)?;
     let key = canonical_path_key(cwd);
     if let Some(sid) = caps.workspace_by_cwd.get(&key) {
         return Ok(sid.clone());
     }
     let sid = make_random_cap_sid_string();
     caps.workspace_by_cwd.insert(key, sid.clone());
-    persist_caps(&path, &caps)?;
+    persist_caps(path, &caps)?;
     Ok(sid)
 }
 
@@ -120,15 +120,16 @@ pub fn workspace_cap_sid_for_cwd(sandbox_home: &Path, cwd: &Path) -> Result<Stri
 pub fn writable_root_cap_sid_for_path(sandbox_home: &Path, root: &Path) -> Result<String> {
     ensure_case_insensitive_acl_path(root)?;
     let path = cap_sid_file(sandbox_home);
-    let _lock = lock_state(&path)?;
-    let mut caps = load_or_create_cap_sids_unlocked(sandbox_home)?;
+    let lock = lock_state(&path)?;
+    let path = lock.path();
+    let mut caps = load_or_create_cap_sids_unlocked(path)?;
     let key = canonical_path_key(root);
     if let Some(sid) = caps.writable_root_by_path.get(&key) {
         return Ok(sid.clone());
     }
     let sid = make_random_cap_sid_string();
     caps.writable_root_by_path.insert(key, sid.clone());
-    persist_caps(&path, &caps)?;
+    persist_caps(path, &caps)?;
     Ok(sid)
 }
 

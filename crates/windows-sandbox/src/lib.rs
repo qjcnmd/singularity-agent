@@ -420,6 +420,7 @@ mod windows_impl {
     use super::spawn_prep::SpawnPrepOptions;
     use super::spawn_prep::allow_null_device_for_workspace_write;
     use super::spawn_prep::apply_restricted_token_acl_rules;
+    use super::spawn_prep::plan_restricted_token_acl_rules;
     use super::spawn_prep::prepare_restricted_token_security;
     use super::spawn_prep::prepare_restricted_token_spawn_context;
     use super::spawn_prep::restricted_token_capability_roots;
@@ -653,6 +654,23 @@ mod windows_impl {
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
             .collect::<Vec<_>>();
+        if !requested_permissions.has_full_disk_read_access() {
+            anyhow::bail!(
+                "Restricted read-only access requires the elevated Windows sandbox backend"
+            );
+        }
+        // WRITE_RESTRICTED tokens consult restricting SIDs only for writes, so this
+        // backend cannot make capability-SID deny-read ACLs authoritative.
+        if !additional_deny_read_paths.is_empty() {
+            anyhow::bail!("deny-read overrides require the elevated Windows sandbox backend");
+        }
+        let acl_plan = plan_restricted_token_acl_rules(
+            &requested_permissions,
+            cwd,
+            &env_map,
+            &additional_deny_read_paths,
+            &additional_deny_write_paths,
+        )?;
         let common = prepare_restricted_token_spawn_context(
             permission_profile,
             workspace_roots,
@@ -674,16 +692,6 @@ mod windows_impl {
             .is_some_and(WindowsSandboxCancellationToken::is_cancelled)
         {
             return Ok(cancelled_capture_result());
-        }
-        if !permissions.has_full_disk_read_access() {
-            anyhow::bail!(
-                "Restricted read-only access requires the elevated Windows sandbox backend"
-            );
-        }
-        // WRITE_RESTRICTED tokens consult restricting SIDs only for writes, so this
-        // backend cannot make capability-SID deny-read ACLs authoritative.
-        if !additional_deny_read_paths.is_empty() {
-            anyhow::bail!("deny-read overrides require the elevated Windows sandbox backend");
         }
         let capability_roots =
             restricted_token_capability_roots(&permissions, &current_dir, &env_map, sandbox_home);
@@ -707,12 +715,9 @@ mod windows_impl {
             return Ok(cancelled_capture_result());
         }
         apply_restricted_token_acl_rules(
-            &permissions,
+            &acl_plan,
             sandbox_home,
             &current_dir,
-            &env_map,
-            &additional_deny_read_paths,
-            &additional_deny_write_paths,
             RestrictedTokenAclSids {
                 readonly_sid: security.readonly_sid.as_ref(),
                 readonly_sid_str: security.readonly_sid_str.as_deref(),
@@ -838,18 +843,17 @@ mod windows_impl {
             return Ok(());
         }
 
-        ensure_sandbox_home_exists(sandbox_home)?;
         let current_dir = cwd.to_path_buf();
+        let acl_plan =
+            plan_restricted_token_acl_rules(&permissions, &current_dir, env_map, &[], &[])?;
+        ensure_sandbox_home_exists(sandbox_home)?;
         let capability_roots =
             restricted_token_capability_roots(&permissions, &current_dir, env_map, sandbox_home);
         let write_root_sids = root_capability_sids(sandbox_home, cwd, capability_roots)?;
         apply_restricted_token_acl_rules(
-            &permissions,
+            &acl_plan,
             sandbox_home,
             &current_dir,
-            env_map,
-            &[],
-            &[],
             RestrictedTokenAclSids {
                 readonly_sid: None,
                 readonly_sid_str: None,
@@ -862,6 +866,11 @@ mod windows_impl {
 
     #[cfg(test)]
     mod tests {
+        use crate::absolute_path::AbsolutePathBuf;
+        use crate::cap::cap_sid_file;
+        use crate::path_safety::CaseSensitivityTestOutcome;
+        use crate::path_safety::ProtectedMetadataError;
+        use crate::path_safety::override_case_sensitivity_for_test;
         use crate::permissions::NetworkSandboxPolicy;
         use crate::permissions::PermissionProfile;
         use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
@@ -945,6 +954,54 @@ mod windows_impl {
             assert!(result.cancelled);
             assert!(result.stdout.is_empty());
             assert!(result.stderr.is_empty());
+        }
+
+        #[test]
+        fn restricted_token_rejects_the_acl_batch_before_state_or_spawn_setup() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let sandbox_home = temp.path().join("singularity-home");
+            let workspace = temp.path().join("workspace");
+            let rejected = temp.path().join("rejected");
+            std::fs::create_dir(&workspace).expect("create workspace");
+            std::fs::create_dir(&rejected).expect("create rejected path");
+            let _case_sensitive = override_case_sensitivity_for_test(
+                &rejected,
+                CaseSensitivityTestOutcome::CaseSensitive,
+            );
+            let rejected =
+                AbsolutePathBuf::from_absolute_path(&rejected).expect("absolute rejected path");
+
+            let error = match super::run_windows_sandbox_capture_with_filesystem_overrides(
+                &workspace_profile(NetworkSandboxPolicy::Enabled),
+                &[],
+                &sandbox_home,
+                vec!["cmd.exe".to_string()],
+                &workspace,
+                HashMap::new(),
+                Some(1_000),
+                None,
+                &[],
+                &[rejected],
+                false,
+            ) {
+                Ok(_) => panic!("invalid compound ACL request must fail during pure preflight"),
+                Err(error) => error,
+            };
+
+            assert_eq!(
+                error.downcast_ref::<ProtectedMetadataError>(),
+                Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
+                    path: temp.path().join("rejected"),
+                })
+            );
+            assert!(
+                !cap_sid_file(&sandbox_home).exists(),
+                "failed preflight must not persist capability SIDs"
+            );
+            assert!(
+                !sandbox_home.join(".sandbox").exists(),
+                "failed preflight must not create spawn state or logs"
+            );
         }
     }
 }

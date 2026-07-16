@@ -1178,8 +1178,9 @@ mod tests {
     use super::path_contains_reparse_component;
     use super::revoke_deny_read_ace;
     use super::set_target_dacl;
+    use crate::path_safety::CaseSensitivityTestOutcome;
     use crate::path_safety::ProtectedMetadataError;
-    use crate::path_safety::enable_case_sensitive_directory_for_test;
+    use crate::path_safety::override_case_sensitivity_for_test;
     use crate::token::LocalSid;
     use std::ffi::c_void;
     use std::fs::OpenOptions;
@@ -1274,9 +1275,8 @@ mod tests {
         let parent = tmp.path().join("case-sensitive-parent");
         let target = parent.join("target.txt");
         std::fs::create_dir(&parent).expect("create parent");
-        if !enable_case_sensitive_directory_for_test(&parent) {
-            return;
-        }
+        let _case_sensitive =
+            override_case_sensitivity_for_test(&parent, CaseSensitivityTestOutcome::CaseSensitive);
         std::fs::write(&target, "fixture").expect("write target");
         let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
             .expect("test capability SID");
@@ -1451,11 +1451,10 @@ mod tests {
         assert!(junction_created, "junction fixture must be available");
 
         let error = unsafe { fetch_dacl_handle(&alias) }.expect_err("reparse target rejected");
-        let typed = error
-            .downcast_ref::<WindowsAclError>()
-            .expect("typed Windows ACL error");
-        assert_eq!(typed.operation, AclOperation::ReparseTargetUnsupported);
-        assert_eq!(typed.code, 50);
+        assert_eq!(
+            error.downcast_ref::<ProtectedMetadataError>(),
+            Some(&ProtectedMetadataError::ReparseTargetUnsupported { path: alias })
+        );
     }
 
     #[test]

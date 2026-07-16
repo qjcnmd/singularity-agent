@@ -74,6 +74,13 @@ pub(crate) struct RestrictedTokenAclSids<'a> {
     pub(crate) write_root_sids: &'a [RootCapabilitySid],
 }
 
+/// Fully validated ACL inputs consumed by restricted-token security setup.
+pub(crate) struct RestrictedTokenAclPlan {
+    allow: Vec<PathBuf>,
+    deny: Vec<PathBuf>,
+    deny_read: Vec<PathBuf>,
+}
+
 fn prepare_spawn_context_common(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
@@ -207,6 +214,12 @@ pub(crate) fn root_capability_sids(
     roots.sort_by_key(|root| canonicalize_path(root.as_path()));
     roots.dedup_by(|a, b| canonicalize_path(a.as_path()) == canonicalize_path(b.as_path()));
 
+    // Validate the complete compound request before the first capability SID is persisted.
+    ensure_case_insensitive_acl_path(cwd)?;
+    for root in &roots {
+        ensure_case_insensitive_acl_path(root)?;
+    }
+
     let mut out = Vec::with_capacity(roots.len());
     for root in roots {
         let sid_str = workspace_write_cap_sid_for_root(sandbox_home, cwd, &root)?;
@@ -258,28 +271,38 @@ pub(crate) fn allow_null_device_for_workspace_write(is_workspace_write: bool) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_restricted_token_acl_rules(
+pub(crate) fn plan_restricted_token_acl_rules(
     permissions: &ResolvedWindowsSandboxPermissions,
-    sandbox_home: &Path,
     current_dir: &Path,
     env_map: &HashMap<String, String>,
     additional_deny_read_paths: &[PathBuf],
     additional_deny_write_paths: &[PathBuf],
-    acl_sids: RestrictedTokenAclSids<'_>,
-) -> Result<()> {
+) -> Result<RestrictedTokenAclPlan> {
     let AllowDenyPaths { allow, mut deny } =
         compute_allow_paths_for_permissions(permissions, current_dir, env_map);
     deny.extend(additional_deny_write_paths.iter().cloned());
-    plan_deny_read_acl_paths(additional_deny_read_paths)?;
+    let deny_read = plan_deny_read_acl_paths(additional_deny_read_paths)?;
     for path in &allow {
         ensure_case_insensitive_acl_path(path)?;
     }
     for path in &deny {
         ensure_case_insensitive_acl_path(path)?;
     }
+    Ok(RestrictedTokenAclPlan {
+        allow: allow.into_iter().collect(),
+        deny: deny.into_iter().collect(),
+        deny_read,
+    })
+}
+
+pub(crate) fn apply_restricted_token_acl_rules(
+    plan: &RestrictedTokenAclPlan,
+    sandbox_home: &Path,
+    current_dir: &Path,
+    acl_sids: RestrictedTokenAclSids<'_>,
+) -> Result<()> {
     let mut materialized = HashMap::new();
-    for path in &deny {
+    for path in &plan.deny {
         // Explicit carveouts must exist before the command starts so the sandbox cannot create
         // them under a writable parent first. The helper rejects reparse-point ancestors.
         match std::fs::symlink_metadata(path) {
@@ -295,18 +318,18 @@ pub(crate) fn apply_restricted_token_acl_rules(
     }
     unsafe {
         if let Some(readonly_sid) = acl_sids.readonly_sid {
-            for p in &allow {
+            for p in &plan.allow {
                 add_allow_ace(p, readonly_sid.as_ptr())?;
             }
         } else {
-            for p in &allow {
+            for p in &plan.allow {
                 let Some(root_sid) = matching_root_capability(p, acl_sids.write_root_sids) else {
                     continue;
                 };
                 ensure_allow_write_aces(p, &[root_sid.sid.as_ptr()])?;
             }
         }
-        for p in &deny {
+        for p in &plan.deny {
             for root_sid in deny_root_capabilities_for_path(p, acl_sids.write_root_sids) {
                 if let Some(materialized) = materialized.get(&lexical_path_key(p)) {
                     materialized.add_deny_write_ace(root_sid.sid.as_ptr())?;
@@ -315,7 +338,7 @@ pub(crate) fn apply_restricted_token_acl_rules(
                 }
             }
         }
-        if !additional_deny_read_paths.is_empty() {
+        if !plan.deny_read.is_empty() {
             if let Some(readonly_sid) = acl_sids.readonly_sid {
                 let Some(readonly_sid_str) = acl_sids.readonly_sid_str else {
                     anyhow::bail!("readonly capability SID string missing");
@@ -323,7 +346,7 @@ pub(crate) fn apply_restricted_token_acl_rules(
                 sync_persistent_deny_read_acls(
                     sandbox_home,
                     readonly_sid_str,
-                    additional_deny_read_paths,
+                    &plan.deny_read,
                     readonly_sid.as_ptr(),
                 )?;
             } else {
@@ -331,7 +354,7 @@ pub(crate) fn apply_restricted_token_acl_rules(
                     sync_persistent_deny_read_acls(
                         sandbox_home,
                         &root_sid.sid_str,
-                        additional_deny_read_paths,
+                        &plan.deny_read,
                         root_sid.sid.as_ptr(),
                     )?;
                 }
@@ -366,8 +389,12 @@ mod tests {
     use super::restricted_token_capability_roots;
     use super::root_capability_sids;
     use crate::absolute_path::AbsolutePathBuf;
+    use crate::cap::cap_sid_file;
     use crate::cap::load_or_create_cap_sids;
     use crate::cap::workspace_write_cap_sid_for_root;
+    use crate::path_safety::CaseSensitivityTestOutcome;
+    use crate::path_safety::ProtectedMetadataError;
+    use crate::path_safety::override_case_sensitivity_for_test;
     use crate::permissions::NetworkSandboxPolicy;
     use crate::permissions::PermissionProfile;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
@@ -551,6 +578,43 @@ mod tests {
         assert!(sid_strs.contains(&active_sid));
         assert!(!sid_strs.contains(&stale_sid));
         assert!(!sid_strs.contains(&caps.workspace));
+    }
+
+    #[test]
+    fn root_capability_batch_rejects_before_persisting_any_sid() {
+        let temp = TempDir::new().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let workspace = temp.path().join("workspace");
+        let ordinary_root = temp.path().join("a-ordinary-root");
+        let rejected_root = temp.path().join("z-rejected-root");
+        std::fs::create_dir_all(&sandbox_home).expect("create singularity home");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&ordinary_root).expect("create ordinary root");
+        std::fs::create_dir_all(&rejected_root).expect("create rejected root");
+        let _case_sensitive = override_case_sensitivity_for_test(
+            &rejected_root,
+            CaseSensitivityTestOutcome::CaseSensitive,
+        );
+
+        let error = match root_capability_sids(
+            &sandbox_home,
+            &workspace,
+            vec![ordinary_root, rejected_root.clone()],
+        ) {
+            Ok(_) => panic!("compound capability request must fail before SID persistence"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.downcast_ref::<ProtectedMetadataError>(),
+            Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
+                path: rejected_root,
+            })
+        );
+        assert!(
+            !cap_sid_file(&sandbox_home).exists(),
+            "failed batch must not persist a SID for an earlier root"
+        );
     }
 
     #[test]
