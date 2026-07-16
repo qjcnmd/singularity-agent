@@ -293,6 +293,15 @@ fn protocol_v1_id_params_are_camel_case_on_wire() {
 }
 
 #[test]
+fn thread_id_params_reject_unknown_fields() {
+    let result = serde_json::from_value::<ThreadIdParams>(serde_json::json!({
+        "threadId": "thread_1",
+        "sandboxMode": "read-only"
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
 fn item_kind_uses_codex_style_wire_names() {
     assert_eq!(
         serde_json::to_value(ItemKind::CommandExecution).unwrap(),

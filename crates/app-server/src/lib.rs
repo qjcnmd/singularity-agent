@@ -21,7 +21,7 @@ use singularity_agent::{
 };
 use singularity_core::{
     CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
-    load_project_instructions_from_cwd,
+    load_project_instructions,
 };
 use singularity_model::{Provider, ProviderConfigSnapshot};
 use singularity_policy::{
@@ -1782,7 +1782,7 @@ fn agent_loop_input(
     thread: &Thread,
     params: &TurnStartParams,
     turn_id: &str,
-    cwd: &std::path::Path,
+    workspace_root: &std::path::Path,
     history: &[ConversationMessage],
 ) -> Result<AgentLoopInput, ProjectInstructionError> {
     let goal = params
@@ -1804,8 +1804,11 @@ fn agent_loop_input(
     let mut input = AgentLoopInput::new(&params.thread_id, turn_id, goal)
         .with_history(history)
         .with_model_name(thread.model.clone());
-    if let Some(instructions) = load_project_instructions_from_cwd(cwd)? {
-        input = input.with_project_instructions(instructions.content);
+    if let Some(instructions) = load_project_instructions(workspace_root, workspace_root)? {
+        input = input.with_project_instructions_snapshot(
+            instructions.content,
+            instructions.aggregate_digest,
+        );
     }
     Ok(input)
 }
@@ -2311,25 +2314,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_loop_loads_hierarchical_agents_md_from_thread_cwd() {
+    fn agent_loop_loads_bounded_agents_md_from_thread_cwd() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let workspace = temp
+        let ancestor = temp
             .path()
             .join("SINGULARITY_API_KEY=must-not-leak")
-            .join("workspace");
-        let cwd = workspace.join("crates").join("agent");
-        std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
-        std::fs::create_dir_all(&cwd).expect("nested cwd");
-        std::fs::write(workspace.join("AGENTS.md"), "root instructions").expect("root agents");
-        std::fs::write(
-            workspace.join("crates").join("AGENTS.md"),
-            "crate instructions",
-        )
-        .expect("crate agents");
-        std::fs::write(cwd.join("AGENTS.md"), "agent instructions").expect("agent agents");
+            .join("ancestor");
+        let workspace = ancestor.join("workspace");
+        std::fs::create_dir_all(ancestor.join(".git")).expect("ancestor git marker");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(ancestor.join("AGENTS.md"), "ancestor instructions")
+            .expect("ancestor agents");
+        std::fs::write(workspace.join("AGENTS.md"), "workspace instructions")
+            .expect("workspace agents");
+        std::fs::write(workspace.join("AGENTS.override.md"), "workspace override")
+            .expect("workspace override");
         let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
         let thread = store
-            .create_thread(Some("gpt-test"), Some(&cwd.to_string_lossy()))
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
             .expect("thread");
         let params = TurnStartParams {
             thread_id: thread.thread_id.clone(),
@@ -2367,9 +2369,8 @@ mod tests {
         assert_eq!(requests[0].messages[1].role, ModelRole::User);
         let developer = &requests[0].messages[0].content;
         assert!(developer.starts_with("You are a coding agent working in the current workspace."));
-        assert!(developer.ends_with(
-            "Project instructions:\nroot instructions\n\ncrate instructions\n\nagent instructions"
-        ));
+        assert!(developer.ends_with("Project instructions:\nworkspace override"));
+        assert!(!developer.contains("ancestor instructions"));
         assert_eq!(requests[0].messages[1].content, "user goal");
         let hidden_workspace_marker = workspace.to_string_lossy();
         assert!(!requests[0].tools.iter().any(|tool| {
@@ -3293,6 +3294,8 @@ mod tests {
         let db_path = dir.path().join("sessions.sqlite3");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(workspace.join("AGENTS.md"), "stable project instructions")
+            .expect("stable agents");
         let file_path = workspace.join("README.md");
         std::fs::write(&file_path, "before").expect("write readme");
         let store = SessionStore::open(&db_path).expect("store");
@@ -3447,6 +3450,11 @@ mod tests {
             .expect("record approval");
         let pending_payload = recorded.pending_tool_call.expect("checkpoint payload");
         assert_eq!(pending_payload["checkpoint_version"], 1);
+        assert!(
+            pending_payload["project_instructions_digest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        );
         assert!(pending_payload["messages"].is_array());
         assert!(pending_payload["tool_results"].is_array());
 
@@ -3521,6 +3529,158 @@ mod tests {
         assert_eq!(
             requests[0].messages[5].tool_call_id.as_deref(),
             Some("call_1")
+        );
+    }
+
+    #[test]
+    fn agent_loop_approval_resume_fails_closed_when_project_instructions_change() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(workspace.join("AGENTS.md"), "initial project instructions")
+            .expect("initial agents");
+        let file_path = workspace.join("README.md");
+        std::fs::write(&file_path, "before").expect("write readme");
+        let store = SessionStore::open(&db_path).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "edit readme"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "edit readme".to_string(),
+            }],
+        };
+        let mut initial_response =
+            ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "before");
+        initial_response.tool_calls.push(ModelToolCall {
+            tool_call_id: "call_1".to_string(),
+            tool_name: TOOL_EDIT.to_string(),
+            arguments: json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            }),
+            raw_arguments: json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            })
+            .to_string(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+        let initial_seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+        let blocked_status = server
+            .run_agent_loop_with_provider(
+                StaticProvider {
+                    responses: vec![initial_response],
+                    seen_requests: Arc::clone(&initial_seen_requests),
+                },
+                &thread,
+                &params,
+                &turn.turn_id,
+                &[],
+                &CancellationToken::new(),
+            )
+            .expect("initial agent loop");
+        assert_eq!(blocked_status.status, AgentStatus::Blocked);
+        server
+            .commit_turn_run_status(turn.clone(), &blocked_status, &CancellationToken::new())
+            .expect("commit blocked turn");
+        assert!(
+            !serde_json::to_string(&blocked_status)
+                .expect("blocked status json")
+                .contains("project_instructions_digest")
+        );
+        let initial_request_json =
+            serde_json::to_string(&initial_seen_requests.lock().expect("initial requests")[0])
+                .expect("initial request json");
+        assert!(!initial_request_json.contains("AGENTS.md"));
+        assert!(!initial_request_json.contains(workspace.to_string_lossy().as_ref()));
+        for trace in server
+            .store
+            .list_trace(&thread.thread_id)
+            .expect("thread trace")
+        {
+            assert!(
+                !serde_json::to_string(&trace.payload)
+                    .expect("trace json")
+                    .contains("project_instructions_digest")
+            );
+        }
+        drop(server);
+
+        std::fs::write(
+            workspace.join("AGENTS.override.md"),
+            "replacement project instructions",
+        )
+        .expect("override agents");
+        let server = app_server(SessionStore::open(&db_path).expect("reopen store"))
+            .with_sandbox_backend(CompletedSandboxBackend);
+        let request = server
+            .store
+            .get_pending_approval(&format!("approval_{}_call_1", turn.turn_id))
+            .expect("stored approval");
+        let decision = ApprovalDecision::new(
+            request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "approved",
+        );
+        let recorded = server
+            .store
+            .record_approval_decision(&decision, "approval", "approval decision recorded")
+            .expect("record approval");
+        let pending_payload = recorded.pending_tool_call.expect("checkpoint payload");
+        let checkpoint_digest = pending_payload["project_instructions_digest"]
+            .as_str()
+            .expect("checkpoint project instruction digest");
+        assert!(checkpoint_digest.starts_with("sha256:"));
+
+        let resumed_seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let resumed = server
+            .resume_agent_loop_after_gate(
+                &request,
+                &decision,
+                Some(pending_payload),
+                StaticProvider {
+                    responses: vec![ModelTurnResponse::completed(
+                        "model_request_turn_1_0",
+                        "response_1",
+                        "must not run",
+                    )],
+                    seen_requests: Arc::clone(&resumed_seen_requests),
+                },
+                &CancellationToken::new(),
+            )
+            .expect("resume")
+            .expect("terminal status");
+
+        assert_eq!(resumed.1.status, AgentStatus::Failed);
+        assert_eq!(
+            resumed.1.error.as_deref(),
+            Some("approval checkpoint project instructions digest mismatch")
+        );
+        assert!(
+            resumed_seen_requests
+                .lock()
+                .expect("resumed requests")
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("read readme"),
+            "before"
         );
     }
 

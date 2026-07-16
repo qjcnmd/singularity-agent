@@ -442,6 +442,9 @@ pub struct AgentLoopInput {
     #[serde(skip)]
     #[schemars(skip)]
     pub project_instructions: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub project_instructions_digest: Option<String>,
     pub input: Vec<AgentContextItem>,
     pub interrupted: bool,
     pub max_turns: u32,
@@ -464,6 +467,7 @@ impl AgentLoopInput {
             turn_id,
             model_preferences: ModelPreferences::default(),
             project_instructions: None,
+            project_instructions_digest: None,
             input: vec![AgentContextItem::user("input_1", goal.into())],
             interrupted: false,
             max_turns: DEFAULT_MAX_AGENT_LOOP_TURNS,
@@ -497,6 +501,19 @@ impl AgentLoopInput {
     pub fn with_project_instructions(mut self, instructions: impl Into<String>) -> Self {
         let instructions = instructions.into();
         self.project_instructions = (!instructions.trim().is_empty()).then_some(instructions);
+        self.project_instructions_digest = None;
+        self
+    }
+
+    /// 附加本轮项目指令正文及其不可公开的来源聚合摘要。
+    pub fn with_project_instructions_snapshot(
+        mut self,
+        instructions: impl Into<String>,
+        aggregate_digest: impl Into<String>,
+    ) -> Self {
+        let instructions = instructions.into();
+        self.project_instructions = (!instructions.trim().is_empty()).then_some(instructions);
+        self.project_instructions_digest = Some(aggregate_digest.into());
         self
     }
 
@@ -907,6 +924,8 @@ struct AgentLoopCheckpoint {
     checkpoint_version: u32,
     thread_id: String,
     turn_id: String,
+    #[serde(default)]
+    project_instructions_digest: Option<String>,
     messages: Vec<ModelMessage>,
     tool_results: Vec<CheckpointToolResult>,
     used_approval_grants: Vec<String>,
@@ -1108,6 +1127,7 @@ impl AgentLoopState {
             checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
             thread_id: input.thread_id.clone(),
             turn_id: input.turn_id.clone(),
+            project_instructions_digest: input.project_instructions_digest.clone(),
             messages: self.messages.clone(),
             tool_results: self
                 .tool_results
@@ -3038,6 +3058,9 @@ fn restore_checkpoint(
     }
     if checkpoint.turn_id != input.turn_id {
         return Err("approval checkpoint turn mismatch".to_string());
+    }
+    if checkpoint.project_instructions_digest != input.project_instructions_digest {
+        return Err("approval checkpoint project instructions digest mismatch".to_string());
     }
     if checkpoint.pending_tool_call != *pending {
         return Err("approval checkpoint tool call mismatch".to_string());

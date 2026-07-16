@@ -219,6 +219,33 @@ fn v8_threads_migrate_to_policy_snapshot_defaults() {
     );
 }
 
+// 验证非空 v8 库即使预先出现完整 v9 列，也不能在缺少 migration marker 时被认领。
+#[test]
+fn complete_thread_policy_columns_without_marker_fail_closed_for_nonempty_v8_store() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("create current store");
+    store
+        .create_thread(Some("gpt-test"), Some("C:/repo"))
+        .expect("create thread");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "delete from schema_migrations where migration_id = '0009_thread_policy_snapshot';
+             update schema_meta set schema_version = 8;",
+        )
+        .expect("remove migration marker");
+    drop(connection);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(message))
+            if message.contains("columns exist without migration marker")
+    ));
+}
+
 // 验证 marker 或列只完成一半时，store 不会猜测并继续运行。
 #[test]
 fn partial_thread_policy_migration_fails_closed() {

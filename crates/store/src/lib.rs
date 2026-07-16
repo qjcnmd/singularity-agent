@@ -2588,6 +2588,17 @@ impl SessionStore {
                 "thread policy schema is partially migrated".to_string(),
             ));
         }
+        if !applied && has_complete_schema {
+            let has_threads =
+                transaction.query_row("select exists(select 1 from threads)", [], |row| {
+                    row.get::<_, bool>(0)
+                })?;
+            if schema_version != Some(PREVIOUS_SCHEMA_VERSION) || has_threads {
+                return Err(StoreError::InvalidState(
+                    "thread policy columns exist without migration marker".to_string(),
+                ));
+            }
+        }
         if !has_complete_schema {
             transaction.execute(
                 "alter table threads add column sandbox_mode text not null default '\"workspace-write\"'",

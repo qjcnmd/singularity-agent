@@ -259,6 +259,7 @@ pub struct ThreadStartParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 /// 只包含 thread id 的请求参数。
 pub struct ThreadIdParams {
     #[serde(rename = "threadId")]

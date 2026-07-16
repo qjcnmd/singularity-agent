@@ -18,7 +18,7 @@ use singularity_agent::{
     AgentVerificationRequirement, UPDATE_PLAN_TOOL, agent_control_tool_specs,
     eligible_command_scope_digests,
 };
-use singularity_core::{contains_sensitive_text, load_project_instructions_from_cwd};
+use singularity_core::{contains_sensitive_text, load_project_instructions};
 use singularity_evaluation::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
     EvaluationBlocker, EvaluationCapability, EvaluationEvidenceSummary, EvaluationManifest,
@@ -1242,7 +1242,7 @@ fn run_agent_stage(
             );
         }
     };
-    let project_instructions = match load_project_instructions_from_cwd(agent_dir) {
+    let project_instructions = match load_project_instructions(agent_dir, agent_dir) {
         Ok(instructions) => instructions,
         Err(error) => {
             return blocked_agent_stage(
@@ -1279,7 +1279,10 @@ fn run_agent_stage(
     .with_max_turns(DEFAULT_AGENT_MAX_TURNS)
     .with_verification_requirements(verification_requirements);
     if let Some(instructions) = project_instructions {
-        input = input.with_project_instructions(instructions.content);
+        input = input.with_project_instructions_snapshot(
+            instructions.content,
+            instructions.aggregate_digest,
+        );
     }
     let agent_started = Instant::now();
     let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)

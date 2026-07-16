@@ -268,6 +268,21 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         "Thread is archived; resume it before starting a turn"
     );
 
+    let invalid_resume = server
+        .handle_json(&format!(
+            r#"{{"method":"thread/resume","id":433,"params":{{"threadId":"{thread_id}","sandboxMode":"workspace-write"}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(invalid_resume[0]["error"]["code"], -32602);
+    let unchanged = server
+        .handle_json(&format!(
+            r#"{{"method":"thread/read","id":434,"params":{{"threadId":"{thread_id}"}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(unchanged[0]["result"]["thread"]["status"], "archived");
+    assert_eq!(unchanged[0]["result"]["thread"]["sandboxMode"], "read-only");
+    assert_eq!(unchanged[0]["result"]["thread"]["approvalPolicy"], "never");
+
     let resumed = server
         .handle_json(&format!(
             r#"{{"method":"thread/resume","id":432,"params":{{"threadId":"{thread_id}"}}}}"#
