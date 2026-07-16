@@ -1914,6 +1914,7 @@ mod tests {
                 dunce::canonicalize(&command_git).expect("canonical command .git"),
                 command_cwd.join(".agents"),
                 command_cwd.join(".singularity"),
+                extra_write_root.join(".git"),
                 extra_write_root.join(".agents"),
                 dunce::canonicalize(&extra_singularity).expect("canonical extra .singularity"),
                 explicit_deny,

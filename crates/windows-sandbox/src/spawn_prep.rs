@@ -10,7 +10,7 @@ use crate::cap::workspace_write_cap_sid_for_root;
 use crate::cap::workspace_write_root_contains_path;
 use crate::cap::workspace_write_root_overlaps_path;
 use crate::cap::workspace_write_root_specificity;
-use crate::deny_read_acl::ensure_directory_materialized;
+use crate::deny_read_acl::ensure_missing_protected_path_materialized;
 use crate::deny_read_state::sync_persistent_deny_read_acls;
 use crate::env::apply_no_network_to_env;
 use crate::env::ensure_non_interactive_pager;
@@ -270,12 +270,22 @@ pub(crate) fn apply_restricted_token_acl_rules(
     for path in additional_deny_write_paths {
         // Explicit carveouts must exist before the command starts so the sandbox cannot create
         // them under a writable parent first. The helper rejects reparse-point ancestors.
-        ensure_directory_materialized(path)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ensure_missing_protected_path_materialized(path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         deny.insert(path.clone());
     }
     for path in &deny {
-        if std::fs::symlink_metadata(path).is_err() {
-            ensure_directory_materialized(path)?;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ensure_missing_protected_path_materialized(path)?;
+            }
+            Err(error) => return Err(error.into()),
         }
     }
     unsafe {

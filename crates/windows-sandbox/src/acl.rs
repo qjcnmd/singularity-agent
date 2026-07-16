@@ -62,6 +62,15 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 const GENERIC_READ_MASK: u32 = 0x8000_0000;
 const GENERIC_WRITE_MASK: u32 = 0x4000_0000;
 const DENY_ACCESS: i32 = 3;
+const DENY_READ_MASK: u32 = FILE_GENERIC_READ | GENERIC_READ_MASK;
+const DENY_WRITE_MASK: u32 = FILE_GENERIC_WRITE
+    | FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_WRITE_EA
+    | FILE_WRITE_ATTRIBUTES
+    | GENERIC_WRITE_MASK
+    | DELETE
+    | FILE_DELETE_CHILD;
 
 /// The Win32 operation that failed while reading or writing a DACL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -502,6 +511,20 @@ pub unsafe fn dacl_has_write_allow_for_sid(p_dacl: *mut ACL, psid: *mut c_void) 
 }
 
 pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+    dacl_has_deny_mask_for_sid(p_dacl, psid, DENY_WRITE_MASK)
+}
+
+pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
+    dacl_has_deny_mask_for_sid(p_dacl, psid, DENY_READ_MASK)
+}
+
+/// Returns true only when one applicable deny ACE covers the complete effective mask. Generic
+/// rights are mapped before comparison so stale or split partial ACEs cannot suppress repair.
+unsafe fn dacl_has_deny_mask_for_sid(
+    p_dacl: *mut ACL,
+    psid: *mut c_void,
+    required_mask: u32,
+) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -515,14 +538,7 @@ pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -
     if ok == 0 {
         return false;
     }
-    let deny_write_mask = FILE_GENERIC_WRITE
-        | FILE_WRITE_DATA
-        | FILE_APPEND_DATA
-        | FILE_WRITE_EA
-        | FILE_WRITE_ATTRIBUTES
-        | GENERIC_WRITE_MASK
-        | DELETE
-        | FILE_DELETE_CHILD;
+    let required_mask = effective_file_access_mask(required_mask);
     for i in 0..info.AceCount {
         let mut p_ace: *mut c_void = std::ptr::null_mut();
         if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
@@ -539,49 +555,29 @@ pub unsafe fn dacl_has_write_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -
         let base = p_ace as usize;
         let sid_ptr =
             (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
-        if EqualSid(sid_ptr, psid) != 0 && (ace.Mask & deny_write_mask) != 0 {
+        if EqualSid(sid_ptr, psid) != 0
+            && (effective_file_access_mask(ace.Mask) & required_mask) == required_mask
+        {
             return true;
         }
     }
     false
 }
 
-pub unsafe fn dacl_has_read_deny_for_sid(p_dacl: *mut ACL, psid: *mut c_void) -> bool {
-    if p_dacl.is_null() {
-        return false;
+fn file_generic_mapping() -> GENERIC_MAPPING {
+    GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
     }
-    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
-    let ok = GetAclInformation(
-        p_dacl as *const ACL,
-        &mut info as *mut _ as *mut c_void,
-        std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-        AclSizeInformation,
-    );
-    if ok == 0 {
-        return false;
-    }
-    let deny_read_mask = FILE_GENERIC_READ | GENERIC_READ_MASK;
-    for i in 0..info.AceCount {
-        let mut p_ace: *mut c_void = std::ptr::null_mut();
-        if GetAce(p_dacl as *const ACL, i, &mut p_ace) == 0 {
-            continue;
-        }
-        let hdr = &*(p_ace as *const ACE_HEADER);
-        if hdr.AceType != ACCESS_DENIED_ACE_TYPE {
-            continue; // ACCESS_DENIED_ACE_TYPE
-        }
-        if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
-            continue;
-        }
-        let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
-        let base = p_ace as usize;
-        let sid_ptr =
-            (base + std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()) as *mut c_void;
-        if EqualSid(sid_ptr, psid) != 0 && (ace.Mask & deny_read_mask) != 0 {
-            return true;
-        }
-    }
-    false
+}
+
+unsafe fn effective_file_access_mask(mask: u32) -> u32 {
+    let mut effective = mask;
+    let mapping = file_generic_mapping();
+    MapGenericMask(&mut effective, &mapping);
+    effective
 }
 
 // Grant DELETE on each inheriting descendant instead of FILE_DELETE_CHILD on
@@ -760,17 +756,8 @@ enum DenyAceKind {
 impl DenyAceKind {
     fn mask(self) -> u32 {
         match self {
-            Self::Read => FILE_GENERIC_READ | GENERIC_READ_MASK,
-            Self::Write => {
-                FILE_GENERIC_WRITE
-                    | FILE_WRITE_DATA
-                    | FILE_APPEND_DATA
-                    | FILE_WRITE_EA
-                    | FILE_WRITE_ATTRIBUTES
-                    | GENERIC_WRITE_MASK
-                    | DELETE
-                    | FILE_DELETE_CHILD
-            }
+            Self::Read => DENY_READ_MASK,
+            Self::Write => DENY_WRITE_MASK,
         }
     }
 
@@ -904,10 +891,120 @@ const OBJECT_INHERIT_ACE: u32 = 0x1;
 #[cfg(test)]
 mod tests {
     use super::AclOperation;
+    use super::AclTarget;
+    use super::DENY_ACCESS;
+    use super::ERROR_SUCCESS;
+    use super::SetEntriesInAclW;
+    use super::TRUSTEE_IS_SID;
+    use super::TRUSTEE_IS_UNKNOWN;
+    use super::TRUSTEE_W;
     use super::WindowsAclError;
+    use super::add_deny_read_ace;
+    use super::add_deny_write_ace;
+    use super::dacl_has_read_deny_for_sid;
+    use super::dacl_has_write_deny_for_sid;
     use super::fetch_dacl_handle;
+    use super::open_acl_target;
+    use super::set_target_dacl;
+    use crate::token::LocalSid;
+    use std::ffi::c_void;
+    use std::fs::OpenOptions;
     use std::os::windows::process::CommandExt;
     use tempfile::TempDir;
+    use windows_sys::Win32::Foundation::HLOCAL;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Storage::FileSystem::DELETE;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
+    use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+    use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+
+    unsafe fn seed_partial_deny(target: &AclTarget, psid: *mut c_void, mask: u32) {
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: psid as *mut u16,
+        };
+        let explicit = super::EXPLICIT_ACCESS_W {
+            grfAccessPermissions: mask,
+            grfAccessMode: DENY_ACCESS,
+            grfInheritance: 0,
+            Trustee: trustee,
+        };
+        let mut new_dacl = std::ptr::null_mut();
+        assert_eq!(
+            SetEntriesInAclW(1, &explicit, target.p_dacl, &mut new_dacl),
+            ERROR_SUCCESS,
+            "seed partial deny ACE"
+        );
+        let result = set_target_dacl(target, new_dacl, 1);
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl as HLOCAL);
+        }
+        result.expect("install partial deny ACE");
+    }
+
+    unsafe fn fetch_has_deny(path: &std::path::Path, sid: *mut c_void, write: bool) -> bool {
+        let (p_dacl, p_sd) = fetch_dacl_handle(path).expect("fetch test DACL");
+        let has = if write {
+            dacl_has_write_deny_for_sid(p_dacl, sid)
+        } else {
+            dacl_has_read_deny_for_sid(p_dacl, sid)
+        };
+        LocalFree(p_sd as HLOCAL);
+        has
+    }
+
+    #[test]
+    fn partial_write_deny_is_completed_and_blocks_write() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("write-target.txt");
+        std::fs::write(&path, b"payload").expect("write fixture");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+        let world_sid = LocalSid::from_string("S-1-1-0").expect("world SID");
+        let target = unsafe { open_acl_target(&path, READ_CONTROL | WRITE_DAC, 1) }
+            .expect("open ACL target");
+
+        unsafe { seed_partial_deny(&target, sid.as_ptr(), DELETE) };
+        assert!(!unsafe { fetch_has_deny(&path, sid.as_ptr(), true) });
+        assert!(unsafe { add_deny_write_ace(&path, sid.as_ptr()) }.expect("complete write deny"));
+        assert!(unsafe { fetch_has_deny(&path, sid.as_ptr(), true) });
+        assert!(
+            unsafe { add_deny_write_ace(&path, world_sid.as_ptr()) }
+                .expect("install observable write deny")
+        );
+        let write_blocked = OpenOptions::new().write(true).open(&path).is_err();
+
+        unsafe { set_target_dacl(&target, target.p_dacl, 1).expect("restore original DACL") };
+        assert!(write_blocked, "complete deny ACE must block writes");
+    }
+
+    #[test]
+    fn partial_read_deny_is_completed_and_blocks_read() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("read-target.txt");
+        std::fs::write(&path, b"payload").expect("write fixture");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+        let world_sid = LocalSid::from_string("S-1-1-0").expect("world SID");
+        let target = unsafe { open_acl_target(&path, READ_CONTROL | WRITE_DAC, 1) }
+            .expect("open ACL target");
+
+        unsafe { seed_partial_deny(&target, sid.as_ptr(), FILE_READ_DATA) };
+        assert!(!unsafe { fetch_has_deny(&path, sid.as_ptr(), false) });
+        assert!(unsafe { add_deny_read_ace(&path, sid.as_ptr()) }.expect("complete read deny"));
+        assert!(unsafe { fetch_has_deny(&path, sid.as_ptr(), false) });
+        assert!(
+            unsafe { add_deny_read_ace(&path, world_sid.as_ptr()) }
+                .expect("install observable read deny")
+        );
+        let read_blocked = std::fs::read(&path).is_err();
+
+        unsafe { set_target_dacl(&target, target.p_dacl, 1).expect("restore original DACL") };
+        assert!(read_blocked, "complete deny ACE must block reads");
+    }
 
     #[test]
     fn reparse_acl_target_returns_typed_unsupported_error() {

@@ -18,7 +18,7 @@ use singularity_windows_sandbox::canonicalize_path;
 use singularity_windows_sandbox::convert_string_sid_to_sid;
 use singularity_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use singularity_windows_sandbox::ensure_allow_write_aces;
-use singularity_windows_sandbox::ensure_directory_materialized;
+use singularity_windows_sandbox::ensure_missing_protected_path_materialized;
 use singularity_windows_sandbox::extract_setup_failure;
 use singularity_windows_sandbox::hide_newly_created_users;
 use singularity_windows_sandbox::install_wfp_filters;
@@ -1007,9 +1007,15 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             continue;
         }
 
-        // Deny ACEs attach to filesystem objects. Materialize missing carveouts without
+        // Deny ACEs attach to filesystem objects. Materialize only missing carveouts without
         // following a reparse point in any ancestor so a child cannot create the path later.
-        let created_by_setup = ensure_directory_materialized(path)?;
+        let created_by_setup = match std::fs::symlink_metadata(path) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ensure_missing_protected_path_materialized(path)?
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         let deny_sid_strs = workspace_write_cap_sids_for_path(
             &payload.sandbox_home,

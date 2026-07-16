@@ -44,8 +44,9 @@ const JWT_MIN_PART_CHARS: usize = 8;
 /// Protected metadata directories whose names are reserved by the workspace/runtime contract.
 ///
 /// Keep this list in `core` so tools, sandbox policy resolution, and the Windows enforcement
-/// adapter cannot silently diverge. `.git` is intentionally recognized without creating a
-/// missing sentinel: Git uses its ancestor marker for workspace discovery.
+/// adapter cannot silently diverge. Windows may materialize a missing `.git` sentinel only when
+/// no ancestor repository marker exists; nested markers are rejected by the adapter so Git uses
+/// its existing ancestor discovery semantics.
 pub const PROTECTED_GIT_DIR_NAME: &str = ".git";
 pub const PROTECTED_AGENTS_DIR_NAME: &str = ".agents";
 pub const PROTECTED_METADATA_DIR_NAME: &str = ".singularity";

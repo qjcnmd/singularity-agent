@@ -1098,7 +1098,8 @@ mod windows_backend {
         FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
         ManagedFileSystemPermissions, NetworkSandboxPolicy, PermissionProfile,
         WindowsSandboxCancellationToken, resolve_windows_deny_read_paths,
-        run_windows_sandbox_capture, run_windows_sandbox_capture_for_permission_profile_elevated,
+        run_windows_sandbox_capture_for_permission_profile_elevated,
+        run_windows_sandbox_capture_with_filesystem_overrides,
     };
 
     const BACKEND_NAME: &str = "windows";
@@ -1325,6 +1326,7 @@ mod windows_backend {
         argv: Vec<String>,
         read_roots: Vec<PathBuf>,
         protected_deny_read_paths: Vec<AbsolutePathBuf>,
+        protected_deny_write_paths: Vec<AbsolutePathBuf>,
     }
 
     impl PreparedCommand {
@@ -1340,6 +1342,15 @@ mod windows_backend {
                 .map_err(|error| {
                     PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
                 })?;
+            let protected_deny_write_paths = if matches!(
+                request.filesystem.mode,
+                SandboxFilesystemMode::WorkspaceWrite
+            ) {
+                resolve_existing_protected_paths(&workspace_root)
+                    .map_err(PrepareCommandError::ProtectedPaths)?
+            } else {
+                Vec::new()
+            };
             let workspace_roots = vec![workspace_root];
             let network = match request.network.mode {
                 SandboxNetworkMode::Denied => NetworkSandboxPolicy::Restricted,
@@ -1383,6 +1394,7 @@ mod windows_backend {
                 argv: resolved.argv,
                 read_roots: resolved.read_roots,
                 protected_deny_read_paths: Vec::new(),
+                protected_deny_write_paths,
             })
         }
 
@@ -1412,6 +1424,14 @@ mod windows_backend {
                 })?;
             let protected_deny_read_paths = resolve_existing_protected_paths(&workspace_root)
                 .map_err(PrepareCommandError::ProtectedPaths)?;
+            let protected_deny_write_paths = if matches!(
+                request.filesystem.mode,
+                SandboxFilesystemMode::WorkspaceWrite
+            ) {
+                protected_deny_read_paths.clone()
+            } else {
+                Vec::new()
+            };
             let workspace_roots = vec![workspace_root];
             let network = match request.network.mode {
                 SandboxNetworkMode::Denied => NetworkSandboxPolicy::Restricted,
@@ -1456,6 +1476,7 @@ mod windows_backend {
                 argv,
                 read_roots: executable_read_roots(&powershell),
                 protected_deny_read_paths,
+                protected_deny_write_paths,
             })
         }
     }
@@ -1477,6 +1498,7 @@ mod windows_backend {
         elevated.cancellation = Some(windows_cancellation);
         elevated.additional_read_roots = &prepared.read_roots;
         elevated.deny_read_paths_override = &prepared.protected_deny_read_paths;
+        elevated.deny_write_paths_override = &prepared.protected_deny_write_paths;
         elevated
     }
 
@@ -1501,7 +1523,7 @@ mod windows_backend {
                     && prepared.protected_deny_read_paths.is_empty() =>
             {
                 let elevated_error = windows_error_summary(&elevated_error);
-                let capture = run_windows_sandbox_capture(
+                let capture = run_windows_sandbox_capture_with_filesystem_overrides(
                     &prepared.permission_profile,
                     &prepared.workspace_roots,
                     &prepared.sandbox_home,
@@ -1510,6 +1532,8 @@ mod windows_backend {
                     prepared.env_map,
                     Some(prepared.timeout_ms),
                     Some(windows_cancellation),
+                    &[],
+                    &prepared.protected_deny_write_paths,
                     true,
                 )
                 .map_err(|restricted_error| {
@@ -1525,7 +1549,9 @@ mod windows_backend {
                     ))
             }
             Err(error) => {
-                if !prepared.protected_deny_read_paths.is_empty() {
+                if !prepared.protected_deny_read_paths.is_empty()
+                    || !prepared.protected_deny_write_paths.is_empty()
+                {
                     Err(PROTECTED_PATH_ENFORCEMENT_FAILED.to_string())
                 } else {
                     Err(format!(
@@ -2191,6 +2217,48 @@ mod windows_backend {
         }
 
         #[test]
+        fn workspace_write_command_projects_existing_protected_paths_to_deny_write() {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let env_file = workspace.path().join(".env");
+            create_test_file(&env_file, "opaque");
+            let missing_env = workspace.path().join(".env.future");
+            let comspec = std::env::var_os("ComSpec").expect("ComSpec");
+            let request = CommandRequest::project_verification(
+                "command_protected_write",
+                vec![
+                    PathBuf::from(comspec).to_string_lossy().into_owned(),
+                    "/c".to_string(),
+                    "echo ready".to_string(),
+                ],
+                workspace.path().to_string_lossy(),
+                workspace.path().to_string_lossy(),
+            );
+
+            let prepared = PreparedCommand::from_request(&request)
+                .expect("workspace-write command preparation");
+            let protected_paths = prepared
+                .protected_deny_write_paths
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                protected_paths,
+                [dunce::canonicalize(&env_file).expect("canonical .env")]
+                    .into_iter()
+                    .collect()
+            );
+            assert!(!missing_env.exists());
+            assert!(prepared.protected_deny_read_paths.is_empty());
+
+            let elevated =
+                elevated_capture_request(&prepared, WindowsSandboxCancellationToken::new(|| false));
+            assert_eq!(
+                elevated.deny_write_paths_override,
+                prepared.protected_deny_write_paths.as_slice()
+            );
+        }
+
+        #[test]
         fn model_script_with_shell_syntax_and_sensitive_text_reaches_backend_boundary() {
             let workspace = tempfile::tempdir().expect("workspace");
             let request = CommandScriptRequest::agent_requested(
@@ -2238,13 +2306,14 @@ mod windows_backend {
             create_test_file(&nested.join("private-key.pem"), "opaque");
             create_test_file(&nested.join("client.p12"), "opaque");
             create_test_file(&nested.join("client-secret.txt"), "opaque");
-            let mut request = CommandScriptRequest::agent_requested(
+            let request = CommandScriptRequest::agent_requested_with_policy(
                 "script_protected_path",
                 "Join-Path 'nested' (Get-Random) | Out-Null",
                 workspace.path().to_string_lossy(),
                 workspace.path().to_string_lossy(),
+                SandboxFilesystemMode::WorkspaceWrite,
+                SandboxNetworkMode::Allowed,
             );
-            request.network.mode = SandboxNetworkMode::Allowed;
 
             let prepared = match PreparedCommand::from_script_request(&request) {
                 Ok(prepared) => prepared,
@@ -2277,6 +2346,10 @@ mod windows_backend {
             assert_eq!(
                 elevated.deny_read_paths_override,
                 prepared.protected_deny_read_paths.as_slice()
+            );
+            assert_eq!(
+                elevated.deny_write_paths_override,
+                prepared.protected_deny_write_paths.as_slice()
             );
         }
 

@@ -8,7 +8,9 @@ use anyhow::Result;
 use dunce::canonicalize;
 use singularity_core::PROTECTED_GIT_DIR_NAME;
 use std::collections::HashSet;
+use std::error::Error;
 use std::ffi::c_void;
+use std::fmt;
 use std::fs::Metadata;
 use std::path::Path;
 use std::path::PathBuf;
@@ -275,6 +277,72 @@ fn is_missing_git_marker(path: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case(PROTECTED_GIT_DIR_NAME))
 }
 
+/// Identifies a protected metadata path that cannot be safely materialized without changing
+/// repository discovery semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProtectedMetadataError {
+    NestedGitMarkerUnsupported {
+        path: PathBuf,
+        ancestor_git_marker: PathBuf,
+    },
+}
+
+impl fmt::Display for ProtectedMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NestedGitMarkerUnsupported {
+                path,
+                ancestor_git_marker,
+            } => write!(
+                f,
+                "unsupported_nested_git_marker: {} (ancestor={})",
+                path.display(),
+                ancestor_git_marker.display()
+            ),
+        }
+    }
+}
+
+impl Error for ProtectedMetadataError {}
+
+fn existing_git_ancestor_for_missing_marker(path: &Path) -> Result<Option<PathBuf>> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("protected metadata path has no parent: {}", path.display())
+    })?;
+    for ancestor in parent.ancestors().skip(1) {
+        let marker = ancestor.join(PROTECTED_GIT_DIR_NAME);
+        match std::fs::symlink_metadata(&marker) {
+            Ok(_) => return Ok(Some(marker)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect ancestor Git marker while materializing {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Materializes a missing protected path, rejecting a nested `.git` sentinel under an existing
+/// ancestor repository so Git's ancestor discovery remains unchanged.
+pub fn ensure_missing_protected_path_materialized(path: &Path) -> Result<bool> {
+    if is_missing_git_marker(path)
+        && let Some(ancestor_git_marker) = existing_git_ancestor_for_missing_marker(path)?
+    {
+        return Err(anyhow::Error::new(
+            ProtectedMetadataError::NestedGitMarkerUnsupported {
+                path: path.to_path_buf(),
+                ancestor_git_marker,
+            },
+        ));
+    }
+    ensure_directory_materialized(path)
+}
+
 /// Applies deny-read ACEs to explicit paths. Missing paths are materialized as
 /// directories before the ACE is applied so a sandboxed command cannot create a
 /// previously absent denied path and then read from it in the same run.
@@ -289,16 +357,11 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
     let mut seen = HashSet::new();
     let mut added_in_this_call: Vec<PathBuf> = Vec::new();
     for path in planned {
-        let result = (|| -> Result<Option<bool>> {
+        let result = (|| -> Result<bool> {
             match std::fs::symlink_metadata(&path) {
                 Ok(_) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    if is_missing_git_marker(&path) {
-                        // Do not create a synthetic `.git`: Git ancestor discovery must still
-                        // be able to walk through a workspace whose repository marker is absent.
-                        return Ok(None);
-                    }
-                    ensure_directory_materialized(&path)?;
+                    ensure_missing_protected_path_materialized(&path)?;
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -316,9 +379,9 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
                     path.display()
                 );
             }
-            Ok(Some(added))
+            Ok(added)
         })();
-        let Some(added) = (match result {
+        let added = match result {
             Ok(added) => added,
             Err(err) => {
                 for added_path in &added_in_this_call {
@@ -331,8 +394,6 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
                 }
                 return Err(err);
             }
-        }) else {
-            continue;
         };
         if added {
             added_in_this_call.push(path.clone());
@@ -344,16 +405,22 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use super::ProtectedMetadataError;
     use super::apply_deny_read_acls;
     use super::cleanup_empty_runtime_sentinel;
     use super::ensure_directory_materialized;
     use super::plan_deny_read_acl_paths;
+    use crate::acl::dacl_has_read_deny_for_sid;
+    use crate::acl::fetch_dacl_handle;
+    use crate::acl::revoke_ace;
     use crate::token::LocalSid;
     use pretty_assertions::assert_eq;
     use std::collections::HashSet;
     use std::os::windows::process::CommandExt;
     use std::path::PathBuf;
     use tempfile::TempDir;
+    use windows_sys::Win32::Foundation::HLOCAL;
+    use windows_sys::Win32::Foundation::LocalFree;
 
     #[test]
     fn plan_preserves_missing_paths() {
@@ -427,19 +494,79 @@ mod tests {
     }
 
     #[test]
-    fn missing_git_marker_is_not_materialized_or_acl_applied() {
+    fn existing_git_marker_is_acl_protected() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        let existing_git = workspace.join(".git");
+        std::fs::create_dir(&existing_git).expect("create existing git marker");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+
+        let applied =
+            unsafe { apply_deny_read_acls(std::slice::from_ref(&existing_git), sid.as_ptr()) }
+                .expect("protect existing .git");
+
+        assert_eq!(applied, vec![existing_git.clone()]);
+        let (p_dacl, p_sd) = unsafe { fetch_dacl_handle(&existing_git) }.expect("fetch .git ACL");
+        assert!(unsafe { dacl_has_read_deny_for_sid(p_dacl, sid.as_ptr()) });
+        unsafe {
+            LocalFree(p_sd as HLOCAL);
+            revoke_ace(&existing_git, sid.as_ptr()).expect("restore .git ACL");
+        }
+    }
+
+    #[test]
+    fn missing_git_marker_without_ancestor_is_materialized_and_acl_protected() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir(&workspace).expect("create workspace");
         let missing_git = workspace.join(".git");
-        let sid = LocalSid::from_string("S-1-1-0").expect("world SID");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
 
         let applied =
             unsafe { apply_deny_read_acls(std::slice::from_ref(&missing_git), sid.as_ptr()) }
-                .expect("missing .git is intentionally skipped");
+                .expect("materialize and protect missing .git");
 
-        assert!(applied.is_empty());
+        assert_eq!(applied, vec![missing_git.clone()]);
+        assert!(missing_git.is_dir());
+        let (p_dacl, p_sd) = unsafe { fetch_dacl_handle(&missing_git) }.expect("fetch .git ACL");
+        assert!(unsafe { dacl_has_read_deny_for_sid(p_dacl, sid.as_ptr()) });
+        unsafe {
+            LocalFree(p_sd as HLOCAL);
+            revoke_ace(&missing_git, sid.as_ptr()).expect("restore .git ACL");
+        }
+        cleanup_empty_runtime_sentinel(&missing_git, &workspace, true)
+            .expect("cleanup runtime-created .git sentinel");
         assert!(!missing_git.exists());
+    }
+
+    #[test]
+    fn missing_nested_git_marker_under_ancestor_is_typed_unsupported_without_sentinel() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repository = tmp.path().join("repository");
+        let workspace = repository.join("nested");
+        std::fs::create_dir_all(&workspace).expect("create nested workspace");
+        let ancestor_git = repository.join(".git");
+        std::fs::create_dir(&ancestor_git).expect("create ancestor git marker");
+        let nested_git = workspace.join(".git");
+        let sid = LocalSid::from_string("S-1-1-0").expect("world SID");
+
+        let error =
+            unsafe { apply_deny_read_acls(std::slice::from_ref(&nested_git), sid.as_ptr()) }
+                .expect_err("nested .git marker must fail closed");
+        let typed = error
+            .downcast_ref::<ProtectedMetadataError>()
+            .expect("typed nested metadata error");
+        assert_eq!(
+            typed,
+            &ProtectedMetadataError::NestedGitMarkerUnsupported {
+                path: nested_git.clone(),
+                ancestor_git_marker: ancestor_git.clone(),
+            }
+        );
+        assert!(!nested_git.exists());
     }
 
     #[test]

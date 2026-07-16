@@ -29,7 +29,7 @@ pub const DEFAULT_USE_PRIVATE_DESKTOP: bool = true;
 pub const PRIVATE_DESKTOP_PREFIX: &str = "SingularitySandboxDesktop";
 pub const RUNNER_PIPE_PREFIX: &str = r"\\.\pipe\singularity-windows-sandbox-runner";
 pub const RUNNER_CONNECT_THREAD_PREFIX: &str = "singularity-sandbox-runner-connect";
-pub const READ_ACL_MUTEX_NAME: &str = r"Local\SingularitySandboxReadAcl";
+pub const READ_ACL_MUTEX_NAME: &str = r"Global\SingularitySandboxReadAcl";
 
 pub const LOCAL_APP_DATA_VENDOR_DIR_NAME: &str = "Singularity";
 pub const LOCAL_APP_DATA_PRODUCT_DIR_NAME: &str = "Agent";

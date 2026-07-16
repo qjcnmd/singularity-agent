@@ -58,7 +58,7 @@ fn state_mutex_name(path: &Path) -> String {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!(r"Local\SingularityDenyReadState_{hash:016x}")
+    format!(r"Global\SingularityDenyReadState_{hash:016x}")
 }
 
 pub(crate) fn lock_state(path: &Path) -> Result<StateMutex> {
@@ -203,16 +203,24 @@ mod tests {
     use super::load_state;
     use super::merge_monotonic_paths;
     use super::sandbox_dir;
+    use super::state_mutex_name;
     use super::sync_persistent_deny_read_acls;
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
     use crate::deny_read_acl::lexical_path_key;
     use crate::token::LocalSid;
+    use std::path::Path;
     use std::path::PathBuf;
 
     const CHILD_ENV: &str = "SINGULARITY_DENY_READ_STATE_CHILD";
     const HOME_ENV: &str = "SINGULARITY_DENY_READ_STATE_HOME";
     const PATH_ENV: &str = "SINGULARITY_DENY_READ_STATE_PATH";
+
+    #[test]
+    fn state_mutex_uses_global_namespace_for_cross_session_state() {
+        let name = state_mutex_name(Path::new(r"C:\sandbox\.sandbox\deny_read_acl_state.json"));
+        assert!(name.starts_with(r"Global\"), "mutex name was {name}");
+    }
 
     #[test]
     fn state_merge_never_retracts_an_older_deny() {
