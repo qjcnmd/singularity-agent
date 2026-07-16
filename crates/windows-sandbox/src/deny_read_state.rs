@@ -339,12 +339,14 @@ pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> R
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
     let deadline = (timeout_ms != INFINITE)
         .then(|| Instant::now() + Duration::from_millis(u64::from(timeout_ms)));
-    let leases = {
+    let (state_path, leases) = {
         let lock = lock_state(&state_path)?;
-        load_state(lock.path())?
+        let state_path = lock.path().to_path_buf();
+        let leases = load_state(&state_path)?
             .active_runner_leases
             .into_iter()
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (state_path, leases)
     };
     for lease_name in leases {
         validate_runner_lease_name(&lease_name)?;
@@ -362,15 +364,14 @@ pub(crate) fn reconcile_runner_leases(sandbox_home: &Path, timeout_ms: u32) -> R
         let Some(lease_mutex) = wait_raw_named_mutex(&lease_name, remaining_ms)? else {
             return Ok(false);
         };
-        remove_runner_lease(sandbox_home, &lease_name)?;
+        remove_runner_lease(&state_path, &lease_name)?;
         drop(lease_mutex);
     }
     Ok(true)
 }
 
-fn remove_runner_lease(sandbox_home: &Path, lease_name: &str) -> Result<()> {
-    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    let lock = lock_state(&state_path)?;
+fn remove_runner_lease(state_path: &Path, lease_name: &str) -> Result<()> {
+    let lock = lock_state(state_path)?;
     let state_path = lock.path();
     let mut state = load_state(state_path)?;
     if state.active_runner_leases.remove(lease_name) {

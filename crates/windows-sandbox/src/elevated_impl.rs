@@ -81,6 +81,7 @@ mod windows_impl {
     use crate::logging::log_failure;
     use crate::logging::log_start;
     use crate::logging::log_success;
+    use crate::path_normalization::canonicalize_path_allow_missing;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use crate::runner_client::retry_runner_spawn_once;
     use crate::runner_client::spawn_runner_transport;
@@ -191,6 +192,10 @@ mod windows_impl {
             deny_write_paths_override,
             protect_workspace_metadata,
         } = request;
+        // Resolve safe aliases once so the execution mutex, setup payload, runner registration,
+        // cleanup, and every state-file operation share one long-lived sandbox-home identity.
+        let canonical_sandbox_home = canonicalize_path_allow_missing(sandbox_home);
+        let sandbox_home = canonical_sandbox_home.as_path();
         if cancellation
             .as_ref()
             .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)

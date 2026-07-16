@@ -413,6 +413,7 @@ mod windows_impl {
     use super::WindowsSandboxCancellationToken;
     use super::logging::log_failure;
     use super::logging::log_success;
+    use super::path_normalization::canonicalize_path_allow_missing;
     use super::process::create_process_as_user;
     use super::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use super::sandbox_utils::ensure_sandbox_home_exists;
@@ -635,6 +636,10 @@ mod windows_impl {
         {
             return Ok(cancelled_capture_result());
         }
+        // Keep capability state, ACL setup, and process cleanup on one resolved home identity even
+        // if the caller supplied a junction that changes while the sandbox is running.
+        let canonical_sandbox_home = canonicalize_path_allow_missing(sandbox_home);
+        let sandbox_home = canonical_sandbox_home.as_path();
         let requested_permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 permission_profile,
@@ -843,6 +848,8 @@ mod windows_impl {
             return Ok(());
         }
 
+        let canonical_sandbox_home = canonicalize_path_allow_missing(sandbox_home);
+        let sandbox_home = canonical_sandbox_home.as_path();
         let current_dir = cwd.to_path_buf();
         let acl_plan =
             plan_restricted_token_acl_rules(&permissions, &current_dir, env_map, &[], &[])?;
