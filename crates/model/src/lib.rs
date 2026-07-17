@@ -41,6 +41,8 @@ const V1_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 const RESPONSES_PATH: &str = "/responses";
 const V1_RESPONSES_PATH: &str = "/v1/responses";
 const PROVIDER_TIMEOUT_SECONDS: u64 = 120;
+const PROVIDER_RUNTIME_WORKER_THREADS: usize = 2;
+const PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE: &str = "provider_runtime_initialization_failed";
 const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_ATTEMPTS: u32 = 3;
@@ -316,7 +318,7 @@ impl ProviderConfigSnapshot {
             && let Err(error) = &provider
         {
             configuration.configured = false;
-            configuration.blocker = provider_initialization_blocker(&error.error.category());
+            configuration.blocker = provider_initialization_blocker(&error.error);
         }
         Self {
             snapshot_id: format!("{PROVIDER_SNAPSHOT_ID_PREFIX}{}", Uuid::new_v4().simple()),
@@ -361,6 +363,7 @@ pub enum ModelBlockerKind {
     AuthenticationProviderError,
     BaseUrlNetworkError,
     ModelNameConfigError,
+    ProviderRuntimeUnavailable,
 }
 
 impl ModelBlockerKind {
@@ -371,6 +374,7 @@ impl ModelBlockerKind {
             Self::AuthenticationProviderError => "authentication_provider_error",
             Self::BaseUrlNetworkError => "base_url_network_error",
             Self::ModelNameConfigError => "model_name_config_error",
+            Self::ProviderRuntimeUnavailable => "provider_runtime_unavailable",
         }
     }
 
@@ -381,12 +385,16 @@ impl ModelBlockerKind {
             Self::AuthenticationProviderError => "authentication/provider error",
             Self::BaseUrlNetworkError => "base_url/network error",
             Self::ModelNameConfigError => "model name/config error",
+            Self::ProviderRuntimeUnavailable => "provider runtime unavailable",
         }
     }
 }
 
-fn provider_initialization_blocker(category: &ModelErrorCategory) -> Option<ModelBlockerKind> {
-    match category {
+fn provider_initialization_blocker(error: &ModelError) -> Option<ModelBlockerKind> {
+    if error.code.as_deref() == Some(PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE) {
+        return Some(ModelBlockerKind::ProviderRuntimeUnavailable);
+    }
+    match error.category() {
         ModelErrorCategory::Authentication => Some(ModelBlockerKind::AuthenticationProviderError),
         ModelErrorCategory::Network | ModelErrorCategory::ProviderUnavailable => {
             Some(ModelBlockerKind::BaseUrlNetworkError)
@@ -946,6 +954,8 @@ impl OpenAiProviderConfig {
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     client: reqwest::Client,
+    /// 所有 provider clone 共享的受控多线程 runtime；最后一个持有者释放时由 Tokio 关闭它。
+    runtime: Arc<tokio::runtime::Runtime>,
     request_timeout_seconds: u64,
     tool_capability_cache: Arc<Mutex<HashMap<String, ProviderProtocolNegotiation>>>,
     tool_capability_probe_in_flight: Arc<Mutex<HashMap<String, Arc<CapabilityProbeState>>>>,
@@ -957,6 +967,7 @@ impl fmt::Debug for OpenAiProvider {
             .debug_struct("OpenAiProvider")
             .field("config", &self.config)
             .field("client", &"[redacted]")
+            .field("runtime", &"[shared]")
             .field("tool_capability_cache", &"[redacted]")
             .field("tool_capability_probe_in_flight", &"[redacted]")
             .finish()
@@ -1084,9 +1095,15 @@ impl OpenAiProvider {
             .timeout(Duration::from_secs(request_timeout_seconds))
             .build()
             .map_err(provider_client_initialization_error)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(PROVIDER_RUNTIME_WORKER_THREADS)
+            .enable_all()
+            .build()
+            .map_err(provider_runtime_error)?;
         Ok(Self {
             config,
             client,
+            runtime: Arc::new(runtime),
             request_timeout_seconds,
             tool_capability_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_capability_probe_in_flight: Arc::new(Mutex::new(HashMap::new())),
@@ -1547,10 +1564,7 @@ impl OpenAiProvider {
         api_protocol: ProviderApiProtocol,
         model_name: &str,
     ) -> Result<OpenAiCompletion, ProviderError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(provider_runtime_error)?;
+        let runtime = self.runtime.as_ref();
         let started_at = Instant::now();
         let mut metadata = ProviderAttemptMetadata::zero();
         let endpoint = match api_protocol {
@@ -3082,7 +3096,7 @@ fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
             "provider runtime initialization failed",
         )
         .with_provider_diagnostic(
-            "provider_runtime_initialization_failed",
+            PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
             ProviderErrorStage::ClientInitialization,
         ),
     )
@@ -4137,11 +4151,101 @@ fn redacted_presence(present: bool) -> String {
 #[cfg(test)]
 mod transport_tests {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, Receiver};
     use std::thread;
     use std::time::Duration;
 
     use super::*;
+
+    fn test_provider_config(base_url: String) -> OpenAiProviderConfig {
+        OpenAiProviderConfig {
+            provider_name: "openai_compatible".to_string(),
+            model_name: "gpt-test".to_string(),
+            base_url,
+            api_key: "sk-secret-value".to_string(),
+            source: ProviderConfigSource::ProcessEnvironment,
+            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        }
+    }
+
+    fn read_test_provider_request(stream: &TcpStream) {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("read provider request line");
+        assert!(line.contains("/v1/chat/completions"));
+    }
+
+    fn write_test_provider_response(stream: &mut TcpStream) {
+        let body = r#"{"id":"response_1","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write provider response");
+    }
+
+    fn concurrent_provider_server() -> (String, Receiver<usize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind concurrent provider");
+        let address = listener.local_addr().expect("concurrent provider address");
+        let (maximum_tx, maximum_rx) = mpsc::channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let server = thread::spawn({
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move || {
+                let mut workers = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("accept concurrent request");
+                    let active = Arc::clone(&active);
+                    let maximum = Arc::clone(&maximum);
+                    workers.push(thread::spawn(move || {
+                        read_test_provider_request(&stream);
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(150));
+                        write_test_provider_response(&mut stream);
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    }));
+                }
+                for worker in workers {
+                    worker.join().expect("join concurrent provider request");
+                }
+                maximum_tx
+                    .send(maximum.load(Ordering::SeqCst))
+                    .expect("send concurrent provider maximum");
+            }
+        });
+        (format!("http://{address}"), maximum_rx, server)
+    }
+
+    fn cancellation_followup_server() -> (String, Receiver<()>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind cancellation provider");
+        let address = listener
+            .local_addr()
+            .expect("cancellation provider address");
+        let (first_request_tx, first_request_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (first_stream, _) = listener.accept().expect("accept cancelled request");
+            read_test_provider_request(&first_stream);
+            first_request_tx
+                .send(())
+                .expect("send cancelled request started");
+
+            let (mut followup_stream, _) = listener.accept().expect("accept follow-up request");
+            read_test_provider_request(&followup_stream);
+            write_test_provider_response(&mut followup_stream);
+            thread::sleep(Duration::from_millis(100));
+        });
+        (format!("http://{address}"), first_request_rx, server)
+    }
 
     #[test]
     fn configured_deadline_is_reported_from_a_real_transport_timeout() {
@@ -4269,5 +4373,152 @@ mod transport_tests {
         assert_eq!(metadata.attempt_count, 1);
         assert_eq!(metadata.retry_count, 0);
         server.join().expect("provider server");
+    }
+
+    #[test]
+    fn provider_clones_share_a_runtime_and_requests_progress_concurrently() {
+        let (base_url, maximum_rx, server) = concurrent_provider_server();
+        let provider = OpenAiProvider::new(test_provider_config(base_url)).expect("provider");
+        let cloned = provider.clone();
+        assert!(Arc::ptr_eq(&provider.runtime, &cloned.runtime));
+
+        let provider = Arc::new(provider);
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut callers = Vec::new();
+        for request_id in ["request_concurrent_a", "request_concurrent_b"] {
+            let provider = Arc::clone(&provider);
+            let start = Arc::clone(&start);
+            let result_tx = result_tx.clone();
+            callers.push(thread::spawn(move || {
+                let request = ModelTurnRequest::new(
+                    request_id,
+                    vec![ModelMessage::text(ModelRole::User, "hello")],
+                );
+                start.wait();
+                result_tx
+                    .send(provider.complete(&request, &CancellationToken::new()))
+                    .expect("send concurrent provider result");
+            }));
+        }
+        start.wait();
+
+        for _ in 0..2 {
+            result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("concurrent provider request completed")
+                .expect("concurrent provider request succeeded");
+        }
+        for caller in callers {
+            caller.join().expect("join concurrent provider caller");
+        }
+        assert_eq!(
+            maximum_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("concurrent provider maximum"),
+            2,
+            "shared runtime must not serialize provider requests"
+        );
+        server.join().expect("join concurrent provider server");
+    }
+
+    #[test]
+    fn cancelled_request_does_not_poison_followup_on_the_shared_runtime() {
+        let (base_url, first_request_rx, server) = cancellation_followup_server();
+        let provider = OpenAiProvider::new(test_provider_config(base_url)).expect("provider");
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_provider = provider.clone();
+        let worker = thread::spawn(move || {
+            let request = ModelTurnRequest::new(
+                "request_cancel_shared_runtime",
+                vec![ModelMessage::text(ModelRole::User, "wait")],
+            );
+            worker_provider.complete(&request, &worker_cancellation)
+        });
+
+        first_request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled request started");
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("join cancelled provider caller")
+            .expect_err("cancelled request must fail");
+        assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+
+        let followup = ModelTurnRequest::new(
+            "request_after_cancel_shared_runtime",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        provider
+            .complete(&followup, &CancellationToken::new())
+            .expect("follow-up request must still succeed");
+        server.join().expect("join cancellation provider server");
+    }
+
+    #[test]
+    fn timed_out_request_does_not_poison_followup_on_the_shared_runtime() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind timeout provider");
+        let address = listener.local_addr().expect("timeout provider address");
+        let server = thread::spawn(move || {
+            let mut hanging_streams = Vec::new();
+            for _ in 0..MAX_PROVIDER_ATTEMPTS {
+                let (stream, _) = listener.accept().expect("accept timed-out request");
+                read_test_provider_request(&stream);
+                hanging_streams.push(stream);
+            }
+
+            let (mut followup_stream, _) = listener.accept().expect("accept timeout follow-up");
+            read_test_provider_request(&followup_stream);
+            write_test_provider_response(&mut followup_stream);
+            drop(hanging_streams);
+        });
+        let provider = OpenAiProvider::new_with_request_timeout(
+            test_provider_config(format!("http://{address}")),
+            1,
+        )
+        .expect("provider");
+        let timed_out_request = ModelTurnRequest::new(
+            "request_timeout_shared_runtime",
+            vec![ModelMessage::text(ModelRole::User, "wait")],
+        );
+        let error = provider
+            .complete(&timed_out_request, &CancellationToken::new())
+            .expect_err("provider request must time out");
+        assert_eq!(error.error.kind, ModelErrorKind::Timeout);
+        assert_eq!(
+            error
+                .provider_attempt_metadata
+                .as_ref()
+                .expect("timeout metadata")
+                .attempt_count,
+            MAX_PROVIDER_ATTEMPTS
+        );
+
+        let followup = ModelTurnRequest::new(
+            "request_after_timeout_shared_runtime",
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        provider
+            .complete(&followup, &CancellationToken::new())
+            .expect("follow-up request must still succeed");
+        server.join().expect("join timeout provider server");
+    }
+
+    #[test]
+    fn runtime_initialization_failure_maps_to_a_stable_provider_blocker() {
+        let error = provider_runtime_error(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "synthetic runtime initialization failure",
+        ));
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some(PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE)
+        );
+        assert_eq!(
+            provider_initialization_blocker(&error.error),
+            Some(ModelBlockerKind::ProviderRuntimeUnavailable)
+        );
     }
 }
