@@ -167,11 +167,10 @@ pub enum ToolExposure {
     Internal,
 }
 
-/// 每个 typed executor 的稳定能力、可见性、授权和并发合同。
+/// 每个 typed executor 的稳定能力、授权和并发合同。
 #[derive(Debug, Clone, Copy)]
 struct ToolExecutorContract {
     capability: ToolCapability,
-    exposure: ToolExposure,
     authorization: ToolAuthorization,
     execution_mode: ToolExecutionMode,
 }
@@ -182,34 +181,29 @@ impl ToolExecutor {
             Self::Workspace(WorkspaceToolExecutor::Read | WorkspaceToolExecutor::List) => {
                 ToolExecutorContract {
                     capability: ToolCapability::WorkspaceRead,
-                    exposure: ToolExposure::Model,
                     authorization: ToolAuthorization::WorkspaceRead,
                     execution_mode: ToolExecutionMode::ParallelRead,
                 }
             }
             Self::Workspace(WorkspaceToolExecutor::Grep) => ToolExecutorContract {
                 capability: ToolCapability::WorkspaceSearch,
-                exposure: ToolExposure::Model,
                 authorization: ToolAuthorization::WorkspaceRead,
                 execution_mode: ToolExecutionMode::ParallelRead,
             },
             Self::Workspace(WorkspaceToolExecutor::Edit | WorkspaceToolExecutor::Patch) => {
                 ToolExecutorContract {
                     capability: ToolCapability::WorkspaceWrite,
-                    exposure: ToolExposure::Model,
                     authorization: ToolAuthorization::WorkspaceWrite,
                     execution_mode: ToolExecutionMode::Exclusive,
                 }
             }
             Self::Workspace(WorkspaceToolExecutor::Command) => ToolExecutorContract {
                 capability: ToolCapability::CommandExecution,
-                exposure: ToolExposure::Model,
                 authorization: ToolAuthorization::Command,
                 execution_mode: ToolExecutionMode::Exclusive,
             },
             Self::AgentControl(AgentControlToolExecutor::UpdatePlan) => ToolExecutorContract {
                 capability: ToolCapability::PlanManagement,
-                exposure: ToolExposure::Model,
                 authorization: ToolAuthorization::AgentControl,
                 execution_mode: ToolExecutionMode::Exclusive,
             },
@@ -459,12 +453,48 @@ impl ToolEntry {
         authorization: ToolAuthorization,
         executor: ToolExecutor,
     ) -> Result<Self, String> {
+        Self::with_exposure(
+            spec,
+            version,
+            ToolExposure::Model,
+            capability,
+            authorization,
+            executor,
+        )
+    }
+
+    /// 创建仅供显式内部调用使用的版本化工具条目。
+    pub fn internal(
+        spec: ToolSpec,
+        version: u32,
+        capability: ToolCapability,
+        authorization: ToolAuthorization,
+        executor: ToolExecutor,
+    ) -> Result<Self, String> {
+        Self::with_exposure(
+            spec,
+            version,
+            ToolExposure::Internal,
+            capability,
+            authorization,
+            executor,
+        )
+    }
+
+    fn with_exposure(
+        spec: ToolSpec,
+        version: u32,
+        exposure: ToolExposure,
+        capability: ToolCapability,
+        authorization: ToolAuthorization,
+        executor: ToolExecutor,
+    ) -> Result<Self, String> {
         let id = ToolId::new(spec.name.clone())?;
         let entry = Self {
             id,
             version,
             capability,
-            exposure: ToolExposure::Model,
+            exposure,
             authorization,
             executor,
             spec,
@@ -488,12 +518,6 @@ impl ToolEntry {
         if self.capability != expected.capability {
             return Err(format!(
                 "tool {} capability does not match its executor contract",
-                self.id.as_str()
-            ));
-        }
-        if self.exposure != expected.exposure {
-            return Err(format!(
-                "tool {} exposure does not match its executor contract",
                 self.id.as_str()
             ));
         }

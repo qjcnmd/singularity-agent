@@ -88,13 +88,6 @@ fn contract_mismatch_cases() -> Vec<(&'static str, ToolEntry)> {
     );
     wrong_execution_mode.spec.execution_mode = ToolExecutionMode::ParallelRead;
 
-    let mut wrong_exposure = test_tool_spec(
-        "update_plan",
-        "Update the plan",
-        serde_json::json!({"type": "object"}),
-    );
-    wrong_exposure.exposure = ToolExposure::Internal;
-
     let mut wrong_spec_name = test_tool_spec(
         "update_plan",
         "Update the plan",
@@ -106,7 +99,6 @@ fn contract_mismatch_cases() -> Vec<(&'static str, ToolEntry)> {
         ("capability", wrong_capability),
         ("authorization", wrong_authorization),
         ("execution_mode", wrong_execution_mode),
-        ("exposure", wrong_exposure),
         ("spec_name", wrong_spec_name),
     ]
 }
@@ -346,6 +338,80 @@ fn broker_binds_valid_workspace_and_agent_control_entries() {
     );
     assert_eq!(update_plan.execution_mode, ToolExecutionMode::Exclusive);
     remove_workspace(&workspace);
+}
+
+#[test]
+fn internal_entries_stay_out_of_model_projection_but_bind_and_execute_explicitly() {
+    let internal_entry = ToolEntry::internal(
+        raw_test_tool_spec(
+            "internal_update_plan",
+            "Internal plan update",
+            serde_json::json!({"type": "object"}),
+        ),
+        1,
+        ToolCapability::PlanManagement,
+        ToolAuthorization::AgentControl,
+        ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan),
+    )
+    .expect("internal entry is valid");
+
+    let mut broker = ToolBroker::default();
+    broker
+        .register(internal_entry)
+        .expect("internal entry is a valid registered tool");
+
+    assert_eq!(
+        broker
+            .entry("internal_update_plan")
+            .expect("entry")
+            .exposure,
+        ToolExposure::Internal
+    );
+    assert!(
+        broker
+            .tool_schema_payloads()
+            .iter()
+            .all(|payload| payload["name"] != "internal_update_plan")
+    );
+    assert!(
+        broker
+            .entries_for_capability(ToolCapability::PlanManagement, 1)
+            .is_empty()
+    );
+    assert_eq!(
+        broker
+            .prepare_model_input("internal_update_plan", &serde_json::json!({}))
+            .expect_err("internal entry is not model-visible")
+            .code,
+        "tool_not_visible"
+    );
+
+    let bound = broker
+        .bind_authorization(
+            "internal_update_plan",
+            serde_json::json!({}),
+            None,
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        )
+        .expect("explicit internal binding is allowed");
+    assert_eq!(
+        bound.executor,
+        ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan)
+    );
+
+    let envelope = ToolCallRequest::new("call_internal", "internal_update_plan", "{}");
+    let mut executor_called = false;
+    let result = broker.execute(&envelope, ToolBrokerDecision::Allow, |executor, _| {
+        executor_called = true;
+        assert_eq!(
+            executor,
+            ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan)
+        );
+        ToolOutput::success(serde_json::json!({"ok": true}))
+    });
+    assert!(executor_called);
+    assert!(result.ok);
 }
 
 #[test]
