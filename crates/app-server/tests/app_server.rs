@@ -409,11 +409,12 @@ fn legacy_threads_without_an_absolute_workspace_fail_closed_on_resume_and_turn_s
                 r#"{{"jsonrpc":"2.0","method":"thread/resume","id":2,"params":{{"threadId":"{thread_id}"}}}}"#
             ))
             .expect("resume response");
-        assert!(
+        assert_eq!(
             response[0]["error"]["message"]
                 .as_str()
-                .expect("error message")
-                .contains("absolute workspace")
+                .expect("error message"),
+            "workspace capability unavailable",
+            "response={response:?}"
         );
     }
 
@@ -424,10 +425,8 @@ fn legacy_threads_without_an_absolute_workspace_fail_closed_on_resume_and_turn_s
         ))
         .expect("turn response");
     assert!(
-        turn[0]["error"]["message"]
-            .as_str()
-            .expect("turn error")
-            .contains("absolute workspace")
+        turn[0]["error"]["message"].as_str().expect("turn error")
+            == "workspace capability unavailable"
     );
 
     let store = SessionStore::open(&db_path).expect("reopen store");
@@ -1377,13 +1376,7 @@ fn allow_resume_precondition_failure_is_terminalized_without_replay() {
     let error = terminal_trace.payload["error"]
         .as_str()
         .expect("terminal trace error");
-    #[cfg(windows)]
-    assert!(error.contains("user input"), "error={error}");
-    #[cfg(not(windows))]
-    assert!(
-        error.contains("agent loop turn could not resume"),
-        "error={error}"
-    );
+    assert_eq!(error, "agent loop execution failed");
     assert_eq!(
         std::fs::read_to_string(file_path).expect("readme"),
         "before"

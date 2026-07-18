@@ -109,7 +109,9 @@ sg run <goal>
 | `cancel_requested` | 保持原 `running` / `blocked` | 已记录取消请求，worker 正在收敛；该行是中间状态，不是 Turn 终态 |
 | `cancelled` | `interrupted` | 取消已经传播并完成 |
 
-`turn/started` 在 AgentLoop 调用前发送；终态 item、`turn/completed` 和 matching response 在事务提交后发送。失败、blocked 或 cancelled 不伪造成功 assistant item。
+`event/subscribe` 的 event type 列表是 app-server 进程内共享的并发快照，不写入 Store；主请求线程更新后，已创建的 request worker 在下一次事件通知读取时可见最新列表。每次通知只在短暂读取锁内复制快照，锁不跨越事件构造或其他 I/O；已经构造或发送的事件不追溯重过滤。`turn/started` 在 AgentLoop 调用前发送；终态 item、`turn/completed` 和 matching response 在事务提交后发送。失败、blocked 或 cancelled 不伪造成功 assistant item。
+
+Turn 一旦持久化为 `running`，事件通知、AgentLoop、approval checkpoint、cancellation monitor 或 terminal outcome 的失败都会在同一个请求编排路径立即尝试 typed `failed` terminalization；失败原因只投影稳定的 stage/cause 分类，不把 Store、SQLite 或 workspace 原文带到公共错误。终态提交前，编排路径停止并在有界窗口内收敛 cancellation monitor，再以原子冻结的 typed outcome 区分 `InfrastructureFailure` 与 `UserCancellation`；monitor 无法在窗口内收敛时按基础设施失败处理。若并发路径已经安全提交 `blocked`、`completed`、`failed`、`interrupted` 或 `cancelled`，补偿会保留该状态；补偿本身失败时同时返回原始 stage/cause 与脱敏的 `store`、`state_changed` 或 `event_notification` cleanup 分类。
 
 `turn/start` 在创建 Turn 前取得基于 Store 文件和 canonical workspace 的跨进程 `WorkspaceExecutionGuard`，并持有到 AgentLoop outcome 提交完成；SQLite 的同一 `BEGIN IMMEDIATE` 事务还会拒绝该 workspace 已存在任何非终态 Turn。OS 文件锁区分仍存活的 owner，SQLite 约束保留持久状态，因此同一 Store 中共享一个 workspace 的不同 logical thread 也不会并发修改同一文件树；不同 workspace 不被全局串行化。`thread/archive` 和 `thread/delete` 仍只拒绝目标 thread 自身存在非终态 Turn。
 
@@ -275,13 +277,15 @@ AppServer 从当前绑定的 `SandboxBackend::capabilities()` 投影 AgentLoop �
 
 ## 10. Cancel 与 Shutdown
 
-每个活动 turn 在 app-server 内注册一个 `CancellationToken`。`turn/interrupt`：
+每个活动 turn 在 app-server 内注册一个 `CancellationToken`，并由 file-backed request worker 附加独立的 cancellation monitor。monitor 的检查结果是 typed `UserCancellation` 或 `InfrastructureFailure`：SQLite `busy`/`locked` 通过 Store 的稳定 transient-contention 分类继续轮询；其他 Store 读取失败会记录基础设施失败并取消 token，不会被归约成普通 interrupted/cancelled。
+
+`turn/interrupt`：
 
 1. 先在同进程 registry 调用 `cancel()`。
 2. 调用 `SessionStore::request_turn_cancellation`：只有纯 pending Approval 分支会在该事务内直接写成 `interrupted/cancelled` 并删除 request/checkpoint；普通运行或存在 `executing` Approval 时只写 `agent_loop_status=cancel_requested` 并追加 request trace，Turn 的持久化 `status` 暂时保持原来的 `running` / `blocked`。
 3. worker 的 cancellation monitor 也轮询 SQLite，因此另一个 CLI/app-server 进程发出的 interrupt 可以传播到原 worker。
 
-provider HTTP wait、AgentLoop 回合边界和 sandbox command 都检查同一个 token。普通运行或 `executing` Approval 的 interrupt response 报告 `cancel_requested`，但不提前发送 terminal event；worker 最终把结果提交为 `interrupted/cancelled` 后才发送 terminal item/event/response。`commit_turn_outcome` / `commit_turn_outcome_and_resolve_pending_execution` 的事务会重新读取当前 Turn；若 `agent_loop_status=cancel_requested`，Store 拒绝非 `Interrupted` outcome，AppServer 把晚到的 provider、assistant 或 tool 结果归约为 `cancelled` 后再提交。因此晚到结果不能把持久化 Turn 改回 `completed` 或 `failed`；可能追加一条 `cancelled` AgentLoop trace，但不会覆盖 Interrupted 状态。`server/shutdown` 先锁存全局 execution stop，再取消所有当前或随后登记的 turn，并在同一个全局 5 秒宽限期内等待 request worker 与 stdout writer 收敛；仍未响应时进程以失败状态退出，让 OS 释放执行锁，后续进程再按持久状态恢复，而不是无限等待。
+provider HTTP wait、AgentLoop 回合边界和 sandbox command 都检查同一个 token。monitor 的 `InfrastructureFailure` 在下一副作用边界前停止 AgentLoop/approval/terminal outcome 继续执行，并由 turn orchestration 交给 Store 的 typed `InfrastructureFailure` authority 原子归约为 `Failed`；即使持久 turn 已是 `cancel_requested`，该 authority 也不能伪装成 `Interrupted`、`Completed` 或其他状态。`UserCancellation` 才允许归约为 `interrupted/cancelled`。普通运行或 `executing` Approval 的 interrupt response 报告 `cancel_requested`，但不提前发送 terminal event；worker 最终把结果提交为 `interrupted/cancelled` 后才发送 terminal item/event/response。`commit_turn_outcome` / `commit_turn_outcome_and_resolve_pending_execution` 的普通 AgentLoop authority 会重新读取当前 Turn，并在 `agent_loop_status=cancel_requested` 时拒绝非 `Interrupted` outcome；基础设施 authority 只接受 `Failed`，并在 approval continuation 的同一事务中清理 executing checkpoint。AppServer 把晚到的 provider、assistant 或 tool 结果按当前 typed outcome 归约后再提交，因此晚到结果不能把持久化 Turn 改回 `completed` 或以普通错误覆盖 `Interrupted`。monitor 的 outcome 发布是 CAS：只有成功发布结果的 owner 才取消 token；终态提交前 stop/wake 后冻结结果，teardown 超时也先以基础设施失败冻结再 detach，晚到 monitor 不能改变 token 或终态。`server/shutdown` 先锁存全局 execution stop，再取消所有当前或随后登记的 turn，并在同一个全局 5 秒宽限期内等待 request worker 与 stdout writer 收敛；仍未响应时进程以失败状态退出，让 OS 释放执行锁，后续进程再按持久状态恢复，而不是无限等待。
 
 ## 11. Store、Trace 与 Artifact
 
@@ -301,11 +305,11 @@ artifact_refs
 schema_meta / schema_migrations
 ```
 
-AppServer 先预分配 turn id，再完成 monitor Store reopen、可失败的 monitor thread spawn 和 active cancellation token 注册；monitor 在 Store 提交前保持暂停。任一准备步骤失败都不会留下 `Running` Turn。准备完成后，turn、输入 item、history page 和 started trace 在一个事务内生成，commit 后才启动 monitor 和发出事件。monitor 把 SQLite busy/locked 视为临时竞争，guard teardown 以有界等待唤醒并停止 monitor，不让 request Drop 无界阻塞。终态 turn、可选 `ItemKind::Plan` plan item、assistant item 和 terminal trace 也在一个事务内提交。`commit_turn_outcome` 返回 `CommittedTurnOutcome.plan_item`，app-server 只有在事务成功提交后才发送 `turn/plan/updated`（随后发送 assistant item events 和 `turn/completed`）；plan item 本身使用该 turn 的 item sequence 持久化。Approval continuation 的 `commit_turn_outcome_and_resolve_pending_execution` 还在同一事务内完成 executing request 的 outcome、plan/assistant/trace 写入、旧 checkpoint 删除和下一 approval/checkpoint handoff。turn sequence 和 item sequence 是每个父级内的严格正整数，用于恢复稳定顺序。
+AppServer 先预分配 turn id，再完成 monitor Store reopen、可失败的 monitor thread spawn 和 active cancellation token 注册；monitor 在 Store 提交前保持暂停。任一准备步骤失败都不会留下 `Running` Turn。准备完成后，turn、输入 item、history page 和 started trace 在一个事务内生成，commit 后才启动 monitor 和发出事件。monitor 把 SQLite busy/locked 视为临时竞争，其他读取失败产生可检查的 `InfrastructureFailure`；终态提交前由 stop/wake 与有界等待收敛 monitor，随后冻结 outcome，超时则按基础设施失败 terminalize；guard teardown 只在短暂的内存 registry 临界区取得 `active_turns` mutex，保持有界，不让 request Drop 无界阻塞。终态 turn、可选 `ItemKind::Plan` plan item、assistant item 和 terminal trace 也在一个事务内提交。`persist_agent_approval_requests` 将整批 approval/checkpoint 交给 Store 的单一 `BEGIN IMMEDIATE` API；Store 先验证所有 request、thread/turn/tool-call/resource、唯一性和当前状态，再产生任何副作用，后续约束或 trace 写入失败会回滚整批，不留下部分 Blocked turn 或 checkpoint。`commit_turn_outcome` 返回 `CommittedTurnOutcome.plan_item`，app-server 只有在事务成功提交后才发送 `turn/plan/updated`（随后发送 assistant item events 和 `turn/completed`）；plan item 本身使用该 turn 的 item sequence 持久化。Approval continuation 的 `record_approval_decision` 在 claim 事务内返回绑定 turn 快照；claim 后的读取、provider、project-instruction 或 workspace 失败都进入统一 terminalization funnel，`commit_turn_outcome_and_resolve_pending_execution` 在同一事务内完成 typed outcome、plan/assistant/trace 写入、旧 executing checkpoint 删除和下一 approval/checkpoint handoff。turn sequence 和 item sequence 是每个父级内的严格正整数，用于恢复稳定顺序。
 
 store 在写入 item、trace 和 artifact reference 前执行敏感文本检查。检测到 secret-like 内容时保存固定 redacted 文本；trace 保存 SHA-256 payload hash，并在读取时验证完整性。`artifact/fetch` 当前只返回已经登记且脱敏的 `ArtifactRef`，不直接提供任意文件读取。
 
-Store 只持久化上游已经完成的 audit projection，再对 trace payload 做递归敏感文本脱敏和 hash 完整性校验；`TraceEvent::for_turn` 固定 `run_id=thread_id`、`session_id=turn_id`、`task_id=turn_id`，所有 turn trace 写入在同一 `BEGIN IMMEDIATE` 事务内校验并插入，list/tail 批量预取绑定后统一验证。唯一可判定的历史 turn-shaped trace 按 `task_id` 归一化，存在歧义则拒绝；读取 roundtrip 不会恢复被投影丢弃的原始字段。`approvals` 直接保存并索引 `thread_id`/`turn_id`，每次读取都与 JSON payload 比较；Defer 保持 pending/resumable，不产生最终 decision history。history 先解码所选 turn 的全部 status、kind 和 item status，再投影 user/agent，坏行不会被 SQL 过滤隐藏。
+Store 只持久化上游已经完成的 audit projection，再对 trace payload 做递归敏感文本脱敏和 hash 完整性校验；AppServer 在进入该边界前把 provider body、project-instruction 内容、workspace/raw error 和 raw arguments 投影为固定安全摘要及稳定 stage/cause/cleanup 字段，trace 只保存 typed provider diagnostic，不保存 validation 原文。`TraceEvent::for_turn` 固定 `run_id=thread_id`、`session_id=turn_id`、`task_id=turn_id`，所有 turn trace 写入在同一 `BEGIN IMMEDIATE` 事务内校验并插入，list/tail 批量预取绑定后统一验证。唯一可判定的历史 turn-shaped trace 按 `task_id` 归一化，存在歧义则拒绝；读取 roundtrip 不会恢复被投影丢弃的原始字段。`approvals` 直接保存并索引 `thread_id`/`turn_id`，每次读取都与 JSON payload 比较；Defer 保持 pending/resumable，不产生最终 decision history。history 先解码所选 turn 的全部 status、kind 和 item status，再投影 user/agent，坏行不会被 SQL 过滤隐藏。
 
 ## 12. Evaluation
 

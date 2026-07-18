@@ -3221,6 +3221,15 @@ pub struct CommittedTurnOutcome {
     pub trace: TraceEvent,
 }
 
+/// 终态提交时拥有该状态归约权的 typed 原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcomeAuthority {
+    /// 普通 AgentLoop/用户路径，必须遵守 cancel-requested 的取消合同。
+    AgentLoop,
+    /// 监视基础设施故障，唯一允许的归约是 Failed，不伪装成 Interrupted。
+    InfrastructureFailure,
+}
+
 /// 负责 turn 生命周期、approval、追踪、产物和恢复的持久化 SQLite 存储。
 pub struct SessionStore {
     connection: Connection,
@@ -3273,6 +3282,8 @@ pub struct RecordedApprovalDecision {
     pub request: ApprovalRequest,
     /// 已记录的 approval decision。
     pub decision: ApprovalDecision,
+    /// claim 事务提交时绑定 turn 的一致性快照，供后续补偿路径复用。
+    pub turn: Turn,
     /// 允许继续执行时保留的 pending tool call checkpoint。
     pub pending_tool_call: Option<Value>,
     /// 记录决定的 trace event。
@@ -3901,9 +3912,20 @@ impl SessionStore {
         turn_id: &str,
         params: CommitTurnOutcomeParams<'_>,
     ) -> StoreResult<CommittedTurnOutcome> {
+        self.commit_turn_outcome_with_authority(turn_id, params, TurnOutcomeAuthority::AgentLoop)
+    }
+
+    /// 在 typed 基础设施故障权限下提交 turn 终态。
+    pub fn commit_turn_outcome_with_authority(
+        &self,
+        turn_id: &str,
+        params: CommitTurnOutcomeParams<'_>,
+        authority: TurnOutcomeAuthority,
+    ) -> StoreResult<CommittedTurnOutcome> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let committed = self.commit_turn_outcome_in_transaction(&transaction, turn_id, params)?;
+        let committed =
+            self.commit_turn_outcome_in_transaction(&transaction, turn_id, params, authority)?;
         transaction.commit()?;
         Ok(committed)
     }
@@ -3914,6 +3936,7 @@ impl SessionStore {
         transaction: &Transaction<'_>,
         turn_id: &str,
         params: CommitTurnOutcomeParams<'_>,
+        authority: TurnOutcomeAuthority,
     ) -> StoreResult<CommittedTurnOutcome> {
         let CommitTurnOutcomeParams {
             status,
@@ -3934,7 +3957,7 @@ impl SessionStore {
                 }
                 other => StoreError::Sqlite(other),
             })?;
-        validate_turn_status_update(&current, &status, Some(agent_loop_status))?;
+        validate_turn_status_update(&current, &status, Some(agent_loop_status), authority)?;
         validate_turn_trace_binding(trace, &current.thread_id, &current.turn_id)?;
         match (&status, assistant_delta) {
             (TurnStatus::Completed, Some(delta)) if !delta.trim().is_empty() => {}
@@ -4292,19 +4315,180 @@ impl SessionStore {
         self.create_approval_with_pending_tool_call_and_trace(request, None, component, summary)
     }
 
-    /// 保存 approval 请求和可选检查点，并将其绑定到阻塞的 turn。
-    pub fn create_approval_with_pending_tool_call_and_trace(
+    /// 原子保存一批 approval 请求、检查点和对应 trace。
+    ///
+    /// 所有请求会在同一个 `BEGIN IMMEDIATE` 事务中先完成绑定、checkpoint、
+    /// resource、当前 turn 状态和唯一性校验；已有完全相同的 pending 请求按
+    /// 幂等重试处理，新的请求则要么全部提交，要么不留下任何副作用。
+    pub fn create_approval_batch_with_pending_tool_calls_and_trace(
         &self,
-        request: &ApprovalRequest,
-        pending_tool_call: Option<Value>,
+        approvals: &[(ApprovalRequest, Value)],
         component: &str,
         summary: &str,
-    ) -> StoreResult<TraceEvent> {
-        let transaction = self.connection.unchecked_transaction()?;
-        insert_approval(&transaction, request)?;
-        if let Some(payload) = pending_tool_call {
-            let tool_call_id = pending_tool_call_id(&transaction, request, &payload)?;
-            ensure_request_turn_binding(&transaction, request)?;
+    ) -> StoreResult<Vec<TraceEvent>> {
+        if approvals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let mut request_ids = BTreeSet::new();
+        let mut tool_call_keys = BTreeSet::new();
+        let mut existing_request_ids = BTreeSet::new();
+        let mut new_turn_ids = BTreeSet::new();
+
+        // 先验证整个批次，不能让第一个合法项先改变 turn 或写入 approval。
+        for (request, checkpoint) in approvals {
+            if request.request_id.trim().is_empty()
+                || !request_ids.insert(request.request_id.clone())
+            {
+                return Err(StoreError::InvalidState(
+                    "approval batch request ids must be non-empty and unique".to_string(),
+                ));
+            }
+            let tool_call_id = pending_tool_call_id(&transaction, request, checkpoint)?;
+            if !tool_call_keys.insert((request.turn_id.clone(), tool_call_id.clone())) {
+                return Err(StoreError::InvalidState(
+                    "approval batch tool call bindings must be unique".to_string(),
+                ));
+            }
+
+            let (turn_thread_id, status_text, agent_loop_status): (String, String, String) =
+                transaction
+                    .query_row(
+                        "select thread_id, status, agent_loop_status from turns where turn_id = ?1",
+                        params![request.turn_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::QueryReturnedNoRows => {
+                            StoreError::NotFound(format!("turn {}", request.turn_id))
+                        }
+                        other => StoreError::Sqlite(other),
+                    })?;
+            if turn_thread_id != request.thread_id {
+                return Err(StoreError::InvalidState(
+                    APPROVAL_TURN_THREAD_MISMATCH.to_string(),
+                ));
+            }
+            let turn_status = TurnStatus::from_storage_text(&status_text)
+                .ok_or_else(|| unknown_db_enum("turn status", &status_text))?;
+            let valid_turn_state = matches!(turn_status, TurnStatus::Running | TurnStatus::Blocked)
+                && matches!(agent_loop_status.as_str(), "running" | "blocked");
+            if !valid_turn_state {
+                return Err(StoreError::InvalidState(
+                    "pending approval requires a running or blocked turn".to_string(),
+                ));
+            }
+
+            let existing = transaction
+                .query_row(
+                    "select request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
+                     from approvals where request_id = ?1",
+                    params![request.request_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((
+                stored_request_id,
+                stored_thread_id,
+                stored_turn_id,
+                stored_payload,
+                stored_outcome,
+                stored_reason,
+            )) = existing
+            {
+                let stored_request = decode_stored_approval_request_row(
+                    &transaction,
+                    &stored_request_id,
+                    &stored_thread_id,
+                    &stored_turn_id,
+                    &stored_payload,
+                    stored_outcome.as_deref(),
+                    stored_reason.as_deref(),
+                )?;
+                if stored_request != *request || stored_outcome.is_some() {
+                    return Err(StoreError::InvalidState(
+                        "approval batch request already exists with different state".to_string(),
+                    ));
+                }
+                let stored_pending = transaction
+                    .query_row(
+                        "select thread_id, turn_id, tool_call_id, payload, execution_state
+                         from pending_tool_calls where request_id = ?1",
+                        params![request.request_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((
+                    stored_pending_thread_id,
+                    stored_pending_turn_id,
+                    stored_tool_call_id,
+                    stored_checkpoint,
+                    execution_state,
+                )) = stored_pending
+                else {
+                    return Err(StoreError::InvalidState(
+                        "existing approval batch request is missing its checkpoint".to_string(),
+                    ));
+                };
+                let stored_checkpoint = serde_json::from_str::<Value>(&stored_checkpoint)?;
+                let stored_checkpoint_tool_call_id =
+                    pending_tool_call_id(&transaction, request, &stored_checkpoint)?;
+                if execution_state != "pending"
+                    || stored_pending_thread_id != request.thread_id
+                    || stored_pending_turn_id != request.turn_id
+                    || stored_tool_call_id != tool_call_id
+                    || stored_checkpoint_tool_call_id != tool_call_id
+                    || stored_checkpoint != *checkpoint
+                {
+                    return Err(StoreError::InvalidState(
+                        "existing approval batch checkpoint does not match the request".to_string(),
+                    ));
+                }
+                existing_request_ids.insert(request.request_id.clone());
+            } else {
+                let conflicting_request = transaction
+                    .query_row(
+                        "select request_id from pending_tool_calls
+                         where turn_id = ?1 and tool_call_id = ?2 limit 1",
+                        params![request.turn_id, tool_call_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if conflicting_request.is_some() {
+                    return Err(StoreError::InvalidState(
+                        "approval batch tool call is already bound to another request".to_string(),
+                    ));
+                }
+                new_turn_ids.insert(request.turn_id.clone());
+            }
+        }
+
+        let mut traces = Vec::new();
+        for (request, checkpoint) in approvals {
+            if existing_request_ids.contains(&request.request_id) {
+                continue;
+            }
+            insert_approval(&transaction, request)?;
+            let tool_call_id = pending_tool_call_id(&transaction, request, checkpoint)?;
             transaction.execute(
                 "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload, execution_state) values(?1, ?2, ?3, ?4, ?5, 'pending')",
                 params![
@@ -4312,16 +4496,18 @@ impl SessionStore {
                     request.thread_id,
                     request.turn_id,
                     tool_call_id,
-                    serde_json::to_string(&payload)?
+                    serde_json::to_string(checkpoint)?
                 ],
             )?;
+        }
+        for turn_id in &new_turn_ids {
             let changed = transaction.execute(
                 "update turns set status = ?1, agent_loop_status = 'blocked'
                  where turn_id = ?2 and status in (?3, ?1)
                    and agent_loop_status in ('running', 'blocked')",
                 params![
                     TurnStatus::Blocked.to_db_text(),
-                    request.turn_id,
+                    turn_id,
                     TurnStatus::Running.to_db_text(),
                 ],
             )?;
@@ -4331,6 +4517,56 @@ impl SessionStore {
                 ));
             }
         }
+        for (request, _) in approvals {
+            if existing_request_ids.contains(&request.request_id) {
+                continue;
+            }
+            let trace = TraceEvent {
+                task_id: Some(request.turn_id.clone()),
+                payload: serde_json::json!({
+                    "request_id": &request.request_id,
+                    "action": &request.action,
+                    "tool_call_id": &request.tool_call_id,
+                }),
+                ..TraceEvent::for_turn(
+                    format!("trace_{}", request.request_id),
+                    request.thread_id.clone(),
+                    request.turn_id.clone(),
+                    component,
+                    summary,
+                )
+            };
+            traces.push(Self::insert_turn_trace(
+                &transaction,
+                &trace,
+                &request.thread_id,
+                &request.turn_id,
+            )?);
+        }
+        transaction.commit()?;
+        Ok(traces)
+    }
+
+    /// 保存 approval 请求和可选检查点，并将其绑定到阻塞的 turn。
+    pub fn create_approval_with_pending_tool_call_and_trace(
+        &self,
+        request: &ApprovalRequest,
+        pending_tool_call: Option<Value>,
+        component: &str,
+        summary: &str,
+    ) -> StoreResult<TraceEvent> {
+        if let Some(pending_tool_call) = pending_tool_call {
+            let traces = self.create_approval_batch_with_pending_tool_calls_and_trace(
+                &[(request.clone(), pending_tool_call)],
+                component,
+                summary,
+            )?;
+            return traces.into_iter().next().ok_or_else(|| {
+                StoreError::AlreadyExists(format!("approval {}", request.request_id))
+            });
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        insert_approval(&transaction, request)?;
         let trace = TraceEvent::for_turn(
             format!("trace_{}", request.request_id),
             request.thread_id.clone(),
@@ -4754,10 +4990,12 @@ impl SessionStore {
                 &request.thread_id,
                 &request.turn_id,
             )?;
+            let turn = self.turn_in_transaction(&transaction, &request.turn_id)?;
             transaction.commit()?;
             return Ok(RecordedApprovalDecision {
                 request,
                 decision: decision.clone(),
+                turn,
                 pending_tool_call,
                 trace,
             });
@@ -4859,10 +5097,12 @@ impl SessionStore {
         };
         let trace =
             Self::insert_turn_trace(&transaction, &trace, &request.thread_id, &request.turn_id)?;
+        let turn = self.turn_in_transaction(&transaction, &request.turn_id)?;
         transaction.commit()?;
         Ok(RecordedApprovalDecision {
             request,
             decision: decision.clone(),
+            turn,
             pending_tool_call,
             trace,
         })
@@ -4874,6 +5114,22 @@ impl SessionStore {
         request_id: &str,
         params: CommitTurnOutcomeParams<'_>,
         next_approvals: &[(ApprovalRequest, Value)],
+    ) -> StoreResult<CommittedTurnOutcome> {
+        self.commit_turn_outcome_and_resolve_pending_execution_with_authority(
+            request_id,
+            params,
+            next_approvals,
+            TurnOutcomeAuthority::AgentLoop,
+        )
+    }
+
+    /// 在 typed 基础设施故障权限下提交 executing approval 的终态并清理 checkpoint。
+    pub fn commit_turn_outcome_and_resolve_pending_execution_with_authority(
+        &self,
+        request_id: &str,
+        params: CommitTurnOutcomeParams<'_>,
+        next_approvals: &[(ApprovalRequest, Value)],
+        authority: TurnOutcomeAuthority,
     ) -> StoreResult<CommittedTurnOutcome> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -4897,8 +5153,12 @@ impl SessionStore {
                 other => StoreError::Sqlite(other),
             })?;
         // 先提交当前 executing approval 的 turn 结果。
-        let committed =
-            self.commit_turn_outcome_in_transaction(&transaction, &bound_turn_id, params)?;
+        let committed = self.commit_turn_outcome_in_transaction(
+            &transaction,
+            &bound_turn_id,
+            params,
+            authority,
+        )?;
         // 原子移除已解决 checkpoint，再写入 successor approvals。
         let deleted = transaction.execute(
             "delete from pending_tool_calls where request_id = ?1 and execution_state = 'executing'",
@@ -5919,6 +6179,26 @@ impl SessionStore {
         })
     }
 
+    // 在调用方事务中读取绑定 turn，避免 claim 后再开启一个不受补偿控制的读取。
+    fn turn_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        turn_id: &str,
+    ) -> StoreResult<Turn> {
+        transaction
+            .query_row(
+                "select turn_id, thread_id, status, agent_loop_status from turns where turn_id = ?1",
+                params![turn_id],
+                |row| self.turn_from_row(row),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    StoreError::NotFound(format!("turn {turn_id}"))
+                }
+                other => StoreError::Sqlite(other),
+            })
+    }
+
     // 校验 turn 状态迁移是否允许覆盖当前状态。
     fn ensure_turn_status_update_allowed(
         &self,
@@ -5927,7 +6207,12 @@ impl SessionStore {
         next_agent_loop_status: Option<&str>,
     ) -> StoreResult<()> {
         let current = self.get_turn(turn_id)?;
-        validate_turn_status_update(&current, next_status, next_agent_loop_status)
+        validate_turn_status_update(
+            &current,
+            next_status,
+            next_agent_loop_status,
+            TurnOutcomeAuthority::AgentLoop,
+        )
     }
 
     // 构造带新 id、初始 active 状态和安全策略快照的 Thread。
@@ -6681,8 +6966,19 @@ fn validate_turn_status_update(
     current: &Turn,
     next_status: &TurnStatus,
     next_agent_loop_status: Option<&str>,
+    authority: TurnOutcomeAuthority,
 ) -> StoreResult<()> {
-    if current.agent_loop_status == "cancel_requested" && *next_status != TurnStatus::Interrupted {
+    if authority == TurnOutcomeAuthority::InfrastructureFailure
+        && (*next_status != TurnStatus::Failed || next_agent_loop_status != Some("failed"))
+    {
+        return Err(StoreError::InvalidState(
+            "infrastructure failure can only finalize as failed".to_string(),
+        ));
+    }
+    if current.agent_loop_status == "cancel_requested"
+        && *next_status != TurnStatus::Interrupted
+        && authority != TurnOutcomeAuthority::InfrastructureFailure
+    {
         return Err(StoreError::InvalidState(
             "cancel-requested turn can only finalize as interrupted".to_string(),
         ));

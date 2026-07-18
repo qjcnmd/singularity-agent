@@ -8,7 +8,7 @@ use singularity_policy::{
 use singularity_protocol::{ItemKind, ThreadStatus, TraceBindingError, TraceEvent, TurnStatus};
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
-    SessionStoreDescriptor, StoreError,
+    SessionStoreDescriptor, StoreError, TurnOutcomeAuthority,
 };
 use std::sync::{Arc, Barrier};
 
@@ -1399,6 +1399,102 @@ fn pending_tool_call_requires_checkpoint_and_rolls_back_atomically() {
     ));
 }
 
+// 验证批次第二条 trace 写入失败时，approval、checkpoint、turn 和首条 trace 全部回滚。
+#[test]
+fn approval_batch_rolls_back_when_second_write_hits_existing_trace() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let first = ApprovalRequest::new(
+        "approval_batch_first",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_1");
+    let second = ApprovalRequest::new(
+        "approval_batch_second",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_2");
+    let checkpoint = |request: &ApprovalRequest, tool_call_id: &str| {
+        serde_json::json!({
+            "request_id": &request.request_id,
+            "thread_id": &request.thread_id,
+            "turn_id": &request.turn_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": "edit",
+            "raw_arguments": "{}",
+            "resources": [],
+            "checkpoint_version": 1,
+            "messages": [],
+            "tool_results": [],
+            "used_approval_grants": [],
+            "approval_count": 1,
+            "model_turns": 1,
+            "completion": {}
+        })
+    };
+    store
+        .append_trace(&TraceEvent::for_turn(
+            format!("trace_{}", second.request_id),
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "test",
+            "reserved event id",
+        ))
+        .expect("reserve second trace id");
+
+    let result = store.create_approval_batch_with_pending_tool_calls_and_trace(
+        &[
+            (first.clone(), checkpoint(&first, "call_1")),
+            (second.clone(), checkpoint(&second, "call_2")),
+        ],
+        "approval",
+        "approval requested",
+    );
+    assert!(matches!(result, Err(StoreError::Sqlite(_))));
+    assert_eq!(
+        store.get_turn(&turn.turn_id).expect("turn").status,
+        TurnStatus::Running
+    );
+    assert_eq!(
+        store
+            .get_turn(&turn.turn_id)
+            .expect("turn")
+            .agent_loop_status,
+        "running"
+    );
+    assert!(
+        store
+            .list_pending_approvals()
+            .expect("approvals")
+            .is_empty()
+    );
+    assert!(
+        !store
+            .has_pending_tool_call(&first.request_id)
+            .expect("first checkpoint")
+    );
+    assert!(
+        !store
+            .has_pending_tool_call(&second.request_id)
+            .expect("second checkpoint")
+    );
+    let trace_ids = store
+        .list_trace(&thread.thread_id)
+        .expect("trace list")
+        .into_iter()
+        .map(|trace| trace.event_id)
+        .collect::<Vec<_>>();
+    assert_eq!(trace_ids, vec![format!("trace_{}", second.request_id)]);
+}
+
 // 验证创建 pending approval 不会覆盖已请求取消的 turn。
 #[test]
 fn pending_approval_creation_does_not_overwrite_cancel_requested_turn() {
@@ -1657,6 +1753,283 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
         .map(|trace| trace.event_id)
         .collect::<Vec<_>>();
     assert_eq!(trace_ids, vec!["trace_cancel_requested", "trace_cancelled"]);
+}
+
+// 验证 monitor 基础设施故障优先于 cancel_requested，并原子清理 executing checkpoint。
+#[test]
+fn infrastructure_failure_after_approval_claim_terminalizes_and_cleans_checkpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_infra_after_claim",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_1");
+    let checkpoint = serde_json::json!({
+        "request_id": &request.request_id,
+        "thread_id": &request.thread_id,
+        "turn_id": &request.turn_id,
+        "tool_call_id": "call_1",
+        "tool_name": "edit",
+        "raw_arguments": "{}",
+        "resources": [],
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(checkpoint),
+            "approval",
+            "approval requested",
+        )
+        .expect("pending approval");
+    store
+        .record_approval_decision(
+            &ApprovalDecision::new(request.request_id.clone(), ApprovalOutcome::Allow, "allow"),
+            "approval",
+            "approval decision recorded",
+        )
+        .expect("claim approval");
+    store
+        .request_turn_cancellation(
+            &turn.turn_id,
+            &TraceEvent::for_turn(
+                "trace_infra_after_claim_cancel",
+                thread.thread_id.clone(),
+                turn.turn_id.clone(),
+                "app_server",
+                "turn interrupt requested",
+            ),
+        )
+        .expect("request cancellation");
+
+    let committed = store
+        .commit_turn_outcome_and_resolve_pending_execution_with_authority(
+            &request.request_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Failed,
+                agent_loop_status: "failed",
+                assistant_delta: None,
+                plan: None,
+                trace: &TraceEvent::for_turn(
+                    "trace_infra_after_claim_failed",
+                    thread.thread_id.clone(),
+                    turn.turn_id.clone(),
+                    "agent_loop",
+                    "turn execution failed",
+                ),
+            },
+            &[],
+            TurnOutcomeAuthority::InfrastructureFailure,
+        )
+        .expect("infra failure must win cancellation");
+    assert_eq!(committed.turn.status, TurnStatus::Failed);
+    assert_eq!(committed.turn.agent_loop_status, "failed");
+    assert!(
+        !store
+            .has_pending_tool_call(&request.request_id)
+            .expect("executing checkpoint cleanup")
+    );
+}
+
+// 验证 claim 后的终态 trace 写入失败不会留下部分状态，随后安全补偿仍可原子收口。
+#[test]
+fn approval_terminal_store_failure_rolls_back_then_allows_safe_cleanup() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_terminal_store_failure",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_1");
+    let checkpoint = serde_json::json!({
+        "request_id": &request.request_id,
+        "thread_id": &request.thread_id,
+        "turn_id": &request.turn_id,
+        "tool_call_id": "call_1",
+        "tool_name": "edit",
+        "raw_arguments": "{}",
+        "resources": [],
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(checkpoint),
+            "approval",
+            "approval requested",
+        )
+        .expect("pending approval");
+    let decision = ApprovalDecision::new(
+        request.request_id.clone(),
+        ApprovalOutcome::Allow,
+        "approved",
+    );
+    store
+        .record_approval_decision(&decision, "approval", "approval decision recorded")
+        .expect("claim approval");
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "
+            create trigger fail_approval_terminal_trace
+            before insert on trace_events
+            when new.payload like '%forced approval terminal failure%'
+            begin
+                select raise(abort, 'forced approval terminal trace failure');
+            end;
+            ",
+        )
+        .expect("install trigger");
+    drop(connection);
+
+    let failed_attempt = store.commit_turn_outcome_and_resolve_pending_execution(
+        &request.request_id,
+        CommitTurnOutcomeParams {
+            status: TurnStatus::Failed,
+            agent_loop_status: "failed",
+            assistant_delta: None,
+            plan: None,
+            trace: &TraceEvent {
+                payload: serde_json::json!({"error": "forced approval terminal failure"}),
+                ..TraceEvent::for_turn(
+                    "trace_approval_terminal_failure",
+                    thread.thread_id.clone(),
+                    turn.turn_id.clone(),
+                    "agent_loop",
+                    "approval terminal attempt",
+                )
+            },
+        },
+        &[],
+    );
+    assert!(matches!(failed_attempt, Err(StoreError::Sqlite(_))));
+    let after_rollback = store.get_turn(&turn.turn_id).expect("turn after rollback");
+    assert_eq!(after_rollback.status, TurnStatus::Blocked);
+    assert_eq!(after_rollback.agent_loop_status, "blocked");
+    assert!(
+        store
+            .has_pending_tool_call(&request.request_id)
+            .expect("executing checkpoint remains for compensation")
+    );
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch("drop trigger fail_approval_terminal_trace")
+        .expect("remove trigger");
+    drop(connection);
+
+    let committed = store
+        .commit_turn_outcome_and_resolve_pending_execution(
+            &request.request_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Failed,
+                agent_loop_status: "failed",
+                assistant_delta: None,
+                plan: None,
+                trace: &TraceEvent::for_turn(
+                    "trace_approval_terminal_cleanup",
+                    thread.thread_id.clone(),
+                    turn.turn_id.clone(),
+                    "agent_loop",
+                    "approval continuation failed during approval_checkpoint",
+                ),
+            },
+            &[],
+        )
+        .expect("safe cleanup");
+    assert_eq!(committed.turn.status, TurnStatus::Failed);
+    assert_eq!(committed.turn.agent_loop_status, "failed");
+    assert!(
+        !store
+            .has_pending_tool_call(&request.request_id)
+            .expect("checkpoint cleanup")
+    );
+}
+
+// Infrastructure authority is a typed Failed reduction, never an alternate
+// spelling of cancellation or a way to publish a successful late result.
+#[test]
+fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
+    for (status, agent_loop_status) in [
+        (TurnStatus::Interrupted, "cancelled"),
+        (TurnStatus::Completed, "completed"),
+    ] {
+        let is_completed = status == TurnStatus::Completed;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let thread = store.create_thread(None, None).expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "running")
+            .expect("turn");
+        store
+            .request_turn_cancellation(
+                &turn.turn_id,
+                &TraceEvent::for_turn(
+                    format!("trace_infrastructure_authority_{}", agent_loop_status),
+                    thread.thread_id.clone(),
+                    turn.turn_id.clone(),
+                    "test",
+                    "cancel requested",
+                ),
+            )
+            .expect("cancel request");
+
+        let result = store.commit_turn_outcome_with_authority(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status,
+                agent_loop_status,
+                assistant_delta: is_completed.then_some("late result"),
+                plan: None,
+                trace: &TraceEvent::for_turn(
+                    format!(
+                        "trace_infrastructure_authority_result_{}",
+                        agent_loop_status
+                    ),
+                    thread.thread_id.clone(),
+                    turn.turn_id.clone(),
+                    "test",
+                    "infrastructure result",
+                ),
+            },
+            TurnOutcomeAuthority::InfrastructureFailure,
+        );
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidState(message))
+                if message == "infrastructure failure can only finalize as failed"
+        ));
+        let current = store.get_turn(&turn.turn_id).expect("unchanged turn");
+        assert_eq!(current.status, TurnStatus::Running);
+        assert_eq!(current.agent_loop_status, "cancel_requested");
+    }
 }
 
 // 验证 approval 决定只写入一次且保留在 decision history。
