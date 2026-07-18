@@ -153,101 +153,110 @@ jobs:
           $checksum = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$checksum  $name.zip" | Set-Content -Encoding ascii $checksumPath
 
-          $appBomStem = "singularity-app-server-sbom"
-          $cliBomStem = "singularity-cli-sbom"
-          $appManifest = Join-Path $PWD "crates/app-server/Cargo.toml"
-          $cliManifest = Join-Path $PWD "crates/cli/Cargo.toml"
-          & "${{ steps.sbom-tool.outputs.path }}" cyclonedx `
-            --manifest-path $appManifest --format json --all-features `
-            --target x86_64-pc-windows-msvc --spec-version 1.5 `
-            --override-filename $appBomStem --quiet
-          if ($LASTEXITCODE -ne 0) {
-            throw "cargo-cyclonedx failed for the app-server graph"
-          }
-          & "${{ steps.sbom-tool.outputs.path }}" cyclonedx `
-            --manifest-path $cliManifest --format json --all-features `
-            --target x86_64-pc-windows-msvc --spec-version 1.5 `
-            --override-filename $cliBomStem --quiet
-          if ($LASTEXITCODE -ne 0) {
-            throw "cargo-cyclonedx failed for the CLI graph"
-          }
-
-          $appBomFiles = @(Get-ChildItem -LiteralPath (Split-Path $appManifest) -Filter "$appBomStem*.json" -File)
-          $cliBomFiles = @(Get-ChildItem -LiteralPath (Split-Path $cliManifest) -Filter "$cliBomStem*.json" -File)
-          if ($appBomFiles.Count -ne 1 -or $cliBomFiles.Count -ne 1) {
-            throw "expected one generated BOM per release graph"
-          }
-          $bom = Get-Content -Raw -LiteralPath $appBomFiles[0].FullName | ConvertFrom-Json
-          $cliBom = Get-Content -Raw -LiteralPath $cliBomFiles[0].FullName | ConvertFrom-Json
-
-          $componentRefs = [System.Collections.Generic.HashSet[string]]::new()
-          foreach ($component in @($bom.components)) {
-            [void]$componentRefs.Add([string]$component.'bom-ref')
-          }
-          foreach ($component in @($cliBom.components)) {
-            if ($componentRefs.Add([string]$component.'bom-ref')) {
-              $bom.components += $component
+          $sbomRequests = @(
+            [ordered]@{
+              Manifest = Join-Path $PWD "crates/cli/Cargo.toml"
+              Directory = Join-Path $PWD "crates/cli"
+              ExpectedNames = @("sg")
             }
-          }
-          if ($componentRefs.Add([string]$cliBom.metadata.component.'bom-ref')) {
-            $bom.components += $cliBom.metadata.component
-          }
-
-          $dependencyByRef = @{}
-          foreach ($dependency in @($bom.dependencies)) {
-            $dependencyByRef[[string]$dependency.ref] = $dependency
-          }
-          foreach ($dependency in @($cliBom.dependencies)) {
-            $ref = [string]$dependency.ref
-            if ($dependencyByRef.ContainsKey($ref)) {
-              $dependsOn = [System.Collections.Generic.HashSet[string]]::new()
-              foreach ($item in @($dependencyByRef[$ref].dependsOn)) {
-                [void]$dependsOn.Add([string]$item)
-              }
-              foreach ($item in @($dependency.dependsOn)) {
-                [void]$dependsOn.Add([string]$item)
-              }
-              if ($dependencyByRef[$ref].PSObject.Properties.Name -contains "dependsOn") {
-                $dependencyByRef[$ref].dependsOn = @($dependsOn)
-              } else {
-                $dependencyByRef[$ref] | Add-Member -NotePropertyName dependsOn -NotePropertyValue @($dependsOn)
-              }
-            } else {
-              $bom.dependencies += $dependency
-              $dependencyByRef[$ref] = $dependency
+            [ordered]@{
+              Manifest = Join-Path $PWD "crates/app-server/Cargo.toml"
+              Directory = Join-Path $PWD "crates/app-server"
+              ExpectedNames = @("singularity_app_server")
             }
-          }
-
-          $archiveComponent = [ordered]@{
-            type = "file"
-            bom-ref = "artifact:$name.zip"
-            name = "$name.zip"
-            hashes = @(@{ alg = "SHA-256"; content = $checksum })
-          }
-          $checksumHash = (Get-FileHash -LiteralPath $checksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          $checksumComponent = [ordered]@{
-            type = "file"
-            bom-ref = "artifact:SHA256SUMS.txt"
-            name = "SHA256SUMS.txt"
-            hashes = @(@{ alg = "SHA-256"; content = $checksumHash })
-          }
-          $bom.components += $archiveComponent
-          $bom.components += $checksumComponent
-          $bom.metadata.properties += @(
-            @{ name = "singularity:release:archive"; value = "$name.zip" }
-            @{ name = "singularity:release:checksum"; value = "SHA256SUMS.txt" }
-            @{ name = "singularity:release:sbom-graphs"; value = "singularity_app_server,singularity_cli" }
+            [ordered]@{
+              Manifest = Join-Path $PWD "crates/windows-sandbox/Cargo.toml"
+              Directory = Join-Path $PWD "crates/windows-sandbox"
+              ExpectedNames = @("singularity-command-runner", "singularity-windows-sandbox-setup")
+            }
           )
+          $expectedBinaryNames = @(
+            "sg"
+            "singularity_app_server"
+            "singularity-command-runner"
+            "singularity-windows-sandbox-setup"
+          )
+          $stableNames = @{
+            "sg" = "sbom-sg.cdx.json"
+            "singularity_app_server" = "sbom-singularity-app-server.cdx.json"
+            "singularity-command-runner" = "sbom-singularity-command-runner.cdx.json"
+            "singularity-windows-sandbox-setup" = "sbom-singularity-windows-sandbox-setup.cdx.json"
+          }
+          $generatedBomFiles = @()
+          foreach ($request in $sbomRequests) {
+            $existing = @(Get-ChildItem -LiteralPath $request.Directory -Filter "*.cdx.json" -File)
+            if ($existing.Count -ne 0) {
+              throw "unexpected pre-existing CycloneDX files in $($request.Directory)"
+            }
+            & "${{ steps.sbom-tool.outputs.path }}" cyclonedx `
+              --manifest-path $request.Manifest --format json --describe binaries --all-features `
+              --target x86_64-pc-windows-msvc --spec-version 1.5 --quiet
+            if ($LASTEXITCODE -ne 0) {
+              throw "cargo-cyclonedx failed for $($request.Manifest)"
+            }
+            $outputs = @(Get-ChildItem -LiteralPath $request.Directory -Filter "*.cdx.json" -File)
+            if ($outputs.Count -ne $request.ExpectedNames.Count) {
+              throw "expected $($request.ExpectedNames.Count) binary BOMs in $($request.Directory), found $($outputs.Count)"
+            }
+            $generatedBomFiles += $outputs
+          }
+          if ($generatedBomFiles.Count -ne $expectedBinaryNames.Count) {
+            throw "expected four generated binary BOMs, found $($generatedBomFiles.Count)"
+          }
 
-          $sbomPath = Join-Path $PWD "dist/$name-sbom.cdx.json"
-          $bom | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $sbomPath -Encoding utf8NoBOM
-          $null = Get-Content -Raw -LiteralPath $sbomPath | ConvertFrom-Json
-          Remove-Item -LiteralPath $appBomFiles[0].FullName, $cliBomFiles[0].FullName -Force
+          $validatedBoms = @()
+          foreach ($bomFile in @($generatedBomFiles | Sort-Object FullName)) {
+            try {
+              $bom = Get-Content -Raw -LiteralPath $bomFile.FullName | ConvertFrom-Json
+            } catch {
+              throw "invalid CycloneDX JSON: $($bomFile.FullName): $($_.Exception.Message)"
+            }
+            if ([string]$bom.bomFormat -ne "CycloneDX" -or [string]$bom.specVersion -ne "1.5") {
+              throw "unexpected CycloneDX format or spec version: $($bomFile.FullName)"
+            }
+            if ($null -eq $bom.metadata -or $null -eq $bom.metadata.component) {
+              throw "missing CycloneDX metadata component: $($bomFile.FullName)"
+            }
+            $binaryName = [string]$bom.metadata.component.name
+            if ([string]$bom.metadata.component.type -ne "application" -or $stableNames.Keys -notcontains $binaryName) {
+              throw "metadata component does not identify a release binary: $($bomFile.FullName)"
+            }
+            $request = @($sbomRequests | Where-Object { $_.Directory -eq $bomFile.DirectoryName })
+            if ($request.Count -ne 1 -or $request[0].ExpectedNames -notcontains $binaryName) {
+              throw "metadata binary does not match its manifest: $($bomFile.FullName)"
+            }
+            if (@($validatedBoms | Where-Object { $_.BinaryName -eq $binaryName }).Count -ne 0) {
+              throw "duplicate binary BOM metadata: $binaryName"
+            }
+            $validatedBoms += [PSCustomObject]@{
+              BinaryName = $binaryName
+              File = $bomFile
+              StableName = $stableNames[$binaryName]
+            }
+          }
+          if ($validatedBoms.Count -ne $expectedBinaryNames.Count) {
+            throw "expected four validated binary BOMs, found $($validatedBoms.Count)"
+          }
+          foreach ($binaryName in $expectedBinaryNames) {
+            $validated = @($validatedBoms | Where-Object { $_.BinaryName -eq $binaryName })
+            if ($validated.Count -ne 1) {
+              throw "missing expected binary BOM: $binaryName"
+            }
+            $stablePath = Join-Path $PWD "dist/$($validated[0].StableName)"
+            if (Test-Path -LiteralPath $stablePath) {
+              throw "stable SBOM path already exists: $stablePath"
+            }
+            Copy-Item -LiteralPath $validated[0].File.FullName -Destination $stablePath
+          }
+          $generatedBomFiles | Remove-Item -Force
 
           "name=$name" >> $env:GITHUB_OUTPUT
           "archive=$archive" >> $env:GITHUB_OUTPUT
           "checksum=$checksumPath" >> $env:GITHUB_OUTPUT
-          "sbom=$sbomPath" >> $env:GITHUB_OUTPUT
+          "sbom_sg=$(Join-Path $PWD 'dist/sbom-sg.cdx.json')" >> $env:GITHUB_OUTPUT
+          "sbom_app_server=$(Join-Path $PWD 'dist/sbom-singularity-app-server.cdx.json')" >> $env:GITHUB_OUTPUT
+          "sbom_command_runner=$(Join-Path $PWD 'dist/sbom-singularity-command-runner.cdx.json')" >> $env:GITHUB_OUTPUT
+          "sbom_windows_sandbox_setup=$(Join-Path $PWD 'dist/sbom-singularity-windows-sandbox-setup.cdx.json')" >> $env:GITHUB_OUTPUT
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -256,7 +265,10 @@ jobs:
           path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
-            ${{ steps.package.outputs.sbom }}
+            ${{ steps.package.outputs.sbom_sg }}
+            ${{ steps.package.outputs.sbom_app_server }}
+            ${{ steps.package.outputs.sbom_command_runner }}
+            ${{ steps.package.outputs.sbom_windows_sandbox_setup }}
           if-no-files-found: error
 
       - name: Generate artifact provenance attestation
@@ -265,7 +277,10 @@ jobs:
           subject-path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
-            ${{ steps.package.outputs.sbom }}
+            ${{ steps.package.outputs.sbom_sg }}
+            ${{ steps.package.outputs.sbom_app_server }}
+            ${{ steps.package.outputs.sbom_command_runner }}
+            ${{ steps.package.outputs.sbom_windows_sandbox_setup }}
 
   publish:
     if: github.ref_type == 'tag'
@@ -290,13 +305,19 @@ jobs:
             throw "expected one release archive, found $($archive.Count)"
           }
           $archive = $archive.FullName
-          $sbom = Get-ChildItem -LiteralPath dist -Filter "*-sbom.cdx.json" -File
-          if ($sbom.Count -ne 1) {
-            throw "expected one release SBOM, found $($sbom.Count)"
+          $sbomNames = @(
+            "sbom-sg.cdx.json"
+            "sbom-singularity-app-server.cdx.json"
+            "sbom-singularity-command-runner.cdx.json"
+            "sbom-singularity-windows-sandbox-setup.cdx.json"
+          )
+          $sboms = @(Get-ChildItem -LiteralPath dist -Filter "sbom-*.cdx.json" -File | Sort-Object Name)
+          if ($sboms.Count -ne $sbomNames.Count -or @($sboms.Name | Where-Object { $sbomNames -notcontains $_ }).Count -ne 0) {
+            throw "expected exactly four release SBOMs"
           }
-          $sbom = $sbom.FullName
+          $assets = @($archive, (Join-Path $PWD "dist/SHA256SUMS.txt")) + @($sboms.FullName)
           if (gh release view $env:GITHUB_REF_NAME *> $null) {
-            gh release upload $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt $sbom --clobber
+            gh release upload $env:GITHUB_REF_NAME @assets --clobber
           } else {
-            gh release create $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt $sbom --verify-tag --generate-notes
+            gh release create $env:GITHUB_REF_NAME @assets --verify-tag --generate-notes
           }
