@@ -1,5 +1,6 @@
 {
-  "schema_version": "evaluation.task_set/v4",
+  "schema_version": "evaluation.task_set/v5",
+  "trial_count": 2,
   "tasks": [
     {
       "task_id": "sqlfluff__sqlfluff-2419",
@@ -64,13 +65,12 @@
         "allowed_paths": [
           "src/sqlfluff/rules/L060.py"
         ],
-        "allowed_tools": [
-          "read",
-          "grep",
-          "edit",
-          "patch",
-          "command",
-          "update_plan"
+        "required_tool_capabilities": [
+          {"capability": "workspace_read", "minimum_version": 1},
+          {"capability": "workspace_search", "minimum_version": 1},
+          {"capability": "workspace_write", "minimum_version": 1},
+          {"capability": "command_execution", "minimum_version": 1},
+          {"capability": "plan_management", "minimum_version": 1}
         ],
         "smoke_commands": [
           {
@@ -156,13 +156,12 @@
           "pricing.py",
           "receipt.py"
         ],
-        "allowed_tools": [
-          "read",
-          "grep",
-          "edit",
-          "patch",
-          "command",
-          "update_plan"
+        "required_tool_capabilities": [
+          {"capability": "workspace_read", "minimum_version": 1},
+          {"capability": "workspace_search", "minimum_version": 1},
+          {"capability": "workspace_write", "minimum_version": 1},
+          {"capability": "command_execution", "minimum_version": 1},
+          {"capability": "plan_management", "minimum_version": 1}
         ],
         "smoke_commands": [
           {
@@ -264,13 +263,12 @@
           "src/lib.rs",
           "calculator.mjs"
         ],
-        "allowed_tools": [
-          "read",
-          "grep",
-          "edit",
-          "patch",
-          "command",
-          "update_plan"
+        "required_tool_capabilities": [
+          {"capability": "workspace_read", "minimum_version": 1},
+          {"capability": "workspace_search", "minimum_version": 1},
+          {"capability": "workspace_write", "minimum_version": 1},
+          {"capability": "command_execution", "minimum_version": 1},
+          {"capability": "plan_management", "minimum_version": 1}
         ],
         "smoke_commands": [
           {
@@ -334,13 +332,12 @@
           "catalog.mjs",
           "inventory.mjs"
         ],
-        "allowed_tools": [
-          "read",
-          "grep",
-          "edit",
-          "patch",
-          "command",
-          "update_plan"
+        "required_tool_capabilities": [
+          {"capability": "workspace_read", "minimum_version": 1},
+          {"capability": "workspace_search", "minimum_version": 1},
+          {"capability": "workspace_write", "minimum_version": 1},
+          {"capability": "command_execution", "minimum_version": 1},
+          {"capability": "plan_management", "minimum_version": 1}
         ],
         "smoke_commands": [
           {
@@ -419,14 +416,12 @@
           "src/billing/ledger.py",
           "src/billing/report.py"
         ],
-        "allowed_tools": [
-          "read",
-          "list",
-          "grep",
-          "edit",
-          "patch",
-          "command",
-          "update_plan"
+        "required_tool_capabilities": [
+          {"capability": "workspace_read", "minimum_version": 1},
+          {"capability": "workspace_search", "minimum_version": 1},
+          {"capability": "workspace_write", "minimum_version": 1},
+          {"capability": "command_execution", "minimum_version": 1},
+          {"capability": "plan_management", "minimum_version": 1}
         ],
         "smoke_commands": [
           {

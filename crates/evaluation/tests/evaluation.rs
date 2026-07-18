@@ -10,7 +10,8 @@ use singularity_evaluation::{
     EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationScopeEvidence,
     EvaluationStageResults, EvaluationStatus, EvaluationTaskEvidence, EvaluationTaskResult,
     EvaluationTrialEvidence, EvaluationTrialResult, EvidenceVerdict, RunId, StageResult,
-    StageStatus, TaskId, ToolCapabilityName, ToolCapabilityRequirement, task_selection_digest,
+    StageStatus, TaskId, TaskSetSchemaVersion, ToolCapabilityName, ToolCapabilityRequirement,
+    task_selection_digest,
 };
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -65,6 +66,25 @@ fn parse_manifest(value: &Value) -> Result<EvaluationManifest, EvaluationError> 
         &serde_json::to_string(value).expect("manifest JSON"),
         env!("CARGO_MANIFEST_DIR"),
     )
+}
+
+#[test]
+fn public_representative_task_uses_the_current_runtime_contract() {
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/evaluation/public-representative-task.json");
+    let manifest = EvaluationManifest::load(manifest_path).expect("public manifest is runnable");
+
+    assert_eq!(manifest.task_set().schema_version, TaskSetSchemaVersion::V5);
+    assert_eq!(manifest.task_set().trial_count, 2);
+    assert_eq!(manifest.task_set().tasks.len(), 5);
+    assert!(manifest.task_set().tasks.iter().all(|task| {
+        !task.agent.required_tool_capabilities.is_empty()
+            && task
+                .agent
+                .required_tool_capabilities
+                .iter()
+                .all(|requirement| requirement.minimum_version == 1)
+    }));
 }
 
 fn stages(agent: StageResult, public: StageResult, hidden: StageResult) -> EvaluationStageResults {
