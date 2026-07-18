@@ -1,11 +1,11 @@
 //! `AppServer` 的标准输入输出（stdio）传输层。
 //!
 //! 输入独立读取；请求工作线程准入队列和传输队列均有界，由单一写入方串行化 JSON 行输出，
-//! 并在背压时拒绝继续处理。
+//! 事件通知采用有界的尽力而为队列；控制响应始终使用独立的有界队列。
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,8 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MAX_REQUEST_WORKERS: usize = 16;
 const INPUT_QUEUE_CAPACITY: usize = 64;
-const OUTPUT_QUEUE_CAPACITY: usize = 256;
+const CONTROL_QUEUE_CAPACITY: usize = 64;
+const EVENT_QUEUE_CAPACITY: usize = 256;
 const REQUEST_CAPACITY_EXCEEDED: &str = "AppServer request capacity exceeded";
 const FILE_BACKED_STORE_REQUIRED: &str =
     "app-server requires a file-backed SINGULARITY_APP_SERVER_DB";
@@ -32,6 +33,34 @@ const SAFE_FILE_BACKED_STATE_REQUIRED: &str =
     "app-server requires a canonical regular file-backed state database";
 const CACHE_TEMP_FILE_PREFIX: &str = ".provider-capability-cache.json.tmp-";
 const CACHE_KEY_LOCK_FILE_PREFIX: &str = ".provider-capability-cache.key-lock-";
+
+#[derive(Clone)]
+struct OutputChannels {
+    control: SyncSender<Value>,
+    event: SyncSender<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputKind {
+    Control,
+    Event,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputSendStatus {
+    Enqueued,
+    EventDropped,
+}
+
+trait ExecutionStop {
+    fn request_execution_stop(&self);
+}
+
+impl ExecutionStop for AppServerCancellationHandle {
+    fn request_execution_stop(&self) {
+        let _ = AppServerCancellationHandle::request_execution_stop(self);
+    }
+}
 
 /// 启动标准输入输出服务；传输或生命周期关闭失败时以非零状态退出。
 fn main() {
@@ -58,26 +87,21 @@ fn run() -> Result<(), String> {
     );
     let mut server = AppServer::new(store, provider_snapshot);
     let cancellation = server.cancellation_handle();
-    let (output_tx, output_rx) = mpsc::sync_channel::<Value>(OUTPUT_QUEUE_CAPACITY);
+    let (control_tx, control_rx) = mpsc::sync_channel::<Value>(CONTROL_QUEUE_CAPACITY);
+    let (event_tx, event_rx) = mpsc::sync_channel::<Value>(EVENT_QUEUE_CAPACITY);
+    let outputs = OutputChannels {
+        control: control_tx,
+        event: event_tx,
+    };
     let (writer_error_tx, writer_error_rx) = mpsc::channel::<String>();
     let writer_cancellation = cancellation.clone();
     let writer = thread::spawn(move || -> Result<(), String> {
         let mut stdout = io::stdout().lock();
-        for message in output_rx {
-            let result = write_json_line(&mut stdout, &message)
-                .map_err(|error| format!("failed to write response: {error}"))
-                .and_then(|()| {
-                    stdout
-                        .flush()
-                        .map_err(|error| format!("failed to flush response: {error}"))
-                });
-            if let Err(error) = result {
-                let _ = writer_cancellation.request_execution_stop();
-                let _ = writer_error_tx.send(error.clone());
-                return Err(error);
-            }
+        let result = write_output_queue(control_rx, event_rx, &mut stdout, &writer_cancellation);
+        if let Err(error) = &result {
+            let _ = writer_error_tx.send(error.clone());
         }
-        Ok(())
+        result
     });
     let (input_tx, input_rx) =
         mpsc::sync_channel::<Result<Option<String>, String>>(INPUT_QUEUE_CAPACITY);
@@ -134,7 +158,8 @@ fn run() -> Result<(), String> {
             Ok(payload) => payload,
             Err(_) => {
                 if let Err(error) = send_output(
-                    &output_tx,
+                    &outputs,
+                    OutputKind::Control,
                     &cancellation,
                     JsonRpcMessage::parse_error().to_wire_value(),
                 ) {
@@ -145,7 +170,7 @@ fn run() -> Result<(), String> {
             }
         };
         if !matches!(payload, JsonRpcPayload::Single(_)) {
-            if let Err(error) = dispatch_batch(&mut server, payload, &output_tx, &cancellation) {
+            if let Err(error) = dispatch_batch(&mut server, payload, &outputs, &cancellation) {
                 terminal_error = Some(error);
                 break;
             }
@@ -161,7 +186,8 @@ fn run() -> Result<(), String> {
             JsonRpcBatchItem::Message(message) => message,
             JsonRpcBatchItem::Invalid { id } => {
                 if let Err(error) = send_output(
-                    &output_tx,
+                    &outputs,
+                    OutputKind::Control,
                     &cancellation,
                     JsonRpcMessage::invalid_request(id).to_wire_value(),
                 ) {
@@ -175,7 +201,8 @@ fn run() -> Result<(), String> {
         if is_request_worker_method(&message) && server.ready_for_turn_worker() {
             if request_workers.len() >= MAX_REQUEST_WORKERS {
                 if let Err(error) = send_output(
-                    &output_tx,
+                    &outputs,
+                    OutputKind::Control,
                     &cancellation,
                     internal_error_value(request_id, REQUEST_CAPACITY_EXCEEDED),
                 ) {
@@ -186,22 +213,18 @@ fn run() -> Result<(), String> {
             }
             match server.turn_worker() {
                 Ok(worker) => {
-                    let worker_output_tx = output_tx.clone();
+                    let worker_outputs = outputs.clone();
                     let worker_cancellation = cancellation.clone();
                     match thread::Builder::new()
                         .name("singularity-request".to_string())
                         .spawn(move || {
-                            run_request_worker(
-                                worker,
-                                message,
-                                worker_output_tx,
-                                worker_cancellation,
-                            )
+                            run_request_worker(worker, message, worker_outputs, worker_cancellation)
                         }) {
                         Ok(worker) => request_workers.push(worker),
                         Err(error) => {
                             if let Err(error) = send_output(
-                                &output_tx,
+                                &outputs,
+                                OutputKind::Control,
                                 &cancellation,
                                 internal_error_value(
                                     request_id,
@@ -216,7 +239,8 @@ fn run() -> Result<(), String> {
                 }
                 Err(error) => {
                     if let Err(error) = send_output(
-                        &output_tx,
+                        &outputs,
+                        OutputKind::Control,
                         &cancellation,
                         transport_error_value(request_id, &error),
                     ) {
@@ -226,24 +250,31 @@ fn run() -> Result<(), String> {
                 }
             }
         } else {
+            let notification = message.is_notification();
             match server.handle(message) {
                 Ok(messages) => {
                     for message in messages {
-                        if let Err(error) = send_output(&output_tx, &cancellation, message) {
+                        let kind = classify_output(&message);
+                        if notification && kind == OutputKind::Control {
+                            continue;
+                        }
+                        if let Err(error) = send_output(&outputs, kind, &cancellation, message) {
                             terminal_error = Some(error);
                             break;
                         }
                     }
                 }
-                Err(error) => {
+                Err(error) if !notification => {
                     if let Err(error) = send_output(
-                        &output_tx,
+                        &outputs,
+                        OutputKind::Control,
                         &cancellation,
                         transport_error_value(request_id, &error),
                     ) {
                         terminal_error = Some(error);
                     }
                 }
+                Err(_) => {}
             }
             if terminal_error.is_some() {
                 break;
@@ -261,7 +292,7 @@ fn run() -> Result<(), String> {
         .and_then(|()| {
             join_request_workers_during_shutdown(&mut request_workers, shutdown_deadline)
         });
-    drop(output_tx);
+    drop(outputs);
     let writer_result = join_writer_during_shutdown(writer, shutdown_deadline);
     request_worker_result?;
     if let Some(error) = terminal_error {
@@ -283,20 +314,22 @@ fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
     )
 }
 
-/// 按输入顺序串行分发 batch；副作用项不并行，notification 项不产生任何输出。
+/// 按输入顺序串行分发 batch；副作用项不并行，notification 项不产生控制响应。
 fn dispatch_batch(
     server: &mut AppServer,
     payload: JsonRpcPayload,
-    output_tx: &SyncSender<Value>,
-    cancellation: &AppServerCancellationHandle,
+    outputs: &OutputChannels,
+    cancellation: &dyn ExecutionStop,
 ) -> Result<(), String> {
     let items = match payload {
         JsonRpcPayload::EmptyBatch => {
             return send_output(
-                output_tx,
+                outputs,
+                OutputKind::Control,
                 cancellation,
                 JsonRpcMessage::invalid_request(None).to_wire_value(),
-            );
+            )
+            .map(|_| ());
         }
         JsonRpcPayload::Batch(items) => items,
         JsonRpcPayload::Single(_) => {
@@ -344,27 +377,34 @@ fn dispatch_batch(
         }
     }
     for notification in notifications {
-        send_output(output_tx, cancellation, notification)?;
+        send_output(outputs, OutputKind::Event, cancellation, notification)?;
     }
     if responses.is_empty() {
         return Ok(());
     }
-    send_output(output_tx, cancellation, Value::Array(responses))
+    send_output(
+        outputs,
+        OutputKind::Control,
+        cancellation,
+        Value::Array(responses),
+    )
+    .map(|_| ())
 }
 
-/// 分发一个由工作线程负责的请求，并通过共享有界队列发送全部响应。
+/// 分发一个由工作线程负责的请求，并将事件与最终控制响应分别排队。
 fn run_request_worker(
     mut worker: AppServer,
     message: JsonRpcMessage,
-    output_tx: SyncSender<Value>,
+    outputs: OutputChannels,
     cancellation: AppServerCancellationHandle,
 ) -> Result<(), String> {
     let request_id = message.id().cloned();
     let mut output_error = None;
     let result = if message.method_name() == Some(Method::TurnStart.as_str()) {
         worker.handle_turn_start_streaming(message, |message| {
+            let kind = classify_output(&message);
             if output_error.is_none()
-                && let Err(error) = send_output(&output_tx, &cancellation, message)
+                && let Err(error) = send_output(&outputs, kind, &cancellation, message)
             {
                 output_error = Some(error);
             }
@@ -372,7 +412,8 @@ fn run_request_worker(
     } else {
         worker.handle(message).map(|messages| {
             for message in messages {
-                if let Err(error) = send_output(&output_tx, &cancellation, message) {
+                let kind = classify_output(&message);
+                if let Err(error) = send_output(&outputs, kind, &cancellation, message) {
                     output_error = Some(error);
                     break;
                 }
@@ -384,7 +425,8 @@ fn run_request_worker(
     }
     if let Err(error) = result {
         send_output(
-            &output_tx,
+            &outputs,
+            OutputKind::Control,
             &cancellation,
             request_error_value(request_id, &error),
         )?;
@@ -466,19 +508,106 @@ fn join_request_worker(worker: JoinHandle<Result<(), String>>) -> Result<(), Str
         .map_err(|_| "request worker panicked".to_string())?
 }
 
-/// 入队一个响应；检测到 `stdout` 背压或断开时停止执行。
+fn classify_output(value: &Value) -> OutputKind {
+    match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
+        Ok(JsonRpcMessage::Notification(_)) => OutputKind::Event,
+        Ok(JsonRpcMessage::Request(_))
+        | Ok(JsonRpcMessage::Success(_))
+        | Ok(JsonRpcMessage::Error(_))
+        | Err(_) => OutputKind::Control,
+    }
+}
+
+/// 按类型入队；事件队列满时只丢弃当前连接的事件，不停止其他活动 turn。
 fn send_output(
-    sender: &SyncSender<Value>,
-    cancellation: &AppServerCancellationHandle,
+    outputs: &OutputChannels,
+    kind: OutputKind,
+    cancellation: &dyn ExecutionStop,
     message: Value,
-) -> Result<(), String> {
-    sender.try_send(message).map_err(|error| {
-        let _ = cancellation.request_execution_stop();
-        match error {
-            TrySendError::Full(_) => "stdout transport backpressure exceeded".to_string(),
-            TrySendError::Disconnected(_) => "stdout transport unavailable".to_string(),
+) -> Result<OutputSendStatus, String> {
+    let sender = match kind {
+        OutputKind::Control => &outputs.control,
+        OutputKind::Event => &outputs.event,
+    };
+    match sender.try_send(message) {
+        Ok(()) => Ok(OutputSendStatus::Enqueued),
+        Err(TrySendError::Full(_)) if kind == OutputKind::Event => {
+            Ok(OutputSendStatus::EventDropped)
         }
-    })
+        Err(TrySendError::Full(_)) => {
+            cancellation.request_execution_stop();
+            Err("stdout control transport overload".to_string())
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            cancellation.request_execution_stop();
+            Err("stdout transport unavailable".to_string())
+        }
+    }
+}
+
+/// 以控制响应优先、各自 FIFO 的顺序从两个有界队列取出一条 frame。
+fn next_output(
+    control_rx: &Receiver<Value>,
+    event_rx: &Receiver<Value>,
+    control_open: &mut bool,
+    event_open: &mut bool,
+) -> Option<Value> {
+    loop {
+        if *control_open {
+            match control_rx.try_recv() {
+                Ok(message) => return Some(message),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => *control_open = false,
+            }
+        }
+        if *event_open {
+            match event_rx.try_recv() {
+                Ok(message) => return Some(message),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => *event_open = false,
+            }
+        }
+        if !*control_open && !*event_open {
+            return None;
+        }
+        if *control_open {
+            match control_rx.recv_timeout(INPUT_POLL_INTERVAL) {
+                Ok(message) => return Some(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => *control_open = false,
+            }
+        } else if *event_open {
+            match event_rx.recv_timeout(INPUT_POLL_INTERVAL) {
+                Ok(message) => return Some(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => *event_open = false,
+            }
+        }
+    }
+}
+
+/// 串行写出控制与事件 frame；真实写入或 flush 失败才触发全局停止。
+fn write_output_queue(
+    control_rx: Receiver<Value>,
+    event_rx: Receiver<Value>,
+    stdout: &mut impl Write,
+    cancellation: &dyn ExecutionStop,
+) -> Result<(), String> {
+    let mut control_open = true;
+    let mut event_open = true;
+    while let Some(message) =
+        next_output(&control_rx, &event_rx, &mut control_open, &mut event_open)
+    {
+        if let Err(error) = write_json_line(stdout, &message) {
+            cancellation.request_execution_stop();
+            return Err(format!("failed to write response: {error}"));
+        }
+        if let Err(error) = stdout.flush() {
+            cancellation.request_execution_stop();
+            return Err(format!("failed to flush response: {error}"));
+        }
+    }
+    Ok(())
 }
 
 /// 将一个 JSON-RPC 值严格串行化为一条以换行分隔的 `stdout` 记录。
@@ -699,6 +828,34 @@ fn validate_database_file(path: &Path, allow_missing: bool) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct CancellationProbe {
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl CancellationProbe {
+        fn request_count(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ExecutionStop for CancellationProbe {
+        fn request_execution_stop(&self) {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn test_output_channels(
+        control_capacity: usize,
+        event_capacity: usize,
+    ) -> (OutputChannels, Receiver<Value>, Receiver<Value>) {
+        let (control, control_rx) = mpsc::sync_channel(control_capacity);
+        let (event, event_rx) = mpsc::sync_channel(event_capacity);
+        (OutputChannels { control, event }, control_rx, event_rx)
+    }
 
     #[test]
     fn state_path_rejects_sqlite_uri_before_cache_injection() {
@@ -823,18 +980,126 @@ mod tests {
     }
 
     #[test]
-    fn stdout_queue_fails_closed_when_backpressure_limit_is_reached() {
-        let store = SessionStore::open(":memory:").expect("store");
-        let server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
-        let cancellation = server.cancellation_handle();
-        let (sender, _receiver) = mpsc::sync_channel(1);
-        send_output(&sender, &cancellation, serde_json::json!({"first": true}))
-            .expect("first output fits");
+    fn control_queue_fails_closed_when_backpressure_limit_is_reached() {
+        let (outputs, _control_rx, _event_rx) = test_output_channels(1, 1);
+        let cancellation = CancellationProbe::default();
+        send_output(
+            &outputs,
+            OutputKind::Control,
+            &cancellation,
+            serde_json::json!({"first": true}),
+        )
+        .expect("first output fits");
 
-        let error = send_output(&sender, &cancellation, serde_json::json!({"second": true}))
-            .expect_err("full queue must fail closed");
+        let error = send_output(
+            &outputs,
+            OutputKind::Control,
+            &cancellation,
+            serde_json::json!({"second": true}),
+        )
+        .expect_err("full control queue must fail closed");
 
-        assert_eq!(error, "stdout transport backpressure exceeded");
+        assert_eq!(error, "stdout control transport overload");
+        assert_eq!(cancellation.request_count(), 1);
+    }
+
+    #[test]
+    fn saturated_event_output_does_not_stop_equivalent_active_turn_handles() {
+        let (outputs, _control_rx, _event_rx) = test_output_channels(1, 1);
+        let first_turn_cancellation = CancellationProbe::default();
+        let second_turn_cancellation = first_turn_cancellation.clone();
+        send_output(
+            &outputs,
+            OutputKind::Event,
+            &first_turn_cancellation,
+            serde_json::json!({"event": 1}),
+        )
+        .expect("first event fits");
+
+        let result = send_output(
+            &outputs,
+            OutputKind::Event,
+            &first_turn_cancellation,
+            serde_json::json!({"event": 2}),
+        )
+        .expect("event pressure must not stop execution");
+
+        assert_eq!(result, OutputSendStatus::EventDropped);
+        assert_eq!(first_turn_cancellation.request_count(), 0);
+        assert_eq!(second_turn_cancellation.request_count(), 0);
+    }
+
+    #[test]
+    fn control_output_remains_available_and_is_written_before_events() {
+        let (outputs, control_rx, event_rx) = test_output_channels(1, 1);
+        let cancellation = CancellationProbe::default();
+        send_output(
+            &outputs,
+            OutputKind::Event,
+            &cancellation,
+            serde_json::json!({"kind": "event"}),
+        )
+        .expect("event fits");
+        send_output(
+            &outputs,
+            OutputKind::Event,
+            &cancellation,
+            serde_json::json!({"kind": "dropped"}),
+        )
+        .expect("event pressure is a recoverable drop");
+        send_output(
+            &outputs,
+            OutputKind::Control,
+            &cancellation,
+            serde_json::json!({"kind": "control"}),
+        )
+        .expect("control remains available while events are full");
+        drop(outputs);
+
+        let mut stdout = Vec::new();
+        write_output_queue(control_rx, event_rx, &mut stdout, &cancellation)
+            .expect("writer drains both queues");
+        let lines = String::from_utf8(stdout).expect("writer output is UTF-8");
+        let values = lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("JSONL frame"))
+            .collect::<Vec<_>>();
+        assert_eq!(values[0]["kind"], "control");
+        assert_eq!(values[1]["kind"], "event");
+        assert_eq!(cancellation.request_count(), 0);
+    }
+
+    struct DisconnectedWriter;
+
+    impl Write for DisconnectedWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stdout_writer_disconnect_stops_all_execution() {
+        let (outputs, control_rx, event_rx) = test_output_channels(1, 1);
+        let cancellation = CancellationProbe::default();
+        send_output(
+            &outputs,
+            OutputKind::Control,
+            &cancellation,
+            serde_json::json!({"kind": "control"}),
+        )
+        .expect("control fits");
+        drop(outputs);
+
+        let mut stdout = DisconnectedWriter;
+        let error = write_output_queue(control_rx, event_rx, &mut stdout, &cancellation)
+            .expect_err("writer disconnect is transport-fatal");
+
+        assert!(error.starts_with("failed to write response:"));
+        assert_eq!(cancellation.request_count(), 1);
     }
 
     #[test]
@@ -842,7 +1107,7 @@ mod tests {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
         let cancellation = server.cancellation_handle();
-        let (sender, receiver) = mpsc::sync_channel(8);
+        let (outputs, receiver, _event_receiver) = test_output_channels(8, 8);
         let payload = parse_json_rpc_payload(
             r#"[
                 {"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}},
@@ -856,7 +1121,7 @@ mod tests {
         )
         .expect("batch parses");
 
-        dispatch_batch(&mut server, payload, &sender, &cancellation).expect("dispatch batch");
+        dispatch_batch(&mut server, payload, &outputs, &cancellation).expect("dispatch batch");
 
         let outputs = receiver.try_iter().collect::<Vec<_>>();
         assert_eq!(outputs.len(), 1);
@@ -880,7 +1145,7 @@ mod tests {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
         let cancellation = server.cancellation_handle();
-        let (sender, receiver) = mpsc::sync_channel(8);
+        let (outputs, control_receiver, event_receiver) = test_output_channels(8, 8);
         let payload = parse_json_rpc_payload(
             r#"[
                 {"jsonrpc":"2.0","method":"thread/read","params":{}},
@@ -889,10 +1154,11 @@ mod tests {
         )
         .expect("notification batch parses");
 
-        dispatch_batch(&mut server, payload, &sender, &cancellation)
+        dispatch_batch(&mut server, payload, &outputs, &cancellation)
             .expect("dispatch notification batch");
 
-        assert!(receiver.try_recv().is_err());
+        assert!(control_receiver.try_recv().is_err());
+        assert!(event_receiver.try_recv().is_err());
     }
 
     #[test]
@@ -900,12 +1166,12 @@ mod tests {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
         let cancellation = server.cancellation_handle();
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (outputs, receiver, _event_receiver) = test_output_channels(1, 1);
 
         dispatch_batch(
             &mut server,
             JsonRpcPayload::EmptyBatch,
-            &sender,
+            &outputs,
             &cancellation,
         )
         .expect("dispatch empty batch");
