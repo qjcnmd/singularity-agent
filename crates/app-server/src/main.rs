@@ -15,7 +15,9 @@ use serde_json::Value;
 use singularity_app_server::{AppServer, AppServerCancellationHandle, AppServerError};
 use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
 use singularity_model::{PROVIDER_CAPABILITY_CACHE_FILE_NAME, ProviderConfigSnapshot};
-use singularity_protocol::{JsonRpcMessage, Method};
+use singularity_protocol::{
+    JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
+};
 use singularity_store::SessionStore;
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -128,16 +130,13 @@ fn run() -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        let message = match serde_json::from_str::<JsonRpcMessage>(&line) {
-            Ok(message) => message,
-            Err(error) => {
+        let payload = match parse_json_rpc_payload(&line) {
+            Ok(payload) => payload,
+            Err(_) => {
                 if let Err(error) = send_output(
                     &output_tx,
                     &cancellation,
-                    transport_error_value(
-                        recover_request_id(&line),
-                        &AppServerError::InvalidJson(error),
-                    ),
+                    JsonRpcMessage::parse_error().to_wire_value(),
                 ) {
                     terminal_error = Some(error);
                     break;
@@ -145,17 +144,40 @@ fn run() -> Result<(), String> {
                 continue;
             }
         };
-        let request_id = message.id.clone();
+        if !matches!(payload, JsonRpcPayload::Single(_)) {
+            if let Err(error) = dispatch_batch(&mut server, payload, &output_tx, &cancellation) {
+                terminal_error = Some(error);
+                break;
+            }
+            if server.shutdown_requested() {
+                break;
+            }
+            continue;
+        }
+        let JsonRpcPayload::Single(item) = payload else {
+            unreachable!("non-single payload handled above")
+        };
+        let message = match item {
+            JsonRpcBatchItem::Message(message) => message,
+            JsonRpcBatchItem::Invalid { id } => {
+                if let Err(error) = send_output(
+                    &output_tx,
+                    &cancellation,
+                    JsonRpcMessage::invalid_request(id).to_wire_value(),
+                ) {
+                    terminal_error = Some(error);
+                    break;
+                }
+                continue;
+            }
+        };
+        let request_id = message.id().cloned();
         if is_request_worker_method(&message) && server.ready_for_turn_worker() {
             if request_workers.len() >= MAX_REQUEST_WORKERS {
                 if let Err(error) = send_output(
                     &output_tx,
                     &cancellation,
-                    JsonRpcMessage::error(
-                        request_id,
-                        ErrorCode::invalid_request(REQUEST_CAPACITY_EXCEEDED),
-                    )
-                    .to_wire_value(),
+                    internal_error_value(request_id, REQUEST_CAPACITY_EXCEEDED),
                 ) {
                     terminal_error = Some(error);
                     break;
@@ -250,12 +272,84 @@ fn run() -> Result<(), String> {
 }
 
 fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
+    if message.is_notification() {
+        return false;
+    }
     matches!(
-        message.method.as_deref(),
+        message.method_name(),
         Some(method)
             if method == Method::TurnStart.as_str()
                 || method == Method::ApprovalDecision.as_str()
     )
+}
+
+/// 按输入顺序串行分发 batch；副作用项不并行，notification 项不产生任何输出。
+fn dispatch_batch(
+    server: &mut AppServer,
+    payload: JsonRpcPayload,
+    output_tx: &SyncSender<Value>,
+    cancellation: &AppServerCancellationHandle,
+) -> Result<(), String> {
+    let items = match payload {
+        JsonRpcPayload::EmptyBatch => {
+            return send_output(
+                output_tx,
+                cancellation,
+                JsonRpcMessage::invalid_request(None).to_wire_value(),
+            );
+        }
+        JsonRpcPayload::Batch(items) => items,
+        JsonRpcPayload::Single(_) => {
+            return Err("single JSON-RPC payload reached batch dispatcher".to_string());
+        }
+    };
+    let mut notifications = Vec::new();
+    let mut responses = Vec::new();
+    for item in items {
+        match item {
+            JsonRpcBatchItem::Invalid { id } => {
+                responses.push(JsonRpcMessage::invalid_request(id).to_wire_value());
+            }
+            JsonRpcBatchItem::Message(message) => {
+                let notification = message.is_notification();
+                let request_id = message.id().cloned();
+                match server.handle(message) {
+                    Ok(messages) => {
+                        for value in messages {
+                            match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
+                                Ok(JsonRpcMessage::Notification(_)) if !notification => {
+                                    notifications.push(value);
+                                }
+                                Ok(JsonRpcMessage::Success(_) | JsonRpcMessage::Error(_))
+                                    if !notification =>
+                                {
+                                    responses.push(value);
+                                }
+                                Ok(_) if notification => {}
+                                Ok(_) | Err(_) => {
+                                    responses.push(internal_error_value(
+                                        request_id.clone(),
+                                        "dispatcher produced an invalid response envelope",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(error) if !notification => {
+                        responses.push(transport_error_value(request_id, &error));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    for notification in notifications {
+        send_output(output_tx, cancellation, notification)?;
+    }
+    if responses.is_empty() {
+        return Ok(());
+    }
+    send_output(output_tx, cancellation, Value::Array(responses))
 }
 
 /// 分发一个由工作线程负责的请求，并通过共享有界队列发送全部响应。
@@ -265,9 +359,9 @@ fn run_request_worker(
     output_tx: SyncSender<Value>,
     cancellation: AppServerCancellationHandle,
 ) -> Result<(), String> {
-    let request_id = message.id.clone();
+    let request_id = message.id().cloned();
     let mut output_error = None;
-    let result = if message.method.as_deref() == Some(Method::TurnStart.as_str()) {
+    let result = if message.method_name() == Some(Method::TurnStart.as_str()) {
         worker.handle_turn_start_streaming(message, |message| {
             if output_error.is_none()
                 && let Err(error) = send_output(&output_tx, &cancellation, message)
@@ -292,7 +386,7 @@ fn run_request_worker(
         send_output(
             &output_tx,
             &cancellation,
-            transport_error_value(request_id, &error),
+            request_error_value(request_id, &error),
         )?;
     }
     Ok(())
@@ -394,17 +488,25 @@ fn write_json_line(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
     stdout.write_all(b"\n")
 }
 
-fn transport_error_value(id: Option<Value>, error: &AppServerError) -> Value {
-    internal_error_value(id, error.to_string())
+fn transport_error_value(id: Option<JsonRpcId>, _error: &AppServerError) -> Value {
+    internal_error_value(id, "Internal error")
 }
 
-fn internal_error_value(id: Option<Value>, message: impl Into<String>) -> Value {
-    JsonRpcMessage::error(id, ErrorCode::new(JSON_RPC_INTERNAL_ERROR, message)).to_wire_value()
+fn request_error_value(id: Option<JsonRpcId>, error: &AppServerError) -> Value {
+    match error {
+        AppServerError::InvalidParams(_) => {
+            JsonRpcMessage::error(id, ErrorCode::invalid_params("Invalid params")).to_wire_value()
+        }
+        error => transport_error_value(id, error),
+    }
 }
 
-fn recover_request_id(line: &str) -> Option<Value> {
-    let value = serde_json::from_str::<Value>(line).ok()?;
-    value.get("id").cloned()
+fn internal_error_value(id: Option<JsonRpcId>, _diagnostic: impl Into<String>) -> Value {
+    JsonRpcMessage::error(
+        id,
+        ErrorCode::new(JSON_RPC_INTERNAL_ERROR, "Internal error"),
+    )
+    .to_wire_value()
 }
 
 fn resolve_app_server_state_paths(configured_db_path: &str) -> Result<(String, PathBuf), String> {
@@ -733,6 +835,99 @@ mod tests {
             .expect_err("full queue must fail closed");
 
         assert_eq!(error, "stdout transport backpressure exceeded");
+    }
+
+    #[test]
+    fn mixed_batch_is_sequential_and_only_requests_produce_ordered_responses() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let cancellation = server.cancellation_handle();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let payload = parse_json_rpc_payload(
+            r#"[
+                {"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}},
+                {"jsonrpc":"2.0","method":"initialized","params":{}},
+                {"jsonrpc":"2.0","method":"server/capabilities","id":2,"params":{}},
+                {"jsonrpc":"2.0","method":"thread/read","params":{}},
+                {"jsonrpc":"2.0","method":"unknown","params":{}},
+                {"jsonrpc":"2.0","method":"unknown","id":3,"params":{}},
+                {"jsonrpc":"2.0","method":"thread/read","id":4,"params":{}}
+            ]"#,
+        )
+        .expect("batch parses");
+
+        dispatch_batch(&mut server, payload, &sender, &cancellation).expect("dispatch batch");
+
+        let outputs = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(outputs.len(), 1);
+        let responses = outputs[0].as_array().expect("batch response array");
+        assert_eq!(responses.len(), 4);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[2]["id"], 3);
+        assert_eq!(responses[2]["error"]["code"], -32601);
+        assert_eq!(responses[3]["id"], 4);
+        assert_eq!(responses[3]["error"]["code"], -32602);
+        assert!(
+            responses
+                .iter()
+                .all(|response| response["jsonrpc"] == "2.0")
+        );
+    }
+
+    #[test]
+    fn all_notification_batch_has_no_output_even_for_unknown_method_or_invalid_params() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let cancellation = server.cancellation_handle();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let payload = parse_json_rpc_payload(
+            r#"[
+                {"jsonrpc":"2.0","method":"thread/read","params":{}},
+                {"jsonrpc":"2.0","method":"unknown","params":{}}
+            ]"#,
+        )
+        .expect("notification batch parses");
+
+        dispatch_batch(&mut server, payload, &sender, &cancellation)
+            .expect("dispatch notification batch");
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn empty_batch_returns_standard_invalid_request() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let cancellation = server.cancellation_handle();
+        let (sender, receiver) = mpsc::sync_channel(1);
+
+        dispatch_batch(
+            &mut server,
+            JsonRpcPayload::EmptyBatch,
+            &sender,
+            &cancellation,
+        )
+        .expect("dispatch empty batch");
+
+        let response = receiver.try_recv().expect("invalid request response");
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], Value::Null);
+        assert_eq!(response["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn streaming_worker_maps_invalid_params_without_exposing_diagnostics() {
+        let response = request_error_value(
+            Some(JsonRpcId::Number(7)),
+            &AppServerError::InvalidParams("secret-shaped diagnostic".to_string()),
+        );
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["message"], "Invalid params");
+        assert!(!response.to_string().contains("secret-shaped"));
     }
 
     #[test]

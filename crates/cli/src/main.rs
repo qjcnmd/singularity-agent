@@ -10,7 +10,14 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use singularity_core::ClientInfo;
-use singularity_protocol::{InitializeParams, JsonRpcMessage, Method};
+use singularity_protocol::{
+    AgentCapabilityResult, ApprovalDecision, ApprovalOutcome, ApprovalPolicy, EmptyParams,
+    EvalRunParams, EvalRunResult, InitializeParams, InputItem, ItemEventParams, JsonRpcId,
+    JsonRpcMessage, JsonRpcNotification, Method, PermissionProfileName,
+    ProviderConfigurationStatus, RpcMethod, Thread, ThreadEventParams, ThreadIdParams,
+    ThreadStartParams, TraceEvent, TraceShowParams, TraceTailParams, Turn, TurnEventParams,
+    TurnIdParams, TurnStartParams, TurnStatus, rpc_methods,
+};
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
@@ -148,10 +155,10 @@ enum SandboxModeArg {
 }
 
 impl SandboxModeArg {
-    fn as_str(self) -> &'static str {
+    fn protocol_value(self) -> PermissionProfileName {
         match self {
-            Self::ReadOnly => "read-only",
-            Self::WorkspaceWrite => "workspace-write",
+            Self::ReadOnly => PermissionProfileName::ReadOnly,
+            Self::WorkspaceWrite => PermissionProfileName::WorkspaceWrite,
         }
     }
 }
@@ -164,10 +171,10 @@ enum ApprovalPolicyArg {
 }
 
 impl ApprovalPolicyArg {
-    fn as_str(self) -> &'static str {
+    fn protocol_value(self) -> ApprovalPolicy {
         match self {
-            Self::OnRequest => "on-request",
-            Self::Never => "never",
+            Self::OnRequest => ApprovalPolicy::OnRequest,
+            Self::Never => ApprovalPolicy::Never,
         }
     }
 }
@@ -175,11 +182,11 @@ impl ApprovalPolicyArg {
 // approval CLI 枚举到协议 outcome 的转换边界。
 impl ApprovalDecisionArg {
     // 将 CLI 枚举映射为 app-server 协议值。
-    fn as_str(self) -> &'static str {
+    fn protocol_value(self) -> ApprovalOutcome {
         match self {
-            Self::Allow => "allow",
-            Self::Deny => "deny",
-            Self::Defer => "defer",
+            Self::Allow => ApprovalOutcome::Allow,
+            Self::Deny => ApprovalOutcome::Deny,
+            Self::Defer => ApprovalOutcome::Defer,
         }
     }
 }
@@ -208,35 +215,28 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             ensure_agent_loop_available(&mut client)?;
             let (thread, thread_events) = client.thread_start(
                 model,
-                sandbox_mode.map(SandboxModeArg::as_str),
-                approval_policy.map(ApprovalPolicyArg::as_str),
+                sandbox_mode.map(SandboxModeArg::protocol_value),
+                approval_policy.map(ApprovalPolicyArg::protocol_value),
                 !json,
             )?;
             if !json {
-                println!(
-                    "thread {}",
-                    required_str(&thread, &["thread", "thread_id"])?
-                );
+                println!("thread {}", thread.thread_id);
                 render_thread_policy(&thread)?;
             }
-            let (turn, turn_events) = client.turn_start(
-                required_str(&thread, &["thread", "thread_id"])?,
-                &goal,
-                !json,
-            )?;
+            let (turn, turn_events) = client.turn_start(&thread.thread_id, &goal, !json)?;
             if json {
                 let mut events = protocol_events(thread_events);
                 events.extend(protocol_events(turn_events));
                 println!(
                     "{}",
                     json!({
-                        "thread": thread["thread"],
-                        "turn": turn["turn"],
+                        "thread": thread,
+                        "turn": turn,
                         "events": events,
                     })
                 );
             }
-            fail_for_failed_turn(&turn["turn"])?;
+            fail_for_failed_turn(&turn)?;
             Ok(())
         }
         Command::Continue {
@@ -251,7 +251,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             println!("thread {thread_id}");
             render_thread_policy(&thread)?;
             let (turn, _events) = client.turn_start(&thread_id, &instruction, true)?;
-            fail_for_failed_turn(&turn["turn"])?;
+            fail_for_failed_turn(&turn)?;
             Ok(())
         }
         Command::Turn { command } => {
@@ -320,30 +320,22 @@ fn run_cli(cli: Cli) -> Result<(), String> {
 // 在启动新 turn 前确认 AgentLoop 已完成且无 blocker。
 fn ensure_agent_loop_available(client: &mut AppServerClient) -> Result<(), String> {
     let capability = client.agent_capability()?;
-    let agent_loop = &capability["agentLoop"];
-    let available = agent_loop["available"].as_bool().unwrap_or(false);
-    let status = agent_loop["status"].as_str().unwrap_or("unknown");
-    let blockers = agent_loop_blockers(agent_loop);
-    if available && blockers == "none" && status == "completed" {
+    let blockers = agent_loop_blockers(&capability.agent_loop.blockers);
+    if capability.agent_loop.available
+        && blockers == "none"
+        && capability.agent_loop.status == "completed"
+    {
         return Ok(());
     }
+    let status = &capability.agent_loop.status;
     Err(format!(
         "AgentLoop is not available: status={status}; blockers={blockers}"
     ))
 }
 
 // 将 capability 中的 blocker 列表压缩为稳定的诊断文本。
-fn agent_loop_blockers(agent_loop: &Value) -> String {
-    let blockers = agent_loop["blockers"]
-        .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
+fn agent_loop_blockers(blockers: &[String]) -> String {
+    let blockers = blockers.join(",");
     if blockers.is_empty() {
         "none".to_string()
     } else {
@@ -357,38 +349,30 @@ fn print_readiness() -> Result<(), String> {
     client.response_timeout = AGENT_TURN_RESPONSE_TIMEOUT;
     client.initialize()?;
     let capability = client.agent_capability()?;
-    let agent_loop = &capability["agentLoop"];
-    println!(
-        "agent_loop={}",
-        agent_loop["status"].as_str().unwrap_or("unknown")
-    );
+    println!("agent_loop={}", capability.agent_loop.status);
     println!("evaluation=agent_loop");
-    print_provider_configuration(&capability["providerConfiguration"])
+    print_provider_configuration(&capability.provider_configuration)
 }
 
 // 校验并输出 provider capability，始终只暴露字段存在性。
-fn print_provider_configuration(provider: &Value) -> Result<(), String> {
-    let source = match provider["source"].as_str() {
+fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Result<(), String> {
+    let source = match provider.source.as_deref() {
         Some("process_env") => "process_env",
         Some("project_env") => "project_env",
-        None if provider["source"].is_null() => "unconfigured",
+        None => "unconfigured",
         _ => {
             return Err("invalid agent capability: providerConfiguration.source".to_string());
         }
     };
     println!("provider_config_source={source}");
-    let snapshot_id = provider["snapshotId"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
+    let snapshot_id = (!provider.snapshot_id.trim().is_empty())
+        .then_some(provider.snapshot_id.as_str())
         .ok_or_else(|| "invalid agent capability: providerConfiguration.snapshotId".to_string())?;
     println!("provider_snapshot_id={snapshot_id}");
-    let configured = provider["configured"]
-        .as_bool()
-        .ok_or_else(|| "invalid agent capability: providerConfiguration.configured".to_string())?;
-    println!("provider_configured={configured}");
-    let blocker = match provider.get("configurationBlocker") {
-        Some(Value::Null) | None => "none",
-        Some(Value::String(blocker)) if !blocker.trim().is_empty() => blocker,
+    println!("provider_configured={}", provider.configured);
+    let blocker = match provider.configuration_blocker.as_deref() {
+        None => "none",
+        Some(blocker) if !blocker.trim().is_empty() => blocker,
         _ => {
             return Err(
                 "invalid agent capability: providerConfiguration.configurationBlocker".to_string(),
@@ -396,14 +380,11 @@ fn print_provider_configuration(provider: &Value) -> Result<(), String> {
         }
     };
     println!("provider_configuration_blocker={blocker}");
-    for (name, field) in [
-        ("SINGULARITY_API_KEY", "apiKeyPresent"),
-        ("SINGULARITY_BASE_URL", "baseUrlPresent"),
-        ("SINGULARITY_MODEL", "modelPresent"),
+    for (name, present) in [
+        ("SINGULARITY_API_KEY", provider.api_key_present),
+        ("SINGULARITY_BASE_URL", provider.base_url_present),
+        ("SINGULARITY_MODEL", provider.model_present),
     ] {
-        let present = provider[field]
-            .as_bool()
-            .ok_or_else(|| format!("invalid agent capability: providerConfiguration.{field}"))?;
         let status = if present {
             "present(redacted)"
         } else {
@@ -424,22 +405,22 @@ fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), St
     client.initialize()?;
     let result = client.eval_run(&manifest, run_id)?;
     if json_output {
-        println!("{result}");
+        println!(
+            "{}",
+            serde_json::to_string(&result).map_err(|error| error.to_string())?
+        );
     } else {
         println!(
             "eval {} {} runner={}",
-            result["run_id"].as_str().unwrap_or(run_id),
-            result["status"].as_str().unwrap_or("unknown"),
-            result["runner"].as_str().unwrap_or("unknown")
+            result.run_id, result.status, result.runner
         );
     }
-    if result["evaluation_passed"].as_bool().unwrap_or(false) {
+    if result.evaluation_passed {
         Ok(())
     } else {
-        Err(result["blocker"]
-            .as_str()
-            .unwrap_or("evaluation_failed")
-            .to_string())
+        Err(result
+            .blocker
+            .unwrap_or_else(|| "evaluation_failed".to_string()))
     }
 }
 
@@ -451,6 +432,12 @@ struct AppServerClient {
     stdout_reader: Option<JoinHandle<()>>,
     response_timeout: Duration,
     next_id: i64,
+}
+
+/// 与 typed request id 匹配的结果及其之前到达的通知。
+struct RpcReply<R> {
+    result: R,
+    notifications: Vec<JsonRpcNotification>,
 }
 
 // AppServerClient 的生命周期与 JSON-RPC 操作实现。
@@ -486,70 +473,55 @@ impl AppServerClient {
 
     // 完成 JSON-RPC initialize/initialized 握手。
     fn initialize(&mut self) -> Result<(), String> {
-        let id = self.next_request_id();
-        self.request(initialize_request(id))?;
-        self.notify(Method::Initialized, json!({}))
+        let _ = self.request::<rpc_methods::Initialize>(&InitializeParams {
+            client_info: ClientInfo::new(CLI_CLIENT_NAME, CLI_CLIENT_TITLE, CLI_CLIENT_VERSION),
+            capabilities: None,
+        })?;
+        self.notify::<rpc_methods::Initialized>(&EmptyParams::default())
     }
 
     // 创建 thread，并可选地渲染启动事件。
     fn thread_start(
         &mut self,
         model: Option<String>,
-        sandbox_mode: Option<&str>,
-        approval_policy: Option<&str>,
+        sandbox_mode: Option<PermissionProfileName>,
+        approval_policy: Option<ApprovalPolicy>,
         render: bool,
-    ) -> Result<(Value, Vec<Value>), String> {
-        let id = self.next_request_id();
-        let cwd = canonical_current_dir()?;
-        let mut params = json!({"model": model, "cwd": cwd});
-        if let Some(sandbox_mode) = sandbox_mode {
-            params["sandboxMode"] = json!(sandbox_mode);
-        }
-        if let Some(approval_policy) = approval_policy {
-            params["approvalPolicy"] = json!(approval_policy);
-        }
-        let responses = self.request(JsonRpcMessage::request(
-            Method::ThreadStart,
-            json!(id),
-            params,
-        ))?;
+    ) -> Result<(Thread, Vec<JsonRpcNotification>), String> {
+        let reply = self.request::<rpc_methods::ThreadStart>(&ThreadStartParams {
+            model,
+            cwd: Some(canonical_current_dir()?),
+            sandbox_mode,
+            approval_policy,
+        })?;
         if render {
-            render_messages(&responses, false);
+            render_messages(&reply.notifications, false);
         }
-        let result = first_result_ref(&responses)?.clone();
-        Ok((result, responses))
+        Ok((reply.result.thread, reply.notifications))
     }
 
     // 提交 evaluation manifest，并返回 app-server 的结果对象。
-    fn eval_run(&mut self, manifest: &Path, run_id: &str) -> Result<Value, String> {
-        let id = self.next_request_id();
-        let mut params = json!({"manifest": manifest.to_string_lossy(), "runId": run_id});
-        if let Ok(output_root) = std::env::var(EVAL_OUTPUT_DIR_ENV) {
-            params["outputRoot"] = json!(output_root);
-        }
-        let responses =
-            self.request(JsonRpcMessage::request(Method::EvalRun, json!(id), params))?;
-        first_result(responses)
+    fn eval_run(&mut self, manifest: &Path, run_id: &str) -> Result<EvalRunResult, String> {
+        let reply = self.request::<rpc_methods::EvalRun>(&EvalRunParams {
+            manifest: manifest.to_string_lossy().to_string(),
+            run_id: run_id.to_string(),
+            output_root: std::env::var(EVAL_OUTPUT_DIR_ENV).ok(),
+        })?;
+        Ok(reply.result)
     }
 
     // 恢复现有 thread，不向 app-server 上传历史。
-    fn thread_resume(&mut self, thread_id: &str) -> Result<Value, String> {
-        let id = self.next_request_id();
-        first_result(self.request(JsonRpcMessage::request(
-            Method::ThreadResume,
-            json!(id),
-            json!({"threadId": thread_id}),
-        ))?)
+    fn thread_resume(&mut self, thread_id: &str) -> Result<Thread, String> {
+        let reply = self.request::<rpc_methods::ThreadResume>(&ThreadIdParams {
+            thread_id: thread_id.to_string(),
+        })?;
+        Ok(reply.result.thread)
     }
 
     // 读取 AgentLoop capability 快照。
-    fn agent_capability(&mut self) -> Result<Value, String> {
-        let id = self.next_request_id();
-        first_result(self.request(JsonRpcMessage::request(
-            Method::AgentCapability,
-            json!(id),
-            json!({}),
-        ))?)
+    fn agent_capability(&mut self) -> Result<AgentCapabilityResult, String> {
+        let reply = self.request::<rpc_methods::AgentCapability>(&EmptyParams::default())?;
+        Ok(reply.result)
     }
 
     // 启动 turn、渲染事件，并在必要时轮询到终态。
@@ -558,44 +530,36 @@ impl AppServerClient {
         thread_id: &str,
         text: &str,
         render: bool,
-    ) -> Result<(Value, Vec<Value>), String> {
-        let id = self.next_request_id();
-        let responses = self.request(JsonRpcMessage::request(
-            Method::TurnStart,
-            json!(id),
-            json!({"threadId": thread_id, "input": [{"type": "text", "text": text}]}),
-        ))?;
-        let mut turn = first_result_ref(&responses)?.clone();
+    ) -> Result<(Turn, Vec<JsonRpcNotification>), String> {
+        let reply = self.request::<rpc_methods::TurnStart>(&TurnStartParams {
+            thread_id: thread_id.to_string(),
+            input: vec![InputItem::Text {
+                text: text.to_string(),
+            }],
+        })?;
+        let mut turn = reply.result.turn;
         if render {
-            render_messages(&responses, should_render_assistant_summary(&turn["turn"]));
-            render_turn(&turn["turn"]);
+            render_messages(&reply.notifications, should_render_assistant_summary(&turn));
+            render_turn(&turn);
         }
-        if should_poll_running_turn(&turn["turn"]) {
-            let terminal =
-                self.wait_for_turn_terminal(required_str(&turn["turn"], &["turn_id"])?, render)?;
-            turn["turn"]["status"] = json!(terminal.status);
-            if let Some(agent_loop_status) = terminal.agent_loop_status {
-                turn["turn"]["agent_loop_status"] = json!(agent_loop_status);
-            }
+        if should_poll_running_turn(&turn) {
+            turn = self.wait_for_turn_terminal(&turn.turn_id, render)?;
         }
-        Ok((turn, responses))
+        Ok((turn, reply.notifications))
     }
 
     // 按固定间隔查询 running turn，直到出现终态。
-    fn wait_for_turn_terminal(&mut self, turn_id: &str, render: bool) -> Result<TurnView, String> {
+    fn wait_for_turn_terminal(&mut self, turn_id: &str, render: bool) -> Result<Turn, String> {
         loop {
             thread::sleep(TURN_STATUS_POLL_INTERVAL);
             let turn = self.fetch_turn_status(turn_id)?;
-            if turn.status != "running" {
+            if turn.status != TurnStatus::Running {
                 if render {
                     println!(
-                        "turn {} {}{}",
+                        "turn {} {} agent_loop_status={}",
                         turn.turn_id,
-                        turn.status,
-                        turn.agent_loop_status
-                            .as_deref()
-                            .map(|status| format!(" agent_loop_status={status}"))
-                            .unwrap_or_default()
+                        turn.status.as_storage_text(),
+                        turn.agent_loop_status,
                     );
                 }
                 return Ok(turn);
@@ -604,115 +568,73 @@ impl AppServerClient {
     }
 
     // 将 turn/status 响应投影为 CLI 所需的最小视图。
-    fn fetch_turn_status(&mut self, turn_id: &str) -> Result<TurnView, String> {
-        let id = self.next_request_id();
-        let result = first_result(self.request(JsonRpcMessage::request(
-            Method::TurnStatus,
-            json!(id),
-            json!({"turnId": turn_id}),
-        ))?)?;
-        let turn = &result["turn"];
-        Ok(TurnView {
-            turn_id: required_str(turn, &["turn_id"])?.to_string(),
-            status: required_str(turn, &["status"])?.to_string(),
-            agent_loop_status: turn["agent_loop_status"].as_str().map(str::to_string),
-        })
+    fn fetch_turn_status(&mut self, turn_id: &str) -> Result<Turn, String> {
+        let reply = self.request::<rpc_methods::TurnStatus>(&TurnIdParams {
+            turn_id: turn_id.to_string(),
+        })?;
+        Ok(reply.result.turn)
     }
 
     // 请求并打印持久化 thread 列表。
     fn thread_list(&mut self) -> Result<(), String> {
-        let id = self.next_request_id();
-        let result = first_result(self.request(JsonRpcMessage::request(
-            Method::ThreadList,
-            json!(id),
-            json!({}),
-        ))?)?;
-        if let Some(threads) = result["threads"].as_array() {
-            for thread in threads {
-                println!(
-                    "{} {}",
-                    thread["thread_id"].as_str().unwrap_or(""),
-                    thread["status"].as_str().unwrap_or("")
-                );
-                render_thread_policy_value(thread)?;
-            }
+        let reply = self.request::<rpc_methods::ThreadList>(&EmptyParams::default())?;
+        for thread in &reply.result.threads {
+            println!("{} {}", thread.thread_id, thread.status.as_storage_text());
+            render_thread_policy(thread)?;
         }
         Ok(())
     }
 
     // 请求并渲染单个 turn 的状态。
     fn turn_status(&mut self, turn_id: &str) -> Result<(), String> {
-        let id = self.next_request_id();
-        let result = first_result(self.request(JsonRpcMessage::request(
-            Method::TurnStatus,
-            json!(id),
-            json!({"turnId": turn_id}),
-        ))?)?;
-        render_turn(&result["turn"]);
+        let reply = self.request::<rpc_methods::TurnStatus>(&TurnIdParams {
+            turn_id: turn_id.to_string(),
+        })?;
+        render_turn(&reply.result.turn);
         Ok(())
     }
 
     // 请求中断 turn，并打印服务端返回的状态。
     fn turn_interrupt(&mut self, turn_id: &str) -> Result<(), String> {
-        let id = self.next_request_id();
-        let result = first_result(self.request(JsonRpcMessage::request(
-            Method::TurnInterrupt,
-            json!(id),
-            json!({"turnId": turn_id}),
-        ))?)?;
+        let reply = self.request::<rpc_methods::TurnInterrupt>(&TurnIdParams {
+            turn_id: turn_id.to_string(),
+        })?;
         println!(
             "turn {} {}{}",
-            result["turnId"].as_str().unwrap_or(turn_id),
-            result["status"].as_str().unwrap_or(""),
-            agent_loop_status_suffix(&result)
+            reply.result.turn_id,
+            reply.result.status,
+            agent_loop_status_suffix(reply.result.agent_loop_status.as_deref())
         );
         Ok(())
     }
 
     // 请求并按顺序渲染 run 的 trace 尾部。
     fn trace_tail(&mut self, run_id: &str, limit: usize) -> Result<(), String> {
-        let id = self.next_request_id();
-        let result = first_result(self.request(JsonRpcMessage::request(
-            Method::TraceTail,
-            json!(id),
-            json!({"runId": run_id, "limit": limit}),
-        ))?)?;
-        if let Some(events) = result["events"].as_array() {
-            for event in events {
-                render_trace_event(event);
-            }
+        let reply = self.request::<rpc_methods::TraceTail>(&TraceTailParams {
+            run_id: run_id.to_string(),
+            limit: Some(limit),
+            offset: None,
+        })?;
+        for event in &reply.result.events {
+            render_trace_event(event);
         }
         Ok(())
     }
 
     // 请求并渲染指定 trace event。
     fn trace_show(&mut self, event_id: &str) -> Result<(), String> {
-        let id = self.next_request_id();
-        let result = first_result(self.request(JsonRpcMessage::request(
-            Method::TraceShow,
-            json!(id),
-            json!({"eventId": event_id}),
-        ))?)?;
-        render_trace_event(&result["event"]);
+        let reply = self.request::<rpc_methods::TraceShow>(&TraceShowParams {
+            event_id: event_id.to_string(),
+        })?;
+        render_trace_event(&reply.result.event);
         Ok(())
     }
 
     // 请求并打印当前 pending approval 列表。
     fn approvals(&mut self) -> Result<(), String> {
-        let id = self.next_request_id();
-        let result = first_result(self.request(JsonRpcMessage::request(
-            Method::ApprovalList,
-            json!(id),
-            json!({}),
-        ))?)?;
-        if let Some(approvals) = result["approvals"].as_array() {
-            for approval in approvals {
-                println!(
-                    "{} {}",
-                    approval["request_id"].as_str().unwrap_or(""),
-                    approval["action"].as_str().unwrap_or("")
-                );
-            }
+        let reply = self.request::<rpc_methods::ApprovalList>(&EmptyParams::default())?;
+        for approval in &reply.result.approvals {
+            println!("{} {}", approval.request_id, approval.action.as_str());
         }
         Ok(())
     }
@@ -724,53 +646,57 @@ impl AppServerClient {
         decision: ApprovalDecisionArg,
         reason: &str,
     ) -> Result<(), String> {
-        let id = self.next_request_id();
-        let outcome = decision.as_str();
-        let result = first_result(self.request(JsonRpcMessage::request(
-            Method::ApprovalDecision,
-            json!(id),
-            json!({
-                "request_id": request_id,
-                "decision_id": format!("{request_id}_decision"),
-                "outcome": outcome,
-                "reason": reason,
-            }),
-        ))?)?;
-        let decision = &result["decision"];
+        let params = ApprovalDecision::new(request_id, decision.protocol_value(), reason);
+        let reply = self.request::<rpc_methods::ApprovalDecision>(&params)?;
         println!(
             "approval {} {}",
-            decision["request_id"].as_str().unwrap_or(request_id),
-            decision["outcome"].as_str().unwrap_or(outcome)
+            reply.result.decision.request_id,
+            reply.result.decision.outcome.as_storage_text()
         );
         Ok(())
     }
 
     // 发送请求并只接收匹配 id 的响应，同时保留通知事件。
-    fn request(&mut self, message: JsonRpcMessage) -> Result<Vec<Value>, String> {
-        let id = message
-            .id
-            .clone()
-            .ok_or_else(|| "request id missing".to_string())?;
+    fn request<M: RpcMethod>(&mut self, params: &M::Params) -> Result<RpcReply<M::Result>, String> {
+        let method = M::METHOD;
+        let params_value = serde_json::to_value(params)
+            .map_err(|error| format!("failed to serialize {} params: {error}", method.as_str()))?;
+        method
+            .spec()
+            .validate_params(params_value)
+            .map_err(|error| format!("invalid {} params: {error}", method.as_str()))?;
+        let id = JsonRpcId::Number(self.next_request_id());
+        let message = JsonRpcMessage::request(method, id.clone(), params)
+            .map_err(|error| format!("failed to serialize app-server request: {error}"))?;
         self.write_message(&message)?;
-        let mut messages = Vec::new();
+        let mut notifications = Vec::new();
         loop {
-            let value = self.read_message(self.response_timeout)?;
-            if value.get("id") == Some(&id) {
-                if value.get("error").is_some() {
-                    return Err(format!("app-server error: {}", value["error"]["message"]));
+            match self.read_message(self.response_timeout)? {
+                JsonRpcMessage::Notification(notification) => notifications.push(notification),
+                JsonRpcMessage::Success(response) if response.id == id => {
+                    let result = serde_json::from_value(response.result)
+                        .map_err(|error| format!("invalid {} result: {error}", method.as_str()))?;
+                    return Ok(RpcReply {
+                        result,
+                        notifications,
+                    });
                 }
-                messages.push(value);
-                return Ok(messages);
-            }
-            if value.get("method").is_some() {
-                messages.push(value);
+                JsonRpcMessage::Error(response) if response.id.as_ref() == Some(&id) => {
+                    return Err(format!("app-server error: {}", response.error.message));
+                }
+                JsonRpcMessage::Success(_) | JsonRpcMessage::Error(_) => {}
+                JsonRpcMessage::Request(_) => {
+                    return Err("app-server emitted a request on the response channel".to_string());
+                }
             }
         }
     }
 
     // 向 app-server 发送 JSON-RPC notification。
-    fn notify(&mut self, method: Method, params: Value) -> Result<(), String> {
-        let message = JsonRpcMessage::notification(method.as_str(), params);
+    fn notify<M: RpcMethod>(&mut self, params: &M::Params) -> Result<(), String> {
+        let method = M::METHOD;
+        let message = JsonRpcMessage::notification(method.as_str(), params)
+            .map_err(|error| format!("failed to serialize app-server notification: {error}"))?;
         self.write_message(&message)
     }
 
@@ -788,7 +714,7 @@ impl AppServerClient {
     }
 
     // 从 stdout reader 读取一条消息，并区分超时、断开与非法 JSON。
-    fn read_message(&mut self, timeout: Duration) -> Result<Value, String> {
+    fn read_message(&mut self, timeout: Duration) -> Result<JsonRpcMessage, String> {
         let line =
             match self.stdout.recv_timeout(timeout) {
                 Ok(line) => line?,
@@ -827,11 +753,11 @@ impl Drop for AppServerClient {
     fn drop(&mut self) {
         if self.stdin.is_some() {
             let id = self.next_request_id();
-            let _ = self.write_message(&JsonRpcMessage::request(
-                Method::ServerShutdown,
-                json!(id),
-                json!({}),
-            ));
+            if let Ok(message) =
+                JsonRpcMessage::request(Method::ServerShutdown, id, EmptyParams::default())
+            {
+                let _ = self.write_message(&message);
+            }
         }
         let _ = self.stdin.take();
         let deadline = Instant::now() + SHUTDOWN_WAIT_TIMEOUT;
@@ -890,58 +816,18 @@ fn canonical_current_dir() -> Result<String, String> {
         .ok_or_else(|| "current directory is not valid UTF-8".to_string())
 }
 
-// 渲染 thread 实际持久化的安全策略快照；旧的协议响应不带该摘要时保持兼容显示。
-fn render_thread_policy(envelope: &Value) -> Result<(), String> {
-    if let Some(thread) = envelope.get("thread") {
-        render_thread_policy_value(thread)?;
-    }
+// 渲染 thread 实际持久化的安全策略快照。
+fn render_thread_policy(thread: &Thread) -> Result<(), String> {
+    println!(
+        "thread_policy sandbox_mode={} approval_policy={}",
+        thread.sandbox_mode.as_storage_text(),
+        thread.approval_policy.as_storage_text()
+    );
     Ok(())
 }
 
-fn render_thread_policy_value(thread: &Value) -> Result<(), String> {
-    let sandbox_mode = thread.get("sandboxMode").and_then(Value::as_str);
-    let approval_policy = thread.get("approvalPolicy").and_then(Value::as_str);
-    match (sandbox_mode, approval_policy) {
-        (Some(sandbox_mode), Some(approval_policy)) => {
-            println!("thread_policy sandbox_mode={sandbox_mode} approval_policy={approval_policy}");
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        _ => Err("thread response has an incomplete policy snapshot".to_string()),
-    }
-}
-
-// 构造 CLI 使用的 initialize 请求。
-fn initialize_request(id: i64) -> JsonRpcMessage {
-    JsonRpcMessage::request(
-        Method::Initialize,
-        json!(id),
-        serde_json::to_value(InitializeParams {
-            client_info: ClientInfo::new(CLI_CLIENT_NAME, CLI_CLIENT_TITLE, CLI_CLIENT_VERSION),
-            capabilities: None,
-        })
-        .expect("serialize initialize params"),
-    )
-}
-
-// 从响应集合中取出首个 result。
-fn first_result(messages: Vec<Value>) -> Result<Value, String> {
-    messages
-        .into_iter()
-        .find_map(|message| message.get("result").cloned())
-        .ok_or_else(|| "app-server response did not include result".to_string())
-}
-
-// 以借用形式从响应集合中取出首个 result。
-fn first_result_ref(messages: &[Value]) -> Result<&Value, String> {
-    messages
-        .iter()
-        .find_map(|message| message.get("result"))
-        .ok_or_else(|| "app-server response did not include result".to_string())
-}
-
 // 过滤并脱敏可公开渲染的协议事件。
-fn protocol_events(messages: Vec<Value>) -> Vec<Value> {
+fn protocol_events(messages: Vec<JsonRpcNotification>) -> Vec<Value> {
     messages
         .into_iter()
         .filter_map(safe_protocol_event)
@@ -949,15 +835,19 @@ fn protocol_events(messages: Vec<Value>) -> Vec<Value> {
 }
 
 // 将单条协议通知投影为不泄露 raw payload 的事件。
-fn safe_protocol_event(message: Value) -> Option<Value> {
-    let method = message["method"].as_str()?;
-    let item_id = message["params"]["item"]["item_id"].as_str().unwrap_or("");
-    match method {
+fn safe_protocol_event(message: JsonRpcNotification) -> Option<Value> {
+    let method = message.method;
+    let params = serde_json::from_value::<ItemEventParams>(message.params).ok();
+    let item_id = params
+        .as_ref()
+        .map(|params| params.item.item_id.as_str())
+        .unwrap_or("");
+    match method.as_str() {
         "item/agentMessage/delta" => Some(json!({
             "method": method,
             "params": {
                 "item_id": item_id,
-                "delta": message["params"]["delta"].as_str().unwrap_or(""),
+                "delta": params.and_then(|params| params.delta).unwrap_or_default(),
             },
         })),
         "item/started" | "item/completed" => Some(json!({
@@ -969,126 +859,112 @@ fn safe_protocol_event(message: Value) -> Option<Value> {
 }
 
 // 按协议 method 渲染 thread、turn 与 item 事件。
-fn render_messages(messages: &[Value], render_assistant_summary: bool) {
+fn render_messages(messages: &[JsonRpcNotification], render_assistant_summary: bool) {
     for message in messages {
-        if let Some(method) = message["method"].as_str() {
-            match method {
-                "thread/started" => {
-                    if let Some(thread_id) = message["params"]["thread"]["thread_id"].as_str() {
-                        println!("thread/started {thread_id}");
-                    }
+        let method = message.method.as_str();
+        match method {
+            "thread/started" => {
+                if let Ok(params) =
+                    serde_json::from_value::<ThreadEventParams>(message.params.clone())
+                {
+                    println!("thread/started {}", params.thread.thread_id);
                 }
-                "turn/started" => {
-                    if let Some(turn_id) = message["params"]["turn"]["turn_id"].as_str() {
-                        println!("turn/started {turn_id}");
-                    }
-                    render_turn(&message["params"]["turn"]);
+            }
+            "turn/started" => {
+                if let Ok(params) =
+                    serde_json::from_value::<TurnEventParams>(message.params.clone())
+                {
+                    println!("turn/started {}", params.turn.turn_id);
+                    render_turn(&params.turn);
                 }
-                "item/started" | "item/completed" => {
-                    if let Some(item_id) = message["params"]["item"]["item_id"].as_str() {
-                        println!("{method} {item_id}");
-                    }
+            }
+            "item/started" | "item/completed" => {
+                if let Ok(params) =
+                    serde_json::from_value::<ItemEventParams>(message.params.clone())
+                {
+                    println!("{method} {}", params.item.item_id);
                 }
-                "item/agentMessage/delta" | "item/commandExecution/outputDelta" => {
-                    let text = message["params"]["delta"]
-                        .as_str()
-                        .or_else(|| message["params"]["output"].as_str())
-                        .unwrap_or("");
+            }
+            "item/agentMessage/delta" | "item/commandExecution/outputDelta" => {
+                if let Ok(params) =
+                    serde_json::from_value::<ItemEventParams>(message.params.clone())
+                {
+                    let text = params.delta.or(params.output).unwrap_or_default();
                     println!("{method} {text}");
                     if render_assistant_summary && method == "item/agentMessage/delta" {
                         println!("assistant {text}");
                     }
                 }
-                _ => println!("{method}"),
             }
+            _ => println!("{method}"),
         }
     }
 }
 
 // 判断是否应额外输出已完成的 assistant 摘要。
-fn should_render_assistant_summary(turn: &Value) -> bool {
-    turn["status"].as_str() == Some("completed")
-        && turn["agent_loop_status"].as_str() == Some("completed")
+fn should_render_assistant_summary(turn: &Turn) -> bool {
+    turn.status == TurnStatus::Completed && turn.agent_loop_status == "completed"
 }
 
 // 判断 running turn 是否仍可通过轮询等待终态。
-fn should_poll_running_turn(turn: &Value) -> bool {
-    turn["status"].as_str() == Some("running")
+fn should_poll_running_turn(turn: &Turn) -> bool {
+    turn.status == TurnStatus::Running
         && matches!(
-            turn["agent_loop_status"].as_str(),
-            Some("running" | "cancel_requested")
+            turn.agent_loop_status.as_str(),
+            "running" | "cancel_requested"
         )
 }
 
 // 渲染 turn 的稳定状态行。
-fn render_turn(turn: &Value) {
-    let turn_id = turn["turn_id"].as_str().unwrap_or("");
-    if turn_id.is_empty() {
+fn render_turn(turn: &Turn) {
+    if turn.turn_id.is_empty() {
         return;
     }
     println!(
         "turn {} {} agent_loop_status={}",
-        turn_id,
-        turn["status"].as_str().unwrap_or(""),
-        turn["agent_loop_status"].as_str().unwrap_or("")
+        turn.turn_id,
+        turn.status.as_storage_text(),
+        turn.agent_loop_status
     );
 }
 
 // 从响应对象提取可选的 AgentLoop 状态后缀。
-fn agent_loop_status_suffix(value: &Value) -> String {
-    value["agent_loop_status"]
-        .as_str()
+fn agent_loop_status_suffix(status: Option<&str>) -> String {
+    status
         .map(|status| format!(" agent_loop_status={status}"))
         .unwrap_or_default()
 }
 
 // 渲染 trace event 的公开摘要字段。
-fn render_trace_event(event: &Value) {
+fn render_trace_event(event: &TraceEvent) {
     println!(
         "trace {} {} {}",
-        event["event_id"].as_str().unwrap_or(""),
-        event["component"].as_str().unwrap_or(""),
-        event["summary"].as_str().unwrap_or("")
+        event.event_id, event.component, event.summary
     );
 }
 
 // 将失败、blocked 或未能安全轮询的 turn 映射为 CLI 错误。
-fn fail_for_failed_turn(turn: &Value) -> Result<(), String> {
-    let status = turn["status"].as_str().unwrap_or("");
-    let agent_loop_status = turn["agent_loop_status"].as_str().unwrap_or("");
-    let non_terminal_running = status == "running" && !should_poll_running_turn(turn);
+fn fail_for_failed_turn(turn: &Turn) -> Result<(), String> {
+    let status = turn.status.as_storage_text();
+    let agent_loop_status = turn.agent_loop_status.as_str();
+    let non_terminal_running =
+        turn.status == TurnStatus::Running && !should_poll_running_turn(turn);
     if non_terminal_running
-        || matches!(status, "failed" | "blocked" | "interrupted" | "cancelled")
+        || matches!(
+            turn.status,
+            TurnStatus::Failed | TurnStatus::Blocked | TurnStatus::Interrupted
+        )
         || matches!(agent_loop_status, "failed" | "blocked" | "cancelled")
     {
-        let turn_id = turn["turn_id"].as_str().unwrap_or("");
-        if turn_id.is_empty() {
+        if turn.turn_id.is_empty() {
             return Err(format!("error {status}: turn {status}"));
         }
         return Err(format!(
-            "error {status}: turn {status}; turn {turn_id} {status}"
+            "error {status}: turn {status}; turn {} {status}",
+            turn.turn_id
         ));
     }
     Ok(())
-}
-
-#[derive(Debug)]
-// 轮询过程中用于判断 turn 终态的最小字段集合。
-struct TurnView {
-    turn_id: String,
-    status: String,
-    agent_loop_status: Option<String>,
-}
-
-// 从 JSON 路径读取必需的字符串字段。
-fn required_str<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str, String> {
-    let mut current = value;
-    for key in path {
-        current = &current[*key];
-    }
-    current
-        .as_str()
-        .ok_or_else(|| format!("missing string field {}", path.join(".")))
 }
 
 // 解析显式 app-server 路径或相邻的默认二进制。

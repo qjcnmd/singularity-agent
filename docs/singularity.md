@@ -56,6 +56,12 @@ flowchart LR
 
 CLI 不直接依赖 agent、model、tools 或 store。公共协议对象只在 `protocol` 定义，安全执行细节不进入 protocol。
 
+### JSON-RPC 2.0 传输合同
+
+stdio 的每一行是一个完整 JSON 值；JSONL 只负责 framing，不改变 JSON-RPC 2.0 语义。所有 envelope 都必须带 `jsonrpc: "2.0"`，并由互斥的 request、notification、success 或 error 类型表示。request id 只允许字符串或整数；服务端无法恢复合法 id 时，错误响应使用 `id: null`。`METHOD_REGISTRY` 是 method 名、调用类型、params schema 和 result schema 的唯一事实源；dispatcher 与 CLI 都从该 registry 查找并校验合同。
+
+单请求、空 batch 和 mixed batch 都受支持。batch 按输入顺序串行分发，不并行执行有副作用项；notification 项即使 method 未知或 params 非法也不产生响应，全 notification batch 不输出任何行。batch response 保持请求项的输入顺序。解析失败、无效请求、未知方法、无效参数和内部错误分别使用 `-32700`、`-32600`、`-32601`、`-32602` 和 `-32603`；合法调用触发的 runtime 状态冲突使用项目错误 `-32005`，不占用 `-32600`。标准错误不回显原始输入或内部诊断，`data` 仅允许显式脱敏内容。
+
 ## 3. 主调用链
 
 ```text
@@ -82,7 +88,7 @@ sg run <goal>
      -> turn/start response
 ```
 
-`singularity_app_server` 的 stdin 主线程继续处理 protocol 请求；每个 `turn/start` 和可能继续运行 AgentLoop 的 `approval/decision` 由独立 request worker 使用新的 SQLite connection 执行，因此同一进程可以在 turn 或 approval continuation 运行时接收 `turn/interrupt` 和 `server/shutdown`。不同 workspace 可以并发，同一 workspace 由 Store execution guard 串行。进程最多同时接纳 16 个 request worker，stdin reader 和 stdout writer 分别使用容量 64 与 256 的有界队列；worker 超限或输出背压耗尽都在继续产生副作用前 fail closed。worker 复用同一个 active-turn cancellation registry；stdout 由单独 writer 串行输出 JSONL，写入、flush、队列满或 transport disconnect 会先锁存全局 execution stop、取消已登记 turn，再终止 app-server，因此竞态中稍后登记的 turn 也从创建时即为 cancelled。
+`singularity_app_server` 的 stdin 主线程继续处理 protocol 请求；单请求中的 `turn/start` 和可能继续运行 AgentLoop 的 `approval/decision` 由独立 request worker 使用新的 SQLite connection 执行，因此同一进程可以在 turn 或 approval continuation 运行时接收 `turn/interrupt` 和 `server/shutdown`。batch 始终在 stdin 主线程按项串行处理。不同 workspace 可以并发，同一 workspace 由 Store execution guard 串行。进程最多同时接纳 16 个 request worker，stdin reader 和 stdout writer 分别使用容量 64 与 256 的有界队列；worker 超限或输出背压耗尽都在继续产生副作用前 fail closed。worker 复用同一个 active-turn cancellation registry；stdout 由单独 writer 串行输出 JSONL，写入、flush、队列满或 transport disconnect 会先锁存全局 execution stop、取消已登记 turn，再终止 app-server，因此竞态中稍后登记的 turn 也从创建时即为 cancelled。
 
 ## 4. Thread、Turn 与 Continue
 
@@ -329,7 +335,7 @@ Agent workspace 的 before/after 快照保留完整 materialized tree；仅在�
 ## 13. 失败与安全不变量
 
 - 不支持的平台、缺失 binary、缺失 provider、无效 workspace 和 sandbox setup 失败都返回明确错误，不切换执行路径。Agent 请求的可执行文件不在宿主 `PATH` 或绝对路径不可用时返回 `command_executable_unavailable` capability，允许模型在有界下一回合提交新的合法 command string；Evaluation 自身固定命令的同一事实归为 environment blocker。两条路径都零执行、不伪装成 sandbox 不可用，也不暴露完整 PATH。
-- CLI 只把 matching response 之前的 notification 与 response 关联；EOF、child exit、timeout 和 JSON-RPC error 都是非零退出。
+- CLI 使用 method 对应的 typed params/result 和 `JsonRpcId` 关联请求，只把 matching response 之前的 notification 与 response 关联；EOF、child exit、timeout、非法 envelope 和 JSON-RPC error 都是非零退出。
 - thread workspace 必须是存在的绝对目录；archive thread 不能开始或恢复 pending turn。
 - protected path、workspace 越界、非法 tool arguments 和扩大 sandbox/network 权限在执行前拒绝。
 - approval 必须显式绑定 thread、turn 和 tool call，不能重放。

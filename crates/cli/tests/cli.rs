@@ -1,5 +1,6 @@
 //! 验证 CLI 仅通过 app-server 协议工作，并保持输出与失败边界稳定。
 
+#[allow(dead_code)]
 mod support;
 
 use assert_cmd::Command;
@@ -7,8 +8,9 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use support::{
-    FakeAppServer, Scenario, agent_loop_capability, capture_params, exit, print_stderr, respond,
-    send, sleep_ms, thread as fake_thread, turn as fake_turn, write_text,
+    FakeAppServer as RawFakeAppServer, Scenario as RawScenario, agent_loop_capability,
+    capture_params, exit, print_stderr, sleep_ms, thread as raw_fake_thread, turn as fake_turn,
+    write_text,
 };
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
@@ -19,6 +21,131 @@ const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
 const JSON_RPC_SERVER_ERROR_CODE: i64 = -32000;
 const NON_MATCHING_RESPONSE_ID: i64 = 999;
 const POST_RESPONSE_DELAY_MS: u64 = 25;
+
+/// 为既有 fake app-server 补齐严格 JSON-RPC 2.0 envelope。
+struct FakeAppServer(RawFakeAppServer);
+
+impl FakeAppServer {
+    fn new(dir: &Path, scenario: Scenario) -> Self {
+        Self(RawFakeAppServer::new(dir, scenario.0))
+    }
+
+    fn binary(&self) -> &Path {
+        self.0.binary()
+    }
+
+    fn configure(&self, command: &mut Command) {
+        self.0.configure(command);
+    }
+
+    fn configure_process(&self, command: &mut std::process::Command) {
+        self.0.configure_process(command);
+    }
+
+    fn copy_binary_as(&self, dir: &Path, name: &str) -> PathBuf {
+        self.0.copy_binary_as(dir, name)
+    }
+}
+
+struct Scenario(RawScenario);
+
+impl Scenario {
+    fn new() -> Self {
+        Self(RawScenario::new())
+    }
+
+    fn startup(self, actions: Vec<serde_json::Value>) -> Self {
+        Self(self.0.startup(actions))
+    }
+
+    fn interaction(self, method: &str, actions: Vec<serde_json::Value>) -> Self {
+        Self(self.0.interaction(method, actions))
+    }
+
+    fn respond(self, method: &str, result: serde_json::Value) -> Self {
+        self.interaction(method, vec![respond(result)])
+    }
+
+    fn initialized(self) -> Self {
+        self.respond(
+            "initialize",
+            json!({"userAgent":"fake","platformFamily":"local","platformOs":"test"}),
+        )
+    }
+
+    fn agent_loop_ready(self) -> Self {
+        self.respond(
+            "agent/capability",
+            agent_loop_capability(true, "completed", "enabled", &[]),
+        )
+    }
+
+    fn shutdown(self) -> Self {
+        self.interaction(
+            "server/shutdown",
+            vec![respond(json!({"shutdown": true})), exit(0)],
+        )
+    }
+
+    fn error(self, method: &str, code: i64, message: &str) -> Self {
+        self.interaction(
+            method,
+            vec![json!({"respond":{"jsonrpc":"2.0","error":{"code":code,"message":message}}})],
+        )
+    }
+
+    fn trace_methods_to(self, path: &Path) -> Self {
+        Self(self.0.trace_methods_to(path))
+    }
+}
+
+fn respond(result: serde_json::Value) -> serde_json::Value {
+    json!({"respond":{"jsonrpc":"2.0","result":result}})
+}
+
+fn send(mut message: serde_json::Value) -> serde_json::Value {
+    message
+        .as_object_mut()
+        .expect("fake JSON-RPC message object")
+        .insert("jsonrpc".to_string(), json!("2.0"));
+    json!({"send":message})
+}
+
+fn fake_thread(thread_id: &str) -> serde_json::Value {
+    let mut thread = raw_fake_thread(thread_id);
+    thread["sandboxMode"] = json!("workspace-write");
+    thread["approvalPolicy"] = json!("on-request");
+    thread
+}
+
+fn fake_trace_event(event_id: &str, summary: &str) -> serde_json::Value {
+    json!({
+        "event_id": event_id,
+        "event_type": "trace.event",
+        "run_id": "run_fake",
+        "session_id": "session_fake",
+        "task_id": null,
+        "phase_id": null,
+        "action_id": null,
+        "parent_event_id": null,
+        "timestamp": null,
+        "monotonic_ms": null,
+        "component": "thread",
+        "severity": "info",
+        "summary": summary,
+        "payload": {},
+        "artifact_refs": [],
+        "policy_decision_id": null,
+        "approval_grant_id": null,
+        "sandbox_id": null,
+        "command_id": null,
+        "transaction_id": null,
+        "verification_id": null,
+        "span_id": null,
+        "redaction_applied": true,
+        "payload_hash": ""
+    })
+}
 
 // 确认 CLI 能启动并暴露 app-server 协议模式。
 #[test]
@@ -143,7 +270,7 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
             )
             .respond(
                 "trace/tail",
-                json!({"events": [{"event_id": "trace_1", "component": "thread", "summary": "thread started"}]}),
+                json!({"events": [fake_trace_event("trace_1", "thread started")]}),
             )
             .respond("approval/list", json!({"approvals": []}))
             .shutdown(),
@@ -636,7 +763,7 @@ fn cli_eval_command_is_script_friendly_and_validates_manifest() {
         .expect("eval cli invalid");
 
     assert!(!invalid.status.success());
-    assert!(stderr(&invalid).contains("invalid eval manifest"));
+    assert!(stderr(&invalid).contains("app-server error: Invalid params"));
 }
 
 // 验证 eval run 通过 app-server 返回并渲染 verification 结果。
@@ -857,8 +984,9 @@ fn cli_turn_status_interrupt_approval_decision_and_trace_show_use_protocol() {
                 "approval/decision",
                 json!({
                     "decision": {
-                        "approvalId": "approval_fake",
-                        "decision": "allow",
+                        "request_id": "approval_fake",
+                        "decision_id": "approval_fake_decision",
+                        "outcome": "allow",
                         "reason": "operator approved"
                     }
                 }),

@@ -3,23 +3,37 @@
 use singularity_core::ClientInfo;
 use singularity_policy::{ApprovalPolicy, PermissionProfileName};
 use singularity_protocol::{
-    AgentCapabilityResult, AppEvent, ArtifactFetchParams, ArtifactRef, ConversationMessage,
-    ConversationRole, EventSubscribeParams, InitializeParams, InitializeResult, ItemKind,
-    ItemStatus, JsonRpcMessage, Method, ProviderConfigurationStatus, ThreadIdParams,
+    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ArtifactFetchParams, ArtifactRef,
+    ConversationMessage, ConversationRole, EventSubscribeParams, InitializeParams,
+    InitializeResult, ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage,
+    JsonRpcPayload, METHOD_REGISTRY, Method, ProviderConfigurationStatus, ThreadIdParams,
     ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceListParams,
     TraceShowParams, TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus,
+    parse_json_rpc_payload,
 };
 
 #[test]
-fn json_rpc_accepts_omitted_jsonrpc_header_and_keeps_camel_case_params() {
+fn json_rpc_requires_the_2_0_version_member() {
     let raw = r#"{"method":"turn/start","id":2,"params":{"threadId":"thread_1","input":[{"type":"text","text":"hi"}]}}"#;
-    let message: JsonRpcMessage = serde_json::from_str(raw).expect("parse json-rpc message");
+    assert!(serde_json::from_str::<JsonRpcMessage>(raw).is_err());
 
-    assert_eq!(message.method(), Some(Method::TurnStart));
-    assert_eq!(message.id().and_then(|id| id.as_i64()), Some(2));
+    let wrong_version = r#"{"jsonrpc":"1.0","method":"turn/start","id":2,"params":{"threadId":"thread_1","input":[{"type":"text","text":"hi"}]}}"#;
+    assert!(serde_json::from_str::<JsonRpcMessage>(wrong_version).is_err());
+}
 
-    let params: TurnStartParams = message.params_as().expect("decode params");
-    assert_eq!(params.thread_id, "thread_1");
+#[test]
+fn json_rpc_rejects_ambiguous_envelopes_and_non_scalar_ids() {
+    for raw in [
+        r#"{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{},"result":{}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"boom"}}"#,
+        r#"{"jsonrpc":"2.0","method":"thread/list","id":{"nested":true},"params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"thread/list","id":1.5,"params":{}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<JsonRpcMessage>(raw).is_err(),
+            "invalid envelope was accepted: {raw}"
+        );
+    }
 }
 
 #[test]
@@ -111,7 +125,7 @@ fn thread_read_uses_typed_paginated_safe_conversation_history() {
 }
 #[test]
 fn turn_start_params_reject_agent_host_selector() {
-    let raw = r#"{"method":"turn/start","id":2,"params":{"threadId":"thread_1","agentHost":"alternate","input":[{"type":"text","text":"hi"}]}}"#;
+    let raw = r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"thread_1","agentHost":"alternate","input":[{"type":"text","text":"hi"}]}}"#;
     let message: JsonRpcMessage = serde_json::from_str(raw).expect("parse json-rpc message");
 
     let error = message
@@ -169,7 +183,12 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
 #[test]
 fn agent_capability_uses_the_canonical_agent_loop_wire_name() {
     let result = AgentCapabilityResult {
-        agent_loop: serde_json::json!({"available": true}),
+        agent_loop: AgentLoopCapabilityStatus {
+            available: true,
+            status: "completed".to_string(),
+            reason: "ready".to_string(),
+            blockers: Vec::new(),
+        },
         provider_configuration: ProviderConfigurationStatus {
             source: None,
             snapshot_id: "provider_snapshot_test".to_string(),
@@ -187,18 +206,68 @@ fn agent_capability_uses_the_canonical_agent_loop_wire_name() {
 }
 
 #[test]
-fn json_rpc_wire_output_omits_null_jsonrpc_result_and_error_fields() {
+fn json_rpc_wire_output_is_a_standard_request_envelope() {
     let request = JsonRpcMessage::request(
         Method::Initialize,
-        serde_json::json!(1),
+        1,
         serde_json::json!({"clientInfo": {"name": "test", "title": "Test", "version": "0.1.0"}}),
-    );
+    )
+    .expect("request serializes");
     let value = request.to_wire_value();
 
     assert_eq!(value["method"], "initialize");
-    assert!(value.get("jsonrpc").is_none());
+    assert_eq!(value["jsonrpc"], "2.0");
     assert!(value.get("result").is_none());
     assert!(value.get("error").is_none());
+}
+
+#[test]
+fn json_rpc_payload_distinguishes_empty_single_and_mixed_batch() {
+    assert_eq!(
+        parse_json_rpc_payload("[]").expect("empty batch"),
+        JsonRpcPayload::EmptyBatch
+    );
+
+    let single = parse_json_rpc_payload(
+        r#"{"jsonrpc":"2.0","method":"thread/list","id":"request-1","params":{}}"#,
+    )
+    .expect("single request");
+    assert!(matches!(
+        single,
+        JsonRpcPayload::Single(JsonRpcBatchItem::Message(message))
+            if message.id() == Some(&JsonRpcId::String("request-1".to_string()))
+    ));
+
+    let mixed = parse_json_rpc_payload(
+        r#"[{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{}},{"jsonrpc":"2.0","method":"initialized","params":{}},false]"#,
+    )
+    .expect("mixed batch");
+    assert!(matches!(mixed, JsonRpcPayload::Batch(items) if items.len() == 3));
+
+    assert!(parse_json_rpc_payload("{").is_err());
+    let parse_error = JsonRpcMessage::parse_error().to_wire_value();
+    assert_eq!(parse_error["jsonrpc"], "2.0");
+    assert_eq!(parse_error["id"], serde_json::Value::Null);
+    assert_eq!(parse_error["error"]["code"], -32700);
+}
+
+#[test]
+fn method_registry_is_the_unique_name_and_contract_source() {
+    assert_eq!(METHOD_REGISTRY.len(), 25);
+    for spec in METHOD_REGISTRY {
+        assert_eq!(Method::parse(spec.name), Some(spec.method));
+        assert_eq!(spec.method.as_str(), spec.name);
+        assert!(spec.params_schema().is_object());
+        assert!(spec.result_schema().is_object());
+    }
+
+    let thread_read = Method::ThreadRead.spec();
+    assert!(
+        thread_read
+            .validate_params(serde_json::json!({"threadId":"thread_1"}))
+            .is_ok()
+    );
+    assert!(thread_read.validate_params(serde_json::json!({})).is_err());
 }
 
 #[test]

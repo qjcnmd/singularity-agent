@@ -31,15 +31,16 @@ use singularity_policy::{
     PermissionRule, PolicyEngine, SettingsScope,
 };
 use singularity_protocol::{
-    AgentCapabilityResult, AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams,
-    ArtifactFetchResult, ConversationMessage, ConversationRole, EvalRunParams,
-    EventSubscribeParams, EventSubscribeResult, InitializeParams, InitializeResult, Item,
-    JsonRpcMessage, Method, ProviderConfigurationStatus, ServerCapabilitiesResult, Thread,
+    AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ApprovalCenterResult,
+    ApprovalDecisionResult, ApprovalListResult, ArtifactFetchParams, ArtifactFetchResult,
+    ConversationMessage, ConversationRole, EvalRunParams, EventSubscribeParams,
+    EventSubscribeResult, InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage,
+    Method, ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceTailParams,
-    TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult, TurnStartParams,
-    TurnStartResult, TurnStatus,
+    TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceShowResult,
+    TraceTailParams, TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult,
+    TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_sandbox::{SandboxBackend, SandboxBackendEnforcement, WindowsSandboxBackend};
 use singularity_store::{
@@ -75,6 +76,7 @@ const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 const TURN_CANCELLATION_POLL_MS: u64 = 25;
 const TURN_MONITOR_SHUTDOWN_WAIT_MS: u64 = 100;
 const STRICT_COMMAND_SANDBOX_UNAVAILABLE: &str = "strict_command_sandbox_unavailable";
+const APP_ERROR_INVALID_STATE: i64 = -32005;
 
 /// 在应用边界转换为 JSON-RPC 响应的错误。
 #[derive(Debug, Error)]
@@ -320,31 +322,57 @@ impl AppServer {
 
     /// 处理一个已解析的 JSON-RPC 请求，并返回零个或多个协议响应或事件。
     pub fn handle(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let id = message.id.clone();
-        let Some(method_name) = message.method.as_deref() else {
-            return Ok(vec![
-                JsonRpcMessage::error(id, ErrorCode::invalid_request("Missing method"))
-                    .to_wire_value(),
-            ]);
+        let notification = message.is_notification();
+        let id = message.id().cloned();
+        let Some(method_name) = message.method_name() else {
+            return if notification {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![JsonRpcMessage::invalid_request(id).to_wire_value()])
+            };
         };
         let Some(method) = Method::parse(method_name) else {
-            return Ok(vec![
-                JsonRpcMessage::error(id, ErrorCode::method_not_found(method_name)).to_wire_value(),
-            ]);
+            return if notification {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![JsonRpcMessage::method_not_found(id).to_wire_value()])
+            };
         };
 
+        if method
+            .spec()
+            .validate_params(message.params().cloned().unwrap_or_else(|| json!({})))
+            .is_err()
+        {
+            return if notification {
+                Ok(Vec::new())
+            } else {
+                json_error(id, ErrorCode::invalid_params("Invalid params"))
+            };
+        }
+
         if matches!(method, Method::Initialized) && !self.initialized {
-            return Ok(vec![
-                JsonRpcMessage::error(id, ErrorCode::not_initialized()).to_wire_value(),
-            ]);
+            return if notification {
+                Ok(Vec::new())
+            } else {
+                json_error(id, ErrorCode::not_initialized())
+            };
         }
         if !matches!(method, Method::Initialize | Method::Initialized)
             && !self.initialized_acknowledged
         {
-            return Ok(vec![
-                JsonRpcMessage::error(id, ErrorCode::not_initialized()).to_wire_value(),
-            ]);
+            return if notification {
+                Ok(Vec::new())
+            } else {
+                json_error(id, ErrorCode::not_initialized())
+            };
         }
+
+        let message = if notification {
+            message.into_request_with_id(JsonRpcId::Number(0))
+        } else {
+            message
+        };
 
         let result = match method {
             Method::Initialize => self.initialize(message),
@@ -376,6 +404,9 @@ impl AppServer {
             Method::TraceTail => self.trace_tail(message),
             Method::ServerShutdown => self.server_shutdown(message),
         };
+        if notification {
+            return Ok(Vec::new());
+        }
         match result {
             Err(AppServerError::InvalidParams(error)) => {
                 json_error(id, ErrorCode::invalid_params(error))
@@ -387,20 +418,24 @@ impl AppServer {
     fn initialize(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         if self.initialized {
             return Ok(vec![
-                JsonRpcMessage::error(message.id, ErrorCode::already_initialized()).to_wire_value(),
+                JsonRpcMessage::error(message.required_id(), ErrorCode::already_initialized())
+                    .to_wire_value(),
             ]);
         }
         let _params: InitializeParams = parse_params(&message)?;
         self.initialized = true;
         Ok(vec![
-            JsonRpcMessage::response(message.id, serde_json::to_value(InitializeResult::local())?)
-                .to_wire_value(),
+            JsonRpcMessage::response(
+                message.required_id(),
+                serde_json::to_value(InitializeResult::local())?,
+            )
+            .to_wire_value(),
         ])
     }
 
     fn server_capabilities(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         json_response(
-            message.id,
+            message.required_id(),
             ServerCapabilitiesResult {
                 transports: vec![
                     TransportCapability {
@@ -422,7 +457,7 @@ impl AppServer {
         let threads = self.store.list_threads()?;
         Ok(vec![
             JsonRpcMessage::response(
-                message.id,
+                message.required_id(),
                 serde_json::to_value(ThreadListResult { threads })?,
             )
             .to_wire_value(),
@@ -433,12 +468,12 @@ impl AppServer {
         let params: ThreadReadParams = parse_params(&message)?;
         let turn_limit = match history_turn_limit(params.limit) {
             Ok(limit) => limit,
-            Err(error) => return invalid_request_response(message.id, error),
+            Err(_) => return invalid_params_response(message.required_id()),
         };
         let thread = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.id, THREAD_NOT_FOUND);
+                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
         };
@@ -448,14 +483,16 @@ impl AppServer {
             turn_limit,
         ) {
             Ok(history) => json_response(
-                message.id,
+                message.required_id(),
                 ThreadReadResult {
                     thread,
                     messages: history.messages,
                     next_before_turn_sequence: history.next_before_turn_sequence,
                 },
             ),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, THREAD_NOT_FOUND),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), THREAD_NOT_FOUND)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -465,19 +502,21 @@ impl AppServer {
         let thread = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.id, THREAD_NOT_FOUND);
+                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
         };
         if let Err(error) = workspace_tools_for_thread(&thread, Arc::clone(&self.sandbox_backend)) {
-            return invalid_request_response(message.id, error);
+            return invalid_state_response(message.required_id(), error);
         }
         match self.store.update_thread_status(
             &params.thread_id,
             singularity_protocol::ThreadStatus::Active,
         ) {
-            Ok(thread) => json_response(message.id, ThreadResult { thread }),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, THREAD_NOT_FOUND),
+            Ok(thread) => json_response(message.required_id(), ThreadResult { thread }),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), THREAD_NOT_FOUND)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -485,7 +524,7 @@ impl AppServer {
         let params: ThreadStartParams = parse_params(&message)?;
         let cwd = match canonical_thread_cwd(params.cwd.as_deref()) {
             Ok(cwd) => cwd,
-            Err(error) => return invalid_request_response(message.id, error),
+            Err(_) => return invalid_params_response(message.required_id()),
         };
         let (thread, _trace) = self.store.create_thread_with_trace_and_policy(
             params.model.as_deref(),
@@ -501,7 +540,7 @@ impl AppServer {
         messages.extend(self.event_notification(AppEvent::thread_started(&thread)));
         messages.push(
             JsonRpcMessage::response(
-                message.id,
+                message.required_id(),
                 serde_json::to_value(ThreadStartResult {
                     thread: thread.clone(),
                 })?,
@@ -516,22 +555,22 @@ impl AppServer {
         let source = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.id, THREAD_NOT_FOUND);
+                return not_found_response(message.required_id(), THREAD_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
         };
         let source_cwd = match params.cwd.as_deref().or(source.cwd.as_deref()) {
             Some(cwd) => cwd,
             None => {
-                return invalid_request_response(
-                    message.id,
+                return invalid_state_response(
+                    message.required_id(),
                     "source thread does not have an absolute workspace",
                 );
             }
         };
         let cwd = match canonical_thread_cwd(Some(source_cwd)) {
             Ok(cwd) => cwd,
-            Err(error) => return invalid_request_response(message.id, error),
+            Err(_) => return invalid_params_response(message.required_id()),
         };
         let thread = self.store.create_thread_with_policy(
             params.model.as_deref().or(source.model.as_deref()),
@@ -541,7 +580,7 @@ impl AppServer {
         )?;
         Ok(vec![
             JsonRpcMessage::response(
-                message.id,
+                message.required_id(),
                 serde_json::to_value(ThreadForkResult {
                     source_thread_id: params.thread_id,
                     thread,
@@ -557,10 +596,12 @@ impl AppServer {
             &params.thread_id,
             singularity_protocol::ThreadStatus::Archived,
         ) {
-            Ok(thread) => json_response(message.id, ThreadResult { thread }),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, THREAD_NOT_FOUND),
+            Ok(thread) => json_response(message.required_id(), ThreadResult { thread }),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), THREAD_NOT_FOUND)
+            }
             Err(StoreError::ThreadHasNonterminalTurn { .. }) => {
-                invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE)
+                invalid_state_response(message.required_id(), THREAD_EXECUTION_ACTIVE)
             }
             Err(error) => Err(error.into()),
         }
@@ -571,7 +612,7 @@ impl AppServer {
         match self.store.delete_thread(&params.thread_id) {
             Ok(()) => Ok(vec![
                 JsonRpcMessage::response(
-                    message.id,
+                    message.required_id(),
                     serde_json::to_value(ThreadDeleteResult {
                         thread_id: params.thread_id,
                         deleted: true,
@@ -579,9 +620,11 @@ impl AppServer {
                 )
                 .to_wire_value(),
             ]),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, THREAD_NOT_FOUND),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), THREAD_NOT_FOUND)
+            }
             Err(StoreError::ThreadHasNonterminalTurn { .. }) => {
-                invalid_request_response(message.id, THREAD_EXECUTION_ACTIVE)
+                invalid_state_response(message.required_id(), THREAD_EXECUTION_ACTIVE)
             }
             Err(error) => Err(error.into()),
         }
@@ -599,7 +642,7 @@ impl AppServer {
         message: JsonRpcMessage,
         mut emit: impl FnMut(Value),
     ) -> AppServerResult<()> {
-        if message.method.as_deref() != Some(Method::TurnStart.as_str()) {
+        if message.method_name() != Some(Method::TurnStart.as_str()) {
             return Err(AppServerError::InvalidParams(
                 "streaming handler requires turn/start".to_string(),
             ));
@@ -608,7 +651,10 @@ impl AppServer {
         let thread = match self.store.get_thread(&params.thread_id) {
             Ok(thread) => thread,
             Err(StoreError::NotFound(_)) => {
-                emit_messages(&mut emit, not_found_response(message.id, THREAD_NOT_FOUND)?);
+                emit_messages(
+                    &mut emit,
+                    not_found_response(message.required_id(), THREAD_NOT_FOUND)?,
+                );
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
@@ -616,7 +662,7 @@ impl AppServer {
         if thread.status != singularity_protocol::ThreadStatus::Active {
             emit_messages(
                 &mut emit,
-                invalid_request_response(message.id, THREAD_ARCHIVED)?,
+                invalid_state_response(message.required_id(), THREAD_ARCHIVED)?,
             );
             return Ok(());
         }
@@ -624,7 +670,10 @@ impl AppServer {
             match workspace_tools_for_thread(&thread, Arc::clone(&self.sandbox_backend)) {
                 Ok(tools) => tools,
                 Err(error) => {
-                    emit_messages(&mut emit, invalid_request_response(message.id, error)?);
+                    emit_messages(
+                        &mut emit,
+                        invalid_state_response(message.required_id(), error)?,
+                    );
                     return Ok(());
                 }
             };
@@ -632,7 +681,10 @@ impl AppServer {
         if !agent_loop_capability_ready(&capability) {
             emit_messages(
                 &mut emit,
-                invalid_request_response(message.id, agent_loop_unavailable_message(&capability))?,
+                invalid_state_response(
+                    message.required_id(),
+                    agent_loop_unavailable_message(&capability),
+                )?,
             );
             return Ok(());
         }
@@ -642,7 +694,7 @@ impl AppServer {
         else {
             emit_messages(
                 &mut emit,
-                invalid_request_response(message.id, WORKSPACE_EXECUTION_ACTIVE)?,
+                invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE)?,
             );
             return Ok(());
         };
@@ -665,13 +717,16 @@ impl AppServer {
             ) {
             Ok(result) => result,
             Err(StoreError::NotFound(_)) => {
-                emit_messages(&mut emit, not_found_response(message.id, THREAD_NOT_FOUND)?);
+                emit_messages(
+                    &mut emit,
+                    not_found_response(message.required_id(), THREAD_NOT_FOUND)?,
+                );
                 return Ok(());
             }
             Err(StoreError::WorkspaceHasNonterminalTurn { .. }) => {
                 emit_messages(
                     &mut emit,
-                    invalid_request_response(message.id, WORKSPACE_EXECUTION_ACTIVE)?,
+                    invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE)?,
                 );
                 return Ok(());
             }
@@ -695,19 +750,26 @@ impl AppServer {
         let turn = committed.turn;
         emit_messages(&mut emit, terminal_events);
         emit(
-            JsonRpcMessage::response(message.id, serde_json::to_value(TurnStartResult { turn })?)
-                .to_wire_value(),
+            JsonRpcMessage::response(
+                message.required_id(),
+                serde_json::to_value(TurnStartResult { turn })?,
+            )
+            .to_wire_value(),
         );
         Ok(())
     }
 
     fn agent_capability(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let capability = agent_loop_capability(self.sandbox_backend.as_ref());
         json_response(
-            message.id,
+            message.required_id(),
             AgentCapabilityResult {
-                agent_loop: serde_json::to_value(agent_loop_capability(
-                    self.sandbox_backend.as_ref(),
-                ))?,
+                agent_loop: AgentLoopCapabilityStatus {
+                    available: capability.available,
+                    status: capability.status.as_str().to_string(),
+                    reason: capability.reason,
+                    blockers: capability.blockers,
+                },
                 provider_configuration: provider_configuration(&self.provider_snapshot),
             },
         )
@@ -720,8 +782,11 @@ impl AppServer {
             Arc::clone(&self.sandbox_backend),
             &self.provider_snapshot,
         ) {
-            Ok(result) => json_response(message.id, result),
-            Err(error) => json_error(message.id, ErrorCode::invalid_request(error)),
+            Ok(result) => json_response(message.required_id(), result),
+            Err(_) => json_error(
+                Some(message.required_id()),
+                ErrorCode::invalid_params("Invalid params"),
+            ),
         }
     }
 
@@ -1151,14 +1216,14 @@ impl AppServer {
         let turn = match self.store.get_turn(&params.turn_id) {
             Ok(turn) => self.refresh_turn_if_unowned(turn)?,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.id, TURN_NOT_FOUND);
+                return not_found_response(message.required_id(), TURN_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
         };
         if is_terminal_turn_status(&turn.status) {
             return Ok(vec![
                 JsonRpcMessage::response(
-                    message.id,
+                    message.required_id(),
                     serde_json::to_value(TurnInterruptResult {
                         status: turn.status.as_storage_text().to_string(),
                         turn_id: turn.turn_id,
@@ -1205,7 +1270,7 @@ impl AppServer {
         }
         messages.push(
             JsonRpcMessage::response(
-                message.id,
+                message.required_id(),
                 serde_json::to_value(TurnInterruptResult {
                     turn_id: turn.turn_id,
                     status: status.to_string(),
@@ -1221,12 +1286,14 @@ impl AppServer {
         let params: TurnIdParams = parse_params(&message)?;
         match self.store.get_turn(&params.turn_id) {
             Ok(turn) => json_response(
-                message.id,
+                message.required_id(),
                 TurnResult {
                     turn: self.refresh_turn_if_unowned(turn)?,
                 },
             ),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, TURN_NOT_FOUND),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), TURN_NOT_FOUND)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -1234,16 +1301,17 @@ impl AppServer {
     fn server_shutdown(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         self.shutdown_requested = true;
         self.request_execution_stop()?;
-        Ok(vec![
-            JsonRpcMessage::response(message.id, json!({"shutdown": true})).to_wire_value(),
-        ])
+        json_response(
+            message.required_id(),
+            ServerShutdownResult { shutdown: true },
+        )
     }
 
     fn approval_list(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let approvals = self.store.list_pending_approvals()?;
         Ok(vec![
             JsonRpcMessage::response(
-                message.id,
+                message.required_id(),
                 serde_json::to_value(ApprovalListResult { approvals })?,
             )
             .to_wire_value(),
@@ -1252,7 +1320,7 @@ impl AppServer {
 
     fn approval_center(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         json_response(
-            message.id,
+            message.required_id(),
             ApprovalCenterResult {
                 pending_approvals: self.store.list_pending_approvals()?,
                 decisions: self.store.list_approval_decisions()?,
@@ -1262,7 +1330,7 @@ impl AppServer {
 
     fn approval_request(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let _request: ApprovalRequest = parse_params(&message)?;
-        invalid_request_response(message.id, APPROVAL_REQUEST_INTERNAL_ONLY)
+        invalid_state_response(message.required_id(), APPROVAL_REQUEST_INTERNAL_ONLY)
     }
 
     /// 记录 approval，并保留、失败处理或恢复已认领的检查点。
@@ -1271,7 +1339,7 @@ impl AppServer {
         let pending_request = match self.store.get_pending_approval(&decision.request_id) {
             Ok(request) => request,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND);
+                return not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND);
             }
             Err(error) => return Err(error.into()),
         };
@@ -1281,18 +1349,18 @@ impl AppServer {
                 .store
                 .has_pending_tool_call(&pending_request.request_id)?
         {
-            return not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND);
+            return not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND);
         }
         let pending_thread = self.store.get_thread(&pending_request.thread_id)?;
         let continues_execution =
             is_tool_continuation && matches!(decision.outcome, ApprovalOutcome::Allow);
         let continuation_workspace = if continues_execution {
             if pending_thread.status != singularity_protocol::ThreadStatus::Active {
-                return invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION);
+                return invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION);
             }
             match workspace_tools_for_thread(&pending_thread, Arc::clone(&self.sandbox_backend)) {
                 Ok(tools) => Some(tools),
-                Err(error) => return invalid_request_response(message.id, error),
+                Err(error) => return invalid_state_response(message.required_id(), error),
             }
         } else {
             None
@@ -1302,7 +1370,7 @@ impl AppServer {
                 .store
                 .try_begin_workspace_execution(&pending_request.thread_id)?
             else {
-                return invalid_request_response(message.id, WORKSPACE_EXECUTION_ACTIVE);
+                return invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE);
             };
             Some(guard)
         } else {
@@ -1311,7 +1379,7 @@ impl AppServer {
         let active_turn = if continues_execution {
             let active_turn = self.activate_turn(&pending_request.turn_id)?;
             if active_turn.0.is_cancelled() {
-                return invalid_request_response(message.id, EXECUTION_STOPPED);
+                return invalid_state_response(message.required_id(), EXECUTION_STOPPED);
             }
             Some(active_turn)
         } else {
@@ -1326,15 +1394,15 @@ impl AppServer {
             Err(error) => {
                 return match error {
                     StoreError::NotFound(_) => {
-                        not_found_response(message.id, PENDING_APPROVAL_NOT_FOUND)
+                        not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND)
                     }
                     StoreError::InvalidState(state_message)
                         if state_message == "pending approval allow requires an active thread" =>
                     {
-                        invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION)
+                        invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION)
                     }
                     StoreError::WorkspaceHasNonterminalTurn { .. } => {
-                        invalid_request_response(message.id, WORKSPACE_EXECUTION_ACTIVE)
+                        invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE)
                     }
                     other => Err(other.into()),
                 };
@@ -1348,9 +1416,10 @@ impl AppServer {
         }
         let pending_tool_call = recorded.pending_tool_call.clone();
         if matches!(decision.outcome, ApprovalOutcome::Defer) {
-            return Ok(vec![
-                JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
-            ]);
+            return Ok(vec![approval_decision_response(
+                message.required_id(),
+                &decision,
+            )?]);
         }
         if matches!(decision.outcome, ApprovalOutcome::Deny) {
             let mut messages = Vec::new();
@@ -1358,9 +1427,10 @@ impl AppServer {
                 let turn = self.store.get_turn(&recorded.request.turn_id)?;
                 messages.extend(self.event_notification(AppEvent::turn_completed(&turn)));
             }
-            messages.push(
-                JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
-            );
+            messages.push(approval_decision_response(
+                message.required_id(),
+                &decision,
+            )?);
             return Ok(messages);
         }
         let mut messages = Vec::new();
@@ -1399,10 +1469,10 @@ impl AppServer {
                     &error,
                 )?;
                 messages.extend(self.committed_turn_events(&committed)?);
-                messages.push(
-                    JsonRpcMessage::response(message.id, json!({"decision": decision}))
-                        .to_wire_value(),
-                );
+                messages.push(approval_decision_response(
+                    message.required_id(),
+                    &decision,
+                )?);
                 return Ok(messages);
             }
         };
@@ -1428,9 +1498,10 @@ impl AppServer {
             };
             messages.extend(self.committed_turn_events(&committed)?);
         }
-        messages.push(
-            JsonRpcMessage::response(message.id, json!({"decision": decision})).to_wire_value(),
-        );
+        messages.push(approval_decision_response(
+            message.required_id(),
+            &decision,
+        )?);
         Ok(messages)
     }
 
@@ -1543,7 +1614,7 @@ impl AppServer {
         let params: EventSubscribeParams = parse_params(&message)?;
         self.event_filter = Some(params.event_types.clone());
         json_response(
-            message.id,
+            message.required_id(),
             EventSubscribeResult {
                 subscription_id: EVENT_SUBSCRIPTION_ID.to_string(),
                 event_types: params.event_types,
@@ -1554,8 +1625,10 @@ impl AppServer {
     fn artifact_fetch(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: ArtifactFetchParams = parse_params(&message)?;
         match self.store.get_artifact_ref(&params.artifact_id) {
-            Ok(artifact) => json_response(message.id, ArtifactFetchResult { artifact }),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, ARTIFACT_NOT_FOUND),
+            Ok(artifact) => json_response(message.required_id(), ArtifactFetchResult { artifact }),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), ARTIFACT_NOT_FOUND)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -1632,8 +1705,10 @@ impl AppServer {
             .store
             .list_trace_page(&params.run_id, params.limit, params.offset)
         {
-            Ok(events) => json_response(message.id, TraceListResult { events }),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, TRACE_RUN_NOT_FOUND),
+            Ok(events) => json_response(message.required_id(), TraceListResult { events }),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), TRACE_RUN_NOT_FOUND)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -1641,10 +1716,10 @@ impl AppServer {
     fn trace_show(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: TraceShowParams = parse_params(&message)?;
         match self.store.show_trace(&params.event_id) {
-            Ok(event) => Ok(vec![
-                JsonRpcMessage::response(message.id, json!({"event": event})).to_wire_value(),
-            ]),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, TRACE_EVENT_NOT_FOUND),
+            Ok(event) => json_response(message.required_id(), TraceShowResult { event }),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), TRACE_EVENT_NOT_FOUND)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -1657,21 +1732,36 @@ impl AppServer {
         {
             Ok(events) => Ok(vec![
                 JsonRpcMessage::response(
-                    message.id,
+                    message.required_id(),
                     serde_json::to_value(TraceListResult { events })?,
                 )
                 .to_wire_value(),
             ]),
-            Err(StoreError::NotFound(_)) => not_found_response(message.id, TRACE_RUN_NOT_FOUND),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), TRACE_RUN_NOT_FOUND)
+            }
             Err(error) => Err(error.into()),
         }
     }
 }
 
-fn json_response<T: serde::Serialize>(id: Option<Value>, result: T) -> AppServerResult<Vec<Value>> {
+fn json_response<T: serde::Serialize>(id: JsonRpcId, result: T) -> AppServerResult<Vec<Value>> {
     Ok(vec![
         JsonRpcMessage::response(id, serde_json::to_value(result)?).to_wire_value(),
     ])
+}
+
+fn approval_decision_response(
+    id: JsonRpcId,
+    decision: &ApprovalDecision,
+) -> AppServerResult<Value> {
+    Ok(JsonRpcMessage::response(
+        id,
+        serde_json::to_value(ApprovalDecisionResult {
+            decision: decision.clone(),
+        })?,
+    )
+    .to_wire_value())
 }
 
 fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
@@ -2016,7 +2106,7 @@ fn sandbox_command_rule() -> PermissionRule {
     .for_operation(PermissionOperation::Execute)
 }
 
-fn json_error(id: Option<Value>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
+fn json_error(id: Option<JsonRpcId>, error: ErrorCode) -> AppServerResult<Vec<Value>> {
     Ok(vec![JsonRpcMessage::error(id, error).to_wire_value()])
 }
 
@@ -2129,19 +2219,23 @@ fn redact_app_server_text(text: &str) -> String {
     }
 }
 
-fn not_found_response(id: Option<Value>, message: &'static str) -> AppServerResult<Vec<Value>> {
+fn not_found_response(id: JsonRpcId, message: &'static str) -> AppServerResult<Vec<Value>> {
     Ok(vec![
         JsonRpcMessage::error(id, ErrorCode::not_found(message)).to_wire_value(),
     ])
 }
 
-fn invalid_request_response(
-    id: Option<Value>,
+fn invalid_state_response(
+    id: JsonRpcId,
     message: impl Into<String>,
 ) -> AppServerResult<Vec<Value>> {
     Ok(vec![
-        JsonRpcMessage::error(id, ErrorCode::invalid_request(message)).to_wire_value(),
+        JsonRpcMessage::error(id, ErrorCode::new(APP_ERROR_INVALID_STATE, message)).to_wire_value(),
     ])
+}
+
+fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Value>> {
+    json_error(Some(id), ErrorCode::invalid_params("Invalid params"))
 }
 
 #[cfg(test)]
@@ -2472,6 +2566,7 @@ mod tests {
             "approved",
         );
         let message = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
             "method": "approval/decision",
             "id": 1,
             "params": decision,
