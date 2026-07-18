@@ -88,7 +88,7 @@ sg run <goal>
      -> turn/start response
 ```
 
-`singularity_app_server` 的 stdin 主线程继续处理 protocol 请求；单请求中的 `turn/start` 和可能继续运行 AgentLoop 的 `approval/decision` 由独立 request worker 使用新的 SQLite connection 执行，因此同一进程可以在 turn 或 approval continuation 运行时接收 `turn/interrupt` 和 `server/shutdown`。batch 始终在 stdin 主线程按项串行处理。不同 workspace 可以并发，同一 workspace 由 Store execution guard 串行。进程最多同时接纳 16 个 request worker，stdin reader 和 stdout writer 分别使用容量 64 与 256 的有界队列；worker 超限或输出背压耗尽都在继续产生副作用前 fail closed。worker 复用同一个 active-turn cancellation registry；stdout 由单独 writer 串行输出 JSONL，写入、flush、队列满或 transport disconnect 会先锁存全局 execution stop、取消已登记 turn，再终止 app-server，因此竞态中稍后登记的 turn 也从创建时即为 cancelled。
+`singularity_app_server` 的 stdin 主线程继续处理 protocol 请求；单请求中的 `turn/start` 和可能继续运行 AgentLoop 的 `approval/decision` 由独立 request worker 使用新的 SQLite connection 执行，因此同一进程可以在 turn 或 approval continuation 运行时接收 `turn/interrupt` 和 `server/shutdown`。batch 始终在 stdin 主线程按项串行处理。不同 workspace 可以并发，同一 workspace 由 Store execution guard 串行。进程最多同时接纳 16 个 request worker；stdin reader 使用容量 64 的有界队列，stdout 将容量 64 的控制响应队列与容量 256 的事件通知队列隔离，并在各自保持 FIFO 的前提下优先写出控制响应。事件队列满只丢弃当前尚未送达的事件，不取消任何 Turn；客户端仍可通过终态控制响应和状态查询恢复。worker 超限、控制队列过载、输出通道断开以及真实 write/flush 失败才会 fail closed，锁存全局 execution stop、取消已登记 Turn 并终止 app-server，因此竞态中稍后登记的 Turn 也从创建时即为 cancelled。worker 复用同一个 active-turn cancellation registry；stdout 仍由单独 writer 串行输出 JSONL。
 
 ## 4. Thread、Turn 与 Continue
 
