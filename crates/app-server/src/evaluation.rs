@@ -1536,7 +1536,7 @@ fn run_agent_stage(
     if let Some(instructions) = project_instructions {
         input = input.with_project_instructions(instructions);
     }
-    let workspace_tools = match WorkspaceTools::new(agent_dir) {
+    let workspace_tools = match WorkspaceTools::new(&agent_dir) {
         Ok(tools) => tools
             .with_shared_sandbox_backend(sandbox_backend)
             .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated),
@@ -3344,10 +3344,13 @@ mod tests {
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
-            assert!(
-                request.is_trusted_workspace_preparation(),
-                "source clone and checkout are fixed Evaluation control-plane operations"
-            );
+            if !request.is_trusted_workspace_preparation() {
+                return CommandResult::backend_error(
+                    &request.command_id,
+                    "source test backend does not execute evaluator commands",
+                )
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
             if request.argv.get(1).map(String::as_str) == Some("clone") {
                 let source = Path::new(&request.cwd).join(SOURCE_DIR);
                 fs::create_dir(&source).expect("source directory");

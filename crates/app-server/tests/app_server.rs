@@ -655,7 +655,8 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v4",
+  "schema_version": "evaluation.task_set/v5",
+  "trial_count": 1,
   "tasks": [
     {
       "task_id": "fixture_eval",
@@ -667,7 +668,9 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
       "agent": {
         "instructions": "Finish the task.",
         "allowed_paths": ["README.md"],
-        "allowed_tools": ["read"]
+        "required_tool_capabilities": [
+          {"capability": "workspace_read", "minimum_version": 1}
+        ]
       },
       "evaluator": {
         "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
@@ -703,14 +706,14 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     assert_eq!(result["status"], "blocked");
     assert_eq!(result["blocker"], expected_eval_blocker_kind());
     assert_eq!(result["evaluation_passed"], false);
-    assert_eq!(result["tasks"][0]["agent_completed"], false);
-    assert_eq!(result["tasks"][0]["tests_passed"], false);
+    assert_eq!(result["tasks"][0]["trials"][0]["agent_completed"], false);
+    assert_eq!(result["tasks"][0]["trials"][0]["tests_passed"], false);
     assert_eq!(
-        result["tasks"][0]["diagnostics"]["smoke_command_satisfied"],
+        result["tasks"][0]["trial_diagnostics"][0]["smoke_command_satisfied"],
         true
     );
     assert_eq!(
-        result["tasks"][0]["diagnostics"]["local_process_fallback_count"],
+        result["tasks"][0]["trial_diagnostics"][0]["local_process_fallback_count"],
         0
     );
     let result_path = result["result_path"].as_str().expect("result path");
@@ -723,28 +726,32 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
-    assert_eq!(payload["schema_version"], "evaluation.result/v5");
+    assert_eq!(payload["schema_version"], "evaluation.result/v6");
     assert_eq!(payload["status"], "blocked");
     assert_eq!(
         payload["tasks"][0]["blocker"]["kind"],
         expected_eval_blocker_kind()
     );
     assert_eq!(
-        payload["tasks"][0]["stages"]["baseline"]["status"],
+        payload["tasks"][0]["trials"][0]["stages"]["baseline"]["status"],
         expected_baseline_status
     );
-    assert_eq!(payload["tasks"][0]["stages"]["public"]["status"], "skipped");
-    assert_eq!(payload["summary"]["scored_task_count"], 1);
+    assert_eq!(
+        payload["tasks"][0]["trials"][0]["stages"]["public"]["status"],
+        "skipped"
+    );
+    assert_eq!(payload["summary"]["agent_scored_trial_count"], 0);
     let evidence_json = std::fs::read_to_string(evidence_path).expect("evidence json");
     assert!(!evidence_json.contains(&dir.path().to_string_lossy().to_string()));
     assert!(!evidence_json.contains("missing-source"));
     let evidence: serde_json::Value =
         serde_json::from_str(&evidence_json).expect("evidence payload");
-    assert_eq!(evidence["schema_version"], "evaluation.evidence/v1");
+    assert_eq!(evidence["schema_version"], "evaluation.evidence/v2");
     assert_eq!(evidence["denominator_task_count"], 1);
-    assert_eq!(evidence["tasks"][0]["allowlist"], "unknown");
+    assert_eq!(evidence["denominator_trial_count"], 1);
+    assert_eq!(evidence["tasks"][0]["trials"][0]["allowlist"], "unknown");
     assert_eq!(
-        evidence["tasks"][0]["local_process_fallback_unknown_count"],
+        evidence["tasks"][0]["trials"][0]["local_process_fallback_unknown_count"],
         0
     );
 }
@@ -759,7 +766,8 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v4",
+  "schema_version": "evaluation.task_set/v5",
+  "trial_count": 1,
   "tasks": [
     {
       "task_id": "fixture_eval",
@@ -771,7 +779,10 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
       "agent": {
         "instructions": "Finish the task.",
         "allowed_paths": ["README.md"],
-        "allowed_tools": ["read", "command"],
+        "required_tool_capabilities": [
+          {"capability": "workspace_read", "minimum_version": 1},
+          {"capability": "command_execution", "minimum_version": 1}
+        ],
         "smoke_commands": [
           {"argv": ["git", "status", "--short"], "timeout_seconds": 30}
         ]
@@ -812,12 +823,12 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
         expected_eval_blocker_kind()
     );
     assert_eq!(
-        result["tasks"][0]["diagnostics"]["smoke_command_satisfied"],
+        result["tasks"][0]["trial_diagnostics"][0]["smoke_command_satisfied"],
         false
     );
     let (_, expected_agent_status) = expected_pre_agent_blocked_stage_statuses();
     assert_eq!(
-        result["tasks"][0]["stages"]["agent"]["status"],
+        result["tasks"][0]["trials"][0]["stages"]["agent"]["status"],
         expected_agent_status
     );
 }
@@ -833,7 +844,8 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v4",
+  "schema_version": "evaluation.task_set/v5",
+  "trial_count": 1,
   "tasks": [
     {
       "task_id": "fixture_eval",
@@ -845,7 +857,9 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
       "agent": {
         "instructions": "Finish the task.",
         "allowed_paths": ["README.md"],
-        "allowed_tools": ["read"]
+        "required_tool_capabilities": [
+          {"capability": "workspace_read", "minimum_version": 1}
+        ]
       },
       "evaluator": {
         "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
@@ -880,7 +894,7 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
     assert_eq!(result["runner"], "agent_loop");
     assert_eq!(result["status"], "blocked");
     assert_eq!(result["blocker"], "environment");
-    assert_eq!(result["tasks"][0]["agent_completed"], false);
+    assert_eq!(result["tasks"][0]["trials"][0]["agent_completed"], false);
     assert_eq!(result["tasks"][0]["blocker"]["kind"], "environment");
 }
 

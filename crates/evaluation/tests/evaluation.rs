@@ -102,6 +102,10 @@ fn passed_trial(trial: u32) -> EvaluationTrialResult {
             model_turns: trial + 1,
             tool_calls: trial + 2,
             agent_duration_ms: u64::from(trial) * 100,
+            provider_latency_ms: u64::from(trial) * 25,
+            provider_attempt_count: trial,
+            provider_retry_count: trial - 1,
+            total_tokens: u64::from(trial) * 200,
             ..EvaluationEvidenceSummary::default()
         },
     }
@@ -371,6 +375,9 @@ fn single_trial_is_unstable_and_multi_trial_statistics_are_finite() {
         multiple.stability.model_turns.as_ref(),
         multiple.stability.tool_calls.as_ref(),
         multiple.stability.agent_duration_ms.as_ref(),
+        multiple.stability.provider_latency_ms.as_ref(),
+        multiple.stability.provider_retries.as_ref(),
+        multiple.stability.total_tokens.as_ref(),
     ] {
         let statistics = statistics.expect("finite statistics");
         assert!(statistics.mean.is_finite());

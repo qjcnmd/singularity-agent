@@ -315,6 +315,12 @@ pub struct EvaluationStabilitySummary {
     pub tool_calls: Option<FiniteStatistics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_duration_ms: Option<FiniteStatistics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_latency_ms: Option<FiniteStatistics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_retries: Option<FiniteStatistics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<FiniteStatistics>,
 }
 
 impl EvaluationStabilitySummary {
@@ -353,6 +359,24 @@ impl EvaluationStabilitySummary {
                     .map(|trial| trial.evidence.agent_duration_ms)
                     .collect::<Vec<_>>(),
             ),
+            provider_latency_ms: FiniteStatistics::from_values(
+                &scored
+                    .iter()
+                    .map(|trial| trial.evidence.provider_latency_ms)
+                    .collect::<Vec<_>>(),
+            ),
+            provider_retries: FiniteStatistics::from_values(
+                &scored
+                    .iter()
+                    .map(|trial| u64::from(trial.evidence.provider_retry_count))
+                    .collect::<Vec<_>>(),
+            ),
+            total_tokens: FiniteStatistics::from_values(
+                &scored
+                    .iter()
+                    .map(|trial| trial.evidence.total_tokens)
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -366,6 +390,9 @@ impl EvaluationStabilitySummary {
             ("model_turns", self.model_turns.as_ref()),
             ("tool_calls", self.tool_calls.as_ref()),
             ("agent_duration_ms", self.agent_duration_ms.as_ref()),
+            ("provider_latency_ms", self.provider_latency_ms.as_ref()),
+            ("provider_retries", self.provider_retries.as_ref()),
+            ("total_tokens", self.total_tokens.as_ref()),
         ] {
             if let Some(statistic) = statistic {
                 statistic.validate(&format!("{context} {name}"))?;
