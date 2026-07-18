@@ -378,7 +378,7 @@ impl AppServer {
             Method::Initialize => self.initialize(message),
             Method::Initialized => {
                 self.initialized_acknowledged = true;
-                Ok(Vec::new())
+                json_response(message.required_id(), singularity_protocol::EmptyResult {})
             }
             Method::ServerCapabilities => self.server_capabilities(message),
             Method::ThreadList => self.thread_list(message),
@@ -2279,6 +2279,26 @@ mod tests {
     }
 
     #[test]
+    fn initialized_request_receives_a_standard_empty_result() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let mut server = app_server(store);
+        server
+            .handle_json(
+                r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+            )
+            .expect("initialize");
+
+        let response = server
+            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","id":2,"params":{}}"#)
+            .expect("initialized request");
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0]["jsonrpc"], "2.0");
+        assert_eq!(response[0]["id"], 2);
+        assert_eq!(response[0]["result"], serde_json::json!({}));
+    }
+
+    #[test]
     fn ordinary_and_evaluation_traces_share_safe_audit_projection_and_store_roundtrip() {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
@@ -2378,14 +2398,17 @@ mod tests {
         let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
 
         let response = server
-            .turn_start(JsonRpcMessage::request(
-                Method::TurnStart,
-                json!(1),
-                json!({
-                    "threadId": thread.thread_id,
-                    "input": [{"type": "text", "text": "must not persist"}],
-                }),
-            ))
+            .turn_start(
+                JsonRpcMessage::request(
+                    Method::TurnStart,
+                    1,
+                    json!({
+                        "threadId": thread.thread_id,
+                        "input": [{"type": "text", "text": "must not persist"}],
+                    }),
+                )
+                .expect("request"),
+            )
             .expect("turn response");
 
         assert!(

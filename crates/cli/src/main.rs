@@ -681,7 +681,7 @@ impl AppServerClient {
                         notifications,
                     });
                 }
-                JsonRpcMessage::Error(response) if response.id.as_ref() == Some(&id) => {
+                JsonRpcMessage::Error(response) if response.id == id => {
                     return Err(format!("app-server error: {}", response.error.message));
                 }
                 JsonRpcMessage::Success(_) | JsonRpcMessage::Error(_) => {}

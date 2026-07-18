@@ -164,12 +164,15 @@ method_registry! {
     ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
-/// JSON-RPC request id；只允许字符串或整数。
+/// JSON-RPC request id；完整接受标准允许的字符串、数字或 null。
 pub enum JsonRpcId {
     String(String),
     Number(i64),
+    Unsigned(u64),
+    Fraction(f64),
+    Null,
 }
 
 impl From<i64> for JsonRpcId {
@@ -181,6 +184,24 @@ impl From<i64> for JsonRpcId {
 impl From<String> for JsonRpcId {
     fn from(value: String) -> Self {
         Self::String(value)
+    }
+}
+
+impl From<i32> for JsonRpcId {
+    fn from(value: i32) -> Self {
+        Self::Number(i64::from(value))
+    }
+}
+
+impl From<u64> for JsonRpcId {
+    fn from(value: u64) -> Self {
+        Self::Unsigned(value)
+    }
+}
+
+impl From<u32> for JsonRpcId {
+    fn from(value: u32) -> Self {
+        Self::Unsigned(u64::from(value))
     }
 }
 
@@ -231,7 +252,7 @@ pub struct JsonRpcSuccess {
 /// JSON-RPC error response。
 pub struct JsonRpcErrorResponse {
     jsonrpc: JsonRpcVersion,
-    pub id: Option<JsonRpcId>,
+    pub id: JsonRpcId,
     pub error: JsonRpcError,
 }
 
@@ -327,7 +348,7 @@ impl JsonRpcMessage {
     pub fn error(id: impl Into<Option<JsonRpcId>>, error: ErrorCode) -> Self {
         Self::Error(JsonRpcErrorResponse {
             jsonrpc: JsonRpcVersion::V2,
-            id: id.into(),
+            id: id.into().unwrap_or(JsonRpcId::Null),
             error: JsonRpcError {
                 code: error.code,
                 message: error.message,
@@ -385,7 +406,7 @@ impl JsonRpcMessage {
         match self {
             Self::Request(message) => Some(&message.id),
             Self::Success(message) => Some(&message.id),
-            Self::Error(message) => message.id.as_ref(),
+            Self::Error(message) => Some(&message.id),
             Self::Notification(_) => None,
         }
     }

@@ -58,7 +58,7 @@ CLI 不直接依赖 agent、model、tools 或 store。公共协议对象只在 `
 
 ### JSON-RPC 2.0 传输合同
 
-stdio 的每一行是一个完整 JSON 值；JSONL 只负责 framing，不改变 JSON-RPC 2.0 语义。所有 envelope 都必须带 `jsonrpc: "2.0"`，并由互斥的 request、notification、success 或 error 类型表示。request id 只允许字符串或整数；服务端无法恢复合法 id 时，错误响应使用 `id: null`。`METHOD_REGISTRY` 是 method 名、调用类型、params schema 和 result schema 的唯一事实源；dispatcher 与 CLI 都从该 registry 查找并校验合同。
+stdio 的每一行是一个完整 JSON 值；JSONL 只负责 framing，不改变 JSON-RPC 2.0 语义。所有 envelope 都必须带 `jsonrpc: "2.0"`，并由互斥的 request、notification、success 或 error 类型表示。request id 接受标准规定的字符串、JSON number 或 `null`（客户端仍应避免 `null` 和带小数部分的 number），响应按解析后的 JSON 值原样关联；服务端无法恢复合法 id 时，错误响应使用 `id: null`，且 error envelope 不允许省略 `id`。`METHOD_REGISTRY` 是 method 名、调用类型、params schema 和 result schema 的唯一事实源；dispatcher 与 CLI 都从该 registry 查找并校验合同。
 
 单请求、空 batch 和 mixed batch 都受支持。batch 按输入顺序串行分发，不并行执行有副作用项；notification 项即使 method 未知或 params 非法也不产生响应，全 notification batch 不输出任何行。batch response 保持请求项的输入顺序。解析失败、无效请求、未知方法、无效参数和内部错误分别使用 `-32700`、`-32600`、`-32601`、`-32602` 和 `-32603`；合法调用触发的 runtime 状态冲突使用项目错误 `-32005`，不占用 `-32600`。标准错误不回显原始输入或内部诊断，`data` 仅允许显式脱敏内容。
 

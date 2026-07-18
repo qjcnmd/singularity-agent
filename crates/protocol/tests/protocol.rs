@@ -27,12 +27,36 @@ fn json_rpc_rejects_ambiguous_envelopes_and_non_scalar_ids() {
         r#"{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{},"result":{}}"#,
         r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"boom"}}"#,
         r#"{"jsonrpc":"2.0","method":"thread/list","id":{"nested":true},"params":{}}"#,
-        r#"{"jsonrpc":"2.0","method":"thread/list","id":1.5,"params":{}}"#,
+        r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"boom"}}"#,
     ] {
         assert!(
             serde_json::from_str::<JsonRpcMessage>(raw).is_err(),
             "invalid envelope was accepted: {raw}"
         );
+    }
+}
+
+#[test]
+fn json_rpc_accepts_and_echoes_every_standard_id_shape() {
+    for (raw, expected) in [
+        (
+            r#"{"jsonrpc":"2.0","method":"thread/list","id":null,"params":{}}"#,
+            JsonRpcId::Null,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"thread/list","id":1.5,"params":{}}"#,
+            JsonRpcId::Fraction(1.5),
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"thread/list","id":18446744073709551615,"params":{}}"#,
+            JsonRpcId::Unsigned(u64::MAX),
+        ),
+    ] {
+        let request_value: serde_json::Value = serde_json::from_str(raw).expect("request JSON");
+        let message: JsonRpcMessage = serde_json::from_str(raw).expect("standard request id");
+        assert_eq!(message.id(), Some(&expected));
+        let response = JsonRpcMessage::response(expected, serde_json::json!({})).to_wire_value();
+        assert_eq!(response["id"], request_value["id"]);
     }
 }
 

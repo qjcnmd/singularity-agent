@@ -68,7 +68,7 @@ fn request_worker_reopens_the_initialized_file_store() {
     let mut worker = server.turn_worker().expect("trusted request worker reopen");
 
     let response = worker
-        .handle_json(r#"{"method":"thread/list","id":1,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/list","id":1,"params":{}}"#)
         .expect("thread list");
     assert_eq!(
         response[0]["result"]["threads"][0]["thread_id"],
@@ -137,40 +137,37 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     let mut server = app_server(store);
 
     let not_initialized = server
-        .handle_json(r#"{"method":"thread/start","id":1,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/start","id":1,"params":{}}"#)
         .unwrap();
     assert_eq!(not_initialized[0]["error"]["message"], "Not initialized");
 
     let unknown = server
-        .handle_json(r#"{"method":"thread/unknown","id":11,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/unknown","id":11,"params":{}}"#)
         .unwrap();
     assert_eq!(unknown[0]["error"]["code"], -32601);
-    assert_eq!(
-        unknown[0]["error"]["message"],
-        "Method not found: thread/unknown"
-    );
+    assert_eq!(unknown[0]["error"]["message"], "Method not found");
 
     let initialized = server
-        .handle_json(r#"{"method":"initialize","id":2,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":2,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     assert_eq!(initialized[0]["result"]["platformFamily"], "local");
 
     let before_initialized = server
-        .handle_json(r#"{"method":"thread/start","id":30,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/start","id":30,"params":{}}"#)
         .unwrap();
     assert_eq!(before_initialized[0]["error"]["message"], "Not initialized");
 
     let duplicate = server
-        .handle_json(r#"{"method":"initialize","id":3,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":3,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     assert_eq!(duplicate[0]["error"]["message"], "Already initialized");
 
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let capabilities = server
-        .handle_json(r#"{"method":"server/capabilities","id":31,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"server/capabilities","id":31,"params":{}}"#)
         .unwrap();
     assert!(
         capabilities[0]["result"]["transports"]
@@ -191,7 +188,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let subscription = server
         .handle_json(
-            r#"{"method":"event/subscribe","id":32,"params":{"eventTypes":["thread/started","turn/started"]}}"#,
+            r#"{"jsonrpc":"2.0","method":"event/subscribe","id":32,"params":{"eventTypes":["thread/started","turn/started"]}}"#,
         )
         .unwrap();
     assert_eq!(
@@ -200,7 +197,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     );
 
     let thread = server
-        .handle_json(r#"{"method":"thread/start","id":4,"params":{"model":"gpt-test","sandboxMode":"read-only","approvalPolicy":"never"}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/start","id":4,"params":{"model":"gpt-test","sandboxMode":"read-only","approvalPolicy":"never"}}"#)
         .unwrap();
     let thread_result = result_message(&thread);
     let thread_id = thread_result["thread"]["thread_id"].as_str().unwrap();
@@ -222,31 +219,29 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     );
 
     let list = server
-        .handle_json(r#"{"method":"thread/list","id":41,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/list","id":41,"params":{}}"#)
         .unwrap();
     assert_eq!(list[0]["result"]["threads"][0]["thread_id"], thread_id);
 
     let read = server
         .handle_json(&format!(
-            r#"{{"method":"thread/read","id":42,"params":{{"threadId":"{thread_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/read","id":42,"params":{{"threadId":"{thread_id}"}}}}"#
         ))
         .unwrap();
     assert_eq!(read[0]["result"]["thread"]["thread_id"], thread_id);
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":5,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":5,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
-    assert!(
-        turn[0]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown field `agentHost`")
-    );
+    assert_eq!(turn[0]["error"]["code"], -32602);
+    assert_eq!(turn[0]["error"]["message"], "Invalid params");
 
     let missing_trace_list = server
-        .handle_json(r#"{"method":"trace/list","id":6,"params":{"runId":"missing"}}"#)
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"trace/list","id":6,"params":{"runId":"missing"}}"#,
+        )
         .unwrap();
     assert_eq!(
         missing_trace_list[0]["error"]["message"],
@@ -254,7 +249,9 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     );
 
     let missing_trace_show = server
-        .handle_json(r#"{"method":"trace/show","id":7,"params":{"eventId":"missing"}}"#)
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"trace/show","id":7,"params":{"eventId":"missing"}}"#,
+        )
         .unwrap();
     assert_eq!(
         missing_trace_show[0]["error"]["message"],
@@ -263,7 +260,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let trace_tail = server
         .handle_json(&format!(
-            r#"{{"method":"trace/tail","id":8,"params":{{"runId":"{thread_id}","limit":1}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"trace/tail","id":8,"params":{{"runId":"{thread_id}","limit":1}}}}"#
         ))
         .unwrap();
     assert_eq!(
@@ -272,7 +269,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     );
     let trace_tail_with_offset = server
         .handle_json(&format!(
-            r#"{{"method":"trace/tail","id":82,"params":{{"runId":"{thread_id}","limit":1,"offset":1}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"trace/tail","id":82,"params":{{"runId":"{thread_id}","limit":1,"offset":1}}}}"#
         ))
         .unwrap();
     assert_eq!(
@@ -284,7 +281,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
     );
     let empty_trace_page = server
         .handle_json(&format!(
-            r#"{{"method":"trace/list","id":81,"params":{{"runId":"{thread_id}","limit":1,"offset":99}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"trace/list","id":81,"params":{{"runId":"{thread_id}","limit":1,"offset":99}}}}"#
         ))
         .unwrap();
     assert!(
@@ -296,14 +293,14 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let archived = server
         .handle_json(&format!(
-            r#"{{"method":"thread/archive","id":43,"params":{{"threadId":"{thread_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/archive","id":43,"params":{{"threadId":"{thread_id}"}}}}"#
         ))
         .unwrap();
     assert_eq!(archived[0]["result"]["thread"]["status"], "archived");
 
     let rejected_turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":431,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"must resume first"}}]}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":431,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"must resume first"}}]}}}}"#
         ))
         .unwrap();
     assert_eq!(
@@ -313,13 +310,13 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let invalid_resume = server
         .handle_json(&format!(
-            r#"{{"method":"thread/resume","id":433,"params":{{"threadId":"{thread_id}","sandboxMode":"workspace-write"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":433,"params":{{"threadId":"{thread_id}","sandboxMode":"workspace-write"}}}}"#
         ))
         .unwrap();
     assert_eq!(invalid_resume[0]["error"]["code"], -32602);
     let unchanged = server
         .handle_json(&format!(
-            r#"{{"method":"thread/read","id":434,"params":{{"threadId":"{thread_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/read","id":434,"params":{{"threadId":"{thread_id}"}}}}"#
         ))
         .unwrap();
     assert_eq!(unchanged[0]["result"]["thread"]["status"], "archived");
@@ -328,7 +325,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let resumed = server
         .handle_json(&format!(
-            r#"{{"method":"thread/resume","id":432,"params":{{"threadId":"{thread_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/resume","id":432,"params":{{"threadId":"{thread_id}"}}}}"#
         ))
         .unwrap();
     assert_eq!(resumed[0]["result"]["thread"]["status"], "active");
@@ -337,7 +334,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let forked = server
         .handle_json(&format!(
-            r#"{{"method":"thread/fork","id":44,"params":{{"threadId":"{thread_id}","model":"gpt-fork"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/fork","id":44,"params":{{"threadId":"{thread_id}","model":"gpt-fork"}}}}"#
         ))
         .unwrap();
     assert_eq!(forked[0]["result"]["sourceThreadId"], thread_id);
@@ -351,7 +348,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let overridden_fork = server
         .handle_json(&format!(
-            r#"{{"method":"thread/fork","id":45,"params":{{"threadId":"{thread_id}","sandboxMode":"workspace-write","approvalPolicy":"on-request"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/fork","id":45,"params":{{"threadId":"{thread_id}","sandboxMode":"workspace-write","approvalPolicy":"on-request"}}}}"#
         ))
         .unwrap();
     assert_eq!(
@@ -365,7 +362,7 @@ fn app_server_enforces_initialize_and_emits_item_events() {
 
     let deleted = server
         .handle_json(&format!(
-            r#"{{"method":"thread/delete","id":46,"params":{{"threadId":"{thread_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/delete","id":46,"params":{{"threadId":"{thread_id}"}}}}"#
         ))
         .unwrap();
     assert_eq!(deleted[0]["result"]["deleted"], true);
@@ -378,10 +375,10 @@ fn legacy_threads_without_an_absolute_workspace_fail_closed_on_resume_and_turn_s
     let store = SessionStore::open(&db_path).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .expect("initialize");
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
 
     let store = SessionStore::open(&db_path).expect("reopen store");
@@ -409,7 +406,7 @@ fn legacy_threads_without_an_absolute_workspace_fail_closed_on_resume_and_turn_s
     for thread_id in [&missing.thread_id, &relative.thread_id] {
         let response = server
             .handle_json(&format!(
-                r#"{{"method":"thread/resume","id":2,"params":{{"threadId":"{thread_id}"}}}}"#
+                r#"{{"jsonrpc":"2.0","method":"thread/resume","id":2,"params":{{"threadId":"{thread_id}"}}}}"#
             ))
             .expect("resume response");
         assert!(
@@ -422,7 +419,7 @@ fn legacy_threads_without_an_absolute_workspace_fail_closed_on_resume_and_turn_s
 
     let turn = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{}","input":[{{"type":"text","text":"do not run"}}]}}}}"#,
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{}","input":[{{"type":"text","text":"do not run"}}]}}}}"#,
             active_missing.thread_id
         ))
         .expect("turn response");
@@ -456,25 +453,25 @@ fn thread_read_reports_invalid_params_and_keeps_the_connection_usable() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .expect("initialize");
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
     let started = server
-        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{}}"#)
         .expect("thread start");
     let thread_id = result_message(&started)["thread"]["thread_id"]
         .as_str()
         .expect("thread id");
 
     for request in [
-        r#"{"method":"thread/read","id":3,"params":{"limit":1}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","method":"thread/read","id":3,"params":{"limit":1}}"#.to_string(),
         format!(
-            r#"{{"method":"thread/read","id":4,"params":{{"threadId":"{thread_id}","limit":"bad"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/read","id":4,"params":{{"threadId":"{thread_id}","limit":"bad"}}}}"#
         ),
         format!(
-            r#"{{"method":"thread/read","id":5,"params":{{"threadId":"{thread_id}","unknown":true}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/read","id":5,"params":{{"threadId":"{thread_id}","unknown":true}}}}"#
         ),
     ] {
         let response = server
@@ -485,7 +482,7 @@ fn thread_read_reports_invalid_params_and_keeps_the_connection_usable() {
 
     let valid = server
         .handle_json(&format!(
-            r#"{{"method":"thread/read","id":6,"params":{{"threadId":"{thread_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"thread/read","id":6,"params":{{"threadId":"{thread_id}"}}}}"#
         ))
         .expect("valid read after invalid params");
     assert_eq!(valid[0]["result"]["thread"]["thread_id"], thread_id);
@@ -512,10 +509,10 @@ fn app_server_binary_reports_only_redacted_provider_configuration() {
         .expect("spawn app-server");
     let mut stdin = child.stdin.take().expect("app-server stdin");
     for line in [
-        r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
-        r#"{"method":"initialized","params":{}}"#,
-        r#"{"method":"agent/capability","id":2,"params":{}}"#,
-        r#"{"method":"server/shutdown","id":3,"params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"agent/capability","id":2,"params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"server/shutdown","id":3,"params":{}}"#,
     ] {
         writeln!(stdin, "{line}").expect("write app-server request");
     }
@@ -560,16 +557,16 @@ fn app_server_reuses_one_provider_snapshot_for_capability_reads() {
     let expected_snapshot_id = snapshot.snapshot_id().to_string();
     let mut server = AppServer::new(store, snapshot);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     for id in [2, 3] {
         let capability = server
             .handle_json(&format!(
-                r#"{{"method":"agent/capability","id":{id},"params":{{}}}}"#
+                r#"{{"jsonrpc":"2.0","method":"agent/capability","id":{id},"params":{{}}}}"#
             ))
             .unwrap();
         let provider = &capability[0]["result"]["providerConfiguration"];
@@ -585,14 +582,14 @@ fn app_server_reports_agent_loop_capability_as_available() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let capability = server
-        .handle_json(r#"{"method":"agent/capability","id":2,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"agent/capability","id":2,"params":{}}"#)
         .unwrap();
 
     assert_eq!(capability[0]["result"]["agentLoop"]["available"], true);
@@ -624,14 +621,14 @@ fn app_server_reports_default_agent_loop_backend_as_unavailable_off_windows() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let capability = server
-        .handle_json(r#"{"method":"agent/capability","id":2,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"agent/capability","id":2,"params":{}}"#)
         .unwrap();
 
     assert_eq!(capability[0]["result"]["agentLoop"]["available"], false);
@@ -683,14 +680,14 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     )
     .expect("manifest");
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let request = serde_json::json!({
-        "method": "eval/run",
+        "jsonrpc": "2.0", "method": "eval/run",
         "id": 2,
         "params": {
             "manifest": manifest,
@@ -798,14 +795,14 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     )
     .expect("manifest");
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let request = serde_json::json!({
-        "method": "eval/run",
+        "jsonrpc": "2.0", "method": "eval/run",
         "id": 2,
         "params": {
             "manifest": manifest,
@@ -872,14 +869,14 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
     )
     .expect("manifest");
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let request = serde_json::json!({
-        "method": "eval/run",
+        "jsonrpc": "2.0", "method": "eval/run",
         "id": 2,
         "params": {
             "manifest": manifest,
@@ -904,13 +901,13 @@ fn app_server_rejects_public_agent_host_selector() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
     let thread = server
-        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{}}"#)
         .unwrap();
     let thread_id = result_message(&thread)["thread"]["thread_id"]
         .as_str()
@@ -918,16 +915,12 @@ fn app_server_rejects_public_agent_host_selector() {
 
     let response = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
 
-    assert!(
-        response[0]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown field `agentHost`")
-    );
+    assert_eq!(response[0]["error"]["code"], -32602);
+    assert_eq!(response[0]["error"]["message"], "Invalid params");
 }
 
 #[test]
@@ -936,13 +929,13 @@ fn public_agent_host_rejection_does_not_create_turn() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
     let thread = server
-        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{}}"#)
         .unwrap();
     let thread_id = result_message(&thread)["thread"]["thread_id"]
         .as_str()
@@ -950,19 +943,15 @@ fn public_agent_host_rejection_does_not_create_turn() {
 
     let response = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
 
-    assert!(
-        response[0]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown field `agentHost`")
-    );
+    assert_eq!(response[0]["error"]["code"], -32602);
+    assert_eq!(response[0]["error"]["message"], "Invalid params");
     let trace = server
         .handle_json(&format!(
-            r#"{{"method":"trace/tail","id":4,"params":{{"runId":"{thread_id}","limit":10}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"trace/tail","id":4,"params":{{"runId":"{thread_id}","limit":10}}}}"#
         ))
         .unwrap();
     let serialized = serde_json::to_string(&trace).expect("serialize trace");
@@ -975,13 +964,13 @@ fn turn_start_rejects_agent_host_selector_before_turn_creation() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
     let thread = server
-        .handle_json(r#"{"method":"thread/start","id":2,"params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{}}"#)
         .unwrap();
     let thread_id = result_message(&thread)["thread"]["thread_id"]
         .as_str()
@@ -989,16 +978,12 @@ fn turn_start_rejects_agent_host_selector_before_turn_creation() {
 
     let response = server
         .handle_json(&format!(
-            r#"{{"method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","agentHost":"alternate","input":[{{"type":"text","text":"hello"}}]}}}}"#
         ))
         .unwrap();
 
-    assert!(
-        response[0]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("unknown field `agentHost`")
-    );
+    assert_eq!(response[0]["error"]["code"], -32602);
+    assert_eq!(response[0]["error"]["message"], "Invalid params");
 }
 
 #[test]
@@ -1012,14 +997,14 @@ fn approval_defer_remains_pending_while_allow_and_deny_are_consumed() {
         let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
         let mut server = app_server(store);
         server
-            .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
             .unwrap();
         server
-            .handle_json(r#"{"method":"initialized","params":{}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
             .unwrap();
 
         let center_without_records = server
-            .handle_json(r#"{"method":"approval/center","id":21,"params":{}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"approval/center","id":21,"params":{}}"#)
             .unwrap();
         assert!(
             center_without_records[0]["result"]["pendingApprovals"]
@@ -1051,14 +1036,14 @@ fn approval_defer_remains_pending_while_allow_and_deny_are_consumed() {
         drop(store);
 
         let approvals = server
-            .handle_json(r#"{"method":"approval/list","id":22,"params":{}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"approval/list","id":22,"params":{}}"#)
             .unwrap();
         assert_eq!(
             approvals[0]["result"]["approvals"][0]["request_id"],
             "approval_1"
         );
         let center = server
-            .handle_json(r#"{"method":"approval/center","id":23,"params":{}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"approval/center","id":23,"params":{}}"#)
             .unwrap();
         assert_eq!(
             center[0]["result"]["pendingApprovals"][0]["request_id"],
@@ -1067,7 +1052,7 @@ fn approval_defer_remains_pending_while_allow_and_deny_are_consumed() {
 
         let decision = ApprovalDecision::new("approval_1", outcome, "operator decision");
         let decision_message = serde_json::json!({
-            "method": "approval/decision",
+            "jsonrpc": "2.0", "method": "approval/decision",
             "id": 3,
             "params": decision,
         });
@@ -1077,7 +1062,7 @@ fn approval_defer_remains_pending_while_allow_and_deny_are_consumed() {
             "approval_1"
         );
         let center_after_decision = server
-            .handle_json(r#"{"method":"approval/center","id":24,"params":{}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"approval/center","id":24,"params":{}}"#)
             .unwrap();
         if outcome == ApprovalOutcome::Defer {
             assert_eq!(
@@ -1125,10 +1110,10 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
     let store = SessionStore::open(&db_path).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
     let store = SessionStore::open(&db_path).expect("reopen store");
     let thread = store
@@ -1175,7 +1160,7 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
     let response = server
         .handle_json(
             &serde_json::json!({
-                "method": "approval/decision",
+                "jsonrpc": "2.0", "method": "approval/decision",
                 "id": 4,
                 "params": decision,
             })
@@ -1218,10 +1203,10 @@ fn pending_approval_prevents_thread_archive_and_delete() {
     let store = SessionStore::open(&db_path).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .expect("initialize");
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
     let store = SessionStore::open(&db_path).expect("reopen store");
     let thread = store.create_thread(None, None).expect("thread");
@@ -1272,7 +1257,7 @@ fn pending_approval_prevents_thread_archive_and_delete() {
         let response = server
             .handle_json(
                 &serde_json::json!({
-                    "method": method,
+                    "jsonrpc": "2.0", "method": method,
                     "id": 4,
                     "params": {"threadId": &thread.thread_id},
                 })
@@ -1308,10 +1293,10 @@ fn allow_resume_precondition_failure_is_terminalized_without_replay() {
     let store = SessionStore::open(&db_path).expect("open store");
     let mut server = configured_app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .expect("initialize");
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
 
     let store = SessionStore::open(&db_path).expect("reopen store");
@@ -1357,7 +1342,7 @@ fn allow_resume_precondition_failure_is_terminalized_without_replay() {
     let response = server
         .handle_json(
             &serde_json::json!({
-                "method": "approval/decision",
+                "jsonrpc": "2.0", "method": "approval/decision",
                 "id": 4,
                 "params": decision,
             })
@@ -1424,10 +1409,10 @@ fn unavailable_workspace_only_blocks_allow_decisions() {
         let store = SessionStore::open(&db_path).expect("open store");
         let mut server = app_server(store);
         server
-                .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+                .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
                 .expect("initialize");
         server
-            .handle_json(r#"{"method":"initialized","params":{}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
             .expect("initialized");
 
         let store = SessionStore::open(&db_path).expect("reopen store");
@@ -1474,7 +1459,7 @@ fn unavailable_workspace_only_blocks_allow_decisions() {
         let response = server
             .handle_json(
                 &serde_json::json!({
-                    "method": "approval/decision",
+                    "jsonrpc": "2.0", "method": "approval/decision",
                     "id": 4,
                     "params": decision,
                 })
@@ -1549,10 +1534,10 @@ fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
     let store = SessionStore::open(&db_path).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .expect("initialize");
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
     let store = SessionStore::open(&db_path).expect("reopen store");
     let thread = store
@@ -1595,7 +1580,7 @@ fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
     let response = server
         .handle_json(
             &serde_json::json!({
-                "method": "turn/interrupt",
+                "jsonrpc": "2.0", "method": "turn/interrupt",
                 "id": 4,
                 "params": {"turnId": &turn.turn_id},
             })
@@ -1655,14 +1640,14 @@ fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_agent_loop
         let store = SessionStore::open(&db_path).expect("open store");
         let mut server = app_server(store);
         server
-            .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
             .unwrap();
         server
-            .handle_json(r#"{"method":"initialized","params":{}}"#)
+            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
             .unwrap();
         let thread = server
             .handle_json(&format!(
-                r#"{{"method":"thread/start","id":2,"params":{{"cwd":{}}}}}"#,
+                r#"{{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{{"cwd":{}}}}}"#,
                 serde_json::to_string(&workspace.to_string_lossy()).expect("cwd")
             ))
             .unwrap();
@@ -1704,7 +1689,7 @@ fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_agent_loop
         let response = server
             .handle_json(
                 &serde_json::json!({
-                    "method": "approval/decision",
+                    "jsonrpc": "2.0", "method": "approval/decision",
                     "id": 3,
                     "params": decision,
                 })
@@ -1746,15 +1731,15 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let missing_turn_thread = server
         .handle_json(
-            r#"{"method":"turn/start","id":2,"params":{"threadId":"missing","input":[{"type":"text","text":"hello"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"missing","input":[{"type":"text","text":"hello"}]}}"#,
         )
         .unwrap();
     assert_eq!(
@@ -1769,20 +1754,20 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
         tool_id("write_file"),
     );
     let request_message = serde_json::json!({
-        "method": "approval/request",
+        "jsonrpc": "2.0", "method": "approval/request",
         "id": 3,
         "params": request,
     });
     let public_request = server.handle_json(&request_message.to_string()).unwrap();
 
-    assert_eq!(public_request[0]["error"]["code"], -32600);
+    assert_eq!(public_request[0]["error"]["code"], -32005);
     assert_eq!(
         public_request[0]["error"]["message"],
         "approval/request is internal to the AgentLoop approval history"
     );
 
     let missing_artifact = server
-        .handle_json(r#"{"method":"artifact/fetch","id":4,"params":{"artifactId":"missing"}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"artifact/fetch","id":4,"params":{"artifactId":"missing"}}"#)
         .unwrap();
     assert_eq!(
         missing_artifact[0]["error"]["message"],
@@ -1796,15 +1781,15 @@ fn turn_start_missing_thread_fails_before_turn_creation() {
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let missing_thread = server
         .handle_json(
-            r#"{"method":"turn/start","id":2,"params":{"threadId":"missing","input":[{"type":"text","text":"hello"}]}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/start","id":2,"params":{"threadId":"missing","input":[{"type":"text","text":"hello"}]}}"#,
         )
         .unwrap();
 
@@ -1828,21 +1813,21 @@ fn turn_lifecycle_interrupt_on_terminal_turn_is_idempotent() {
         .expect("completed turn");
     let mut server = app_server(store);
     server
-        .handle_json(r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .unwrap();
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .unwrap();
 
     let interrupted = server
         .handle_json(&format!(
-            r#"{{"method":"turn/interrupt","id":2,"params":{{"turnId":"{}"}}}}"#,
+            r#"{{"jsonrpc":"2.0","method":"turn/interrupt","id":2,"params":{{"turnId":"{}"}}}}"#,
             turn.turn_id
         ))
         .unwrap();
     let status = server
         .handle_json(&format!(
-            r#"{{"method":"turn/status","id":3,"params":{{"turnId":"{}"}}}}"#,
+            r#"{{"jsonrpc":"2.0","method":"turn/status","id":3,"params":{{"turnId":"{}"}}}}"#,
             turn.turn_id
         ))
         .unwrap();
@@ -1871,7 +1856,7 @@ fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_s
     send_json(
         &mut input,
         serde_json::json!({
-            "method": "turn/start",
+            "jsonrpc": "2.0", "method": "turn/start",
             "id": 3,
             "params": {
                 "threadId": thread_id,
@@ -1891,7 +1876,7 @@ fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_s
     send_json(
         &mut input,
         serde_json::json!({
-            "method": "turn/interrupt",
+            "jsonrpc": "2.0", "method": "turn/interrupt",
             "id": 4,
             "params": {"turnId": turn_id}
         }),
@@ -1943,7 +1928,7 @@ fn app_server_serializes_shared_workspace_across_processes_and_observes_interrup
     send_json(
         &mut primary_input,
         serde_json::json!({
-            "method": "turn/start",
+            "jsonrpc": "2.0", "method": "turn/start",
             "id": 3,
             "params": {
                 "threadId": thread_id,
@@ -1968,7 +1953,7 @@ fn app_server_serializes_shared_workspace_across_processes_and_observes_interrup
     send_json(
         &mut secondary_input,
         serde_json::json!({
-            "method": "turn/start",
+            "jsonrpc": "2.0", "method": "turn/start",
             "id": 11,
             "params": {
                 "threadId": secondary_thread_id,
@@ -1984,7 +1969,7 @@ fn app_server_serializes_shared_workspace_across_processes_and_observes_interrup
     send_json(
         &mut secondary_input,
         serde_json::json!({
-            "method": "turn/interrupt",
+            "jsonrpc": "2.0", "method": "turn/interrupt",
             "id": 12,
             "params": {"turnId": turn_id}
         }),
@@ -2069,7 +2054,7 @@ fn app_server_approval_continuation_keeps_interrupt_and_shutdown_responsive() {
     send_json(
         &mut input,
         serde_json::json!({
-            "method": "approval/decision",
+            "jsonrpc": "2.0", "method": "approval/decision",
             "id": 3,
             "params": {
                 "request_id": request.request_id,
@@ -2086,7 +2071,7 @@ fn app_server_approval_continuation_keeps_interrupt_and_shutdown_responsive() {
     send_json(
         &mut input,
         serde_json::json!({
-            "method": "turn/interrupt",
+            "jsonrpc": "2.0", "method": "turn/interrupt",
             "id": 4,
             "params": {"turnId": turn.turn_id}
         }),
@@ -2098,7 +2083,7 @@ fn app_server_approval_continuation_keeps_interrupt_and_shutdown_responsive() {
     send_json(
         &mut input,
         serde_json::json!({
-            "method": "server/shutdown",
+            "jsonrpc": "2.0", "method": "server/shutdown",
             "id": 5,
             "params": {}
         }),
@@ -2135,7 +2120,7 @@ fn app_server_binary_errors_are_valid_json_rpc_lines() {
         .expect("spawn app-server");
     let mut stdin = child.stdin.take().expect("stdin");
     stdin
-        .write_all(b"{\"method\":\"initialize\",\"id\":\"quoted-id\",\"params\":\"bad\"}\n")
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":\"quoted-id\",\"params\":\"bad\"}\n")
         .expect("write invalid params");
     drop(stdin);
     let output = child.wait_with_output().expect("app-server output");
@@ -2146,12 +2131,7 @@ fn app_server_binary_errors_are_valid_json_rpc_lines() {
 
     assert_eq!(value["id"], "quoted-id");
     assert_eq!(value["error"]["code"], -32602);
-    assert!(
-        value["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid type")
-    );
+    assert_eq!(value["error"]["message"], "Invalid params");
 }
 
 #[test]
@@ -2166,16 +2146,16 @@ fn turn_status_recovers_an_unowned_running_turn() {
     let mut server = app_server(store);
     server
         .handle_json(
-            r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
         )
         .expect("initialize");
     server
-        .handle_json(r#"{"method":"initialized","params":{}}"#)
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
 
     let response = server
         .handle_json(&format!(
-            r#"{{"method":"turn/status","id":2,"params":{{"turnId":"{}"}}}}"#,
+            r#"{{"jsonrpc":"2.0","method":"turn/status","id":2,"params":{{"turnId":"{}"}}}}"#,
             turn.turn_id
         ))
         .expect("turn status");
@@ -2187,7 +2167,7 @@ fn turn_status_recovers_an_unowned_running_turn() {
     );
     let trace = server
         .handle_json(&format!(
-            r#"{{"method":"trace/list","id":3,"params":{{"runId":"{}"}}}}"#,
+            r#"{{"jsonrpc":"2.0","method":"trace/list","id":3,"params":{{"runId":"{}"}}}}"#,
             thread.thread_id
         ))
         .expect("trace list");
@@ -2217,7 +2197,7 @@ fn app_server_exits_when_stdout_transport_is_lost() {
     drop(child.stdout.take().expect("stdout"));
     stdin
         .write_all(
-            b"{\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"test\",\"title\":\"Test\",\"version\":\"0.1.0\"}}}\n",
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"test\",\"title\":\"Test\",\"version\":\"0.1.0\"}}}\n",
         )
         .expect("write initialize");
     stdin.flush().expect("flush initialize");
@@ -2339,7 +2319,7 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
     send_json(
         input,
         serde_json::json!({
-            "method": "initialize",
+            "jsonrpc": "2.0", "method": "initialize",
             "id": 1,
             "params": {"clientInfo": {"name": "test", "title": "Test", "version": "0.1.0"}}
         }),
@@ -2348,7 +2328,7 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
     assert!(initialized.get("result").is_some());
     send_json(
         input,
-        serde_json::json!({"method": "initialized", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
     );
 }
 
@@ -2362,7 +2342,7 @@ fn start_process_thread(
     send_json(
         input,
         serde_json::json!({
-            "method": "thread/start",
+            "jsonrpc": "2.0", "method": "thread/start",
             "id": id,
             "params": {"model": "gpt-test", "cwd": workspace}
         }),
@@ -2383,7 +2363,7 @@ fn send_json(input: &mut impl Write, message: serde_json::Value) {
 fn shutdown_process(child: &mut Child, input: &mut ChildStdin, output: &mut JsonOutput, id: i64) {
     send_json(
         input,
-        serde_json::json!({"method": "server/shutdown", "id": id, "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "server/shutdown", "id": id, "params": {}}),
     );
     assert_eq!(
         output.recv_id(id, Duration::from_secs(2))["result"]["shutdown"],
