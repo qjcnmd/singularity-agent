@@ -84,13 +84,14 @@ const PROVIDER_CAPABILITY_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_PROVIDER_CAPABILITY_CACHE_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_CAPABILITY_CACHE_RECORDS: usize = 256;
 const PROVIDER_CAPABILITY_CACHE_LOCK_RETRY_MS: u64 = 25;
-const PROVIDER_CAPABILITY_CACHE_LOCK_WAIT_MS: u64 = 5_000;
 const PROVIDER_CAPABILITY_CACHE_KEY_LOCK_PREFIX: &str = ".provider-capability-cache.key-lock-";
 const PROVIDER_CAPABILITY_CACHE_KEY_LOCK_SUFFIX: &str = ".lock";
 const MAX_PROVIDER_CAPABILITY_CACHE_KEY_LOCK_FILES: usize = 256;
 const CAPABILITY_PROBE_DEADLINE_SECONDS: u64 = 120;
 const PROVIDER_ADAPTER_VERSION: u32 = 1;
 const CAPABILITY_PROBE_CONTRACT_VERSION: u32 = 1;
+const PROVIDER_CAPABILITY_CACHE_INVALIDATION_DEADLINE_CODE: &str =
+    "provider_capability_cache_invalidation_deadline_exceeded";
 
 /// 面向模型的对话历史支持的角色。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2505,7 +2506,8 @@ impl OpenAiProvider {
     fn invalidate_tool_capability_negotiation(
         &self,
         key: &ProviderCapabilityCacheKey,
-        _cancellation: &CancellationToken,
+        cancellation: &CancellationToken,
+        deadline: Instant,
     ) -> Result<(), ProviderError> {
         {
             let mut cache = self
@@ -2517,12 +2519,18 @@ impl OpenAiProvider {
         let Some(persistent_cache) = &self.persistent_capability_cache else {
             return Ok(());
         };
-        let invalidation_token = CancellationToken::new();
-        let deadline =
-            Instant::now() + Duration::from_millis(PROVIDER_CAPABILITY_CACHE_LOCK_WAIT_MS);
-        if let Err(error) = persistent_cache.invalidate(key, &invalidation_token, Some(deadline)) {
+        if let Err(error) = persistent_cache.invalidate(key, cancellation, Some(deadline)) {
             self.record_cache_diagnostic(error);
-            return Err(provider_capability_cache_invalidation_error());
+            return Err(match error {
+                ProviderCapabilityCacheError::Cancelled => provider_cancelled_error(),
+                ProviderCapabilityCacheError::Deadline => {
+                    provider_capability_cache_invalidation_deadline_error()
+                }
+                ProviderCapabilityCacheError::Unavailable
+                | ProviderCapabilityCacheError::Invalid => {
+                    provider_capability_cache_invalidation_error()
+                }
+            });
         }
         Ok(())
     }
@@ -2612,14 +2620,12 @@ impl OpenAiProvider {
         }
         if cancellation.is_cancelled() {
             self.remove_cached_entry(&cache_key);
-            let _ =
-                self.invalidate_tool_capability_negotiation(&cache_key, &CancellationToken::new());
+            let _ = self.invalidate_tool_capability_negotiation(&cache_key, cancellation, deadline);
             return Err(capability_probe_cancelled_error());
         }
         if Instant::now() >= deadline {
             self.remove_cached_entry(&cache_key);
-            let _ =
-                self.invalidate_tool_capability_negotiation(&cache_key, &CancellationToken::new());
+            let _ = self.invalidate_tool_capability_negotiation(&cache_key, cancellation, deadline);
             return Err(capability_probe_deadline_error());
         }
         Ok(BoundProviderProtocolNegotiation {
@@ -2764,7 +2770,12 @@ impl OpenAiProvider {
                 let result =
                     self.probe_as_persistent_owner(model_name, cancellation, &epochs, deadline);
                 let result = match result {
-                    Err(error) => Err(self.invalidate_fresh_probe_rejection(model_name, error)),
+                    Err(error) => Err(self.invalidate_fresh_probe_rejection(
+                        model_name,
+                        cancellation,
+                        deadline,
+                        error,
+                    )),
                     result => result,
                 };
                 let completion = match &result {
@@ -2832,6 +2843,8 @@ impl OpenAiProvider {
     fn invalidate_fresh_probe_rejection(
         &self,
         model_name: &str,
+        cancellation: &CancellationToken,
+        deadline: Instant,
         mut error: ProviderError,
     ) -> ProviderError {
         if !is_stable_capability_rejection(&error) {
@@ -2847,7 +2860,7 @@ impl OpenAiProvider {
         };
         let key = self.capability_cache_key(model_name, api_protocol);
         if let Err(invalidation_error) =
-            self.invalidate_tool_capability_negotiation(&key, &CancellationToken::new())
+            self.invalidate_tool_capability_negotiation(&key, cancellation, deadline)
         {
             error.error.validation_errors.push(
                 invalidation_error
@@ -3511,6 +3524,8 @@ impl Provider for OpenAiProvider {
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
+        let cache_invalidation_deadline =
+            Instant::now() + Duration::from_secs(self.request_timeout_seconds);
         let result = self.complete_with_contract(
             request,
             cancellation,
@@ -3521,7 +3536,11 @@ impl Provider for OpenAiProvider {
         let result = if let (Some(binding), Err(error)) = (&capability_binding, &result)
             && is_stable_capability_rejection(error)
         {
-            match self.invalidate_tool_capability_negotiation(&binding.key, cancellation) {
+            match self.invalidate_tool_capability_negotiation(
+                &binding.key,
+                cancellation,
+                cache_invalidation_deadline,
+            ) {
                 Ok(()) => result,
                 Err(invalidation_error) => result.map_err(|mut original| {
                     original.error.validation_errors.push(
@@ -4916,6 +4935,19 @@ fn provider_capability_cache_invalidation_error() -> ProviderError {
     )
 }
 
+fn provider_capability_cache_invalidation_deadline_error() -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::Timeout,
+            "provider capability cache invalidation deadline exceeded",
+        )
+        .with_provider_diagnostic(
+            PROVIDER_CAPABILITY_CACHE_INVALIDATION_DEADLINE_CODE,
+            ProviderErrorStage::ClientInitialization,
+        ),
+    )
+}
+
 fn capability_probe_definition_error(errors: Vec<String>) -> ProviderError {
     let mut error = ModelError::new(
         ModelErrorKind::UnknownProviderError,
@@ -6062,6 +6094,124 @@ mod transport_tests {
     }
 
     #[test]
+    fn capability_cache_invalidation_reuses_caller_cancellation_while_lock_held() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
+        let provider = OpenAiProvider::new_with_cache_path(
+            test_provider_config("http://127.0.0.1:1".to_string()),
+            Some(cache_path),
+        )
+        .expect("provider");
+        let key =
+            provider.capability_cache_key("gpt-test", ProviderApiProtocol::OpenAiChatCompletions);
+        let persistent_cache = Arc::clone(
+            provider
+                .persistent_capability_cache
+                .as_ref()
+                .expect("persistent cache"),
+        );
+        let holder = persistent_cache
+            .acquire_global_lock(
+                true,
+                &CancellationToken::new(),
+                Some(Instant::now() + Duration::from_secs(1)),
+            )
+            .expect("hold cache lock");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let started = Instant::now();
+        let error = provider
+            .invalidate_tool_capability_negotiation(
+                &key,
+                &cancellation,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect_err("cancelled invalidation must report cancellation");
+        assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_request_cancelled")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancelled invalidation must not wait for the held persistent lock"
+        );
+        assert_eq!(
+            provider
+                .capability_cache_diagnostic
+                .lock()
+                .expect("cache diagnostic lock")
+                .as_deref(),
+            Some("cancelled")
+        );
+        drop(holder);
+    }
+
+    #[test]
+    fn fresh_probe_rejection_invalidation_preserves_cause_when_cancelled() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
+        let provider = OpenAiProvider::new_with_cache_path(
+            test_provider_config("http://127.0.0.1:1".to_string()),
+            Some(cache_path),
+        )
+        .expect("provider");
+        let persistent_cache = Arc::clone(
+            provider
+                .persistent_capability_cache
+                .as_ref()
+                .expect("persistent cache"),
+        );
+        let holder = persistent_cache
+            .acquire_global_lock(
+                true,
+                &CancellationToken::new(),
+                Some(Instant::now() + Duration::from_secs(1)),
+            )
+            .expect("hold cache lock");
+        let mut rejection = capability_probe_tool_reasoning_error(
+            &ModelTurnResponse::completed("probe", "response", "done"),
+            "tool_reasoning_disable_not_honored",
+        );
+        rejection.capability_metadata = Some(Box::new(capability_probe_metadata(
+            ProviderApiProtocol::OpenAiChatCompletions,
+            ProviderCapabilityProfile::StrictSingle,
+            1,
+            0,
+            &ModelUsage::default(),
+            &ProviderAttemptMetadata::zero(),
+        )));
+        let original_code = rejection.error.code.clone();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let started = Instant::now();
+        let rejection = provider.invalidate_fresh_probe_rejection(
+            "gpt-test",
+            &cancellation,
+            Instant::now() + Duration::from_secs(5),
+            rejection,
+        );
+        assert_eq!(rejection.error.code, original_code);
+        assert!(
+            rejection
+                .error
+                .validation_errors
+                .contains(&"provider_request_cancelled".to_string())
+        );
+        assert!(
+            !rejection
+                .error
+                .validation_errors
+                .contains(&"provider_capability_cache_invalidation_failed".to_string())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "fresh rejection invalidation must honor caller cancellation"
+        );
+        drop(holder);
+    }
+
+    #[test]
     fn capability_probe_total_deadline_does_not_publish_cache() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind deadline provider");
         let address = listener.local_addr().expect("deadline provider address");
@@ -6111,7 +6261,11 @@ mod transport_tests {
         let key =
             provider.capability_cache_key("gpt-test", ProviderApiProtocol::OpenAiChatCompletions);
         let error = provider
-            .invalidate_tool_capability_negotiation(&key, &CancellationToken::new())
+            .invalidate_tool_capability_negotiation(
+                &key,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(1),
+            )
             .expect_err("persistent invalidation must report the write/read failure");
         assert_eq!(
             error.error.code.as_deref(),
