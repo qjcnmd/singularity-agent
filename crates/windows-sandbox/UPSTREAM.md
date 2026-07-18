@@ -7,7 +7,7 @@
 - Extraction commit: `1f0566d3f59298d1bb88820a0d35294f1eeb07ea`
 - Commit date: `2026-07-09`
 - Extraction date: `2026-07-10`
-- Official verification commit: [`82b294c73c902a4c51f789ba68bb599f0065616f`](https://github.com/openai/codex/commit/82b294c73c902a4c51f789ba68bb599f0065616f), verified `2026-07-18`
+- Official verification commit: [`56395bddaf26eb2829387ca6a417bf9128e5b239`](https://github.com/openai/codex/commit/56395bddaf26eb2829387ca6a417bf9128e5b239), verified `2026-07-18`
 - Upstream license: Apache License 2.0
 
 The upstream `LICENSE` and `NOTICE` files are preserved verbatim in this directory.
@@ -105,6 +105,8 @@ The port does not depend on `codex-utils-pty`, `codex-otel`, the upstream protoc
 ## Selective upstream delta verification
 
 The following upstream commits were resolved to complete SHAs and reviewed from their official diffs against the verification commit above. They were not cherry-picked as a directory or as blind commits.
+
+The previous verification point `82b294c73c902a4c51f789ba68bb599f0065616f` is an ancestor of the current verification commit, and the path-limited diff for `codex-rs/windows-sandbox-rs` between them is empty. No additional Windows sandbox change therefore required migration in that interval.
 
 - [`87f3e39fdf7e676d0ba25b0587f78e5b85e695e2`](https://github.com/openai/codex/commit/87f3e39fdf7e676d0ba25b0587f78e5b85e695e2) — not applicable. The upstream `ConsoleMode::NoWindow` path hides the upstream `--codex-run-as-fs-helper` filesystem helper and also changes the omitted upstream `unified_exec` surface. This crate has no filesystem-helper argument contract or `src/unified_exec`; its ordinary `SpawnRequest.command` is a product command. The local setup helper already uses `CREATE_NO_WINDOW`/`SW_HIDE` in `src/setup.rs`, so no parallel console-mode API was added.
 - [`abbb8c569cbda65fd75f1a51fcc8dd99ced199fa`](https://github.com/openai/codex/commit/abbb8c569cbda65fd75f1a51fcc8dd99ced199fa) — excluded as not applicable. The Windows-sandbox part is a proxy-enforcement validation in the upstream `src/unified_exec/mod.rs` and depends on upstream config and cross-crate proxy contracts absent from this crate. No partial proxy interface or fallback behavior was added.
