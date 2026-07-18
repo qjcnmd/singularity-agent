@@ -10,29 +10,33 @@ mod value;
 use std::path::PathBuf;
 
 pub use evidence::{
-    EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationScopeEvidence,
-    EvaluationTaskEvidence, EvidenceVerdict, task_selection_digest,
+    EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationPromptStructure,
+    EvaluationProviderEvidence, EvaluationScopeEvidence, EvaluationTaskEvidence,
+    EvaluationTrialEvidence, EvidenceVerdict, task_selection_digest,
 };
 pub use manifest::{
     AgentStagePlan, AgentTaskProjection, AgentTaskSpec, BaselineStagePlan, CommandExpectation,
     CommandSpec, EvaluationCapability, EvaluationManifest, EvaluationStage, EvaluationTask,
     EvaluationTaskSet, EvaluatorSpec, EvaluatorStageSpec, EvaluatorTestPatch, PatchFormat,
-    PlannedWorkspaceSource, TaskSetSchemaVersion, VerificationStagePlan, WorkspacePlan,
-    WorkspaceSeed, WorkspaceSource, WorkspaceSpec,
+    PlannedWorkspaceSource, TaskSetSchemaVersion, ToolCapabilityRequirement, VerificationStagePlan,
+    WorkspacePlan, WorkspaceSeed, WorkspaceSource, WorkspaceSpec,
 };
 pub use result::{
     BlockerKind, EvaluationBlocker, EvaluationEvidenceSummary, EvaluationResult,
-    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationStageResults, EvaluationStatus,
-    EvaluationTaskResult, StageResult, StageStatus,
+    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationStabilitySummary,
+    EvaluationStageResults, EvaluationStatus, EvaluationTaskResult, EvaluationTaskSummary,
+    EvaluationTrialResult, FiniteStatistics, StageResult, StageStatus,
 };
-pub use value::{Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId, ToolName};
+pub use value::{
+    Argv, GitCommit, RelativePath, RemoteRepository, RunId, TaskId, ToolCapabilityName,
+};
 
 /// 当前 task set schema 版本。
-pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v4";
+pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v5";
 /// 当前稳定 result schema 版本。
-pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v5";
+pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v6";
 /// 当前 evidence schema 版本。
-pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v1";
+pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v2";
 /// 核心任务成功率门禁的 basis points 阈值。
 pub const CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
 

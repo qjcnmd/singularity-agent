@@ -1,950 +1,461 @@
 #![recursion_limit = "256"]
 
-//! Evaluation manifest、result、evidence 和固定任务集的合同测试。
-
-use std::path::Path;
+//! Evaluation v5/v6/v2 schema、trial 分母和证据绑定合同测试。
 
 use serde_json::{Value, json};
 use singularity_evaluation::{
-    CommandExpectation, EvaluationError, EvaluationEvidence, EvaluationManifest, EvaluationResult,
-    EvaluationStage, EvaluationStatus, PlannedWorkspaceSource, StageStatus, TaskId, WorkspaceSeed,
+    BlockerKind, EvaluationBlocker, EvaluationCapability, EvaluationError, EvaluationEvidence,
+    EvaluationEvidenceSchemaVersion, EvaluationEvidenceSummary, EvaluationManifest,
+    EvaluationPromptStructure, EvaluationProviderEvidence, EvaluationResult,
+    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationScopeEvidence,
+    EvaluationStageResults, EvaluationStatus, EvaluationTaskEvidence, EvaluationTaskResult,
+    EvaluationTrialEvidence, EvaluationTrialResult, EvidenceVerdict, RunId, StageResult,
+    StageStatus, TaskId, ToolCapabilityName, ToolCapabilityRequirement, task_selection_digest,
 };
 
+const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const IMMUTABLE_COMMIT: &str = "f1dba0e1dd764ae72d67c3d5e1471cf14d3db030";
-const PUBLIC_TEST_PATCH_MARKER: &str = "PUBLIC_EVALUATOR_ONLY_PATCH_MARKER";
-const HIDDEN_TEST_PATCH_MARKER: &str = "HIDDEN_EVALUATOR_ONLY_PATCH_MARKER";
+
+fn requirement(name: &str) -> ToolCapabilityRequirement {
+    ToolCapabilityRequirement {
+        capability: ToolCapabilityName::new(name).expect("capability name"),
+        minimum_version: 1,
+    }
+}
 
 fn valid_manifest() -> Value {
     json!({
-        "schema_version": "evaluation.task_set/v4",
-        "tasks": [
-            {
-                "task_id": "sqlfluff__sqlfluff-2419",
-                "description": "Fix the public representative SQLFluff task.",
-                "capabilities": ["single_file_fix", "python", "required_verification"],
-                "workspace": {
-                    "source": {
-                        "type": "remote_git",
-                        "repository": "https://github.com/sqlfluff/sqlfluff.git",
-                        "commit": IMMUTABLE_COMMIT
-                    },
-                    "setup_commands": [
-                        {"argv": ["cargo", "fetch"]}
-                    ]
+        "schema_version": "evaluation.task_set/v5",
+        "trial_count": 2,
+        "tasks": [{
+            "task_id": "representative-task",
+            "description": "Fix a representative task.",
+            "capabilities": ["single_file_fix", "required_verification"],
+            "workspace": {
+                "source": {
+                    "type": "remote_git",
+                    "repository": "https://github.com/example/repository.git",
+                    "commit": IMMUTABLE_COMMIT
                 },
-                "agent": {
-                    "instructions": "Apply the smallest focused fix.",
-                    "allowed_paths": ["src/sqlfluff/rules/L060.py"],
-                    "allowed_tools": [
-                        "read",
-                        "grep",
-                        "edit",
-                        "command"
-                    ],
-                    "smoke_commands": [
-                        {
-                            "argv": [
-                                "cargo",
-                                "check"
-                            ],
-                            "timeout_seconds": 60
-                        }
-                    ]
-                },
-                "evaluator": {
-                    "public_test_patch": {
-                        "format": "unified_diff",
-                        "content": PUBLIC_TEST_PATCH_MARKER
-                    },
-                    "hidden_test_patch": {
-                        "format": "unified_diff",
-                        "content": HIDDEN_TEST_PATCH_MARKER
-                    },
-                    "baseline": {
-                        "commands": [
-                            {
-                                "argv": [
-                                    "cargo",
-                                    "test",
-                                    "--workspace"
-                                ]
-                            }
-                        ]
-                    },
-                    "public": {
-                        "commands": [
-                            {
-                                "argv": [
-                                    "cargo",
-                                    "test",
-                                    "--workspace"
-                                ]
-                            }
-                        ]
-                    },
-                    "hidden": {
-                        "commands": [
-                            {
-                                "argv": [
-                                    "cargo",
-                                    "test",
-                                    "--workspace"
-                                ]
-                            }
-                        ]
-                    }
-                }
+                "setup_commands": [{"argv": ["cargo", "fetch"]}]
+            },
+            "agent": {
+                "instructions": "Apply a focused fix.",
+                "allowed_paths": ["src/lib.rs"],
+                "required_tool_capabilities": [
+                    {"capability": "workspace_read", "minimum_version": 1},
+                    {"capability": "workspace_write", "minimum_version": 1},
+                    {"capability": "command_execution", "minimum_version": 1}
+                ],
+                "smoke_commands": [{"argv": ["cargo", "check"], "timeout_seconds": 60}]
+            },
+            "evaluator": {
+                "public_test_patch": {"format": "unified_diff", "content": "public patch"},
+                "hidden_test_patch": {"format": "unified_diff", "content": "hidden patch"},
+                "baseline": {"commands": [{"argv": ["cargo", "test", "--lib"]}]},
+                "public": {"commands": [{"argv": ["cargo", "test", "--lib"]}]},
+                "hidden": {"commands": [{"argv": ["cargo", "test", "--tests"]}]}
             }
-        ]
-    })
-}
-
-fn valid_result() -> Value {
-    json!({
-        "schema_version": "evaluation.result/v5",
-        "run_id": "public-representative-20260710",
-        "status": "completed",
-        "evaluation_passed": false,
-        "summary": {
-            "task_count": 1,
-            "scored_task_count": 1,
-            "agent_completed_count": 1,
-            "tests_passed_count": 0,
-            "evaluation_passed_count": 0,
-            "blocked_count": 0,
-            "task_success_rate_basis_points": 0,
-            "meets_core_task_success_threshold": false
-        },
-        "tasks": [
-            {
-                "task_id": "sqlfluff__sqlfluff-2419",
-                "capabilities": ["single_file_fix", "python", "required_verification"],
-                "status": "completed",
-                "stages": {
-                    "baseline": {"status": "passed"},
-                    "agent": {"status": "passed"},
-                    "public": {"status": "failed"},
-                    "hidden": {"status": "passed"}
-                },
-                "agent_completed": true,
-                "tests_passed": false,
-                "evaluation_passed": false,
-                "evidence": {
-                    "workspace_change_count": 1,
-                    "patch_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "tool_calls": 2,
-                    "model_turns": 2,
-                    "approval_count": 0,
-                    "plan_update_count": 1,
-                    "plan_completed": true,
-                    "invalid_tool_call_count": 0,
-                    "repeated_tool_call_count": 0,
-                    "repair_attempt_count": 0,
-                    "completion_rejection_count": 0,
-                    "compaction_count": 0,
-                    "verification_required_command_count": 1,
-                    "verification_satisfied_command_count": 1,
-                    "provider_attempt_count": 2,
-                    "provider_retry_count": 0,
-                    "input_tokens": 100,
-                    "output_tokens": 20,
-                    "cached_input_tokens": 0,
-                    "reasoning_tokens": 0,
-                    "total_tokens": 120,
-                    "provider_latency_ms": 500,
-                    "agent_duration_ms": 700,
-                    "smoke_command_satisfied": true,
-                    "strict_sandbox_command_count": 3,
-                    "local_process_fallback_count": 0,
-                    "local_process_fallback_unknown_count": 0
-                }
-            }
-        ]
-    })
-}
-
-fn valid_evidence() -> Value {
-    let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    json!({
-        "schema_version": "evaluation.evidence/v1",
-        "run_id": "public-representative-20260710",
-        "manifest_digest": digest,
-        "task_selection_digest": "sha256:bb1808f38961b3a490cc4dea9275c1b6068760461d4530de79ba8f64e417dfce",
-        "denominator_task_count": 1,
-        "tasks": [
-            {
-                "task_id": "sqlfluff__sqlfluff-2419",
-                "source_tree_digest": digest,
-                "source_commit": IMMUTABLE_COMMIT,
-                "allowed_paths_digest": digest,
-                "changed_paths_digest": digest,
-                "allowlist": "passed",
-                "smoke": {
-                    "expectation_known": true,
-                    "expected_scope_digests": [digest],
-                    "observed_scope_digests": [digest],
-                    "required_scopes_satisfied": "passed"
-                },
-                "baseline": {
-                    "expectation_known": true,
-                    "expected_scope_digests": [digest],
-                    "observed_scope_digests": [digest],
-                    "required_scopes_satisfied": "passed"
-                },
-                "public": {
-                    "expectation_known": true,
-                    "expected_scope_digests": [digest],
-                    "observed_scope_digests": [digest],
-                    "required_scopes_satisfied": "passed"
-                },
-                "hidden": {
-                    "expectation_known": true,
-                    "expected_scope_digests": [digest],
-                    "observed_scope_digests": [digest],
-                    "required_scopes_satisfied": "passed"
-                },
-                "trace_digest": digest,
-                "patch_digest": digest,
-                "local_process_fallback_count": 0,
-                "local_process_fallback_unknown_count": 0
-            }
-        ]
+        }]
     })
 }
 
 fn parse_manifest(value: &Value) -> Result<EvaluationManifest, EvaluationError> {
     EvaluationManifest::from_json_str(
-        &serde_json::to_string(value).expect("serialize manifest fixture"),
+        &serde_json::to_string(value).expect("manifest JSON"),
         env!("CARGO_MANIFEST_DIR"),
     )
 }
 
-fn parse_result(value: &Value) -> Result<EvaluationResult, EvaluationError> {
-    EvaluationResult::from_json_str(
-        &serde_json::to_string(value).expect("serialize result fixture"),
+fn stages(agent: StageResult, public: StageResult, hidden: StageResult) -> EvaluationStageResults {
+    EvaluationStageResults {
+        baseline: StageResult {
+            status: StageStatus::Passed,
+            blocker: None,
+        },
+        agent,
+        public,
+        hidden,
+    }
+}
+
+fn passed_stage() -> StageResult {
+    StageResult {
+        status: StageStatus::Passed,
+        blocker: None,
+    }
+}
+
+fn passed_trial(trial: u32) -> EvaluationTrialResult {
+    EvaluationTrialResult {
+        trial,
+        status: EvaluationStatus::Completed,
+        blocker: None,
+        stages: stages(passed_stage(), passed_stage(), passed_stage()),
+        agent_completed: true,
+        tests_passed: true,
+        evaluation_passed: true,
+        evidence: EvaluationEvidenceSummary {
+            patch_digest: Some(DIGEST.to_string()),
+            smoke_command_satisfied: true,
+            strict_sandbox_command_count: 4,
+            model_turns: trial + 1,
+            tool_calls: trial + 2,
+            agent_duration_ms: u64::from(trial) * 100,
+            ..EvaluationEvidenceSummary::default()
+        },
+    }
+}
+
+fn failed_trial(trial: u32) -> EvaluationTrialResult {
+    EvaluationTrialResult {
+        trial,
+        status: EvaluationStatus::Failed,
+        blocker: None,
+        stages: stages(
+            passed_stage(),
+            StageResult {
+                status: StageStatus::Failed,
+                blocker: None,
+            },
+            passed_stage(),
+        ),
+        agent_completed: true,
+        tests_passed: false,
+        evaluation_passed: false,
+        evidence: EvaluationEvidenceSummary {
+            model_turns: 2,
+            tool_calls: 3,
+            agent_duration_ms: 100,
+            ..EvaluationEvidenceSummary::default()
+        },
+    }
+}
+
+fn blocked_trial(trial: u32) -> EvaluationTrialResult {
+    let blocker = EvaluationBlocker {
+        kind: BlockerKind::Network,
+        message: "provider unavailable".to_string(),
+    };
+    EvaluationTrialResult {
+        trial,
+        status: EvaluationStatus::Blocked,
+        blocker: Some(blocker.clone()),
+        stages: EvaluationStageResults {
+            baseline: StageResult {
+                status: StageStatus::Skipped,
+                blocker: None,
+            },
+            agent: StageResult {
+                status: StageStatus::Blocked,
+                blocker: Some(blocker),
+            },
+            public: StageResult {
+                status: StageStatus::Skipped,
+                blocker: None,
+            },
+            hidden: StageResult {
+                status: StageStatus::Skipped,
+                blocker: None,
+            },
+        },
+        agent_completed: false,
+        tests_passed: false,
+        evaluation_passed: false,
+        evidence: EvaluationEvidenceSummary::default(),
+    }
+}
+
+fn task_result(trials: Vec<EvaluationTrialResult>) -> EvaluationTaskResult {
+    EvaluationTaskResult::from_trials(
+        TaskId::new("representative-task").expect("task id"),
+        vec![EvaluationCapability::RequiredVerification],
+        vec![requirement("workspace_read")],
+        trials,
     )
 }
 
-#[test]
-fn evaluation_evidence_contract_binds_a_fixed_safe_task_set() {
-    let evidence = EvaluationEvidence::from_json_str(
-        &serde_json::to_string(&valid_evidence()).expect("serialize evidence fixture"),
-    )
-    .expect("valid evidence");
+fn result_for(task: EvaluationTaskResult, trials_per_task: u32) -> EvaluationResult {
+    let status = task.status;
+    let blocker = task.blocker.clone();
+    let evaluation_passed = task.evaluation_passed;
+    let tasks = vec![task];
+    EvaluationResult {
+        schema_version: EvaluationResultSchemaVersion::V6,
+        run_id: RunId::new("run-1").expect("run id"),
+        status,
+        blocker,
+        evaluation_passed,
+        summary: EvaluationRunSummary::from_tasks(&tasks, trials_per_task),
+        tasks,
+    }
+}
 
-    assert_eq!(evidence.denominator_task_count, 1);
-    assert_eq!(evidence.tasks.len(), 1);
+fn empty_scope() -> EvaluationScopeEvidence {
+    EvaluationScopeEvidence {
+        expectation_known: true,
+        expected_scope_digests: Vec::new(),
+        observed_scope_digests: Vec::new(),
+        required_scopes_satisfied: EvidenceVerdict::Passed,
+    }
+}
 
-    let mut forged_denominator = valid_evidence();
-    forged_denominator["denominator_task_count"] = json!(0);
-    let error = EvaluationEvidence::from_json_str(
-        &serde_json::to_string(&forged_denominator).expect("serialize forged evidence"),
-    )
-    .expect_err("denominator must stay bound to the selected tasks");
-    assert!(error.to_string().contains("denominator_task_count"));
+fn trial_evidence(trial: &EvaluationTrialResult, complete: bool) -> EvaluationTrialEvidence {
+    EvaluationTrialEvidence {
+        trial: trial.trial,
+        changed_paths_digest: complete.then(|| DIGEST.to_string()),
+        allowlist: if complete {
+            EvidenceVerdict::Passed
+        } else {
+            EvidenceVerdict::Unknown
+        },
+        smoke: empty_scope(),
+        baseline: empty_scope(),
+        public: empty_scope(),
+        hidden: empty_scope(),
+        trace_digest: complete.then(|| DIGEST.to_string()),
+        patch_digest: trial.evidence.patch_digest.clone(),
+        prompt_structure: complete.then(|| EvaluationPromptStructure {
+            contract: "evaluation.agent_prompt/v1".to_string(),
+            model_message_roles: vec!["developer".to_string(), "user".to_string()],
+            section_kinds: vec!["task_instructions".to_string()],
+            allowed_path_count: 1,
+            resolved_tool_count: 1,
+            smoke_command_count: 0,
+            project_instructions_fingerprint: None,
+        }),
+        prompt_fingerprint: complete.then(|| DIGEST.to_string()),
+        tool_schema_fingerprint: complete.then(|| DIGEST.to_string()),
+        provider: complete.then(|| EvaluationProviderEvidence {
+            provider_fingerprint: DIGEST.to_string(),
+            model_fingerprint: DIGEST.to_string(),
+            negotiation_fingerprint: Some(DIGEST.to_string()),
+            api_protocol: Some("responses".to_string()),
+            protocol_contract_fingerprint: Some(DIGEST.to_string()),
+            capability_metadata_fingerprint: Some(DIGEST.to_string()),
+        }),
+        local_process_fallback_count: trial.evidence.local_process_fallback_count,
+        local_process_fallback_unknown_count: trial.evidence.local_process_fallback_unknown_count,
+    }
+}
 
-    let mut forged_selection = valid_evidence();
-    forged_selection["task_selection_digest"] =
-        json!("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let error = EvaluationEvidence::from_json_str(
-        &serde_json::to_string(&forged_selection).expect("serialize forged selection"),
-    )
-    .expect_err("task selection digest must bind the selected task identities");
-    assert!(error.to_string().contains("task_selection_digest"));
-
-    let mut inconsistent_scope = valid_evidence();
-    inconsistent_scope["tasks"][0]["smoke"]["expectation_known"] = json!(false);
-    let error = EvaluationEvidence::from_json_str(
-        &serde_json::to_string(&inconsistent_scope).expect("serialize inconsistent scope"),
-    )
-    .expect_err("scope verdict must match known expected and observed digests");
-    assert!(error.to_string().contains("required_scopes_satisfied"));
-
-    let mut unsafe_extension = valid_evidence();
-    unsafe_extension["tasks"][0]["raw_arguments"] = json!("secret");
-    let error = EvaluationEvidence::from_json_str(
-        &serde_json::to_string(&unsafe_extension).expect("serialize unsafe evidence"),
-    )
-    .expect_err("unknown raw fields must fail closed");
-    assert!(error.to_string().contains("unknown field"));
+fn evidence_for(result: &EvaluationResult, complete: bool) -> EvaluationEvidence {
+    let task = &result.tasks[0];
+    EvaluationEvidence {
+        schema_version: EvaluationEvidenceSchemaVersion::V2,
+        run_id: result.run_id.clone(),
+        manifest_digest: DIGEST.to_string(),
+        task_selection_digest: task_selection_digest(std::slice::from_ref(&task.task_id)),
+        denominator_task_count: 1,
+        trials_per_task: result.summary.trials_per_task,
+        denominator_trial_count: result.summary.trial_count,
+        tasks: vec![EvaluationTaskEvidence {
+            task_id: task.task_id.clone(),
+            source_tree_digest: complete.then(|| DIGEST.to_string()),
+            source_commit: None,
+            allowed_paths_digest: DIGEST.to_string(),
+            tool_capability_requirements_digest: DIGEST.to_string(),
+            trials: task
+                .trials
+                .iter()
+                .map(|trial| trial_evidence(trial, complete))
+                .collect(),
+        }],
+    }
 }
 
 #[test]
-fn evaluation_evidence_is_bound_to_the_stable_result() {
-    let result = parse_result(&valid_result()).expect("valid result");
-    let evidence = EvaluationEvidence::from_json_str(
-        &serde_json::to_string(&valid_evidence()).expect("serialize evidence fixture"),
-    )
-    .expect("valid evidence");
-
-    evidence
-        .validate_against_result(&result)
-        .expect("matching result and evidence");
-
-    let mut mismatched = valid_evidence();
-    mismatched["tasks"][0]["task_id"] = json!("different_task");
-    mismatched["task_selection_digest"] =
-        json!("sha256:9c8c5be48cd2a67107bb720d569dd9c7b541ddb0d24892666c8eb7531e1ef263");
-    let mismatched = EvaluationEvidence::from_json_str(
-        &serde_json::to_string(&mismatched).expect("serialize mismatched evidence"),
-    )
-    .expect("structurally valid evidence");
-    let error = mismatched
-        .validate_against_result(&result)
-        .expect_err("task identities must match");
-    assert!(error.to_string().contains("task"));
+fn task_set_v5_uses_explicit_versioned_capability_requirements() {
+    let manifest = parse_manifest(&valid_manifest()).expect("valid v5 manifest");
+    assert_eq!(manifest.task_set().trial_count, 2);
+    let projection = manifest.task_set().tasks[0].agent_projection();
+    assert_eq!(projection.required_tool_capabilities.len(), 3);
+    assert_eq!(
+        projection.required_tool_capabilities[0].capability.as_str(),
+        "workspace_read"
+    );
+    let serialized = serde_json::to_string(&projection).expect("projection JSON");
+    assert!(!serialized.contains("allowed_tools"));
 }
 
 #[test]
-fn task_set_rejects_unknown_fields_at_every_schema_boundary() {
-    let mut top_level = valid_manifest();
-    top_level["legacy_mode"] = json!(true);
-    let error = parse_manifest(&top_level).expect_err("reject unknown top-level field");
-    assert!(error.to_string().contains("unknown field"));
-
-    let mut nested = valid_manifest();
-    nested["tasks"][0]["agent"]["hidden_hint"] = json!("do not expose");
-    let error = parse_manifest(&nested).expect_err("reject unknown nested field");
-    assert!(error.to_string().contains("unknown field"));
-
-    let mut workspace_source = valid_manifest();
-    workspace_source["tasks"][0]["workspace"]["source"]["branch"] = json!("main");
-    let error = parse_manifest(&workspace_source).expect_err("reject unknown source field");
-    assert!(error.to_string().contains("unknown field"));
-}
-
-#[test]
-fn result_rejects_unknown_fields() {
-    let mut result = valid_result();
-    result["tasks"][0]["legacy_status"] = json!("success");
-
-    let error = parse_result(&result).expect_err("reject unknown result field");
-    assert!(error.to_string().contains("unknown field"));
-
-    let mut stage = valid_result();
-    stage["tasks"][0]["stages"]["public"]["exit_code"] = json!(1);
-    let error = parse_result(&stage).expect_err("reject unknown stage result field");
-    assert!(error.to_string().contains("unknown field"));
-}
-
-#[test]
-fn legacy_task_set_versions_and_legacy_task_fields_are_rejected() {
-    let mut manifest = valid_manifest();
-    manifest["schema_version"] = json!("evaluation.task_set/v1");
+fn old_schema_and_tool_name_artifacts_fail_closed() {
+    let mut old = valid_manifest();
+    old["schema_version"] = json!("evaluation.task_set/v4");
     assert!(matches!(
-        parse_manifest(&manifest),
+        parse_manifest(&old),
         Err(EvaluationError::UnsupportedSchemaVersion { .. })
-    ));
-
-    manifest["schema_version"] = json!("evaluation.task_set/v2");
-    assert!(matches!(
-        parse_manifest(&manifest),
-        Err(EvaluationError::UnsupportedSchemaVersion { .. })
-    ));
-
-    let mut result = valid_result();
-    result["schema_version"] = json!("evaluation.result/v1");
-    let error = parse_result(&result).expect_err("reject result v1");
-    assert!(matches!(
-        error,
-        EvaluationError::UnsupportedSchemaVersion { .. }
     ));
 
     let mut legacy_field = valid_manifest();
-    legacy_field["tasks"][0]["user_task"] = json!("legacy prompt field");
-    let error = parse_manifest(&legacy_field).expect_err("reject legacy task field");
+    legacy_field["tasks"][0]["agent"]["allowed_tools"] = json!(["read"]);
+    let error = parse_manifest(&legacy_field).expect_err("legacy field must be rejected");
     assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
-fn duplicate_task_ids_are_rejected() {
-    let mut manifest = valid_manifest();
-    let duplicate = manifest["tasks"][0].clone();
-    manifest["tasks"]
-        .as_array_mut()
-        .expect("tasks array")
-        .push(duplicate);
-
-    let error = parse_manifest(&manifest).expect_err("reject duplicate task ids");
-    assert!(matches!(error, EvaluationError::DuplicateTaskId(_)));
-}
-
-#[test]
-fn task_and_run_ids_use_strict_portable_syntax() {
-    for invalid in [
-        "",
-        " has-space",
-        "contains space",
-        "contains/slash",
-        "contains:colon",
-        ".leading-dot",
-        "trailing-dot.",
-    ] {
+fn trial_count_and_capability_versions_are_bounded() {
+    for invalid in [0, 33] {
         let mut manifest = valid_manifest();
-        manifest["tasks"][0]["task_id"] = json!(invalid);
-        assert!(parse_manifest(&manifest).is_err(), "task id {invalid:?}");
-
-        let mut result = valid_result();
-        result["run_id"] = json!(invalid);
-        assert!(parse_result(&result).is_err(), "run id {invalid:?}");
+        manifest["trial_count"] = json!(invalid);
+        assert!(parse_manifest(&manifest).is_err());
     }
+    let mut zero_version = valid_manifest();
+    zero_version["tasks"][0]["agent"]["required_tool_capabilities"][0]["minimum_version"] =
+        json!(0);
+    assert!(parse_manifest(&zero_version).is_err());
 }
 
 #[test]
-fn local_workspace_paths_are_manifest_relative_and_lexically_safe() {
-    let temp = tempfile::tempdir().expect("create manifest directory");
+fn duplicate_capability_names_are_rejected_even_with_different_versions() {
     let mut manifest = valid_manifest();
-    manifest["tasks"][0]["workspace"]["source"] = json!({
-        "type": "local",
-        "path": "fixtures/sqlfluff"
-    });
-
-    let loaded = EvaluationManifest::from_json_str(
-        &serde_json::to_string(&manifest).expect("serialize manifest"),
-        temp.path(),
-    )
-    .expect("parse local workspace");
-    let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
-    let plan = loaded
-        .workspace_plan(&task_id)
-        .expect("build workspace plan");
-
-    let expected = std::fs::canonicalize(temp.path())
-        .expect("canonical manifest directory")
-        .join("fixtures")
-        .join("sqlfluff");
-    assert_eq!(
-        plan.source,
-        PlannedWorkspaceSource::Local { path: expected }
-    );
-
-    for invalid in [
-        "../repo",
-        "fixtures/../repo",
-        "/absolute/repo",
-        "C:/absolute/repo",
-        "fixtures/repo:stream",
-        r"fixtures\repo",
-        "fixtures//repo",
-    ] {
-        let mut invalid_manifest = manifest.clone();
-        invalid_manifest["tasks"][0]["workspace"]["source"]["path"] = json!(invalid);
-        assert!(
-            EvaluationManifest::from_json_str(
-                &serde_json::to_string(&invalid_manifest).expect("serialize invalid manifest"),
-                temp.path(),
-            )
-            .is_err(),
-            "workspace path {invalid:?}"
-        );
-    }
+    manifest["tasks"][0]["agent"]["required_tool_capabilities"] = json!([
+        {"capability": "workspace_read", "minimum_version": 1},
+        {"capability": "workspace_read", "minimum_version": 2}
+    ]);
+    let error = parse_manifest(&manifest).expect_err("duplicate capabilities");
+    assert!(error.to_string().contains("duplicate capability"));
 }
 
 #[test]
-fn task_paths_reject_parent_absolute_ads_and_backslash_forms() {
-    for invalid in [
-        "../secret.txt",
-        "src/../secret.txt",
-        "/secret.txt",
-        "C:/secret.txt",
-        "src/file.txt:stream",
-        r"src\file.txt",
-    ] {
+fn capability_names_are_syntax_checked_without_a_local_whitelist() {
+    let mut manifest = valid_manifest();
+    manifest["tasks"][0]["agent"]["required_tool_capabilities"][0]["capability"] =
+        json!("future_registry_capability");
+    parse_manifest(&manifest).expect("registry owns semantic capability validation");
+
+    manifest["tasks"][0]["agent"]["required_tool_capabilities"][0]["capability"] =
+        json!("Invalid-Capability");
+    assert!(parse_manifest(&manifest).is_err());
+}
+
+#[test]
+fn command_and_path_trust_boundaries_remain_fail_closed() {
+    for invalid in ["../secret", "C:/secret", "src\\secret", "src/file:stream"] {
         let mut manifest = valid_manifest();
         manifest["tasks"][0]["agent"]["allowed_paths"] = json!([invalid]);
-        assert!(
-            parse_manifest(&manifest).is_err(),
-            "allowed path {invalid:?}"
-        );
+        assert!(parse_manifest(&manifest).is_err(), "{invalid}");
     }
+    let mut shell = valid_manifest();
+    shell["tasks"][0]["evaluator"]["public"]["commands"][0]["argv"] =
+        json!(["sh", "-c", "cargo test"]);
+    assert!(parse_manifest(&shell).is_err());
 }
 
 #[test]
-fn commands_require_nonempty_argv_arrays_and_reject_shell_string_wrappers() {
-    let mut raw_string = valid_manifest();
-    raw_string["tasks"][0]["evaluator"]["public"]["commands"] = json!(["cargo test"]);
-    assert!(parse_manifest(&raw_string).is_err());
+fn result_v6_derives_blocked_excluding_agent_denominators() {
+    let task = task_result(vec![passed_trial(1), blocked_trial(2)]);
+    assert_eq!(task.summary.completed_trial_count, 1);
+    assert_eq!(task.summary.failed_trial_count, 0);
+    assert_eq!(task.summary.blocked_trial_count, 1);
+    assert_eq!(task.summary.agent_scored_trial_count, 1);
+    assert_eq!(task.summary.agent_completed_count, 1);
+    assert_eq!(task.summary.agent_failed_count, 0);
 
-    let mut empty_argv = valid_manifest();
-    empty_argv["tasks"][0]["evaluator"]["public"]["commands"] = json!([{"argv": []}]);
-    assert!(parse_manifest(&empty_argv).is_err());
+    let result = result_for(task, 2);
+    result.validate().expect("valid blocked-denominator result");
+    assert_eq!(result.summary.blocked_trial_count, 1);
+    assert_eq!(result.summary.agent_scored_trial_count, 1);
+}
 
-    for argv in [
-        json!(["sh", "-c", "cargo test"]),
-        json!(["bash", "-c", "cargo test"]),
-        json!(["cmd.exe", "/C", "cargo test"]),
-        json!(["powershell.exe", "-Command", "cargo test"]),
+#[test]
+fn single_trial_is_unstable_and_multi_trial_statistics_are_finite() {
+    let single = task_result(vec![failed_trial(1)]);
+    assert!(!single.stability.stable);
+    let single_result = result_for(single, 1);
+    single_result.validate().expect("single trial result");
+
+    let multiple = task_result(vec![passed_trial(1), passed_trial(2)]);
+    assert!(multiple.stability.stable);
+    for statistics in [
+        multiple.stability.model_turns.as_ref(),
+        multiple.stability.tool_calls.as_ref(),
+        multiple.stability.agent_duration_ms.as_ref(),
     ] {
-        let mut shell = valid_manifest();
-        shell["tasks"][0]["evaluator"]["public"]["commands"] = json!([{"argv": argv}]);
-        assert!(parse_manifest(&shell).is_err(), "shell argv {argv}");
+        let statistics = statistics.expect("finite statistics");
+        assert!(statistics.mean.is_finite());
+        assert!(statistics.population_variance.is_finite());
+        assert_eq!(statistics.sample_count, 2);
     }
-
-    parse_manifest(&valid_manifest()).expect("direct argv commands are valid");
+    result_for(multiple, 2)
+        .validate()
+        .expect("multi trial result");
 }
 
 #[test]
-fn remote_git_workspace_requires_remote_url_and_full_immutable_commit() {
-    for invalid_commit in [
-        "main",
-        "v1.2.3",
-        "f1dba0e",
-        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-    ] {
-        let mut manifest = valid_manifest();
-        manifest["tasks"][0]["workspace"]["source"]["commit"] = json!(invalid_commit);
-        assert!(
-            parse_manifest(&manifest).is_err(),
-            "commit {invalid_commit:?}"
-        );
-    }
+fn result_v5_and_evidence_v1_are_typed_rejections() {
+    let result = result_for(task_result(vec![failed_trial(1)]), 1);
+    let mut value = serde_json::to_value(result).expect("result JSON");
+    value["schema_version"] = json!("evaluation.result/v5");
+    assert!(matches!(
+        EvaluationResult::from_json_str(&serde_json::to_string(&value).expect("JSON")),
+        Err(EvaluationError::UnsupportedSchemaVersion { .. })
+    ));
 
-    for invalid_repo in ["../sqlfluff", "C:/repos/sqlfluff", "file:///tmp/sqlfluff"] {
-        let mut manifest = valid_manifest();
-        manifest["tasks"][0]["workspace"]["source"]["repository"] = json!(invalid_repo);
-        assert!(parse_manifest(&manifest).is_err(), "repo {invalid_repo:?}");
-    }
-
-    parse_manifest(&valid_manifest()).expect("full commit is immutable");
+    let result = result_for(task_result(vec![failed_trial(1)]), 1);
+    let mut value = serde_json::to_value(evidence_for(&result, false)).expect("evidence JSON");
+    value["schema_version"] = json!("evaluation.evidence/v1");
+    assert!(matches!(
+        EvaluationEvidence::from_json_str(&serde_json::to_string(&value).expect("JSON")),
+        Err(EvaluationError::UnsupportedSchemaVersion { .. })
+    ));
 }
 
 #[test]
-fn evaluation_commands_default_to_denied_network_and_allow_explicit_opt_in() {
-    let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
-    let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
-    let plan = manifest.workspace_plan(&task_id).expect("build plan");
-    let default_command =
-        serde_json::to_value(&plan.public.commands[0]).expect("serialize command");
-    assert_eq!(default_command.get("network_access"), None);
+fn evidence_v2_binds_every_trial_and_safe_reproducibility_identity() {
+    let result = result_for(task_result(vec![passed_trial(1), passed_trial(2)]), 2);
+    let evidence = evidence_for(&result, true);
+    evidence
+        .validate_against_result(&result)
+        .expect("complete per-trial evidence");
 
-    let mut explicit = valid_manifest();
-    explicit["tasks"][0]["workspace"]["setup_commands"][0]["network_access"] = json!("allowed");
-    let manifest = parse_manifest(&explicit).expect("parse explicit network command");
-    let plan = manifest
-        .workspace_plan(&task_id)
-        .expect("build explicit plan");
-    let setup = serde_json::to_value(&plan.agent.setup_commands[0]).expect("serialize setup");
-    assert_eq!(setup["network_access"], "allowed");
+    let mut missing_provider = evidence.clone();
+    missing_provider.tasks[0].trials[1].provider = None;
+    let error = missing_provider
+        .validate_against_result(&result)
+        .expect_err("passed trial requires provider negotiation identity");
+    assert!(error.to_string().contains("trial 2"));
+
+    let mut mismatched_trial = evidence;
+    mismatched_trial.tasks[0].trials[1].trial = 3;
+    assert!(mismatched_trial.validate().is_err());
 }
 
 #[test]
-fn evaluation_rejects_unimplemented_tool_namespaces() {
-    for unsupported in ["plugin.server.tool", "mcp.server.tool", "unknown"] {
-        let mut manifest = valid_manifest();
-        manifest["tasks"][0]["agent"]["allowed_tools"] = json!([unsupported]);
-        let error = parse_manifest(&manifest).expect_err("reject unsupported tool");
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported evaluation tool name"),
-            "{unsupported}: {error}"
-        );
-    }
+fn evidence_rejects_partial_negotiation_and_unknown_raw_fields() {
+    let result = result_for(task_result(vec![failed_trial(1)]), 1);
+    let mut evidence = evidence_for(&result, true);
+    evidence.tasks[0].trials[0]
+        .provider
+        .as_mut()
+        .expect("provider")
+        .api_protocol = None;
+    assert!(evidence.validate().is_err());
+
+    let evidence = evidence_for(&result, false);
+    let mut value = serde_json::to_value(evidence).expect("evidence JSON");
+    value["tasks"][0]["trials"][0]["raw_prompt"] = json!("secret");
+    let error =
+        EvaluationEvidence::from_json_str(&serde_json::to_string(&value).expect("evidence JSON"))
+            .expect_err("unknown raw evidence field");
+    assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
-fn smoke_commands_require_the_command_tool() {
-    let mut manifest = valid_manifest();
-    manifest["tasks"][0]["agent"]["allowed_tools"] = json!(["read"]);
-    let error = parse_manifest(&manifest).expect_err("smoke command without command tool");
-    assert!(
-        error
-            .to_string()
-            .contains("agent.smoke_commands requires command"),
-        "{error}"
-    );
-}
-
-#[test]
-fn command_timeout_has_a_bounded_upper_limit() {
-    let mut manifest = valid_manifest();
-    manifest["tasks"][0]["agent"]["smoke_commands"][0]["timeout_seconds"] = json!(3_601);
-    let error = parse_manifest(&manifest).expect_err("reject excessive command timeout");
-    assert!(
-        error.to_string().contains("must not exceed 3600"),
-        "{error}"
-    );
-}
-
-#[test]
-fn workspace_plan_has_typed_isolated_baseline_agent_public_and_hidden_stages() {
-    let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
-    let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
-    let plan = manifest.workspace_plan(&task_id).expect("build plan");
-
-    assert_eq!(plan.baseline.stage, EvaluationStage::Baseline);
-    assert_eq!(plan.baseline.seed, WorkspaceSeed::TaskSource);
-    assert_eq!(plan.baseline.expectation, CommandExpectation::Failure);
-    assert_eq!(plan.agent.stage, EvaluationStage::Agent);
-    assert_eq!(plan.agent.seed, WorkspaceSeed::TaskSource);
-    assert_eq!(plan.public.stage, EvaluationStage::Public);
-    assert_eq!(plan.public.seed, WorkspaceSeed::AgentOutput);
-    assert_eq!(plan.public.expectation, CommandExpectation::Success);
-    assert_eq!(plan.hidden.stage, EvaluationStage::Hidden);
-    assert_eq!(plan.hidden.seed, WorkspaceSeed::AgentOutput);
-    assert_eq!(plan.hidden.expectation, CommandExpectation::Success);
-    assert_eq!(plan.baseline.setup_commands.len(), 1);
-    assert_eq!(plan.agent.setup_commands.len(), 1);
-    assert_eq!(plan.public.setup_commands.len(), 1);
-    assert_eq!(plan.hidden.setup_commands.len(), 1);
-    assert_eq!(plan.baseline.commands.len(), 1);
-    assert_eq!(plan.public.commands.len(), 1);
-    assert_eq!(plan.hidden.commands.len(), 1);
-}
-
-#[test]
-fn evaluator_only_test_patches_never_enter_agent_visible_projection() {
-    let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
-    let task = &manifest.task_set().tasks[0];
-    let projection = task.agent_projection();
-    let projection_json = serde_json::to_string(&projection).expect("serialize projection");
-
-    assert!(!projection_json.contains(PUBLIC_TEST_PATCH_MARKER));
-    assert!(!projection_json.contains(HIDDEN_TEST_PATCH_MARKER));
-    assert!(!projection_json.contains("test_patch"));
-    assert!(!projection_json.contains("evaluator"));
-
-    let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
-    let plan = manifest.workspace_plan(&task_id).expect("build plan");
-    let agent_plan_json = serde_json::to_string(&plan.agent).expect("serialize agent plan");
-    assert!(!agent_plan_json.contains(PUBLIC_TEST_PATCH_MARKER));
-    assert!(!agent_plan_json.contains(HIDDEN_TEST_PATCH_MARKER));
-    assert!(
-        plan.baseline
-            .test_patch
-            .as_ref()
-            .is_some_and(|patch| patch.content() == PUBLIC_TEST_PATCH_MARKER)
-    );
-    assert!(
-        plan.public
-            .test_patch
-            .as_ref()
-            .is_some_and(|patch| patch.content() == PUBLIC_TEST_PATCH_MARKER)
-    );
-    assert!(
-        plan.hidden
-            .test_patch
-            .as_ref()
-            .is_some_and(|patch| patch.content() == HIDDEN_TEST_PATCH_MARKER)
-    );
-}
-
-#[test]
-fn manifest_rejects_duplicate_public_and_hidden_verification_evidence() {
-    let mut value = valid_manifest();
-    value["tasks"][0]["evaluator"]["hidden_test_patch"] =
-        value["tasks"][0]["evaluator"]["public_test_patch"].clone();
-    value["tasks"][0]["evaluator"]["hidden"] = value["tasks"][0]["evaluator"]["public"].clone();
-
-    let error = parse_manifest(&value).expect_err("duplicate evidence must be rejected");
-    assert!(error.to_string().contains("independent public and hidden"));
-}
-
-#[test]
-fn manifest_rejects_verification_evidence_that_only_differs_in_execution_settings() {
-    for (field, setting) in [
-        ("timeout_seconds", json!(60)),
-        ("network_access", json!("allowed")),
-    ] {
-        let mut value = valid_manifest();
-        value["tasks"][0]["evaluator"]["hidden_test_patch"] =
-            value["tasks"][0]["evaluator"]["public_test_patch"].clone();
-        value["tasks"][0]["evaluator"]["hidden"]["commands"][0][field] = setting;
-
-        let error =
-            parse_manifest(&value).expect_err("execution-setting-only evidence must be rejected");
-        assert!(error.to_string().contains("independent public and hidden"));
-    }
-}
-
-#[test]
-fn manifest_accepts_independent_patch_or_command_scope_evidence() {
-    let mut different_patch = valid_manifest();
-    different_patch["tasks"][0]["evaluator"]["hidden"]["commands"] =
-        different_patch["tasks"][0]["evaluator"]["public"]["commands"].clone();
-    parse_manifest(&different_patch).expect("different patches are independent evidence");
-
-    let mut different_command_scope = valid_manifest();
-    different_command_scope["tasks"][0]["evaluator"]["hidden_test_patch"] =
-        different_command_scope["tasks"][0]["evaluator"]["public_test_patch"].clone();
-    different_command_scope["tasks"][0]["evaluator"]["hidden"]["commands"][0]["argv"] =
-        json!(["cargo", "test", "--all-targets"]);
-    parse_manifest(&different_command_scope)
-        .expect("different command argv is independent evidence");
-}
-
-#[test]
-fn agent_completion_test_success_and_evaluation_success_remain_separate() {
-    let result = parse_result(&valid_result()).expect("parse result");
-    let task = &result.tasks[0];
-
-    assert_eq!(result.status, EvaluationStatus::Completed);
-    assert_eq!(task.status, EvaluationStatus::Completed);
-    assert_eq!(task.stages.agent.status, StageStatus::Passed);
-    assert!(task.agent_completed);
-    assert!(!task.tests_passed);
-    assert!(!task.evaluation_passed);
-    assert!(!result.evaluation_passed);
-
-    let mut invalid = valid_result();
-    invalid["tasks"][0]["evaluation_passed"] = json!(true);
-    invalid["evaluation_passed"] = json!(true);
-    let error = parse_result(&invalid).expect_err("evaluation pass requires agent and tests");
-    assert!(error.to_string().contains("evaluation_passed"));
-
-    let mut baseline_not_satisfied = valid_result();
-    baseline_not_satisfied["tasks"][0]["stages"]["baseline"]["status"] = json!("failed");
-    baseline_not_satisfied["tasks"][0]["stages"]["public"]["status"] = json!("passed");
-    baseline_not_satisfied["tasks"][0]["tests_passed"] = json!(true);
-    baseline_not_satisfied["tasks"][0]["evaluation_passed"] = json!(true);
-    baseline_not_satisfied["evaluation_passed"] = json!(true);
-    let error = parse_result(&baseline_not_satisfied)
-        .expect_err("evaluation pass requires a satisfied baseline contract");
-    assert!(error.to_string().contains("baseline"));
-}
-
-#[test]
-fn blocked_status_requires_a_typed_blocker() {
-    let mut blocked = valid_result();
-    blocked["status"] = json!("blocked");
-    blocked["evaluation_passed"] = json!(false);
-    blocked["tasks"][0]["status"] = json!("blocked");
-    blocked["tasks"][0]["stages"]["agent"] = json!({
-        "status": "blocked",
-        "blocker": {
-            "kind": "sandbox",
-            "message": "restricted-token sandbox is unavailable"
-        }
-    });
-    blocked["tasks"][0]["blocker"] = json!({
-        "kind": "sandbox",
-        "message": "restricted-token sandbox is unavailable"
-    });
-    blocked["blocker"] = json!({
-        "kind": "sandbox",
-        "message": "restricted-token sandbox is unavailable"
-    });
-    blocked["tasks"][0]["agent_completed"] = json!(false);
-    blocked["summary"]["scored_task_count"] = json!(1);
-    blocked["summary"]["agent_completed_count"] = json!(0);
-    blocked["summary"]["blocked_count"] = json!(1);
-
-    parse_result(&blocked).expect("typed blocker is valid");
-
-    blocked
-        .as_object_mut()
-        .expect("result object")
-        .remove("blocker");
-    let error = parse_result(&blocked).expect_err("blocked run needs blocker");
-    assert!(error.to_string().contains("blocker"));
-}
-
-#[test]
-fn public_representative_manifest_is_validated_by_the_crate() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("docs")
-        .join("evaluation")
-        .join("public-representative-task.json");
-    let manifest = EvaluationManifest::load(&path).expect("load public manifest");
-
-    let expected_sources = [
-        ("sqlfluff__sqlfluff-2419", None),
-        (
-            "receipt_calculator__multi_line_receipt",
-            Some("fixtures/receipt-calculator"),
-        ),
-        (
-            "rust_node_calculator__multi_line_total",
-            Some("fixtures/rust-node-calculator"),
-        ),
-        ("node_inventory__summary", Some("fixtures/node-inventory")),
-        (
-            "repository_context__billing_report",
-            Some("fixtures/repository-context"),
-        ),
-    ];
-    assert_eq!(manifest.task_set().tasks.len(), expected_sources.len());
-
-    for (task_id, expected_local_source) in expected_sources {
-        let task = manifest
-            .task_set()
-            .tasks
-            .iter()
-            .find(|task| task.task_id.as_str() == task_id)
-            .unwrap_or_else(|| panic!("expected task {task_id}"));
-        let projection = task.agent_projection();
-        let projection_value = serde_json::to_value(&projection).expect("serialize projection");
-        assert!(projection_value.get("capabilities").is_none());
-        assert!(projection_value.get("evaluator").is_none());
-        assert!(projection_value.get("test_patch").is_none());
-        let projection_json = serde_json::to_string(&projection).expect("serialize projection");
-        assert!(!projection_json.contains(PUBLIC_TEST_PATCH_MARKER));
-        assert!(!projection_json.contains(HIDDEN_TEST_PATCH_MARKER));
-
-        let plan = manifest
-            .workspace_plan(&task.task_id)
-            .unwrap_or_else(|error| panic!("build plan for {task_id}: {error}"));
-        match (expected_local_source, &plan.source) {
-            (Some(expected_path), PlannedWorkspaceSource::Local { path }) => {
-                assert_eq!(path, &manifest.manifest_dir().join(expected_path));
-            }
-            (None, PlannedWorkspaceSource::RemoteGit { .. }) => {}
-            (Some(expected_path), source) => {
-                panic!("task {task_id} expected local source {expected_path}, got {source:?}");
-            }
-            (None, source) => panic!("task {task_id} expected remote source, got {source:?}"),
-        }
-
-        let public_patch = plan.public.test_patch.as_ref().expect("public patch");
-        let hidden_patch = plan.hidden.test_patch.as_ref().expect("hidden patch");
-        assert_ne!(public_patch.content(), hidden_patch.content());
-        assert!(!plan.baseline.commands.is_empty());
-        assert!(!plan.public.commands.is_empty());
-        assert!(!plan.hidden.commands.is_empty());
-
-        if task_id == "receipt_calculator__multi_line_receipt" {
-            assert_eq!(
-                projection
-                    .allowed_paths
-                    .iter()
-                    .map(|path| path.as_str())
-                    .collect::<Vec<_>>(),
-                ["pricing.py", "receipt.py"]
-            );
-            assert_eq!(
-                projection.smoke_commands[0].argv.as_slice(),
-                ["python", "-B", "smoke_test.py"]
-            );
-            assert!(public_patch.content().contains("test_public_receipt.py"));
-            assert!(hidden_patch.content().contains("test_hidden_receipt.py"));
-        }
-
-        if task_id == "rust_node_calculator__multi_line_total" {
-            assert_eq!(projection.smoke_commands.len(), 2);
-            assert_eq!(
-                projection.smoke_commands[0].argv.as_slice(),
-                ["cargo", "test", "--locked", "--lib"]
-            );
-            assert_eq!(
-                projection.smoke_commands[1].argv.as_slice(),
-                ["node", "smoke_test.mjs"]
-            );
-        }
-    }
-}
-
-#[test]
-fn run_summary_reports_success_rate_without_weakening_evaluation_passed() {
-    let result = parse_result(&valid_result()).expect("parse result");
-
-    assert_eq!(result.summary.task_count, 1);
-    assert_eq!(result.summary.scored_task_count, 1);
-    assert_eq!(result.summary.agent_completed_count, 1);
-    assert_eq!(result.summary.tests_passed_count, 0);
-    assert_eq!(result.summary.evaluation_passed_count, 0);
-    assert_eq!(result.summary.task_success_rate_basis_points, 0);
-    assert!(!result.summary.meets_core_task_success_threshold);
-    assert!(!result.evaluation_passed);
-
-    let mut forged = valid_result();
-    forged["summary"]["task_success_rate_basis_points"] = json!(10_000);
-    forged["summary"]["meets_core_task_success_threshold"] = json!(true);
-    let error = parse_result(&forged).expect_err("summary must be derived from task results");
+fn summary_and_stability_cannot_be_forged() {
+    let result = result_for(task_result(vec![passed_trial(1), passed_trial(2)]), 2);
+    let mut value = serde_json::to_value(result).expect("result JSON");
+    value["summary"]["blocked_trial_count"] = json!(2);
+    let error =
+        EvaluationResult::from_json_str(&serde_json::to_string(&value).expect("result JSON"))
+            .expect_err("summary must be derived");
     assert!(error.to_string().contains("summary"));
-}
 
-#[test]
-fn evaluation_pass_requires_complete_local_process_fallback_observation() {
-    let mut unknown = valid_result();
-    unknown["tasks"][0]["stages"]["public"]["status"] = json!("passed");
-    unknown["tasks"][0]["tests_passed"] = json!(true);
-    unknown["tasks"][0]["evaluation_passed"] = json!(true);
-    unknown["tasks"][0]["evidence"]["local_process_fallback_unknown_count"] = json!(1);
-    unknown["summary"]["tests_passed_count"] = json!(1);
-    unknown["summary"]["evaluation_passed_count"] = json!(1);
-    unknown["summary"]["task_success_rate_basis_points"] = json!(10_000);
-    unknown["summary"]["meets_core_task_success_threshold"] = json!(true);
-    unknown["evaluation_passed"] = json!(true);
-
-    let error = parse_result(&unknown)
-        .expect_err("unknown fallback observation must not satisfy evaluation");
-    assert!(error.to_string().contains("fallback"));
-}
-
-#[test]
-fn task_capabilities_are_required_unique_and_evaluator_owned() {
-    let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
-    assert!(
-        manifest.task_set().tasks[0]
-            .capabilities
-            .contains(&singularity_evaluation::EvaluationCapability::RequiredVerification)
-    );
-    let projection = serde_json::to_value(manifest.task_set().tasks[0].agent_projection())
-        .expect("serialize projection");
-    assert!(projection.get("capabilities").is_none());
-
-    let mut missing = valid_manifest();
-    missing["tasks"][0]
-        .as_object_mut()
-        .expect("task object")
-        .remove("capabilities");
-    assert!(parse_manifest(&missing).is_err());
-
-    let mut duplicate = valid_manifest();
-    duplicate["tasks"][0]["capabilities"] = json!(["python", "python"]);
-    let error = parse_manifest(&duplicate).expect_err("duplicate capabilities fail closed");
-    assert!(error.to_string().contains("duplicates"));
-}
-
-#[test]
-fn manifest_path_resolution_uses_the_manifest_directory_not_process_cwd() {
-    let temp = tempfile::tempdir().expect("create temp directory");
-    let manifest_dir = temp.path().join("nested").join("manifests");
-    std::fs::create_dir_all(&manifest_dir).expect("create manifest directory");
-    let manifest_path = manifest_dir.join("task-set.json");
-    let mut manifest = valid_manifest();
-    manifest["tasks"][0]["workspace"]["source"] = json!({
-        "type": "local",
-        "path": "workspace/repo"
-    });
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
-    )
-    .expect("write manifest");
-
-    let loaded = EvaluationManifest::load(&manifest_path).expect("load manifest");
-    let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
-    let plan = loaded.workspace_plan(&task_id).expect("build plan");
-    let expected = std::fs::canonicalize(&manifest_dir)
-        .expect("canonical manifest dir")
-        .join("workspace")
-        .join("repo");
-
-    assert_eq!(
-        plan.source,
-        PlannedWorkspaceSource::Local { path: expected }
-    );
-}
-
-#[test]
-fn workspace_plan_source_is_remote_for_remote_git_tasks() {
-    let manifest = parse_manifest(&valid_manifest()).expect("parse manifest");
-    let task_id = TaskId::new("sqlfluff__sqlfluff-2419").expect("valid task id");
-    let plan = manifest.workspace_plan(&task_id).expect("build plan");
-
-    match plan.source {
-        PlannedWorkspaceSource::RemoteGit { repository, commit } => {
-            assert_eq!(
-                repository.as_str(),
-                "https://github.com/sqlfluff/sqlfluff.git"
-            );
-            assert_eq!(commit.as_str(), IMMUTABLE_COMMIT);
-        }
-        PlannedWorkspaceSource::Local { path } => {
-            panic!("expected remote source, got {}", path.display());
-        }
-    }
+    let result = result_for(task_result(vec![failed_trial(1)]), 1);
+    let mut value = serde_json::to_value(result).expect("result JSON");
+    value["tasks"][0]["stability"]["stable"] = json!(true);
+    let error =
+        EvaluationResult::from_json_str(&serde_json::to_string(&value).expect("result JSON"))
+            .expect_err("single trial cannot claim stability");
+    assert!(error.to_string().contains("stability") || error.to_string().contains("stable"));
 }

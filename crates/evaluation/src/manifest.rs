@@ -12,17 +12,17 @@ use singularity_policy::NetworkAccess;
 
 use crate::{
     Argv, EvaluationError, GitCommit, RelativePath, RemoteRepository, Result,
-    TASK_SET_SCHEMA_VERSION, TaskId, ToolName, require_schema_version, validation_error,
+    TASK_SET_SCHEMA_VERSION, TaskId, ToolCapabilityName, require_schema_version, validation_error,
 };
 
-const COMMAND_TOOL_NAME: &str = "command";
 const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
+const MAX_TRIAL_COUNT: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation task set 的 schema 版本。
 pub enum TaskSetSchemaVersion {
-    #[serde(rename = "evaluation.task_set/v4")]
-    V4,
+    #[serde(rename = "evaluation.task_set/v5")]
+    V5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -51,11 +51,17 @@ pub enum EvaluationCapability {
 /// 一组可验证的 Evaluation 任务。
 pub struct EvaluationTaskSet {
     pub schema_version: TaskSetSchemaVersion,
+    pub trial_count: u32,
     pub tasks: Vec<EvaluationTask>,
 }
 
 impl EvaluationTaskSet {
     fn validate(&self) -> Result<()> {
+        if !(1..=MAX_TRIAL_COUNT).contains(&self.trial_count) {
+            return Err(validation_error(format!(
+                "evaluation task set trial_count must be between 1 and {MAX_TRIAL_COUNT}"
+            )));
+        }
         if self.tasks.is_empty() {
             return Err(validation_error(
                 "evaluation task set requires at least one task",
@@ -105,7 +111,7 @@ impl EvaluationTask {
             description: self.description.clone(),
             instructions: self.agent.instructions.clone(),
             allowed_paths: self.agent.allowed_paths.clone(),
-            allowed_tools: self.agent.allowed_tools.clone(),
+            required_tool_capabilities: self.agent.required_tool_capabilities.clone(),
             smoke_commands: self.agent.smoke_commands.clone(),
         }
     }
@@ -214,7 +220,7 @@ pub enum WorkspaceSource {
 pub struct AgentTaskSpec {
     pub instructions: String,
     pub allowed_paths: Vec<RelativePath>,
-    pub allowed_tools: Vec<ToolName>,
+    pub required_tool_capabilities: Vec<ToolCapabilityRequirement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub smoke_commands: Vec<CommandSpec>,
 }
@@ -227,18 +233,44 @@ impl AgentTaskSpec {
             )));
         }
         validate_nonempty_unique(task_id, "agent.allowed_paths", &self.allowed_paths)?;
-        validate_nonempty_unique(task_id, "agent.allowed_tools", &self.allowed_tools)?;
-        if !self.smoke_commands.is_empty()
-            && !self
-                .allowed_tools
-                .iter()
-                .any(|tool| tool.as_str() == COMMAND_TOOL_NAME)
-        {
+        validate_nonempty_unique(
+            task_id,
+            "agent.required_tool_capabilities",
+            &self.required_tool_capabilities,
+        )?;
+        for requirement in &self.required_tool_capabilities {
+            requirement.validate(task_id)?;
+        }
+        let unique_capabilities = self
+            .required_tool_capabilities
+            .iter()
+            .map(|requirement| requirement.capability.clone())
+            .collect::<BTreeSet<_>>();
+        if unique_capabilities.len() != self.required_tool_capabilities.len() {
             return Err(validation_error(format!(
-                "evaluation task {task_id} agent.smoke_commands requires {COMMAND_TOOL_NAME} in agent.allowed_tools"
+                "evaluation task {task_id} agent.required_tool_capabilities contains duplicate capability names"
             )));
         }
         validate_commands(task_id, "agent.smoke_commands", &self.smoke_commands, false)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Evaluation 从运行时工具注册表解析的版本化能力要求。
+pub struct ToolCapabilityRequirement {
+    pub capability: ToolCapabilityName,
+    pub minimum_version: u32,
+}
+
+impl ToolCapabilityRequirement {
+    fn validate(&self, task_id: &TaskId) -> Result<()> {
+        if self.minimum_version == 0 {
+            return Err(validation_error(format!(
+                "evaluation task {task_id} tool capability minimum_version must be positive"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -525,7 +557,7 @@ pub struct AgentTaskProjection {
     pub description: String,
     pub instructions: String,
     pub allowed_paths: Vec<RelativePath>,
-    pub allowed_tools: Vec<ToolName>,
+    pub required_tool_capabilities: Vec<ToolCapabilityRequirement>,
     pub smoke_commands: Vec<CommandSpec>,
 }
 

@@ -3,7 +3,6 @@
 //! 本模块只把 manifest 的可信内部命令和模型可见 command string 分开投影，
 //! 并在固定 gate、sandbox 与 evidence 合同下汇总结果。
 
-use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -15,20 +14,21 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics, AgentStatus,
-    AgentVerificationRequirement, UPDATE_PLAN_TOOL, agent_control_tool_entries,
-    terminal_command_scope_digests,
+    AgentVerificationRequirement, agent_control_tool_entries, terminal_command_scope_digests,
 };
 use singularity_core::{contains_sensitive_text, load_project_instructions};
 use singularity_evaluation::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
-    EvaluationBlocker, EvaluationCapability, EvaluationEvidenceSummary, EvaluationManifest,
-    EvaluationResult, EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationStageResults,
-    EvaluationStatus, EvaluationTaskResult, PatchFormat, PlannedWorkspaceSource, RunId,
-    StageResult, StageStatus, TaskId, VerificationStagePlan, WorkspacePlan,
+    EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationPromptStructure,
+    EvaluationProviderEvidence, EvaluationResult, EvaluationResultSchemaVersion,
+    EvaluationRunSummary, EvaluationStageResults, EvaluationStatus, EvaluationTaskResult,
+    EvaluationTrialResult, PatchFormat, PlannedWorkspaceSource, RunId, StageResult, StageStatus,
+    TaskId, VerificationStagePlan, WorkspacePlan,
 };
 use singularity_model::{
     ModelErrorCategory, ModelUsage, OpenAiProvider, ProviderAttemptMetadata,
-    ProviderConfigSnapshot, ProviderDiagnostic, ProviderError, ProviderErrorStage,
+    ProviderCapabilityMetadata, ProviderConfigSnapshot, ProviderDiagnostic, ProviderError,
+    ProviderErrorStage, ProviderProtocolContract, ProviderProtocolNegotiation,
 };
 use singularity_policy::{
     ApprovalPolicy, CommandScopeDigest, NetworkAccess, PermissionDecisionOutcome,
@@ -38,10 +38,12 @@ use singularity_policy::{
 use singularity_protocol::{EvalRunParams, EvalRunResult};
 use singularity_tools::{
     CommandEnvironmentPolicy, SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode,
-    ToolBroker, ToolRegistry, WorkspaceTools, command_script_scope_digest_with_policy,
+    ToolAuthorization, ToolBroker, ToolCapability, ToolExecutor, ToolRegistry,
+    WorkspaceToolExecutor, WorkspaceTools, command_script_scope_digest_with_policy,
     workspace_tool_entries,
 };
 
+#[allow(unused_imports)]
 use super::{TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ};
 
 mod command;
@@ -53,7 +55,8 @@ use command::{
     run_command_spec, run_workspace_preparation_command, sandbox_network_mode,
 };
 use evidence::{
-    agent_command_observation, build_evaluation_evidence, content_digest, safe_command_scope_digest,
+    agent_command_observation, build_evaluation_evidence, canonical_json_digest, content_digest,
+    safe_command_scope_digest,
 };
 use workspace::{
     WorkspaceChangeEvidence, apply_agent_changes, copy_tree_checked, evaluation_changed_paths,
@@ -78,6 +81,9 @@ const EVALUATOR_GIT_DIR: &str = ".singularity-evaluator-git";
 const RESULT_FILE: &str = "result.json";
 const REPORT_FILE: &str = "report.json";
 const EVIDENCE_FILE: &str = "evidence.json";
+const PUBLICATION_DIR: &str = "publication";
+const PUBLICATION_MANIFEST_FILE: &str = "publication.json";
+const PUBLICATION_SCHEMA_VERSION: &str = "evaluation.publication/v1";
 const AGENT_TRACE_FILE: &str = "agent-trace.json";
 const PATCH_EVIDENCE_FILE: &str = "patch-evidence.json";
 const ARTIFACT_TEMP_FILE_ATTEMPTS: usize = 64;
@@ -97,8 +103,6 @@ struct StageDiagnostics {
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct TaskDiagnostics {
-    #[serde(skip)]
-    capabilities: Vec<EvaluationCapability>,
     source: Option<SourceProvenance>,
     source_commands: Vec<CommandDiagnostic>,
     baseline: StageDiagnostics,
@@ -138,6 +142,10 @@ struct TaskDiagnostics {
     trace_path: Option<String>,
     error: Option<String>,
     provider_diagnostic: Option<ProviderDiagnostic>,
+    prompt_structure: Option<EvaluationPromptStructure>,
+    prompt_fingerprint: Option<String>,
+    tool_schema_fingerprint: Option<String>,
+    provider_evidence: Option<EvaluationProviderEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,11 +239,65 @@ struct AgentStageExecution {
     trace_path: Option<String>,
     error: Option<String>,
     provider_diagnostic: Option<ProviderDiagnostic>,
+    prompt_structure: Option<EvaluationPromptStructure>,
+    prompt_fingerprint: Option<String>,
+    tool_schema_fingerprint: Option<String>,
+    provider_evidence: Option<EvaluationProviderEvidence>,
 }
 
 struct TaskExecution {
-    result: EvaluationTaskResult,
+    result: EvaluationTrialResult,
     diagnostics: TaskDiagnostics,
+}
+
+struct TaskEvaluation {
+    result: EvaluationTaskResult,
+    trials: Vec<TaskExecution>,
+}
+
+/// 同一 prepared source 派生全部隔离 trial 时共享的只读任务上下文。
+struct PreparedTaskContext<'a> {
+    run_id: &'a RunId,
+    task_root: &'a Path,
+    source_dir: &'a Path,
+    source: &'a SourceProvenance,
+    source_commands: &'a [CommandDiagnostic],
+    plan: &'a WorkspacePlan,
+    sandbox_backend: &'a SharedSandboxBackend,
+    provider_snapshot: &'a ProviderConfigSnapshot,
+}
+
+#[derive(Debug)]
+struct ResolvedEvaluationTools {
+    registry: ToolRegistry,
+    names: Vec<String>,
+    schema_fingerprint: String,
+    allow_read: bool,
+    allow_write: bool,
+    allow_command: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PublicationArtifact {
+    path: String,
+    digest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EvaluationPublicationManifest {
+    schema_version: &'static str,
+    run_id: String,
+    artifact_set_digest: String,
+    result: PublicationArtifact,
+    report: PublicationArtifact,
+    evidence: PublicationArtifact,
+}
+
+#[derive(Debug)]
+struct PublishedEvaluationArtifacts {
+    result_path: PathBuf,
+    report_path: PathBuf,
+    evidence_path: PathBuf,
 }
 
 pub(crate) fn run_evaluation(
@@ -276,7 +338,8 @@ pub(crate) fn run_evaluation(
         .iter()
         .map(|plan| plan.task_id.clone())
         .collect::<Vec<_>>();
-    preflight_evaluation_path_budget(&output_root, &run_id, &task_ids)?;
+    let trials_per_task = manifest.task_set().trial_count;
+    preflight_evaluation_path_budget(&output_root, &run_id, &task_ids, trials_per_task)?;
     fs::create_dir_all(&output_root).map_err(|error| {
         format!(
             "failed to create evaluation output root {}: {error}",
@@ -293,11 +356,12 @@ pub(crate) fn run_evaluation(
 
     let mut task_executions = Vec::new();
     for plan in &plans {
-        task_executions.push(run_task(
+        task_executions.push(run_task_trials(
             &run_id,
             &run_dir,
             manifest.manifest_dir(),
             plan,
+            trials_per_task,
             Arc::clone(&sandbox_backend),
             provider_snapshot,
         ));
@@ -308,21 +372,29 @@ pub(crate) fn run_evaluation(
         .map(|execution| execution.result.clone())
         .collect::<Vec<_>>();
     let evaluation_passed = tasks.iter().all(|task| task.evaluation_passed);
-    let blocker = tasks.iter().find_map(|task| task.blocker.clone());
-    let status = if blocker.is_some() {
-        EvaluationStatus::Blocked
-    } else if evaluation_passed {
+    let status = if tasks
+        .iter()
+        .all(|task| task.status == EvaluationStatus::Completed)
+    {
         EvaluationStatus::Completed
-    } else {
+    } else if tasks
+        .iter()
+        .any(|task| task.status == EvaluationStatus::Failed)
+    {
         EvaluationStatus::Failed
+    } else {
+        EvaluationStatus::Blocked
     };
+    let blocker = (status == EvaluationStatus::Blocked)
+        .then(|| tasks.iter().find_map(|task| task.blocker.clone()))
+        .flatten();
     let result = EvaluationResult {
-        schema_version: EvaluationResultSchemaVersion::V5,
+        schema_version: EvaluationResultSchemaVersion::V6,
         run_id: run_id.clone(),
         status,
         blocker,
         evaluation_passed,
-        summary: EvaluationRunSummary::from_tasks(&tasks),
+        summary: EvaluationRunSummary::from_tasks(&tasks, trials_per_task),
         tasks,
     };
     if let Err(error) = result.validate() {
@@ -332,9 +404,10 @@ pub(crate) fn run_evaluation(
         ));
     }
 
-    let result_path = run_dir.join(RESULT_FILE);
-    let report_path = run_dir.join(REPORT_FILE);
-    let evidence_path = run_dir.join(EVIDENCE_FILE);
+    let publication_dir = run_dir.join(PUBLICATION_DIR);
+    let result_path = publication_dir.join(RESULT_FILE);
+    let report_path = publication_dir.join(REPORT_FILE);
+    let evidence_path = publication_dir.join(EVIDENCE_FILE);
     let evidence = match build_evaluation_evidence(
         &run_id,
         manifest_digest,
@@ -365,16 +438,11 @@ pub(crate) fn run_evaluation(
         "report_path": report_path.to_string_lossy(),
         "evidence_path": evidence_path.to_string_lossy(),
     });
-    if let Err(error) = publish_evaluation_artifacts(
-        &result_path,
-        &result,
-        &report_path,
-        &report,
-        &evidence_path,
-        &evidence,
-    ) {
-        return Err(cleanup_incomplete_run(&run_dir, error));
-    }
+    let published =
+        match publish_evaluation_artifacts(&run_dir, &run_id, &result, &report, &evidence) {
+            Ok(published) => published,
+            Err(error) => return Err(cleanup_incomplete_run(&run_dir, error)),
+        };
 
     Ok(EvalRunResult {
         run_id: run_id.as_str().to_string(),
@@ -383,9 +451,9 @@ pub(crate) fn run_evaluation(
         status: status_string,
         blocker: result.blocker.as_ref().map(blocker_code),
         tasks: report["tasks"].as_array().cloned().unwrap_or_default(),
-        result_path: Some(result_path.to_string_lossy().into_owned()),
-        report_path: Some(report_path.to_string_lossy().into_owned()),
-        evidence_path: Some(evidence_path.to_string_lossy().into_owned()),
+        result_path: Some(published.result_path.to_string_lossy().into_owned()),
+        report_path: Some(published.report_path.to_string_lossy().into_owned()),
+        evidence_path: Some(published.evidence_path.to_string_lossy().into_owned()),
         evaluation_passed: result.evaluation_passed,
     })
 }
@@ -400,32 +468,172 @@ fn cleanup_incomplete_run(run_dir: &Path, error: String) -> String {
     }
 }
 
-fn task_report(execution: &TaskExecution) -> Value {
+fn task_report(execution: &TaskEvaluation) -> Value {
     let mut report =
         serde_json::to_value(&execution.result).expect("evaluation task result serializes");
     if let Some(object) = report.as_object_mut() {
         object.insert(
-            "diagnostics".to_string(),
-            serde_json::to_value(&execution.diagnostics).expect("evaluation diagnostics serialize"),
+            "trial_diagnostics".to_string(),
+            serde_json::to_value(
+                execution
+                    .trials
+                    .iter()
+                    .map(|trial| &trial.diagnostics)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("evaluation diagnostics serialize"),
         );
     }
     report
 }
 
-fn run_task(
+fn run_task_trials(
     run_id: &RunId,
     run_dir: &Path,
     manifest_dir: &Path,
     plan: &WorkspacePlan,
+    trials_per_task: u32,
     sandbox_backend: SharedSandboxBackend,
     provider_snapshot: &ProviderConfigSnapshot,
-) -> TaskExecution {
-    let task_dir = run_dir.join(plan.task_id.as_str());
-    let source_dir = task_dir.join(SOURCE_DIR);
+) -> TaskEvaluation {
+    let task_root = run_dir.join(plan.task_id.as_str());
+    let source_dir = task_root.join(SOURCE_DIR);
+    let initial_source = source_provenance(&plan.source, &source_dir, manifest_dir);
+    if let Err(error) = fs::create_dir(&task_root) {
+        return blocked_task_trials(
+            plan,
+            trials_per_task,
+            evaluation_blocker(
+                BlockerKind::WorkspacePreparation,
+                format!(
+                    "failed to create task directory {}: {error}",
+                    task_root.display()
+                ),
+            ),
+            initial_source,
+            Vec::new(),
+            false,
+        );
+    }
+    let capability = super::agent_loop_capability(sandbox_backend.as_ref());
+    if !capability.available {
+        return blocked_task_trials(
+            plan,
+            trials_per_task,
+            evaluation_blocker(
+                BlockerKind::Environment,
+                format!("{}: {}", capability.status.as_str(), capability.reason),
+            ),
+            initial_source,
+            Vec::new(),
+            false,
+        );
+    }
+    if matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. })
+        && let Err(error) = provider_snapshot.provider()
+    {
+        return blocked_task_trials(
+            plan,
+            trials_per_task,
+            provider_blocker(&error),
+            initial_source,
+            Vec::new(),
+            false,
+        );
+    }
+    let source_commands = match prepare_source(
+        &plan.source,
+        &task_root,
+        &source_dir,
+        Arc::clone(&sandbox_backend),
+    ) {
+        Ok(commands) => commands,
+        Err((blocker, commands)) => {
+            return blocked_task_trials(
+                plan,
+                trials_per_task,
+                blocker,
+                source_provenance(&plan.source, &source_dir, manifest_dir),
+                commands,
+                true,
+            );
+        }
+    };
+    let source = source_provenance(&plan.source, &source_dir, manifest_dir);
+    let prepared = PreparedTaskContext {
+        run_id,
+        task_root: &task_root,
+        source_dir: &source_dir,
+        source: &source,
+        source_commands: &source_commands,
+        plan,
+        sandbox_backend: &sandbox_backend,
+        provider_snapshot,
+    };
+    let trials = (1..=trials_per_task)
+        .map(|trial| run_task(&prepared, trial))
+        .collect::<Vec<_>>();
+    task_evaluation_from_trials(plan, trials)
+}
+
+fn blocked_task_trials(
+    plan: &WorkspacePlan,
+    trials_per_task: u32,
+    blocker: EvaluationBlocker,
+    source: SourceProvenance,
+    source_commands: Vec<CommandDiagnostic>,
+    source_preparation_failed: bool,
+) -> TaskEvaluation {
+    let trials = (1..=trials_per_task)
+        .map(|trial| {
+            let mut diagnostics = TaskDiagnostics {
+                source: Some(source.clone()),
+                source_commands: source_commands.clone(),
+                smoke_command_satisfied: plan.agent.projection.smoke_commands.is_empty(),
+                error: Some(blocker.message.clone()),
+                ..TaskDiagnostics::default()
+            };
+            if source_preparation_failed {
+                diagnostics.baseline.message = Some(blocker.message.clone());
+                finish_task(
+                    &plan.task_id,
+                    trial,
+                    StageExecution::blocked(blocker.clone(), Vec::new()),
+                    StageExecution::skipped(
+                        "agent stage skipped because source preparation failed",
+                    ),
+                    StageExecution::skipped(
+                        "public stage skipped because source preparation failed",
+                    ),
+                    StageExecution::skipped(
+                        "hidden stage skipped because source preparation failed",
+                    ),
+                    diagnostics,
+                )
+            } else {
+                blocked_task_before_workspace(&plan.task_id, trial, blocker.clone(), diagnostics)
+            }
+        })
+        .collect();
+    task_evaluation_from_trials(plan, trials)
+}
+
+fn task_evaluation_from_trials(plan: &WorkspacePlan, trials: Vec<TaskExecution>) -> TaskEvaluation {
+    let result = EvaluationTaskResult::from_trials(
+        plan.task_id.clone(),
+        plan.capabilities.clone(),
+        plan.agent.projection.required_tool_capabilities.clone(),
+        trials.iter().map(|trial| trial.result.clone()).collect(),
+    );
+    TaskEvaluation { result, trials }
+}
+
+fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
+    let task_dir = prepared.task_root.join(format!("trial-{trial:04}"));
     let mut diagnostics = TaskDiagnostics {
-        capabilities: plan.capabilities.clone(),
-        source: Some(source_provenance(&plan.source, &source_dir, manifest_dir)),
-        smoke_command_satisfied: plan.agent.projection.smoke_commands.is_empty(),
+        source: Some(prepared.source.clone()),
+        source_commands: prepared.source_commands.to_vec(),
+        smoke_command_satisfied: prepared.plan.agent.projection.smoke_commands.is_empty(),
         ..TaskDiagnostics::default()
     };
     if let Err(error) = fs::create_dir(&task_dir) {
@@ -436,74 +644,31 @@ fn run_task(
                 task_dir.display()
             ),
         );
-        return blocked_task_before_workspace(&plan.task_id, blocker, diagnostics);
+        return blocked_task_before_workspace(&prepared.plan.task_id, trial, blocker, diagnostics);
     }
 
-    let capability = super::agent_loop_capability(sandbox_backend.as_ref());
-    if !capability.available {
-        let blocker = evaluation_blocker(
-            BlockerKind::Environment,
-            format!("{}: {}", capability.status.as_str(), capability.reason),
-        );
-        return blocked_task_before_workspace(&plan.task_id, blocker, diagnostics);
-    }
-
-    let mut provider = if matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. }) {
-        match provider_snapshot.provider() {
-            Ok(provider) => Some(provider),
-            Err(error) => {
-                let blocker = provider_blocker(&error);
-                diagnostics.error = Some(safe_text(error.message));
-                return blocked_task_before_workspace(&plan.task_id, blocker, diagnostics);
-            }
+    let provider = match prepared.provider_snapshot.provider() {
+        Ok(provider) => provider,
+        Err(error) => {
+            let blocker = provider_blocker(&error);
+            diagnostics.error = Some(safe_text(error.message));
+            return blocked_task_before_workspace(
+                &prepared.plan.task_id,
+                trial,
+                blocker,
+                diagnostics,
+            );
         }
-    } else {
-        None
-    };
-
-    match prepare_source(
-        &plan.source,
-        &task_dir,
-        &source_dir,
-        Arc::clone(&sandbox_backend),
-    ) {
-        Ok(commands) => {
-            diagnostics.source_commands = commands;
-            diagnostics.source = Some(source_provenance(&plan.source, &source_dir, manifest_dir));
-        }
-        Err((blocker, commands)) => {
-            diagnostics.source_commands = commands;
-            let baseline = StageExecution::blocked(blocker, Vec::new());
-            let agent =
-                StageExecution::skipped("agent stage skipped because source preparation failed");
-            let public =
-                StageExecution::skipped("public stage skipped because source preparation failed");
-            let hidden =
-                StageExecution::skipped("hidden stage skipped because source preparation failed");
-            return finish_task(&plan.task_id, baseline, agent, public, hidden, diagnostics);
-        }
-    }
-
-    let provider = match provider.take() {
-        Some(provider) => provider,
-        None => match provider_snapshot.provider() {
-            Ok(provider) => provider,
-            Err(error) => {
-                let blocker = provider_blocker(&error);
-                diagnostics.error = Some(safe_text(error.message));
-                return blocked_task_before_workspace(&plan.task_id, blocker, diagnostics);
-            }
-        },
     };
 
     let baseline = run_verification_stage(
-        &source_dir,
+        prepared.source_dir,
         &task_dir.join(BASELINE_DIR),
-        &plan.baseline.setup_commands,
-        plan.baseline.test_patch.as_ref(),
-        &plan.baseline.commands,
-        plan.baseline.expectation,
-        Arc::clone(&sandbox_backend),
+        &prepared.plan.baseline.setup_commands,
+        prepared.plan.baseline.test_patch.as_ref(),
+        &prepared.plan.baseline.commands,
+        prepared.plan.baseline.expectation,
+        Arc::clone(prepared.sandbox_backend),
     );
     diagnostics.baseline = baseline.diagnostics.clone();
     if baseline.result.status != StageStatus::Passed {
@@ -512,17 +677,25 @@ fn run_task(
         );
         let public = StageExecution::skipped("public stage skipped because baseline did not pass");
         let hidden = StageExecution::skipped("hidden stage skipped because baseline did not pass");
-        return finish_task(&plan.task_id, baseline, agent, public, hidden, diagnostics);
+        return finish_task(
+            &prepared.plan.task_id,
+            trial,
+            baseline,
+            agent,
+            public,
+            hidden,
+            diagnostics,
+        );
     }
 
     let agent_execution = run_agent_stage(
-        run_id,
-        &source_dir,
-        &task_dir.join(AGENT_DIR),
-        &plan.agent,
-        provider,
-        Arc::clone(&sandbox_backend),
+        prepared.run_id,
+        prepared.source_dir,
         &task_dir,
+        &prepared.plan.agent,
+        trial,
+        provider,
+        Arc::clone(prepared.sandbox_backend),
     );
     diagnostics.agent = agent_execution.stage.diagnostics.clone();
     diagnostics.changed_files = agent_execution.changed_files.clone();
@@ -562,6 +735,10 @@ fn run_task(
     diagnostics.trace_path = agent_execution.trace_path.clone();
     diagnostics.error = agent_execution.error.clone();
     diagnostics.provider_diagnostic = agent_execution.provider_diagnostic.clone();
+    diagnostics.prompt_structure = agent_execution.prompt_structure.clone();
+    diagnostics.prompt_fingerprint = agent_execution.prompt_fingerprint.clone();
+    diagnostics.tool_schema_fingerprint = agent_execution.tool_schema_fingerprint.clone();
+    diagnostics.provider_evidence = agent_execution.provider_evidence.clone();
     diagnostics.local_process_fallback_count = agent_execution
         .audit_events
         .iter()
@@ -574,7 +751,8 @@ fn run_task(
         let hidden =
             StageExecution::skipped("hidden stage skipped because agent workspace is unavailable");
         return finish_task(
-            &plan.task_id,
+            &prepared.plan.task_id,
+            trial,
             baseline,
             agent_execution.stage,
             public,
@@ -584,25 +762,26 @@ fn run_task(
     };
 
     let public = run_verification_stage_with_agent_changes(
-        &source_dir,
+        prepared.source_dir,
         agent_workspace,
         &agent_execution.changed_files,
         &task_dir.join(PUBLIC_DIR),
-        &plan.public,
-        Arc::clone(&sandbox_backend),
+        &prepared.plan.public,
+        Arc::clone(prepared.sandbox_backend),
     );
     diagnostics.public = public.diagnostics.clone();
     let hidden = run_verification_stage_with_agent_changes(
-        &source_dir,
+        prepared.source_dir,
         agent_workspace,
         &agent_execution.changed_files,
         &task_dir.join(HIDDEN_DIR),
-        &plan.hidden,
-        sandbox_backend,
+        &prepared.plan.hidden,
+        Arc::clone(prepared.sandbox_backend),
     );
     diagnostics.hidden = hidden.diagnostics.clone();
     finish_task(
-        &plan.task_id,
+        &prepared.plan.task_id,
+        trial,
         baseline,
         agent_execution.stage,
         public,
@@ -665,6 +844,7 @@ fn redacted_remote_repository(repository: &str) -> String {
 
 fn blocked_task_before_workspace(
     task_id: &TaskId,
+    trial: u32,
     blocker: EvaluationBlocker,
     mut diagnostics: TaskDiagnostics,
 ) -> TaskExecution {
@@ -672,6 +852,7 @@ fn blocked_task_before_workspace(
     diagnostics.error = Some(blocker.message.clone());
     finish_task(
         task_id,
+        trial,
         StageExecution::skipped("baseline stage not run"),
         StageExecution::blocked(blocker, Vec::new()),
         StageExecution::skipped("public stage not run"),
@@ -681,7 +862,8 @@ fn blocked_task_before_workspace(
 }
 
 fn finish_task(
-    task_id: &TaskId,
+    _task_id: &TaskId,
+    trial: u32,
     baseline: StageExecution,
     agent: StageExecution,
     public: StageExecution,
@@ -735,9 +917,8 @@ fn finish_task(
     } else {
         EvaluationStatus::Failed
     };
-    let result = EvaluationTaskResult {
-        task_id: task_id.clone(),
-        capabilities: diagnostics.capabilities.clone(),
+    let result = EvaluationTrialResult {
+        trial,
         status,
         blocker,
         stages,
@@ -1244,12 +1425,13 @@ fn cleanup_evaluator_control_files(
 fn run_agent_stage(
     run_id: &RunId,
     source_dir: &Path,
-    agent_dir: &Path,
+    task_dir: &Path,
     plan: &AgentStagePlan,
+    trial: u32,
     provider: OpenAiProvider,
     sandbox_backend: SharedSandboxBackend,
-    task_dir: &Path,
 ) -> AgentStageExecution {
+    let agent_dir = task_dir.join(AGENT_DIR);
     let projection = &plan.projection;
     let pristine_source = match snapshot_workspace(source_dir) {
         Ok(snapshot) => snapshot,
@@ -1260,7 +1442,7 @@ fn run_agent_stage(
             );
         }
     };
-    if let Err(error) = copy_tree_checked(source_dir, agent_dir) {
+    if let Err(error) = copy_tree_checked(source_dir, &agent_dir) {
         return blocked_agent_stage(
             evaluation_blocker(BlockerKind::WorkspacePreparation, error),
             Vec::new(),
@@ -1268,14 +1450,14 @@ fn run_agent_stage(
     }
     let mut command_diagnostics = Vec::new();
     if let Err(blocker) = run_setup_commands(
-        agent_dir,
+        &agent_dir,
         &plan.setup_commands,
         Arc::clone(&sandbox_backend),
         &mut command_diagnostics,
     ) {
         return blocked_agent_stage(blocker, command_diagnostics);
     }
-    let before = match snapshot_workspace(agent_dir) {
+    let before = match snapshot_workspace(&agent_dir) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return blocked_agent_stage(
@@ -1284,7 +1466,7 @@ fn run_agent_stage(
             );
         }
     };
-    let project_instructions = match load_project_instructions(agent_dir, agent_dir) {
+    let project_instructions = match load_project_instructions(&agent_dir, &agent_dir) {
         Ok(instructions) => instructions,
         Err(error) => {
             return blocked_agent_stage(
@@ -1294,8 +1476,8 @@ fn run_agent_stage(
         }
     };
 
-    let registry = match evaluation_registry(projection) {
-        Ok(registry) => registry,
+    let resolved_tools = match evaluation_registry(projection) {
+        Ok(resolved_tools) => resolved_tools,
         Err(error) => {
             return blocked_agent_stage(
                 evaluation_blocker(BlockerKind::AgentRuntime, error),
@@ -1303,8 +1485,35 @@ fn run_agent_stage(
             );
         }
     };
-    let policy = evaluation_policy(agent_dir, projection);
-    let verification_requirements = match agent_verification_requirements(agent_dir, projection) {
+    let policy = evaluation_policy(&agent_dir, projection, &resolved_tools);
+    let prompt = agent_prompt(projection, &resolved_tools.names);
+    let project_instructions_fingerprint = project_instructions
+        .as_ref()
+        .map(|instructions| instructions.aggregate_digest().to_string());
+    let prompt_structure = EvaluationPromptStructure {
+        contract: "evaluation.agent_prompt/v1".to_string(),
+        model_message_roles: vec!["developer".to_string(), "user".to_string()],
+        section_kinds: vec![
+            "task_instructions".to_string(),
+            "allowed_paths".to_string(),
+            "resolved_tools".to_string(),
+            "smoke_requirements".to_string(),
+            "completion_instruction".to_string(),
+        ],
+        allowed_path_count: u32::try_from(projection.allowed_paths.len()).unwrap_or(u32::MAX),
+        resolved_tool_count: u32::try_from(resolved_tools.names.len()).unwrap_or(u32::MAX),
+        smoke_command_count: u32::try_from(projection.smoke_commands.len()).unwrap_or(u32::MAX),
+        project_instructions_fingerprint: project_instructions_fingerprint.clone(),
+    };
+    let tool_schema_fingerprint = resolved_tools.schema_fingerprint.clone();
+    let prompt_fingerprint = canonical_json_digest(&json!({
+        "prompt_structure": &prompt_structure,
+        "user_prompt_fingerprint": content_digest(prompt.as_bytes()),
+        "project_instructions_fingerprint": project_instructions_fingerprint,
+        "tool_schema_fingerprint": &tool_schema_fingerprint,
+    }))
+    .expect("evaluation prompt fingerprint inputs serialize canonically");
+    let verification_requirements = match agent_verification_requirements(&agent_dir, projection) {
         Ok(requirements) => requirements,
         Err(error) => {
             return blocked_agent_stage(
@@ -1315,8 +1524,12 @@ fn run_agent_stage(
     };
     let mut input = AgentLoopInput::new(
         projection.task_id.as_str(),
-        format!("eval_{}_{}", run_id.as_str(), projection.task_id.as_str()),
-        agent_prompt(projection),
+        format!(
+            "eval_{}_{}_trial_{trial}",
+            run_id.as_str(),
+            projection.task_id.as_str()
+        ),
+        prompt,
     )
     .with_max_turns(DEFAULT_AGENT_MAX_TURNS)
     .with_verification_requirements(verification_requirements);
@@ -1335,11 +1548,17 @@ fn run_agent_stage(
         }
     };
     let agent_started = Instant::now();
-    let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
+    let provider_identity = provider.clone();
+    let result = AgentLoop::new(provider, ToolBroker::new(resolved_tools.registry), policy)
         .with_workspace_tools(workspace_tools)
         .run(&input);
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let run_status = result.to_run_status();
+    let provider_evidence = provider_evidence(
+        &provider_identity,
+        run_status.provider_protocol_contract.as_ref(),
+        run_status.provider_capability_metadata.as_ref(),
+    );
     let (observed_smoke_scope_digests, local_process_fallback_unknown_count) =
         agent_command_observation(&result, projection.smoke_commands.len());
     let trace_path = task_dir.join(AGENT_TRACE_FILE);
@@ -1350,6 +1569,7 @@ fn run_agent_stage(
         "thread_id": &input.thread_id,
         "turn_id": &input.turn_id,
         "task_id": projection.task_id.as_str(),
+        "trial": trial,
         "model_turns": run_status.model_turns,
         "model_turn_limit": run_status.model_turn_limit,
         "context": run_status.context_trace.as_ref().map(|context| json!({
@@ -1368,9 +1588,13 @@ fn run_agent_stage(
         "model_usage": run_status.model_usage,
         "provider_attempts": run_status.provider_attempts,
         "provider_protocol": {
-            "contract": run_status.provider_protocol_contract,
-            "capability_metadata": run_status.provider_capability_metadata,
+            "contract": &run_status.provider_protocol_contract,
+            "capability_metadata": &run_status.provider_capability_metadata,
         },
+        "provider_identity": &provider_evidence,
+        "prompt_structure": &prompt_structure,
+        "prompt_fingerprint": &prompt_fingerprint,
+        "tool_schema_fingerprint": &tool_schema_fingerprint,
         "tool_outcomes": result.tool_results.iter().map(|tool_result| json!({
             "tool_call_id": safe_text(&tool_result.tool_call_id),
             "tool_name": safe_text(&tool_result.tool_name),
@@ -1421,11 +1645,15 @@ fn run_agent_stage(
                 trace_path: None,
                 error: Some(safe_text(error)),
                 provider_diagnostic: run_status.provider_diagnostic,
+                prompt_structure: Some(prompt_structure.clone()),
+                prompt_fingerprint: Some(prompt_fingerprint.clone()),
+                tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
+                provider_evidence: Some(provider_evidence.clone()),
             };
         }
     };
 
-    let after = match snapshot_workspace(agent_dir) {
+    let after = match snapshot_workspace(&agent_dir) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return AgentStageExecution {
@@ -1458,6 +1686,10 @@ fn run_agent_stage(
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
                 provider_diagnostic: run_status.provider_diagnostic,
+                prompt_structure: Some(prompt_structure.clone()),
+                prompt_fingerprint: Some(prompt_fingerprint.clone()),
+                tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
+                provider_evidence: Some(provider_evidence.clone()),
             };
         }
     };
@@ -1502,6 +1734,10 @@ fn run_agent_stage(
                 trace_path: trace_path_string,
                 error: Some(safe_text(error)),
                 provider_diagnostic: run_status.provider_diagnostic,
+                prompt_structure: Some(prompt_structure.clone()),
+                prompt_fingerprint: Some(prompt_fingerprint.clone()),
+                tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
+                provider_evidence: Some(provider_evidence.clone()),
             };
         }
     };
@@ -1510,7 +1746,7 @@ fn run_agent_stage(
         .filter(|path| !path_is_allowed(path, &projection.allowed_paths))
         .cloned()
         .collect::<Vec<_>>();
-    let smoke_command_satisfied = smoke_commands_satisfied(agent_dir, projection, &result);
+    let smoke_command_satisfied = smoke_commands_satisfied(&agent_dir, projection, &result);
     let loop_completed = result.completed && result.status == AgentStatus::Completed;
     let error = result.error.clone().map(safe_text);
     let sandbox_blocker = agent_sandbox_blocker(&run_status.audit_events);
@@ -1593,6 +1829,10 @@ fn run_agent_stage(
         trace_path: trace_path_string,
         error,
         provider_diagnostic: run_status.provider_diagnostic,
+        prompt_structure: Some(prompt_structure),
+        prompt_fingerprint: Some(prompt_fingerprint),
+        tool_schema_fingerprint: Some(tool_schema_fingerprint),
+        provider_evidence: Some(provider_evidence),
     }
 }
 
@@ -1627,24 +1867,97 @@ fn blocked_agent_stage(
         trace_path: None,
         error: Some(blocker.message),
         provider_diagnostic: None,
+        prompt_structure: None,
+        prompt_fingerprint: None,
+        tool_schema_fingerprint: None,
+        provider_evidence: None,
     }
 }
 
-fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry, String> {
-    let allowed = projection
-        .allowed_tools
-        .iter()
-        .map(|tool| tool.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut registry = ToolRegistry::default();
-    for mut entry in workspace_tool_entries()
+fn provider_evidence(
+    provider: &OpenAiProvider,
+    contract: Option<&ProviderProtocolContract>,
+    metadata: Option<&ProviderCapabilityMetadata>,
+) -> EvaluationProviderEvidence {
+    let base = provider.runtime_fingerprint(None);
+    let Some((contract, metadata)) = contract.zip(metadata) else {
+        return EvaluationProviderEvidence {
+            provider_fingerprint: base.provider_fingerprint,
+            model_fingerprint: base.model_fingerprint,
+            negotiation_fingerprint: None,
+            api_protocol: None,
+            protocol_contract_fingerprint: None,
+            capability_metadata_fingerprint: None,
+        };
+    };
+    let negotiation = ProviderProtocolNegotiation {
+        contract: contract.clone(),
+        metadata: metadata.clone(),
+    };
+    let runtime = provider.runtime_fingerprint_for_negotiation(None, &negotiation);
+    EvaluationProviderEvidence {
+        provider_fingerprint: runtime.provider_fingerprint,
+        model_fingerprint: runtime.model_fingerprint,
+        negotiation_fingerprint: runtime.negotiation_fingerprint,
+        api_protocol: Some(
+            enum_string(metadata.api_protocol)
+                .expect("provider API protocol serializes to a string"),
+        ),
+        protocol_contract_fingerprint: Some(
+            canonical_json_digest(contract).expect("provider contract serializes canonically"),
+        ),
+        capability_metadata_fingerprint: Some(
+            canonical_json_digest(metadata)
+                .expect("provider capability metadata serializes canonically"),
+        ),
+    }
+}
+
+fn evaluation_registry(
+    projection: &AgentTaskProjection,
+) -> Result<ResolvedEvaluationTools, String> {
+    let mut catalog = ToolRegistry::default();
+    for entry in workspace_tool_entries()
         .into_iter()
         .chain(agent_control_tool_entries())
     {
-        if !allowed.contains(entry.id.as_str()) {
-            continue;
+        catalog.register(entry)?;
+    }
+    let mut selected = std::collections::BTreeMap::new();
+    for requirement in &projection.required_tool_capabilities {
+        let capability = serde_json::from_value::<ToolCapability>(Value::String(
+            requirement.capability.as_str().to_string(),
+        ))
+        .map_err(|_| {
+            format!(
+                "unsupported evaluation tool capability {}",
+                requirement.capability.as_str()
+            )
+        })?;
+        let entries = catalog.entries_for_capability(capability, requirement.minimum_version);
+        if entries.is_empty() {
+            return Err(format!(
+                "evaluation tool capability {} requires version {} but the registry has no matching model-visible entry",
+                requirement.capability.as_str(),
+                requirement.minimum_version
+            ));
         }
-        if entry.id.as_str() == TOOL_COMMAND {
+        for entry in entries {
+            selected.insert(entry.id.as_str().to_string(), entry.clone());
+        }
+    }
+    let mut registry = ToolRegistry::default();
+    let mut allow_read = false;
+    let mut allow_write = false;
+    let mut allow_command = false;
+    for (_, mut entry) in selected {
+        allow_read |= matches!(
+            entry.authorization,
+            ToolAuthorization::WorkspaceRead | ToolAuthorization::AgentControl
+        );
+        allow_write |= entry.authorization == ToolAuthorization::WorkspaceWrite;
+        allow_command |= entry.authorization == ToolAuthorization::Command;
+        if entry.executor == ToolExecutor::Workspace(WorkspaceToolExecutor::Command) {
             let bindings = projection
                 .smoke_commands
                 .iter()
@@ -1659,10 +1972,34 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
         }
         registry.register(entry)?;
     }
-    Ok(registry)
+    if !projection.smoke_commands.is_empty() && !allow_command {
+        return Err(
+            "evaluation smoke commands require a registry-resolved command execution tool"
+                .to_string(),
+        );
+    }
+    let names = registry
+        .schema_payloads()
+        .iter()
+        .filter_map(|schema| schema.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let schema_fingerprint = canonical_json_digest(&registry.schema_payloads())?;
+    Ok(ResolvedEvaluationTools {
+        registry,
+        names,
+        schema_fingerprint,
+        allow_read,
+        allow_write,
+        allow_command,
+    })
 }
 
-fn evaluation_policy(_workspace: &Path, projection: &AgentTaskProjection) -> PolicyEngine {
+fn evaluation_policy(
+    _workspace: &Path,
+    projection: &AgentTaskProjection,
+    resolved_tools: &ResolvedEvaluationTools,
+) -> PolicyEngine {
     let mut profile = PermissionProfile::workspace_write();
     profile.approval_policy = ApprovalPolicy::Never;
     if projection
@@ -1672,16 +2009,8 @@ fn evaluation_policy(_workspace: &Path, projection: &AgentTaskProjection) -> Pol
     {
         profile.network_access = NetworkAccess::Allowed;
     }
-    let allowed = projection
-        .allowed_tools
-        .iter()
-        .map(|tool| tool.as_str())
-        .collect::<BTreeSet<_>>();
     let mut policy = PolicyEngine::new(profile);
-    if [TOOL_READ, TOOL_LIST, TOOL_GREP, UPDATE_PLAN_TOOL]
-        .iter()
-        .any(|tool| allowed.contains(tool))
-    {
+    if resolved_tools.allow_read {
         policy = policy.with_rule(
             PermissionRule::new(
                 "allow_evaluation_read_tools",
@@ -1691,7 +2020,7 @@ fn evaluation_policy(_workspace: &Path, projection: &AgentTaskProjection) -> Pol
             .for_operation(PermissionOperation::Read),
         );
     }
-    if allowed.contains(TOOL_EDIT) || allowed.contains(TOOL_PATCH) {
+    if resolved_tools.allow_write {
         for (index, path) in projection.allowed_paths.iter().enumerate() {
             policy = policy.with_rule(
                 PermissionRule::new(
@@ -1707,7 +2036,7 @@ fn evaluation_policy(_workspace: &Path, projection: &AgentTaskProjection) -> Pol
             );
         }
     }
-    if allowed.contains(TOOL_COMMAND) {
+    if resolved_tools.allow_command {
         for (index, command) in projection.smoke_commands.iter().enumerate() {
             let network = sandbox_network_mode(command.network_access);
             let resource = PermissionResource::CommandScope(
@@ -1747,19 +2076,14 @@ fn evaluation_policy(_workspace: &Path, projection: &AgentTaskProjection) -> Pol
     policy
 }
 
-fn agent_prompt(projection: &AgentTaskProjection) -> String {
+fn agent_prompt(projection: &AgentTaskProjection, resolved_tools: &[String]) -> String {
     let allowed_paths = projection
         .allowed_paths
         .iter()
         .map(|path| path.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let allowed_tools = projection
-        .allowed_tools
-        .iter()
-        .map(|tool| tool.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let allowed_tools = resolved_tools.join(", ");
     let mut sections = vec![
         projection.instructions.clone(),
         format!("Only modify these workspace paths: {allowed_paths}."),
@@ -1997,12 +2321,14 @@ fn preflight_evaluation_path_budget(
     output_root: &Path,
     run_id: &RunId,
     task_ids: &[TaskId],
+    trials_per_task: u32,
 ) -> Result<(), String> {
     if cfg!(windows) {
         preflight_evaluation_path_budget_with_limit(
             output_root,
             run_id,
             task_ids,
+            trials_per_task,
             WINDOWS_MAX_PATH_CHARS,
         )
     } else {
@@ -2014,25 +2340,45 @@ fn preflight_evaluation_path_budget_with_limit(
     output_root: &Path,
     run_id: &RunId,
     task_ids: &[TaskId],
+    trials_per_task: u32,
     max_path_chars: usize,
 ) -> Result<(), String> {
     let output_root = absolute_path_for_path_budget(output_root)?;
     let run_dir = output_root.join(run_id.as_str());
     for (context, path) in [
-        ("evaluation result artifact", run_dir.join(RESULT_FILE)),
-        ("evaluation report artifact", run_dir.join(REPORT_FILE)),
-        ("evaluation evidence artifact", run_dir.join(EVIDENCE_FILE)),
         (
-            "evaluation report temporary artifact",
-            run_dir.join(format!(
-                ".{REPORT_FILE}.4294967295.18446744073709551615.tmp"
-            )),
+            "evaluation result artifact",
+            run_dir.join(PUBLICATION_DIR).join(RESULT_FILE),
         ),
         (
-            "evaluation evidence temporary artifact",
-            run_dir.join(format!(
-                ".{EVIDENCE_FILE}.4294967295.18446744073709551615.tmp"
-            )),
+            "evaluation report artifact",
+            run_dir.join(PUBLICATION_DIR).join(REPORT_FILE),
+        ),
+        (
+            "evaluation evidence artifact",
+            run_dir.join(PUBLICATION_DIR).join(EVIDENCE_FILE),
+        ),
+        (
+            "evaluation publication manifest",
+            run_dir
+                .join(PUBLICATION_DIR)
+                .join(PUBLICATION_MANIFEST_FILE),
+        ),
+        (
+            "evaluation publication staging artifact",
+            run_dir
+                .join(format!(
+                    ".{PUBLICATION_DIR}.4294967295.18446744073709551615.tmp"
+                ))
+                .join(EVIDENCE_FILE),
+        ),
+        (
+            "evaluation publication staging manifest",
+            run_dir
+                .join(format!(
+                    ".{PUBLICATION_DIR}.4294967295.18446744073709551615.tmp"
+                ))
+                .join(PUBLICATION_MANIFEST_FILE),
         ),
     ] {
         check_path_budget(context, &path, max_path_chars)?;
@@ -2040,6 +2386,7 @@ fn preflight_evaluation_path_budget_with_limit(
 
     for task_id in task_ids {
         let task_dir = run_dir.join(task_id.as_str());
+        let trial_dir = task_dir.join(format!("trial-{trials_per_task:04}"));
         for (context, path) in [
             (
                 "remote git pack keep file",
@@ -2050,17 +2397,17 @@ fn preflight_evaluation_path_budget_with_limit(
                     .join("pack")
                     .join(format!("pack-{GIT_PACK_HEX}.keep")),
             ),
-            ("agent trace artifact", task_dir.join(AGENT_TRACE_FILE)),
+            ("agent trace artifact", trial_dir.join(AGENT_TRACE_FILE)),
             (
                 "patch evidence artifact",
-                task_dir.join(PATCH_EVIDENCE_FILE),
+                trial_dir.join(PATCH_EVIDENCE_FILE),
             ),
         ] {
             check_path_budget(context, &path, max_path_chars)?;
         }
 
         for stage in [BASELINE_DIR, AGENT_DIR, PUBLIC_DIR, HIDDEN_DIR] {
-            let stage_dir = task_dir.join(stage);
+            let stage_dir = trial_dir.join(stage);
             check_path_budget(
                 "Cargo target dependency artifact",
                 &stage_dir
@@ -2112,53 +2459,115 @@ fn path_length_for_path_budget(path: &Path) -> usize {
 }
 
 fn publish_evaluation_artifacts(
-    result_path: &Path,
+    run_dir: &Path,
+    run_id: &RunId,
     result: &impl Serialize,
-    report_path: &Path,
     report: &impl Serialize,
-    evidence_path: &Path,
     evidence: &impl Serialize,
-) -> Result<(), String> {
-    let report_temp = write_json_temp(report_path, report)?;
-    let evidence_temp = match write_json_temp(evidence_path, evidence) {
-        Ok(temp) => temp,
-        Err(error) => {
-            let _ = fs::remove_file(&report_temp);
-            return Err(error);
-        }
+) -> Result<PublishedEvaluationArtifacts, String> {
+    let result_bytes = serialize_json_artifact(result)?;
+    let report_bytes = serialize_json_artifact(report)?;
+    let evidence_bytes = serialize_json_artifact(evidence)?;
+    let relative_result = format!("{PUBLICATION_DIR}/{RESULT_FILE}");
+    let relative_report = format!("{PUBLICATION_DIR}/{REPORT_FILE}");
+    let relative_evidence = format!("{PUBLICATION_DIR}/{EVIDENCE_FILE}");
+    let result_artifact = PublicationArtifact {
+        path: relative_result,
+        digest: content_digest(&result_bytes),
     };
-    let result_temp = match write_json_temp(result_path, result) {
-        Ok(temp) => temp,
-        Err(error) => {
-            let _ = fs::remove_file(&report_temp);
-            let _ = fs::remove_file(&evidence_temp);
-            return Err(error);
-        }
+    let report_artifact = PublicationArtifact {
+        path: relative_report,
+        digest: content_digest(&report_bytes),
     };
-    if let Err(error) = publish_json_temp(&evidence_temp, evidence_path) {
-        let _ = fs::remove_file(&report_temp);
-        let _ = fs::remove_file(&result_temp);
+    let evidence_artifact = PublicationArtifact {
+        path: relative_evidence,
+        digest: content_digest(&evidence_bytes),
+    };
+    let artifact_set_digest = canonical_json_digest(&json!({
+        "run_id": run_id.as_str(),
+        "result": &result_artifact,
+        "report": &report_artifact,
+        "evidence": &evidence_artifact,
+    }))?;
+    let manifest = EvaluationPublicationManifest {
+        schema_version: PUBLICATION_SCHEMA_VERSION,
+        run_id: run_id.as_str().to_string(),
+        artifact_set_digest,
+        result: result_artifact,
+        report: report_artifact,
+        evidence: evidence_artifact,
+    };
+    let manifest_bytes = serialize_json_artifact(&manifest)?;
+
+    let staging_dir = create_publication_staging_dir(run_dir)?;
+    let write_result = (|| {
+        write_synced_artifact(&staging_dir.join(RESULT_FILE), &result_bytes)?;
+        write_synced_artifact(&staging_dir.join(REPORT_FILE), &report_bytes)?;
+        write_synced_artifact(&staging_dir.join(EVIDENCE_FILE), &evidence_bytes)?;
+        write_synced_artifact(
+            &staging_dir.join(PUBLICATION_MANIFEST_FILE),
+            &manifest_bytes,
+        )
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
-    if let Err(error) = publish_json_temp(&report_temp, report_path) {
-        let _ = fs::remove_file(&result_temp);
-        return Err(cleanup_published_artifact(evidence_path, error));
+
+    let publication_dir = run_dir.join(PUBLICATION_DIR);
+    if let Err(error) = fs::rename(&staging_dir, &publication_dir) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(format!(
+            "failed to publish evaluation artifact set {}: {error}",
+            publication_dir.display()
+        ));
     }
-    if let Err(error) = publish_json_temp(&result_temp, result_path) {
-        let error = cleanup_published_artifact(report_path, error);
-        return Err(cleanup_published_artifact(evidence_path, error));
-    }
-    Ok(())
+    Ok(PublishedEvaluationArtifacts {
+        result_path: publication_dir.join(RESULT_FILE),
+        report_path: publication_dir.join(REPORT_FILE),
+        evidence_path: publication_dir.join(EVIDENCE_FILE),
+    })
 }
 
-fn cleanup_published_artifact(path: &Path, error: String) -> String {
-    match fs::remove_file(path) {
-        Ok(()) => error,
-        Err(cleanup_error) => format!(
-            "{error}; failed to remove incomplete artifact {}: {cleanup_error}",
-            path.display()
-        ),
+fn serialize_json_artifact(value: &impl Serialize) -> Result<Vec<u8>, String> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("failed to serialize artifact: {error}"))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn create_publication_staging_dir(run_dir: &Path) -> Result<PathBuf, String> {
+    for _ in 0..ARTIFACT_TEMP_FILE_ATTEMPTS {
+        let sequence = ARTIFACT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let staging_dir = run_dir.join(format!(
+            ".{PUBLICATION_DIR}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match fs::create_dir(&staging_dir) {
+            Ok(()) => return Ok(staging_dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create publication staging directory {}: {error}",
+                    staging_dir.display()
+                ));
+            }
+        }
     }
+    Err("failed to allocate a unique publication staging directory".to_string())
+}
+
+fn write_synced_artifact(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("failed to create artifact {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("failed to write artifact {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("failed to sync artifact {}: {error}", path.display()))
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -2262,7 +2671,11 @@ fn safe_text(text: impl AsRef<str>) -> String {
 mod tests {
     use super::*;
     use serde::Serializer;
-    use singularity_evaluation::{Argv, GitCommit, RelativePath, RemoteRepository, ToolName};
+    use singularity_agent::UPDATE_PLAN_TOOL;
+    use singularity_evaluation::{
+        Argv, GitCommit, RelativePath, RemoteRepository, ToolCapabilityName,
+        ToolCapabilityRequirement,
+    };
     use singularity_tools::{
         CommandRequest, CommandResult, SandboxBackendEnforcement, SandboxCapabilities,
     };
@@ -2274,6 +2687,18 @@ mod tests {
             cwd: None,
             timeout_seconds: Some(30),
             network_access: NetworkAccess::Denied,
+        }
+    }
+
+    fn requirement(capability: ToolCapability) -> ToolCapabilityRequirement {
+        let name = serde_json::to_value(capability)
+            .expect("capability serializes")
+            .as_str()
+            .expect("capability serializes as string")
+            .to_string();
+        ToolCapabilityRequirement {
+            capability: ToolCapabilityName::new(name).expect("capability name"),
+            minimum_version: 1,
         }
     }
 
@@ -2344,14 +2769,17 @@ mod tests {
             description: "description".to_string(),
             instructions: "fix the bug".to_string(),
             allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            allowed_tools: vec![
-                ToolName::new(TOOL_READ).expect("tool"),
-                ToolName::new(TOOL_COMMAND).expect("tool"),
+            required_tool_capabilities: vec![
+                requirement(ToolCapability::WorkspaceRead),
+                requirement(ToolCapability::CommandExecution),
             ],
             smoke_commands: vec![command(&["cargo", "test"])],
         };
 
-        let prompt = agent_prompt(&projection);
+        let prompt = agent_prompt(
+            &projection,
+            &[TOOL_READ.to_string(), TOOL_COMMAND.to_string()],
+        );
         assert!(prompt.contains("\"command\":\"cargo test\""));
         assert!(!prompt.contains("sandbox_mode"));
         assert!(!prompt.contains("network_access"));
@@ -2447,7 +2875,7 @@ mod tests {
             description: "description".to_string(),
             instructions: "fix".to_string(),
             allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            allowed_tools: vec![ToolName::new(TOOL_COMMAND).expect("tool")],
+            required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
             smoke_commands: vec![smoke.clone(), smoke.clone()],
         };
         let tool_result = successful_command_result("call-1", &smoke, workspace.path());
@@ -2488,9 +2916,9 @@ mod tests {
             description: "description".to_string(),
             instructions: "fix".to_string(),
             allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            allowed_tools: vec![
-                ToolName::new(TOOL_EDIT).expect("tool"),
-                ToolName::new(TOOL_COMMAND).expect("tool"),
+            required_tool_capabilities: vec![
+                requirement(ToolCapability::WorkspaceWrite),
+                requirement(ToolCapability::CommandExecution),
             ],
             smoke_commands: vec![smoke.clone()],
         };
@@ -2523,7 +2951,7 @@ mod tests {
             description: "description".to_string(),
             instructions: "fix".to_string(),
             allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            allowed_tools: vec![ToolName::new(TOOL_COMMAND).expect("tool")],
+            required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
             smoke_commands: vec![smoke.clone()],
         };
         let smoke_result = successful_command_result("call-smoke", &smoke, workspace.path());
@@ -2576,19 +3004,25 @@ mod tests {
 
     #[test]
     fn registry_exposes_only_manifest_tools() {
-        let projection = AgentTaskProjection {
+        let mut projection = AgentTaskProjection {
             task_id: TaskId::new("task-1").expect("task id"),
             description: "description".to_string(),
             instructions: "fix".to_string(),
             allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            allowed_tools: vec![ToolName::new(TOOL_READ).expect("tool")],
+            required_tool_capabilities: vec![requirement(ToolCapability::WorkspaceRead)],
             smoke_commands: Vec::new(),
         };
         let registry = evaluation_registry(&projection).expect("registry");
-        assert!(registry.get(TOOL_READ).is_some());
-        assert!(registry.get(UPDATE_PLAN_TOOL).is_none());
-        assert!(registry.get(TOOL_COMMAND).is_none());
-        assert!(registry.get(TOOL_EDIT).is_none());
+        assert!(registry.registry.get(TOOL_READ).is_some());
+        assert!(registry.registry.get(TOOL_LIST).is_some());
+        assert!(registry.registry.get(UPDATE_PLAN_TOOL).is_none());
+        assert!(registry.registry.get(TOOL_COMMAND).is_none());
+        assert!(registry.registry.get(TOOL_EDIT).is_none());
+
+        projection.required_tool_capabilities = vec![requirement(ToolCapability::WorkspaceSearch)];
+        let registry = evaluation_registry(&projection).expect("search registry");
+        assert!(registry.registry.get(TOOL_GREP).is_some());
+        assert!(registry.registry.get(TOOL_READ).is_none());
     }
 
     #[test]
@@ -2599,12 +3033,12 @@ mod tests {
             description: "description".to_string(),
             instructions: "fix".to_string(),
             allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
-            allowed_tools: vec![ToolName::new(TOOL_COMMAND).expect("tool")],
+            required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
             smoke_commands: vec![smoke.clone()],
         };
 
         let registry = evaluation_registry(&projection).expect("registry");
-        let command = registry.get(TOOL_COMMAND).expect("command tool");
+        let command = registry.registry.get(TOOL_COMMAND).expect("command tool");
         let payload = smoke_command_model_input(&smoke);
 
         assert_eq!(
@@ -2617,11 +3051,13 @@ mod tests {
         assert!(command.input_schema.get("sandbox_mode").is_none());
         assert!(!command.input_schema.to_string().contains("network_access"));
         let (_, execution_input) = registry
+            .registry
             .prepare_model_input(TOOL_COMMAND, &payload)
             .expect("declared command model input");
         assert_eq!(execution_input, payload);
         assert!(
             registry
+                .registry
                 .validate_execution_input(TOOL_COMMAND, &execution_input)
                 .is_ok()
         );
@@ -2629,11 +3065,27 @@ mod tests {
         undeclared["command"] = json!("cargo check");
         assert_eq!(
             registry
+                .registry
                 .prepare_model_input(TOOL_COMMAND, &undeclared)
                 .expect_err("undeclared command must fail locally")
                 .code,
             "input_not_allowed"
         );
+    }
+
+    #[test]
+    fn smoke_commands_require_a_registry_resolved_command_capability() {
+        let projection = AgentTaskProjection {
+            task_id: TaskId::new("task-1").expect("task id"),
+            description: "description".to_string(),
+            instructions: "fix".to_string(),
+            allowed_paths: vec![RelativePath::new("src/lib.rs").expect("path")],
+            required_tool_capabilities: vec![requirement(ToolCapability::WorkspaceRead)],
+            smoke_commands: vec![command(&["cargo", "test"])],
+        };
+
+        let error = evaluation_registry(&projection).expect_err("missing command capability");
+        assert!(error.contains("registry-resolved command execution tool"));
     }
 
     #[test]
@@ -2681,6 +3133,7 @@ mod tests {
             &output_root,
             &long_run_id,
             std::slice::from_ref(&long_task_id),
+            1,
             WINDOWS_MAX_PATH_CHARS,
         )
         .expect_err("full-SHA evaluation paths must exceed the conservative budget");
@@ -2700,6 +3153,7 @@ mod tests {
             &output_root,
             &run_id,
             std::slice::from_ref(&task_id),
+            1,
             WINDOWS_MAX_PATH_CHARS,
         )
         .expect("short evaluation paths must fit the conservative budget");
@@ -2713,7 +3167,8 @@ mod tests {
         let run_id = "a".repeat(40);
         let task_id = "b".repeat(40);
         let manifest = json!({
-            "schema_version": "evaluation.task_set/v4",
+            "schema_version": "evaluation.task_set/v5",
+            "trial_count": 1,
             "tasks": [{
                 "task_id": task_id,
                 "description": "path budget preflight",
@@ -2724,7 +3179,9 @@ mod tests {
                 "agent": {
                     "instructions": "inspect",
                     "allowed_paths": ["README.md"],
-                    "allowed_tools": ["read"]
+                    "required_tool_capabilities": [
+                        {"capability": "workspace_read", "minimum_version": 1}
+                    ]
                 },
                 "evaluator": {
                     "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
@@ -2842,10 +3299,13 @@ mod tests {
             description: "description".to_string(),
             instructions: "fix".to_string(),
             allowed_paths: vec![RelativePath::new("src").expect("path")],
-            allowed_tools: vec![ToolName::new(TOOL_EDIT).expect("tool")],
+            required_tool_capabilities: vec![requirement(ToolCapability::WorkspaceWrite)],
             smoke_commands: Vec::new(),
         };
-        let policy = evaluation_policy(Path::new("C:/workspace"), &projection);
+        let resolved_tools = evaluation_registry(&projection).expect("resolved write tools");
+        assert!(resolved_tools.registry.get(TOOL_EDIT).is_some());
+        assert!(resolved_tools.registry.get(TOOL_PATCH).is_some());
+        let policy = evaluation_policy(Path::new("C:/workspace"), &projection, &resolved_tools);
         let allowed = policy.evaluate(&singularity_policy::PermissionRequest::new(
             singularity_policy::ToolId::new(TOOL_EDIT).expect("tool id"),
             PermissionOperation::Write,
@@ -3072,6 +3532,147 @@ mod tests {
     }
 
     #[test]
+    fn trials_reuse_one_read_only_prepared_source_and_keep_stage_roots_isolated() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let run_dir = temp.path().join("run");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::create_dir(&run_dir).expect("run directory");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let manifest_json = json!({
+            "schema_version": "evaluation.task_set/v5",
+            "trial_count": 3,
+            "tasks": [{
+                "task_id": "source-reuse",
+                "description": "verify source reuse",
+                "capabilities": ["repository_context"],
+                "workspace": {"source": {"type": "local", "path": "fixture"}},
+                "agent": {
+                    "instructions": "inspect",
+                    "allowed_paths": ["README.md"],
+                    "required_tool_capabilities": [
+                        {"capability": "workspace_read", "minimum_version": 1}
+                    ]
+                },
+                "evaluator": {
+                    "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
+                    "public": {"commands": [{"argv": ["cargo", "test"]}]},
+                    "hidden": {"commands": [{"argv": ["cargo", "check"]}]}
+                }
+            }]
+        });
+        let manifest = EvaluationManifest::from_json_str(
+            &serde_json::to_string(&manifest_json).expect("manifest JSON"),
+            temp.path(),
+        )
+        .expect("manifest");
+        let plan = manifest
+            .workspace_plan(&TaskId::new("source-reuse").expect("task id"))
+            .expect("plan");
+
+        let evaluation = run_task_trials(
+            &RunId::new("source-reuse-run").expect("run id"),
+            &run_dir,
+            temp.path(),
+            &plan,
+            3,
+            Arc::new(SourceSandboxBackend),
+            &ProviderConfigSnapshot::capture(|_| None),
+        );
+
+        let task_root = run_dir.join("source-reuse");
+        assert_eq!(
+            fs::read_to_string(task_root.join(SOURCE_DIR).join("README.md"))
+                .expect("prepared source"),
+            "seed"
+        );
+        assert_eq!(evaluation.trials.len(), 3);
+        for trial in 1usize..=3 {
+            let trial_dir = task_root.join(format!("trial-{trial:04}"));
+            assert!(trial_dir.is_dir());
+            assert!(!trial_dir.join(SOURCE_DIR).exists());
+            assert_eq!(
+                evaluation.trials[trial - 1].result.status,
+                EvaluationStatus::Blocked
+            );
+        }
+    }
+
+    #[test]
+    fn v5_blocked_run_publishes_v6_result_and_v2_evidence_as_one_artifact_set() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let output_root = temp.path().join("output");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let manifest_path = temp.path().join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "evaluation.task_set/v5",
+                "trial_count": 2,
+                "tasks": [{
+                    "task_id": "blocked-artifacts",
+                    "description": "verify blocked artifacts",
+                    "capabilities": ["repository_context"],
+                    "workspace": {"source": {"type": "local", "path": "fixture"}},
+                    "agent": {
+                        "instructions": "inspect",
+                        "allowed_paths": ["README.md"],
+                        "required_tool_capabilities": [
+                            {"capability": "workspace_read", "minimum_version": 1}
+                        ]
+                    },
+                    "evaluator": {
+                        "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
+                        "public": {"commands": [{"argv": ["cargo", "test"]}]},
+                        "hidden": {"commands": [{"argv": ["cargo", "check"]}]}
+                    }
+                }]
+            }))
+            .expect("manifest JSON"),
+        )
+        .expect("manifest file");
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "blocked-artifacts-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+
+        let response = run_evaluation(
+            &params,
+            Arc::new(SourceSandboxBackend),
+            &ProviderConfigSnapshot::capture(|_| None),
+        )
+        .expect("blocked run still publishes typed artifacts");
+
+        assert_eq!(response.status, "blocked");
+        let result_path = PathBuf::from(response.result_path.expect("result path"));
+        let evidence_path = PathBuf::from(response.evidence_path.expect("evidence path"));
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(&result_path).expect("result artifact"),
+        )
+        .expect("result v6");
+        let evidence = singularity_evaluation::EvaluationEvidence::from_json_str(
+            &fs::read_to_string(&evidence_path).expect("evidence artifact"),
+        )
+        .expect("evidence v2");
+        evidence
+            .validate_against_result(&result)
+            .expect("result/evidence binding");
+        assert_eq!(result.summary.trials_per_task, 2);
+        assert_eq!(result.summary.blocked_trial_count, 2);
+        assert_eq!(result.summary.agent_scored_trial_count, 0);
+        assert!(
+            output_root
+                .join("blocked-artifacts-run")
+                .join(PUBLICATION_DIR)
+                .join(PUBLICATION_MANIFEST_FILE)
+                .is_file()
+        );
+    }
+
+    #[test]
     fn report_source_provenance_records_tree_identity_without_remote_credentials() {
         let temp = tempfile::tempdir().expect("temp");
         let local_source = temp.path().join("local-source");
@@ -3138,27 +3739,35 @@ mod tests {
     }
 
     #[test]
-    fn result_commit_marker_requires_complete_report_and_evidence_artifacts() {
+    fn atomic_publication_requires_complete_report_and_evidence_artifacts() {
         let temp = tempfile::tempdir().expect("temp");
-        let result_path = temp.path().join("result.json");
-        let report_path = temp.path().join("report.json");
-        let evidence_path = temp.path().join("evidence.json");
-        fs::create_dir(&result_path).expect("blocking result directory");
+        let run_id = RunId::new("atomic-publication").expect("run id");
+        fs::create_dir(temp.path().join(PUBLICATION_DIR)).expect("blocking publication directory");
+        fs::write(
+            temp.path().join(PUBLICATION_DIR).join("sentinel"),
+            "existing publication",
+        )
+        .expect("non-empty publication directory");
 
         let error = publish_evaluation_artifacts(
-            &result_path,
+            temp.path(),
+            &run_id,
             &json!({"status": "completed"}),
-            &report_path,
             &json!({"runner": RUNNER_NAME}),
-            &evidence_path,
-            &json!({"schema_version": "evaluation.evidence/v1"}),
+            &json!({"schema_version": "evaluation.evidence/v2"}),
         )
         .expect_err("publish must fail");
 
-        assert!(error.contains("failed to publish artifact"));
-        assert!(!report_path.exists());
-        assert!(!evidence_path.exists());
-        assert!(result_path.is_dir());
+        assert!(error.contains("failed to publish evaluation artifact set"));
+        assert!(temp.path().join(PUBLICATION_DIR).is_dir());
+        assert!(temp.path().join(PUBLICATION_DIR).join("sentinel").is_file());
+        assert!(
+            !temp
+                .path()
+                .join(PUBLICATION_DIR)
+                .join(PUBLICATION_MANIFEST_FILE)
+                .exists()
+        );
         assert_eq!(
             fs::read_dir(temp.path())
                 .expect("directory")
@@ -3167,6 +3776,47 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn publication_manifest_binds_one_immutable_artifact_set() {
+        let temp = tempfile::tempdir().expect("temp");
+        let run_id = RunId::new("atomic-publication").expect("run id");
+        let published = publish_evaluation_artifacts(
+            temp.path(),
+            &run_id,
+            &json!({"schema_version": "evaluation.result/v6"}),
+            &json!({"runner": RUNNER_NAME}),
+            &json!({"schema_version": "evaluation.evidence/v2"}),
+        )
+        .expect("publish artifact set");
+
+        let manifest: Value = serde_json::from_str(
+            &fs::read_to_string(
+                temp.path()
+                    .join(PUBLICATION_DIR)
+                    .join(PUBLICATION_MANIFEST_FILE),
+            )
+            .expect("publication manifest"),
+        )
+        .expect("manifest JSON");
+        assert_eq!(manifest["schema_version"], PUBLICATION_SCHEMA_VERSION);
+        assert_eq!(manifest["run_id"], run_id.as_str());
+        assert_eq!(
+            manifest["result"]["digest"],
+            content_digest(&fs::read(&published.result_path).expect("result artifact"))
+        );
+        assert_eq!(
+            manifest["report"]["digest"],
+            content_digest(&fs::read(&published.report_path).expect("report artifact"))
+        );
+        assert_eq!(
+            manifest["evidence"]["digest"],
+            content_digest(&fs::read(&published.evidence_path).expect("evidence artifact"))
+        );
+        assert!(!temp.path().join(RESULT_FILE).exists());
+        assert!(!temp.path().join(REPORT_FILE).exists());
+        assert!(!temp.path().join(EVIDENCE_FILE).exists());
     }
 
     #[test]
@@ -3194,6 +3844,7 @@ mod tests {
 
         let execution = finish_task(
             &task_id,
+            1,
             StageExecution::passed(Vec::new()),
             StageExecution::passed(Vec::new()),
             StageExecution::passed(Vec::new()),

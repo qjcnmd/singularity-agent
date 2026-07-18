@@ -1,4 +1,4 @@
-//! Evaluation task/result 状态、门禁汇总和 blocker 校验。
+//! Evaluation trial/result 状态、有限统计、门禁汇总和 blocker 校验。
 
 use std::collections::BTreeSet;
 
@@ -6,19 +6,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS, EvaluationCapability, EvaluationError,
-    RESULT_SCHEMA_VERSION, Result, RunId, TaskId, require_schema_version, validation_error,
+    RESULT_SCHEMA_VERSION, Result, RunId, TaskId, ToolCapabilityRequirement,
+    require_schema_version, validation_error,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation result 的 schema 版本。
 pub enum EvaluationResultSchemaVersion {
-    #[serde(rename = "evaluation.result/v5")]
-    V5,
+    #[serde(rename = "evaluation.result/v6")]
+    V6,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 单个任务的执行证据计数和摘要。
+/// 单个 trial 的执行证据计数和摘要。
 pub struct EvaluationEvidenceSummary {
     pub workspace_change_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,61 +51,60 @@ pub struct EvaluationEvidenceSummary {
     pub local_process_fallback_unknown_count: u32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 整个 Evaluation run 的汇总计数和门禁结果。
-pub struct EvaluationRunSummary {
-    pub task_count: u32,
-    pub scored_task_count: u32,
-    pub agent_completed_count: u32,
-    pub tests_passed_count: u32,
-    pub evaluation_passed_count: u32,
-    pub blocked_count: u32,
-    pub task_success_rate_basis_points: u32,
-    pub meets_core_task_success_threshold: bool,
+/// 非 blocked trial 样本的有限值统计。
+pub struct FiniteStatistics {
+    pub sample_count: u32,
+    pub minimum: u64,
+    pub maximum: u64,
+    pub mean: f64,
+    pub population_variance: f64,
 }
 
-impl EvaluationRunSummary {
-    /// 从各任务结果计算不可手工覆盖的 run 汇总。
-    pub fn from_tasks(tasks: &[EvaluationTaskResult]) -> Self {
-        let task_count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
-        let agent_completed_count = count_tasks(tasks, |task| task.agent_completed);
-        let tests_passed_count = count_tasks(tasks, |task| task.tests_passed);
-        let evaluation_passed_count = count_tasks(tasks, |task| task.evaluation_passed);
-        let blocked_count = count_tasks(tasks, |task| task.status == EvaluationStatus::Blocked);
-        let scored_task_count = task_count;
-        let task_success_rate_basis_points = if scored_task_count == 0 {
-            0
-        } else {
-            evaluation_passed_count
-                .saturating_mul(10_000)
-                .checked_div(scored_task_count)
-                .unwrap_or(0)
-        };
-        Self {
-            task_count,
-            scored_task_count,
-            agent_completed_count,
-            tests_passed_count,
-            evaluation_passed_count,
-            blocked_count,
-            task_success_rate_basis_points,
-            meets_core_task_success_threshold: task_success_rate_basis_points
-                >= CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS,
-        }
+impl FiniteStatistics {
+    /// 从整数观测构造不会产生 NaN 或 infinity 的统计。
+    pub fn from_values(values: &[u64]) -> Option<Self> {
+        let (&minimum, &maximum) = (values.iter().min()?, values.iter().max()?);
+        let sample_count = u32::try_from(values.len()).ok()?;
+        let mean = values.iter().map(|value| *value as f64).sum::<f64>() / f64::from(sample_count);
+        let population_variance = values
+            .iter()
+            .map(|value| {
+                let delta = *value as f64 - mean;
+                delta * delta
+            })
+            .sum::<f64>()
+            / f64::from(sample_count);
+        Some(Self {
+            sample_count,
+            minimum,
+            maximum,
+            mean,
+            population_variance,
+        })
     }
-}
 
-fn count_tasks(
-    tasks: &[EvaluationTaskResult],
-    predicate: impl Fn(&EvaluationTaskResult) -> bool,
-) -> u32 {
-    u32::try_from(tasks.iter().filter(|task| predicate(task)).count()).unwrap_or(u32::MAX)
+    fn validate(&self, context: &str) -> Result<()> {
+        if self.sample_count == 0
+            || self.minimum > self.maximum
+            || !self.mean.is_finite()
+            || !self.population_variance.is_finite()
+            || self.population_variance < 0.0
+            || self.mean < self.minimum as f64
+            || self.mean > self.maximum as f64
+        {
+            return Err(validation_error(format!(
+                "{context} must contain finite statistics for at least one sample"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-/// Evaluation run 的生命周期状态。
+/// Evaluation run 或 trial 的生命周期状态。
 pub enum EvaluationStatus {
     Pending,
     Running,
@@ -168,13 +168,17 @@ pub struct StageResult {
 
 impl StageResult {
     fn validate(&self, context: &str) -> Result<()> {
-        validate_stage_blocker(self.status, self.blocker.as_ref(), context)
+        validate_blocker(
+            self.status == StageStatus::Blocked,
+            self.blocker.as_ref(),
+            context,
+        )
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 一个任务的 baseline、agent、public、hidden 阶段结果。
+/// 一个 trial 的 baseline、agent、public、hidden 阶段结果。
 pub struct EvaluationStageResults {
     pub baseline: StageResult,
     pub agent: StageResult,
@@ -183,24 +187,20 @@ pub struct EvaluationStageResults {
 }
 
 impl EvaluationStageResults {
-    fn validate(&self, task_id: &TaskId) -> Result<()> {
+    fn validate(&self, context: &str) -> Result<()> {
         self.baseline
-            .validate(&format!("evaluation task {task_id} baseline stage"))?;
-        self.agent
-            .validate(&format!("evaluation task {task_id} agent stage"))?;
-        self.public
-            .validate(&format!("evaluation task {task_id} public stage"))?;
-        self.hidden
-            .validate(&format!("evaluation task {task_id} hidden stage"))
+            .validate(&format!("{context} baseline stage"))?;
+        self.agent.validate(&format!("{context} agent stage"))?;
+        self.public.validate(&format!("{context} public stage"))?;
+        self.hidden.validate(&format!("{context} hidden stage"))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 单个 Evaluation 任务的最终结果和门禁字段。
-pub struct EvaluationTaskResult {
-    pub task_id: TaskId,
-    pub capabilities: Vec<EvaluationCapability>,
+/// 单个独立 trial 的最终结果和门禁字段。
+pub struct EvaluationTrialResult {
+    pub trial: u32,
     pub status: EvaluationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<EvaluationBlocker>,
@@ -211,24 +211,16 @@ pub struct EvaluationTaskResult {
     pub evidence: EvaluationEvidenceSummary,
 }
 
-impl EvaluationTaskResult {
-    fn validate(&self) -> Result<()> {
-        let context = format!("evaluation task {}", self.task_id);
-        if self.capabilities.is_empty()
-            || self
-                .capabilities
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .len()
-                != self.capabilities.len()
-        {
+impl EvaluationTrialResult {
+    fn validate(&self, task_id: &TaskId) -> Result<()> {
+        let context = format!("evaluation task {task_id} trial {}", self.trial);
+        if self.trial == 0 {
             return Err(validation_error(format!(
-                "{context} capabilities must be non-empty and unique"
+                "{context} trial must be positive"
             )));
         }
         validate_evaluation_blocker(self.status, self.blocker.as_ref(), &context)?;
-        self.stages.validate(&self.task_id)?;
+        self.stages.validate(&context)?;
         if self.agent_completed != (self.stages.agent.status == StageStatus::Passed) {
             return Err(validation_error(format!(
                 "{context} agent_completed must match the agent stage status"
@@ -242,19 +234,14 @@ impl EvaluationTaskResult {
                 "{context} tests_passed requires passed public and hidden stages"
             )));
         }
-        if self.evaluation_passed && self.stages.baseline.status != StageStatus::Passed {
+        if self.evaluation_passed
+            && (self.stages.baseline.status != StageStatus::Passed
+                || !self.agent_completed
+                || !self.tests_passed
+                || self.status != EvaluationStatus::Completed)
+        {
             return Err(validation_error(format!(
-                "{context} evaluation_passed requires a passed baseline stage"
-            )));
-        }
-        if self.evaluation_passed && (!self.agent_completed || !self.tests_passed) {
-            return Err(validation_error(format!(
-                "{context} evaluation_passed requires agent_completed and tests_passed"
-            )));
-        }
-        if self.evaluation_passed && self.status != EvaluationStatus::Completed {
-            return Err(validation_error(format!(
-                "{context} evaluation_passed requires completed status"
+                "{context} evaluation_passed requires completed baseline, agent, and tests"
             )));
         }
         if self.evaluation_passed
@@ -277,7 +264,293 @@ impl EvaluationTaskResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// 同一任务的 trial 分母和状态计数。
+pub struct EvaluationTaskSummary {
+    pub trial_count: u32,
+    pub completed_trial_count: u32,
+    pub failed_trial_count: u32,
+    pub blocked_trial_count: u32,
+    pub agent_scored_trial_count: u32,
+    pub agent_completed_count: u32,
+    pub agent_failed_count: u32,
+    pub evaluation_passed_count: u32,
+}
+
+impl EvaluationTaskSummary {
+    pub fn from_trials(trials: &[EvaluationTrialResult]) -> Self {
+        let trial_count = count_trials(trials, |_| true);
+        let completed_trial_count =
+            count_trials(trials, |trial| trial.status == EvaluationStatus::Completed);
+        let failed_trial_count =
+            count_trials(trials, |trial| trial.status == EvaluationStatus::Failed);
+        let blocked_trial_count =
+            count_trials(trials, |trial| trial.status == EvaluationStatus::Blocked);
+        let agent_scored_trial_count = completed_trial_count.saturating_add(failed_trial_count);
+        let agent_completed_count = count_trials(trials, |trial| {
+            trial.status != EvaluationStatus::Blocked && trial.agent_completed
+        });
+        Self {
+            trial_count,
+            completed_trial_count,
+            failed_trial_count,
+            blocked_trial_count,
+            agent_scored_trial_count,
+            agent_completed_count,
+            agent_failed_count: agent_scored_trial_count.saturating_sub(agent_completed_count),
+            evaluation_passed_count: count_trials(trials, |trial| trial.evaluation_passed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// 多 trial 的稳定性结论和有限指标分布。
+pub struct EvaluationStabilitySummary {
+    pub stable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_turns: Option<FiniteStatistics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<FiniteStatistics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_duration_ms: Option<FiniteStatistics>,
+}
+
+impl EvaluationStabilitySummary {
+    pub fn from_trials(trials: &[EvaluationTrialResult]) -> Self {
+        let scored = trials
+            .iter()
+            .filter(|trial| trial.status != EvaluationStatus::Blocked)
+            .collect::<Vec<_>>();
+        let stable = trials.len() > 1
+            && scored.len() == trials.len()
+            && scored.first().is_some_and(|first| {
+                scored.iter().all(|trial| {
+                    trial.status == first.status
+                        && trial.agent_completed == first.agent_completed
+                        && trial.tests_passed == first.tests_passed
+                        && trial.evaluation_passed == first.evaluation_passed
+                })
+            });
+        Self {
+            stable,
+            model_turns: FiniteStatistics::from_values(
+                &scored
+                    .iter()
+                    .map(|trial| u64::from(trial.evidence.model_turns))
+                    .collect::<Vec<_>>(),
+            ),
+            tool_calls: FiniteStatistics::from_values(
+                &scored
+                    .iter()
+                    .map(|trial| u64::from(trial.evidence.tool_calls))
+                    .collect::<Vec<_>>(),
+            ),
+            agent_duration_ms: FiniteStatistics::from_values(
+                &scored
+                    .iter()
+                    .map(|trial| trial.evidence.agent_duration_ms)
+                    .collect::<Vec<_>>(),
+            ),
+        }
+    }
+
+    fn validate(&self, context: &str, trial_count: u32) -> Result<()> {
+        if trial_count == 1 && self.stable {
+            return Err(validation_error(format!(
+                "{context} single-trial result must report stable=false"
+            )));
+        }
+        for (name, statistic) in [
+            ("model_turns", self.model_turns.as_ref()),
+            ("tool_calls", self.tool_calls.as_ref()),
+            ("agent_duration_ms", self.agent_duration_ms.as_ref()),
+        ] {
+            if let Some(statistic) = statistic {
+                statistic.validate(&format!("{context} {name}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// 一个任务的全部隔离 trial 与派生稳定性结论。
+pub struct EvaluationTaskResult {
+    pub task_id: TaskId,
+    pub capabilities: Vec<EvaluationCapability>,
+    pub required_tool_capabilities: Vec<ToolCapabilityRequirement>,
+    pub status: EvaluationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<EvaluationBlocker>,
+    pub evaluation_passed: bool,
+    pub summary: EvaluationTaskSummary,
+    pub stability: EvaluationStabilitySummary,
+    pub trials: Vec<EvaluationTrialResult>,
+}
+
+impl EvaluationTaskResult {
+    /// 从同一任务的独立 trial 构造不可手工覆盖的汇总。
+    pub fn from_trials(
+        task_id: TaskId,
+        capabilities: Vec<EvaluationCapability>,
+        required_tool_capabilities: Vec<ToolCapabilityRequirement>,
+        trials: Vec<EvaluationTrialResult>,
+    ) -> Self {
+        let summary = EvaluationTaskSummary::from_trials(&trials);
+        let status = aggregate_status(&trials.iter().map(|trial| trial.status).collect::<Vec<_>>());
+        let blocker = (status == EvaluationStatus::Blocked)
+            .then(|| trials.iter().find_map(|trial| trial.blocker.clone()))
+            .flatten();
+        let evaluation_passed =
+            !trials.is_empty() && trials.iter().all(|trial| trial.evaluation_passed);
+        let stability = EvaluationStabilitySummary::from_trials(&trials);
+        Self {
+            task_id,
+            capabilities,
+            required_tool_capabilities,
+            status,
+            blocker,
+            evaluation_passed,
+            summary,
+            stability,
+            trials,
+        }
+    }
+
+    fn validate(&self, trials_per_task: u32) -> Result<()> {
+        let context = format!("evaluation task {}", self.task_id);
+        validate_nonempty_unique(&self.capabilities, &format!("{context} capabilities"))?;
+        validate_nonempty_unique(
+            &self.required_tool_capabilities,
+            &format!("{context} required_tool_capabilities"),
+        )?;
+        if self.trials.len() != usize::try_from(trials_per_task).unwrap_or(usize::MAX) {
+            return Err(validation_error(format!(
+                "{context} trial count must match trials_per_task"
+            )));
+        }
+        for (index, trial) in self.trials.iter().enumerate() {
+            trial.validate(&self.task_id)?;
+            if trial.trial != u32::try_from(index + 1).unwrap_or(u32::MAX) {
+                return Err(validation_error(format!(
+                    "{context} trials must be ordered contiguously from one"
+                )));
+            }
+        }
+        let expected_summary = EvaluationTaskSummary::from_trials(&self.trials);
+        if self.summary != expected_summary {
+            return Err(validation_error(format!(
+                "{context} summary must match trials"
+            )));
+        }
+        let expected_status = aggregate_status(
+            &self
+                .trials
+                .iter()
+                .map(|trial| trial.status)
+                .collect::<Vec<_>>(),
+        );
+        if self.status != expected_status {
+            return Err(validation_error(format!(
+                "{context} status must match trials"
+            )));
+        }
+        validate_evaluation_blocker(self.status, self.blocker.as_ref(), &context)?;
+        if self.evaluation_passed != self.trials.iter().all(|trial| trial.evaluation_passed) {
+            return Err(validation_error(format!(
+                "{context} evaluation_passed must match all trials"
+            )));
+        }
+        let expected_stability = EvaluationStabilitySummary::from_trials(&self.trials);
+        if self.stability != expected_stability {
+            return Err(validation_error(format!(
+                "{context} stability must match trials"
+            )));
+        }
+        self.stability.validate(&context, trials_per_task)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// 整个 Evaluation run 的 trial 分母和门禁结果。
+pub struct EvaluationRunSummary {
+    pub task_count: u32,
+    pub trials_per_task: u32,
+    pub trial_count: u32,
+    pub completed_trial_count: u32,
+    pub failed_trial_count: u32,
+    pub blocked_trial_count: u32,
+    pub agent_scored_trial_count: u32,
+    pub agent_completed_count: u32,
+    pub agent_failed_count: u32,
+    pub evaluation_passed_count: u32,
+    pub task_success_rate_basis_points: u32,
+    pub meets_core_task_success_threshold: bool,
+}
+
+impl EvaluationRunSummary {
+    pub fn from_tasks(tasks: &[EvaluationTaskResult], trials_per_task: u32) -> Self {
+        let task_count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
+        let trial_count = tasks.iter().map(|task| task.summary.trial_count).sum();
+        let completed_trial_count = tasks
+            .iter()
+            .map(|task| task.summary.completed_trial_count)
+            .sum();
+        let failed_trial_count = tasks
+            .iter()
+            .map(|task| task.summary.failed_trial_count)
+            .sum();
+        let blocked_trial_count = tasks
+            .iter()
+            .map(|task| task.summary.blocked_trial_count)
+            .sum();
+        let agent_scored_trial_count = tasks
+            .iter()
+            .map(|task| task.summary.agent_scored_trial_count)
+            .sum();
+        let agent_completed_count = tasks
+            .iter()
+            .map(|task| task.summary.agent_completed_count)
+            .sum();
+        let agent_failed_count = tasks
+            .iter()
+            .map(|task| task.summary.agent_failed_count)
+            .sum();
+        let evaluation_passed_count: u32 = tasks
+            .iter()
+            .map(|task| task.summary.evaluation_passed_count)
+            .sum();
+        let task_success_rate_basis_points = if agent_scored_trial_count == 0 {
+            0
+        } else {
+            evaluation_passed_count
+                .saturating_mul(10_000)
+                .checked_div(agent_scored_trial_count)
+                .unwrap_or(0)
+        };
+        Self {
+            task_count,
+            trials_per_task,
+            trial_count,
+            completed_trial_count,
+            failed_trial_count,
+            blocked_trial_count,
+            agent_scored_trial_count,
+            agent_completed_count,
+            agent_failed_count,
+            evaluation_passed_count,
+            task_success_rate_basis_points,
+            meets_core_task_success_threshold: task_success_rate_basis_points
+                >= CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 一个 Evaluation run 的稳定结果。
 pub struct EvaluationResult {
@@ -292,7 +565,6 @@ pub struct EvaluationResult {
 }
 
 impl EvaluationResult {
-    /// 从 JSON 读取并校验稳定结果。
     pub fn from_json_str(json: &str) -> Result<Self> {
         require_schema_version(json, RESULT_SCHEMA_VERSION)?;
         let result: Self = serde_json::from_str(json)?;
@@ -300,40 +572,75 @@ impl EvaluationResult {
         Ok(result)
     }
 
-    /// 校验结果、阶段状态和汇总字段的一致性。
     pub fn validate(&self) -> Result<()> {
-        validate_evaluation_blocker(self.status, self.blocker.as_ref(), "evaluation run")?;
-        if self.tasks.is_empty() {
+        if self.tasks.is_empty() || self.summary.trials_per_task == 0 {
             return Err(validation_error(
-                "evaluation result requires at least one task result",
+                "evaluation result requires tasks and a positive trials_per_task",
             ));
         }
         let mut task_ids = BTreeSet::new();
         for task in &self.tasks {
-            task.validate()?;
+            task.validate(self.summary.trials_per_task)?;
             if !task_ids.insert(task.task_id.clone()) {
                 return Err(EvaluationError::DuplicateTaskId(task.task_id.clone()));
             }
         }
-        let expected_summary = EvaluationRunSummary::from_tasks(&self.tasks);
+        let expected_summary =
+            EvaluationRunSummary::from_tasks(&self.tasks, self.summary.trials_per_task);
         if self.summary != expected_summary {
             return Err(validation_error(
-                "evaluation run summary must match the task results",
+                "evaluation run summary must match trial results",
             ));
         }
-        let all_tasks_passed = self.tasks.iter().all(|task| task.evaluation_passed);
-        if self.evaluation_passed != all_tasks_passed {
+        let expected_status = aggregate_status(
+            &self
+                .tasks
+                .iter()
+                .map(|task| task.status)
+                .collect::<Vec<_>>(),
+        );
+        if self.status != expected_status {
             return Err(validation_error(
-                "evaluation run evaluation_passed must equal all task evaluation_passed values",
+                "evaluation run status must match task results",
             ));
         }
-        if self.evaluation_passed && self.status != EvaluationStatus::Completed {
+        validate_evaluation_blocker(self.status, self.blocker.as_ref(), "evaluation run")?;
+        if self.evaluation_passed != self.tasks.iter().all(|task| task.evaluation_passed) {
             return Err(validation_error(
-                "evaluation run evaluation_passed requires completed status",
+                "evaluation run evaluation_passed must equal all task values",
             ));
         }
         Ok(())
     }
+}
+
+fn aggregate_status(statuses: &[EvaluationStatus]) -> EvaluationStatus {
+    if statuses
+        .iter()
+        .all(|status| *status == EvaluationStatus::Completed)
+    {
+        EvaluationStatus::Completed
+    } else if statuses.contains(&EvaluationStatus::Failed) {
+        EvaluationStatus::Failed
+    } else {
+        EvaluationStatus::Blocked
+    }
+}
+
+fn count_trials(
+    trials: &[EvaluationTrialResult],
+    predicate: impl Fn(&EvaluationTrialResult) -> bool,
+) -> u32 {
+    u32::try_from(trials.iter().filter(|trial| predicate(trial)).count()).unwrap_or(u32::MAX)
+}
+
+fn validate_nonempty_unique<T: Ord + Clone>(values: &[T], context: &str) -> Result<()> {
+    if values.is_empty() || values.iter().cloned().collect::<BTreeSet<_>>().len() != values.len() {
+        return Err(validation_error(format!(
+            "{context} must be non-empty and unique"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_evaluation_blocker(
@@ -342,14 +649,6 @@ fn validate_evaluation_blocker(
     context: &str,
 ) -> Result<()> {
     validate_blocker(status == EvaluationStatus::Blocked, blocker, context)
-}
-
-fn validate_stage_blocker(
-    status: StageStatus,
-    blocker: Option<&EvaluationBlocker>,
-    context: &str,
-) -> Result<()> {
-    validate_blocker(status == StageStatus::Blocked, blocker, context)
 }
 
 fn validate_blocker(

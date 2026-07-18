@@ -4,20 +4,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_agent::{AgentLoopResult, terminal_command_scope_digests};
 use singularity_evaluation::{
     CommandSpec, EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationScopeEvidence,
-    EvaluationTaskEvidence, EvidenceVerdict, PlannedWorkspaceSource, RunId, WorkspacePlan,
-    task_selection_digest,
+    EvaluationTaskEvidence, EvaluationTrialEvidence, EvidenceVerdict, PlannedWorkspaceSource,
+    RunId, WorkspacePlan, task_selection_digest,
 };
 use singularity_tools::ToolResult;
 
 use super::command::command_scope_digest_for_spec;
 use super::{
     AGENT_DIR, BASELINE_DIR, DEFAULT_COMMAND_TIMEOUT_SECONDS, HIDDEN_DIR, PUBLIC_DIR,
-    StageDiagnostics, TOOL_COMMAND, TaskExecution,
+    StageDiagnostics, TOOL_COMMAND, TaskEvaluation, TaskExecution,
 };
 
 /// 从任务计划和执行诊断构造脱敏 evidence。
@@ -25,7 +26,7 @@ pub(super) fn build_evaluation_evidence(
     run_id: &RunId,
     manifest_digest: String,
     plans: &[WorkspacePlan],
-    executions: &[TaskExecution],
+    executions: &[TaskEvaluation],
     run_dir: &Path,
 ) -> Result<EvaluationEvidence, String> {
     if plans.len() != executions.len() {
@@ -41,11 +42,18 @@ pub(super) fn build_evaluation_evidence(
         .map(|plan| plan.task_id.clone())
         .collect::<Vec<_>>();
     let evidence = EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V1,
+        schema_version: EvaluationEvidenceSchemaVersion::V2,
         run_id: run_id.clone(),
         manifest_digest,
         task_selection_digest: task_selection_digest(&task_ids),
         denominator_task_count: u32::try_from(tasks.len()).unwrap_or(u32::MAX),
+        trials_per_task: executions.first().map_or(0, |execution| {
+            u32::try_from(execution.trials.len()).unwrap_or(u32::MAX)
+        }),
+        denominator_trial_count: executions
+            .iter()
+            .map(|execution| u32::try_from(execution.trials.len()).unwrap_or(u32::MAX))
+            .sum(),
         tasks,
     };
     evidence
@@ -57,6 +65,48 @@ pub(super) fn build_evaluation_evidence(
 /// 计算产物内容摘要。
 pub(super) fn content_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+/// 对 JSON 对象键排序后计算稳定摘要，避免 map 插入顺序影响指纹。
+pub(super) fn canonical_json_digest(value: &impl Serialize) -> Result<String, String> {
+    let value = serde_json::to_value(value)
+        .map_err(|error| format!("failed to serialize canonical JSON fingerprint: {error}"))?;
+    let mut bytes = Vec::new();
+    write_canonical_json(&value, &mut bytes)?;
+    Ok(content_digest(&bytes))
+}
+
+fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            output.push(b'{');
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key)
+                    .map_err(|error| format!("failed to serialize canonical JSON key: {error}"))?;
+                output.push(b':');
+                write_canonical_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+        Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        _ => serde_json::to_writer(output, value)
+            .map_err(|error| format!("failed to serialize canonical JSON value: {error}"))?,
+    }
+    Ok(())
 }
 
 /// 从 Agent 结果提取 command scope 与未知审计计数。
@@ -104,11 +154,9 @@ pub(super) fn safe_command_scope_digest(tool_result: &ToolResult) -> Option<&str
 
 fn build_task_evidence(
     plan: &WorkspacePlan,
-    execution: &TaskExecution,
+    execution: &TaskEvaluation,
     run_dir: &Path,
 ) -> Result<EvaluationTaskEvidence, String> {
-    let diagnostics = &execution.diagnostics;
-    let task_dir = run_dir.join(plan.task_id.as_str());
     let allowed_paths = plan
         .agent
         .projection
@@ -116,6 +164,54 @@ fn build_task_evidence(
         .iter()
         .map(|path| path.as_str().to_string())
         .collect::<Vec<_>>();
+    let requirements = plan
+        .agent
+        .projection
+        .required_tool_capabilities
+        .iter()
+        .map(|requirement| {
+            format!(
+                "{}@{}",
+                requirement.capability.as_str(),
+                requirement.minimum_version
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_commit = match &plan.source {
+        PlannedWorkspaceSource::RemoteGit { commit, .. } => Some(commit.clone()),
+        PlannedWorkspaceSource::Local { .. } => None,
+    };
+    let trials = execution
+        .trials
+        .iter()
+        .map(|trial| build_trial_evidence(plan, trial, run_dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EvaluationTaskEvidence {
+        task_id: plan.task_id.clone(),
+        source_tree_digest: execution
+            .trials
+            .first()
+            .and_then(|trial| trial.diagnostics.source.as_ref())
+            .and_then(|source| source.tree_digest.clone()),
+        source_commit,
+        allowed_paths_digest: set_strings_digest("evaluation.allowed_paths/v2", &allowed_paths),
+        tool_capability_requirements_digest: set_strings_digest(
+            "evaluation.tool_capability_requirements/v1",
+            &requirements,
+        ),
+        trials,
+    })
+}
+
+fn build_trial_evidence(
+    plan: &WorkspacePlan,
+    execution: &TaskExecution,
+    run_dir: &Path,
+) -> Result<EvaluationTrialEvidence, String> {
+    let diagnostics = &execution.diagnostics;
+    let task_dir = run_dir
+        .join(plan.task_id.as_str())
+        .join(format!("trial-{:04}", execution.result.trial));
     let changed_paths_digest = diagnostics
         .patch_evidence_path
         .as_ref()
@@ -132,18 +228,8 @@ fn build_task_evidence(
         .as_deref()
         .map(|path| artifact_digest(Path::new(path)))
         .transpose()?;
-    let source_commit = match &plan.source {
-        PlannedWorkspaceSource::RemoteGit { commit, .. } => Some(commit.clone()),
-        PlannedWorkspaceSource::Local { .. } => None,
-    };
-    Ok(EvaluationTaskEvidence {
-        task_id: plan.task_id.clone(),
-        source_tree_digest: diagnostics
-            .source
-            .as_ref()
-            .and_then(|source| source.tree_digest.clone()),
-        source_commit,
-        allowed_paths_digest: set_strings_digest("evaluation.allowed_paths/v1", &allowed_paths),
+    Ok(EvaluationTrialEvidence {
+        trial: execution.result.trial,
         changed_paths_digest,
         allowlist,
         smoke: smoke_scope_evidence(
@@ -171,6 +257,10 @@ fn build_task_evidence(
         ),
         trace_digest,
         patch_digest: diagnostics.patch_digest.clone(),
+        prompt_structure: diagnostics.prompt_structure.clone(),
+        prompt_fingerprint: diagnostics.prompt_fingerprint.clone(),
+        tool_schema_fingerprint: diagnostics.tool_schema_fingerprint.clone(),
+        provider: diagnostics.provider_evidence.clone(),
         local_process_fallback_count: u32::try_from(diagnostics.local_process_fallback_count)
             .unwrap_or(u32::MAX),
         local_process_fallback_unknown_count: u32::try_from(
