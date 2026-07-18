@@ -14,8 +14,40 @@ defaults:
     shell: pwsh
 
 jobs:
+  supply-chain:
+    name: Supply-chain policy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Install pinned supply-chain tools
+        run: |
+          $toolRoot = Join-Path $env:RUNNER_TEMP "cargo-tools"
+          $auditRoot = Join-Path $toolRoot "cargo-audit"
+          $denyRoot = Join-Path $toolRoot "cargo-deny"
+          cargo install cargo-audit --version 0.22.2 --locked --root $auditRoot
+          cargo install cargo-deny --version 0.20.2 --locked --root $denyRoot
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $auditRoot "bin")
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $denyRoot "bin")
+
+      - name: Audit locked dependencies
+        run: |
+          cargo metadata --workspace --all-features --locked --format-version 1 --no-deps | Out-Null
+          cargo audit --file Cargo.lock --deny warnings
+
+      - name: Check locked dependency policy
+        run: cargo deny --workspace --all-features --locked check advisories bans licenses sources
+
   verify:
     name: Verify (${{ matrix.os }})
+    needs: supply-chain
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -46,6 +78,10 @@ jobs:
   windows-x86_64:
     needs: verify
     runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     outputs:
       package-name: ${{ steps.package.outputs.name }}
 
@@ -57,6 +93,26 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal
           rustup default 1.96.0
+
+      - name: Install pinned SBOM generator
+        id: sbom-tool
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "0.5.9"
+          $url = "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$version/cargo-cyclonedx-x86_64-pc-windows-msvc.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "cargo-cyclonedx-$version.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne "8750e00775661dcb75bc482c1a298839fd94e8a0c033b49905ba0f246ffed202") {
+            throw "cargo-cyclonedx archive hash mismatch: $hash"
+          }
+          $toolDirectory = Join-Path $env:RUNNER_TEMP "cargo-cyclonedx-$version"
+          Expand-Archive -LiteralPath $zip -DestinationPath $toolDirectory -Force
+          $tool = Get-ChildItem -LiteralPath $toolDirectory -Filter "cargo-cyclonedx.exe" -File -Recurse | Select-Object -First 1
+          if ($null -eq $tool) {
+            throw "cargo-cyclonedx executable was not found"
+          }
+          "path=$($tool.FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Build release binaries
         run: cargo build --workspace --bins --release --locked
@@ -93,11 +149,105 @@ jobs:
 
           $archive = Join-Path $PWD "dist/$name.zip"
           Compress-Archive -LiteralPath $directory -DestinationPath $archive
+          $checksumPath = Join-Path $PWD "dist/SHA256SUMS.txt"
           $checksum = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$checksum  $name.zip" | Set-Content -Encoding ascii (Join-Path $PWD "dist/SHA256SUMS.txt")
+          "$checksum  $name.zip" | Set-Content -Encoding ascii $checksumPath
+
+          $appBomStem = "singularity-app-server-sbom"
+          $cliBomStem = "singularity-cli-sbom"
+          $appManifest = Join-Path $PWD "crates/app-server/Cargo.toml"
+          $cliManifest = Join-Path $PWD "crates/cli/Cargo.toml"
+          & "${{ steps.sbom-tool.outputs.path }}" cyclonedx `
+            --manifest-path $appManifest --format json --all-features `
+            --target x86_64-pc-windows-msvc --spec-version 1.5 `
+            --override-filename $appBomStem --quiet
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo-cyclonedx failed for the app-server graph"
+          }
+          & "${{ steps.sbom-tool.outputs.path }}" cyclonedx `
+            --manifest-path $cliManifest --format json --all-features `
+            --target x86_64-pc-windows-msvc --spec-version 1.5 `
+            --override-filename $cliBomStem --quiet
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo-cyclonedx failed for the CLI graph"
+          }
+
+          $appBomFiles = @(Get-ChildItem -LiteralPath (Split-Path $appManifest) -Filter "$appBomStem*.json" -File)
+          $cliBomFiles = @(Get-ChildItem -LiteralPath (Split-Path $cliManifest) -Filter "$cliBomStem*.json" -File)
+          if ($appBomFiles.Count -ne 1 -or $cliBomFiles.Count -ne 1) {
+            throw "expected one generated BOM per release graph"
+          }
+          $bom = Get-Content -Raw -LiteralPath $appBomFiles[0].FullName | ConvertFrom-Json
+          $cliBom = Get-Content -Raw -LiteralPath $cliBomFiles[0].FullName | ConvertFrom-Json
+
+          $componentRefs = [System.Collections.Generic.HashSet[string]]::new()
+          foreach ($component in @($bom.components)) {
+            [void]$componentRefs.Add([string]$component.'bom-ref')
+          }
+          foreach ($component in @($cliBom.components)) {
+            if ($componentRefs.Add([string]$component.'bom-ref')) {
+              $bom.components += $component
+            }
+          }
+          if ($componentRefs.Add([string]$cliBom.metadata.component.'bom-ref')) {
+            $bom.components += $cliBom.metadata.component
+          }
+
+          $dependencyByRef = @{}
+          foreach ($dependency in @($bom.dependencies)) {
+            $dependencyByRef[[string]$dependency.ref] = $dependency
+          }
+          foreach ($dependency in @($cliBom.dependencies)) {
+            $ref = [string]$dependency.ref
+            if ($dependencyByRef.ContainsKey($ref)) {
+              $dependsOn = [System.Collections.Generic.HashSet[string]]::new()
+              foreach ($item in @($dependencyByRef[$ref].dependsOn)) {
+                [void]$dependsOn.Add([string]$item)
+              }
+              foreach ($item in @($dependency.dependsOn)) {
+                [void]$dependsOn.Add([string]$item)
+              }
+              if ($dependencyByRef[$ref].PSObject.Properties.Name -contains "dependsOn") {
+                $dependencyByRef[$ref].dependsOn = @($dependsOn)
+              } else {
+                $dependencyByRef[$ref] | Add-Member -NotePropertyName dependsOn -NotePropertyValue @($dependsOn)
+              }
+            } else {
+              $bom.dependencies += $dependency
+              $dependencyByRef[$ref] = $dependency
+            }
+          }
+
+          $archiveComponent = [ordered]@{
+            type = "file"
+            bom-ref = "artifact:$name.zip"
+            name = "$name.zip"
+            hashes = @(@{ alg = "SHA-256"; content = $checksum })
+          }
+          $checksumHash = (Get-FileHash -LiteralPath $checksumPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumComponent = [ordered]@{
+            type = "file"
+            bom-ref = "artifact:SHA256SUMS.txt"
+            name = "SHA256SUMS.txt"
+            hashes = @(@{ alg = "SHA-256"; content = $checksumHash })
+          }
+          $bom.components += $archiveComponent
+          $bom.components += $checksumComponent
+          $bom.metadata.properties += @(
+            @{ name = "singularity:release:archive"; value = "$name.zip" }
+            @{ name = "singularity:release:checksum"; value = "SHA256SUMS.txt" }
+            @{ name = "singularity:release:sbom-graphs"; value = "singularity_app_server,singularity_cli" }
+          )
+
+          $sbomPath = Join-Path $PWD "dist/$name-sbom.cdx.json"
+          $bom | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $sbomPath -Encoding utf8NoBOM
+          $null = Get-Content -Raw -LiteralPath $sbomPath | ConvertFrom-Json
+          Remove-Item -LiteralPath $appBomFiles[0].FullName, $cliBomFiles[0].FullName -Force
 
           "name=$name" >> $env:GITHUB_OUTPUT
           "archive=$archive" >> $env:GITHUB_OUTPUT
+          "checksum=$checksumPath" >> $env:GITHUB_OUTPUT
+          "sbom=$sbomPath" >> $env:GITHUB_OUTPUT
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -105,8 +255,17 @@ jobs:
           name: ${{ steps.package.outputs.name }}
           path: |
             ${{ steps.package.outputs.archive }}
-            dist/SHA256SUMS.txt
+            ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.sbom }}
           if-no-files-found: error
+
+      - name: Generate artifact provenance attestation
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.sbom }}
 
   publish:
     if: github.ref_type == 'tag'
@@ -131,8 +290,13 @@ jobs:
             throw "expected one release archive, found $($archive.Count)"
           }
           $archive = $archive.FullName
+          $sbom = Get-ChildItem -LiteralPath dist -Filter "*-sbom.cdx.json" -File
+          if ($sbom.Count -ne 1) {
+            throw "expected one release SBOM, found $($sbom.Count)"
+          }
+          $sbom = $sbom.FullName
           if (gh release view $env:GITHUB_REF_NAME *> $null) {
-            gh release upload $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt --clobber
+            gh release upload $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt $sbom --clobber
           } else {
-            gh release create $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt --verify-tag --generate-notes
+            gh release create $env:GITHUB_REF_NAME $archive dist/SHA256SUMS.txt $sbom --verify-tag --generate-notes
           }
