@@ -2,7 +2,10 @@
 
 use singularity_app_server::{AppServer, AppServerError};
 use singularity_model::ProviderConfigSnapshot;
-use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
+use singularity_policy::{
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
+    WorkspaceRelativePath,
+};
 use singularity_store::{SessionStore, StoreError};
 #[cfg(windows)]
 use std::collections::VecDeque;
@@ -20,6 +23,16 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
+
+fn tool_id(value: &str) -> ToolId {
+    ToolId::new(value).expect("valid tool id")
+}
+
+fn workspace_resource(value: &str) -> PermissionResource {
+    PermissionResource::WorkspacePath(
+        WorkspaceRelativePath::from_canonical(value).expect("canonical workspace path"),
+    )
+}
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1016,7 +1029,7 @@ fn approval_defer_remains_pending_while_allow_and_deny_are_consumed() {
             "approval_1",
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            "write_file",
+            tool_id("write_file"),
         );
         store
             .create_approval_with_trace(&request, "approval", "approval requested")
@@ -1127,10 +1140,10 @@ fn approval_decision_allow_without_pending_tool_call_is_rejected() {
         format!("approval_{}_call_1", turn.turn_id),
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "edit",
+        tool_id("edit"),
     )
     .with_tool_call_id("call_1")
-    .with_resources(["README.md"]);
+    .with_resources([workspace_resource("README.md")]);
     store
         .create_approval_with_trace(&request, "approval", "approval requested")
         .expect("approval");
@@ -1212,10 +1225,10 @@ fn pending_approval_prevents_thread_archive_and_delete() {
         "approval_archived",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "edit",
+        tool_id("edit"),
     )
     .with_tool_call_id("call_1")
-    .with_resources(["README.md"]);
+    .with_resources([workspace_resource("README.md")]);
     store
         .create_approval_with_pending_tool_call_and_trace(
             &request,
@@ -1226,7 +1239,7 @@ fn pending_approval_prevents_thread_archive_and_delete() {
                 "tool_call_id": "call_1",
                 "tool_name": "edit",
                 "raw_arguments": "{}",
-                "resources": ["README.md"],
+                "resources": &request.resources,
                 "checkpoint_version": 1,
                 "messages": [],
                 "tool_results": [],
@@ -1308,10 +1321,10 @@ fn allow_resume_precondition_failure_is_terminalized_without_replay() {
         "approval_resume_error",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "edit",
+        tool_id("edit"),
     )
     .with_tool_call_id("call_1")
-    .with_resources(["README.md"]);
+    .with_resources([workspace_resource("README.md")]);
     store
         .create_approval_with_pending_tool_call_and_trace(
             &request,
@@ -1427,10 +1440,10 @@ fn unavailable_workspace_only_blocks_allow_decisions() {
             format!("approval_workspace_missing_{outcome_label}"),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            "edit",
+            tool_id("edit"),
         )
         .with_tool_call_id("call_1")
-        .with_resources(["README.md"]);
+        .with_resources([workspace_resource("README.md")]);
         store
             .create_approval_with_pending_tool_call_and_trace(
                 &request,
@@ -1551,10 +1564,10 @@ fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
         "approval_interrupted",
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "edit",
+        tool_id("edit"),
     )
     .with_tool_call_id("call_1")
-    .with_resources(["README.md"]);
+    .with_resources([workspace_resource("README.md")]);
     store
         .create_approval_with_pending_tool_call_and_trace(
             &request,
@@ -1663,10 +1676,10 @@ fn approval_decision_deny_defer_and_mismatched_resource_do_not_resume_agent_loop
             format!("approval_{}_call_1", turn.turn_id),
             thread_id.to_string(),
             turn.turn_id.clone(),
-            "edit",
+            tool_id("edit"),
         )
         .with_tool_call_id("call_1")
-        .with_resources([request_resource]);
+        .with_resources([workspace_resource(request_resource)]);
         store
             .create_approval_with_trace(&request, "approval", "approval requested")
             .expect("approval");
@@ -1735,7 +1748,12 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
         "Thread not found"
     );
 
-    let request = ApprovalRequest::new("approval_public", "thread_1", "turn_1", "write_file");
+    let request = ApprovalRequest::new(
+        "approval_public",
+        "thread_1",
+        "turn_1",
+        tool_id("write_file"),
+    );
     let request_message = serde_json::json!({
         "method": "approval/request",
         "id": 3,
@@ -2008,10 +2026,10 @@ fn app_server_approval_continuation_keeps_interrupt_and_shutdown_responsive() {
         format!("approval_{}_call_1", turn.turn_id),
         thread.thread_id.clone(),
         turn.turn_id.clone(),
-        "edit",
+        tool_id("edit"),
     )
     .with_tool_call_id("call_1")
-    .with_resources(["README.md"]);
+    .with_resources([workspace_resource("README.md")]);
     let mut checkpoint = approval_checkpoint(&request, "call_1");
     let arguments = serde_json::json!({
         "path": "README.md",

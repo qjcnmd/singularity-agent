@@ -7,16 +7,33 @@ use singularity_sandbox::{
     SandboxNetworkMode,
 };
 use singularity_tools::{
-    CommandToolInput, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, ToolBroker,
-    ToolBrokerDecision, ToolCallRequest, ToolExecutionMode, ToolFailureKind,
+    AgentControlToolExecutor, CommandToolInput, EditToolInput, GrepToolInput, ListToolInput,
+    ReadToolInput, ToolAuthorization, ToolBroker, ToolBrokerDecision, ToolCallRequest,
+    ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolFailureKind,
     ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspacePatch,
-    WorkspacePatchChange, WorkspaceToolError, WorkspaceTools, command_scope_digest,
-    command_script_scope_digest, command_script_scope_resource, workspace_tool_specs,
+    WorkspacePatchChange, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
+    command_scope_digest, command_script_scope_digest, workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn test_tool_spec(
+    name: impl Into<String>,
+    description: impl Into<String>,
+    input_schema: serde_json::Value,
+) -> ToolEntry {
+    let spec = raw_test_tool_spec(name, description, input_schema);
+    ToolEntry::model(
+        spec,
+        1,
+        ToolCapability::PlanManagement,
+        ToolAuthorization::AgentControl,
+        ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan),
+    )
+    .expect("valid test tool entry")
+}
+
+fn raw_test_tool_spec(
     name: impl Into<String>,
     description: impl Into<String>,
     input_schema: serde_json::Value,
@@ -28,6 +45,17 @@ fn test_tool_spec(
         ToolExecutionMode::Exclusive,
         validate_object_input,
     )
+}
+
+fn test_command_entry(spec: ToolSpec) -> ToolEntry {
+    ToolEntry::model(
+        spec,
+        1,
+        ToolCapability::CommandExecution,
+        ToolAuthorization::Command,
+        ToolExecutor::Workspace(WorkspaceToolExecutor::Command),
+    )
+    .expect("valid command test entry")
 }
 
 fn validate_object_input(input: &serde_json::Value) -> Result<(), ToolInputValidationError> {
@@ -261,7 +289,7 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
     let denied = broker.execute(
         &envelope,
         ToolBrokerDecision::deny("policy denied"),
-        |_envelope| panic!("denied tool must not execute"),
+        |_, _envelope| panic!("denied tool must not execute"),
     );
     let denied_payload = denied.to_message_payload();
 
@@ -275,7 +303,7 @@ fn broker_does_not_execute_denied_or_unknown_tools() {
     );
 
     let missing = ToolCallRequest::new("call_2", "mcp.missing.tool", "{}");
-    let unknown = broker.execute(&missing, ToolBrokerDecision::Allow, |_envelope| {
+    let unknown = broker.execute(&missing, ToolBrokerDecision::Allow, |_, _envelope| {
         panic!("unknown tool must not execute")
     });
 
@@ -295,7 +323,7 @@ fn broker_validates_known_tool_input_before_executing_an_allowed_tool() {
     let envelope = ToolCallRequest::new("call_1", "formatter", "[]");
     let mut executed = false;
 
-    let result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
+    let result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_, _envelope| {
         executed = true;
         ToolOutput::success(serde_json::json!({"summary": "must not execute"}))
     });
@@ -318,7 +346,7 @@ fn broker_executes_allowed_tool_and_tool_result_payload_stays_safe() {
         .expect("register tool");
     let envelope = ToolCallRequest::new("call_1", "formatter", r#"{"path": ".env"}"#);
 
-    let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
+    let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_, _envelope| {
         ToolOutput::success(serde_json::json!({"summary": "formatted"}))
     });
     let payload = tool_result.to_message_payload();
@@ -342,7 +370,7 @@ fn broker_tool_result_omits_preview_for_truncated_artifact_result() {
         .expect("register tool");
     let envelope = ToolCallRequest::new("call_1", "read", r#"{"path": "README.md"}"#);
 
-    let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_envelope| {
+    let tool_result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_, _envelope| {
         let mut output = ToolOutput::success(serde_json::json!({
             "content": "x".repeat(10_000),
             "artifact_ref": "artifact://result/readme"
@@ -984,7 +1012,7 @@ fn workspace_grep_supports_case_control_and_deterministic_order() {
 #[test]
 fn exact_tool_inputs_drive_both_projected_schema_and_local_admission() {
     let allowed = serde_json::json!({"path": "README.md"});
-    let mut spec = test_tool_spec("read", "Read a file", serde_json::json!({"type": "object"}));
+    let mut spec = raw_test_tool_spec("read", "Read a file", serde_json::json!({"type": "object"}));
 
     spec.restrict_to_exact_inputs(vec![allowed.clone(), allowed.clone()])
         .expect("restrict exact inputs");
@@ -1063,7 +1091,9 @@ fn command_contract_rejects_policy_fields() {
     );
 
     let mut broker = ToolBroker::default();
-    broker.register(command).expect("register bound command");
+    broker
+        .register(test_command_entry(command))
+        .expect("register bound command");
     let tampered = ToolCallRequest::new(
         "call_1",
         "command",
@@ -1076,7 +1106,7 @@ fn command_contract_rejects_policy_fields() {
         .to_string(),
     );
     let mut executed = false;
-    let result = broker.execute(&tampered, ToolBrokerDecision::Allow, |_| {
+    let result = broker.execute(&tampered, ToolBrokerDecision::Allow, |_, _| {
         executed = true;
         ToolOutput::success(serde_json::json!({"summary": "must not execute"}))
     });
@@ -1088,7 +1118,7 @@ fn command_contract_rejects_policy_fields() {
 #[test]
 fn exact_input_bindings_reject_ambiguous_mappings() {
     let model_input = serde_json::json!({"path": "README.md"});
-    let mut spec = test_tool_spec("read", "Read a file", serde_json::json!({"type": "object"}));
+    let mut spec = raw_test_tool_spec("read", "Read a file", serde_json::json!({"type": "object"}));
 
     let error = spec
         .restrict_to_input_bindings(vec![
@@ -1795,7 +1825,7 @@ fn broker_ask_decision_blocks_execution_with_safe_approval_tool_result() {
     let tool_result = broker.execute(
         &envelope,
         ToolBrokerDecision::ask("approval_1", "operator approval required"),
-        |_envelope| panic!("ask decision must not execute"),
+        |_, _envelope| panic!("ask decision must not execute"),
     );
     let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
@@ -2006,17 +2036,6 @@ fn command_scope_digest_binds_exact_argv_cwd_and_timeout() {
         base,
         "sha256:ece623945e0ecd850e29830be37f7c47675c84314d8a5f8304653e808154479b"
     );
-    let resource = singularity_tools::command_scope_resource(
-        &argv,
-        ".",
-        5,
-        &SandboxFilesystemMode::WorkspaceWrite,
-        &SandboxNetworkMode::Denied,
-    );
-    assert!(resource.contains("\"cwd\":\".\""));
-    assert!(resource.contains("\"timeout_seconds\":5"));
-    assert!(resource.contains("\"sandbox_mode\":\"workspace_write\""));
-    assert!(resource.contains("\"network_access\":\"denied\""));
     assert_ne!(
         base,
         command_scope_digest(
@@ -2051,26 +2070,6 @@ fn command_scope_digest_binds_exact_argv_cwd_and_timeout() {
             &SandboxNetworkMode::Denied,
         )
     );
-    assert_ne!(
-        resource,
-        singularity_tools::command_scope_resource(
-            &argv,
-            "src",
-            5,
-            &SandboxFilesystemMode::WorkspaceWrite,
-            &SandboxNetworkMode::Denied,
-        )
-    );
-    assert_ne!(
-        resource,
-        singularity_tools::command_scope_resource(
-            &argv,
-            ".",
-            6,
-            &SandboxFilesystemMode::WorkspaceWrite,
-            &SandboxNetworkMode::Denied,
-        )
-    );
 }
 
 #[test]
@@ -2083,9 +2082,8 @@ fn command_script_scope_digest_binds_script_without_exposing_it() {
     );
     assert_ne!(base, command_script_scope_digest(script, "C:/other", 5));
     assert_ne!(base, command_script_scope_digest(script, "C:/workspace", 6));
-    let resource = command_script_scope_resource(script, "C:/workspace", 5);
-    assert!(resource.contains("scope_digest:"));
-    assert!(!resource.contains(script));
+    assert!(base.starts_with("sha256:"));
+    assert!(!base.contains(script));
 }
 
 struct RecordingSandboxBackend;

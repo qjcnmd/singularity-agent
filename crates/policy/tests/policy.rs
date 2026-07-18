@@ -1,17 +1,69 @@
 //! Policy rule、approval policy 和 permission decision 的行为测试。
 
 use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess,
-    PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
-    PermissionProfileName, PermissionRequest, PermissionRule, PolicyEngine, SettingsScope,
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest,
+    NetworkAccess, PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation,
+    PermissionProfile, PermissionProfileName, PermissionRequest, PermissionResource,
+    PermissionRule, PolicyEngine, SettingsScope, ToolId, WorkspaceRelativePath,
 };
+
+fn tool(value: &str) -> ToolId {
+    ToolId::new(value).expect("valid tool id")
+}
+
+fn workspace_path(value: &str) -> PermissionResource {
+    PermissionResource::WorkspacePath(
+        WorkspaceRelativePath::from_canonical(value).expect("canonical workspace path"),
+    )
+}
+
+fn command_scope(hex: char) -> PermissionResource {
+    PermissionResource::CommandScope(
+        CommandScopeDigest::new(format!("sha256:{}", hex.to_string().repeat(64)))
+            .expect("valid command digest"),
+    )
+}
+
+fn tool_resource(value: &str) -> PermissionResource {
+    PermissionResource::Tool(tool(value))
+}
+
+#[test]
+fn typed_permission_resources_revalidate_untrusted_json() {
+    assert!(serde_json::from_str::<ToolId>(r#""not a tool id""#).is_err());
+    assert!(serde_json::from_str::<WorkspaceRelativePath>(r#""../secret""#).is_err());
+    assert!(serde_json::from_str::<CommandScopeDigest>(r#""sha256:short""#).is_err());
+    assert!(
+        serde_json::from_value::<PermissionResource>(serde_json::json!({
+            "kind": "workspace_path",
+            "value": "src/../secret"
+        }))
+        .is_err()
+    );
+
+    let digest = format!("sha256:{}", "A".repeat(64));
+    let parsed = serde_json::from_value::<PermissionResource>(serde_json::json!({
+        "kind": "command_scope",
+        "value": digest
+    }))
+    .expect("valid command scope");
+    assert_eq!(parsed, command_scope('a'));
+}
+
+fn request(
+    tool_id: &str,
+    operation: PermissionOperation,
+    resource: PermissionResource,
+) -> PermissionRequest {
+    PermissionRequest::new(tool(tool_id), operation, resource)
+}
 
 fn rule(
     id: &str,
     scope: SettingsScope,
     outcome: PermissionDecisionOutcome,
     operation: PermissionOperation,
-    resource: &str,
+    resource: PermissionResource,
 ) -> PermissionRule {
     PermissionRule::new(id, scope, outcome)
         .for_operation(operation)
@@ -20,13 +72,13 @@ fn rule(
 
 #[test]
 fn permission_profile_and_approval_objects_keep_wire_names() {
-    let profile = PermissionProfile::workspace_write("C:/repo");
+    let profile = PermissionProfile::workspace_write();
     let value = serde_json::to_value(&profile).expect("serialize permission profile");
 
     assert_eq!(value["profile"], "workspace-write");
-    assert_eq!(value["workspace_roots"][0], "C:/repo");
+    assert!(value.get("workspace_roots").is_none());
 
-    let request = ApprovalRequest::new("approval_1", "thread_1", "turn_1", "write_file");
+    let request = ApprovalRequest::new("approval_1", "thread_1", "turn_1", tool("write_file"));
     let decision = ApprovalDecision::new(
         request.request_id.clone(),
         ApprovalOutcome::Deny,
@@ -55,44 +107,47 @@ fn storage_enum_text_is_stable_and_rejects_unknown_values() {
 }
 
 #[test]
-fn resource_prefix_rules_match_only_the_named_path_tree() {
+fn workspace_subtree_rules_match_only_the_named_path_tree() {
     let rule = PermissionRule::new(
         "allow_src_tree",
         SettingsScope::Project,
         PermissionDecisionOutcome::Allow,
     )
     .for_operation(PermissionOperation::Write)
-    .for_resource_prefix("src");
+    .for_workspace_subtree(
+        WorkspaceRelativePath::from_canonical("src").expect("canonical subtree"),
+    );
 
-    for resource in ["src", "src/lib.rs", "src\\lib.rs"] {
-        assert!(rule.matches(&PermissionRequest::new(
+    for resource in ["src", "src/lib.rs"] {
+        assert!(rule.matches(&request(
             "edit",
             PermissionOperation::Write,
-            resource,
+            workspace_path(resource),
         )));
     }
-    assert!(!rule.matches(&PermissionRequest::new(
+    assert!(!rule.matches(&request(
         "edit",
         PermissionOperation::Write,
-        "src2/lib.rs",
+        workspace_path("src2/lib.rs"),
     )));
+    assert!(WorkspaceRelativePath::from_canonical("src\\lib.rs").is_err());
 }
 
 #[test]
 fn denied_profile_network_cannot_be_enabled_by_permission_rule() {
-    let profile = PermissionProfile::workspace_write("C:/repo");
+    let profile = PermissionProfile::workspace_write();
     let decision = PolicyEngine::new(profile)
         .with_rule(rule(
             "allow_network",
             SettingsScope::Managed,
             PermissionDecisionOutcome::Allow,
             PermissionOperation::Network,
-            "command:curl https://example.com",
+            command_scope('a'),
         ))
-        .evaluate(&PermissionRequest::new(
+        .evaluate(&request(
             "command",
             PermissionOperation::Network,
-            "command:curl https://example.com",
+            command_scope('a'),
         ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
@@ -106,25 +161,25 @@ fn denied_profile_network_cannot_be_enabled_by_permission_rule() {
 
 #[test]
 fn allowed_profile_network_still_requires_a_matching_rule() {
-    let mut profile = PermissionProfile::workspace_write("C:/repo");
+    let mut profile = PermissionProfile::workspace_write();
     profile.network_access = NetworkAccess::Allowed;
     let engine = PolicyEngine::new(profile).with_rule(rule(
         "allow_network",
         SettingsScope::Project,
         PermissionDecisionOutcome::Allow,
         PermissionOperation::Network,
-        "command:curl https://example.com",
+        command_scope('a'),
     ));
 
-    let allowed = engine.evaluate(&PermissionRequest::new(
+    let allowed = engine.evaluate(&request(
         "command",
         PermissionOperation::Network,
-        "command:curl https://example.com",
+        command_scope('a'),
     ));
-    let unmatched = engine.evaluate(&PermissionRequest::new(
+    let unmatched = engine.evaluate(&request(
         "command",
         PermissionOperation::Network,
-        "command:curl https://other.example",
+        command_scope('b'),
     ));
 
     assert_eq!(allowed.outcome, PermissionDecisionOutcome::Allow);
@@ -133,21 +188,21 @@ fn allowed_profile_network_still_requires_a_matching_rule() {
 
 #[test]
 fn policy_engine_evaluates_rules_in_fail_closed_order() {
-    let request = PermissionRequest::new("shell", PermissionOperation::Execute, "cargo test");
-    let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+    let request = request("shell", PermissionOperation::Execute, command_scope('a'));
+    let engine = PolicyEngine::new(PermissionProfile::workspace_write())
         .with_rule(rule(
             "allow_test",
             SettingsScope::Project,
             PermissionDecisionOutcome::Allow,
             PermissionOperation::Execute,
-            "cargo test",
+            command_scope('a'),
         ))
         .with_rule(rule(
             "deny_test",
             SettingsScope::User,
             PermissionDecisionOutcome::Deny,
             PermissionOperation::Execute,
-            "cargo test",
+            command_scope('a'),
         ));
 
     let decision = engine.evaluate(&request);
@@ -159,21 +214,25 @@ fn policy_engine_evaluates_rules_in_fail_closed_order() {
 
 #[test]
 fn managed_policy_precedence_wins_over_lower_scope_rules() {
-    let request = PermissionRequest::new("read", PermissionOperation::Read, "README.md");
-    let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+    let request = request(
+        "read",
+        PermissionOperation::Read,
+        workspace_path("README.md"),
+    );
+    let engine = PolicyEngine::new(PermissionProfile::workspace_write())
         .with_rule(rule(
             "local_deny",
             SettingsScope::Local,
             PermissionDecisionOutcome::Deny,
             PermissionOperation::Read,
-            "README.md",
+            workspace_path("README.md"),
         ))
         .with_rule(rule(
             "managed_deny",
             SettingsScope::Managed,
             PermissionDecisionOutcome::Deny,
             PermissionOperation::Read,
-            "README.md",
+            workspace_path("README.md"),
         ));
 
     let decision = engine.evaluate(&request);
@@ -186,11 +245,10 @@ fn managed_policy_precedence_wins_over_lower_scope_rules() {
 
 #[test]
 fn sensitive_resources_are_denied_when_marked_by_caller() {
-    let request =
-        PermissionRequest::new("read", PermissionOperation::Read, ".env").with_sensitive_resource();
+    let request = request("read", PermissionOperation::Read, workspace_path(".env"))
+        .with_sensitive_resource();
 
-    let decision =
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).evaluate(&request);
+    let decision = PolicyEngine::new(PermissionProfile::workspace_write()).evaluate(&request);
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
     assert_eq!(decision.cause, PermissionDecisionCause::ProtectedResource);
@@ -199,28 +257,29 @@ fn sensitive_resources_are_denied_when_marked_by_caller() {
 
 #[test]
 fn explicit_ask_rule_creates_approval_flow() {
-    let request = PermissionRequest::new("shell", PermissionOperation::Execute, "cargo test");
-    let decision = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+    let request = request("shell", PermissionOperation::Execute, command_scope('a'));
+    let decision = PolicyEngine::new(PermissionProfile::workspace_write())
         .with_rule(rule(
             "ask_tests",
             SettingsScope::Project,
             PermissionDecisionOutcome::Ask,
             PermissionOperation::Execute,
-            "cargo test",
+            command_scope('a'),
         ))
         .evaluate(&request);
 
-    let approval = ApprovalRequest::new("approval_1", "thread_1", "turn_1", request.tool_name);
+    let approval =
+        ApprovalRequest::new("approval_1", "thread_1", "turn_1", request.tool_id.clone());
     let approved = ApprovalDecision::new("approval_1", ApprovalOutcome::Allow, "operator approved");
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Ask);
-    assert_eq!(approval.action, "shell");
+    assert_eq!(approval.action.as_str(), "shell");
     assert_eq!(approved.outcome, ApprovalOutcome::Allow);
 }
 
 #[test]
 fn approval_policy_never_turns_approval_requests_into_deny() {
-    let mut profile = PermissionProfile::workspace_write("C:/repo");
+    let mut profile = PermissionProfile::workspace_write();
     profile.approval_policy = ApprovalPolicy::Never;
 
     let decision = PolicyEngine::new(profile)
@@ -229,12 +288,12 @@ fn approval_policy_never_turns_approval_requests_into_deny() {
             SettingsScope::Project,
             PermissionDecisionOutcome::Ask,
             PermissionOperation::Execute,
-            "cargo test",
+            command_scope('a'),
         ))
-        .evaluate(&PermissionRequest::new(
+        .evaluate(&request(
             "shell",
             PermissionOperation::Execute,
-            "cargo test",
+            command_scope('a'),
         ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
@@ -245,12 +304,12 @@ fn approval_policy_never_turns_approval_requests_into_deny() {
 
 #[test]
 fn read_only_profile_hard_denies_write_even_with_an_allow_rule() {
-    let profile = PermissionProfile::read_only("C:/repo");
+    let profile = PermissionProfile::read_only();
 
-    let decision = PolicyEngine::new(profile).evaluate(&PermissionRequest::new(
+    let decision = PolicyEngine::new(profile).evaluate(&request(
         "edit",
         PermissionOperation::Write,
-        "README.md",
+        workspace_path("README.md"),
     ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
@@ -262,48 +321,42 @@ fn read_only_profile_hard_denies_write_even_with_an_allow_rule() {
 }
 
 #[test]
-fn workspace_write_rejects_absolute_resources_outside_the_canonical_root() {
-    let decision = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).evaluate(
-        &PermissionRequest::new("edit", PermissionOperation::Write, "C:/other/README.md"),
-    );
-
-    assert_eq!(decision.outcome, PermissionDecisionOutcome::Deny);
-    assert_eq!(decision.cause, PermissionDecisionCause::FilesystemProfile);
+fn absolute_resources_are_rejected_before_policy_evaluation() {
+    assert!(WorkspaceRelativePath::from_canonical("C:/other/README.md").is_err());
+    assert!(WorkspaceRelativePath::from_canonical("/other/README.md").is_err());
 }
 
 #[test]
 fn unmatched_permission_requests_require_approval() {
-    let decision = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).evaluate(
-        &PermissionRequest::new("git", PermissionOperation::Execute, "git status"),
-    );
+    let decision = PolicyEngine::new(PermissionProfile::workspace_write()).evaluate(&request(
+        "git",
+        PermissionOperation::Execute,
+        tool_resource("git"),
+    ));
 
     assert_eq!(decision.outcome, PermissionDecisionOutcome::Ask);
     assert_eq!(decision.rule_id, None);
 }
 
 #[test]
-fn equivalent_shell_forms_are_not_a_policy_special_case() {
-    let engine = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(rule(
+fn distinct_typed_command_scopes_are_not_a_policy_special_case() {
+    let engine = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(rule(
         "deny_cargo_test",
         SettingsScope::Managed,
         PermissionDecisionOutcome::Deny,
         PermissionOperation::Execute,
-        "cargo test",
+        command_scope('a'),
     ));
 
-    let wrapped = PermissionRequest::new(
-        "shell",
-        PermissionOperation::Execute,
-        "cmd.exe /c cargo test",
-    );
-    let normalized = PermissionRequest::new("shell", PermissionOperation::Execute, "cargo test");
+    let other_scope = request("shell", PermissionOperation::Execute, command_scope('b'));
+    let exact_scope = request("shell", PermissionOperation::Execute, command_scope('a'));
 
     assert_eq!(
-        engine.evaluate(&wrapped).outcome,
+        engine.evaluate(&other_scope).outcome,
         PermissionDecisionOutcome::Ask
     );
     assert_eq!(
-        engine.evaluate(&normalized).outcome,
+        engine.evaluate(&exact_scope).outcome,
         PermissionDecisionOutcome::Deny
     );
 }

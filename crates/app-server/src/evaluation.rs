@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentLoop, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics, AgentStatus,
-    AgentVerificationRequirement, UPDATE_PLAN_TOOL, agent_control_tool_specs,
+    AgentVerificationRequirement, UPDATE_PLAN_TOOL, agent_control_tool_entries,
     terminal_command_scope_digests,
 };
 use singularity_core::{contains_sensitive_text, load_project_instructions};
@@ -31,14 +31,15 @@ use singularity_model::{
     ProviderConfigSnapshot, ProviderDiagnostic, ProviderError, ProviderErrorStage,
 };
 use singularity_policy::{
-    ApprovalPolicy, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
-    PermissionProfile, PermissionRule, PolicyEngine, SettingsScope,
+    ApprovalPolicy, CommandScopeDigest, NetworkAccess, PermissionDecisionOutcome,
+    PermissionOperation, PermissionProfile, PermissionResource, PermissionRule, PolicyEngine,
+    SettingsScope, WorkspaceRelativePath,
 };
 use singularity_protocol::{EvalRunParams, EvalRunResult};
 use singularity_tools::{
     CommandEnvironmentPolicy, SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode,
     ToolBroker, ToolRegistry, WorkspaceTools, command_script_scope_digest_with_policy,
-    command_script_scope_resource_with_policy, workspace_tool_specs,
+    workspace_tool_entries,
 };
 
 use super::{TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ};
@@ -1629,14 +1630,14 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
         .map(|tool| tool.as_str())
         .collect::<BTreeSet<_>>();
     let mut registry = ToolRegistry::default();
-    for mut spec in workspace_tool_specs()
+    for mut entry in workspace_tool_entries()
         .into_iter()
-        .chain(agent_control_tool_specs())
+        .chain(agent_control_tool_entries())
     {
-        if !allowed.contains(spec.name.as_str()) {
+        if !allowed.contains(entry.id.as_str()) {
             continue;
         }
-        if spec.name == TOOL_COMMAND {
+        if entry.id.as_str() == TOOL_COMMAND {
             let bindings = projection
                 .smoke_commands
                 .iter()
@@ -1647,15 +1648,15 @@ fn evaluation_registry(projection: &AgentTaskProjection) -> Result<ToolRegistry,
                     )
                 })
                 .collect::<Vec<_>>();
-            spec.restrict_to_input_bindings(bindings)?;
+            entry.spec.restrict_to_input_bindings(bindings)?;
         }
-        registry.register(spec)?;
+        registry.register(entry)?;
     }
     Ok(registry)
 }
 
-fn evaluation_policy(workspace: &Path, projection: &AgentTaskProjection) -> PolicyEngine {
-    let mut profile = PermissionProfile::workspace_write(workspace.to_string_lossy().into_owned());
+fn evaluation_policy(_workspace: &Path, projection: &AgentTaskProjection) -> PolicyEngine {
+    let mut profile = PermissionProfile::workspace_write();
     profile.approval_policy = ApprovalPolicy::Never;
     if projection
         .smoke_commands
@@ -1692,21 +1693,27 @@ fn evaluation_policy(workspace: &Path, projection: &AgentTaskProjection) -> Poli
                     PermissionDecisionOutcome::Allow,
                 )
                 .for_operation(PermissionOperation::Write)
-                .for_resource_prefix(path.as_str()),
+                .for_workspace_subtree(
+                    WorkspaceRelativePath::from_canonical(path.as_str())
+                        .expect("evaluation paths are canonical workspace-relative paths"),
+                ),
             );
         }
     }
     if allowed.contains(TOOL_COMMAND) {
         for (index, command) in projection.smoke_commands.iter().enumerate() {
             let network = sandbox_network_mode(command.network_access);
-            let resource = command_script_scope_resource_with_policy(
-                &command_script_from_argv(command.argv.as_slice()),
-                command.cwd.as_ref().map_or(".", |cwd| cwd.as_str()),
-                command
-                    .timeout_seconds
-                    .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-                SandboxFilesystemMode::WorkspaceWrite,
-                network.clone(),
+            let resource = PermissionResource::CommandScope(
+                CommandScopeDigest::new(command_script_scope_digest_with_policy(
+                    &command_script_from_argv(command.argv.as_slice()),
+                    command.cwd.as_ref().map_or(".", |cwd| cwd.as_str()),
+                    command
+                        .timeout_seconds
+                        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
+                    SandboxFilesystemMode::WorkspaceWrite,
+                    network.clone(),
+                ))
+                .expect("evaluation command scope digest is valid"),
             );
             policy = policy.with_rule(
                 PermissionRule::new(
@@ -1863,13 +1870,25 @@ fn smoke_command_scope_digest(workspace: &Path, command: &CommandSpec) -> Result
 }
 
 fn resolved_smoke_cwd(workspace: &Path, command: &CommandSpec) -> Option<String> {
-    let cwd = command.cwd.as_ref().map_or_else(
-        || workspace.to_path_buf(),
-        |cwd| workspace.join(cwd.as_str()),
-    );
-    fs::canonicalize(cwd)
+    let workspace = fs::canonicalize(workspace).ok()?;
+    let cwd = command
+        .cwd
+        .as_ref()
+        .map_or_else(|| workspace.clone(), |cwd| workspace.join(cwd.as_str()));
+    let cwd = fs::canonicalize(cwd).ok()?;
+    let relative = cwd.strip_prefix(&workspace).ok()?;
+    let relative = if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()?
+            .join("/")
+    };
+    WorkspaceRelativePath::from_canonical(relative)
         .ok()
-        .map(|cwd| cwd.to_string_lossy().into_owned())
+        .map(|path| path.as_str().to_string())
 }
 fn agent_sandbox_blocker(audit_events: &[Value]) -> Option<EvaluationBlocker> {
     if audit_events
@@ -2821,14 +2840,18 @@ mod tests {
         };
         let policy = evaluation_policy(Path::new("C:/workspace"), &projection);
         let allowed = policy.evaluate(&singularity_policy::PermissionRequest::new(
-            TOOL_EDIT,
+            singularity_policy::ToolId::new(TOOL_EDIT).expect("tool id"),
             PermissionOperation::Write,
-            "src/lib.rs",
+            PermissionResource::WorkspacePath(
+                WorkspaceRelativePath::from_canonical("src/lib.rs").expect("path"),
+            ),
         ));
         let denied = policy.evaluate(&singularity_policy::PermissionRequest::new(
-            TOOL_EDIT,
+            singularity_policy::ToolId::new(TOOL_EDIT).expect("tool id"),
             PermissionOperation::Write,
-            "src2/lib.rs",
+            PermissionResource::WorkspacePath(
+                WorkspaceRelativePath::from_canonical("src2/lib.rs").expect("path"),
+            ),
         ));
 
         assert_eq!(allowed.outcome, PermissionDecisionOutcome::Allow);

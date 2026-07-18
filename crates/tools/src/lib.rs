@@ -19,11 +19,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 pub use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
+pub use singularity_policy::{
+    CommandScopeDigest, PermissionOperation, PermissionResource, ToolId, WorkspaceRelativePath,
+};
 pub use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, CommandSemanticStatus, DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    command_permission_resource,
 };
 
 const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";
@@ -78,6 +80,64 @@ static MUTATION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub enum ToolExecutionMode {
     ParallelRead,
     Exclusive,
+}
+
+/// 运行时可用于能力协商与 Evaluation 要求映射的稳定能力标识。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCapability {
+    WorkspaceRead,
+    WorkspaceSearch,
+    WorkspaceWrite,
+    CommandExecution,
+    PlanManagement,
+}
+
+/// 工作区执行器的类型化入口；名称到执行器的绑定只存在于注册表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceToolExecutor {
+    Read,
+    List,
+    Grep,
+    Edit,
+    Patch,
+    Command,
+}
+
+/// Agent 内部状态执行器的类型化入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlToolExecutor {
+    UpdatePlan,
+}
+
+/// 注册表绑定的真实执行器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", content = "executor", rename_all = "snake_case")]
+pub enum ToolExecutor {
+    Workspace(WorkspaceToolExecutor),
+    AgentControl(AgentControlToolExecutor),
+}
+
+/// 注册表绑定的授权投影合同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAuthorization {
+    WorkspaceRead,
+    WorkspaceWrite,
+    Command,
+    AgentControl,
+}
+
+/// 工具是否投影到模型边界。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExposure {
+    Model,
+    Internal,
 }
 
 /// tool 到达执行阶段前返回的结构化校验代码。
@@ -282,6 +342,62 @@ impl ToolSpec {
     }
 }
 
+/// 单一工具事实源：定义、能力、模型暴露、授权投影和执行器绑定。
+#[derive(Debug, Clone)]
+pub struct ToolEntry {
+    pub id: ToolId,
+    pub version: u32,
+    pub capability: ToolCapability,
+    pub exposure: ToolExposure,
+    pub authorization: ToolAuthorization,
+    pub executor: ToolExecutor,
+    pub spec: ToolSpec,
+}
+
+/// 模型输入经注册表和工作区边界绑定后的可执行调用与授权资源。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundToolCall {
+    pub tool_id: ToolId,
+    pub execution_mode: ToolExecutionMode,
+    pub executor: ToolExecutor,
+    pub operation: PermissionOperation,
+    pub arguments: Value,
+    pub resources: Vec<PermissionResource>,
+    sensitive_resources: BTreeSet<PermissionResource>,
+}
+
+impl BoundToolCall {
+    /// 判断某个资源是否在工作区边界被标记为受保护资源。
+    pub fn resource_is_sensitive(&self, resource: &PermissionResource) -> bool {
+        self.sensitive_resources.contains(resource)
+    }
+}
+
+impl ToolEntry {
+    /// 创建一个模型可见且拥有真实执行器的版本化工具条目。
+    pub fn model(
+        spec: ToolSpec,
+        version: u32,
+        capability: ToolCapability,
+        authorization: ToolAuthorization,
+        executor: ToolExecutor,
+    ) -> Result<Self, String> {
+        let id = ToolId::new(spec.name.clone())?;
+        if version == 0 {
+            return Err(format!("tool {} version must be positive", spec.name));
+        }
+        Ok(Self {
+            id,
+            version,
+            capability,
+            exposure: ToolExposure::Model,
+            authorization,
+            executor,
+            spec,
+        })
+    }
+}
+
 fn exact_inputs_schema(inputs: &[Value]) -> Value {
     let schemas = inputs.iter().map(exact_input_schema).collect::<Vec<_>>();
     if schemas.len() == 1 {
@@ -397,151 +513,230 @@ where
         .map_err(|_| ToolInputValidationError::new(validation_code))
 }
 
-/// 返回内置的工作区读取、搜索、变更和命令 tool 定义。
-pub fn workspace_tool_specs() -> Vec<ToolSpec> {
+/// 返回工作区工具的完整注册表条目；schema、能力、授权与执行器在同一处声明。
+pub fn workspace_tool_entries() -> Vec<ToolEntry> {
     vec![
-        ToolSpec::new(
-            READ_TOOL,
-            "Read a bounded range from a workspace text file",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "minLength": 1},
-                    "max_chars": {"type": "integer", "minimum": 1, "maximum": MAX_READ_MAX_CHARS},
-                    "line_start": {"type": "integer", "minimum": 1},
-                    "line_end": {"type": "integer", "minimum": 1}
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-            ToolExecutionMode::ParallelRead,
-            validate_read_tool_input,
+        workspace_tool_entry(
+            ToolSpec::new(
+                READ_TOOL,
+                "Read a bounded range from a workspace text file",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "max_chars": {"type": "integer", "minimum": 1, "maximum": MAX_READ_MAX_CHARS},
+                        "line_start": {"type": "integer", "minimum": 1},
+                        "line_end": {"type": "integer", "minimum": 1}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                ToolExecutionMode::ParallelRead,
+                validate_read_tool_input,
+            ),
+            ToolCapability::WorkspaceRead,
+            ToolAuthorization::WorkspaceRead,
+            WorkspaceToolExecutor::Read,
         ),
-        ToolSpec::new(
-            LIST_TOOL,
-            "List bounded workspace directory entries with optional recursion",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "minLength": 1},
-                    "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_ENTRIES},
-                    "recursive": {"type": "boolean"},
-                    "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_DEPTH}
-                },
-                "required": [],
-                "additionalProperties": false
-            }),
-            ToolExecutionMode::ParallelRead,
-            validate_list_tool_input,
+        workspace_tool_entry(
+            ToolSpec::new(
+                LIST_TOOL,
+                "List bounded workspace directory entries with optional recursion",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "max_entries": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_ENTRIES},
+                        "recursive": {"type": "boolean"},
+                        "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_LIST_MAX_DEPTH}
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }),
+                ToolExecutionMode::ParallelRead,
+                validate_list_tool_input,
+            ),
+            ToolCapability::WorkspaceRead,
+            ToolAuthorization::WorkspaceRead,
+            WorkspaceToolExecutor::List,
         ),
-        ToolSpec::new(
-            GREP_TOOL,
-            "Search bounded workspace text with deterministic ordering",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "minLength": 1},
-                    "pattern": {"type": "string", "minLength": 1},
-                    "max_matches": {"type": "integer", "minimum": 1, "maximum": MAX_GREP_MAX_MATCHES},
-                    "case_sensitive": {"type": "boolean"}
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-            ToolExecutionMode::ParallelRead,
-            validate_grep_tool_input,
+        workspace_tool_entry(
+            ToolSpec::new(
+                GREP_TOOL,
+                "Search bounded workspace text with deterministic ordering",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "pattern": {"type": "string", "minLength": 1},
+                        "max_matches": {"type": "integer", "minimum": 1, "maximum": MAX_GREP_MAX_MATCHES},
+                        "case_sensitive": {"type": "boolean"}
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                }),
+                ToolExecutionMode::ParallelRead,
+                validate_grep_tool_input,
+            ),
+            ToolCapability::WorkspaceSearch,
+            ToolAuthorization::WorkspaceRead,
+            WorkspaceToolExecutor::Grep,
         ),
-        ToolSpec::new(
-            EDIT_TOOL,
-            "Replace expected text in a workspace file",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "minLength": 1},
-                    "expected": {"type": "string"},
-                    "replacement": {"type": "string"}
-                },
-                "required": ["path", "expected", "replacement"],
-                "additionalProperties": false
-            }),
-            ToolExecutionMode::Exclusive,
-            validate_edit_tool_input,
+        workspace_tool_entry(
+            ToolSpec::new(
+                EDIT_TOOL,
+                "Replace expected text in a workspace file",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "expected": {"type": "string"},
+                        "replacement": {"type": "string"}
+                    },
+                    "required": ["path", "expected", "replacement"],
+                    "additionalProperties": false
+                }),
+                ToolExecutionMode::Exclusive,
+                validate_edit_tool_input,
+            ),
+            ToolCapability::WorkspaceWrite,
+            ToolAuthorization::WorkspaceWrite,
+            WorkspaceToolExecutor::Edit,
         ),
-        ToolSpec::new(
-            PATCH_TOOL,
-            "Apply explicit workspace file changes",
-            json!({
-                "type": "object",
-                "properties": {
-                    "changes": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string", "minLength": 1},
-                                "expected": {"type": "string"},
-                                "replacement": {"type": "string"}
-                            },
-                            "required": ["path", "replacement"],
-                            "additionalProperties": false
+        workspace_tool_entry(
+            ToolSpec::new(
+                PATCH_TOOL,
+                "Apply explicit workspace file changes",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "changes": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "minLength": 1},
+                                    "expected": {"type": "string"},
+                                    "replacement": {"type": "string"}
+                                },
+                                "required": ["path", "replacement"],
+                                "additionalProperties": false
+                            }
                         }
-                    }
-                },
-                "required": ["changes"],
-                "additionalProperties": false
-            }),
-            ToolExecutionMode::Exclusive,
-            validate_patch_tool_input,
+                    },
+                    "required": ["changes"],
+                    "additionalProperties": false
+                }),
+                ToolExecutionMode::Exclusive,
+                validate_patch_tool_input,
+            ),
+            ToolCapability::WorkspaceWrite,
+            ToolAuthorization::WorkspaceWrite,
+            WorkspaceToolExecutor::Patch,
         ),
-        ToolSpec::new(
-            COMMAND_TOOL,
-            "Run a bounded sandboxed command",
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "minLength": 1, "maxLength": MAX_COMMAND_SCRIPT_CHARS},
-                    "cwd": {"type": "string", "minLength": 1},
-                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_COMMAND_TIMEOUT_SECONDS}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-            ToolExecutionMode::Exclusive,
-            validate_command_model_input,
+        workspace_tool_entry(
+            ToolSpec::new(
+                COMMAND_TOOL,
+                "Run a bounded sandboxed command",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "minLength": 1, "maxLength": MAX_COMMAND_SCRIPT_CHARS},
+                        "cwd": {"type": "string", "minLength": 1},
+                        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_COMMAND_TIMEOUT_SECONDS}
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+                ToolExecutionMode::Exclusive,
+                validate_command_model_input,
+            )
+            .with_execution_input_validator(validate_command_execution_input),
+            ToolCapability::CommandExecution,
+            ToolAuthorization::Command,
+            WorkspaceToolExecutor::Command,
         )
-        .with_execution_input_validator(validate_command_execution_input),
     ]
 }
 
-/// 负责管理向模型暴露且供 tool 代理器使用的 tool 注册表。
+/// 返回内置工作区工具的模型定义；视图从完整注册表条目投影。
+pub fn workspace_tool_specs() -> Vec<ToolSpec> {
+    workspace_tool_entries()
+        .into_iter()
+        .map(|entry| entry.spec)
+        .collect()
+}
+
+fn workspace_tool_entry(
+    spec: ToolSpec,
+    capability: ToolCapability,
+    authorization: ToolAuthorization,
+    executor: WorkspaceToolExecutor,
+) -> ToolEntry {
+    ToolEntry::model(
+        spec,
+        1,
+        capability,
+        authorization,
+        ToolExecutor::Workspace(executor),
+    )
+    .expect("built-in workspace tool entry is valid")
+}
+
+/// 负责管理模型暴露、能力、授权投影和执行器绑定的唯一工具注册表。
 #[derive(Debug, Default, Clone)]
 pub struct ToolRegistry {
-    tools: BTreeMap<String, ToolSpec>,
+    tools: BTreeMap<String, ToolEntry>,
 }
 
 impl ToolRegistry {
     /// 注册一个新的 tool 定义。
-    pub fn register(&mut self, spec: ToolSpec) -> Result<(), String> {
-        validate_tool_name(&spec.name)?;
-        if self.tools.contains_key(&spec.name) {
-            return Err(format!("tool already registered: {}", spec.name));
+    pub fn register(&mut self, entry: ToolEntry) -> Result<(), String> {
+        validate_tool_name(entry.id.as_str())?;
+        if entry.spec.name != entry.id.as_str() {
+            return Err("tool entry id and schema name differ".to_string());
         }
-        self.tools.insert(spec.name.clone(), spec);
+        if self.tools.contains_key(entry.id.as_str()) {
+            return Err(format!("tool already registered: {}", entry.id.as_str()));
+        }
+        self.tools.insert(entry.id.as_str().to_string(), entry);
         Ok(())
+    }
+
+    /// 按名称查找完整 tool 条目。
+    pub fn entry(&self, name: &str) -> Option<&ToolEntry> {
+        self.tools.get(name)
     }
 
     /// 按名称查找 tool 定义。
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
-        self.tools.get(name)
+        self.entry(name).map(|entry| &entry.spec)
     }
 
     /// 返回全部模型可见的 schema payload。
     pub fn schema_payloads(&self) -> Vec<Value> {
         self.tools
             .values()
-            .map(ToolSpec::to_schema_payload)
+            .filter(|entry| entry.exposure == ToolExposure::Model)
+            .map(|entry| entry.spec.to_schema_payload())
             .collect::<Vec<_>>()
+    }
+
+    /// 返回满足版本化能力要求的模型可见条目。
+    pub fn entries_for_capability(
+        &self,
+        capability: ToolCapability,
+        minimum_version: u32,
+    ) -> Vec<&ToolEntry> {
+        self.tools
+            .values()
+            .filter(|entry| {
+                entry.exposure == ToolExposure::Model
+                    && entry.capability == capability
+                    && entry.version >= minimum_version
+            })
+            .collect()
     }
 
     /// 校验并准备指定 tool 的模型输入。
@@ -550,11 +745,12 @@ impl ToolRegistry {
         name: &str,
         input: &Value,
     ) -> Result<(ToolExecutionMode, Value), ToolInputValidationError> {
-        let spec = self
-            .get(name)
+        let entry = self
+            .entry(name)
+            .filter(|entry| entry.exposure == ToolExposure::Model)
             .ok_or_else(|| ToolInputValidationError::new("tool_not_visible"))?;
-        let execution_input = spec.prepare_model_input(input)?;
-        Ok((spec.execution_mode, execution_input))
+        let execution_input = entry.spec.prepare_model_input(input)?;
+        Ok((entry.spec.execution_mode, execution_input))
     }
 
     /// 校验指定 tool 的执行输入。
@@ -563,11 +759,11 @@ impl ToolRegistry {
         name: &str,
         input: &Value,
     ) -> Result<ToolExecutionMode, ToolInputValidationError> {
-        let spec = self
-            .get(name)
+        let entry = self
+            .entry(name)
             .ok_or_else(|| ToolInputValidationError::new("tool_not_visible"))?;
-        spec.validate_execution_input(input)?;
-        Ok(spec.execution_mode)
+        entry.spec.validate_execution_input(input)?;
+        Ok(entry.spec.execution_mode)
     }
 }
 
@@ -657,13 +853,28 @@ impl ToolBroker {
     }
 
     /// 注册 tool 并保持 broker 的名称约束。
-    pub fn register(&mut self, spec: ToolSpec) -> Result<(), String> {
-        self.registry.register(spec)
+    pub fn register(&mut self, entry: ToolEntry) -> Result<(), String> {
+        self.registry.register(entry)
     }
 
     /// 按名称查找 tool 定义。
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
         self.registry.get(name)
+    }
+
+    /// 按名称查找完整工具条目。
+    pub fn entry(&self, name: &str) -> Option<&ToolEntry> {
+        self.registry.entry(name)
+    }
+
+    /// 返回满足版本化能力要求的注册条目。
+    pub fn entries_for_capability(
+        &self,
+        capability: ToolCapability,
+        minimum_version: u32,
+    ) -> Vec<&ToolEntry> {
+        self.registry
+            .entries_for_capability(capability, minimum_version)
     }
 
     /// 返回 broker 暴露给模型的 schema。
@@ -678,6 +889,39 @@ impl ToolBroker {
         input: &Value,
     ) -> Result<(ToolExecutionMode, Value), ToolInputValidationError> {
         self.registry.prepare_model_input(name, input)
+    }
+
+    /// 由注册表绑定执行器，并由工作区边界投影类型化授权资源。
+    pub fn bind_authorization(
+        &self,
+        name: &str,
+        input: Value,
+        workspace_tools: Option<&WorkspaceTools>,
+        filesystem: SandboxFilesystemMode,
+        network: SandboxNetworkMode,
+    ) -> Result<BoundToolCall, WorkspaceToolError> {
+        let entry = self.registry.entry(name).ok_or_else(|| {
+            WorkspaceToolError::InvalidInput("tool is not registered".to_string())
+        })?;
+        match entry.executor {
+            ToolExecutor::Workspace(executor) => {
+                let workspace_tools = workspace_tools.ok_or_else(|| {
+                    WorkspaceToolError::InvalidInput(
+                        "workspace tool backend is unavailable".to_string(),
+                    )
+                })?;
+                workspace_tools.bind_tool_call(entry, executor, input, filesystem, network)
+            }
+            ToolExecutor::AgentControl(_) => Ok(BoundToolCall {
+                tool_id: entry.id.clone(),
+                execution_mode: entry.spec.execution_mode,
+                executor: entry.executor,
+                operation: PermissionOperation::Read,
+                arguments: input,
+                resources: vec![PermissionResource::Tool(entry.id.clone())],
+                sensitive_resources: BTreeSet::new(),
+            }),
+        }
     }
 
     /// 在执行前校验 tool 输入。
@@ -697,16 +941,16 @@ impl ToolBroker {
         executor: F,
     ) -> ToolResult
     where
-        F: FnOnce(&ToolCallRequest) -> ToolOutput,
+        F: FnOnce(ToolExecutor, &ToolCallRequest) -> ToolOutput,
     {
-        if self.registry.get(&envelope.tool_name).is_none() {
+        let Some(entry) = self.registry.entry(&envelope.tool_name) else {
             return ToolResult::failed_with_kind(
                 envelope,
                 ToolFailureKind::Visibility,
                 UNKNOWN_TOOL_ERROR,
                 "tool is not registered",
             );
-        }
+        };
         if decision.is_allowed() {
             let input = match serde_json::from_str::<Value>(&envelope.raw_arguments) {
                 Ok(input) => input,
@@ -747,7 +991,7 @@ impl ToolBroker {
         if let ToolBrokerDecision::Ask { reason, .. } = decision {
             return ToolResult::approval_required(envelope, reason);
         }
-        ToolResult::from_result(envelope, &executor(envelope))
+        ToolResult::from_result(envelope, &executor(entry.executor, envelope))
     }
 }
 
@@ -1275,6 +1519,151 @@ impl WorkspaceTools {
         self
     }
 
+    /// 规范化执行输入，并从同一次工作区解析结果投影类型化授权资源。
+    fn bind_tool_call(
+        &self,
+        entry: &ToolEntry,
+        executor: WorkspaceToolExecutor,
+        input: Value,
+        filesystem: SandboxFilesystemMode,
+        network: SandboxNetworkMode,
+    ) -> Result<BoundToolCall, WorkspaceToolError> {
+        let (operation, arguments, resources) = match executor {
+            WorkspaceToolExecutor::Read => {
+                ensure_authorization(entry, ToolAuthorization::WorkspaceRead)?;
+                let mut input: ReadToolInput = preflight_input(&input)?;
+                input.validate()?;
+                let path = self.bound_workspace_path(&input.path, false)?;
+                input.path = path.as_str().to_string();
+                (
+                    PermissionOperation::Read,
+                    serde_json::to_value(input).map_err(serialization_error)?,
+                    vec![PermissionResource::WorkspacePath(path)],
+                )
+            }
+            WorkspaceToolExecutor::List => {
+                ensure_authorization(entry, ToolAuthorization::WorkspaceRead)?;
+                let mut input: ListToolInput = preflight_input(&input)?;
+                input.validate()?;
+                let path =
+                    self.bound_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
+                input.path = Some(path.as_str().to_string());
+                (
+                    PermissionOperation::Read,
+                    serde_json::to_value(input).map_err(serialization_error)?,
+                    vec![PermissionResource::WorkspacePath(path)],
+                )
+            }
+            WorkspaceToolExecutor::Grep => {
+                ensure_authorization(entry, ToolAuthorization::WorkspaceRead)?;
+                let mut input: GrepToolInput = preflight_input(&input)?;
+                input.validate()?;
+                let path = self.bound_workspace_path(
+                    input.path.as_deref().unwrap_or("."),
+                    input.path.is_none(),
+                )?;
+                input.path = Some(path.as_str().to_string());
+                (
+                    PermissionOperation::Read,
+                    serde_json::to_value(input).map_err(serialization_error)?,
+                    vec![PermissionResource::WorkspacePath(path)],
+                )
+            }
+            WorkspaceToolExecutor::Edit => {
+                ensure_authorization(entry, ToolAuthorization::WorkspaceWrite)?;
+                let mut input: EditToolInput = preflight_input(&input)?;
+                input.validate()?;
+                let path = self.bound_workspace_path(&input.path, false)?;
+                input.path = path.as_str().to_string();
+                (
+                    PermissionOperation::Write,
+                    serde_json::to_value(input).map_err(serialization_error)?,
+                    vec![PermissionResource::WorkspacePath(path)],
+                )
+            }
+            WorkspaceToolExecutor::Patch => {
+                ensure_authorization(entry, ToolAuthorization::WorkspaceWrite)?;
+                let mut input: WorkspacePatch = preflight_input(&input)?;
+                input.validate()?;
+                let mut resources = Vec::with_capacity(input.changes.len());
+                let mut unique = BTreeSet::new();
+                for change in &mut input.changes {
+                    let path = self.bound_workspace_path(&change.path, false)?;
+                    if !unique.insert(path.clone()) {
+                        return Err(WorkspaceToolError::InvalidInput(
+                            DUPLICATE_PATCH_TARGET.to_string(),
+                        ));
+                    }
+                    change.path = path.as_str().to_string();
+                    resources.push(PermissionResource::WorkspacePath(path));
+                }
+                (
+                    PermissionOperation::Write,
+                    serde_json::to_value(input).map_err(serialization_error)?,
+                    resources,
+                )
+            }
+            WorkspaceToolExecutor::Command => {
+                ensure_authorization(entry, ToolAuthorization::Command)?;
+                let mut input: CommandToolInput = preflight_input(&input)?;
+                input.validate()?;
+                let Some(backend) = &self.sandbox_backend else {
+                    return Err(WorkspaceToolError::SandboxUnavailable);
+                };
+                if !backend.capabilities().supports_command_execution() {
+                    return Err(WorkspaceToolError::SandboxUnavailable);
+                }
+                let cwd = self.bound_workspace_path(input.effective_cwd(), false)?;
+                input.cwd = Some(cwd.as_str().to_string());
+                let digest = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+                    &input.command,
+                    cwd.as_str(),
+                    input.effective_timeout_seconds(),
+                    filesystem,
+                    network,
+                ))
+                .map_err(WorkspaceToolError::InvalidInput)?;
+                (
+                    PermissionOperation::Execute,
+                    serde_json::to_value(input).map_err(serialization_error)?,
+                    vec![PermissionResource::CommandScope(digest)],
+                )
+            }
+        };
+        let sensitive_resources = resources
+            .iter()
+            .filter(|resource| match resource {
+                PermissionResource::WorkspacePath(path) => is_protected_path(path.as_str()),
+                PermissionResource::CommandScope(_) | PermissionResource::Tool(_) => false,
+            })
+            .cloned()
+            .collect();
+        Ok(BoundToolCall {
+            tool_id: entry.id.clone(),
+            execution_mode: entry.spec.execution_mode,
+            executor: entry.executor,
+            operation,
+            arguments,
+            resources,
+            sensitive_resources,
+        })
+    }
+
+    fn bound_workspace_path(
+        &self,
+        path: &str,
+        allow_protected: bool,
+    ) -> Result<WorkspaceRelativePath, WorkspaceToolError> {
+        let resolved = self.resolve_workspace_path(path, allow_protected)?;
+        let relative = self.relative_path(&resolved);
+        WorkspaceRelativePath::from_canonical(if relative.is_empty() {
+            ".".to_string()
+        } else {
+            relative
+        })
+        .map_err(WorkspaceToolError::InvalidInput)
+    }
+
     /// 在执行或变更前校验输入，并解析每个被引用的路径。
     pub fn preflight(&self, tool_name: &str, input: &Value) -> Result<(), WorkspaceToolError> {
         match tool_name {
@@ -1654,13 +2043,25 @@ impl WorkspaceTools {
     /// 仅通过已配置的沙箱运行命令，并将取消传播给命令。
     pub fn command_cancellable(
         &self,
-        input: CommandToolInput,
+        mut input: CommandToolInput,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput, WorkspaceToolError> {
+        input.validate()?;
+        let cwd = self.bound_workspace_path(input.effective_cwd(), false)?;
+        input.cwd = Some(cwd.as_str().to_string());
+        let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+            &input.command,
+            cwd.as_str(),
+            input.effective_timeout_seconds(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        ))
+        .map_err(WorkspaceToolError::InvalidInput)?;
         self.command_cancellable_with_policy(
             input,
             SandboxFilesystemMode::ReadOnly,
             SandboxNetworkMode::Denied,
+            &scope,
             cancellation,
         )
     }
@@ -1671,6 +2072,7 @@ impl WorkspaceTools {
         input: CommandToolInput,
         filesystem: SandboxFilesystemMode,
         network: SandboxNetworkMode,
+        expected_scope: &CommandScopeDigest,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput, WorkspaceToolError> {
         input.validate()?;
@@ -1683,6 +2085,20 @@ impl WorkspaceTools {
         }
         let requested_cwd = input.cwd.as_deref().unwrap_or(".");
         let command_cwd = self.resolve_workspace_path(requested_cwd, false)?;
+        let relative_cwd = self.bound_workspace_path(requested_cwd, false)?;
+        let actual_scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+            &input.command,
+            relative_cwd.as_str(),
+            input.effective_timeout_seconds(),
+            filesystem.clone(),
+            network.clone(),
+        ))
+        .map_err(WorkspaceToolError::InvalidInput)?;
+        if actual_scope != *expected_scope {
+            return Err(WorkspaceToolError::InvalidInput(
+                "command scope binding changed before execution".to_string(),
+            ));
+        }
         let mut request = CommandScriptRequest::agent_requested_with_policy(
             next_command_id(),
             input.command,
@@ -1695,13 +2111,7 @@ impl WorkspaceTools {
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }
-        let scope_digest = command_script_scope_digest_with_policy(
-            &request.script,
-            &request.cwd,
-            request.timeout_seconds,
-            request.filesystem.mode.clone(),
-            request.network.mode.clone(),
-        );
+        let scope_digest = expected_scope.as_str().to_string();
         let result = backend.execute_script_cancellable(&request, cancellation);
         let execution = result.sandbox.clone();
         let mut output = command_tool_output(result);
@@ -1971,6 +2381,23 @@ where
         .map_err(|_| WorkspaceToolError::InvalidInput("invalid tool input".to_string()))
 }
 
+fn ensure_authorization(
+    entry: &ToolEntry,
+    expected: ToolAuthorization,
+) -> Result<(), WorkspaceToolError> {
+    if entry.authorization == expected {
+        Ok(())
+    } else {
+        Err(WorkspaceToolError::InvalidInput(
+            "tool executor and authorization binding differ".to_string(),
+        ))
+    }
+}
+
+fn serialization_error(_error: serde_json::Error) -> WorkspaceToolError {
+    WorkspaceToolError::InvalidInput("tool execution input serialization failed".to_string())
+}
+
 fn check_cancelled(cancellation: &dyn Fn() -> bool) -> Result<(), WorkspaceToolError> {
     if cancellation() {
         Err(WorkspaceToolError::Cancelled)
@@ -2227,27 +2654,6 @@ impl<'a> CommandScope<'a> {
     }
 }
 
-/// 为命令及其生效执行范围构建可审计的权限资源标识。
-pub fn command_scope_resource(
-    argv: &[String],
-    cwd: &str,
-    timeout_seconds: u64,
-    sandbox_mode: &SandboxFilesystemMode,
-    network_access: &SandboxNetworkMode,
-) -> String {
-    let command = command_permission_resource(argv);
-    if command.is_empty() {
-        String::new()
-    } else {
-        let scope = CommandScope::new(argv, cwd, timeout_seconds, sandbox_mode, network_access);
-        format!(
-            "command:{command};scope:{};digest:{}",
-            scope.encoded(),
-            scope.digest()
-        )
-    }
-}
-
 /// 对命令、`cwd`、超时、文件系统模式和网络模式计算哈希，用于校验绑定。
 pub fn command_scope_digest(
     argv: &[String],
@@ -2311,34 +2717,6 @@ pub fn command_script_scope_digest_with_policy(
     network_access: SandboxNetworkMode,
 ) -> String {
     CommandScriptScope::new(command, cwd, timeout_seconds, sandbox_mode, network_access).digest()
-}
-
-/// 返回不包含原始 command 内容的脚本权限资源摘要。
-pub fn command_script_scope_resource(command: &str, cwd: &str, timeout_seconds: u64) -> String {
-    format!(
-        "command_script;scope_digest:{}",
-        command_script_scope_digest(command, cwd, timeout_seconds)
-    )
-}
-
-/// 返回不包含原始 command 内容、但绑定执行范围的脚本权限资源摘要。
-pub fn command_script_scope_resource_with_policy(
-    command: &str,
-    cwd: &str,
-    timeout_seconds: u64,
-    sandbox_mode: SandboxFilesystemMode,
-    network_access: SandboxNetworkMode,
-) -> String {
-    format!(
-        "command_script;scope_digest:{}",
-        command_script_scope_digest_with_policy(
-            command,
-            cwd,
-            timeout_seconds,
-            sandbox_mode,
-            network_access,
-        )
-    )
 }
 
 fn validate_tool_name(name: &str) -> Result<(), String> {

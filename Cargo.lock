@@ -1633,6 +1633,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "singularity_core",
+ "singularity_policy",
  "singularity_sandbox",
 ]
 

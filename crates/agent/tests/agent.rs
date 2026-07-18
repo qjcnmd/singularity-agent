@@ -3,7 +3,8 @@
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopInput, AgentPlan,
     AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentStatus,
-    AgentVerificationRequirement, ApprovalGrant, agent_control_tool_specs, assemble_context_items,
+    AgentVerificationRequirement, ApprovalGrant, agent_control_tool_entries,
+    assemble_context_items,
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
@@ -14,20 +15,34 @@ use singularity_model::{
     ProviderProtocolNegotiation, ToolChoiceMode,
 };
 use singularity_policy::{
-    NetworkAccess, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
-    PermissionRule, PolicyEngine, SettingsScope,
+    CommandScopeDigest, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
+    PermissionProfile, PermissionResource, PermissionRule, PolicyEngine, SettingsScope, ToolId,
+    WorkspaceRelativePath,
 };
 use singularity_tools::{
     CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend, SandboxCapabilities,
     SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolFailureKind, ToolRegistry,
-    WorkspaceTools, command_script_scope_digest_with_policy,
-    command_script_scope_resource_with_policy, workspace_tool_specs,
+    WorkspaceTools, command_script_scope_digest_with_policy, workspace_tool_entries,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+fn tool_id(value: &str) -> ToolId {
+    ToolId::new(value).expect("valid tool id")
+}
+
+fn workspace_resource(value: &str) -> PermissionResource {
+    PermissionResource::WorkspacePath(
+        WorkspaceRelativePath::from_canonical(value).expect("canonical workspace path"),
+    )
+}
+
+fn typed_command_resource(digest: String) -> PermissionResource {
+    PermissionResource::CommandScope(CommandScopeDigest::new(digest).expect("valid command digest"))
+}
 
 struct StaticProvider {
     responses: Vec<ModelTurnResponse>,
@@ -253,20 +268,21 @@ fn agent_loop_with_capabilities_and_plan(
         agent_tool_broker_for_test(include_plan),
         policy,
     )
+    .with_workspace_tools(WorkspaceTools::new(env!("CARGO_MANIFEST_DIR")))
 }
 
 fn agent_tool_broker_for_test(include_plan: bool) -> ToolBroker {
     let mut registry = ToolRegistry::default();
-    for spec in workspace_tool_specs()
+    for entry in workspace_tool_entries()
         .into_iter()
-        .filter(|spec| ["read", "edit", "patch", "command"].contains(&spec.name.as_str()))
+        .filter(|entry| ["read", "edit", "patch", "command"].contains(&entry.spec.name.as_str()))
     {
-        registry.register(spec).expect("register workspace tool");
+        registry.register(entry).expect("register workspace tool");
     }
-    for spec in agent_control_tool_specs() {
+    for entry in agent_control_tool_entries() {
         if include_plan {
             registry
-                .register(spec)
+                .register(entry)
                 .expect("register agent control tool");
         }
     }
@@ -274,7 +290,7 @@ fn agent_tool_broker_for_test(include_plan: bool) -> ToolBroker {
 }
 
 fn allow_read_policy() -> PolicyEngine {
-    PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_read",
             SettingsScope::Project,
@@ -673,7 +689,7 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
     ));
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write())
         .with_rule(
             PermissionRule::new(
                 "allow_write",
@@ -826,7 +842,7 @@ fn direct_tool_mode_rejects_hidden_router_before_policy_or_execution() {
 
     let result = agent_loop_with_capabilities(
         vec![response],
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract {
             ..ProviderProtocolContract::default()
@@ -868,7 +884,7 @@ fn agent_loop_ask_decision_blocks_without_executing_tool() {
 
     let result = agent_loop_with_response(
         response,
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
     )
     .run(&input);
 
@@ -1000,7 +1016,7 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
         PermissionDecisionOutcome::Ask,
     )
     .for_operation(PermissionOperation::Read)
-    .for_resource("README.md");
+    .for_resource(workspace_resource("README.md"));
     let result = agent_loop_with_capabilities(
         vec![
             response,
@@ -1112,7 +1128,7 @@ fn agent_loop_does_not_create_partial_approval_for_a_batch() {
         PermissionDecisionOutcome::Ask,
     )
     .for_operation(PermissionOperation::Read)
-    .for_resource("README.md");
+    .for_resource(workspace_resource("README.md"));
     let policy = allow_read_policy().with_rule(ask_readme);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     response.tool_calls.push(tool_call(
@@ -1218,7 +1234,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
 
     let result = agent_loop_with_response(
         response,
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
     )
     .run(&input);
 
@@ -1269,7 +1285,7 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
     ));
     let agent_loop = agent_loop_with_response(
         response,
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()));
     let blocked = agent_loop.run(&input);
@@ -1301,8 +1317,16 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "one").expect("write file");
-    let first_grant = ApprovalGrant::allow("approval_turn_1_call_1", "edit", ["README.md"]);
-    let second_grant = ApprovalGrant::allow("approval_turn_1_call_2", "edit", ["README.md"]);
+    let first_grant = ApprovalGrant::allow(
+        "approval_turn_1_call_1",
+        tool_id("edit"),
+        [workspace_resource("README.md")],
+    );
+    let second_grant = ApprovalGrant::allow(
+        "approval_turn_1_call_2",
+        tool_id("edit"),
+        [workspace_resource("README.md")],
+    );
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice")
         .with_max_turns(4)
         .with_approval_grant(first_grant.clone());
@@ -1341,7 +1365,7 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
     ));
     let agent_loop = agent_loop_with_responses_and_requests(
         vec![first_response, second_response, reused_response],
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
         Arc::new(Mutex::new(Vec::new())),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()));
@@ -1391,7 +1415,7 @@ fn agent_loop_resume_rejects_tampered_completion_checkpoint() {
     ));
     let agent_loop = agent_loop_with_response(
         response,
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
     );
     let blocked = agent_loop.run(&input);
     let pending = blocked.pending_tool_calls[0].clone();
@@ -1758,14 +1782,11 @@ fn agent_loop_rechecks_context_budget_before_each_model_request() {
 #[test]
 fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let canonical_cwd = std::fs::canonicalize(dir.path())
-        .expect("canonical workspace")
-        .to_string_lossy()
-        .into_owned();
+    let bound_cwd = ".";
     let required_argv = test_command("second-success");
     let required_digest = command_script_scope_digest_with_policy(
         &required_argv.join(" "),
-        &canonical_cwd,
+        bound_cwd,
         5,
         SandboxFilesystemMode::WorkspaceWrite,
         SandboxNetworkMode::Denied,
@@ -1848,13 +1869,10 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
 fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicates() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "before").expect("write file");
-    let canonical_cwd = std::fs::canonicalize(dir.path())
-        .expect("canonical workspace")
-        .to_string_lossy()
-        .into_owned();
+    let bound_cwd = ".";
     let required_digest = command_script_scope_digest_with_policy(
         &test_command_script("success"),
-        &canonical_cwd,
+        bound_cwd,
         5,
         SandboxFilesystemMode::WorkspaceWrite,
         SandboxNetworkMode::Denied,
@@ -1975,7 +1993,7 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
             PermissionDecisionOutcome::Deny,
         )
         .for_operation(PermissionOperation::Read)
-        .for_resource("README.md"),
+        .for_resource(workspace_resource("README.md")),
     );
 
     let result = agent_loop_with_responses_and_requests(
@@ -2013,10 +2031,7 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
 fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "before").expect("write file");
-    let canonical_cwd = std::fs::canonicalize(dir.path())
-        .expect("canonical workspace")
-        .to_string_lossy()
-        .into_owned();
+    let bound_cwd = ".";
     let sandbox_mode = SandboxFilesystemMode::WorkspaceWrite;
     let network_access = SandboxNetworkMode::Denied;
     let first_argv = test_command("success");
@@ -2027,7 +2042,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
             AgentVerificationRequirement::new(
                 command_script_scope_digest_with_policy(
                     &first_argv.join(" "),
-                    &canonical_cwd,
+                    bound_cwd,
                     5,
                     sandbox_mode.clone(),
                     network_access.clone(),
@@ -2037,7 +2052,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
             AgentVerificationRequirement::new(
                 command_script_scope_digest_with_policy(
                     &second_argv.join(" "),
-                    &canonical_cwd,
+                    bound_cwd,
                     5,
                     sandbox_mode.clone(),
                     network_access.clone(),
@@ -2077,33 +2092,32 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let pending_verification = command_response(2, "verify_2", &second_argv);
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_3", "response_3", "done");
-    let first_command_resource = command_script_scope_resource_with_policy(
-        &first_argv.join(" "),
-        ".",
-        5,
-        sandbox_mode.clone(),
-        network_access.clone(),
-    );
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write(
-        dir.path().to_string_lossy().into_owned(),
-    ))
-    .with_rule(
-        PermissionRule::new(
-            "allow_write",
-            SettingsScope::Project,
-            PermissionDecisionOutcome::Allow,
+    let first_command_resource =
+        typed_command_resource(singularity_tools::command_script_scope_digest_with_policy(
+            &first_argv.join(" "),
+            ".",
+            5,
+            sandbox_mode.clone(),
+            network_access.clone(),
+        ));
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write())
+        .with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
         )
-        .for_operation(PermissionOperation::Write),
-    )
-    .with_rule(
-        PermissionRule::new(
-            "allow_first_verification",
-            SettingsScope::Project,
-            PermissionDecisionOutcome::Allow,
-        )
-        .for_operation(PermissionOperation::Execute)
-        .for_resource(first_command_resource),
-    );
+        .with_rule(
+            PermissionRule::new(
+                "allow_first_verification",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Execute)
+            .for_resource(first_command_resource),
+        );
     let capabilities = ProviderProtocolContract {
         max_context_tokens: 1_400,
         max_output_tokens: 128,
@@ -2168,8 +2182,8 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
         .with_approval_grant(ApprovalGrant::allow(
             "approval_turn_1_call_1",
-            "edit",
-            ["README.md"],
+            tool_id("edit"),
+            [workspace_resource("README.md")],
         ))
         .with_max_turns(3);
     let mut tool_response =
@@ -2196,7 +2210,7 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
 
     let result = agent_loop_with_responses_and_requests(
         vec![tool_response, verification_response, final_response],
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+        PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
             PermissionRule::new(
                 "allow_execute",
                 SettingsScope::Project,
@@ -2275,7 +2289,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write())
         .with_rule(
             PermissionRule::new(
                 "allow_write",
@@ -2365,7 +2379,7 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     ));
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_execute",
             SettingsScope::Project,
@@ -2459,7 +2473,7 @@ fn agent_loop_validates_patch_arguments_before_policy() {
     ));
     let result = agent_loop_with_response(
         malformed_response,
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()))
     .run(&input);
@@ -2503,7 +2517,7 @@ fn agent_loop_command_fails_closed_without_sandbox_backend() {
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_command",
             SettingsScope::Project,
@@ -2571,7 +2585,7 @@ fn agent_loop_command_uses_strict_sandbox_backend_when_injected() {
     ));
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_command",
             SettingsScope::Project,
@@ -2621,7 +2635,7 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
     ));
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "handled failure");
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_command",
             SettingsScope::Project,
@@ -2695,7 +2709,7 @@ fn agent_loop_returns_unavailable_executable_to_model_for_repair() {
     ));
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "recovered");
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_command",
             SettingsScope::Project,
@@ -2752,7 +2766,7 @@ fn agent_loop_cancels_a_running_sandbox_command() {
         "command",
         serde_json::json!({"command": "cargo test", "timeout_seconds": 30}),
     ));
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_execute",
             SettingsScope::Project,
@@ -2793,17 +2807,18 @@ fn agent_loop_cancels_a_running_sandbox_command() {
 fn agent_loop_rejects_model_selected_network_before_approval() {
     let dir = tempfile::tempdir().expect("temp dir");
     let argv = test_command("must-not-execute");
-    let resource = command_script_scope_resource_with_policy(
-        &argv.join(" "),
-        ".",
-        5,
-        SandboxFilesystemMode::ReadOnly,
-        SandboxNetworkMode::Allowed,
-    );
+    let resource =
+        typed_command_resource(singularity_tools::command_script_scope_digest_with_policy(
+            &argv.join(" "),
+            ".",
+            5,
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Allowed,
+        ));
     let input = AgentLoopInput::new("thread_1", "turn_1", "run network command")
         .with_approval_grant(ApprovalGrant::allow(
             "approval_turn_1_call_1",
-            "command",
+            tool_id("command"),
             [resource.clone()],
         ))
         .with_max_turns(1);
@@ -2817,7 +2832,7 @@ fn agent_loop_rejects_model_selected_network_before_approval() {
             "timeout_seconds": 5
         }),
     ));
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write())
         .with_rule(
             PermissionRule::new(
                 "allow_command",
@@ -2870,11 +2885,12 @@ fn agent_loop_uses_exact_command_binding_without_exposing_execution_policy() {
     });
     let execution_input = model_input.clone();
     let mut registry = ToolRegistry::default();
-    let mut command = workspace_tool_specs()
+    let mut command = workspace_tool_entries()
         .into_iter()
-        .find(|spec| spec.name == "command")
-        .expect("command spec");
+        .find(|entry| entry.spec.name == "command")
+        .expect("command entry");
     command
+        .spec
         .restrict_to_input_bindings(vec![(model_input.clone(), execution_input)])
         .expect("exact command binding");
     registry.register(command).expect("register command");
@@ -2887,7 +2903,7 @@ fn agent_loop_uses_exact_command_binding_without_exposing_execution_policy() {
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_execute",
             SettingsScope::Project,
@@ -2931,24 +2947,26 @@ fn agent_loop_uses_exact_command_binding_without_exposing_execution_policy() {
 fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let command_script = test_command_script("success");
-    let command_resource = command_script_scope_resource_with_policy(
-        &command_script,
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
-    let mismatched_resource = command_script_scope_resource_with_policy(
-        &command_script,
-        ".",
-        6,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
+    let command_resource =
+        typed_command_resource(singularity_tools::command_script_scope_digest_with_policy(
+            &command_script,
+            ".",
+            5,
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+    let mismatched_resource =
+        typed_command_resource(singularity_tools::command_script_scope_digest_with_policy(
+            &command_script,
+            ".",
+            6,
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
     let input = AgentLoopInput::new("thread_1", "turn_1", "run command")
         .with_approval_grant(ApprovalGrant::allow(
             "approval_turn_1_call_1",
-            "command",
+            tool_id("command"),
             [mismatched_resource],
         ))
         .with_max_turns(2);
@@ -2964,11 +2982,12 @@ fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume(
         .tool_calls
         .push(tool_call("call_1", "command", model_input.clone()));
     let mut registry = ToolRegistry::default();
-    let mut command = workspace_tool_specs()
+    let mut command = workspace_tool_entries()
         .into_iter()
-        .find(|spec| spec.name == "command")
-        .expect("command spec");
+        .find(|entry| entry.spec.name == "command")
+        .expect("command entry");
     command
+        .spec
         .restrict_to_input_bindings(vec![(model_input, execution_input)])
         .expect("exact command binding");
     registry.register(command).expect("register command");
@@ -2982,7 +3001,7 @@ fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume(
             capabilities: ProviderProtocolContract::default(),
         },
         ToolBroker::new(registry),
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend));
 
@@ -3048,7 +3067,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     ));
     let final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
-    let mut profile = PermissionProfile::workspace_write("C:/repo");
+    let mut profile = PermissionProfile::workspace_write();
     profile.network_access = NetworkAccess::Allowed;
     let policy = PolicyEngine::new(profile)
         .with_rule(
@@ -3076,10 +3095,6 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
     .run(&input);
     let run_status = result.to_run_status();
-    let command_cwd = std::fs::canonicalize(dir.path())
-        .expect("canonical workspace")
-        .to_string_lossy()
-        .into_owned();
 
     assert_eq!(run_status.status, AgentStatus::Completed);
     assert_eq!(run_status.audit_events.len(), 1);
@@ -3100,7 +3115,7 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         run_status.audit_events[0]["command_scope_digest"],
         command_script_scope_digest_with_policy(
             &test_command_script("success"),
-            &command_cwd,
+            ".",
             5,
             SandboxFilesystemMode::WorkspaceWrite,
             SandboxNetworkMode::Allowed,
@@ -3314,7 +3329,11 @@ fn agent_loop_approval_grant_matches_request_id_and_is_single_use() {
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "one").expect("write file");
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_approval_grant(
-        ApprovalGrant::allow("approval_turn_1_call_1", "edit", ["README.md"]),
+        ApprovalGrant::allow(
+            "approval_turn_1_call_1",
+            tool_id("edit"),
+            [workspace_resource("README.md")],
+        ),
     );
     let mut first_tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
@@ -3341,7 +3360,7 @@ fn agent_loop_approval_grant_matches_request_id_and_is_single_use() {
 
     let result = agent_loop_with_responses_and_requests(
         vec![first_tool_response, second_tool_response],
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
         Arc::new(Mutex::new(Vec::new())),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()))
@@ -3375,8 +3394,8 @@ fn agent_loop_approval_grant_does_not_override_sensitive_resource_deny() {
         let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
             .with_approval_grant(ApprovalGrant::allow(
                 "approval_turn_1_call_1",
-                "edit",
-                [sensitive_path],
+                tool_id("edit"),
+                [workspace_resource(sensitive_path)],
             ))
             .with_max_turns(1);
         let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
@@ -3392,7 +3411,7 @@ fn agent_loop_approval_grant_does_not_override_sensitive_resource_deny() {
 
         let result = agent_loop_with_response(
             response,
-            PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+            PolicyEngine::new(PermissionProfile::workspace_write()),
         )
         .with_workspace_tools(WorkspaceTools::new(dir.path()))
         .run(&input);
@@ -3423,8 +3442,8 @@ fn agent_loop_patch_grant_does_not_override_sensitive_resource_deny() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
         .with_approval_grant(ApprovalGrant::allow(
             "approval_turn_1_call_1",
-            "patch",
-            [".env"],
+            tool_id("patch"),
+            [workspace_resource(".env")],
         ))
         .with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
@@ -3442,7 +3461,7 @@ fn agent_loop_patch_grant_does_not_override_sensitive_resource_deny() {
 
     let result = agent_loop_with_response(
         response,
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()))
     .run(&input);
@@ -3489,7 +3508,7 @@ fn agent_loop_patch_policy_checks_every_change_path_before_writing() {
             ]
         }),
     ));
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo"))
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write())
         .with_rule(
             PermissionRule::new(
                 "allow_first",
@@ -3497,7 +3516,7 @@ fn agent_loop_patch_policy_checks_every_change_path_before_writing() {
                 PermissionDecisionOutcome::Allow,
             )
             .for_operation(PermissionOperation::Write)
-            .for_resource("first.md"),
+            .for_resource(workspace_resource("first.md")),
         )
         .with_rule(
             PermissionRule::new(
@@ -3506,7 +3525,7 @@ fn agent_loop_patch_policy_checks_every_change_path_before_writing() {
                 PermissionDecisionOutcome::Deny,
             )
             .for_operation(PermissionOperation::Write)
-            .for_resource("second.md"),
+            .for_resource(workspace_resource("second.md")),
         );
 
     let result = agent_loop_with_response(response, policy)
@@ -3555,14 +3574,14 @@ fn agent_loop_patch_approval_request_covers_unapproved_change_path() {
             ]
         }),
     ));
-    let policy = PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")).with_rule(
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
         PermissionRule::new(
             "allow_first",
             SettingsScope::Project,
             PermissionDecisionOutcome::Allow,
         )
         .for_operation(PermissionOperation::Write)
-        .for_resource("first.md"),
+        .for_resource(workspace_resource("first.md")),
     );
 
     let result = agent_loop_with_response(response, policy)
@@ -3604,8 +3623,8 @@ fn agent_loop_approval_grant_requires_exact_resource_set() {
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello")
         .with_approval_grant(ApprovalGrant::allow(
             "approval_turn_1_call_1",
-            "patch",
-            ["first.md"],
+            tool_id("patch"),
+            [workspace_resource("first.md")],
         ))
         .with_max_turns(1);
     let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
@@ -3630,7 +3649,7 @@ fn agent_loop_approval_grant_requires_exact_resource_set() {
 
     let result = agent_loop_with_response(
         response,
-        PolicyEngine::new(PermissionProfile::workspace_write("C:/repo")),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()))
     .run(&input);
@@ -4072,10 +4091,11 @@ fn plan_update_rejects_empty_duplicate_and_multiple_in_progress_steps() {
 
 #[test]
 fn plan_tool_contract_preserves_actionable_validation_causes() {
-    let spec = agent_control_tool_specs()
+    let spec = agent_control_tool_entries()
         .into_iter()
-        .find(|spec| spec.name == "update_plan")
-        .expect("plan tool spec");
+        .find(|entry| entry.spec.name == "update_plan")
+        .expect("plan tool entry")
+        .spec;
     let too_many = (0..65)
         .map(|index| serde_json::json!({"step": format!("step {index}"), "status": "pending"}))
         .collect::<Vec<_>>();
@@ -4183,10 +4203,11 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
 
 #[test]
 fn plan_tool_schema_matches_runtime_bounds() {
-    let spec = agent_control_tool_specs()
+    let spec = agent_control_tool_entries()
         .into_iter()
         .next()
-        .expect("plan tool spec");
+        .expect("plan tool entry")
+        .spec;
     assert_eq!(spec.name, "update_plan");
     assert_eq!(spec.input_schema["properties"]["steps"]["minItems"], 1);
     assert_eq!(spec.input_schema["properties"]["steps"]["maxItems"], 64);
@@ -4284,14 +4305,11 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
 #[test]
 fn verified_completed_plan_enters_tool_free_finalization() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let canonical_cwd = std::fs::canonicalize(workspace.path())
-        .expect("canonical workspace")
-        .to_string_lossy()
-        .into_owned();
+    let bound_cwd = ".";
     let verification_argv = test_command("verify");
     let verification_digest = command_script_scope_digest_with_policy(
         &verification_argv.join(" "),
-        &canonical_cwd,
+        bound_cwd,
         5,
         SandboxFilesystemMode::WorkspaceWrite,
         SandboxNetworkMode::Denied,
@@ -4407,14 +4425,11 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
         FinalizationCase::Cancelled,
     ] {
         let workspace = tempfile::tempdir().expect("workspace");
-        let canonical_cwd = std::fs::canonicalize(workspace.path())
-            .expect("canonical workspace")
-            .to_string_lossy()
-            .into_owned();
+        let bound_cwd = ".";
         let verification_argv = test_command("verify");
         let verification_digest = command_script_scope_digest_with_policy(
             &verification_argv.join(" "),
-            &canonical_cwd,
+            bound_cwd,
             5,
             SandboxFilesystemMode::WorkspaceWrite,
             SandboxNetworkMode::Denied,

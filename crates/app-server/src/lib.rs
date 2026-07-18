@@ -17,7 +17,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult,
-    AgentRunStatus, AgentStatus, ApprovalGrant, PendingToolCall, agent_control_tool_specs,
+    AgentRunStatus, AgentStatus, ApprovalGrant, PendingToolCall, agent_control_tool_entries,
     project_audit_event,
 };
 use singularity_core::{
@@ -27,8 +27,8 @@ use singularity_core::{
 use singularity_model::{Provider, ProviderConfigSnapshot};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionDecisionOutcome,
-    PermissionOperation, PermissionProfile, PermissionProfileName, PermissionRule, PolicyEngine,
-    SettingsScope,
+    PermissionOperation, PermissionProfile, PermissionProfileName, PermissionResource,
+    PermissionRule, PolicyEngine, SettingsScope,
 };
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ApprovalCenterResult, ApprovalListResult, ArtifactFetchParams,
@@ -49,7 +49,7 @@ use singularity_store::{
 use singularity_tools::{
     COMMAND_TOOL as TOOL_COMMAND, EDIT_TOOL as TOOL_EDIT, GREP_TOOL as TOOL_GREP,
     LIST_TOOL as TOOL_LIST, PATCH_TOOL as TOOL_PATCH, READ_TOOL as TOOL_READ, ToolBroker,
-    ToolRegistry, WorkspaceTools, workspace_tool_specs,
+    ToolRegistry, WorkspaceTools, workspace_tool_entries,
 };
 use thiserror::Error;
 
@@ -878,12 +878,7 @@ impl AppServer {
             DEFAULT_THREAD_HISTORY_TURN_LIMIT,
         )?;
         let registry = workspace_tool_registry();
-        let workspace_root_display = workspace_root.to_string_lossy().into_owned();
-        let policy = workspace_policy(
-            workspace_root_display,
-            thread.sandbox_mode,
-            thread.approval_policy,
-        );
+        let policy = workspace_policy(thread.sandbox_mode, thread.approval_policy);
         let loop_input = match agent_loop_input(
             &thread,
             &params,
@@ -922,7 +917,7 @@ impl AppServer {
                 Vec::new()
             }
         };
-        if run_status.audit_events.is_empty() && pending.tool_name == TOOL_COMMAND {
+        if run_status.audit_events.is_empty() && pending.tool_name.as_str() == TOOL_COMMAND {
             let audit_status = approval_terminal_status(
                 &thread,
                 decision,
@@ -953,12 +948,7 @@ impl AppServer {
     {
         let registry = workspace_tool_registry();
         let workspace_root = workspace_root(thread).map_err(AppServerError::Workspace)?;
-        let workspace_root_display = workspace_root.to_string_lossy().into_owned();
-        let policy = workspace_policy(
-            workspace_root_display,
-            thread.sandbox_mode,
-            thread.approval_policy,
-        );
+        let policy = workspace_policy(thread.sandbox_mode, thread.approval_policy);
         let loop_input = agent_loop_input(thread, params, turn_id, &workspace_root, history)?;
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
             .with_workspace_tools(workspace_tools(
@@ -1740,10 +1730,9 @@ fn pending_command_audit_metadata(
     let resources = serde_json::from_value::<PendingToolCall>(pending_value.clone())
         .map(|pending| pending.resources)
         .unwrap_or_default();
-    let scope_digest = resources.iter().find_map(|resource| {
-        resource
-            .strip_prefix("command_script;scope_digest:")
-            .filter(|digest| is_sha256_digest(digest))
+    let scope_digest = resources.iter().find_map(|resource| match resource {
+        PermissionResource::CommandScope(digest) => Some(digest.as_str()),
+        _ => None,
     });
     let audit = json!({
         "sandbox_backend": "not_executed",
@@ -1758,13 +1747,6 @@ fn pending_command_audit_metadata(
         },
     });
     Some(audit)
-}
-
-fn is_sha256_digest(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return false;
-    };
-    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn merge_json_object(target: &mut Value, source: Value) {
@@ -1794,11 +1776,11 @@ fn approval_checkpoints(result: &AgentLoopResult) -> AppServerResult<Vec<Approva
 
 fn workspace_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::default();
-    for spec in workspace_tool_specs()
+    for entry in workspace_tool_entries()
         .into_iter()
-        .chain(agent_control_tool_specs())
+        .chain(agent_control_tool_entries())
     {
-        registry.register(spec).expect("valid builtin tool");
+        registry.register(entry).expect("valid builtin tool");
     }
     registry
 }
@@ -1945,13 +1927,12 @@ fn agent_loop_unavailable_message(capability: &AgentLoopCapability) -> String {
     )
 }
 fn workspace_policy(
-    workspace_root: String,
     sandbox_mode: PermissionProfileName,
     approval_policy: ApprovalPolicy,
 ) -> PolicyEngine {
     let mut profile = match sandbox_mode {
-        PermissionProfileName::ReadOnly => PermissionProfile::read_only(workspace_root),
-        PermissionProfileName::WorkspaceWrite => PermissionProfile::workspace_write(workspace_root),
+        PermissionProfileName::ReadOnly => PermissionProfile::read_only(),
+        PermissionProfileName::WorkspaceWrite => PermissionProfile::workspace_write(),
     };
     profile.approval_policy = approval_policy;
     PolicyEngine::new(profile)
@@ -2122,14 +2103,31 @@ mod tests {
         ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, Provider,
         ProviderError, ProviderProtocolContract,
     };
+    use singularity_policy::{CommandScopeDigest, ToolId, WorkspaceRelativePath};
     use singularity_protocol::ItemKind;
     use singularity_sandbox::CommandScriptRequest;
     use singularity_tools::{
         CommandRequest, CommandResult, SandboxFilesystemMode, SandboxNetworkMode,
-        command_script_scope_resource_with_policy,
+        command_script_scope_digest_with_policy,
     };
 
     use super::*;
+
+    fn tool_id(value: &str) -> ToolId {
+        ToolId::new(value).expect("valid tool id")
+    }
+
+    fn workspace_resource(value: &str) -> PermissionResource {
+        PermissionResource::WorkspacePath(
+            WorkspaceRelativePath::from_canonical(value).expect("canonical workspace path"),
+        )
+    }
+
+    fn command_resource(value: String) -> PermissionResource {
+        PermissionResource::CommandScope(
+            CommandScopeDigest::new(value).expect("valid command scope"),
+        )
+    }
 
     fn app_server(store: SessionStore) -> AppServer {
         AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
@@ -2297,7 +2295,7 @@ mod tests {
             "approval_stopped_execution",
             thread.thread_id,
             turn.turn_id,
-            TOOL_EDIT,
+            tool_id(TOOL_EDIT),
         )
         .with_tool_call_id("call_1");
         let checkpoint = json!({
@@ -2692,11 +2690,12 @@ mod tests {
 
     #[test]
     fn sandbox_command_schema_does_not_expose_permission_expansion_fields() {
-        let command = workspace_tool_specs()
+        let command = workspace_tool_entries()
             .into_iter()
-            .find(|spec| spec.name == TOOL_COMMAND)
-            .expect("command tool spec");
+            .find(|entry| entry.spec.name == TOOL_COMMAND)
+            .expect("command tool entry");
         let properties = command
+            .spec
             .input_schema
             .get("properties")
             .and_then(Value::as_object)
@@ -2836,10 +2835,10 @@ mod tests {
             format!("approval_{}_call_1", turn.turn_id),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            TOOL_EDIT,
+            tool_id(TOOL_EDIT),
         )
         .with_tool_call_id("call_1")
-        .with_resources(["README.md"]);
+        .with_resources([workspace_resource("README.md")]);
         let decision = ApprovalDecision::new(
             request.request_id.clone(),
             ApprovalOutcome::Allow,
@@ -2908,10 +2907,10 @@ mod tests {
             format!("approval_{}_call_1", turn.turn_id),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            TOOL_EDIT,
+            tool_id(TOOL_EDIT),
         )
         .with_tool_call_id("call_1")
-        .with_resources(["README.md"]);
+        .with_resources([workspace_resource("README.md")]);
         let arguments = json!({
             "path": "README.md",
             "expected": "before",
@@ -2920,7 +2919,7 @@ mod tests {
         let pending = PendingToolCall {
             request_id: request.request_id.clone(),
             tool_call_id: "call_1".to_string(),
-            tool_name: TOOL_EDIT.to_string(),
+            tool_name: tool_id(TOOL_EDIT),
             raw_arguments: arguments.to_string(),
             resources: request.resources.clone(),
         };
@@ -3022,13 +3021,13 @@ mod tests {
             format!("approval_{}_call_1", turn.turn_id),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            TOOL_COMMAND,
+            tool_id(TOOL_COMMAND),
         )
         .with_tool_call_id("call_1");
         let pending = PendingToolCall {
             request_id: request.request_id.clone(),
             tool_call_id: "call_1".to_string(),
-            tool_name: TOOL_COMMAND.to_string(),
+            tool_name: tool_id(TOOL_COMMAND),
             raw_arguments: json!({
                 "command": "test-program success",
                 "timeout_seconds": 5
@@ -3128,7 +3127,7 @@ mod tests {
             "approval_cancel_race",
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            TOOL_EDIT,
+            tool_id(TOOL_EDIT),
         )
         .with_tool_call_id("call_1");
         let pending_payload = checkpoint(&request, "call_1");
@@ -3172,7 +3171,7 @@ mod tests {
             "approval_must_not_persist",
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            TOOL_EDIT,
+            tool_id(TOOL_EDIT),
         )
         .with_tool_call_id("call_2");
         let stale_status = AgentRunStatus::failed("stale local result");
@@ -3220,7 +3219,7 @@ mod tests {
             "approval_initial_interrupt",
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            TOOL_EDIT,
+            tool_id(TOOL_EDIT),
         )
         .with_tool_call_id("call_1");
         let checkpoint = json!({
@@ -3313,7 +3312,7 @@ mod tests {
             format!("approval_{}_call_1", turn.turn_id),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
-            TOOL_COMMAND,
+            tool_id(TOOL_COMMAND),
         )
         .with_tool_call_id("call_1");
         let decision = ApprovalDecision::new(
@@ -3326,24 +3325,24 @@ mod tests {
             "timeout_seconds": 5
         })
         .to_string();
-        let bound_resource = command_script_scope_resource_with_policy(
+        let bound_resource = command_resource(command_script_scope_digest_with_policy(
             "test-program success",
             ".",
             5,
             SandboxFilesystemMode::WorkspaceWrite,
             SandboxNetworkMode::Allowed,
-        );
+        ));
         let mismatched_pending = PendingToolCall {
             request_id: "approval_other_call_1".to_string(),
             tool_call_id: "call_1".to_string(),
-            tool_name: TOOL_COMMAND.to_string(),
+            tool_name: tool_id(TOOL_COMMAND),
             raw_arguments: valid_command.clone(),
             resources: vec![bound_resource.clone()],
         };
         let invalid_args_pending = PendingToolCall {
             request_id: request.request_id.clone(),
             tool_call_id: "call_1".to_string(),
-            tool_name: TOOL_COMMAND.to_string(),
+            tool_name: tool_id(TOOL_COMMAND),
             raw_arguments: "{not-json".to_string(),
             resources: Vec::new(),
         };
@@ -3374,9 +3373,10 @@ mod tests {
         );
         assert_eq!(
             mismatch_status.audit_events[0]["command_scope_digest"],
-            bound_resource
-                .strip_prefix("command_script;scope_digest:")
-                .expect("bound scope digest")
+            match &bound_resource {
+                PermissionResource::CommandScope(digest) => digest.as_str(),
+                _ => panic!("bound command resource must be typed"),
+            }
         );
         assert_eq!(
             mismatch_status.audit_events[0]["policy_scope_binding"],

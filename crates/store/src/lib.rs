@@ -25,7 +25,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_core::contains_sensitive_text;
 use singularity_policy::{
-    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
+    ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest,
+    PermissionProfileName, PermissionResource, ToolId, WorkspaceRelativePath,
 };
 use singularity_protocol::{
     ArtifactRef, Item, ItemKind, ItemStatus, Thread, ThreadStatus, TraceBindingError, TraceEvent,
@@ -100,7 +101,7 @@ mod windows_file_identity {
     }
 }
 
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 const THREAD_POLICY_SCHEMA_VERSION: u32 = 9;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 // 保留历史 migration id；当前代码表达 approval/trace event history，不表达密码学 ledger。
@@ -112,8 +113,9 @@ const PENDING_EXECUTION_STATE_SCHEMA_MIGRATION: &str = "0007_pending_execution_s
 const APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION: &str = "0008_approval_execution_recovery";
 const THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION: &str = "0009_thread_policy_snapshot";
 const STABLE_ENUM_TEXT_SCHEMA_MIGRATION: &str = "0010_stable_enum_text";
+const TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION: &str = "0011_typed_permission_resources";
 // This migration existed only while the removed sidecar-run runtime was live.
-// It is accepted while reading old databases and deliberately not retained in v10.
+// It is accepted while reading old databases and deliberately not retained in the current schema.
 const RETIRED_ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION: &str = "0003_active_sidecar_runs";
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const STORE_INITIALIZATION_LOCK_RETRY_MS: u64 = 10;
@@ -260,12 +262,12 @@ fn decode_db_enum<T: DbEnum>(value: String, column: usize) -> rusqlite::Result<T
     })
 }
 
-// Schema detection, legacy preflight/conversion, and v10 DDL validation live
+// Schema detection, legacy preflight/conversion, and current DDL validation live
 // behind one typed initialization entry; runtime transaction paths stay here.
 mod migration {
     use super::*;
 
-    const EXPECTED_MIGRATIONS: [&str; 9] = [
+    const EXPECTED_MIGRATIONS: [&str; 10] = [
         INITIAL_SCHEMA_MIGRATION,
         DURABLE_EVENT_HISTORY_SCHEMA_MIGRATION,
         PENDING_TOOL_CALL_SCHEMA_MIGRATION,
@@ -275,6 +277,7 @@ mod migration {
         APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION,
         THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION,
         STABLE_ENUM_TEXT_SCHEMA_MIGRATION,
+        TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION,
     ];
 
     const KNOWN_LEGACY_MIGRATIONS: [&str; 10] = [
@@ -427,7 +430,7 @@ mod migration {
     pub(super) fn initialize_or_validate_schema(connection: &Connection) -> StoreResult<()> {
         let tables = user_tables(connection)?;
         if tables.is_empty() {
-            create_v10_schema(connection)?;
+            create_v11_schema(connection)?;
             return Ok(());
         }
 
@@ -439,20 +442,20 @@ mod migration {
             });
         }
         if version == SCHEMA_VERSION {
-            return validate_v10_schema(connection);
+            return validate_v11_schema(connection);
         }
 
         migrate_legacy_schema(connection, version)?;
-        // The migration transaction already performed the complete v10 data
+        // The migration transaction already performed the complete v11 data
         // validation before commit.  Recheck only the committed structure here;
-        // callers opening an already-v10 store use the full validator above.
-        validate_v10_structure(connection)
+        // callers opening an already-v11 store use the full validator above.
+        validate_v11_structure(connection)
     }
 
-    fn create_v10_schema(connection: &Connection) -> StoreResult<()> {
+    fn create_v11_schema(connection: &Connection) -> StoreResult<()> {
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-        transaction.execute_batch(V10_SCHEMA_SQL)?;
-        transaction.execute_batch(V10_INDEX_SQL)?;
+        transaction.execute_batch(V11_SCHEMA_SQL)?;
+        transaction.execute_batch(V11_INDEX_SQL)?;
         for migration in EXPECTED_MIGRATIONS {
             transaction.execute(
                 "insert into schema_migrations(migration_id) values(?1)",
@@ -463,14 +466,14 @@ mod migration {
             "insert into schema_meta(schema_version) values(?1)",
             params![SCHEMA_VERSION],
         )?;
-        validate_v10_schema(&transaction)?;
+        validate_v11_schema(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
 
-    const V10_SCHEMA_SQL: &str = r#"
+    const V11_SCHEMA_SQL: &str = r#"
 create table schema_meta(
-    schema_version integer not null check(schema_version = 10)
+    schema_version integer not null check(schema_version = 11)
 );
 create table schema_migrations(
     migration_id text primary key,
@@ -557,7 +560,7 @@ create table pending_tool_calls(
 );
 "#;
 
-    const V10_INDEX_SQL: &str = r#"
+    const V11_INDEX_SQL: &str = r#"
 create unique index turns_thread_sequence_unique on turns(thread_id, turn_sequence);
 create unique index items_turn_sequence_unique on items(turn_id, item_sequence);
 create index turns_history_lookup on turns(thread_id, status, turn_sequence);
@@ -600,6 +603,11 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         history_indexes: LegacyHistoryIndexes,
         v7_pending_constraint: LegacyV7PendingConstraint,
     ) -> String {
+        if version == 10 {
+            let mut sql = V11_SCHEMA_SQL.replace("schema_version = 11", "schema_version = 10");
+            sql.push_str(V11_INDEX_SQL);
+            return sql;
+        }
         let mut sql = String::new();
         if version >= 5 {
             sql.push_str("create table schema_meta(schema_version integer not null);");
@@ -854,11 +862,11 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         sql
     }
 
-    fn canonical_v10_schema_sql(suffix: &str) -> String {
+    fn canonical_v11_schema_sql(suffix: &str) -> String {
         if suffix.is_empty() {
-            return V10_SCHEMA_SQL.to_string();
+            return V11_SCHEMA_SQL.to_string();
         }
-        let mut sql = V10_SCHEMA_SQL.to_string();
+        let mut sql = V11_SCHEMA_SQL.to_string();
         for table in [
             "schema_meta",
             "schema_migrations",
@@ -1016,7 +1024,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                 .collect::<BTreeSet<_>>();
             if markers != expected {
                 return Err(StoreError::InvalidState(
-                    "v10 migration markers are incomplete or unknown".to_string(),
+                    "v11 migration markers are incomplete or unknown".to_string(),
                 ));
             }
             return Ok(());
@@ -1027,7 +1035,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                     "unknown migration marker {marker}"
                 )));
             }
-            if marker == STABLE_ENUM_TEXT_SCHEMA_MIGRATION {
+            if version < 10 && marker == STABLE_ENUM_TEXT_SCHEMA_MIGRATION {
                 return Err(StoreError::InvalidState(
                     "v10 migration marker is present on a legacy schema".to_string(),
                 ));
@@ -1068,6 +1076,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                 (7, PENDING_EXECUTION_STATE_SCHEMA_MIGRATION),
                 (8, APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION),
                 (9, THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION),
+                (10, STABLE_ENUM_TEXT_SCHEMA_MIGRATION),
             ] {
                 if number <= version {
                     expected.insert(marker.to_string());
@@ -1440,16 +1449,70 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         Ok(traces)
     }
 
-    fn current_approval_request(value: LegacyApprovalRequestCurrent) -> ApprovalRequest {
-        ApprovalRequest {
+    fn legacy_tool_id(action: String, context: &str) -> StoreResult<ToolId> {
+        ToolId::new(action).map_err(|error| {
+            StoreError::InvalidState(format!("{context} has an invalid tool id: {error}"))
+        })
+    }
+
+    fn legacy_permission_resources(
+        action: &ToolId,
+        resources: Vec<String>,
+        context: &str,
+    ) -> StoreResult<Vec<PermissionResource>> {
+        resources
+            .into_iter()
+            .map(|resource| match action.as_str() {
+                "read" | "list" | "grep" | "edit" | "patch" => {
+                    WorkspaceRelativePath::from_canonical(resource)
+                        .map(PermissionResource::WorkspacePath)
+                        .map_err(|error| {
+                            StoreError::InvalidState(format!(
+                                "{context} has an invalid workspace resource: {error}"
+                            ))
+                        })
+                }
+                "command" => resource
+                    .strip_prefix("command_script;scope_digest:")
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "{context} command resource is not an exact historical scope"
+                        ))
+                    })
+                    .and_then(|digest| {
+                        CommandScopeDigest::new(digest.to_string())
+                            .map(PermissionResource::CommandScope)
+                            .map_err(|error| {
+                                StoreError::InvalidState(format!(
+                                    "{context} has an invalid command resource: {error}"
+                                ))
+                            })
+                    }),
+                "update_plan" if resource == action.as_str() => {
+                    Ok(PermissionResource::Tool(action.clone()))
+                }
+                _ => Err(StoreError::InvalidState(format!(
+                    "{context} resource type cannot be uniquely recovered"
+                ))),
+            })
+            .collect()
+    }
+
+    fn current_approval_request(
+        value: LegacyApprovalRequestCurrent,
+        context: &str,
+    ) -> StoreResult<ApprovalRequest> {
+        let action = legacy_tool_id(value.action, context)?;
+        let resources = legacy_permission_resources(&action, value.resources, context)?;
+        Ok(ApprovalRequest {
             request_id: value.request_id,
             thread_id: value.thread_id,
             turn_id: value.turn_id,
             tool_call_id: value.tool_call_id,
-            action: value.action,
-            resources: value.resources,
+            action,
+            resources,
             reason: value.reason,
-        }
+        })
     }
 
     fn decode_legacy_approval_request(
@@ -1462,6 +1525,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                 "approval {request_id} payload is invalid for v{version}: {error}"
             ))
         };
+        let context = format!("approval {request_id}");
         match version {
             1..=3 => {
                 let value: LegacyApprovalRequestV1 =
@@ -1471,7 +1535,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                     thread_id: value.session_id,
                     turn_id: value.task_id,
                     tool_call_id: None,
-                    action: value.action,
+                    action: legacy_tool_id(value.action, &context)?,
                     resources: Vec::new(),
                     reason: value.reason,
                 })
@@ -1479,13 +1543,15 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
             4 => {
                 let value: LegacyApprovalRequestV4 =
                     serde_json::from_str(payload).map_err(invalid)?;
+                let action = legacy_tool_id(value.action, &context)?;
+                let resources = legacy_permission_resources(&action, value.resources, &context)?;
                 Ok(ApprovalRequest {
                     request_id: value.request_id,
                     thread_id: value.session_id,
                     turn_id: value.task_id,
                     tool_call_id: None,
-                    action: value.action,
-                    resources: value.resources,
+                    action,
+                    resources,
                     reason: value.reason,
                 })
             }
@@ -1497,19 +1563,21 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                         "approval {request_id} legacy and durable bindings disagree"
                     )));
                 }
+                let action = legacy_tool_id(value.action, &context)?;
+                let resources = legacy_permission_resources(&action, value.resources, &context)?;
                 Ok(ApprovalRequest {
                     request_id: value.request_id,
                     thread_id: value.thread_id,
                     turn_id: value.turn_id,
                     tool_call_id: value.tool_call_id,
-                    action: value.action,
-                    resources: value.resources,
+                    action,
+                    resources,
                     reason: value.reason,
                 })
             }
             6 => {
                 if let Ok(value) = serde_json::from_str::<LegacyApprovalRequestCurrent>(payload) {
-                    return Ok(current_approval_request(value));
+                    return current_approval_request(value, &context);
                 }
                 let value: LegacyApprovalRequestV5 =
                     serde_json::from_str(payload).map_err(invalid)?;
@@ -1518,19 +1586,24 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                         "approval {request_id} legacy and durable bindings disagree"
                     )));
                 }
+                let action = legacy_tool_id(value.action, &context)?;
+                let resources = legacy_permission_resources(&action, value.resources, &context)?;
                 Ok(ApprovalRequest {
                     request_id: value.request_id,
                     thread_id: value.thread_id,
                     turn_id: value.turn_id,
                     tool_call_id: value.tool_call_id,
-                    action: value.action,
-                    resources: value.resources,
+                    action,
+                    resources,
                     reason: value.reason,
                 })
             }
-            7..=SCHEMA_VERSION => serde_json::from_str::<LegacyApprovalRequestCurrent>(payload)
-                .map(current_approval_request)
-                .map_err(invalid),
+            7..=10 => {
+                let value = serde_json::from_str::<LegacyApprovalRequestCurrent>(payload)
+                    .map_err(invalid)?;
+                current_approval_request(value, &context)
+            }
+            11 => serde_json::from_str::<ApprovalRequest>(payload).map_err(invalid),
             _ => Err(StoreError::InvalidState(format!(
                 "approval {request_id} uses unsupported schema version {version}"
             ))),
@@ -1710,10 +1783,19 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                         ))
                     },
                 )?;
+                let legacy_action = legacy_tool_id(
+                    legacy.tool_name.clone(),
+                    &format!("pending tool call {request_id}"),
+                )?;
+                let legacy_resources = legacy_permission_resources(
+                    &legacy_action,
+                    legacy.resources,
+                    &format!("pending tool call {request_id}"),
+                )?;
                 if legacy.request_id != request_id
                     || legacy.tool_call_id.trim().is_empty()
-                    || legacy.tool_name != approval.request.action
-                    || legacy.resources != approval.request.resources
+                    || legacy_action != approval.request.action
+                    || legacy_resources != approval.request.resources
                     || serde_json::from_str::<Value>(&legacy.raw_arguments).is_err()
                     || thread_id
                         .as_deref()
@@ -1731,7 +1813,14 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                     "v{version} pending tool call {request_id} cannot be migrated without fabricating an AgentLoop checkpoint"
                 )));
             }
-            let payload: Value = serde_json::from_str(&payload)?;
+            let mut payload: Value = serde_json::from_str(&payload)?;
+            if version <= 10 {
+                convert_legacy_pending_resources(
+                    &mut payload,
+                    &approval.request.action,
+                    &format!("pending tool call {request_id}"),
+                )?;
+            }
             let derived_tool_call_id = payload
                 .get("tool_call_id")
                 .and_then(Value::as_str)
@@ -1784,6 +1873,49 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
             });
         }
         Ok(pending)
+    }
+
+    fn convert_legacy_pending_resources(
+        payload: &mut Value,
+        action: &ToolId,
+        context: &str,
+    ) -> StoreResult<()> {
+        let object = payload.as_object_mut().ok_or_else(|| {
+            StoreError::InvalidState(format!("{context} checkpoint is not an object"))
+        })?;
+        let tool_name = object
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!("{context} checkpoint has no tool_name"))
+            })?;
+        if tool_name != action.as_str() {
+            return Err(StoreError::InvalidState(format!(
+                "{context} checkpoint tool does not match approval"
+            )));
+        }
+        let resources = object
+            .get_mut("resources")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!("{context} checkpoint has no resources"))
+            })?;
+        let legacy = resources
+            .iter()
+            .map(|resource| resource.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "{context} checkpoint resources are not legacy strings"
+                ))
+            })?;
+        *resources = serde_json::to_value(legacy_permission_resources(action, legacy, context)?)?
+            .as_array()
+            .cloned()
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!("{context} converted resources are not an array"))
+            })?;
+        Ok(())
     }
 
     fn read_legacy_artifacts(connection: &Connection) -> StoreResult<Vec<LegacyArtifactRow>> {
@@ -2103,20 +2235,20 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         // Foreign keys remain enabled: replacement rows are inserted parent-first
         // and legacy tables are removed child-first within this transaction.
         let data = read_legacy_data(&transaction, version, true)?;
-        write_v10_tables(&transaction, &data)?;
+        write_v11_tables(&transaction, &data)?;
         // Validate the fully rebuilt schema while the old database is still
         // recoverable by the transaction. A post-commit validation cannot
         // protect source tables from a malformed final schema or row.
-        validate_v10_schema(&transaction)?;
+        validate_v11_schema(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
 
-    fn write_v10_tables(connection: &Connection, data: &LegacyData) -> StoreResult<()> {
-        connection.execute_batch(&canonical_v10_schema_sql("_v10"))?;
+    fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<()> {
+        connection.execute_batch(&canonical_v11_schema_sql("_v11"))?;
         for thread in &data.threads {
             connection.execute(
-            "insert into threads_v10(thread_id, model, cwd, status, sandbox_mode, approval_policy)
+            "insert into threads_v11(thread_id, model, cwd, status, sandbox_mode, approval_policy)
              values(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 thread.thread_id,
@@ -2130,7 +2262,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         }
         for turn in &data.turns {
             connection.execute(
-            "insert into turns_v10(turn_id, thread_id, turn_sequence, status, agent_loop_status)
+            "insert into turns_v11(turn_id, thread_id, turn_sequence, status, agent_loop_status)
              values(?1, ?2, ?3, ?4, ?5)",
             params![
                 turn.turn_id,
@@ -2143,7 +2275,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         }
         for item in &data.items {
             connection.execute(
-            "insert into items_v10(item_id, turn_id, item_sequence, kind, payload, status, redacted)
+            "insert into items_v11(item_id, turn_id, item_sequence, kind, payload, status, redacted)
              values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 item.item_id,
@@ -2159,7 +2291,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         for trace in &data.traces {
             let event = &trace.event;
             connection.execute(
-                "insert into trace_events_v10(event_id, run_id, session_id, payload)
+                "insert into trace_events_v11(event_id, run_id, session_id, payload)
              values(?1, ?2, ?3, ?4)",
                 params![
                     event.event_id,
@@ -2175,7 +2307,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                 .map(final_approval_outcome_to_db_text)
                 .transpose()?;
             connection.execute(
-                "insert into approvals_v10(
+                "insert into approvals_v11(
                  request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
              ) values(?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
@@ -2191,7 +2323,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         for decision in &data.decisions {
             let outcome = final_approval_outcome_to_db_text(decision.decision.outcome)?;
             connection.execute(
-            "insert into approval_decisions_v10(decision_id, request_id, outcome, reason, payload)
+            "insert into approval_decisions_v11(decision_id, request_id, outcome, reason, payload)
              values(?1, ?2, ?3, ?4, ?5)",
             params![
                 decision.decision.decision_id,
@@ -2204,7 +2336,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         }
         for pending in &data.pending_tool_calls {
             connection.execute(
-                "insert into pending_tool_calls_v10(
+                "insert into pending_tool_calls_v11(
                  request_id, thread_id, turn_id, tool_call_id, payload, execution_state
              ) values(?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
@@ -2220,7 +2352,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         for artifact in &data.artifacts {
             let artifact = &artifact.artifact;
             connection.execute(
-                "insert into artifact_refs_v10(
+                "insert into artifact_refs_v11(
                  artifact_id, run_id, item_id, kind, uri, content_digest,
                  summary, metadata, redacted
              ) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -2239,12 +2371,12 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         }
         for migration in EXPECTED_MIGRATIONS {
             connection.execute(
-                "insert into schema_migrations_v10(migration_id) values(?1)",
+                "insert into schema_migrations_v11(migration_id) values(?1)",
                 params![migration],
             )?;
         }
         connection.execute(
-            "insert into schema_meta_v10(schema_version) values(?1)",
+            "insert into schema_meta_v11(schema_version) values(?1)",
             params![SCHEMA_VERSION],
         )?;
 
@@ -2263,40 +2395,40 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         drop table if exists artifact_refs;
         drop table if exists schema_migrations;
         drop table if exists schema_meta;
-        alter table schema_meta_v10 rename to schema_meta;
-        alter table schema_migrations_v10 rename to schema_migrations;
-        alter table threads_v10 rename to threads;
-        alter table turns_v10 rename to turns;
-        alter table items_v10 rename to items;
-        alter table trace_events_v10 rename to trace_events;
-        alter table approvals_v10 rename to approvals;
-        alter table approval_decisions_v10 rename to approval_decisions;
-        alter table artifact_refs_v10 rename to artifact_refs;
-        alter table pending_tool_calls_v10 rename to pending_tool_calls;
+        alter table schema_meta_v11 rename to schema_meta;
+        alter table schema_migrations_v11 rename to schema_migrations;
+        alter table threads_v11 rename to threads;
+        alter table turns_v11 rename to turns;
+        alter table items_v11 rename to items;
+        alter table trace_events_v11 rename to trace_events;
+        alter table approvals_v11 rename to approvals;
+        alter table approval_decisions_v11 rename to approval_decisions;
+        alter table artifact_refs_v11 rename to artifact_refs;
+        alter table pending_tool_calls_v11 rename to pending_tool_calls;
         "#,
         )?;
-        connection.execute_batch(V10_INDEX_SQL)?;
+        connection.execute_batch(V11_INDEX_SQL)?;
         Ok(())
     }
 
-    fn validate_v10_schema(connection: &Connection) -> StoreResult<()> {
-        validate_v10_structure(connection)?;
+    fn validate_v11_schema(connection: &Connection) -> StoreResult<()> {
+        validate_v11_structure(connection)?;
         read_legacy_data(connection, SCHEMA_VERSION, false)?;
-        fail_closed_on_foreign_key_violations(connection, "v10 validation")?;
+        fail_closed_on_foreign_key_violations(connection, "v11 validation")?;
         Ok(())
     }
 
-    // Validate the immutable v10 interface without scanning or decoding every
+    // Validate the immutable v11 interface without scanning or decoding every
     // stored row.  Trusted reopen uses this after the owning process initialized
     // the database; row payloads remain validated at each read or transaction.
-    pub(super) fn validate_v10_structure(connection: &Connection) -> StoreResult<()> {
+    pub(super) fn validate_v11_structure(connection: &Connection) -> StoreResult<()> {
         if schema_meta_version(connection)? != Some(SCHEMA_VERSION) {
             return Err(StoreError::InvalidState(
-                "v10 schema_meta version is missing or inconsistent".to_string(),
+                "v11 schema_meta version is missing or inconsistent".to_string(),
             ));
         }
         validate_legacy_markers(connection, SCHEMA_VERSION)?;
-        validate_canonical_v10_fingerprint(connection)
+        validate_canonical_v11_fingerprint(connection)
     }
 
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2366,15 +2498,15 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
         match_name: String,
     }
 
-    fn validate_canonical_v10_fingerprint(connection: &Connection) -> StoreResult<()> {
+    fn validate_canonical_v11_fingerprint(connection: &Connection) -> StoreResult<()> {
         let reference = Connection::open_in_memory()?;
-        reference.execute_batch(V10_SCHEMA_SQL)?;
-        reference.execute_batch(V10_INDEX_SQL)?;
+        reference.execute_batch(V11_SCHEMA_SQL)?;
+        reference.execute_batch(V11_INDEX_SQL)?;
         let expected = schema_fingerprint(&reference)?;
         let actual = schema_fingerprint(connection)?;
         if actual != expected {
             return Err(StoreError::InvalidState(
-                "v10 schema fingerprint is not canonical".to_string(),
+                "v11 schema fingerprint is not canonical".to_string(),
             ));
         }
         Ok(())
@@ -2646,11 +2778,12 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
             connection
                 .execute("insert into schema_meta(schema_version) values(9)", [])
                 .expect("insert schema version");
-            for migration in EXPECTED_MIGRATIONS
-                .iter()
-                .copied()
-                .filter(|migration| *migration != STABLE_ENUM_TEXT_SCHEMA_MIGRATION)
-            {
+            for migration in EXPECTED_MIGRATIONS.iter().copied().filter(|migration| {
+                !matches!(
+                    *migration,
+                    STABLE_ENUM_TEXT_SCHEMA_MIGRATION | TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION
+                )
+            }) {
                 connection
                     .execute(
                         "insert into schema_migrations(migration_id) values(?1)",
@@ -2712,10 +2845,9 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                 page_count
             );
 
-            assert!(matches!(
-                migrate_legacy_schema(&connection, 9),
-                Err(StoreError::Sqlite(_))
-            ));
+            let error = migrate_legacy_schema(&connection, 9)
+                .expect_err("page limit must fail the schema write");
+            assert!(matches!(error, StoreError::Sqlite(_)), "{error:?}");
             assert_eq!(
                 connection
                     .query_row("select schema_version from schema_meta", [], |row| {
@@ -2734,7 +2866,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                 connection
                     .query_row(
                         "select count(*) from sqlite_schema
-                         where type = 'table' and name like '%_v10'",
+                         where type = 'table' and name like '%_v11'",
                         [],
                         |row| row.get::<_, u32>(0),
                     )
@@ -3262,7 +3394,7 @@ impl SessionStore {
         original_guard.verify()?;
         configure_connection(&connection)?;
         validate_connection_pragmas(&connection, false)?;
-        migration::validate_v10_structure(&connection)?;
+        migration::validate_v11_structure(&connection)?;
         identity_guard.verify()?;
         original_guard.verify()?;
         Ok(Self {
@@ -6419,19 +6551,18 @@ fn pending_tool_call_id(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
-    if tool_name != request.action {
+    if tool_name != request.action.as_str() {
         return Err(StoreError::InvalidState(
             PENDING_TOOL_CALL_NAME_MISMATCH.to_string(),
         ));
     }
-    let resources = payload
-        .get("resources")
-        .and_then(Value::as_array)
-        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?
-        .iter()
-        .map(|value| value.as_str().map(str::to_string))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
+    let resources = serde_json::from_value::<Vec<PermissionResource>>(
+        payload
+            .get("resources")
+            .cloned()
+            .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?,
+    )
+    .map_err(|_| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
     if resources != request.resources {
         return Err(StoreError::InvalidState(
             PENDING_TOOL_CALL_RESOURCES_MISMATCH.to_string(),
@@ -6624,7 +6755,7 @@ fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRef> {
     })
 }
 
-// 解码 v10 trace 行，同时验证列与 payload 的身份投影一致。
+// 解码现行 trace 行，同时验证列与 payload 的身份投影一致。
 fn decode_stored_trace_row(
     event_id: &str,
     run_id: &str,

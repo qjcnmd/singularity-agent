@@ -105,12 +105,162 @@ pub enum PermissionDecisionOutcome {
     Ask,
 }
 
+/// 注册表中稳定、可持久化的工具标识。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ToolId(String);
+
+impl ToolId {
+    /// 校验并创建工具标识；名称语法与模型工具名的可移植子集一致。
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 128
+            || !value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '/' | '.')
+            })
+        {
+            return Err("tool id is not portable".to_string());
+        }
+        Ok(Self(value))
+    }
+
+    /// 返回注册表使用的稳定名称。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// 已由工作区文件系统边界解析出的规范相对路径。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct WorkspaceRelativePath(String);
+
+impl WorkspaceRelativePath {
+    /// 从工作区边界已经规范化的 `/` 分隔相对路径创建类型化资源。
+    pub fn from_canonical(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value == "." {
+            return Ok(Self(value));
+        }
+        if value.is_empty()
+            || value.starts_with('/')
+            || value.ends_with('/')
+            || value.contains('\\')
+            || value.contains(':')
+            || value
+                .split('/')
+                .any(|component| component.is_empty() || component == "." || component == "..")
+        {
+            return Err("workspace path is not canonical and relative".to_string());
+        }
+        Ok(Self(value))
+    }
+
+    /// 返回工作区文件系统认可的规范相对路径。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn is_within(&self, root: &Self) -> bool {
+        root.0 == "."
+            || self.0 == root.0
+            || self
+                .0
+                .strip_prefix(&root.0)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceRelativePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_canonical(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// 对规范命令执行范围计算的稳定摘要。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct CommandScopeDigest(String);
+
+impl CommandScopeDigest {
+    /// 校验并创建 `sha256:<hex>` 命令范围摘要。
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let Some(hex) = value.strip_prefix("sha256:") else {
+            return Err("command scope digest must use sha256".to_string());
+        };
+        if hex.len() != 64 || !hex.chars().all(|character| character.is_ascii_hexdigit()) {
+            return Err("command scope digest is invalid".to_string());
+        }
+        Ok(Self(format!("sha256:{}", hex.to_ascii_lowercase())))
+    }
+
+    /// 返回稳定摘要文本。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandScopeDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Policy 可以比较但不能自行解析或规范化的类型化权限资源。
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PermissionResource {
+    WorkspacePath(WorkspaceRelativePath),
+    CommandScope(CommandScopeDigest),
+    Tool(ToolId),
+}
+
+/// 规则只允许精确资源或类型化工作区子树，不再解释字符串前缀。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PermissionResourceSelector {
+    Exact(PermissionResource),
+    WorkspaceSubtree(WorkspaceRelativePath),
+}
+
+impl PermissionResourceSelector {
+    fn matches(&self, resource: &PermissionResource) -> bool {
+        match (self, resource) {
+            (Self::Exact(expected), actual) => expected == actual,
+            (Self::WorkspaceSubtree(root), PermissionResource::WorkspacePath(candidate)) => {
+                candidate.is_within(root)
+            }
+            (Self::WorkspaceSubtree(_), _) => false,
+        }
+    }
+}
+
 /// Agent/Policy 共同使用的文件系统、网络和 approval 范围。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PermissionProfile {
     pub profile: PermissionProfileName,
-    pub workspace_roots: Vec<String>,
-    pub additional_writable_directories: Vec<String>,
     pub network_access: NetworkAccess,
     pub approval_policy: ApprovalPolicy,
     pub protected_paths_enforced: bool,
@@ -118,11 +268,9 @@ pub struct PermissionProfile {
 
 impl PermissionProfile {
     /// 创建只读权限档位。
-    pub fn read_only(workspace_root: impl Into<String>) -> Self {
+    pub fn read_only() -> Self {
         Self {
             profile: PermissionProfileName::ReadOnly,
-            workspace_roots: vec![workspace_root.into()],
-            additional_writable_directories: Vec::new(),
             network_access: NetworkAccess::Denied,
             approval_policy: ApprovalPolicy::OnRequest,
             protected_paths_enforced: true,
@@ -130,11 +278,9 @@ impl PermissionProfile {
     }
 
     /// 创建 workspace-write 权限档位。
-    pub fn workspace_write(workspace_root: impl Into<String>) -> Self {
+    pub fn workspace_write() -> Self {
         Self {
             profile: PermissionProfileName::WorkspaceWrite,
-            workspace_roots: vec![workspace_root.into()],
-            additional_writable_directories: Vec::new(),
             network_access: NetworkAccess::Denied,
             approval_policy: ApprovalPolicy::OnRequest,
             protected_paths_enforced: true,
@@ -145,23 +291,23 @@ impl PermissionProfile {
 /// 待评估的工具、操作和资源请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PermissionRequest {
-    pub tool_name: String,
+    pub tool_id: ToolId,
     pub operation: PermissionOperation,
-    pub resource: String,
+    pub resource: PermissionResource,
     pub resource_sensitive: bool,
 }
 
 impl PermissionRequest {
     /// 创建待评估的 permission 请求。
     pub fn new(
-        tool_name: impl Into<String>,
+        tool_id: ToolId,
         operation: PermissionOperation,
-        resource: impl Into<String>,
+        resource: PermissionResource,
     ) -> Self {
         Self {
-            tool_name: tool_name.into(),
+            tool_id,
             operation,
-            resource: resource.into(),
+            resource,
             resource_sensitive: false,
         }
     }
@@ -180,8 +326,7 @@ pub struct PermissionRule {
     pub scope: SettingsScope,
     pub outcome: PermissionDecisionOutcome,
     pub operation: Option<PermissionOperation>,
-    pub resource: Option<String>,
-    pub resource_prefix: Option<String>,
+    pub resource: Option<PermissionResourceSelector>,
 }
 
 impl PermissionRule {
@@ -197,7 +342,6 @@ impl PermissionRule {
             outcome,
             operation: None,
             resource: None,
-            resource_prefix: None,
         }
     }
 
@@ -208,16 +352,14 @@ impl PermissionRule {
     }
 
     /// 限制规则适用的精确资源。
-    pub fn for_resource(mut self, resource: impl Into<String>) -> Self {
-        self.resource = Some(resource.into());
-        self.resource_prefix = None;
+    pub fn for_resource(mut self, resource: PermissionResource) -> Self {
+        self.resource = Some(PermissionResourceSelector::Exact(resource));
         self
     }
 
-    /// 限制规则适用的资源前缀。
-    pub fn for_resource_prefix(mut self, resource_prefix: impl Into<String>) -> Self {
-        self.resource = None;
-        self.resource_prefix = Some(resource_prefix.into());
+    /// 限制规则适用于一个已经规范化的工作区子树。
+    pub fn for_workspace_subtree(mut self, root: WorkspaceRelativePath) -> Self {
+        self.resource = Some(PermissionResourceSelector::WorkspaceSubtree(root));
         self
     }
 
@@ -228,20 +370,8 @@ impl PermissionRule {
             && self
                 .resource
                 .as_ref()
-                .is_none_or(|resource| request.resource == *resource)
-            && self
-                .resource_prefix
-                .as_ref()
-                .is_none_or(|prefix| resource_matches_prefix(&request.resource, prefix))
+                .is_none_or(|resource| resource.matches(&request.resource))
     }
-}
-
-fn resource_matches_prefix(resource: &str, prefix: &str) -> bool {
-    !prefix.is_empty()
-        && (resource == prefix
-            || resource
-                .strip_prefix(prefix)
-                .is_some_and(|suffix| suffix.starts_with(['/', '\\'])))
 }
 
 /// 说明权限决定来源的稳定分类。
@@ -337,11 +467,10 @@ impl PolicyEngine {
                 )
                 .with_cause(PermissionDecisionCause::FilesystemProfile);
             }
-            if !write_resource_is_workspace_scoped(&request.resource, &self.profile.workspace_roots)
-            {
+            if !matches!(request.resource, PermissionResource::WorkspacePath(_)) {
                 return PermissionDecision::new(
                     PermissionDecisionOutcome::Deny,
-                    "write resource is outside the workspace-write profile",
+                    "write access requires a workspace path resource",
                 )
                 .with_cause(PermissionDecisionCause::FilesystemProfile);
             }
@@ -399,40 +528,6 @@ impl PolicyEngine {
     }
 }
 
-fn write_resource_is_workspace_scoped(resource: &str, workspace_roots: &[String]) -> bool {
-    let normalized_resource = normalize_resource_path(resource);
-    if normalized_resource
-        .split('/')
-        .any(|component| component == "..")
-    {
-        return false;
-    }
-    if !is_absolute_resource(&normalized_resource) {
-        return true;
-    }
-    workspace_roots.iter().any(|root| {
-        let normalized_root = normalize_resource_path(root);
-        normalized_resource == normalized_root
-            || normalized_resource
-                .strip_prefix(&normalized_root)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    })
-}
-
-fn normalize_resource_path(value: &str) -> String {
-    value
-        .trim()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn is_absolute_resource(value: &str) -> bool {
-    std::path::Path::new(value).is_absolute()
-        || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
-        || value.starts_with('/')
-}
-
 /// approval 请求的持久化决定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -470,9 +565,9 @@ pub struct ApprovalRequest {
     pub thread_id: String,
     pub turn_id: String,
     pub tool_call_id: Option<String>,
-    pub action: String,
+    pub action: ToolId,
     #[serde(default)]
-    pub resources: Vec<String>,
+    pub resources: Vec<PermissionResource>,
     pub reason: String,
 }
 
@@ -482,26 +577,25 @@ impl ApprovalRequest {
         request_id: impl Into<String>,
         thread_id: impl Into<String>,
         turn_id: impl Into<String>,
-        action: impl Into<String>,
+        action: ToolId,
     ) -> Self {
         Self {
             request_id: request_id.into(),
             thread_id: thread_id.into(),
             turn_id: turn_id.into(),
             tool_call_id: None,
-            action: action.into(),
+            action,
             resources: Vec::new(),
             reason: String::new(),
         }
     }
 
     /// 设置 approval 关联资源。
-    pub fn with_resources<I, S>(mut self, resources: I) -> Self
+    pub fn with_resources<I>(mut self, resources: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = PermissionResource>,
     {
-        self.resources = resources.into_iter().map(Into::into).collect();
+        self.resources = resources.into_iter().collect();
         self
     }
 
