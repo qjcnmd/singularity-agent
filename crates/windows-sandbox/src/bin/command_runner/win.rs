@@ -5,7 +5,7 @@
 //! anonymous pipes, streams captured output, accepts termination, and emits exit status.
 //! The unelevated restricted-token fallback spawns the child directly.
 
-#![allow(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 mod cwd_junction;
 

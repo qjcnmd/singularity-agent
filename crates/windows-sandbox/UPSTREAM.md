@@ -4,9 +4,10 @@
 
 - Repository: `https://github.com/openai/codex`
 - Upstream subtree: `codex-rs/windows-sandbox-rs`
-- Commit: `1f0566d3f59298d1bb88820a0d35294f1eeb07ea`
+- Extraction commit: `1f0566d3f59298d1bb88820a0d35294f1eeb07ea`
 - Commit date: `2026-07-09`
 - Extraction date: `2026-07-10`
+- Official verification commit: [`82b294c73c902a4c51f789ba68bb599f0065616f`](https://github.com/openai/codex/commit/82b294c73c902a4c51f789ba68bb599f0065616f), verified `2026-07-18`
 - Upstream license: Apache License 2.0
 
 The upstream `LICENSE` and `NOTICE` files are preserved verbatim in this directory.
@@ -100,5 +101,14 @@ The port does not depend on `codex-utils-pty`, `codex-otel`, the upstream protoc
 12. Made child-process containment fail closed: both elevated and unelevated launch paths create and configure a kill-on-close Job Object before spawning, create the child suspended, assign it to the Job Object before resuming its primary thread, and terminate the whole Job Object on cancellation or timeout.
 13. Capture cleanup closes or terminates the kill-on-close Job Object before joining stdout/stderr readers, including normal parent exit; the elevated runner also terminates the Job Object when its control transport reaches EOF or returns a read error, and its process, pipe, and Job handles have explicit early-return cleanup.
 14. Preserved Codex's dedicated Sandbox Users read principal, asynchronous read-grant helper, and best-effort `NUL` compatibility grant. Deny-read remains synchronous on that same principal. Its persistent current-set reconciliation is strengthened with a global cross-process state mutex, atomic replacement, versioned runtime-ACE ownership, and a second native mutex held across setup plus the complete Job Object lifetime so concurrent workspaces cannot revoke a live child's protection. Legacy paths without provable ownership are retained as unmanaged and never revoked. The `WRITE_RESTRICTED` fallback explicitly rejects deny-read overrides.
+
+## Selective upstream delta verification
+
+The following upstream commits were resolved to complete SHAs and reviewed from their official diffs against the verification commit above. They were not cherry-picked as a directory or as blind commits.
+
+- [`87f3e39fdf7e676d0ba25b0587f78e5b85e695e2`](https://github.com/openai/codex/commit/87f3e39fdf7e676d0ba25b0587f78e5b85e695e2) — not applicable. The upstream `ConsoleMode::NoWindow` path hides the upstream `--codex-run-as-fs-helper` filesystem helper and also changes the omitted upstream `unified_exec` surface. This crate has no filesystem-helper argument contract or `src/unified_exec`; its ordinary `SpawnRequest.command` is a product command. The local setup helper already uses `CREATE_NO_WINDOW`/`SW_HIDE` in `src/setup.rs`, so no parallel console-mode API was added.
+- [`abbb8c569cbda65fd75f1a51fcc8dd99ced199fa`](https://github.com/openai/codex/commit/abbb8c569cbda65fd75f1a51fcc8dd99ced199fa) — excluded as not applicable. The Windows-sandbox part is a proxy-enforcement validation in the upstream `src/unified_exec/mod.rs` and depends on upstream config and cross-crate proxy contracts absent from this crate. No partial proxy interface or fallback behavior was added.
+- [`3370181ec6e3227a922257497bdd28f3e8e76144`](https://github.com/openai/codex/commit/3370181ec6e3227a922257497bdd28f3e8e76144) — applied in local form. `src/setup.rs` now coalesces identical serialized setup payloads through `SETUP_FLIGHTS`, shares structured `SetupFailure` results, removes completed flights, and covers one in-flight helper execution with `identical_setup_requests_share_one_in_flight_run`.
+- [`4bc2c723efc6445ea833e2ffd1b11e48298fb8f4`](https://github.com/openai/codex/commit/4bc2c723efc6445ea833e2ffd1b11e48298fb8f4) — excluded as not applicable. The upstream revert is also in the absent `src/unified_exec/mod.rs`; `crates/sandbox/src/lib.rs` already attempts elevated capture first for every Windows command, but no managed-proxy field or proxy product contract reaches this crate, so that elevated-first behavior is supporting evidence rather than a proxy-specific port.
 
 `singularity_sandbox::WindowsSandboxBackend` is the product adapter for this crate. It maps the runtime filesystem and network policy into the permission profile above, tries the elevated path first, permits the restricted-token path only when it can enforce the requested profile, and otherwise fails closed.

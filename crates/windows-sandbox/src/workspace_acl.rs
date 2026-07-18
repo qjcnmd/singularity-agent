@@ -15,13 +15,17 @@ pub fn is_command_cwd_root(root: &Path, canonical_command_cwd: &Path) -> bool {
 /// # Safety
 /// Caller must ensure `psid` is a valid SID pointer.
 pub unsafe fn protect_workspace_singularity_dir(cwd: &Path, psid: *mut c_void) -> Result<bool> {
-    protect_workspace_subdir(cwd, psid, PROTECTED_METADATA_DIR_NAME)
+    // SAFETY: the public contract requires a valid SID pointer and the delegated helper only
+    // uses it for the synchronous ACL operation.
+    unsafe { protect_workspace_subdir(cwd, psid, PROTECTED_METADATA_DIR_NAME) }
 }
 
 /// # Safety
 /// Caller must ensure `psid` is a valid SID pointer.
 pub unsafe fn protect_workspace_agents_dir(cwd: &Path, psid: *mut c_void) -> Result<bool> {
-    protect_workspace_subdir(cwd, psid, PROTECTED_AGENTS_DIR_NAME)
+    // SAFETY: the public contract requires a valid SID pointer and the delegated helper only
+    // uses it for the synchronous ACL operation.
+    unsafe { protect_workspace_subdir(cwd, psid, PROTECTED_AGENTS_DIR_NAME) }
 }
 
 unsafe fn protect_workspace_subdir(cwd: &Path, psid: *mut c_void, subdir: &str) -> Result<bool> {

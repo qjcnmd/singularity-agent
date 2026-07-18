@@ -225,11 +225,14 @@ unsafe fn remove_empty_runtime_sentinel_by_handle(
 ) -> Result<()> {
     let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
     (|| -> Result<()> {
-        let mut info = std::mem::zeroed();
-        if GetFileInformationByHandle(handle, &mut info) == 0 {
+        // SAFETY: `file` pins the directory handle for this synchronous identity check and the
+        // Win32 output structure is initialized through a valid mutable pointer.
+        let mut info = unsafe { std::mem::zeroed() };
+        let info_ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+        if info_ok == 0 {
             anyhow::bail!(
                 "query runtime sentinel identity for safe cleanup failed: {}",
-                GetLastError()
+                unsafe { GetLastError() }
             );
         }
         if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
@@ -252,14 +255,16 @@ unsafe fn remove_empty_runtime_sentinel_by_handle(
         let disposition = FILE_DISPOSITION_INFO_EX {
             Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
         };
-        if SetFileInformationByHandle(
-            handle,
-            FileDispositionInfoEx,
-            &disposition as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
-        ) == 0
-        {
-            let code = GetLastError();
+        let delete_ok = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FileDispositionInfoEx,
+                &disposition as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+            )
+        };
+        if delete_ok == 0 {
+            let code = unsafe { GetLastError() };
             if code == ERROR_DIR_NOT_EMPTY {
                 return Ok(());
             }

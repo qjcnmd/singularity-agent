@@ -1,6 +1,4 @@
-// Rust 2024 surfaces this lint across the crate; keep the edition bump separate
-// from the eventual unsafe cleanup.
-#![allow(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 mod absolute_path;
 mod permissions;
@@ -518,51 +516,59 @@ mod windows_impl {
     }
 
     unsafe fn setup_stdio_pipes() -> io::Result<PipeHandles> {
-        let mut in_r: HANDLE = 0;
-        let mut in_w: HANDLE = 0;
-        let mut out_r: HANDLE = 0;
-        let mut out_w: HANDLE = 0;
-        let mut err_r: HANDLE = 0;
-        let mut err_w: HANDLE = 0;
-        if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+        // SAFETY: all handles are created into local storage and every failure path closes the
+        // handles already created before returning them to the caller.
+        unsafe {
+            let mut in_r: HANDLE = 0;
+            let mut in_w: HANDLE = 0;
+            let mut out_r: HANDLE = 0;
+            let mut out_w: HANDLE = 0;
+            let mut err_r: HANDLE = 0;
+            let mut err_w: HANDLE = 0;
+            if CreatePipe(&mut in_r, &mut in_w, ptr::null_mut(), 0) == 0 {
+                return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            }
+            if CreatePipe(&mut out_r, &mut out_w, ptr::null_mut(), 0) == 0 {
+                let error = GetLastError() as i32;
+                CloseHandle(in_r);
+                CloseHandle(in_w);
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            if CreatePipe(&mut err_r, &mut err_w, ptr::null_mut(), 0) == 0 {
+                let error = GetLastError() as i32;
+                CloseHandle(in_r);
+                CloseHandle(in_w);
+                CloseHandle(out_r);
+                CloseHandle(out_w);
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            if SetHandleInformation(in_r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                let error = GetLastError() as i32;
+                close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            if SetHandleInformation(out_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                let error = GetLastError() as i32;
+                close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            if SetHandleInformation(err_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                let error = GetLastError() as i32;
+                close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            Ok(((in_r, in_w), (out_r, out_w), (err_r, err_w)))
         }
-        if CreatePipe(&mut out_r, &mut out_w, ptr::null_mut(), 0) == 0 {
-            let error = GetLastError() as i32;
-            CloseHandle(in_r);
-            CloseHandle(in_w);
-            return Err(io::Error::from_raw_os_error(error));
-        }
-        if CreatePipe(&mut err_r, &mut err_w, ptr::null_mut(), 0) == 0 {
-            let error = GetLastError() as i32;
-            CloseHandle(in_r);
-            CloseHandle(in_w);
-            CloseHandle(out_r);
-            CloseHandle(out_w);
-            return Err(io::Error::from_raw_os_error(error));
-        }
-        if SetHandleInformation(in_r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            let error = GetLastError() as i32;
-            close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
-            return Err(io::Error::from_raw_os_error(error));
-        }
-        if SetHandleInformation(out_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            let error = GetLastError() as i32;
-            close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
-            return Err(io::Error::from_raw_os_error(error));
-        }
-        if SetHandleInformation(err_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            let error = GetLastError() as i32;
-            close_pipe_handles([in_r, in_w, out_r, out_w, err_r, err_w]);
-            return Err(io::Error::from_raw_os_error(error));
-        }
-        Ok(((in_r, in_w), (out_r, out_w), (err_r, err_w)))
     }
 
     unsafe fn close_pipe_handles(handles: [HANDLE; 6]) {
-        for handle in handles {
-            if handle != 0 {
-                CloseHandle(handle);
+        // SAFETY: callers pass handles created by `setup_stdio_pipes`; zero is treated as an
+        // absent handle and each remaining handle is closed exactly once.
+        unsafe {
+            for handle in handles {
+                if handle != 0 {
+                    CloseHandle(handle);
+                }
             }
         }
     }

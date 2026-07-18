@@ -187,22 +187,28 @@ fn last_error(context: &'static str) -> anyhow::Error {
 }
 
 unsafe fn close_process_info(process_info: &PROCESS_INFORMATION) {
-    if process_info.hThread != 0 {
-        CloseHandle(process_info.hThread);
-    }
-    if process_info.hProcess != 0 {
-        CloseHandle(process_info.hProcess);
+    // SAFETY: callers pass the process-information structure returned by CreateProcessAsUserW;
+    // each nonzero handle is owned by that structure and is closed at most once here.
+    unsafe {
+        if process_info.hThread != 0 {
+            CloseHandle(process_info.hThread);
+        }
+        if process_info.hProcess != 0 {
+            CloseHandle(process_info.hProcess);
+        }
     }
 }
 
 unsafe fn terminate_unassigned_process(process_info: &PROCESS_INFORMATION) -> Result<()> {
-    let terminated = TerminateProcess(process_info.hProcess, 1);
+    let terminated = unsafe { TerminateProcess(process_info.hProcess, 1) };
     let result = if terminated == 0 {
         Err(last_error("TerminateProcess failed for suspended child"))
     } else {
         wait_for_process_termination(process_info.hProcess)
     };
-    close_process_info(process_info);
+    unsafe {
+        close_process_info(process_info);
+    }
     result
 }
 
@@ -211,7 +217,9 @@ unsafe fn terminate_assigned_process(
     job: &JobObject,
 ) -> Result<()> {
     let result = job.terminate_and_wait(process_info.hProcess, 1);
-    close_process_info(process_info);
+    unsafe {
+        close_process_info(process_info);
+    }
     result
 }
 
@@ -232,7 +240,7 @@ fn wait_for_process_termination(process: HANDLE) -> Result<()> {
 
 unsafe fn assign_job_and_resume(process_info: &PROCESS_INFORMATION, job: &JobObject) -> Result<()> {
     if let Err(assign_error) = job.assign_process(process_info.hProcess) {
-        return match terminate_unassigned_process(process_info) {
+        return match unsafe { terminate_unassigned_process(process_info) } {
             Ok(()) => Err(assign_error),
             Err(cleanup_error) => Err(anyhow!(
                 "{assign_error:#}; suspended child cleanup also failed: {cleanup_error:#}"
@@ -240,9 +248,9 @@ unsafe fn assign_job_and_resume(process_info: &PROCESS_INFORMATION, job: &JobObj
         };
     }
 
-    if ResumeThread(process_info.hThread) == u32::MAX {
+    if unsafe { ResumeThread(process_info.hThread) } == u32::MAX {
         let resume_error = last_error("ResumeThread failed");
-        return match terminate_assigned_process(process_info, job) {
+        return match unsafe { terminate_assigned_process(process_info, job) } {
             Ok(()) => Err(resume_error),
             Err(cleanup_error) => Err(anyhow!(
                 "{resume_error:#}; assigned child cleanup also failed: {cleanup_error:#}"
@@ -292,19 +300,23 @@ pub fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
 }
 
 unsafe fn ensure_inheritable_stdio(si: &mut STARTUPINFOW) -> Result<()> {
-    for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        let h = GetStdHandle(kind);
-        if h == 0 || h == INVALID_HANDLE_VALUE {
-            return Err(anyhow!("GetStdHandle failed: {}", GetLastError()));
+    // SAFETY: `si` points to caller-owned startup storage; each standard handle is obtained
+    // from the current process and is made inheritable before being copied into that storage.
+    unsafe {
+        for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = GetStdHandle(kind);
+            if h == 0 || h == INVALID_HANDLE_VALUE {
+                return Err(anyhow!("GetStdHandle failed: {}", GetLastError()));
+            }
+            if SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                return Err(anyhow!("SetHandleInformation failed: {}", GetLastError()));
+            }
         }
-        if SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(anyhow!("SetHandleInformation failed: {}", GetLastError()));
-        }
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     }
-    si.dwFlags |= STARTF_USESTDHANDLES;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     Ok(())
 }
 
@@ -325,12 +337,15 @@ pub unsafe fn create_process_as_user(
     let env_block = make_env_block(env_map);
     let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
     let job = JobObject::create_kill_on_close()?;
-    let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+    // SAFETY: PROCESS_INFORMATION and STARTUPINFO(EX) are plain Win32 output/input structs;
+    // all raw pointers passed below are derived from the still-live local buffers or handles
+    // covered by this function's caller safety contract.
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let cwd_wide = to_wide(cwd);
     let env_block_len = env_block.len();
     match stdio {
         Some((stdin_h, stdout_h, stderr_h)) => {
-            let mut si: STARTUPINFOEXW = std::mem::zeroed();
+            let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
             si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
             // Some processes (e.g., PowerShell) can fail with STATUS_DLL_INIT_FAILED
             // if lpDesktop is not set when launching with a restricted token.
@@ -345,10 +360,12 @@ pub unsafe fn create_process_as_user(
                 inherited_handles.push(stderr_h);
             }
             for &handle in &inherited_handles {
-                if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                    == 0
+                {
                     return Err(anyhow!(
                         "SetHandleInformation failed for stdio handle: {}",
-                        GetLastError()
+                        unsafe { GetLastError() }
                     ));
                 }
             }
@@ -358,21 +375,23 @@ pub unsafe fn create_process_as_user(
 
             let creation_flags =
                 CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED;
-            let ok = CreateProcessAsUserW(
-                h_token,
-                std::ptr::null(),
-                cmdline.as_mut_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                1,
-                creation_flags,
-                env_block.as_ptr() as *mut c_void,
-                cwd_wide.as_ptr(),
-                &si.StartupInfo,
-                &mut pi,
-            );
+            let ok = unsafe {
+                CreateProcessAsUserW(
+                    h_token,
+                    std::ptr::null(),
+                    cmdline.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    1,
+                    creation_flags,
+                    env_block.as_ptr() as *mut c_void,
+                    cwd_wide.as_ptr(),
+                    &si.StartupInfo,
+                    &mut pi,
+                )
+            };
             if ok == 0 {
-                let err = GetLastError() as i32;
+                let err = unsafe { GetLastError() } as i32;
                 let msg = format!(
                     "CreateProcessAsUserW failed: {} ({}) | cwd={} | cmd={} | env_u16_len={} | si_flags={} | creation_flags={}",
                     err,
@@ -386,7 +405,7 @@ pub unsafe fn create_process_as_user(
                 logging::debug_log(&msg, logs_base_dir);
                 return Err(std::io::Error::from_raw_os_error(err)).context(msg);
             }
-            assign_job_and_resume(&pi, &job)?;
+            unsafe { assign_job_and_resume(&pi, &job) }?;
             Ok(CreatedProcess {
                 process_info: pi,
                 startup_info: si.StartupInfo,
@@ -395,27 +414,29 @@ pub unsafe fn create_process_as_user(
             })
         }
         None => {
-            let mut si: STARTUPINFOW = std::mem::zeroed();
+            let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
             si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
             si.lpDesktop = desktop.startup_info_desktop();
-            ensure_inheritable_stdio(&mut si)?;
+            unsafe { ensure_inheritable_stdio(&mut si)? };
 
             let creation_flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
-            let ok = CreateProcessAsUserW(
-                h_token,
-                std::ptr::null(),
-                cmdline.as_mut_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                1,
-                creation_flags,
-                env_block.as_ptr() as *mut c_void,
-                cwd_wide.as_ptr(),
-                &si,
-                &mut pi,
-            );
+            let ok = unsafe {
+                CreateProcessAsUserW(
+                    h_token,
+                    std::ptr::null(),
+                    cmdline.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    1,
+                    creation_flags,
+                    env_block.as_ptr() as *mut c_void,
+                    cwd_wide.as_ptr(),
+                    &si,
+                    &mut pi,
+                )
+            };
             if ok == 0 {
-                let err = GetLastError() as i32;
+                let err = unsafe { GetLastError() } as i32;
                 let msg = format!(
                     "CreateProcessAsUserW failed: {} ({}) | cwd={} | cmd={} | env_u16_len={} | si_flags={} | creation_flags={}",
                     err,
@@ -429,7 +450,7 @@ pub unsafe fn create_process_as_user(
                 logging::debug_log(&msg, logs_base_dir);
                 return Err(std::io::Error::from_raw_os_error(err)).context(msg);
             }
-            assign_job_and_resume(&pi, &job)?;
+            unsafe { assign_job_and_resume(&pi, &job) }?;
             Ok(CreatedProcess {
                 process_info: pi,
                 startup_info: si,

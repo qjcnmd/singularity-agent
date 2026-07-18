@@ -129,9 +129,13 @@ impl PrivateDesktop {
 }
 
 unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> Result<()> {
-    let token = get_current_token_for_restriction()?;
-    let mut logon_sid = get_logon_sid_bytes(token)?;
-    CloseHandle(token);
+    // SAFETY: `handle` is the live desktop handle created by `PrivateDesktop`, and the token
+    // helpers return valid owned handles/SID bytes for this synchronous ACL update.
+    let token = unsafe { get_current_token_for_restriction()? };
+    let mut logon_sid = unsafe { get_logon_sid_bytes(token) }?;
+    unsafe {
+        CloseHandle(token);
+    }
 
     let entries = [EXPLICIT_ACCESS_W {
         grfAccessPermissions: DESKTOP_ALL_ACCESS,
@@ -147,12 +151,14 @@ unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> R
     }];
 
     let mut updated_dacl = ptr::null_mut();
-    let set_entries_code = SetEntriesInAclW(
-        entries.len() as u32,
-        entries.as_ptr(),
-        ptr::null_mut(),
-        &mut updated_dacl,
-    );
+    let set_entries_code = unsafe {
+        SetEntriesInAclW(
+            entries.len() as u32,
+            entries.as_ptr(),
+            ptr::null_mut(),
+            &mut updated_dacl,
+        )
+    };
     if set_entries_code != ERROR_SUCCESS {
         logging::debug_log(
             &format!("SetEntriesInAclW failed for private desktop: {set_entries_code}"),
@@ -164,17 +170,21 @@ unsafe fn grant_desktop_access(handle: isize, logs_base_dir: Option<&Path>) -> R
         }));
     }
 
-    let set_security_code = SetSecurityInfo(
-        handle,
-        SE_WINDOW_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        ptr::null_mut(),
-        ptr::null_mut(),
-        updated_dacl,
-        ptr::null_mut(),
-    );
+    let set_security_code = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            updated_dacl,
+            ptr::null_mut(),
+        )
+    };
     if !updated_dacl.is_null() {
-        LocalFree(updated_dacl as HLOCAL);
+        unsafe {
+            LocalFree(updated_dacl as HLOCAL);
+        }
     }
     if set_security_code != ERROR_SUCCESS {
         logging::debug_log(
