@@ -777,7 +777,8 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     std::fs::write(
         &manifest,
         r#"{
-  "schema_version": "evaluation.task_set/v4",
+  "schema_version": "evaluation.task_set/v5",
+  "trial_count": 1,
   "tasks": [{
     "task_id": "fixture_agent",
     "description": "Exercise the AgentLoop evaluation transport.",
@@ -786,7 +787,10 @@ fn cli_eval_run_uses_app_server_and_reports_verification_result() {
     "agent": {
       "instructions": "Change solution.txt so value is 1.",
       "allowed_paths": ["solution.txt"],
-      "allowed_tools": ["read", "edit"]
+      "required_tool_capabilities": [
+        {"capability": "workspace_read", "minimum_version": 1},
+        {"capability": "workspace_write", "minimum_version": 1}
+      ]
     },
     "evaluator": {
       "baseline": {"commands": [{"argv": ["rustc", "--version"]}]},
