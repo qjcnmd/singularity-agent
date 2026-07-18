@@ -9,8 +9,9 @@ mod evaluation;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{Builder as ThreadBuilder, JoinHandle};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -41,7 +42,10 @@ use singularity_protocol::{
     TurnStartResult, TurnStatus,
 };
 use singularity_sandbox::{SandboxBackend, SandboxBackendEnforcement, WindowsSandboxBackend};
-use singularity_store::{CommitTurnOutcomeParams, CommittedTurnOutcome, SessionStore, StoreError};
+use singularity_store::{
+    CommitTurnOutcomeParams, CommittedTurnOutcome, CreateStartedTurnParams, SessionStore,
+    StoreError,
+};
 use singularity_tools::{
     COMMAND_TOOL as TOOL_COMMAND, EDIT_TOOL as TOOL_EDIT, GREP_TOOL as TOOL_GREP,
     LIST_TOOL as TOOL_LIST, PATCH_TOOL as TOOL_PATCH, READ_TOOL as TOOL_READ, ToolBroker,
@@ -63,12 +67,13 @@ const PENDING_APPROVAL_NOT_FOUND: &str = "Pending approval not found";
 const APPROVAL_CHECKPOINT_REQUIRED: &str =
     "approval request requires an internal AgentLoop checkpoint";
 const APPROVAL_REQUEST_INTERNAL_ONLY: &str =
-    "approval/request is internal to the AgentLoop approval ledger";
+    "approval/request is internal to the AgentLoop approval history";
 const ARTIFACT_NOT_FOUND: &str = "Artifact not found";
 const EVENT_SUBSCRIPTION_ID: &str = "subscription_app_server_events";
 const DEFAULT_THREAD_HISTORY_TURN_LIMIT: usize = 64;
 const MAX_THREAD_HISTORY_TURN_LIMIT: usize = 256;
 const TURN_CANCELLATION_POLL_MS: u64 = 25;
+const TURN_MONITOR_SHUTDOWN_WAIT_MS: u64 = 100;
 const STRICT_COMMAND_SANDBOX_UNAVAILABLE: &str = "strict_command_sandbox_unavailable";
 
 /// 在应用边界转换为 JSON-RPC 响应的错误。
@@ -129,15 +134,49 @@ impl AppServerCancellationHandle {
 struct ActiveTurnGuard {
     turn_id: String,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    monitor_stop: Arc<AtomicBool>,
-    monitor: Option<JoinHandle<()>>,
+    monitor: Option<CancellationMonitor>,
+}
+
+struct CancellationMonitorControl {
+    started: AtomicBool,
+    stop: AtomicBool,
+    wake: Sender<()>,
+}
+
+struct CancellationMonitor {
+    control: Arc<CancellationMonitorControl>,
+    done: Receiver<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ActiveTurnGuard {
+    fn start_monitor(&self) {
+        if let Some(monitor) = &self.monitor {
+            monitor.control.started.store(true, Ordering::SeqCst);
+            let _ = monitor.control.wake.send(());
+        }
+    }
 }
 
 impl Drop for ActiveTurnGuard {
     fn drop(&mut self) {
-        self.monitor_stop.store(true, Ordering::SeqCst);
-        if let Some(monitor) = self.monitor.take() {
-            let _ = monitor.join();
+        if let Some(mut monitor) = self.monitor.take() {
+            monitor.control.stop.store(true, Ordering::SeqCst);
+            let _ = monitor.control.wake.send(());
+            match monitor
+                .done
+                .recv_timeout(Duration::from_millis(TURN_MONITOR_SHUTDOWN_WAIT_MS))
+            {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(thread) = monitor.thread.take() {
+                        let _ = thread.join();
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // A busy SQLite read may outlive this request. The stop flag
+                    // prevents another poll; detaching keeps request teardown bounded.
+                }
+            }
         }
         if let Ok(mut active_turns) = self.active_turns.lock() {
             active_turns.remove(&self.turn_id);
@@ -196,7 +235,7 @@ impl AppServer {
     /// 为请求工作线程打开独立的存储连接，同时共享停止状态。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
-            store: SessionStore::open(&self.store.descriptor().path)?,
+            store: self.store.trusted_reopen()?,
             initialized: true,
             initialized_acknowledged: true,
             event_filter: self.event_filter.clone(),
@@ -213,33 +252,42 @@ impl AppServer {
         &self,
         turn_id: &str,
     ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
+        let (cancellation, guard) = self.prepare_turn_activation(turn_id)?;
+        guard.start_monitor();
+        Ok((cancellation, guard))
+    }
+
+    // Establish every fallible runtime resource before a new running Turn is
+    // committed. The monitor remains paused until the caller starts it after commit.
+    fn prepare_turn_activation(
+        &self,
+        turn_id: &str,
+    ) -> AppServerResult<(CancellationToken, ActiveTurnGuard)> {
         let cancellation = CancellationToken::new();
-        {
-            let mut active_turns = self
-                .active_turns
-                .lock()
-                .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?;
-            if active_turns.contains_key(turn_id) {
-                return Err(AppServerError::Workspace(format!(
-                    "turn {turn_id} is already active"
-                )));
-            }
-            if self.execution_stopped.load(Ordering::SeqCst) {
-                cancellation.cancel();
-            }
-            active_turns.insert(turn_id.to_string(), cancellation.clone());
+        // Open the fallible monitor connection before publishing the registry entry.
+        let monitor_store = if self.store.descriptor().path == ":memory:" {
+            None
+        } else {
+            Some(self.store.trusted_reopen()?)
+        };
+        let mut active_turns = self
+            .active_turns
+            .lock()
+            .map_err(|_| AppServerError::Workspace("active turn registry poisoned".into()))?;
+        if active_turns.contains_key(turn_id) {
+            return Err(AppServerError::Workspace(format!(
+                "turn {turn_id} is already active"
+            )));
         }
-        let monitor_stop = Arc::new(AtomicBool::new(false));
-        let monitor = cancellation_monitor(
-            &self.store.descriptor().path,
-            turn_id,
-            cancellation.clone(),
-            Arc::clone(&monitor_stop),
-        );
+        let monitor = cancellation_monitor(monitor_store, turn_id, cancellation.clone())?;
+        if self.execution_stopped.load(Ordering::SeqCst) {
+            cancellation.cancel();
+        }
+        active_turns.insert(turn_id.to_string(), cancellation.clone());
+        drop(active_turns);
         let guard = ActiveTurnGuard {
             turn_id: turn_id.to_string(),
             active_turns: Arc::clone(&self.active_turns),
-            monitor_stop,
             monitor,
         };
         Ok((cancellation, guard))
@@ -587,14 +635,22 @@ impl AppServer {
             return Ok(());
         };
         let payload = serde_json::to_value(&params.input)?;
-        let started = match self.store.create_turn_with_input_trace_and_history(
-            &params.thread_id,
-            AgentStatus::Running.as_str(),
-            payload,
-            "app_server",
-            "turn started",
-            DEFAULT_THREAD_HISTORY_TURN_LIMIT,
-        ) {
+        let allocated_turn_id = SessionStore::allocate_turn_id();
+        let (cancellation, active_turn) =
+            self.prepare_turn_activation(allocated_turn_id.as_str())?;
+        let started = match self
+            .store
+            .create_allocated_turn_with_input_trace_and_history(
+                allocated_turn_id,
+                CreateStartedTurnParams {
+                    thread_id: &params.thread_id,
+                    agent_loop_status: AgentStatus::Running.as_str(),
+                    input: payload,
+                    component: "app_server",
+                    summary: "turn started",
+                    history_turn_limit: DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+                },
+            ) {
             Ok(result) => result,
             Err(StoreError::NotFound(_)) => {
                 emit_messages(&mut emit, not_found_response(message.id, THREAD_NOT_FOUND)?);
@@ -610,7 +666,7 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let turn = started.turn;
-        let (cancellation, _active_turn) = self.activate_turn(&turn.turn_id)?;
+        active_turn.start_monitor();
         if let Some(event) = self.event_notification(AppEvent::turn_started(&turn)) {
             emit(event);
         }
@@ -1071,7 +1127,7 @@ impl AppServer {
                 JsonRpcMessage::response(
                     message.id,
                     serde_json::to_value(TurnInterruptResult {
-                        status: turn_status_str(&turn.status).to_string(),
+                        status: turn.status.as_storage_text().to_string(),
                         turn_id: turn.turn_id,
                         agent_loop_status: Some(turn.agent_loop_status),
                     })?,
@@ -1094,7 +1150,7 @@ impl AppServer {
                 "turn_id": turn.turn_id,
                 "agent_loop_status": AgentStatus::CancelRequested.as_str(),
             }),
-            ..TraceEvent::new(
+            ..TraceEvent::for_turn(
                 format!("trace_{}_interrupt_requested", turn.turn_id),
                 thread_id,
                 turn.turn_id.clone(),
@@ -1108,7 +1164,7 @@ impl AppServer {
         let status = if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() {
             AgentStatus::CancelRequested.as_str()
         } else {
-            turn_status_str(&turn.status)
+            turn.status.as_storage_text()
         };
         let mut messages = Vec::new();
         if is_terminal_turn_status(&turn.status) {
@@ -1589,38 +1645,60 @@ fn emit_messages(emit: &mut impl FnMut(Value), messages: Vec<Value>) {
 
 /// 监视持久化 turn 状态，使外部中断能够到达进程内 `AgentLoop`。
 fn cancellation_monitor(
-    store_path: &str,
+    store: Option<SessionStore>,
     turn_id: &str,
     cancellation: CancellationToken,
-    stop: Arc<AtomicBool>,
-) -> Option<JoinHandle<()>> {
-    if store_path == ":memory:" {
-        return None;
-    }
-    let store_path = store_path.to_string();
+) -> AppServerResult<Option<CancellationMonitor>> {
+    let Some(store) = store else {
+        return Ok(None);
+    };
     let turn_id = turn_id.to_string();
-    Some(std::thread::spawn(move || {
-        let store = match SessionStore::open(store_path) {
-            Ok(store) => store,
-            Err(_) => {
-                cancellation.cancel();
-                return;
-            }
-        };
-        while !stop.load(Ordering::SeqCst) && !cancellation.is_cancelled() {
-            match store.get_turn(&turn_id) {
-                Ok(turn) if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() => {
-                    cancellation.cancel();
-                    break;
+    let (wake, wake_receiver) = mpsc::channel();
+    let (done_sender, done) = mpsc::channel();
+    let control = Arc::new(CancellationMonitorControl {
+        started: AtomicBool::new(false),
+        stop: AtomicBool::new(false),
+        wake,
+    });
+    let thread_control = Arc::clone(&control);
+    let thread = ThreadBuilder::new()
+        .name("turn-cancellation-monitor".to_string())
+        .spawn(move || {
+            while !thread_control.started.load(Ordering::SeqCst)
+                && !thread_control.stop.load(Ordering::SeqCst)
+            {
+                match wake_receiver.recv_timeout(Duration::from_millis(TURN_CANCELLATION_POLL_MS)) {
+                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
-                Ok(_) => {}
-                Err(_) => {
-                    cancellation.cancel();
-                    break;
+            }
+            while !thread_control.stop.load(Ordering::SeqCst) && !cancellation.is_cancelled() {
+                match store.get_turn(&turn_id) {
+                    Ok(turn) if turn.agent_loop_status == AgentStatus::CancelRequested.as_str() => {
+                        cancellation.cancel();
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.is_transient_contention() => {}
+                    Err(_) => {
+                        cancellation.cancel();
+                        break;
+                    }
+                }
+                match wake_receiver.recv_timeout(Duration::from_millis(TURN_CANCELLATION_POLL_MS)) {
+                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            std::thread::sleep(Duration::from_millis(TURN_CANCELLATION_POLL_MS));
-        }
+            let _ = done_sender.send(());
+        })
+        .map_err(|error| {
+            AppServerError::Workspace(format!("cannot spawn turn cancellation monitor: {error}"))
+        })?;
+    Ok(Some(CancellationMonitor {
+        control,
+        done,
+        thread: Some(thread),
     }))
 }
 
@@ -1926,16 +2004,6 @@ fn is_terminal_turn_status(status: &TurnStatus) -> bool {
     )
 }
 
-fn turn_status_str(status: &TurnStatus) -> &'static str {
-    match status {
-        TurnStatus::Running => "running",
-        TurnStatus::Completed => "completed",
-        TurnStatus::Blocked => "blocked",
-        TurnStatus::Failed => "failed",
-        TurnStatus::Interrupted => "interrupted",
-    }
-}
-
 fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
     match status {
         AgentStatus::Completed => TurnStatus::Completed,
@@ -1956,7 +2024,7 @@ fn mark_run_cancelled(status: &mut AgentRunStatus) {
 }
 
 fn agent_loop_trace(turn: &Turn, status: &AgentRunStatus) -> TraceEvent {
-    let mut event = TraceEvent::new(
+    let mut event = TraceEvent::for_turn(
         format!(
             "trace_{}_agent_loop_{}_{}",
             turn.turn_id,
@@ -2140,6 +2208,70 @@ mod tests {
         assert!(original.is_cancelled());
         let (late, _late_guard) = server.activate_turn("turn_2").expect("late activation");
         assert!(late.is_cancelled());
+    }
+
+    #[test]
+    fn monitor_open_failure_does_not_publish_active_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let server = app_server(SessionStore::open(&db_path).expect("store"));
+        std::fs::hard_link(&db_path, dir.path().join("sessions-alias.sqlite3"))
+            .expect("hard link store");
+
+        assert!(matches!(
+            server.activate_turn("turn_monitor_failure"),
+            Err(AppServerError::Store(StoreError::InvalidState(message)))
+                if message.contains("hard links")
+        ));
+        assert!(
+            server
+                .active_turns
+                .lock()
+                .expect("active turn registry")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn turn_start_monitor_failure_does_not_persist_a_running_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db_path).expect("store");
+        let thread = store
+            .create_thread(None, Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+        std::fs::hard_link(&db_path, dir.path().join("sessions-alias.sqlite3"))
+            .expect("hard link store");
+        let message: JsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "turn/start",
+            "params": {
+                "threadId": &thread.thread_id,
+                "input": [{"type": "text", "text": "must not persist"}]
+            }
+        }))
+        .expect("turn/start message");
+
+        assert!(matches!(
+            server.handle_turn_start_streaming(message, |_| {}),
+            Err(AppServerError::Store(StoreError::InvalidState(message)))
+                if message.contains("hard links")
+        ));
+        assert!(
+            server
+                .active_turns
+                .lock()
+                .expect("active registry")
+                .is_empty()
+        );
+        server
+            .store
+            .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+            .expect("no running turn was persisted before monitor setup");
     }
 
     #[test]
@@ -3018,7 +3150,7 @@ mod tests {
             .expect("claim execution");
         let cancellation_trace = TraceEvent {
             payload: json!({"turn_id": &turn.turn_id, "agent_loop_status": "cancel_requested"}),
-            ..TraceEvent::new(
+            ..TraceEvent::for_turn(
                 "trace_cancel_race",
                 thread.thread_id.clone(),
                 turn.turn_id.clone(),
@@ -3117,7 +3249,7 @@ mod tests {
             .expect("persist initial approval");
         let interrupt_trace = TraceEvent {
             payload: json!({"turn_id": &turn.turn_id, "agent_loop_status": "cancel_requested"}),
-            ..TraceEvent::new(
+            ..TraceEvent::for_turn(
                 "trace_interrupt_initial_handoff",
                 thread.thread_id.clone(),
                 turn.turn_id.clone(),

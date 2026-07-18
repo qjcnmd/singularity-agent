@@ -5,9 +5,9 @@ use singularity_policy::{ApprovalPolicy, PermissionProfileName};
 use singularity_protocol::{
     AgentCapabilityResult, AppEvent, ArtifactFetchParams, ArtifactRef, ConversationMessage,
     ConversationRole, EventSubscribeParams, InitializeParams, InitializeResult, ItemKind,
-    JsonRpcMessage, Method, ProviderConfigurationStatus, ThreadIdParams, ThreadReadParams,
-    ThreadReadResult, ThreadStartParams, TraceListParams, TraceShowParams, TraceTailParams,
-    TurnIdParams, TurnStartParams,
+    ItemStatus, JsonRpcMessage, Method, ProviderConfigurationStatus, ThreadIdParams,
+    ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceListParams,
+    TraceShowParams, TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus,
 };
 
 #[test]
@@ -310,12 +310,47 @@ fn item_kind_uses_codex_style_wire_names() {
 }
 
 #[test]
+fn storage_enum_text_is_stable_and_rejects_unknown_values() {
+    assert_eq!(ThreadStatus::Active.as_storage_text(), "active");
+    assert_eq!(TurnStatus::Blocked.as_storage_text(), "blocked");
+    assert_eq!(
+        ItemKind::CommandExecution.as_storage_text(),
+        "commandExecution"
+    );
+    assert_eq!(ItemStatus::Completed.as_storage_text(), "completed");
+    assert_eq!(
+        ThreadStatus::from_storage_text("archived"),
+        Some(ThreadStatus::Archived)
+    );
+    assert_eq!(TurnStatus::from_storage_text("unknown"), None);
+    assert_eq!(ItemKind::from_storage_text("command_execution"), None);
+}
+
+#[test]
 fn new_trace_is_unredacted_until_the_store_sanitizes_it() {
     let trace =
         singularity_protocol::TraceEvent::new("trace_1", "run_1", "session_1", "test", "summary");
 
     assert!(!trace.redaction_applied);
     assert!(trace.payload_hash.is_empty());
+}
+
+#[test]
+fn turn_trace_has_all_three_binding_fields() {
+    let trace = singularity_protocol::TraceEvent::for_turn(
+        "trace_turn",
+        "thread_1",
+        "turn_1",
+        "test",
+        "summary",
+    );
+
+    assert_eq!(trace.run_id, "thread_1");
+    assert_eq!(trace.session_id, "turn_1");
+    assert_eq!(trace.task_id.as_deref(), Some("turn_1"));
+    trace
+        .validate_turn_binding("thread_1", "turn_1")
+        .expect("turn binding");
 }
 
 #[test]

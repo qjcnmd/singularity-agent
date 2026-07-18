@@ -308,6 +308,25 @@ pub enum ThreadStatus {
     Archived,
 }
 
+impl ThreadStatus {
+    /// 返回 SQLite 使用的稳定文本值。
+    pub const fn as_storage_text(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+
+    /// 从 SQLite 的稳定文本值恢复状态；未知值返回 `None`。
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 /// thread/start 的响应。
 pub struct ThreadStartResult {
@@ -408,6 +427,31 @@ pub enum TurnStatus {
     Interrupted,
 }
 
+impl TurnStatus {
+    /// 返回 SQLite 使用的稳定文本值。
+    pub const fn as_storage_text(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    /// 从 SQLite 的稳定文本值恢复状态；未知值返回 `None`。
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "blocked" => Some(Self::Blocked),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 /// 只包含 turn id 的请求参数。
 pub struct TurnIdParams {
@@ -427,6 +471,33 @@ pub enum ItemKind {
     FileChange,
 }
 
+impl ItemKind {
+    /// 返回 SQLite 使用的稳定文本值。
+    pub const fn as_storage_text(&self) -> &'static str {
+        match self {
+            Self::UserMessage => "userMessage",
+            Self::AgentMessage => "agentMessage",
+            Self::Reasoning => "reasoning",
+            Self::Plan => "plan",
+            Self::CommandExecution => "commandExecution",
+            Self::FileChange => "fileChange",
+        }
+    }
+
+    /// 从 SQLite 的稳定文本值恢复 item 类型；未知值返回 `None`。
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "userMessage" => Some(Self::UserMessage),
+            "agentMessage" => Some(Self::AgentMessage),
+            "reasoning" => Some(Self::Reasoning),
+            "plan" => Some(Self::Plan),
+            "commandExecution" => Some(Self::CommandExecution),
+            "fileChange" => Some(Self::FileChange),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 /// turn 输出中的一条 item。
 pub struct Item {
@@ -443,6 +514,25 @@ pub struct Item {
 pub enum ItemStatus {
     Started,
     Completed,
+}
+
+impl ItemStatus {
+    /// 返回 SQLite 使用的稳定文本值。
+    pub const fn as_storage_text(&self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+        }
+    }
+
+    /// 从 SQLite 的稳定文本值恢复 item 状态；未知值返回 `None`。
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "started" => Some(Self::Started),
+            "completed" => Some(Self::Completed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -642,6 +732,41 @@ pub struct TraceEvent {
     pub payload_hash: String,
 }
 
+/// Trace 与一个 turn 绑定时必须满足的身份不变量。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceBindingError {
+    /// trace 的 run id 没有指向所属 thread。
+    RunIdMismatch { expected: String, actual: String },
+    /// trace 的 session id 没有指向所属 turn。
+    SessionIdMismatch { expected: String, actual: String },
+    /// trace 的 task id 没有指向所属 turn。
+    TaskIdMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
+}
+
+impl std::fmt::Display for TraceBindingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RunIdMismatch { expected, actual } => write!(
+                formatter,
+                "turn trace run_id must match thread_id (expected {expected}, got {actual})"
+            ),
+            Self::SessionIdMismatch { expected, actual } => write!(
+                formatter,
+                "turn trace session_id must match turn_id (expected {expected}, got {actual})"
+            ),
+            Self::TaskIdMismatch { expected, actual } => write!(
+                formatter,
+                "turn trace task_id must match turn_id (expected {expected}, got {actual:?})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TraceBindingError {}
+
 impl TraceEvent {
     /// 构造带默认严重级别和空 payload 的 trace 事件。
     pub fn new(
@@ -677,6 +802,54 @@ impl TraceEvent {
             redaction_applied: false,
             payload_hash: String::new(),
         }
+    }
+
+    /// 构造绑定到指定 thread/turn 的 trace 事件。
+    pub fn for_turn(
+        event_id: impl Into<String>,
+        thread_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        component: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        let thread_id = thread_id.into();
+        let turn_id = turn_id.into();
+        let mut event = Self::new(
+            event_id,
+            thread_id.clone(),
+            turn_id.clone(),
+            component,
+            summary,
+        );
+        event.task_id = Some(turn_id);
+        event
+    }
+
+    /// 校验 trace 是否绑定到指定 thread/turn。
+    pub fn validate_turn_binding(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<(), TraceBindingError> {
+        if self.run_id != thread_id {
+            return Err(TraceBindingError::RunIdMismatch {
+                expected: thread_id.to_string(),
+                actual: self.run_id.clone(),
+            });
+        }
+        if self.session_id != turn_id {
+            return Err(TraceBindingError::SessionIdMismatch {
+                expected: turn_id.to_string(),
+                actual: self.session_id.clone(),
+            });
+        }
+        if self.task_id.as_deref() != Some(turn_id) {
+            return Err(TraceBindingError::TaskIdMismatch {
+                expected: turn_id.to_string(),
+                actual: self.task_id.clone(),
+            });
+        }
+        Ok(())
     }
 }
 

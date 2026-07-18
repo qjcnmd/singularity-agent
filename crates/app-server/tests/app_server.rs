@@ -1,9 +1,9 @@
 //! AppServer protocol、approval continuation、recovery 和 sandbox 边界测试。
 
-use singularity_app_server::AppServer;
+use singularity_app_server::{AppServer, AppServerError};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_policy::{ApprovalDecision, ApprovalOutcome, ApprovalRequest};
-use singularity_store::SessionStore;
+use singularity_store::{SessionStore, StoreError};
 #[cfg(windows)]
 use std::collections::VecDeque;
 use std::io::Write;
@@ -31,6 +31,36 @@ fn workspace_root() -> std::path::PathBuf {
 
 fn app_server(store: SessionStore) -> AppServer {
     AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+}
+
+// Request workers must use the typed reopen of an initialized file store;
+// they cannot silently create an unrelated in-memory database.
+#[test]
+fn request_worker_reopen_requires_initialized_file_store() {
+    let server = app_server(SessionStore::open(":memory:").expect("open store"));
+
+    assert!(matches!(
+        server.turn_worker(),
+        Err(AppServerError::Store(StoreError::InvalidState(message)))
+            if message.contains("trusted store reopen")
+    ));
+}
+
+#[test]
+fn request_worker_reopens_the_initialized_file_store() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let server = app_server(store);
+    let mut worker = server.turn_worker().expect("trusted request worker reopen");
+
+    let response = worker
+        .handle_json(r#"{"method":"thread/list","id":1,"params":{}}"#)
+        .expect("thread list");
+    assert_eq!(
+        response[0]["result"]["threads"][0]["thread_id"],
+        thread.thread_id
+    );
 }
 
 fn configured_app_server(store: SessionStore) -> AppServer {
@@ -1716,7 +1746,7 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
     assert_eq!(public_request[0]["error"]["code"], -32600);
     assert_eq!(
         public_request[0]["error"]["message"],
-        "approval/request is internal to the AgentLoop approval ledger"
+        "approval/request is internal to the AgentLoop approval history"
     );
 
     let missing_artifact = server

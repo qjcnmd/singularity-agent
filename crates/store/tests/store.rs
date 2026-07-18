@@ -4,7 +4,7 @@ use schemars::schema_for;
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
 };
-use singularity_protocol::{ItemKind, ThreadStatus, TraceEvent, TurnStatus};
+use singularity_protocol::{ItemKind, ThreadStatus, TraceBindingError, TraceEvent, TurnStatus};
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
     SessionStoreDescriptor, StoreError,
@@ -19,7 +19,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 9);
+    assert_eq!(descriptor.schema_version, 10);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
@@ -30,7 +30,8 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
             "0006_conversation_history".to_string(),
             "0007_pending_execution_state".to_string(),
             "0008_approval_execution_recovery".to_string(),
-            "0009_thread_policy_snapshot".to_string()
+            "0009_thread_policy_snapshot".to_string(),
+            "0010_stable_enum_text".to_string()
         ]
     );
     assert_eq!(
@@ -76,6 +77,20 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
         .record_approval_decision(&decision, "approval", "approval decision recorded")
         .expect("decision");
 
+    let connection =
+        rusqlite::Connection::open(dir.path().join("sessions.sqlite3")).expect("open sqlite");
+    let approval_binding: (String, String) = connection
+        .query_row(
+            "select thread_id, turn_id from approvals where request_id = 'approval_1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("approval binding projection");
+    assert_eq!(
+        approval_binding,
+        (thread.thread_id.clone(), turn.turn_id.clone())
+    );
+
     assert_eq!(item.kind, ItemKind::UserMessage);
     assert_eq!(store.list_trace("run_1").expect("trace list").len(), 1);
     assert_eq!(
@@ -104,7 +119,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
         .query_row("pragma journal_mode", [], |row| row.get(0))
         .expect("journal mode");
 
-    assert_eq!(schema_version, 9);
+    assert_eq!(schema_version, 10);
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 }
 
@@ -128,7 +143,7 @@ fn sqlite_store_rejects_future_schema_version() {
         SessionStore::open(&db_path),
         Err(StoreError::UnsupportedSchema {
             found: 999,
-            supported: 9
+            supported: 10
         })
     ));
 }
@@ -167,39 +182,15 @@ fn thread_policy_snapshot_persists_and_reopens() {
     assert_eq!(restored.approval_policy, ApprovalPolicy::Never);
 }
 
-// 验证 v8 threads 在同一初始化事务中填充安全默认快照并升级到 v9。
+// 验证 v8 threads 在同一 v10 迁移事务中填充安全默认快照。
 #[test]
 fn v8_threads_migrate_to_policy_snapshot_defaults() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("create current store");
-    store
-        .create_thread(Some("gpt-test"), Some("C:/repo"))
-        .expect("create legacy thread");
-    drop(store);
-
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "pragma foreign_keys = off;
-             create table threads_v8(
-                 thread_id text primary key,
-                 model text,
-                 cwd text,
-                 status text not null
-             );
-             insert into threads_v8(thread_id, model, cwd, status)
-                 select thread_id, model, cwd, status from threads;
-             drop table threads;
-             alter table threads_v8 rename to threads;
-             delete from schema_migrations where migration_id = '0009_thread_policy_snapshot';
-             update schema_meta set schema_version = 8;",
-        )
-        .expect("prepare v8 schema");
-    drop(connection);
+    create_legacy_enum_database(&db_path, 8);
 
     let migrated = SessionStore::open(&db_path).expect("migrate v8 store");
-    assert_eq!(migrated.descriptor().schema_version, 9);
+    assert_eq!(migrated.descriptor().schema_version, 10);
     let thread_id = migrated
         .list_threads()
         .expect("migrated threads")
@@ -219,9 +210,723 @@ fn v8_threads_migrate_to_policy_snapshot_defaults() {
     );
 }
 
-// 验证非空 v8 库即使预先出现完整 v9 列，也不能在缺少 migration marker 时被认领。
+// 验证每个受支持的 v1-v9 历史 schema 都在同一 v10 事务中完成转换。
 #[test]
-fn complete_thread_policy_columns_without_marker_fail_closed_for_nonempty_v8_store() {
+fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
+    for schema_version in 1..=9 {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        create_legacy_enum_database(&db_path, schema_version);
+
+        let store = SessionStore::open(&db_path).expect("migrate legacy schema");
+        assert_eq!(store.descriptor().schema_version, 10);
+        assert_eq!(
+            store.applied_migrations().expect("migration markers"),
+            vec![
+                "0001_initial_session_store".to_string(),
+                "0002_durable_ledger".to_string(),
+                "0004_pending_tool_calls".to_string(),
+                "0005_store_hardening".to_string(),
+                "0006_conversation_history".to_string(),
+                "0007_pending_execution_state".to_string(),
+                "0008_approval_execution_recovery".to_string(),
+                "0009_thread_policy_snapshot".to_string(),
+                "0010_stable_enum_text".to_string(),
+            ]
+        );
+        let connection = rusqlite::Connection::open(&db_path).expect("reopen migrated db");
+        let status: String = connection
+            .query_row(
+                "select status from threads where thread_id = 'thread_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("thread status");
+        assert_eq!(status, ThreadStatus::Active.as_storage_text());
+        let item_kind: String = connection
+            .query_row(
+                "select kind from items where item_id = 'item_legacy_completed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("item kind");
+        assert_eq!(item_kind, ItemKind::UserMessage.as_storage_text());
+        assert_eq!(
+            store
+                .list_pending_approvals()
+                .expect("pending approvals")
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["approval_pending"]
+        );
+        assert_eq!(
+            store
+                .get_approval_decision("approval_final_decision")
+                .ok()
+                .map(|decision| decision.outcome),
+            (schema_version >= 2).then_some(ApprovalOutcome::Allow)
+        );
+        let repaired = store
+            .show_trace("trace_legacy_turn_repair")
+            .expect("repaired turn trace");
+        assert_eq!(repaired.run_id, "thread_legacy");
+        assert_eq!(repaired.session_id, "turn_legacy");
+        assert_eq!(repaired.task_id.as_deref(), Some("turn_legacy"));
+        assert!(!connection
+            .query_row(
+                "select exists(select 1 from sqlite_master where type = 'table' and name = 'active_sidecar_runs')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("sidecar absence"));
+    }
+}
+
+// v4-v6 only persisted the selected tool call, not the model/history checkpoint
+// required by the current AgentLoop. Migration must not invent resumable state.
+#[test]
+fn pre_checkpoint_pending_tool_calls_are_rejected_without_mutation() {
+    for schema_version in 4..=6 {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        create_legacy_enum_database(&db_path, schema_version);
+        let connection = rusqlite::Connection::open(&db_path).expect("open legacy db");
+        let payload = serde_json::json!({
+            "request_id": "approval_pending",
+            "tool_call_id": "call_pending",
+            "tool_name": "edit",
+            "raw_arguments": "{}",
+            "resources": [],
+        });
+        if schema_version == 4 {
+            connection
+                .execute(
+                    "insert into pending_tool_calls(request_id, turn_id, payload)
+                     values('approval_pending', 'turn_pending', ?1)",
+                    [serde_json::to_string(&payload).expect("pending payload")],
+                )
+                .expect("insert v4 pending call");
+        } else {
+            connection
+                .execute(
+                    "insert into pending_tool_calls(
+                         request_id, thread_id, turn_id, tool_call_id, payload
+                     ) values(
+                         'approval_pending', 'thread_legacy', 'turn_pending', 'call_pending', ?1
+                     )",
+                    [serde_json::to_string(&payload).expect("pending payload")],
+                )
+                .expect("insert v5-v6 pending call");
+        }
+        drop(connection);
+        let before = sqlite_snapshot(&db_path);
+
+        assert!(matches!(
+            SessionStore::open(&db_path),
+            Err(StoreError::InvalidState(message))
+                if message.contains("cannot be migrated without fabricating an AgentLoop checkpoint")
+        ));
+        assert_eq!(sqlite_snapshot(&db_path), before);
+        assert!(!has_v10_temporary_tables(&db_path));
+    }
+}
+
+// Released upgrades produced a few schema shapes that differ from a fresh
+// database of the same version. Each remains an explicit, bounded contract.
+#[test]
+fn released_legacy_schema_variants_migrate() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let v2_path = dir.path().join("v2-appended-trace.sqlite3");
+    create_legacy_enum_database(&v2_path, 2);
+    let connection = rusqlite::Connection::open(&v2_path).expect("open v2 db");
+    connection
+        .execute_batch(
+            "create table trace_events_upgraded(
+                 event_id text primary key,
+                 run_id text not null,
+                 payload text not null
+             );
+             insert into trace_events_upgraded(event_id, run_id, payload)
+             select event_id, run_id, payload from trace_events;
+             drop table trace_events;
+             alter table trace_events_upgraded rename to trace_events;
+             alter table trace_events add column session_id text not null default '';
+             update trace_events set session_id = run_id;",
+        )
+        .expect("recreate upgraded v2 trace table");
+    drop(connection);
+    assert_eq!(
+        SessionStore::open(&v2_path)
+            .expect("migrate upgraded v2")
+            .descriptor()
+            .schema_version,
+        10
+    );
+
+    let v5_path = dir.path().join("v5-retired-sidecar.sqlite3");
+    create_legacy_enum_database(&v5_path, 5);
+    let connection = rusqlite::Connection::open(&v5_path).expect("open v5 db");
+    connection
+        .execute_batch(
+            "create table active_sidecar_runs(
+                 turn_id text primary key,
+                 thread_id text not null,
+                 run_id text not null,
+                 session_id text not null,
+                 task_id text not null,
+                 status text not null,
+                 created_at text not null default current_timestamp,
+                 updated_at text not null default current_timestamp
+             );
+             insert into schema_migrations(migration_id)
+             values('0003_active_sidecar_runs');",
+        )
+        .expect("restore retired v5 sidecar shape");
+    drop(connection);
+    assert_eq!(
+        SessionStore::open(&v5_path)
+            .expect("migrate upgraded v5")
+            .descriptor()
+            .schema_version,
+        10
+    );
+
+    let v6_path = dir.path().join("v6-initial-indexes.sqlite3");
+    create_legacy_enum_database(&v6_path, 6);
+    let connection = rusqlite::Connection::open(&v6_path).expect("open v6 db");
+    connection
+        .execute_batch(
+            "drop index turns_history_lookup;
+             drop index items_history_lookup;",
+        )
+        .expect("restore initial v6 index set");
+    drop(connection);
+    assert_eq!(
+        SessionStore::open(&v6_path)
+            .expect("migrate initial v6")
+            .descriptor()
+            .schema_version,
+        10
+    );
+
+    let v7_path = dir.path().join("v7-appended-state.sqlite3");
+    create_legacy_enum_database(&v7_path, 7);
+    let connection = rusqlite::Connection::open(&v7_path).expect("open v7 db");
+    connection
+        .execute_batch(
+            "create table pending_tool_calls_upgraded(
+                 request_id text primary key,
+                 thread_id text not null,
+                 turn_id text not null,
+                 tool_call_id text not null,
+                 payload text not null,
+                 execution_state text not null default 'pending',
+                 foreign key(request_id) references approvals(request_id),
+                 foreign key(thread_id) references threads(thread_id),
+                 foreign key(turn_id) references turns(turn_id)
+             );
+             insert into pending_tool_calls_upgraded(
+                 request_id, thread_id, turn_id, tool_call_id, payload, execution_state
+             ) select request_id, thread_id, turn_id, tool_call_id, payload, execution_state
+               from pending_tool_calls;
+             drop table pending_tool_calls;
+             alter table pending_tool_calls_upgraded rename to pending_tool_calls;",
+        )
+        .expect("restore upgraded v7 pending table");
+    drop(connection);
+    assert_eq!(
+        SessionStore::open(&v7_path)
+            .expect("migrate upgraded v7")
+            .descriptor()
+            .schema_version,
+        10
+    );
+}
+
+// v8 historically collapsed every non-pending v7 handoff state to executing,
+// which prevents an unknown external side effect from being replayed.
+#[test]
+fn v7_non_pending_execution_states_migrate_fail_closed_as_executing() {
+    for legacy_state in ["approved", "executing", "outcome_recorded"] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join(format!("v7-{legacy_state}.sqlite3"));
+        create_legacy_enum_database(&db_path, 7);
+        let connection = rusqlite::Connection::open(&db_path).expect("open v7 db");
+        let decision = ApprovalDecision::new(
+            "approval_pending",
+            ApprovalOutcome::Allow,
+            "legacy execution handoff",
+        );
+        connection
+            .execute(
+                "update approvals
+                 set decision_outcome = ?1, decision_reason = ?2
+                 where request_id = 'approval_pending'",
+                rusqlite::params![
+                    serde_json::to_string(&ApprovalOutcome::Allow).expect("allow"),
+                    decision.reason,
+                ],
+            )
+            .expect("finalize legacy approval");
+        connection
+            .execute(
+                "insert into approval_decisions(
+                     decision_id, request_id, outcome, reason, payload
+                 ) values(?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    decision.decision_id,
+                    decision.request_id,
+                    serde_json::to_string(&decision.outcome).expect("allow"),
+                    decision.reason,
+                    serde_json::to_string(&decision).expect("decision"),
+                ],
+            )
+            .expect("insert legacy decision");
+        connection
+            .execute(
+                "update pending_tool_calls set execution_state = ?1
+                 where request_id = 'approval_pending'",
+                [legacy_state],
+            )
+            .expect("set legacy state");
+        drop(connection);
+
+        let store = SessionStore::open(&db_path).expect("migrate v7 state");
+        drop(store);
+        let connection = rusqlite::Connection::open(&db_path).expect("reopen migrated db");
+        let state: String = connection
+            .query_row(
+                "select execution_state from pending_tool_calls
+                 where request_id = 'approval_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migrated execution state");
+        assert_eq!(state, "executing");
+    }
+}
+
+// 验证确定性损坏在任何迁移写入前拒绝，并保持 v1-v9 数据与临时对象不变。
+#[test]
+fn invalid_legacy_enum_is_rejected_without_mutating_any_supported_version() {
+    for schema_version in 1..=9 {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        create_legacy_enum_database(&db_path, schema_version);
+        let before = sqlite_snapshot(&db_path);
+        let connection = rusqlite::Connection::open(&db_path).expect("open legacy db");
+        connection
+            .execute(
+                "update threads set status = ?1 where thread_id = 'thread_legacy'",
+                [r#""unknown""#],
+            )
+            .expect("inject unknown enum");
+        drop(connection);
+        let before_invalid = sqlite_snapshot(&db_path);
+
+        assert!(matches!(
+            SessionStore::open(&db_path),
+            Err(StoreError::InvalidState(message)) if message.contains("thread status")
+        ));
+        assert_ne!(before, before_invalid);
+        assert_eq!(sqlite_snapshot(&db_path), before_invalid);
+        assert!(!has_v10_temporary_tables(&db_path));
+    }
+}
+
+// 完整 legacy fingerprint 在任何迁移写入前拒绝额外对象。
+#[test]
+fn unexpected_legacy_object_is_rejected_without_mutation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    create_legacy_enum_database(&db_path, 9);
+    let connection = rusqlite::Connection::open(&db_path).expect("open legacy db");
+    connection
+        .execute_batch(
+            "create table unexpected_legacy_table(value text);
+             insert into unexpected_legacy_table(value) values('must survive rollback');",
+        )
+        .expect("inject unexpected legacy table");
+    drop(connection);
+    let before = sqlite_snapshot(&db_path);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(message))
+            if message.contains("schema fingerprint is not a released legacy contract")
+    ));
+    assert_eq!(sqlite_snapshot(&db_path), before);
+    assert!(!has_v10_temporary_tables(&db_path));
+    let connection = rusqlite::Connection::open(&db_path).expect("reopen legacy db");
+    let version: u32 = connection
+        .query_row("select schema_version from schema_meta", [], |row| {
+            row.get(0)
+        })
+        .expect("legacy schema version");
+    assert_eq!(version, 9);
+    let value: String = connection
+        .query_row("select value from unexpected_legacy_table", [], |row| {
+            row.get(0)
+        })
+        .expect("unexpected table row");
+    assert_eq!(value, "must survive rollback");
+}
+
+// 验证 v10 每次 open 都拒绝 trace 列与 payload 的身份分裂。
+#[test]
+fn v10_trace_column_payload_mismatch_fails_closed_without_mutation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let trace = TraceEvent {
+        task_id: Some(turn.turn_id.clone()),
+        ..TraceEvent::for_turn(
+            "trace_v10_column_mismatch",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "test",
+            "trace",
+        )
+    };
+    store.append_trace(&trace).expect("trace");
+    drop(store);
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "update trace_events set session_id = 'wrong_turn'
+             where event_id = 'trace_v10_column_mismatch'",
+            [],
+        )
+        .expect("tamper trace column");
+    drop(connection);
+    let before = sqlite_snapshot(&db_path);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(message))
+            if message.contains("session_id column does not match payload")
+    ));
+    assert_eq!(sqlite_snapshot(&db_path), before);
+}
+
+// trusted reopen 只验证结构；实际 trace 行仍必须在读取边界拒绝列/payload 分裂。
+#[test]
+fn trusted_reopen_defers_trace_row_validation_until_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let trace = TraceEvent {
+        task_id: Some(turn.turn_id.clone()),
+        ..TraceEvent::for_turn(
+            "trace_trusted_reopen",
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "test",
+            "trace",
+        )
+    };
+    store.append_trace(&trace).expect("trace");
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "update trace_events set session_id = 'wrong_turn'
+             where event_id = 'trace_trusted_reopen'",
+            [],
+        )
+        .expect("tamper trace column");
+    drop(connection);
+
+    let reopened = store.trusted_reopen().expect("trusted reopen");
+    assert!(matches!(
+        reopened.show_trace("trace_trusted_reopen"),
+        Err(StoreError::InvalidState(message))
+            if message.contains("columns do not match payload")
+    ));
+}
+
+// trusted reopen 仍拒绝已初始化数据库的 marker/结构分裂。
+#[test]
+fn trusted_reopen_validates_v10_markers_before_serving_rows() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "delete from schema_migrations where migration_id = '0010_stable_enum_text'",
+            [],
+        )
+        .expect("remove marker");
+    drop(connection);
+
+    assert!(matches!(
+        store.trusted_reopen(),
+        Err(StoreError::InvalidState(message)) if message.contains("migration markers")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_reopen_rejects_a_hard_linked_store_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let hard_link = dir.path().join("sessions-alias.sqlite3");
+    std::fs::hard_link(&db_path, &hard_link).expect("hard link store");
+
+    assert!(matches!(
+        store.trusted_reopen(),
+        Err(StoreError::InvalidState(message)) if message.contains("hard links")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_reopen_rejects_path_identity_replacement() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let replacement = dir.path().join("replacement.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let replacement_store = SessionStore::open(&replacement).expect("open replacement");
+    drop(replacement_store);
+    let original = dir.path().join("original.sqlite3");
+    std::fs::rename(&db_path, &original).expect("move original");
+    std::fs::rename(&replacement, &db_path).expect("replace store path");
+
+    assert!(matches!(
+        store.trusted_reopen(),
+        Err(StoreError::InvalidState(message)) if message.contains("identity")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn store_open_rejects_final_and_parent_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let real_dir = dir.path().join("real");
+    std::fs::create_dir(&real_dir).expect("real dir");
+    let real_db = real_dir.join("sessions.sqlite3");
+    drop(SessionStore::open(&real_db).expect("create real store"));
+
+    let file_link = dir.path().join("sessions-link.sqlite3");
+    symlink(&real_db, &file_link).expect("file symlink");
+    assert!(matches!(
+        SessionStore::open(&file_link),
+        Err(StoreError::InvalidState(message)) if message.contains("without following links")
+    ));
+
+    let directory_link = dir.path().join("real-link");
+    symlink(&real_dir, &directory_link).expect("directory symlink");
+    assert!(matches!(
+        SessionStore::open(directory_link.join("sessions.sqlite3")),
+        Err(StoreError::InvalidState(message)) if message.contains("without following links")
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn trusted_reopen_keeps_windows_store_path_non_replaceable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let replacement = dir.path().join("replacement.sqlite3");
+    let replacement_store = SessionStore::open(&replacement).expect("open replacement");
+    drop(replacement_store);
+
+    assert!(std::fs::rename(&db_path, dir.path().join("original.sqlite3")).is_err());
+    store
+        .trusted_reopen()
+        .expect("protected store remains usable");
+}
+
+#[cfg(windows)]
+#[test]
+fn store_open_rejects_parent_reparse_point_when_creation_is_available() {
+    use std::os::windows::fs::symlink_dir;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let real_dir = dir.path().join("real");
+    std::fs::create_dir(&real_dir).expect("real dir");
+    let real_db = real_dir.join("sessions.sqlite3");
+    drop(SessionStore::open(&real_db).expect("create real store"));
+    let directory_link = dir.path().join("real-link");
+    if let Err(error) = symlink_dir(&real_dir, &directory_link) {
+        if error.raw_os_error() == Some(1314) {
+            return;
+        }
+        panic!("create directory symlink: {error}");
+    }
+
+    assert!(matches!(
+        SessionStore::open(directory_link.join("sessions.sqlite3")),
+        Err(StoreError::InvalidState(message)) if message.contains("without following links")
+    ));
+}
+
+// trusted reopen 不扫描 approval/checkpoint 全表，但每个读取或决定事务仍 fail closed。
+#[test]
+fn trusted_reopen_defers_approval_and_checkpoint_validation_until_use() {
+    for corruption in ["approval_payload", "decision_payload", "checkpoint"] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db_path).expect("open store");
+        let thread = store.create_thread(None, None).expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "running")
+            .expect("turn");
+        let request = ApprovalRequest::new(
+            format!("approval_trusted_{corruption}"),
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+            "edit",
+        )
+        .with_tool_call_id("call_1");
+        let checkpoint = serde_json::json!({
+            "request_id": &request.request_id,
+            "thread_id": &request.thread_id,
+            "turn_id": &request.turn_id,
+            "tool_call_id": "call_1",
+            "tool_name": "edit",
+            "raw_arguments": "{}",
+            "resources": [],
+            "checkpoint_version": 1,
+            "messages": [],
+            "tool_results": [],
+            "used_approval_grants": [],
+            "approval_count": 1,
+            "model_turns": 1,
+            "completion": {}
+        });
+        let has_pending_checkpoint = corruption != "approval_payload";
+        store
+            .create_approval_with_pending_tool_call_and_trace(
+                &request,
+                has_pending_checkpoint.then_some(checkpoint),
+                "approval",
+                "approval requested",
+            )
+            .expect("approval");
+        let decision_id = if corruption == "decision_payload" {
+            let decision = ApprovalDecision::new(
+                request.request_id.clone(),
+                ApprovalOutcome::Allow,
+                "allowed",
+            );
+            let decision_id = decision.decision_id.clone();
+            store
+                .record_approval_decision(&decision, "approval", "approval decision recorded")
+                .expect("decision");
+            Some(decision_id)
+        } else {
+            None
+        };
+
+        let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        match corruption {
+            "approval_payload" => {
+                connection
+                    .execute(
+                        "update approvals set payload = '{\"request_id\":\"wrong\"}'
+                         where request_id = ?1",
+                        rusqlite::params![request.request_id],
+                    )
+                    .expect("tamper approval payload");
+            }
+            "decision_payload" => {
+                connection
+                    .execute(
+                        "update approval_decisions set payload = '{\"decision_id\":\"wrong\"}'
+                         where request_id = ?1",
+                        rusqlite::params![request.request_id],
+                    )
+                    .expect("tamper decision payload");
+            }
+            "checkpoint" => {
+                connection
+                    .execute(
+                        "update pending_tool_calls set payload = '{}'
+                         where request_id = ?1",
+                        rusqlite::params![request.request_id],
+                    )
+                    .expect("tamper checkpoint");
+            }
+            _ => unreachable!("table-driven corruption case"),
+        }
+        drop(connection);
+
+        let trusted = store.trusted_reopen().expect("trusted reopen");
+        match corruption {
+            "approval_payload" => assert!(matches!(
+                trusted.list_pending_approvals(),
+                Err(StoreError::InvalidState(_))
+            )),
+            "decision_payload" => assert!(matches!(
+                trusted.get_approval_decision(&decision_id.expect("decision id")),
+                Err(StoreError::InvalidState(_))
+            )),
+            "checkpoint" => assert!(matches!(
+                trusted.record_approval_decision(
+                    &ApprovalDecision::new(
+                        request.request_id.clone(),
+                        ApprovalOutcome::Allow,
+                        "allowed",
+                    ),
+                    "approval",
+                    "approval decision recorded",
+                ),
+                Err(StoreError::InvalidState(_))
+            )),
+            _ => unreachable!("table-driven corruption case"),
+        }
+    }
+}
+
+// 验证历史 turn-shaped trace 不能在关联不唯一时被猜测修复。
+#[test]
+fn ambiguous_legacy_turn_trace_is_rejected_without_mutation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    create_legacy_enum_database(&db_path, 9);
+    let connection = rusqlite::Connection::open(&db_path).expect("open legacy db");
+    let payload = legacy_trace_payload(
+        "trace_legacy_turn_repair",
+        "thread_legacy",
+        "turn_pending",
+        Some("turn_legacy"),
+    );
+    connection
+        .execute(
+            "update trace_events set session_id = ?1, payload = ?2
+             where event_id = 'trace_legacy_turn_repair'",
+            rusqlite::params!["turn_pending", payload],
+        )
+        .expect("inject ambiguous trace");
+    drop(connection);
+    let before = sqlite_snapshot(&db_path);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(message)) if message.contains("ambiguous turn binding")
+    ));
+    assert_eq!(sqlite_snapshot(&db_path), before);
+    assert!(!has_v10_temporary_tables(&db_path));
+}
+
+// 验证已标记 v10 库缺少最终 migration marker 时不能被认领。
+#[test]
+fn v10_missing_final_migration_marker_fails_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("create current store");
@@ -233,8 +938,7 @@ fn complete_thread_policy_columns_without_marker_fail_closed_for_nonempty_v8_sto
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     connection
         .execute_batch(
-            "delete from schema_migrations where migration_id = '0009_thread_policy_snapshot';
-             update schema_meta set schema_version = 8;",
+            "delete from schema_migrations where migration_id = '0010_stable_enum_text';",
         )
         .expect("remove migration marker");
     drop(connection);
@@ -242,7 +946,7 @@ fn complete_thread_policy_columns_without_marker_fail_closed_for_nonempty_v8_sto
     assert!(matches!(
         SessionStore::open(&db_path),
         Err(StoreError::InvalidState(message))
-            if message.contains("columns exist without migration marker")
+            if message.contains("migration markers")
     ));
 }
 
@@ -263,9 +967,73 @@ fn partial_thread_policy_migration_fails_closed() {
     assert!(matches!(
         SessionStore::open(&db_path),
         Err(StoreError::InvalidState(message))
-            if message.contains("migration is recorded")
-                || message.contains("partially migrated")
+            if message.contains("v10 schema fingerprint is not canonical")
     ));
+}
+
+// v10 的 check/index/trigger 结构合同被削弱时，open 只读失败且不再追加任何对象或行。
+#[test]
+fn v10_structure_rejects_weak_check_index_and_trigger_without_mutation() {
+    for corruption in ["check", "index", "trigger"] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("sessions.sqlite3");
+        let store = SessionStore::open(&db_path).expect("create current store");
+        store.create_thread(None, None).expect("thread");
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+        match corruption {
+            "check" => {
+                let original_sql: String = connection
+                    .query_row(
+                        "select sql from sqlite_master where type = 'table' and name = 'threads'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("thread schema");
+                let weakened_sql = original_sql.replace(
+                    "check(status in ('active', 'archived'))",
+                    "check(status in ('active', 'archived', 'future'))",
+                );
+                assert_ne!(weakened_sql, original_sql);
+                connection
+                    .pragma_update(None, "writable_schema", "on")
+                    .expect("enable writable schema");
+                connection
+                    .execute(
+                        "update sqlite_master set sql = ?1 where type = 'table' and name = 'threads'",
+                        [&weakened_sql],
+                    )
+                    .expect("weaken check");
+                connection
+                    .pragma_update(None, "writable_schema", "off")
+                    .expect("disable writable schema");
+            }
+            "index" => {
+                connection
+                    .execute("drop index approvals_thread_lookup", [])
+                    .expect("drop canonical index");
+            }
+            "trigger" => {
+                connection
+                    .execute_batch(
+                        "create trigger unexpected_v10_trigger after insert on threads
+                         begin select 1; end;",
+                    )
+                    .expect("create unexpected trigger");
+            }
+            _ => unreachable!(),
+        }
+        drop(connection);
+        let before = sqlite_snapshot(&db_path);
+
+        let error = match SessionStore::open(&db_path) {
+            Ok(_) => panic!("corrupt v10 accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::InvalidState(_)));
+        assert_eq!(sqlite_snapshot(&db_path), before);
+    }
 }
 
 // 验证已经标记完成的 schema 也不会接受未知或伪造的持久化 policy 值。
@@ -273,9 +1041,7 @@ fn partial_thread_policy_migration_fails_closed() {
 fn invalid_thread_policy_snapshot_value_fails_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("create current store");
-    store.create_thread(None, None).expect("thread");
-    drop(store);
+    create_legacy_enum_database(&db_path, 9);
 
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     connection
@@ -288,7 +1054,7 @@ fn invalid_thread_policy_snapshot_value_fails_closed() {
 
     assert!(matches!(
         SessionStore::open(&db_path),
-        Err(StoreError::InvalidState(message)) if message.contains("unknown sandbox policy snapshot")
+        Err(StoreError::InvalidState(message)) if message.contains("sandbox mode")
     ));
 }
 
@@ -297,79 +1063,7 @@ fn invalid_thread_policy_snapshot_value_fails_closed() {
 fn migrated_schema_rebuilds_foreign_key_tables() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            r#"
-            create table schema_migrations(
-                migration_id text primary key,
-                applied_at text not null default current_timestamp
-            );
-            create table threads(
-                thread_id text primary key,
-                model text,
-                cwd text,
-                status text not null
-            );
-            create table turns(
-                turn_id text primary key,
-                thread_id text not null,
-                status text not null,
-                agent_loop_status text not null
-            );
-            create table items(
-                item_id text primary key,
-                turn_id text not null,
-                kind text not null,
-                payload text not null,
-                status text not null
-            );
-            create table trace_events(
-                event_id text primary key,
-                run_id text not null,
-                payload text not null
-            );
-            create table approvals(
-                request_id text primary key,
-                payload text not null,
-                decision_outcome text,
-                decision_reason text
-            );
-            create table approval_decisions(
-                decision_id text primary key,
-                request_id text not null,
-                outcome text not null,
-                reason text not null,
-                payload text not null
-            );
-            create table artifact_refs(
-                artifact_id text primary key,
-                run_id text not null,
-                item_id text,
-                kind text not null,
-                uri text not null,
-                content_digest text not null,
-                summary text not null,
-                metadata text not null,
-                redacted integer not null
-            );
-            create table pending_tool_calls(
-                request_id text primary key,
-                turn_id text not null,
-                tool_call_id text not null,
-                payload text not null
-            );
-            insert into threads(thread_id, model, cwd, status) values('thread_1', null, null, '"active"');
-            insert into turns(turn_id, thread_id, status, agent_loop_status) values('turn_1', 'thread_1', '"blocked"', 'blocked');
-            insert into items(item_id, turn_id, kind, payload, status) values('item_1', 'turn_1', '"userMessage"', '[{"type":"text","text":"legacy input"}]', '"completed"');
-            insert into approvals(request_id, payload, decision_outcome, decision_reason)
-            values('approval_1', '{"request_id":"approval_1","session_id":"thread_1","task_id":"turn_1","thread_id":"thread_1","turn_id":"turn_1","tool_call_id":"call_1","action":"edit","resources":[],"reason":""}', null, null);
-            insert into pending_tool_calls(request_id, turn_id, tool_call_id, payload)
-            values('approval_1', 'turn_1', 'call_1', '{"request_id":"approval_1","tool_call_id":"call_1"}');
-            "#,
-        )
-        .expect("legacy schema");
-    drop(connection);
+    create_legacy_enum_database(&db_path, 4);
 
     let store = SessionStore::open(&db_path).expect("migrate store");
     drop(store);
@@ -388,12 +1082,19 @@ fn migrated_schema_rebuilds_foreign_key_tables() {
             [],
         )
         .is_err());
-    assert!(connection
-        .execute(
-            "update pending_tool_calls set execution_state = 'approved' where request_id = 'approval_1'",
-            [],
-        )
-        .is_err());
+    assert!(
+        connection
+            .execute(
+                "insert into pending_tool_calls(
+                 request_id, thread_id, turn_id, tool_call_id, payload, execution_state
+             ) values(
+                 'approval_pending', 'thread_legacy', 'turn_pending', 'call_invalid',
+                 '{}', 'approved'
+             )",
+                [],
+            )
+            .is_err()
+    );
 }
 
 // 验证新 schema 拒绝孤儿 turn 与 pending tool call。
@@ -411,7 +1112,7 @@ fn fresh_schema_rejects_orphan_turn_and_pending_tool_call_rows() {
 
     assert!(connection
         .execute(
-            "insert into turns(turn_id, thread_id, status, agent_loop_status) values('turn_missing', 'thread_missing', '\"running\"', 'running')",
+            "insert into turns(turn_id, thread_id, status, agent_loop_status) values('turn_missing', 'thread_missing', 'running', 'running')",
             [],
         )
         .is_err());
@@ -634,7 +1335,7 @@ fn pending_approval_creation_does_not_overwrite_cancel_requested_turn() {
         .expect("turn");
     let trace = TraceEvent {
         payload: serde_json::json!({"turn_id": &turn.turn_id, "agent_loop_status": "cancel_requested"}),
-        ..TraceEvent::new(
+        ..TraceEvent::for_turn(
             "trace_cancel_before_approval",
             thread.thread_id.clone(),
             turn.turn_id.clone(),
@@ -821,7 +1522,7 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
     let turn = store
         .create_turn(&thread.thread_id, "running")
         .expect("turn");
-    let trace = TraceEvent::new(
+    let trace = TraceEvent::for_turn(
         "trace_cancel_requested",
         &thread.thread_id,
         &turn.turn_id,
@@ -843,7 +1544,7 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
                 agent_loop_status: "completed",
                 assistant_delta: Some("too late"),
                 plan: None,
-                trace: &TraceEvent::new(
+                trace: &TraceEvent::for_turn(
                     "trace_too_late",
                     &thread.thread_id,
                     &turn.turn_id,
@@ -863,7 +1564,7 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
                 agent_loop_status: "cancelled",
                 assistant_delta: None,
                 plan: None,
-                trace: &TraceEvent::new(
+                trace: &TraceEvent::for_turn(
                     "trace_cancelled",
                     &thread.thread_id,
                     &turn.turn_id,
@@ -883,9 +1584,9 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
     assert_eq!(trace_ids, vec!["trace_cancel_requested", "trace_cancelled"]);
 }
 
-// 验证 approval 决定只写入一次且保留在 decision ledger。
+// 验证 approval 决定只写入一次且保留在 decision history。
 #[test]
-fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
+fn approval_decision_is_written_once_and_kept_in_decision_history() {
     for outcome in [
         ApprovalOutcome::Allow,
         ApprovalOutcome::Deny,
@@ -914,7 +1615,7 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
         assert_eq!(recorded.request, request);
         assert_eq!(recorded.decision, decision);
         assert_eq!(trace.run_id, thread.thread_id);
-        assert_eq!(trace.session_id, thread.thread_id);
+        assert_eq!(trace.session_id, turn.turn_id);
         assert_eq!(trace.task_id.as_deref(), Some(turn.turn_id.as_str()));
         assert_eq!(trace.payload["request_id"], "approval_1");
         assert_eq!(trace.payload["decision_id"], decision.decision_id);
@@ -942,7 +1643,7 @@ fn approval_decision_is_written_once_and_kept_in_decision_ledger() {
             assert_eq!(
                 store
                     .get_approval_decision(&decision.decision_id)
-                    .expect("ledger")
+                    .expect("decision history")
                     .outcome,
                 outcome
             );
@@ -1162,9 +1863,9 @@ fn process_recovery_preserves_pending_successor_after_legacy_half_handoff() {
     );
 }
 
-// 验证 turn 恢复失败时 approval reconciliation 整体回滚。
+// 验证 v10 open 会在恢复前拒绝不一致的 approval/checkpoint 绑定且不改库。
 #[test]
-fn process_recovery_rolls_back_approval_reconciliation_when_turn_recovery_fails() {
+fn v10_open_rejects_inconsistent_approval_checkpoint_before_recovery() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
@@ -1228,10 +1929,6 @@ fn process_recovery_rolls_back_approval_reconciliation_when_turn_recovery_fails(
             "approval requested",
         )
         .expect("pending successor");
-    let trace_count_before = store
-        .list_trace(&thread.thread_id)
-        .expect("trace list")
-        .len();
     drop(store);
 
     let orphan_request_id = "approval_orphan_pending";
@@ -1245,9 +1942,12 @@ fn process_recovery_rolls_back_approval_reconciliation_when_turn_recovery_fails(
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     connection
         .execute(
-            "insert into approvals(request_id, payload) values(?1, ?2)",
+            "insert into approvals(request_id, thread_id, turn_id, payload)
+             values(?1, ?2, ?3, ?4)",
             rusqlite::params![
                 orphan_request_id,
+                thread.thread_id,
+                turn.turn_id,
                 serde_json::to_string(&orphan_request).expect("orphan approval payload")
             ],
         )
@@ -1267,45 +1967,18 @@ fn process_recovery_rolls_back_approval_reconciliation_when_turn_recovery_fails(
         .expect("insert orphan pending execution");
     drop(connection);
 
-    let reopened = SessionStore::open(&db_path).expect("reopen store");
+    let before = sqlite_snapshot(&db_path);
     assert!(matches!(
-        reopened.recover_unowned_workspace_executions(),
-        Err(StoreError::InvalidState(message))
-            if message == format!(
-                "turn {} has inconsistent pending execution state",
-                turn.turn_id
-            )
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(_))
     ));
-    assert!(
-        reopened
-            .has_pending_tool_call(&first.request_id)
-            .expect("first")
-    );
-    assert!(
-        reopened
-            .has_pending_tool_call(&next.request_id)
-            .expect("next")
-    );
-    assert!(
-        reopened
-            .has_pending_tool_call(orphan_request_id)
-            .expect("orphan")
-    );
-    let unchanged_turn = reopened.get_turn(&turn.turn_id).expect("turn");
-    assert_eq!(unchanged_turn.status, TurnStatus::Blocked);
-    assert_eq!(unchanged_turn.agent_loop_status, "blocked");
-    assert_eq!(
-        reopened
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .len(),
-        trace_count_before
-    );
+    assert_eq!(sqlite_snapshot(&db_path), before);
+    assert!(!has_v10_temporary_tables(&db_path));
 }
 
-// 验证恢复拒绝缺失或游离 decision ledger，并保持数据库不变。
+// 验证 v10 open 会在恢复前拒绝缺失或游离 decision history，并保持数据库不变。
 #[test]
-fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutation() {
+fn v10_open_rejects_missing_or_stray_decision_history_without_mutation() {
     for corruption in ["missing", "stray"] {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("sessions.sqlite3");
@@ -1315,7 +1988,7 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
             .create_turn(&thread.thread_id, "running")
             .expect("turn");
         let request = ApprovalRequest::new(
-            format!("approval_ledger_{corruption}"),
+            format!("approval_history_{corruption}"),
             thread.thread_id.clone(),
             turn.turn_id.clone(),
             "edit",
@@ -1355,10 +2028,6 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
                 .record_approval_decision(&decision, "approval", "approval decision recorded")
                 .expect("claim execution");
         }
-        let trace_count_before = store
-            .list_trace(&thread.thread_id)
-            .expect("trace list")
-            .len();
         drop(store);
 
         let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
@@ -1368,7 +2037,7 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
                     "delete from approval_decisions where request_id = ?1",
                     rusqlite::params![request.request_id],
                 )
-                .expect("remove decision ledger");
+                .expect("remove decision history");
         } else {
             connection
                 .execute(
@@ -1377,38 +2046,22 @@ fn process_recovery_rejects_missing_or_stray_decision_ledger_rows_without_mutati
                     rusqlite::params![
                         decision.decision_id,
                         request.request_id,
-                        serde_json::to_string(&ApprovalOutcome::Allow).expect("outcome"),
+                        ApprovalOutcome::Allow.as_storage_text(),
                         decision.reason,
                         serde_json::to_string(&decision).expect("decision"),
                     ],
                 )
-                .expect("insert stray decision ledger");
+                .expect("insert stray decision history");
         }
         drop(connection);
 
-        let reopened = SessionStore::open(&db_path).expect("reopen store");
+        let before = sqlite_snapshot(&db_path);
         assert!(matches!(
-            reopened.recover_unowned_workspace_executions(),
-            Err(StoreError::InvalidState(message))
-                if message == format!(
-                    "approval {} has inconsistent decision ledger",
-                    request.request_id
-                )
+            SessionStore::open(&db_path),
+            Err(StoreError::InvalidState(_))
         ));
-        assert!(
-            reopened
-                .has_pending_tool_call(&request.request_id)
-                .expect("pending checkpoint")
-        );
-        let unchanged_turn = reopened.get_turn(&turn.turn_id).expect("turn");
-        assert_eq!(unchanged_turn.status, TurnStatus::Blocked);
-        assert_eq!(
-            reopened
-                .list_trace(&thread.thread_id)
-                .expect("trace list")
-                .len(),
-            trace_count_before
-        );
+        assert_eq!(sqlite_snapshot(&db_path), before);
+        assert!(!has_v10_temporary_tables(&db_path));
     }
 }
 
@@ -1432,7 +2085,7 @@ fn process_recovery_rejects_unresolved_tool_approval_without_checkpoint() {
         "edit",
     )
     .with_tool_call_id("call_1");
-    store.create_approval(&request).expect("approval ledger");
+    store.create_approval(&request).expect("approval history");
 
     assert!(matches!(
         store.recover_unowned_workspace_executions(),
@@ -1497,16 +2150,13 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
         "edit",
     )
     .with_tool_call_id("call_2");
-    let trace = TraceEvent {
-        task_id: Some(turn.turn_id.clone()),
-        ..TraceEvent::new(
-            "trace_handoff",
-            thread.thread_id.clone(),
-            turn.turn_id.clone(),
-            "agent_loop",
-            "agent loop blocked",
-        )
-    };
+    let trace = TraceEvent::for_turn(
+        "trace_handoff",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "agent_loop",
+        "agent loop blocked",
+    );
 
     assert!(matches!(
         store.commit_turn_outcome_and_resolve_pending_execution(
@@ -1666,10 +2316,7 @@ fn allow_claim_rechecks_active_thread_inside_the_store_transaction() {
     connection
         .execute(
             "update threads set status = ?1 where thread_id = ?2",
-            rusqlite::params![
-                serde_json::to_string(&ThreadStatus::Archived).expect("status"),
-                thread.thread_id
-            ],
+            rusqlite::params![ThreadStatus::Archived.as_storage_text(), thread.thread_id],
         )
         .expect("simulate external archive race");
 
@@ -1741,7 +2388,7 @@ fn thread_delete_removes_bound_approvals_decisions_and_traces() {
         )
         .expect("approval");
     assert_eq!(request_trace.run_id, thread.thread_id);
-    assert_eq!(request_trace.session_id, thread.thread_id);
+    assert_eq!(request_trace.session_id, turn.turn_id);
     assert_eq!(
         request_trace.task_id.as_deref(),
         Some(turn.turn_id.as_str())
@@ -1882,7 +2529,7 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
             "turn started",
         )
         .expect("turn");
-    let trace = TraceEvent::new(
+    let trace = TraceEvent::for_turn(
         "trace_terminal_success",
         &thread.thread_id,
         &turn.turn_id,
@@ -1969,7 +2616,7 @@ fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
         )
         .expect("install trigger");
     drop(connection);
-    let trace = TraceEvent::new(
+    let trace = TraceEvent::for_turn(
         "trace_terminal_failure",
         &thread.thread_id,
         &turn.turn_id,
@@ -2007,14 +2654,151 @@ fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
     let assistant_count: u64 = connection
         .query_row(
             "select count(*) from items where turn_id = ?1 and kind = ?2",
-            rusqlite::params![
-                turn.turn_id,
-                serde_json::to_string(&ItemKind::AgentMessage).expect("agent kind")
-            ],
+            rusqlite::params![turn.turn_id, ItemKind::AgentMessage.as_storage_text()],
             |row| row.get(0),
         )
         .expect("assistant count");
     assert_eq!(assistant_count, 0);
+}
+
+// 验证 runtime turn trace 绑定错误以 typed StoreError 传播，而不是退化为字符串状态。
+#[test]
+fn turn_trace_binding_error_remains_typed_at_store_boundary() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let trace = TraceEvent::for_turn(
+        "trace_wrong_turn_binding",
+        &thread.thread_id,
+        "wrong_turn",
+        "agent_loop",
+        "invalid turn binding",
+    );
+
+    let error = store
+        .commit_turn_outcome(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Interrupted,
+                agent_loop_status: "interrupted",
+                assistant_delta: None,
+                plan: None,
+                trace: &trace,
+            },
+        )
+        .expect_err("mismatched turn trace must be rejected");
+
+    assert!(matches!(
+        error,
+        StoreError::TraceBinding(TraceBindingError::SessionIdMismatch { expected, actual })
+            if expected == turn.turn_id && actual == "wrong_turn"
+    ));
+    assert_eq!(
+        store
+            .get_turn(&turn.turn_id)
+            .expect("turn after rejection")
+            .status,
+        TurnStatus::Running
+    );
+}
+
+#[test]
+fn missing_turn_trace_task_id_remains_typed_at_store_boundary() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let mut trace = TraceEvent::for_turn(
+        "trace_missing_task",
+        &thread.thread_id,
+        &turn.turn_id,
+        "agent_loop",
+        "missing task",
+    );
+    trace.task_id = None;
+
+    assert!(matches!(
+        store.commit_turn_outcome(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Interrupted,
+                agent_loop_status: "interrupted",
+                assistant_delta: None,
+                plan: None,
+                trace: &trace,
+            },
+        ),
+        Err(StoreError::TraceBinding(TraceBindingError::TaskIdMismatch { expected, actual: None }))
+            if expected == turn.turn_id
+    ));
+}
+
+// append_trace 的绑定检查与插入必须和 delete_thread 共享同一个写事务，不能留下孤立 turn trace。
+#[test]
+fn append_and_delete_race_cannot_leave_an_orphan_turn_trace() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let setup = SessionStore::open(&db_path).expect("open store");
+    let thread = setup.create_thread(None, None).expect("thread");
+    let turn = setup
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    setup
+        .update_turn_state(&turn.turn_id, TurnStatus::Completed, "completed")
+        .expect("terminal turn");
+    drop(setup);
+
+    let append_store = SessionStore::open(&db_path).expect("append store");
+    let delete_store = SessionStore::open(&db_path).expect("delete store");
+    let trace = TraceEvent::for_turn(
+        "trace_append_delete_race",
+        &thread.thread_id,
+        &turn.turn_id,
+        "test",
+        "race",
+    );
+    let barrier = Arc::new(Barrier::new(3));
+    let append_barrier = Arc::clone(&barrier);
+    let append_handle = std::thread::spawn(move || {
+        append_barrier.wait();
+        append_store.append_trace(&trace)
+    });
+    let delete_barrier = Arc::clone(&barrier);
+    let thread_id = thread.thread_id.clone();
+    let delete_handle = std::thread::spawn(move || {
+        delete_barrier.wait();
+        delete_store.delete_thread(&thread_id)
+    });
+    barrier.wait();
+
+    let append_result = append_handle.join().expect("append worker");
+    let delete_result = delete_handle.join().expect("delete worker");
+    assert!(delete_result.is_ok(), "delete result: {delete_result:?}");
+    assert!(
+        append_result.is_ok()
+            || matches!(append_result, Err(StoreError::InvalidState(ref message)) if message.contains("existing turn")),
+        "append result: {append_result:?}"
+    );
+
+    let reopened = SessionStore::open(&db_path).expect("reopen store");
+    assert!(matches!(
+        reopened.get_thread(&thread.thread_id),
+        Err(StoreError::NotFound(_))
+    ));
+    let connection = rusqlite::Connection::open(&db_path).expect("inspect store");
+    let trace_count: i64 = connection
+        .query_row(
+            "select count(*) from trace_events where event_id = 'trace_append_delete_race'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("trace count");
+    assert_eq!(trace_count, 0);
 }
 
 // 验证 trace 列表支持分页与尾部窗口读取。
@@ -2308,9 +3092,9 @@ fn concurrent_connections_serialize_the_v5_history_migration() {
     );
 }
 
-// 验证缺失 migration marker 的完整 history schema 会重新脱敏。
+// 验证已标记 v10 数据库缺少 migration marker 时 fail closed 且不改数据。
 #[test]
-fn complete_history_schema_without_migration_marker_is_resanitized() {
+fn v10_missing_migration_marker_fails_closed_without_mutation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let store = SessionStore::open(&db_path).expect("open store");
@@ -2333,30 +3117,22 @@ fn complete_history_schema_without_migration_marker_is_resanitized() {
             [],
         )
         .expect("delete migration marker");
-    connection
-        .execute(
-            "update items set payload = ?1, redacted = 0 where item_id = ?2",
-            rusqlite::params![
-                r#"[{"type":"text","text":"SINGULARITY_API_KEY=unmarked-secret"}]"#,
-                item.item_id
-            ],
-        )
-        .expect("inject legacy secret");
     drop(connection);
 
-    let store = SessionStore::open(&db_path).expect("reopen and sanitize");
-    drop(store);
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(message))
+            if message.contains("migration markers")
+    ));
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    let (payload, redacted): (String, bool) = connection
+    let payload: String = connection
         .query_row(
-            "select payload, redacted from items where item_id = ?1",
+            "select payload from items where item_id = ?1",
             [&item.item_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
-        .expect("read sanitized item");
-    assert!(!payload.contains("unmarked-secret"));
-    assert!(payload.contains("[redacted sensitive user input]"));
-    assert!(redacted);
+        .expect("read unchanged item");
+    assert!(payload.contains("safe"));
 }
 
 // 验证已完成 history 可持久化、排序并按 turn 分页。
@@ -2568,9 +3344,8 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
             "insert into items(item_id, turn_id, item_sequence, kind, payload, status, redacted) values('started_agent_item', ?1, 5, ?2, '{\"delta\":\"not completed\"}', ?3, 0)",
             rusqlite::params![
                 completed,
-                serde_json::to_string(&ItemKind::AgentMessage).expect("agent kind"),
-                serde_json::to_string(&singularity_protocol::ItemStatus::Started)
-                    .expect("started status"),
+                ItemKind::AgentMessage.as_storage_text(),
+                singularity_protocol::ItemStatus::Started.as_storage_text(),
             ],
         )
         .expect("started item");
@@ -2593,6 +3368,31 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
     assert_eq!(history.messages.len(), 2);
     assert_eq!(history.messages[0].content, "safe user");
     assert_eq!(history.messages[1].content, "safe assistant");
+}
+
+#[test]
+fn history_decodes_all_selected_item_status_and_kind_values_before_projection() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = append_completed_conversation(&store, &thread.thread_id, "user", "assistant");
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute_batch("pragma ignore_check_constraints = on;")
+        .expect("ignore checks");
+    connection
+        .execute(
+            "update items set kind = 'unknown_kind' where turn_id = ?1 and kind = 'userMessage'",
+            rusqlite::params![turn],
+        )
+        .expect("tamper item kind");
+    drop(connection);
+
+    assert!(matches!(
+        store.read_thread_history(&thread.thread_id, None, 10),
+        Err(StoreError::InvalidState(message)) if message.contains("item kind")
+    ));
 }
 
 // 验证 user 与 assistant 文本存储和 history 投影都会脱敏。
@@ -2686,10 +3486,7 @@ fn malformed_conversation_payload_fails_closed() {
     connection
         .execute(
             "update items set payload = '{\"delta\":42}' where turn_id = ?1 and kind = ?2",
-            rusqlite::params![
-                turn_id,
-                serde_json::to_string(&ItemKind::AgentMessage).expect("kind")
-            ],
+            rusqlite::params![turn_id, ItemKind::AgentMessage.as_storage_text()],
         )
         .expect("tamper payload");
 
@@ -2757,13 +3554,13 @@ fn turn_and_item_sequence_unique_indexes_reject_duplicates() {
     assert!(indexes.contains(&"items_history_lookup".to_string()));
     assert!(connection
         .execute(
-            "insert into turns(turn_id, thread_id, turn_sequence, status, agent_loop_status) values('duplicate_turn', ?1, 1, '\"running\"', 'running')",
+            "insert into turns(turn_id, thread_id, turn_sequence, status, agent_loop_status) values('duplicate_turn', ?1, 1, 'running', 'running')",
             [&thread.thread_id],
         )
         .is_err());
     assert!(connection
         .execute(
-            "insert into items(item_id, turn_id, item_sequence, kind, payload, status, redacted) values('duplicate_item', ?1, 1, '\"reasoning\"', '{}', '\"completed\"', 0)",
+            "insert into items(item_id, turn_id, item_sequence, kind, payload, status, redacted) values('duplicate_item', ?1, 1, 'reasoning', '{}', 'completed', 0)",
             [&turn.turn_id],
         )
         .is_err());
@@ -3006,6 +3803,47 @@ fn create_v5_history_database(path: &std::path::Path) {
                 status text not null,
                 foreign key(turn_id) references turns(turn_id)
             );
+            create table trace_events(
+                event_id text primary key,
+                run_id text not null,
+                session_id text not null default '',
+                payload text not null
+            );
+            create table approvals(
+                request_id text primary key,
+                payload text not null,
+                decision_outcome text,
+                decision_reason text
+            );
+            create table approval_decisions(
+                decision_id text primary key,
+                request_id text not null,
+                outcome text not null,
+                reason text not null,
+                payload text not null,
+                foreign key(request_id) references approvals(request_id)
+            );
+            create table artifact_refs(
+                artifact_id text primary key,
+                run_id text not null,
+                item_id text,
+                kind text not null,
+                uri text not null,
+                content_digest text not null,
+                summary text not null,
+                metadata text not null,
+                redacted integer not null
+            );
+            create table pending_tool_calls(
+                request_id text primary key,
+                thread_id text not null,
+                turn_id text not null,
+                tool_call_id text not null,
+                payload text not null,
+                foreign key(request_id) references approvals(request_id),
+                foreign key(thread_id) references threads(thread_id),
+                foreign key(turn_id) references turns(turn_id)
+            );
             insert into threads(thread_id, model, cwd, status) values
                 ('thread_a', null, null, '"active"'),
                 ('thread_b', null, null, '"active"');
@@ -3021,6 +3859,699 @@ fn create_v5_history_database(path: &std::path::Path) {
             "#,
         )
         .expect("create v5 schema");
+}
+
+// 创建真实历史版本的最小数据库：v1/v2 仍没有 schema_meta，v3/v4
+// 还携带已删除的 active_sidecar_runs，v5 以后才使用 schema_meta；当前
+// v10 migration 会读取并丢弃这个已移除的运行时 sidecar，而不把它带入现行 schema。
+fn create_legacy_enum_database(path: &std::path::Path, schema_version: u32) {
+    assert!((1..=9).contains(&schema_version));
+    let has_migrations = schema_version >= 2;
+    let has_schema_meta = schema_version >= 5;
+    let has_history = schema_version >= 6;
+    let has_execution_state = schema_version >= 7;
+    let has_execution_recovery = schema_version >= 8;
+    let has_policy_snapshot = schema_version >= 9;
+    let has_trace_session_id = schema_version >= 2;
+    let has_approval_decisions = schema_version >= 2;
+    let has_artifacts = schema_version >= 2;
+    let has_sidecar = (3..=4).contains(&schema_version);
+    let has_pending_tool_calls = schema_version >= 4;
+    let has_pending_bindings = schema_version >= 5;
+
+    let connection = rusqlite::Connection::open(path).expect("open legacy enum sqlite");
+    let mut schema = String::new();
+    if has_schema_meta {
+        schema.push_str("create table schema_meta(schema_version integer not null);");
+    }
+    if has_migrations {
+        schema.push_str(
+            "create table schema_migrations(
+                 migration_id text primary key,
+                 applied_at text not null default current_timestamp
+             );",
+        );
+    }
+    if has_policy_snapshot {
+        schema.push_str(
+            "create table threads(
+                 thread_id text primary key,
+                 model text,
+                 cwd text,
+                 status text not null,
+                 sandbox_mode text not null default '\"workspace-write\"',
+                 approval_policy text not null default '\"on-request\"'
+             );",
+        );
+    } else {
+        schema.push_str(
+            "create table threads(
+                 thread_id text primary key,
+                 model text,
+                 cwd text,
+                 status text not null
+             );",
+        );
+    }
+    if has_history {
+        schema.push_str(&format!(
+            "create table turns(
+                 turn_id text primary key,
+                 thread_id text not null,
+                 turn_sequence integer not null check(turn_sequence > 0),
+                 status text not null,
+                 agent_loop_status text not null{}
+             );",
+            if schema_version >= 5 {
+                ", foreign key(thread_id) references threads(thread_id)"
+            } else {
+                ""
+            },
+        ));
+    } else {
+        schema.push_str(&format!(
+            "create table turns(
+                 turn_id text primary key,
+                 thread_id text not null,
+                 status text not null,
+                 agent_loop_status text not null{}
+             );",
+            if schema_version >= 5 {
+                ", foreign key(thread_id) references threads(thread_id)"
+            } else {
+                ""
+            },
+        ));
+    }
+    if has_history {
+        schema.push_str(&format!(
+            "create table items(
+                 item_id text primary key,
+                 turn_id text not null,
+                 item_sequence integer not null check(item_sequence > 0),
+                 kind text not null,
+                 payload text not null,
+                 status text not null,
+                 redacted integer not null check(redacted in (0, 1)){}
+             );",
+            if schema_version >= 5 {
+                ", foreign key(turn_id) references turns(turn_id)"
+            } else {
+                ""
+            },
+        ));
+    } else {
+        schema.push_str(&format!(
+            "create table items(
+                 item_id text primary key,
+                 turn_id text not null,
+                 kind text not null,
+                 payload text not null,
+                 status text not null{}
+             );",
+            if schema_version >= 5 {
+                ", foreign key(turn_id) references turns(turn_id)"
+            } else {
+                ""
+            },
+        ));
+    }
+    if has_trace_session_id {
+        schema.push_str(
+            "create table trace_events(
+                 event_id text primary key,
+                 run_id text not null,
+                 session_id text not null default '',
+                 payload text not null
+             );",
+        );
+    } else {
+        schema.push_str(
+            "create table trace_events(
+                 event_id text primary key,
+                 run_id text not null,
+                 payload text not null
+             );",
+        );
+    }
+    schema.push_str(
+        "create table approvals(
+             request_id text primary key,
+             payload text not null,
+             decision_outcome text,
+             decision_reason text
+         );",
+    );
+    if has_approval_decisions {
+        schema.push_str(&format!(
+            "create table approval_decisions(
+                 decision_id text primary key,
+                 request_id text not null,
+                 outcome text not null,
+                 reason text not null,
+                 payload text not null{}
+             );",
+            if schema_version >= 5 {
+                ", foreign key(request_id) references approvals(request_id)"
+            } else {
+                ""
+            },
+        ));
+    }
+    if has_artifacts {
+        schema.push_str(
+            "create table artifact_refs(
+                 artifact_id text primary key,
+                 run_id text not null,
+                 item_id text,
+                 kind text not null,
+                 uri text not null,
+                 content_digest text not null,
+                 summary text not null,
+                 metadata text not null,
+                 redacted integer not null
+             );",
+        );
+    }
+    if has_sidecar {
+        schema.push_str(
+            "create table active_sidecar_runs(
+                 turn_id text primary key,
+                 thread_id text not null,
+                 run_id text not null,
+                 session_id text not null,
+                 task_id text not null,
+                 status text not null,
+                 created_at text not null default current_timestamp,
+                 updated_at text not null default current_timestamp
+             );",
+        );
+    }
+    if has_pending_tool_calls {
+        if has_pending_bindings {
+            schema.push_str(&format!(
+                "create table pending_tool_calls(
+                     request_id text primary key,
+                     thread_id text not null,
+                     turn_id text not null,
+                     tool_call_id text not null,
+                     payload text not null{}{}{}
+                 );",
+                if has_execution_state {
+                    if schema_version == 7 {
+                        ", execution_state text not null default 'pending'
+                         check(execution_state in ('pending', 'approved', 'executing', 'outcome_recorded'))"
+                    } else {
+                        ", execution_state text not null default 'pending'"
+                    }
+                } else {
+                    ""
+                },
+                if has_execution_recovery {
+                    if has_execution_state {
+                        " check(execution_state in ('pending', 'executing'))"
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                },
+                if schema_version >= 5 {
+                    ", foreign key(request_id) references approvals(request_id),
+                     foreign key(thread_id) references threads(thread_id),
+                     foreign key(turn_id) references turns(turn_id)"
+                } else {
+                    ""
+                },
+            ));
+        } else {
+            schema.push_str(
+                "create table pending_tool_calls(
+                     request_id text primary key,
+                     turn_id text not null,
+                     payload text not null
+                 );",
+            );
+        }
+    }
+    connection
+        .execute_batch(&schema)
+        .expect("create legacy enum schema");
+    if has_history {
+        connection
+            .execute_batch(
+                "create unique index turns_thread_sequence_unique
+                     on turns(thread_id, turn_sequence);
+                 create unique index items_turn_sequence_unique
+                     on items(turn_id, item_sequence);
+                 create index turns_history_lookup
+                     on turns(thread_id, status, turn_sequence);
+                 create index items_history_lookup
+                     on items(turn_id, status, kind, item_sequence);",
+            )
+            .expect("create legacy history indexes");
+    }
+
+    if has_schema_meta {
+        connection
+            .execute(
+                "insert into schema_meta(schema_version) values(?1)",
+                rusqlite::params![schema_version],
+            )
+            .expect("insert legacy schema version");
+    }
+    if has_migrations {
+        let migrations = [
+            (1, "0001_initial_session_store"),
+            (2, "0002_durable_ledger"),
+            (3, "0003_active_sidecar_runs"),
+            (4, "0004_pending_tool_calls"),
+            (5, "0005_store_hardening"),
+            (6, "0006_conversation_history"),
+            (7, "0007_pending_execution_state"),
+            (8, "0008_approval_execution_recovery"),
+            (9, "0009_thread_policy_snapshot"),
+        ];
+        for (version, migration) in migrations {
+            let is_retired_sidecar_marker = version == 3;
+            if schema_version >= version && (!is_retired_sidecar_marker || has_sidecar) {
+                connection
+                    .execute(
+                        "insert into schema_migrations(migration_id) values(?1)",
+                        rusqlite::params![migration],
+                    )
+                    .expect("insert legacy migration marker");
+            }
+        }
+    }
+
+    let active = serde_json::to_string(&ThreadStatus::Active).expect("thread status");
+    let completed = serde_json::to_string(&TurnStatus::Completed).expect("turn status");
+    let blocked = serde_json::to_string(&TurnStatus::Blocked).expect("turn status");
+    let user_kind = serde_json::to_string(&ItemKind::UserMessage).expect("item kind");
+    let item_status =
+        serde_json::to_string(&singularity_protocol::ItemStatus::Completed).expect("item status");
+    let thread_id = "thread_legacy";
+    let completed_turn_id = "turn_legacy";
+    let pending_turn_id = "turn_pending";
+    if has_policy_snapshot {
+        connection
+            .execute(
+                "insert into threads(
+                     thread_id, model, cwd, status, sandbox_mode, approval_policy
+                 ) values(?1, null, null, ?2, ?3, ?4)",
+                rusqlite::params![
+                    thread_id,
+                    active,
+                    serde_json::to_string(&PermissionProfileName::WorkspaceWrite)
+                        .expect("sandbox mode"),
+                    serde_json::to_string(&ApprovalPolicy::OnRequest).expect("approval policy"),
+                ],
+            )
+            .expect("insert legacy thread");
+    } else {
+        connection
+            .execute(
+                "insert into threads(thread_id, model, cwd, status) values(?1, null, null, ?2)",
+                rusqlite::params![thread_id, active],
+            )
+            .expect("insert legacy thread");
+    }
+    if has_history {
+        for (turn_id, sequence, status) in [
+            (completed_turn_id, 1_i64, completed.as_str()),
+            (pending_turn_id, 2_i64, blocked.as_str()),
+        ] {
+            connection
+                .execute(
+                    "insert into turns(
+                         turn_id, thread_id, turn_sequence, status, agent_loop_status
+                     ) values(?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        turn_id,
+                        thread_id,
+                        sequence,
+                        status,
+                        if status == completed {
+                            "completed"
+                        } else {
+                            "blocked"
+                        },
+                    ],
+                )
+                .expect("insert legacy turn");
+        }
+    } else {
+        for (turn_id, status, agent_loop_status) in [
+            (completed_turn_id, completed.as_str(), "completed"),
+            (pending_turn_id, blocked.as_str(), "blocked"),
+        ] {
+            connection
+                .execute(
+                    "insert into turns(turn_id, thread_id, status, agent_loop_status)
+                     values(?1, ?2, ?3, ?4)",
+                    rusqlite::params![turn_id, thread_id, status, agent_loop_status],
+                )
+                .expect("insert legacy turn");
+        }
+    }
+    let user_payload = serde_json::json!([{"type":"text","text":"legacy input"}]);
+    let user_payload = serde_json::to_string(&user_payload).expect("user payload");
+    let item_rows = [
+        ("item_legacy_completed", completed_turn_id, 1_i64),
+        ("item_legacy_pending", pending_turn_id, 1_i64),
+    ];
+    for (item_id, turn_id, sequence) in item_rows {
+        if has_history {
+            connection
+                .execute(
+                    "insert into items(
+                         item_id, turn_id, item_sequence, kind, payload, status, redacted
+                     ) values(?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                    rusqlite::params![
+                        item_id,
+                        turn_id,
+                        sequence,
+                        user_kind,
+                        user_payload,
+                        item_status
+                    ],
+                )
+                .expect("insert legacy item");
+        } else {
+            connection
+                .execute(
+                    "insert into items(item_id, turn_id, kind, payload, status)
+                     values(?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![item_id, turn_id, user_kind, user_payload, item_status],
+                )
+                .expect("insert legacy item");
+        }
+    }
+
+    let thread_trace = legacy_trace_payload("trace_legacy_thread", thread_id, thread_id, None);
+    let turn_trace = legacy_trace_payload(
+        "trace_legacy_turn_repair",
+        thread_id,
+        thread_id,
+        Some(completed_turn_id),
+    );
+    if has_trace_session_id {
+        connection
+            .execute(
+                "insert into trace_events(event_id, run_id, session_id, payload)
+                 values(?1, ?2, ?3, ?4)",
+                rusqlite::params!["trace_legacy_thread", thread_id, thread_id, thread_trace],
+            )
+            .expect("insert legacy thread trace");
+        connection
+            .execute(
+                "insert into trace_events(event_id, run_id, session_id, payload)
+                 values(?1, ?2, ?3, ?4)",
+                rusqlite::params!["trace_legacy_turn_repair", thread_id, thread_id, turn_trace],
+            )
+            .expect("insert legacy turn trace");
+    } else {
+        for (event_id, payload) in [
+            ("trace_legacy_thread", thread_trace),
+            ("trace_legacy_turn_repair", turn_trace),
+        ] {
+            connection
+                .execute(
+                    "insert into trace_events(event_id, run_id, payload) values(?1, ?2, ?3)",
+                    rusqlite::params![event_id, thread_id, payload],
+                )
+                .expect("insert legacy trace");
+        }
+    }
+
+    let pending_request = if schema_version >= 7 {
+        ApprovalRequest::new("approval_pending", thread_id, pending_turn_id, "edit")
+            .with_tool_call_id("call_pending")
+    } else {
+        ApprovalRequest::new("approval_pending", thread_id, pending_turn_id, "edit")
+    };
+    let pending_payload = legacy_approval_payload(schema_version, &pending_request);
+    connection
+        .execute(
+            "insert into approvals(request_id, payload, decision_outcome, decision_reason)
+             values(?1, ?2, null, null)",
+            rusqlite::params![pending_request.request_id, pending_payload],
+        )
+        .expect("insert pending legacy approval");
+
+    if has_approval_decisions {
+        let final_request =
+            ApprovalRequest::new("approval_final", thread_id, completed_turn_id, "read");
+        let final_decision = ApprovalDecision::new(
+            final_request.request_id.clone(),
+            ApprovalOutcome::Allow,
+            "legacy allow",
+        );
+        let allow = serde_json::to_string(&ApprovalOutcome::Allow).expect("approval outcome");
+        connection
+            .execute(
+                "insert into approvals(
+                     request_id, payload, decision_outcome, decision_reason
+                 ) values(?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    final_request.request_id,
+                    legacy_approval_payload(schema_version, &final_request),
+                    allow,
+                    final_decision.reason,
+                ],
+            )
+            .expect("insert final legacy approval");
+        connection
+            .execute(
+                "insert into approval_decisions(
+                     decision_id, request_id, outcome, reason, payload
+                 ) values(?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    final_decision.decision_id,
+                    final_decision.request_id,
+                    allow,
+                    final_decision.reason,
+                    serde_json::to_string(&final_decision).expect("final decision"),
+                ],
+            )
+            .expect("insert final legacy decision");
+    }
+
+    if schema_version >= 7 {
+        let checkpoint = serde_json::json!({
+            "request_id": pending_request.request_id,
+            "thread_id": thread_id,
+            "turn_id": pending_turn_id,
+            "tool_call_id": "call_pending",
+            "tool_name": "edit",
+            "raw_arguments": "{}",
+            "resources": [],
+            "checkpoint_version": 1,
+            "messages": [],
+            "tool_results": [],
+            "used_approval_grants": [],
+            "approval_count": 1,
+            "model_turns": 1,
+            "completion": {}
+        });
+        let checkpoint = serde_json::to_string(&checkpoint).expect("checkpoint");
+        if has_pending_bindings {
+            if has_execution_state {
+                connection
+                    .execute(
+                        "insert into pending_tool_calls(
+                             request_id, thread_id, turn_id, tool_call_id, payload, execution_state
+                         ) values(?1, ?2, ?3, ?4, ?5, 'pending')",
+                        rusqlite::params![
+                            pending_request.request_id,
+                            thread_id,
+                            pending_turn_id,
+                            "call_pending",
+                            checkpoint,
+                        ],
+                    )
+                    .expect("insert pending checkpoint");
+            } else {
+                connection
+                    .execute(
+                        "insert into pending_tool_calls(
+                             request_id, thread_id, turn_id, tool_call_id, payload
+                         ) values(?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![
+                            pending_request.request_id,
+                            thread_id,
+                            pending_turn_id,
+                            "call_pending",
+                            checkpoint,
+                        ],
+                    )
+                    .expect("insert pending checkpoint");
+            }
+        } else {
+            connection
+                .execute(
+                    "insert into pending_tool_calls(request_id, turn_id, payload)
+                     values(?1, ?2, ?3)",
+                    rusqlite::params![pending_request.request_id, pending_turn_id, checkpoint],
+                )
+                .expect("insert pending checkpoint");
+        }
+    }
+
+    if has_artifacts {
+        connection
+            .execute(
+                "insert into artifact_refs(
+                     artifact_id, run_id, item_id, kind, uri, content_digest,
+                     summary, metadata, redacted
+                 ) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                rusqlite::params![
+                    "artifact_legacy",
+                    thread_id,
+                    "item_legacy_completed",
+                    "text",
+                    "artifact://legacy",
+                    "sha256:legacy",
+                    "legacy artifact",
+                    "{}",
+                ],
+            )
+            .expect("insert legacy artifact");
+    }
+    if has_sidecar {
+        connection
+            .execute(
+                "insert into active_sidecar_runs(
+                     turn_id, thread_id, run_id, session_id, task_id, status
+                 ) values(?1, ?2, ?3, ?4, ?5, 'running')",
+                rusqlite::params![
+                    pending_turn_id,
+                    thread_id,
+                    thread_id,
+                    pending_turn_id,
+                    pending_turn_id,
+                ],
+            )
+            .expect("insert legacy sidecar run");
+    }
+}
+
+fn legacy_approval_payload(schema_version: u32, request: &ApprovalRequest) -> String {
+    let value = match schema_version {
+        1..=3 => serde_json::json!({
+            "request_id": request.request_id,
+            "session_id": request.thread_id,
+            "task_id": request.turn_id,
+            "action": request.action,
+            "reason": request.reason,
+        }),
+        4 => serde_json::json!({
+            "request_id": request.request_id,
+            "session_id": request.thread_id,
+            "task_id": request.turn_id,
+            "action": request.action,
+            "resources": request.resources,
+            "reason": request.reason,
+        }),
+        5 | 6 => serde_json::json!({
+            "request_id": request.request_id,
+            "session_id": request.thread_id,
+            "task_id": request.turn_id,
+            "thread_id": request.thread_id,
+            "turn_id": request.turn_id,
+            "tool_call_id": request.tool_call_id,
+            "action": request.action,
+            "resources": request.resources,
+            "reason": request.reason,
+        }),
+        7..=9 => serde_json::json!({
+            "request_id": request.request_id,
+            "thread_id": request.thread_id,
+            "turn_id": request.turn_id,
+            "tool_call_id": request.tool_call_id,
+            "action": request.action,
+            "resources": request.resources,
+            "reason": request.reason,
+        }),
+        _ => panic!("unsupported legacy schema version {schema_version}"),
+    };
+    serde_json::to_string(&value).expect("serialize legacy approval")
+}
+
+fn legacy_trace_payload(
+    event_id: &str,
+    run_id: &str,
+    session_id: &str,
+    task_id: Option<&str>,
+) -> String {
+    let mut event = TraceEvent::new(event_id, run_id, session_id, "legacy", "legacy trace");
+    event.task_id = task_id.map(str::to_string);
+    serde_json::to_string(&event).expect("serialize legacy trace")
+}
+
+fn sqlite_snapshot(path: &std::path::Path) -> String {
+    let connection = rusqlite::Connection::open(path).expect("open sqlite snapshot");
+    let schema = connection
+        .prepare(
+            "select type, name, coalesce(sql, '')
+             from sqlite_master where name not like 'sqlite_%'
+             order by type, name",
+        )
+        .expect("prepare sqlite schema snapshot")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("query sqlite schema snapshot")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect sqlite schema snapshot");
+    let mut snapshot = String::new();
+    for (kind, name, sql) in &schema {
+        snapshot.push_str(&format!("{kind}:{name}:{sql}\n"));
+    }
+    for (kind, name, _) in schema {
+        if kind != "table" {
+            continue;
+        }
+        let query = format!(
+            "select * from \"{}\" order by rowid",
+            name.replace('"', "\"\"")
+        );
+        let mut statement = connection
+            .prepare(&query)
+            .expect("prepare sqlite row snapshot");
+        let column_count = statement.column_count();
+        let mut rows = statement.query([]).expect("query sqlite row snapshot");
+        while let Some(row) = rows.next().expect("read sqlite row snapshot") {
+            snapshot.push_str(&format!("row:{name}:"));
+            for column in 0..column_count {
+                snapshot.push_str(&format!(
+                    "{:?};",
+                    row.get_ref(column).expect("snapshot value")
+                ));
+            }
+            snapshot.push('\n');
+        }
+    }
+    snapshot
+}
+
+fn has_v10_temporary_tables(path: &std::path::Path) -> bool {
+    let connection = rusqlite::Connection::open(path).expect("open sqlite temp-table check");
+    connection
+        .query_row(
+            "select exists(
+                 select 1 from sqlite_master
+                 where type = 'table' and name like '%_v10'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite temp-table check")
 }
 
 type HistorySequences = (Vec<(String, u64)>, Vec<(String, u64, bool)>);

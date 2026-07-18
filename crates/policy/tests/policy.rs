@@ -39,6 +39,22 @@ fn permission_profile_and_approval_objects_keep_wire_names() {
 }
 
 #[test]
+fn storage_enum_text_is_stable_and_rejects_unknown_values() {
+    assert_eq!(
+        PermissionProfileName::WorkspaceWrite.as_storage_text(),
+        "workspace-write"
+    );
+    assert_eq!(ApprovalPolicy::OnRequest.as_storage_text(), "on-request");
+    assert_eq!(ApprovalOutcome::Allow.as_storage_text(), "allow");
+    assert_eq!(
+        PermissionProfileName::from_storage_text("read-only"),
+        Some(PermissionProfileName::ReadOnly)
+    );
+    assert_eq!(ApprovalPolicy::from_storage_text("unknown"), None);
+    assert_eq!(ApprovalOutcome::from_storage_text("deferred"), None);
+}
+
+#[test]
 fn resource_prefix_rules_match_only_the_named_path_tree() {
     let rule = PermissionRule::new(
         "allow_src_tree",

@@ -19,6 +19,25 @@ pub enum PermissionProfileName {
     WorkspaceWrite,
 }
 
+impl PermissionProfileName {
+    /// 返回 SQLite 使用的稳定文本值。
+    pub const fn as_storage_text(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+        }
+    }
+
+    /// 从 SQLite 的稳定文本值恢复权限档位；未知值返回 `None`。
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "read-only" => Some(Self::ReadOnly),
+            "workspace-write" => Some(Self::WorkspaceWrite),
+            _ => None,
+        }
+    }
+}
+
 /// 当前会话是否允许网络访问。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -33,6 +52,25 @@ pub enum NetworkAccess {
 pub enum ApprovalPolicy {
     OnRequest,
     Never,
+}
+
+impl ApprovalPolicy {
+    /// 返回 SQLite 使用的稳定文本值。
+    pub const fn as_storage_text(&self) -> &'static str {
+        match self {
+            Self::OnRequest => "on-request",
+            Self::Never => "never",
+        }
+    }
+
+    /// 从 SQLite 的稳定文本值恢复 approval 策略；未知值返回 `None`。
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "on-request" => Some(Self::OnRequest),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
 }
 
 /// 配置规则的来源层级。
@@ -402,6 +440,27 @@ pub enum ApprovalOutcome {
     Allow,
     Deny,
     Defer,
+}
+
+impl ApprovalOutcome {
+    /// 返回 SQLite 使用的稳定文本值。
+    pub const fn as_storage_text(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::Defer => "defer",
+        }
+    }
+
+    /// 从 SQLite 的稳定文本值恢复 approval 结果；未知值返回 `None`。
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            "defer" => Some(Self::Defer),
+            _ => None,
+        }
+    }
 }
 
 /// 绑定 thread、turn 和资源的 approval 请求。
