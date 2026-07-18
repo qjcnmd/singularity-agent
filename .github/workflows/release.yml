@@ -117,17 +117,300 @@ jobs:
       - name: Build release binaries
         run: cargo build --workspace --bins --release --locked
 
+      - name: Sign release binaries
+        id: sign
+        env:
+          WINDOWS_CODESIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGNING_PFX_BASE64 }}
+          WINDOWS_CODESIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGNING_PFX_PASSWORD }}
+          WINDOWS_CODESIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGNING_TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $isFormalRelease = "${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag"
+          $binaryNames = @(
+            "sg"
+            "singularity_app_server"
+            "singularity-command-runner"
+            "singularity-windows-sandbox-setup"
+          )
+          $binaryPaths = @($binaryNames | ForEach-Object {
+            Join-Path $PWD ("target/release/{0}.exe" -f $_)
+          })
+          $pfxBase64 = $env:WINDOWS_CODESIGNING_PFX_BASE64
+          $pfxPassword = $env:WINDOWS_CODESIGNING_PFX_PASSWORD
+          $timestampUrl = $env:WINDOWS_CODESIGNING_TIMESTAMP_URL
+          $configuredValues = @($pfxBase64, $pfxPassword, $timestampUrl)
+          $configuredCount = @($configuredValues | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+
+          if (-not $isFormalRelease -and $configuredCount -eq 0) {
+            Write-Host "::warning::No Windows code-signing configuration was provided; this workflow_dispatch artifact is unsigned and is not a release-signed build."
+            "status=unsigned-dev" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+            exit 0
+          }
+          if ($configuredCount -ne 3) {
+            throw "Windows code-signing configuration must provide the PFX, PFX password, and RFC3161 timestamp URL."
+          }
+
+          [Uri]$timestampUri = $null
+          if (-not [Uri]::TryCreate($timestampUrl.Trim(), [UriKind]::Absolute, [ref]$timestampUri)) {
+            throw "Windows code-signing timestamp URL must be an absolute HTTP(S) RFC3161 endpoint."
+          }
+          if (@("http", "https") -notcontains $timestampUri.Scheme.ToLowerInvariant()) {
+            throw "Windows code-signing timestamp URL must be an absolute HTTP(S) RFC3161 endpoint."
+          }
+
+          foreach ($binaryPath in $binaryPaths) {
+            if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+              throw "missing release binary: $binaryPath"
+            }
+          }
+
+          $signtoolPath = $null
+          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+          if (Test-Path -LiteralPath $sdkRoot -PathType Container) {
+            $signtoolCandidate = Get-ChildItem -LiteralPath $sdkRoot -Filter "signtool.exe" -File -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if ($null -ne $signtoolCandidate) {
+              $signtoolPath = $signtoolCandidate.FullName
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($signtoolPath)) {
+            $signtoolCommand = Get-Command signtool.exe -CommandType Application -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($null -ne $signtoolCommand) {
+              $signtoolPath = $signtoolCommand.Source
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($signtoolPath)) {
+            throw "signtool.exe was not found on the Windows runner."
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP ("singularity-codesign-{0}.pfx" -f [Guid]::NewGuid().ToString("N"))
+          $toolLogPath = Join-Path $env:RUNNER_TEMP ("singularity-codesign-{0}.log" -f [Guid]::NewGuid().ToString("N"))
+          $store = $null
+          $securePassword = $null
+          $certificates = $null
+          $importedThumbprints = @()
+          $cleanupFailed = $false
+
+          try {
+            try {
+              $pfxBytes = [Convert]::FromBase64String($pfxBase64)
+            } catch {
+              throw "Windows code-signing PFX is not valid base64."
+            }
+            if ($pfxBytes.Length -eq 0) {
+              throw "Windows code-signing PFX is empty."
+            }
+            [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+
+            $certificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+            $certificates.Import(
+              $pfxPath,
+              $pfxPassword,
+              [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+            )
+            $leafCandidates = @($certificates | Where-Object { $_.HasPrivateKey })
+            if ($leafCandidates.Count -ne 1) {
+              throw "Windows code-signing PFX must contain exactly one private-key leaf certificate."
+            }
+            $leaf = $leafCandidates[0]
+            $now = [DateTime]::UtcNow
+            if ($leaf.NotBefore.ToUniversalTime() -gt $now -or $leaf.NotAfter.ToUniversalTime() -le $now) {
+              throw "Windows code-signing leaf certificate is not currently valid."
+            }
+            $hasCodeSigningEku = $false
+            foreach ($extension in $leaf.Extensions) {
+              if ($extension.Oid.Value -ne "2.5.29.37") {
+                continue
+              }
+              $ekuExtension = [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]$extension
+              if (@($ekuExtension.EnhancedKeyUsages | Where-Object { $_.Value -eq "1.3.6.1.5.5.7.3.3" }).Count -gt 0) {
+                $hasCodeSigningEku = $true
+              }
+            }
+            if (-not $hasCodeSigningEku) {
+              throw "Windows code-signing leaf certificate lacks the Code Signing EKU."
+            }
+            $thumbprint = ($leaf.Thumbprint -replace '\s', '').ToUpperInvariant()
+            if ($thumbprint -notmatch '^[0-9A-F]{40}$') {
+              throw "Windows code-signing leaf certificate has an invalid thumbprint."
+            }
+
+            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+              [System.Security.Cryptography.X509Certificates.StoreName]::My,
+              [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+            )
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+            $preexistingThumbprints = @(
+              $store.Certificates |
+                ForEach-Object { $_.Thumbprint } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Sort-Object -Unique
+            )
+            $preexistingLeaf = @($store.Certificates | Where-Object { $_.Thumbprint -eq $thumbprint })
+            $store.Close()
+
+            if ($preexistingLeaf.Count -gt 1) {
+              throw "Windows code-signing certificate selection is ambiguous."
+            }
+            if ($preexistingLeaf.Count -eq 1) {
+              if (-not $preexistingLeaf[0].HasPrivateKey) {
+                throw "The existing Windows code-signing certificate has no private key."
+              }
+            } else {
+              $importedThumbprints = @(
+                $certificates |
+                  ForEach-Object { $_.Thumbprint } |
+                  Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_) -and $preexistingThumbprints -notcontains $_
+                  } |
+                  Sort-Object -Unique
+              )
+              $securePassword = ConvertTo-SecureString -String $pfxPassword -AsPlainText -Force
+              Import-PfxCertificate `
+                -FilePath $pfxPath `
+                -CertStoreLocation "Cert:\CurrentUser\My" `
+                -Password $securePassword | Out-Null
+            }
+
+            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
+            $storedLeaf = @($store.Certificates | Where-Object { $_.Thumbprint -eq $thumbprint })
+            $store.Close()
+            if ($storedLeaf.Count -ne 1 -or -not $storedLeaf[0].HasPrivateKey) {
+              throw "Windows code-signing leaf certificate was not available with a private key."
+            }
+
+            foreach ($binaryPath in $binaryPaths) {
+              $signArguments = @(
+                "sign"
+                "/fd"
+                "SHA256"
+                "/td"
+                "SHA256"
+                "/tr"
+                $timestampUrl.Trim()
+                "/s"
+                "My"
+                "/sha1"
+                $thumbprint
+                $binaryPath
+              )
+              & $signtoolPath @signArguments *> $toolLogPath
+              if ($LASTEXITCODE -ne 0) {
+                throw "Authenticode signing failed."
+              }
+            }
+
+            foreach ($binaryPath in $binaryPaths) {
+              $verifyArguments = @(
+                "verify"
+                "/pa"
+                "/all"
+                "/tw"
+                $binaryPath
+              )
+              & $signtoolPath @verifyArguments *> $toolLogPath
+              if ($LASTEXITCODE -ne 0) {
+                throw "Authenticode policy verification failed."
+              }
+            }
+            "status=signed" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+          } finally {
+            try {
+              if ($null -ne $store) {
+                $store.Close()
+              }
+            } catch {
+              $cleanupFailed = $true
+            }
+
+            if (@($importedThumbprints).Count -gt 0) {
+              $cleanupStore = $null
+              try {
+                $cleanupStore = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+                  [System.Security.Cryptography.X509Certificates.StoreName]::My,
+                  [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+                )
+                $cleanupStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+                foreach ($importedThumbprint in $importedThumbprints) {
+                  $certificatesToRemove = @(
+                    $cleanupStore.Certificates | Where-Object { $_.Thumbprint -eq $importedThumbprint }
+                  )
+                  foreach ($certificateToRemove in $certificatesToRemove) {
+                    $cleanupStore.Remove($certificateToRemove)
+                  }
+                }
+              } catch {
+                $cleanupFailed = $true
+              } finally {
+                try {
+                  if ($null -ne $cleanupStore) {
+                    $cleanupStore.Close()
+                  }
+                } catch {
+                  $cleanupFailed = $true
+                }
+              }
+            }
+
+            try {
+              if ($null -ne $pfxPath -and (Test-Path -LiteralPath $pfxPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $pfxPath -Force
+              }
+            } catch {
+              $cleanupFailed = $true
+            }
+            try {
+              if ($null -ne $toolLogPath -and (Test-Path -LiteralPath $toolLogPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $toolLogPath -Force
+              }
+            } catch {
+              $cleanupFailed = $true
+            }
+            if ($null -ne $securePassword) {
+              $securePassword.Dispose()
+            }
+            if ($null -ne $certificates) {
+              foreach ($certificate in $certificates) {
+                $certificate.Dispose()
+              }
+            }
+            $pfxBase64 = $null
+            $pfxPassword = $null
+            $pfxBytes = $null
+            foreach ($variableName in @(
+              "WINDOWS_CODESIGNING_PFX_BASE64"
+              "WINDOWS_CODESIGNING_PFX_PASSWORD"
+              "WINDOWS_CODESIGNING_TIMESTAMP_URL"
+            )) {
+              Remove-Item -LiteralPath "Env:$variableName" -ErrorAction SilentlyContinue
+            }
+            if ($cleanupFailed) {
+              throw "Windows code-signing cleanup failed."
+            }
+          }
+
       - name: Assemble archive
         id: package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $version = if ("${{ github.ref_type }}" -eq "tag") {
+          $isFormalRelease = "${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag"
+          $signingStatus = "${{ steps.sign.outputs.status }}"
+          if ($signingStatus -notin @("signed", "unsigned-dev")) {
+            throw "release signing status was not produced"
+          }
+          $version = if ($isFormalRelease) {
             "${{ github.ref_name }}"
           } else {
             "dev-${{ github.run_number }}"
           }
           $name = "singularity-$version-windows-x86_64"
+          if ($signingStatus -eq "unsigned-dev") {
+            $name = "$name-unsigned"
+          }
           $directory = Join-Path $PWD "dist/$name"
           New-Item -ItemType Directory -Force -Path $directory | Out-Null
 
@@ -283,7 +566,7 @@ jobs:
             ${{ steps.package.outputs.sbom_windows_sandbox_setup }}
 
   publish:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [verify, windows-x86_64]
     runs-on: ubuntu-latest
     permissions:

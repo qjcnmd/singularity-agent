@@ -31,6 +31,20 @@ Singularity 当前发布目标是 Windows x86-64。可执行文件之间使用�
 
 release archive 不执行安装脚本，也不修改系统级 `PATH`。
 
+## Release Authenticode 签名
+
+Windows tagged release 的签名接口已经接入 `.github/workflows/release.yml`：四个发布 `.exe` 会先使用 Authenticode 和 SHA-256 文件摘要签名，再生成 archive、`SHA256SUMS.txt`、SBOM 和 provenance attestation。这里的“接口已接入”不代表当前本地 checkout 已经持有真实证书或能够证明真实签名。
+
+工作流使用以下 GitHub 配置，名称必须完全一致：
+
+- encrypted secret `WINDOWS_CODESIGNING_PFX_BASE64`：代码签名证书及私钥的 base64 PFX 内容。
+- encrypted secret `WINDOWS_CODESIGNING_PFX_PASSWORD`：上述 PFX 的密码。
+- repository variable `WINDOWS_CODESIGNING_TIMESTAMP_URL`：RFC3161 timestamp URL。
+
+PFX 只在 Windows runner 的临时 CurrentUser certificate store 中使用。工作流会检查 leaf certificate 的私钥、当前有效期和 Code Signing EKU，按精确 thumbprint 选择证书，并在成功或失败后删除临时 PFX、临时工具日志和本次导入的证书；密码、PFX 内容和 thumbprint 不写入仓库、artifact 或日志。
+
+只有 `push` 的 `v*` tag 是正式发布边界。该边界缺少任一配置、`signtool.exe`、有效证书、签名、RFC3161 timestamp 或 Authenticode policy 验证失败时会 fail closed，不会退回 unsigned release，也不会发布资产。`workflow_dispatch` 始终生成 `dev-<run>` artifact：没有任何签名配置时会明确 warning，并在 artifact 名称中标记 `unsigned`；配置完整时可以签名，但仍不是 tagged release。仓库没有真实证书和私钥时，只能确认上述安全接口已接入，不能据此宣称本地或当前任务已完成真实签名。
+
 ## 配置 provider
 
 复制仓库中的 `.env.example` 为目标项目或其父目录下的 `.env`，填写：
