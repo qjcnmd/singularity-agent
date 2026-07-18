@@ -18,10 +18,12 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Barrier, Mutex,
+    atomic::{AtomicUsize, Ordering},
     mpsc::{self, Receiver},
 };
 use std::thread;
 use std::time::Duration;
+use tempfile::tempdir;
 
 static CURRENT_DIR_LOCK: Mutex<()> = Mutex::new(());
 
@@ -663,6 +665,149 @@ fn direct_only_probe_server() -> (String, Receiver<Vec<String>>) {
             write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
         }
         tx.send(requests).expect("send direct capability requests");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn persistent_probe_server(expected_requests: usize) -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind persistent capability provider");
+    let addr = listener
+        .local_addr()
+        .expect("persistent capability provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..expected_requests {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept persistent capability request");
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone persistent capability stream"),
+            );
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            let response = capability_probe_response(&request_body)
+                .expect("persistent capability probe request");
+            requests.push(request_body);
+            write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
+        }
+        tx.send(requests)
+            .expect("send persistent capability requests");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn parallel_persistent_probe_server(
+    expected_requests: usize,
+) -> (String, Receiver<(usize, Vec<String>)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind parallel capability provider");
+    let addr = listener
+        .local_addr()
+        .expect("parallel capability provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut workers = Vec::new();
+        for _ in 0..expected_requests {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept parallel capability request");
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let requests = Arc::clone(&requests);
+            workers.push(thread::spawn(move || {
+                let mut reader = BufReader::new(
+                    stream
+                        .try_clone()
+                        .expect("clone parallel capability stream"),
+                );
+                let (first_line, headers, request_body) = read_provider_request(&mut reader);
+                assert!(first_line.contains("/v1/chat/completions"));
+                assert!(headers.contains("authorization: Bearer sk-secret-value"));
+                requests
+                    .lock()
+                    .expect("parallel request list")
+                    .push(request_body.clone());
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(100));
+                let response = capability_probe_response(&request_body)
+                    .expect("parallel capability probe request");
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("join parallel capability request");
+        }
+        let requests = Arc::try_unwrap(requests)
+            .expect("parallel request list ownership")
+            .into_inner()
+            .expect("parallel request list mutex");
+        tx.send((maximum.load(Ordering::SeqCst), requests))
+            .expect("send parallel capability requests");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn cached_capability_rejection_server() -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind invalidation provider");
+    let addr = listener
+        .local_addr()
+        .expect("invalidation provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..5 {
+            let (mut stream, _) = listener.accept().expect("accept invalidation request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone invalidation stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if let Some(response) = capability_probe_response(&request_body) {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
+            } else {
+                write_provider_response(
+                    &mut stream,
+                    "HTTP/1.1 200 OK",
+                    ACTUAL_TOOL_REASONING_RESPONSE,
+                    true,
+                );
+            }
+            requests.push(request_body);
+        }
+        tx.send(requests).expect("send invalidation requests");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn ordinary_http_400_server() -> (String, Receiver<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ordinary 400 provider");
+    let addr = listener
+        .local_addr()
+        .expect("ordinary 400 provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept ordinary 400 request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone ordinary 400 stream"));
+            let (first_line, headers, request_body) = read_provider_request(&mut reader);
+            assert!(first_line.contains("/v1/chat/completions"));
+            assert!(headers.contains("authorization: Bearer sk-secret-value"));
+            if let Some(response) = capability_probe_response(&request_body) {
+                write_provider_response(&mut stream, "HTTP/1.1 200 OK", &response, true);
+            } else {
+                write_provider_response(&mut stream, "HTTP/1.1 400 Bad Request", "{}", true);
+            }
+            requests.push(request_body);
+        }
+        tx.send(requests).expect("send ordinary 400 requests");
     });
     (format!("http://{addr}"), rx)
 }
@@ -2135,11 +2280,8 @@ fn openai_capability_negotiation_rejects_unstable_reasoning_tool_mode() {
     )
     .expect_err("unsupported reasoning control must fail closed");
 
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_tool_reasoning_mode_unsupported")
-    );
+    assert_eq!(error.error.kind, ModelErrorKind::UnknownProviderError);
+    assert_eq!(error.error.code.as_deref(), Some("provider_http_status"));
     assert_eq!(error.error.stage, Some(ProviderErrorStage::ResponseStatus));
     assert_eq!(error.error.http_status, Some(400));
     assert!(
@@ -2286,11 +2428,8 @@ fn openai_capability_probe_fails_closed_when_direct_tools_are_unsupported() {
     )
     .expect_err("unsupported direct tools must not become a negotiated capability");
 
-    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
-    assert_eq!(
-        error.error.code.as_deref(),
-        Some("provider_native_structured_tool_calls_unsupported")
-    );
+    assert_eq!(error.error.kind, ModelErrorKind::UnknownProviderError);
+    assert_eq!(error.error.code.as_deref(), Some("provider_http_status"));
     let captured = requests
         .recv_timeout(Duration::from_secs(1))
         .expect("captured direct capability requests");
@@ -2792,6 +2931,560 @@ fn openai_capability_cache_is_partitioned_by_effective_model_and_shared_by_clone
         })
         .collect::<Vec<_>>();
     assert_eq!(models, vec!["gpt-test", "model-b", "model-b"]);
+}
+
+#[test]
+fn openai_persistent_capability_cache_survives_provider_recreation_without_secrets() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("provider-capability-cache.json");
+    let (base_url, requests) = persistent_probe_server(2);
+    let config = provider_test_config(base_url.clone());
+
+    let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
+        .expect("first provider");
+    let first_negotiation = Provider::negotiate_tool_capabilities(
+        &first,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("first capability probe");
+    assert!(!first_negotiation.metadata.cache_hit);
+    drop(first);
+
+    let mut changed_key_config = config;
+    changed_key_config.api_key = "different-test-key".to_string();
+    let second = OpenAiProvider::new_with_cache_path(changed_key_config, Some(cache_path.clone()))
+        .expect("recreated provider");
+    let cached = Provider::negotiate_tool_capabilities(
+        &second,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("persistent capability cache hit");
+    assert!(cached.metadata.cache_hit);
+    assert_eq!(cached.contract, first_negotiation.contract);
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        2
+    );
+
+    let cache_text = std::fs::read_to_string(cache_path).expect("cache file");
+    for forbidden in [
+        "sk-secret-value",
+        "api_key",
+        base_url.as_str(),
+        "singularity_capability_probe",
+        "schema_sentinel",
+        "http://",
+    ] {
+        assert!(!cache_text.contains(forbidden), "cache leaked {forbidden}");
+    }
+}
+
+#[test]
+fn openai_persistent_capability_cache_replaces_existing_file_for_distinct_key() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("provider-capability-cache.json");
+    let (base_url, requests) = persistent_probe_server(4);
+    let first_config = provider_test_config(base_url);
+    let first = OpenAiProvider::new_with_cache_path(first_config.clone(), Some(cache_path.clone()))
+        .expect("first provider");
+    Provider::negotiate_tool_capabilities(
+        &first,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("first capability probe");
+    drop(first);
+
+    let mut second_config = first_config;
+    second_config.max_output_tokens -= 1;
+    let second = OpenAiProvider::new_with_cache_path(second_config, Some(cache_path.clone()))
+        .expect("second provider");
+    Provider::negotiate_tool_capabilities(
+        &second,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("second capability probe");
+
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        4
+    );
+    let cache: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cache_path).expect("read cache"))
+            .expect("cache remains JSON");
+    assert_eq!(cache["records"].as_array().map(Vec::len), Some(2));
+    assert_ne!(
+        cache["records"][0]["key"]["max_output_tokens"],
+        cache["records"][1]["key"]["max_output_tokens"]
+    );
+}
+
+#[test]
+fn openai_persistent_capability_cache_misses_expired_unknown_and_invalid_records() {
+    for mutation in [
+        "expired",
+        "future",
+        "corrupt",
+        "unknown",
+        "invalid_contract",
+        "overclaimed_contract",
+        "model",
+        "endpoint",
+        "protocol",
+        "limits",
+        "adapter",
+        "probe_contract",
+    ] {
+        let directory = tempdir().expect("persistent cache directory");
+        let cache_path = directory.path().join("provider-capability-cache.json");
+        let (base_url, requests) = persistent_probe_server(4);
+        let config = provider_test_config(base_url);
+        let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
+            .expect("first provider");
+        Provider::negotiate_tool_capabilities(
+            &first,
+            &ModelPreferences::default(),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("populate persistent cache");
+        drop(first);
+
+        if mutation == "corrupt" {
+            std::fs::write(&cache_path, b"{not-json").expect("corrupt cache");
+        } else {
+            let mut cache: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&cache_path).expect("read persistent cache"),
+            )
+            .expect("valid cache JSON");
+            match mutation {
+                "expired" => cache["records"][0]["expires_at_unix_seconds"] = serde_json::json!(0),
+                "future" => {
+                    cache["records"][0]["stored_at_unix_seconds"] = serde_json::json!(u64::MAX)
+                }
+                "unknown" => cache["records"][0]["unexpected"] = serde_json::json!(true),
+                "invalid_contract" => {
+                    cache["records"][0]["contract"]["max_tools_per_request"] = serde_json::json!(0)
+                }
+                "overclaimed_contract" => {
+                    cache["records"][0]["contract"]["supports_json_mode"] = serde_json::json!(true)
+                }
+                "model" => cache["records"][0]["key"]["model_name"] = serde_json::json!("other"),
+                "endpoint" => {
+                    cache["records"][0]["key"]["endpoint_sha256"] =
+                        serde_json::json!("00".repeat(32))
+                }
+                "protocol" => {
+                    cache["records"][0]["key"]["api_protocol"] =
+                        serde_json::json!("open_ai_responses")
+                }
+                "limits" => cache["records"][0]["key"]["max_output_tokens"] = serde_json::json!(1),
+                "adapter" => cache["records"][0]["key"]["adapter_version"] = serde_json::json!(2),
+                "probe_contract" => {
+                    cache["records"][0]["key"]["probe_contract_version"] = serde_json::json!(2)
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                &cache_path,
+                serde_json::to_vec(&cache).expect("serialize mutated cache"),
+            )
+            .expect("write mutated cache");
+        }
+
+        let second =
+            OpenAiProvider::new_with_cache_path(config, Some(cache_path)).expect("second provider");
+        let negotiation = Provider::negotiate_tool_capabilities(
+            &second,
+            &ModelPreferences::default(),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect("cache miss reprobe");
+        assert!(!negotiation.metadata.cache_hit, "{mutation} must miss");
+        assert_eq!(
+            requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+            4
+        );
+    }
+}
+
+#[test]
+fn openai_persistent_capability_cache_concurrent_writes_retain_a_valid_record() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("provider-capability-cache.json");
+    let (base_url, requests) = persistent_probe_server(2);
+    let config = provider_test_config(base_url);
+    let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
+        .expect("first provider");
+    let second = OpenAiProvider::new_with_cache_path(config, Some(cache_path.clone()))
+        .expect("second provider");
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = [first, second]
+        .into_iter()
+        .map(|provider| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                Provider::negotiate_tool_capabilities(
+                    &provider,
+                    &ModelPreferences::default(),
+                    &singularity_core::CancellationToken::new(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.join().expect("join concurrent cache writer"));
+    }
+    for result in results {
+        result.expect("concurrent capability probe");
+    }
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        2
+    );
+    let cache: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cache_path).expect("read concurrent cache"))
+            .expect("concurrent cache remains JSON");
+    assert_eq!(cache["records"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn openai_persistent_capability_cache_different_keys_probe_in_parallel() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("provider-capability-cache.json");
+    let (base_url, requests) = parallel_persistent_probe_server(4);
+    let first = OpenAiProvider::new_with_cache_path(
+        provider_test_config(base_url.clone()),
+        Some(cache_path.clone()),
+    )
+    .expect("first provider");
+    let mut second_config = provider_test_config(base_url);
+    second_config.max_output_tokens -= 1;
+    let second = OpenAiProvider::new_with_cache_path(second_config, Some(cache_path))
+        .expect("second provider");
+    let barrier = Arc::new(Barrier::new(3));
+    let first_barrier = Arc::clone(&barrier);
+    let first_thread = thread::spawn(move || {
+        first_barrier.wait();
+        Provider::negotiate_tool_capabilities(
+            &first,
+            &ModelPreferences::default(),
+            &singularity_core::CancellationToken::new(),
+        )
+    });
+    let second_barrier = Arc::clone(&barrier);
+    let second_thread = thread::spawn(move || {
+        second_barrier.wait();
+        Provider::negotiate_tool_capabilities(
+            &second,
+            &ModelPreferences::default(),
+            &singularity_core::CancellationToken::new(),
+        )
+    });
+    barrier.wait();
+    first_thread
+        .join()
+        .expect("join first parallel provider")
+        .expect("first parallel capability probe");
+    second_thread
+        .join()
+        .expect("join second parallel provider")
+        .expect("second parallel capability probe");
+    let (maximum, requests) = requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("parallel capability requests");
+    assert!(maximum >= 2, "different keys must not share a network lock");
+    assert_eq!(requests.len(), 4);
+}
+
+#[test]
+fn openai_persistent_capability_cache_write_failure_does_not_fail_probe() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("cache-directory");
+    std::fs::create_dir(&cache_path).expect("cache failure directory");
+    let (base_url, requests) = persistent_probe_server(2);
+    let provider =
+        OpenAiProvider::new_with_cache_path(provider_test_config(base_url), Some(cache_path))
+            .expect("provider");
+    Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("cache write failure must not fail probe");
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn openai_failed_capability_probe_does_not_create_persistent_record() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("provider-capability-cache.json");
+    let (base_url, requests) = direct_only_probe_server();
+    let provider = OpenAiProvider::new_with_cache_path(
+        provider_test_config(base_url),
+        Some(cache_path.clone()),
+    )
+    .expect("provider");
+    Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect_err("failed probe");
+    assert!(!cache_path.is_file());
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        4
+    );
+}
+
+#[test]
+fn openai_cancelled_capability_probe_does_not_publish_cache() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("provider-capability-cache.json");
+    let (base_url, requests, started) = delayed_probe_server(
+        vec![("HTTP/1.1 400 Bad Request", "{}")],
+        Duration::from_millis(250),
+    );
+    let provider = Arc::new(
+        OpenAiProvider::new_with_cache_path(
+            provider_test_config(base_url),
+            Some(cache_path.clone()),
+        )
+        .expect("provider"),
+    );
+    let cancellation = singularity_core::CancellationToken::new();
+    let worker_provider = Arc::clone(&provider);
+    let worker_cancellation = cancellation.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        result_tx
+            .send(Provider::negotiate_tool_capabilities(
+                worker_provider.as_ref(),
+                &ModelPreferences::default(),
+                &worker_cancellation,
+            ))
+            .expect("send cancelled probe result");
+    });
+    started
+        .recv_timeout(Duration::from_secs(1))
+        .expect("probe started");
+    cancellation.cancel();
+    let error = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cancelled probe result")
+        .expect_err("cancelled probe must fail");
+    assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+    assert!(
+        !cache_path.exists(),
+        "cancelled probe must not publish a record"
+    );
+    worker.join().expect("join cancelled probe");
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn openai_cached_capability_rejection_invalidates_persistent_record() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("provider-capability-cache.json");
+    let (base_url, requests) = cached_capability_rejection_server();
+    let config = provider_test_config(base_url);
+    let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
+        .expect("first provider");
+    Provider::negotiate_tool_capabilities(
+        &first,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("populate cache");
+    let error = first
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("stable capability rejection");
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_history_unsupported")
+    );
+    assert!(
+        error
+            .error
+            .validation_errors
+            .contains(&"tool_reasoning_content_requires_adapter_history_support".to_string())
+    );
+    let invalidated: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&cache_path).expect("read invalidated cache"),
+    )
+    .expect("invalidated cache remains JSON");
+    assert_eq!(invalidated["records"].as_array().map(Vec::len), Some(0));
+    drop(first);
+
+    let second =
+        OpenAiProvider::new_with_cache_path(config, Some(cache_path)).expect("recreated provider");
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &second,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("reprobe after invalidation");
+    assert!(!negotiation.metadata.cache_hit);
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        5
+    );
+}
+
+#[test]
+fn openai_ordinary_http_400_does_not_invalidate_persistent_record() {
+    let directory = tempdir().expect("persistent cache directory");
+    let cache_path = directory.path().join("provider-capability-cache.json");
+    let (base_url, requests) = ordinary_http_400_server();
+    let config = provider_test_config(base_url);
+    let first = OpenAiProvider::new_with_cache_path(config.clone(), Some(cache_path.clone()))
+        .expect("first provider");
+    Provider::negotiate_tool_capabilities(
+        &first,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("populate cache");
+    let error = first
+        .complete(
+            &capability_test_request(None, false, 1),
+            &singularity_core::CancellationToken::new(),
+        )
+        .expect_err("ordinary HTTP 400");
+    assert_eq!(error.error.http_status, Some(400));
+    assert_ne!(
+        error.error.code.as_deref(),
+        Some("provider_tool_reasoning_history_unsupported")
+    );
+    drop(first);
+
+    let second =
+        OpenAiProvider::new_with_cache_path(config, Some(cache_path)).expect("second provider");
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &second,
+        &ModelPreferences::default(),
+        &singularity_core::CancellationToken::new(),
+    )
+    .expect("ordinary HTTP 400 must preserve the cache");
+    assert!(negotiation.metadata.cache_hit);
+    assert_eq!(
+        requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
+        3
+    );
+}
+
+#[test]
+fn provider_runtime_fingerprint_is_stable_partitioned_and_secret_free() {
+    let config = provider_config_with_base_url("https://provider.example/v1".to_string());
+    let first = OpenAiProvider::new(config.clone()).expect("first provider");
+    let second = OpenAiProvider::new(config.clone()).expect("second provider");
+    let first_fingerprint = first.runtime_fingerprint(Some("gpt-test"));
+    let second_fingerprint = second.runtime_fingerprint(Some("gpt-test"));
+    assert_eq!(first_fingerprint, second_fingerprint);
+    assert!(first_fingerprint.negotiation_fingerprint.is_none());
+
+    let mut changed_key_config = config;
+    changed_key_config.api_key = "different-test-key".to_string();
+    let changed_key_provider =
+        OpenAiProvider::new(changed_key_config).expect("changed key provider");
+    assert_eq!(
+        first_fingerprint,
+        changed_key_provider.runtime_fingerprint(Some("gpt-test"))
+    );
+
+    let model_fingerprint = first.runtime_fingerprint(Some("other-model"));
+    assert_eq!(
+        first_fingerprint.provider_fingerprint,
+        model_fingerprint.provider_fingerprint
+    );
+    assert_ne!(
+        first_fingerprint.model_fingerprint,
+        model_fingerprint.model_fingerprint
+    );
+    let endpoint_provider = OpenAiProvider::new(provider_config_with_base_url(
+        "https://provider.example/other".to_string(),
+    ))
+    .expect("endpoint provider");
+    assert_ne!(
+        first_fingerprint.provider_fingerprint,
+        endpoint_provider
+            .runtime_fingerprint(Some("gpt-test"))
+            .provider_fingerprint
+    );
+    let mut limited_config =
+        provider_config_with_base_url("https://provider.example/v1".to_string());
+    limited_config.max_context_tokens += 1;
+    let limited_provider = OpenAiProvider::new(limited_config).expect("limited provider");
+    assert_ne!(
+        first_fingerprint.provider_fingerprint,
+        limited_provider
+            .runtime_fingerprint(Some("gpt-test"))
+            .provider_fingerprint
+    );
+
+    let negotiation = singularity_model::ProviderProtocolNegotiation {
+        contract: ProviderProtocolContract {
+            supports_strict_tool_schema: true,
+            ..ProviderProtocolContract::default()
+        },
+        metadata: singularity_model::ProviderCapabilityMetadata {
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            profile: ProviderCapabilityProfile::StrictSingle,
+            cache_hit: false,
+            profile_attempts: 1,
+            fallback_count: 0,
+            probe_usage: ModelUsage::default(),
+            probe_attempt_metadata: ProviderAttemptMetadata::default(),
+        },
+    };
+    let negotiated = first.runtime_fingerprint_for_negotiation(Some("gpt-test"), &negotiation);
+    let negotiated_again =
+        second.runtime_fingerprint_for_negotiation(Some("gpt-test"), &negotiation);
+    assert_eq!(negotiated, negotiated_again);
+    assert_eq!(
+        negotiated.provider_fingerprint,
+        first_fingerprint.provider_fingerprint
+    );
+    assert_eq!(
+        negotiated.model_fingerprint,
+        first_fingerprint.model_fingerprint
+    );
+    assert!(negotiated.negotiation_fingerprint.is_some());
+    let mut other_protocol_negotiation = negotiation.clone();
+    other_protocol_negotiation.metadata.api_protocol = ProviderApiProtocol::OpenAiResponses;
+    let other_protocol =
+        first.runtime_fingerprint_for_negotiation(Some("gpt-test"), &other_protocol_negotiation);
+    assert_ne!(
+        negotiated.negotiation_fingerprint,
+        other_protocol.negotiation_fingerprint
+    );
+    let serialized = serde_json::to_string(&negotiated).expect("fingerprint JSON");
+    for forbidden in [
+        "provider.example",
+        "sk-secret-value",
+        "api_key",
+        "singularity_capability_probe",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "fingerprint leaked {forbidden}"
+        );
+    }
 }
 
 #[test]

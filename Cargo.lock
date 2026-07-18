@@ -1492,6 +1492,8 @@ dependencies = [
 name = "singularity_app_server"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "schemars",
  "serde",
  "serde_json",
@@ -1507,6 +1509,7 @@ dependencies = [
  "singularity_tools",
  "tempfile",
  "thiserror 2.0.18",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1553,15 +1556,19 @@ dependencies = [
 name = "singularity_model"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "reqwest",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "singularity_core",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

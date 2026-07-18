@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 
 //! 面向模型的消息、模型提供方能力契约和兼容 OpenAI 的传输。
 //!
@@ -8,13 +8,19 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use cap_fs_ext::{
+    FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt, OpenOptionsSyncExt,
+};
+use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use singularity_core::CancellationToken;
 use thiserror::Error;
 use uuid::Uuid;
@@ -70,6 +76,21 @@ const CAPABILITY_PROBE_ALTERNATE_LABEL: &str = "schema_sentinel_beta";
 const CAPABILITY_PROBE_EXPECTED_VALUE: i64 = 7;
 const CAPABILITY_PROBE_DEVELOPER_INSTRUCTION: &str =
     "Follow the fixed capability probe request using native structured tool calls.";
+/// app-server 状态目录中 provider capability cache 的文件名。
+pub const PROVIDER_CAPABILITY_CACHE_FILE_NAME: &str = "provider-capability-cache.json";
+const PROVIDER_CAPABILITY_CACHE_LOCK_FILE_NAME: &str = "provider-capability-cache.lock";
+const PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION: u32 = 1;
+const PROVIDER_CAPABILITY_CACHE_TTL_SECONDS: u64 = 24 * 60 * 60;
+const MAX_PROVIDER_CAPABILITY_CACHE_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_CAPABILITY_CACHE_RECORDS: usize = 256;
+const PROVIDER_CAPABILITY_CACHE_LOCK_RETRY_MS: u64 = 25;
+const PROVIDER_CAPABILITY_CACHE_LOCK_WAIT_MS: u64 = 5_000;
+const PROVIDER_CAPABILITY_CACHE_KEY_LOCK_PREFIX: &str = ".provider-capability-cache.key-lock-";
+const PROVIDER_CAPABILITY_CACHE_KEY_LOCK_SUFFIX: &str = ".lock";
+const MAX_PROVIDER_CAPABILITY_CACHE_KEY_LOCK_FILES: usize = 256;
+const CAPABILITY_PROBE_DEADLINE_SECONDS: u64 = 120;
+const PROVIDER_ADAPTER_VERSION: u32 = 1;
+const CAPABILITY_PROBE_CONTRACT_VERSION: u32 = 1;
 
 /// 面向模型的对话历史支持的角色。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -180,7 +201,7 @@ pub enum ProviderToolReasoningMode {
 }
 
 /// 为模型提供方完成请求选定的线路协议。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiProtocol {
     #[default]
@@ -307,12 +328,20 @@ impl ProviderConfigSnapshot {
     where
         F: FnMut(&str) -> Option<String>,
     {
+        Self::capture_with_cache_path(get_env, None)
+    }
+
+    /// 从环境读取 provider 配置，并显式绑定可选的持久 capability cache 路径。
+    pub fn capture_with_cache_path<F>(get_env: F, cache_path: Option<PathBuf>) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
         let project_dir = std::env::current_dir().ok();
         let values = resolve_provider_values(get_env, project_dir.as_deref());
         let source = values.source;
         let redacted_config = provider_config_resolution(&values).config;
-        let provider =
-            OpenAiProviderConfig::from_resolved_values(values).and_then(OpenAiProvider::new);
+        let provider = OpenAiProviderConfig::from_resolved_values(values)
+            .and_then(|config| OpenAiProvider::new_with_cache_path(config, cache_path));
         let mut configuration = ProviderConfigurationStatus::from_config(&redacted_config);
         if configuration.configured
             && let Err(error) = &provider
@@ -470,6 +499,17 @@ pub struct ProviderCapabilityMetadata {
 pub struct ProviderProtocolNegotiation {
     pub contract: ProviderProtocolContract,
     pub metadata: ProviderCapabilityMetadata,
+}
+
+/// provider runtime 的脱敏稳定指纹；provider 与 model 身份保持可独立引用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderRuntimeFingerprint {
+    /// 绑定 provider、规范化 endpoint 摘要、adapter/probe 版本和配置上限，不包含 model 或凭证。
+    pub provider_fingerprint: String,
+    /// 仅绑定 effective model 的稳定脱敏摘要。
+    pub model_fingerprint: String,
+    /// 在已知最终 protocol/contract 时绑定前两个指纹及协商结果。
+    pub negotiation_fingerprint: Option<String>,
 }
 
 /// 模型侧请求或响应的校验错误和非致命警告。
@@ -810,6 +850,1033 @@ pub struct OpenAiProviderConfig {
     pub max_output_tokens: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct ProviderCapabilityCacheKey {
+    provider_name: String,
+    endpoint_sha256: String,
+    model_name: String,
+    api_protocol: ProviderApiProtocol,
+    adapter_version: u32,
+    probe_contract_version: u32,
+    max_context_tokens: u32,
+    max_output_tokens: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderCapabilityProbeKey {
+    provider_name: String,
+    endpoint_sha256: String,
+    model_name: String,
+    adapter_version: u32,
+    probe_contract_version: u32,
+    max_context_tokens: u32,
+    max_output_tokens: u32,
+}
+
+impl ProviderCapabilityProbeKey {
+    fn cache_key(&self, api_protocol: ProviderApiProtocol) -> ProviderCapabilityCacheKey {
+        ProviderCapabilityCacheKey {
+            provider_name: self.provider_name.clone(),
+            endpoint_sha256: self.endpoint_sha256.clone(),
+            model_name: self.model_name.clone(),
+            api_protocol,
+            adapter_version: self.adapter_version,
+            probe_contract_version: self.probe_contract_version,
+            max_context_tokens: self.max_context_tokens,
+            max_output_tokens: self.max_output_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct ProviderCapabilityCacheRecord {
+    key: ProviderCapabilityCacheKey,
+    stored_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+    contract: PersistedProviderProtocolContract,
+    metadata: PersistedProviderCapabilityMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct ProviderCapabilityCacheFile {
+    schema_version: u32,
+    records: Vec<ProviderCapabilityCacheRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct PersistedProviderProtocolContract {
+    supports_tools: bool,
+    supports_parallel_tool_calls: bool,
+    supports_required_tool_choice: bool,
+    supports_strict_tool_schema: bool,
+    tool_reasoning_mode: ProviderToolReasoningMode,
+    max_tools_per_request: u32,
+    supports_json_mode: bool,
+    supports_system_message: bool,
+    supports_developer_message: bool,
+    max_context_tokens: u32,
+    max_output_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+struct PersistedProviderCapabilityMetadata {
+    api_protocol: ProviderApiProtocol,
+    profile: ProviderCapabilityProfile,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderCapabilityCache {
+    path: PathBuf,
+    global_lock_path: PathBuf,
+    key_lock_dir: PathBuf,
+}
+
+struct ProviderCapabilityCacheFileLock {
+    _file: std::fs::File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderCapabilityCacheError {
+    Cancelled,
+    Deadline,
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Clone)]
+struct InMemoryProviderCapabilityCacheEntry {
+    negotiation: ProviderProtocolNegotiation,
+    expires_at: Instant,
+}
+
+impl From<&ProviderProtocolContract> for PersistedProviderProtocolContract {
+    fn from(contract: &ProviderProtocolContract) -> Self {
+        Self {
+            supports_tools: contract.supports_tools,
+            supports_parallel_tool_calls: contract.supports_parallel_tool_calls,
+            supports_required_tool_choice: contract.supports_required_tool_choice,
+            supports_strict_tool_schema: contract.supports_strict_tool_schema,
+            tool_reasoning_mode: contract.tool_reasoning_mode,
+            max_tools_per_request: contract.max_tools_per_request,
+            supports_json_mode: contract.supports_json_mode,
+            supports_system_message: contract.supports_system_message,
+            supports_developer_message: contract.supports_developer_message,
+            max_context_tokens: contract.max_context_tokens,
+            max_output_tokens: contract.max_output_tokens,
+        }
+    }
+}
+
+impl PersistedProviderProtocolContract {
+    fn into_contract(self) -> ProviderProtocolContract {
+        ProviderProtocolContract {
+            supports_tools: self.supports_tools,
+            supports_parallel_tool_calls: self.supports_parallel_tool_calls,
+            supports_required_tool_choice: self.supports_required_tool_choice,
+            supports_strict_tool_schema: self.supports_strict_tool_schema,
+            tool_reasoning_mode: self.tool_reasoning_mode,
+            max_tools_per_request: self.max_tools_per_request,
+            supports_json_mode: self.supports_json_mode,
+            supports_system_message: self.supports_system_message,
+            supports_developer_message: self.supports_developer_message,
+            max_context_tokens: self.max_context_tokens,
+            max_output_tokens: self.max_output_tokens,
+        }
+    }
+}
+
+impl From<&ProviderCapabilityMetadata> for PersistedProviderCapabilityMetadata {
+    fn from(metadata: &ProviderCapabilityMetadata) -> Self {
+        Self {
+            api_protocol: metadata.api_protocol,
+            profile: metadata.profile,
+        }
+    }
+}
+
+impl PersistedProviderCapabilityMetadata {
+    fn into_metadata(self) -> ProviderCapabilityMetadata {
+        ProviderCapabilityMetadata {
+            api_protocol: self.api_protocol,
+            profile: self.profile,
+            cache_hit: true,
+            profile_attempts: 0,
+            fallback_count: 0,
+            probe_usage: ModelUsage::default(),
+            probe_attempt_metadata: ProviderAttemptMetadata::zero(),
+        }
+    }
+}
+
+impl ProviderCapabilityCache {
+    fn new(path: PathBuf) -> Option<Self> {
+        let path_text = path.to_string_lossy();
+        if path.as_os_str().is_empty()
+            || path_text.eq_ignore_ascii_case(":memory:")
+            || path_text.to_ascii_lowercase().starts_with("file:")
+            || path_text.to_ascii_lowercase().starts_with("sqlite:")
+        {
+            return None;
+        }
+        let parent = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Some(Self {
+            path,
+            global_lock_path: parent.join(PROVIDER_CAPABILITY_CACHE_LOCK_FILE_NAME),
+            key_lock_dir: parent,
+        })
+    }
+
+    fn load(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<Option<(ProviderProtocolNegotiation, Duration)>, ProviderCapabilityCacheError> {
+        let Some(now) = unix_time_seconds() else {
+            return Ok(None);
+        };
+        let _lock = self.acquire_global_lock(false, cancellation, deadline)?;
+        self.load_locked(key, now)
+    }
+
+    fn load_locked(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        now: u64,
+    ) -> Result<Option<(ProviderProtocolNegotiation, Duration)>, ProviderCapabilityCacheError> {
+        let Some(file) = self.read_file()? else {
+            return Ok(None);
+        };
+        if file.schema_version != PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        Ok(file.records.into_iter().find_map(|record| {
+            let negotiation = valid_cached_record(&record, key, now)?;
+            let remaining = Duration::from_secs(record.expires_at_unix_seconds - now);
+            Some((negotiation, remaining))
+        }))
+    }
+
+    fn load_locked_with_global_lock(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        now: u64,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<Option<(ProviderProtocolNegotiation, Duration)>, ProviderCapabilityCacheError> {
+        let _global_lock = self.acquire_global_lock(false, cancellation, deadline)?;
+        self.load_locked(key, now)
+    }
+
+    fn store_locked(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        negotiation: &ProviderProtocolNegotiation,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<(), ProviderCapabilityCacheError> {
+        if cancellation.is_cancelled() {
+            return Err(ProviderCapabilityCacheError::Cancelled);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ProviderCapabilityCacheError::Deadline);
+        }
+        let Some(now) = unix_time_seconds() else {
+            return Err(ProviderCapabilityCacheError::Unavailable);
+        };
+        let record = ProviderCapabilityCacheRecord {
+            key: key.clone(),
+            stored_at_unix_seconds: now,
+            expires_at_unix_seconds: now.saturating_add(PROVIDER_CAPABILITY_CACHE_TTL_SECONDS),
+            contract: PersistedProviderProtocolContract::from(&negotiation.contract),
+            metadata: PersistedProviderCapabilityMetadata::from(&negotiation.metadata),
+        };
+        if valid_cached_record(&record, key, now).is_none() {
+            return Err(ProviderCapabilityCacheError::Invalid);
+        }
+        let mut file = self
+            .read_file()?
+            .unwrap_or_else(empty_capability_cache_file);
+        if file.schema_version != PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION {
+            file = empty_capability_cache_file();
+        }
+        file.records
+            .retain(|existing| existing.key != *key && valid_cache_record_shape_at(existing, now));
+        file.records
+            .sort_unstable_by_key(|existing| existing.stored_at_unix_seconds);
+        if file.records.len() >= MAX_PROVIDER_CAPABILITY_CACHE_RECORDS {
+            let remove_count = file.records.len() - (MAX_PROVIDER_CAPABILITY_CACHE_RECORDS - 1);
+            file.records.drain(..remove_count);
+        }
+        file.records.push(record);
+        if cancellation.is_cancelled() {
+            return Err(ProviderCapabilityCacheError::Cancelled);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ProviderCapabilityCacheError::Deadline);
+        }
+        self.write_file(&file)
+            .map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+        let key_lock_path = self.key_lock_path(key);
+        self.cleanup_key_lock_files_locked(Some(&key_lock_path))
+    }
+
+    fn invalidate(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<(), ProviderCapabilityCacheError> {
+        let Some(now) = unix_time_seconds() else {
+            return Err(ProviderCapabilityCacheError::Unavailable);
+        };
+        let _key_lock = self.acquire_key_lock(key, cancellation, deadline)?;
+        let _global_lock = self.acquire_global_lock(false, cancellation, deadline)?;
+        let key_lock_path = self.key_lock_path(key);
+        let Some(mut file) = self.read_file()? else {
+            return self.cleanup_key_lock_files_locked(Some(&key_lock_path));
+        };
+        if file.schema_version != PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION {
+            self.write_file(&empty_capability_cache_file())
+                .map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+        } else {
+            let original_len = file.records.len();
+            file.records
+                .retain(|record| record.key != *key && valid_cache_record_shape_at(record, now));
+            if file.records.len() != original_len {
+                self.write_file(&file)
+                    .map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+            }
+        }
+        self.cleanup_key_lock_files_locked(Some(&key_lock_path))
+    }
+
+    fn acquire_global_lock(
+        &self,
+        create_parent: bool,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<ProviderCapabilityCacheFileLock, ProviderCapabilityCacheError> {
+        self.acquire_lock_path(
+            &self.global_lock_path,
+            create_parent,
+            cancellation,
+            deadline,
+        )
+    }
+
+    fn acquire_key_lock(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<ProviderCapabilityCacheFileLock, ProviderCapabilityCacheError> {
+        let path = self.key_lock_path(key);
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+        loop {
+            check_cache_wait(cancellation, deadline)?;
+            let global_lock = self.acquire_global_lock(true, cancellation, deadline)?;
+            if let Err(error) = self.cleanup_key_lock_files_locked(Some(&path)) {
+                drop(global_lock);
+                return Err(error);
+            }
+            let file = match open_or_create_private_lock_file(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    drop(global_lock);
+                    return Err(error);
+                }
+            };
+            match file.try_lock() {
+                Ok(()) => {
+                    drop(global_lock);
+                    return Ok(ProviderCapabilityCacheFileLock { _file: file });
+                }
+                Err(error) => {
+                    let error = std::io::Error::from(error);
+                    drop(file);
+                    drop(global_lock);
+                    if error.kind() != std::io::ErrorKind::WouldBlock {
+                        return Err(ProviderCapabilityCacheError::Unavailable);
+                    }
+                    wait_for_cache_lock_retry(cancellation, deadline)?;
+                }
+            }
+        }
+    }
+
+    fn key_lock_path(&self, key: &ProviderCapabilityCacheKey) -> PathBuf {
+        let digest = sha256_hex(
+            &serde_json::to_string(key).unwrap_or_else(|_| "invalid-provider-cache-key".into()),
+        );
+        self.key_lock_dir.join(format!(
+            "{PROVIDER_CAPABILITY_CACHE_KEY_LOCK_PREFIX}{digest}{PROVIDER_CAPABILITY_CACHE_KEY_LOCK_SUFFIX}"
+        ))
+    }
+
+    fn acquire_lock_path(
+        &self,
+        path: &Path,
+        create_parent: bool,
+        cancellation: &CancellationToken,
+        deadline: Option<Instant>,
+    ) -> Result<ProviderCapabilityCacheFileLock, ProviderCapabilityCacheError> {
+        check_cache_wait(cancellation, deadline)?;
+        if create_parent {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent)
+                .map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+        }
+        let file = open_or_create_private_lock_file(path)?;
+        loop {
+            check_cache_wait(cancellation, deadline)?;
+            match file.try_lock() {
+                Ok(()) => return Ok(ProviderCapabilityCacheFileLock { _file: file }),
+                Err(error) => {
+                    let error = std::io::Error::from(error);
+                    if error.kind() != std::io::ErrorKind::WouldBlock {
+                        return Err(ProviderCapabilityCacheError::Unavailable);
+                    }
+                    wait_for_cache_lock_retry(cancellation, deadline)?;
+                }
+            }
+        }
+    }
+
+    /// 在 global lock 内清理未被占用的旧 per-key lock 文件。
+    ///
+    /// 所有 key-lock 的打开和首次 try-lock 都在同一 global lock 内完成；因此清理不会
+    /// 删除另一个进程刚打开但尚未取得 OS 锁的 inode。持有中的 lock 的 try-lock 会返回
+    /// WouldBlock，保持其路径不变。
+    fn cleanup_key_lock_files_locked(
+        &self,
+        keep: Option<&Path>,
+    ) -> Result<(), ProviderCapabilityCacheError> {
+        let entries = match std::fs::read_dir(&self.key_lock_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(ProviderCapabilityCacheError::Unavailable),
+        };
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(PROVIDER_CAPABILITY_CACHE_KEY_LOCK_PREFIX)
+                            && name.ends_with(PROVIDER_CAPABILITY_CACHE_KEY_LOCK_SUFFIX)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if paths.len() <= MAX_PROVIDER_CAPABILITY_CACHE_KEY_LOCK_FILES {
+            return Ok(());
+        }
+        paths.sort_unstable();
+        let mut remaining = paths.len() - MAX_PROVIDER_CAPABILITY_CACHE_KEY_LOCK_FILES;
+        for path in paths {
+            if remaining == 0 || keep.is_some_and(|keep| keep == path.as_path()) {
+                continue;
+            }
+            let (file, identity) = match open_cache_path(&path, true, true, false, true) {
+                Ok((file, identity)) => {
+                    validate_opened_cache_file(&path, &file, identity)?;
+                    (file, identity)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(ProviderCapabilityCacheError::Unavailable),
+            };
+            match file.try_lock() {
+                Ok(()) => {
+                    drop(file);
+                    if remove_owned_path(&path, identity) {
+                        remaining -= 1;
+                    }
+                }
+                Err(error) => {
+                    let error = std::io::Error::from(error);
+                    drop(file);
+                    if error.kind() != std::io::ErrorKind::WouldBlock {
+                        return Err(ProviderCapabilityCacheError::Unavailable);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_file(
+        &self,
+    ) -> Result<Option<ProviderCapabilityCacheFile>, ProviderCapabilityCacheError> {
+        let Some(mut file) = open_existing_cache_file(&self.path, false)? else {
+            return Ok(None);
+        };
+        let length = file
+            .metadata()
+            .map_err(|_| ProviderCapabilityCacheError::Unavailable)?
+            .len();
+        if length > MAX_PROVIDER_CAPABILITY_CACHE_BYTES as u64 {
+            return Ok(None);
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        if file.read_to_end(&mut bytes).is_err() {
+            return Err(ProviderCapabilityCacheError::Unavailable);
+        }
+        if bytes.len() > MAX_PROVIDER_CAPABILITY_CACHE_BYTES {
+            return Ok(None);
+        }
+        let Ok(cache) = serde_json::from_slice::<ProviderCapabilityCacheFile>(&bytes) else {
+            return Ok(None);
+        };
+        Ok((cache.records.len() <= MAX_PROVIDER_CAPABILITY_CACHE_RECORDS).then_some(cache))
+    }
+
+    fn write_file(&self, file: &ProviderCapabilityCacheFile) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(file)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if bytes.len() > MAX_PROVIDER_CAPABILITY_CACHE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "provider capability cache serialization exceeds safety limit",
+            ));
+        }
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        if let Some(target) =
+            open_existing_cache_file(&self.path, false).map_err(cache_error_to_io)?
+        {
+            drop(target);
+        }
+        let (temp_path, temp_identity, mut output) = self.create_temp_file(parent)?;
+        let write_result = output
+            .write_all(&bytes)
+            .and_then(|()| output.flush())
+            .and_then(|()| output.sync_all());
+        drop(output);
+        if let Err(error) = write_result {
+            remove_owned_temp(&temp_path, temp_identity);
+            return Err(error);
+        }
+        if let Err(error) = replace_existing_atomic(&temp_path, &self.path) {
+            remove_owned_temp(&temp_path, temp_identity);
+            return Err(error);
+        }
+        sync_cache_directory(parent)?;
+        if let Some(target) =
+            open_existing_cache_file(&self.path, true).map_err(cache_error_to_io)?
+        {
+            target.sync_all()?;
+        }
+        Ok(())
+    }
+
+    fn temp_file_name(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("provider-capability-cache.json");
+        format!(
+            ".{name}.tmp-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        )
+    }
+
+    fn create_temp_file(
+        &self,
+        parent: &Path,
+    ) -> std::io::Result<(PathBuf, CacheFileIdentity, std::fs::File)> {
+        let temp_path = parent.join(self.temp_file_name());
+        let (file, identity) = open_cache_path(&temp_path, true, true, true, true)?;
+        if let Err(error) = make_private_file(&file).and_then(|()| {
+            validate_opened_cache_file(&temp_path, &file, identity).map_err(cache_error_to_io)
+        }) {
+            drop(file);
+            remove_owned_temp(&temp_path, identity);
+            return Err(error);
+        }
+        Ok((temp_path, identity, file))
+    }
+}
+
+fn check_cache_wait(
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Result<(), ProviderCapabilityCacheError> {
+    if cancellation.is_cancelled() {
+        return Err(ProviderCapabilityCacheError::Cancelled);
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(ProviderCapabilityCacheError::Deadline);
+    }
+    Ok(())
+}
+
+fn wait_for_cache_lock_retry(
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Result<(), ProviderCapabilityCacheError> {
+    check_cache_wait(cancellation, deadline)?;
+    let remaining = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_else(|| Duration::from_millis(PROVIDER_CAPABILITY_CACHE_LOCK_RETRY_MS));
+    if remaining.is_zero() {
+        return Err(ProviderCapabilityCacheError::Deadline);
+    }
+    std::thread::sleep(remaining.min(Duration::from_millis(
+        PROVIDER_CAPABILITY_CACHE_LOCK_RETRY_MS,
+    )));
+    check_cache_wait(cancellation, deadline)
+}
+
+fn open_cache_path(
+    path: &Path,
+    read: bool,
+    write: bool,
+    create_new: bool,
+    synchronized: bool,
+) -> std::io::Result<(std::fs::File, CacheFileIdentity)> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cache path has no file name",
+        )
+    })?;
+    let directory = CapabilityDir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    let mut options = CapabilityOpenOptions::new();
+    options
+        .read(read)
+        .write(write)
+        .create_new(create_new)
+        .follow(FollowSymlinks::No)
+        .sync(synchronized);
+    let file = directory.open_with(name, &options)?;
+    let identity = cache_file_identity(&file.metadata()?).map_err(cache_error_to_io)?;
+    Ok((file.into_std(), identity))
+}
+
+fn open_existing_cache_file(
+    path: &Path,
+    write: bool,
+) -> Result<Option<std::fs::File>, ProviderCapabilityCacheError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ProviderCapabilityCacheError::Unavailable),
+    };
+    validate_cache_metadata(&metadata)?;
+    let (file, identity) = open_cache_path(path, true, write, false, write)
+        .map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+    validate_opened_cache_file(path, &file, identity)?;
+    Ok(Some(file))
+}
+
+fn cache_error_to_io(error: ProviderCapabilityCacheError) -> std::io::Error {
+    let kind = match error {
+        ProviderCapabilityCacheError::Cancelled => std::io::ErrorKind::Interrupted,
+        ProviderCapabilityCacheError::Deadline => std::io::ErrorKind::TimedOut,
+        ProviderCapabilityCacheError::Unavailable => std::io::ErrorKind::PermissionDenied,
+        ProviderCapabilityCacheError::Invalid => std::io::ErrorKind::InvalidData,
+    };
+    std::io::Error::new(kind, "provider capability cache file is unavailable")
+}
+
+fn open_or_create_private_lock_file(
+    path: &Path,
+) -> Result<std::fs::File, ProviderCapabilityCacheError> {
+    if let Some(file) = open_existing_cache_file(path, true)? {
+        make_private_file(&file).map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+        return Ok(file);
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+    match open_cache_path(path, true, true, true, true) {
+        Ok((file, identity)) => {
+            make_private_file(&file).map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+            validate_opened_cache_file(path, &file, identity)?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open_existing_cache_file(path, true)?.ok_or(ProviderCapabilityCacheError::Unavailable)
+        }
+        Err(_) => Err(ProviderCapabilityCacheError::Unavailable),
+    }
+}
+
+fn validate_opened_cache_file(
+    path: &Path,
+    file: &std::fs::File,
+    identity: CacheFileIdentity,
+) -> Result<(), ProviderCapabilityCacheError> {
+    let opened = file
+        .metadata()
+        .map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+    validate_cache_metadata(&opened)?;
+    let (reopened, reopened_identity) = open_cache_path(path, true, false, false, false)
+        .map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+    let reopened_metadata = reopened
+        .metadata()
+        .map_err(|_| ProviderCapabilityCacheError::Unavailable)?;
+    validate_cache_metadata(&reopened_metadata)?;
+    if identity != reopened_identity {
+        return Err(ProviderCapabilityCacheError::Unavailable);
+    }
+    Ok(())
+}
+
+fn validate_cache_metadata(
+    metadata: &std::fs::Metadata,
+) -> Result<(), ProviderCapabilityCacheError> {
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(ProviderCapabilityCacheError::Unavailable);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ProviderCapabilityCacheError::Unavailable);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheFileIdentity {
+    device: u64,
+    inode: u64,
+    links: u64,
+}
+
+fn cache_file_identity(
+    metadata: &cap_std::fs::Metadata,
+) -> Result<CacheFileIdentity, ProviderCapabilityCacheError> {
+    let identity = CacheFileIdentity {
+        device: CapMetadataExt::dev(metadata),
+        inode: CapMetadataExt::ino(metadata),
+        links: CapMetadataExt::nlink(metadata),
+    };
+    (identity.links == 1)
+        .then_some(identity)
+        .ok_or(ProviderCapabilityCacheError::Unavailable)
+}
+
+fn make_private_file(_file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = _file.metadata()?.permissions();
+        permissions.set_mode(0o600);
+        _file.set_permissions(permissions)?;
+    }
+    Ok(())
+}
+
+fn remove_owned_temp(path: &Path, expected: CacheFileIdentity) {
+    let _ = remove_owned_path(path, expected);
+}
+
+fn remove_owned_path(path: &Path, expected: CacheFileIdentity) -> bool {
+    let Ok((file, identity)) = open_cache_path(path, true, true, false, true) else {
+        return false;
+    };
+    if identity != expected || validate_opened_cache_file(path, &file, identity).is_err() {
+        return false;
+    }
+    drop(file);
+    std::fs::remove_file(path).is_ok()
+}
+
+fn replace_existing_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        replace_existing_windows(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+#[cfg(windows)]
+fn replace_existing_windows(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // The source and destination are NUL-terminated UTF-16 paths owned by this function;
+    // MoveFileExW does not retain either pointer after returning.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn sync_cache_directory(parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        return std::fs::File::open(parent)?.sync_all();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+}
+
+fn empty_capability_cache_file() -> ProviderCapabilityCacheFile {
+    ProviderCapabilityCacheFile {
+        schema_version: PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION,
+        records: Vec::new(),
+    }
+}
+
+fn valid_cached_record(
+    record: &ProviderCapabilityCacheRecord,
+    key: &ProviderCapabilityCacheKey,
+    now: u64,
+) -> Option<ProviderProtocolNegotiation> {
+    if record.key != *key || !valid_cache_record_shape_at(record, now) {
+        return None;
+    }
+    Some(ProviderProtocolNegotiation {
+        contract: record.contract.clone().into_contract(),
+        metadata: record.metadata.clone().into_metadata(),
+    })
+}
+
+fn valid_cache_record_shape(record: &ProviderCapabilityCacheRecord) -> bool {
+    if record.stored_at_unix_seconds > record.expires_at_unix_seconds
+        || record
+            .expires_at_unix_seconds
+            .saturating_sub(record.stored_at_unix_seconds)
+            > PROVIDER_CAPABILITY_CACHE_TTL_SECONDS
+    {
+        return false;
+    }
+    let contract = record.contract.clone().into_contract();
+    valid_persisted_cache_contract(
+        &record.key,
+        &contract,
+        record.metadata.api_protocol,
+        record.metadata.profile,
+    )
+}
+
+fn valid_cache_record_shape_at(record: &ProviderCapabilityCacheRecord, now: u64) -> bool {
+    valid_cache_record_shape(record)
+        && record.stored_at_unix_seconds <= now
+        && record.expires_at_unix_seconds > now
+}
+
+fn valid_negotiation_for_cache(
+    key: &ProviderCapabilityCacheKey,
+    negotiation: &ProviderProtocolNegotiation,
+) -> Option<()> {
+    valid_cache_key(key).then_some(())?;
+    valid_cache_contract(key, &negotiation.contract, &negotiation.metadata).then_some(())
+}
+
+fn valid_cache_key(key: &ProviderCapabilityCacheKey) -> bool {
+    !key.provider_name.trim().is_empty()
+        && !key.model_name.trim().is_empty()
+        && is_sha256_hex(&key.endpoint_sha256)
+        && !matches!(key.api_protocol, ProviderApiProtocol::Declared)
+        && key.adapter_version == PROVIDER_ADAPTER_VERSION
+        && key.probe_contract_version == CAPABILITY_PROBE_CONTRACT_VERSION
+        && key.max_context_tokens > 0
+        && key.max_context_tokens <= MAX_CONFIGURED_CONTEXT_TOKENS
+        && key.max_output_tokens > 0
+        && key.max_output_tokens < key.max_context_tokens
+        && key.max_output_tokens <= MAX_CONFIGURED_OUTPUT_TOKENS
+}
+
+fn valid_cache_contract(
+    key: &ProviderCapabilityCacheKey,
+    contract: &ProviderProtocolContract,
+    metadata: &ProviderCapabilityMetadata,
+) -> bool {
+    if !valid_cache_key(key)
+        || metadata.api_protocol != key.api_protocol
+        || metadata.cache_hit
+        || metadata.profile_attempts == 0
+        || !metadata
+            .probe_usage
+            .cost_estimate
+            .is_none_or(|cost| cost.is_finite() && cost >= 0.0)
+        || contract.max_context_tokens != key.max_context_tokens
+        || contract.max_output_tokens != key.max_output_tokens
+        || !contract.supports_tools
+        || contract.supports_required_tool_choice
+        || contract.supports_json_mode
+        || contract.supports_system_message
+        || !contract.supports_developer_message
+        || contract.max_tools_per_request == 0
+        || contract.max_tools_per_request > DEFAULT_MAX_TOOLS_PER_REQUEST
+        || !matches!(
+            (key.api_protocol, contract.tool_reasoning_mode),
+            (
+                ProviderApiProtocol::OpenAiResponses,
+                ProviderToolReasoningMode::DisabledForToolCalls
+            ) | (
+                ProviderApiProtocol::OpenAiChatCompletions,
+                ProviderToolReasoningMode::Unspecified
+            ) | (
+                ProviderApiProtocol::OpenAiChatCompletions,
+                ProviderToolReasoningMode::DisabledForToolCalls
+            )
+        )
+        || (contract.supports_parallel_tool_calls
+            && (!contract.supports_tools || contract.max_tools_per_request < 2))
+        || (contract.supports_required_tool_choice && !contract.supports_tools)
+        || (contract.supports_strict_tool_schema && !contract.supports_tools)
+    {
+        return false;
+    }
+    match metadata.profile {
+        ProviderCapabilityProfile::StrictParallel => {
+            contract.supports_strict_tool_schema && contract.supports_parallel_tool_calls
+        }
+        ProviderCapabilityProfile::StrictSingle => {
+            contract.supports_strict_tool_schema && !contract.supports_parallel_tool_calls
+        }
+        ProviderCapabilityProfile::NonStrictParallel => {
+            !contract.supports_strict_tool_schema && contract.supports_parallel_tool_calls
+        }
+        ProviderCapabilityProfile::NonStrictSingle => {
+            !contract.supports_strict_tool_schema && !contract.supports_parallel_tool_calls
+        }
+        ProviderCapabilityProfile::Declared => false,
+    }
+}
+
+fn valid_persisted_cache_contract(
+    key: &ProviderCapabilityCacheKey,
+    contract: &ProviderProtocolContract,
+    api_protocol: ProviderApiProtocol,
+    profile: ProviderCapabilityProfile,
+) -> bool {
+    let metadata = ProviderCapabilityMetadata {
+        api_protocol,
+        profile,
+        cache_hit: false,
+        profile_attempts: 1,
+        fallback_count: 0,
+        probe_usage: ModelUsage::default(),
+        probe_attempt_metadata: ProviderAttemptMetadata::zero(),
+    };
+    valid_cache_contract(key, contract, &metadata)
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    endpoint.trim().trim_end_matches('/').to_string()
+}
+
+fn provider_fingerprint_for_probe_key(key: &ProviderCapabilityProbeKey) -> String {
+    let material = format!(
+        "singularity-provider-fingerprint-v1\nprovider_name={}\nendpoint_sha256={}\nadapter_version={}\nprobe_contract_version={}\nmax_context_tokens={}\nmax_output_tokens={}",
+        key.provider_name,
+        key.endpoint_sha256,
+        key.adapter_version,
+        key.probe_contract_version,
+        key.max_context_tokens,
+        key.max_output_tokens,
+    );
+    format!("sha256:{}", sha256_hex(&material))
+}
+
+fn model_fingerprint_for_name(model_name: &str) -> String {
+    let material = format!("singularity-model-fingerprint-v1\neffective_model={model_name}");
+    format!("sha256:{}", sha256_hex(&material))
+}
+
+fn negotiation_fingerprint_for_probe_key_and_contract(
+    probe_key: &ProviderCapabilityProbeKey,
+    api_protocol: ProviderApiProtocol,
+    contract: &ProviderProtocolContract,
+) -> String {
+    let provider_fingerprint = provider_fingerprint_for_probe_key(probe_key);
+    let model_fingerprint = model_fingerprint_for_name(&probe_key.model_name);
+    let material = format!(
+        "singularity-negotiation-fingerprint-v1\nprovider_fingerprint={}\nmodel_fingerprint={}\napi_protocol={}\nsupports_tools={}\nsupports_parallel_tool_calls={}\nsupports_required_tool_choice={}\nsupports_strict_tool_schema={}\ntool_reasoning_mode={}\nmax_tools_per_request={}\nsupports_json_mode={}\nsupports_system_message={}\nsupports_developer_message={}\ncontract_max_context_tokens={}\ncontract_max_output_tokens={}",
+        provider_fingerprint,
+        model_fingerprint,
+        provider_api_protocol_name(api_protocol),
+        contract.supports_tools,
+        contract.supports_parallel_tool_calls,
+        contract.supports_required_tool_choice,
+        contract.supports_strict_tool_schema,
+        provider_tool_reasoning_mode_name(contract.tool_reasoning_mode),
+        contract.max_tools_per_request,
+        contract.supports_json_mode,
+        contract.supports_system_message,
+        contract.supports_developer_message,
+        contract.max_context_tokens,
+        contract.max_output_tokens,
+    );
+    format!("sha256:{}", sha256_hex(&material))
+}
+
+fn provider_api_protocol_name(protocol: ProviderApiProtocol) -> &'static str {
+    match protocol {
+        ProviderApiProtocol::Declared => "declared",
+        ProviderApiProtocol::OpenAiResponses => "open_ai_responses",
+        ProviderApiProtocol::OpenAiChatCompletions => "open_ai_chat_completions",
+    }
+}
+
+fn provider_tool_reasoning_mode_name(mode: ProviderToolReasoningMode) -> &'static str {
+    match mode {
+        ProviderToolReasoningMode::Unspecified => "unspecified",
+        ProviderToolReasoningMode::DisabledForToolCalls => "disabled_for_tool_calls",
+    }
+}
+
+fn sha256_hex(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn unix_time_seconds() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
 impl fmt::Debug for OpenAiProviderConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -957,8 +2024,45 @@ pub struct OpenAiProvider {
     /// 所有 provider clone 共享的受控多线程 runtime；最后一个持有者释放时由 Tokio 关闭它。
     runtime: Arc<tokio::runtime::Runtime>,
     request_timeout_seconds: u64,
-    tool_capability_cache: Arc<Mutex<HashMap<String, ProviderProtocolNegotiation>>>,
-    tool_capability_probe_in_flight: Arc<Mutex<HashMap<String, Arc<CapabilityProbeState>>>>,
+    capability_probe_deadline: Duration,
+    tool_capability_cache: Arc<Mutex<InMemoryProviderCapabilityCacheState>>,
+    tool_capability_probe_in_flight:
+        Arc<Mutex<HashMap<ProviderCapabilityProbeKey, Arc<CapabilityProbeState>>>>,
+    persistent_capability_cache: Option<Arc<ProviderCapabilityCache>>,
+    capability_cache_diagnostic: Arc<Mutex<Option<String>>>,
+}
+
+struct InMemoryProviderCapabilityCacheState {
+    entries: HashMap<ProviderCapabilityCacheKey, InMemoryProviderCapabilityCacheEntry>,
+    tombstones: HashMap<ProviderCapabilityCacheKey, u64>,
+    next_epoch: u64,
+}
+
+impl InMemoryProviderCapabilityCacheState {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            tombstones: HashMap::new(),
+            next_epoch: 0,
+        }
+    }
+
+    fn epoch(&self, key: &ProviderCapabilityCacheKey) -> u64 {
+        self.tombstones.get(key).copied().unwrap_or_default()
+    }
+
+    fn invalidate(&mut self, key: &ProviderCapabilityCacheKey) -> u64 {
+        self.next_epoch = self.next_epoch.wrapping_add(1).max(1);
+        self.entries.remove(key);
+        self.tombstones.insert(key.clone(), self.next_epoch);
+        self.next_epoch
+    }
+}
+
+#[derive(Clone)]
+struct BoundProviderProtocolNegotiation {
+    key: ProviderCapabilityCacheKey,
+    negotiation: ProviderProtocolNegotiation,
 }
 
 impl fmt::Debug for OpenAiProvider {
@@ -970,18 +2074,20 @@ impl fmt::Debug for OpenAiProvider {
             .field("runtime", &"[shared]")
             .field("tool_capability_cache", &"[redacted]")
             .field("tool_capability_probe_in_flight", &"[redacted]")
+            .field("persistent_capability_cache", &"[redacted]")
             .finish()
     }
 }
 
 #[derive(Clone)]
 enum CapabilityProbeCompletion {
-    Result(Result<ProviderProtocolNegotiation, ProviderError>),
+    Result(Box<Result<BoundProviderProtocolNegotiation, ProviderError>>),
     OwnerCancelled,
 }
 
 struct CapabilityProbeState {
     completion: Mutex<Option<CapabilityProbeCompletion>>,
+    participants: Mutex<usize>,
     wake: Condvar,
 }
 
@@ -989,29 +2095,56 @@ impl CapabilityProbeState {
     fn new() -> Self {
         Self {
             completion: Mutex::new(None),
+            participants: Mutex::new(1),
             wake: Condvar::new(),
         }
+    }
+
+    fn join(&self) {
+        let mut participants = self
+            .participants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *participants = participants.saturating_add(1);
+    }
+
+    fn leave(&self) -> bool {
+        let mut participants = self
+            .participants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *participants = participants.saturating_sub(1);
+        *participants == 0
+            && self
+                .completion
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
     }
 
     fn wait(
         &self,
         cancellation: &CancellationToken,
+        deadline: Instant,
     ) -> Result<CapabilityProbeCompletion, ProviderError> {
         let mut completion = self
             .completion
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            if let Some(completion) = completion.as_ref() {
-                return Ok(completion.clone());
-            }
             if cancellation.is_cancelled() {
                 return Err(capability_probe_cancelled_error());
             }
-            completion = match self.wake.wait_timeout(
-                completion,
-                Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS),
-            ) {
+            if Instant::now() >= deadline {
+                return Err(capability_probe_deadline_error());
+            }
+            if let Some(completion) = completion.as_ref() {
+                return Ok(completion.clone());
+            }
+            let wait_duration = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
+            completion = match self.wake.wait_timeout(completion, wait_duration) {
                 Ok((completion, _)) => completion,
                 Err(poisoned) => poisoned.into_inner().0,
             };
@@ -1031,43 +2164,65 @@ impl CapabilityProbeState {
 }
 
 struct CapabilityProbeOwnerGuard {
-    in_flight: Arc<Mutex<HashMap<String, Arc<CapabilityProbeState>>>>,
-    model_name: String,
+    in_flight: Arc<Mutex<HashMap<ProviderCapabilityProbeKey, Arc<CapabilityProbeState>>>>,
+    probe_key: ProviderCapabilityProbeKey,
     state: Arc<CapabilityProbeState>,
     armed: bool,
 }
 
 impl CapabilityProbeOwnerGuard {
     fn new(
-        in_flight: Arc<Mutex<HashMap<String, Arc<CapabilityProbeState>>>>,
-        model_name: String,
+        in_flight: Arc<Mutex<HashMap<ProviderCapabilityProbeKey, Arc<CapabilityProbeState>>>>,
+        probe_key: ProviderCapabilityProbeKey,
         state: Arc<CapabilityProbeState>,
     ) -> Self {
         Self {
             in_flight,
-            model_name,
+            probe_key,
             state,
             armed: true,
         }
     }
 
     fn finish(mut self, completion: CapabilityProbeCompletion) {
+        let owner_cancelled = matches!(completion, CapabilityProbeCompletion::OwnerCancelled);
         self.state.complete(completion);
-        self.remove_state();
+        self.state.leave();
+        if owner_cancelled {
+            self.remove_state_unconditionally();
+        } else {
+            self.remove_state();
+        }
         self.armed = false;
     }
 
     fn remove_state(&self) {
+        if !self.state_is_idle() {
+            return;
+        }
+        self.remove_state_unconditionally();
+    }
+
+    fn remove_state_unconditionally(&self) {
         let mut in_flight = self
             .in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if in_flight
-            .get(&self.model_name)
+            .get(&self.probe_key)
             .is_some_and(|current| Arc::ptr_eq(current, &self.state))
         {
-            in_flight.remove(&self.model_name);
+            in_flight.remove(&self.probe_key);
         }
+    }
+
+    fn state_is_idle(&self) -> bool {
+        let participants = self
+            .state
+            .participants
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *participants == 0
     }
 }
 
@@ -1076,7 +2231,8 @@ impl Drop for CapabilityProbeOwnerGuard {
         if self.armed {
             self.state
                 .complete(CapabilityProbeCompletion::OwnerCancelled);
-            self.remove_state();
+            self.state.leave();
+            self.remove_state_unconditionally();
         }
     }
 }
@@ -1087,9 +2243,25 @@ impl OpenAiProvider {
         Self::new_with_request_timeout(config, PROVIDER_TIMEOUT_SECONDS)
     }
 
+    /// 创建 provider，并显式绑定可选的持久 capability cache 文件。
+    pub fn new_with_cache_path(
+        config: OpenAiProviderConfig,
+        cache_path: Option<PathBuf>,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_request_timeout_and_cache_path(config, PROVIDER_TIMEOUT_SECONDS, cache_path)
+    }
+
     fn new_with_request_timeout(
         config: OpenAiProviderConfig,
         request_timeout_seconds: u64,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_request_timeout_and_cache_path(config, request_timeout_seconds, None)
+    }
+
+    fn new_with_request_timeout_and_cache_path(
+        config: OpenAiProviderConfig,
+        request_timeout_seconds: u64,
+        cache_path: Option<PathBuf>,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(request_timeout_seconds))
@@ -1105,8 +2277,15 @@ impl OpenAiProvider {
             client,
             runtime: Arc::new(runtime),
             request_timeout_seconds,
-            tool_capability_cache: Arc::new(Mutex::new(HashMap::new())),
+            capability_probe_deadline: Duration::from_secs(CAPABILITY_PROBE_DEADLINE_SECONDS),
+            tool_capability_cache: Arc::new(
+                Mutex::new(InMemoryProviderCapabilityCacheState::new()),
+            ),
             tool_capability_probe_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            persistent_capability_cache: cache_path
+                .and_then(ProviderCapabilityCache::new)
+                .map(Arc::new),
+            capability_cache_diagnostic: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1120,15 +2299,410 @@ impl OpenAiProvider {
 
     fn cached_tool_capability_negotiation(
         &self,
-        model_name: &str,
-    ) -> Result<Option<ProviderProtocolNegotiation>, ProviderError> {
-        Ok(self
+        key: &ProviderCapabilityCacheKey,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<Option<BoundProviderProtocolNegotiation>, ProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(capability_probe_cancelled_error());
+        }
+        if Instant::now() >= deadline {
+            return Err(capability_probe_deadline_error());
+        }
+        let now = Instant::now();
+        let mut cache = self
             .tool_capability_cache
             .lock()
-            .map_err(|_| provider_capability_cache_error())?
-            .get(model_name)
-            .cloned()
-            .map(cache_hit_negotiation))
+            .map_err(|_| provider_capability_cache_error())?;
+        if let Some(entry) = cache.entries.get(key)
+            && entry.expires_at > now
+        {
+            return Ok(Some(BoundProviderProtocolNegotiation {
+                key: key.clone(),
+                negotiation: cache_hit_negotiation(entry.negotiation.clone()),
+            }));
+        }
+        cache.entries.remove(key);
+        if cache.tombstones.contains_key(key) {
+            return Ok(None);
+        }
+        drop(cache);
+
+        let Some(persistent_cache) = &self.persistent_capability_cache else {
+            return Ok(None);
+        };
+        let loaded = match persistent_cache.load(key, cancellation, Some(deadline)) {
+            Ok(loaded) => loaded,
+            Err(ProviderCapabilityCacheError::Cancelled) => {
+                return Err(capability_probe_cancelled_error());
+            }
+            Err(ProviderCapabilityCacheError::Deadline) if Instant::now() >= deadline => {
+                return Err(capability_probe_deadline_error());
+            }
+            Err(ProviderCapabilityCacheError::Deadline)
+            | Err(ProviderCapabilityCacheError::Unavailable)
+            | Err(ProviderCapabilityCacheError::Invalid) => None,
+        };
+        let Some((negotiation, remaining)) = loaded else {
+            return Ok(None);
+        };
+        if cancellation.is_cancelled() {
+            return Err(capability_probe_cancelled_error());
+        }
+        if Instant::now() >= deadline {
+            return Err(capability_probe_deadline_error());
+        }
+        let mut cache = self
+            .tool_capability_cache
+            .lock()
+            .map_err(|_| provider_capability_cache_error())?;
+        if cache.tombstones.contains_key(key) {
+            return Ok(None);
+        }
+        cache.entries.insert(
+            key.clone(),
+            InMemoryProviderCapabilityCacheEntry {
+                negotiation: negotiation.clone(),
+                expires_at: Instant::now() + remaining,
+            },
+        );
+        Ok(Some(BoundProviderProtocolNegotiation {
+            key: key.clone(),
+            negotiation: cache_hit_negotiation(negotiation),
+        }))
+    }
+
+    fn capability_probe_key(&self, model_name: &str) -> ProviderCapabilityProbeKey {
+        ProviderCapabilityProbeKey {
+            provider_name: self.config.provider_name.clone(),
+            endpoint_sha256: sha256_hex(&normalize_endpoint(&self.config.base_url)),
+            model_name: model_name.to_string(),
+            adapter_version: PROVIDER_ADAPTER_VERSION,
+            probe_contract_version: CAPABILITY_PROBE_CONTRACT_VERSION,
+            max_context_tokens: self.config.max_context_tokens,
+            max_output_tokens: self.config.max_output_tokens,
+        }
+    }
+
+    fn capability_cache_key(
+        &self,
+        model_name: &str,
+        api_protocol: ProviderApiProtocol,
+    ) -> ProviderCapabilityCacheKey {
+        let endpoint = match api_protocol {
+            ProviderApiProtocol::OpenAiResponses => responses_endpoint(&self.config.base_url),
+            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                self.config.endpoint()
+            }
+        };
+        let mut key = self
+            .capability_probe_key(model_name)
+            .cache_key(api_protocol);
+        key.endpoint_sha256 = sha256_hex(&normalize_endpoint(&endpoint));
+        key
+    }
+
+    /// 返回不含原 endpoint、API key 或 probe 内容的 provider/model 稳定指纹。
+    pub fn runtime_fingerprint(&self, effective_model: Option<&str>) -> ProviderRuntimeFingerprint {
+        let model_name = effective_model.unwrap_or(&self.config.model_name);
+        let probe_key = self.capability_probe_key(model_name);
+        ProviderRuntimeFingerprint {
+            provider_fingerprint: provider_fingerprint_for_probe_key(&probe_key),
+            model_fingerprint: model_fingerprint_for_name(model_name),
+            negotiation_fingerprint: None,
+        }
+    }
+
+    /// 将已协商协议和本地 contract 投影为稳定的脱敏 runtime 指纹。
+    pub fn runtime_fingerprint_for_negotiation(
+        &self,
+        effective_model: Option<&str>,
+        negotiation: &ProviderProtocolNegotiation,
+    ) -> ProviderRuntimeFingerprint {
+        let model_name = effective_model.unwrap_or(&self.config.model_name);
+        let probe_key = self.capability_probe_key(model_name);
+        ProviderRuntimeFingerprint {
+            provider_fingerprint: provider_fingerprint_for_probe_key(&probe_key),
+            model_fingerprint: model_fingerprint_for_name(model_name),
+            negotiation_fingerprint: Some(negotiation_fingerprint_for_probe_key_and_contract(
+                &probe_key,
+                negotiation.metadata.api_protocol,
+                &negotiation.contract,
+            )),
+        }
+    }
+
+    fn remember_tool_capability_negotiation(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        negotiation: &ProviderProtocolNegotiation,
+        expected_epoch: u64,
+    ) -> Result<bool, ProviderError> {
+        if valid_negotiation_for_cache(key, negotiation).is_none() {
+            return Ok(false);
+        }
+        let mut cache = self
+            .tool_capability_cache
+            .lock()
+            .map_err(|_| provider_capability_cache_error())?;
+        if cache.epoch(key) != expected_epoch {
+            return Ok(false);
+        }
+        cache.entries.insert(
+            key.clone(),
+            InMemoryProviderCapabilityCacheEntry {
+                negotiation: negotiation.clone(),
+                expires_at: Instant::now()
+                    + Duration::from_secs(PROVIDER_CAPABILITY_CACHE_TTL_SECONDS),
+            },
+        );
+        Ok(true)
+    }
+
+    fn remember_cached_tool_capability_negotiation(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        negotiation: &ProviderProtocolNegotiation,
+        expected_epoch: u64,
+        remaining: Duration,
+    ) -> Result<bool, ProviderError> {
+        let mut cache = self
+            .tool_capability_cache
+            .lock()
+            .map_err(|_| provider_capability_cache_error())?;
+        if cache.epoch(key) != expected_epoch {
+            return Ok(false);
+        }
+        cache.entries.insert(
+            key.clone(),
+            InMemoryProviderCapabilityCacheEntry {
+                negotiation: negotiation.clone(),
+                expires_at: Instant::now() + remaining,
+            },
+        );
+        Ok(true)
+    }
+
+    fn persist_tool_capability_negotiation(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        negotiation: &ProviderProtocolNegotiation,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ProviderCapabilityCacheError> {
+        if valid_negotiation_for_cache(key, negotiation).is_none() {
+            return Err(ProviderCapabilityCacheError::Invalid);
+        }
+        if let Some(persistent_cache) = &self.persistent_capability_cache {
+            let _global_lock =
+                persistent_cache.acquire_global_lock(true, cancellation, Some(deadline))?;
+            persistent_cache.store_locked(key, negotiation, cancellation, Some(deadline))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn invalidate_tool_capability_negotiation(
+        &self,
+        key: &ProviderCapabilityCacheKey,
+        _cancellation: &CancellationToken,
+    ) -> Result<(), ProviderError> {
+        {
+            let mut cache = self
+                .tool_capability_cache
+                .lock()
+                .map_err(|_| provider_capability_cache_error())?;
+            cache.invalidate(key);
+        }
+        let Some(persistent_cache) = &self.persistent_capability_cache else {
+            return Ok(());
+        };
+        let invalidation_token = CancellationToken::new();
+        let deadline =
+            Instant::now() + Duration::from_millis(PROVIDER_CAPABILITY_CACHE_LOCK_WAIT_MS);
+        if let Err(error) = persistent_cache.invalidate(key, &invalidation_token, Some(deadline)) {
+            self.record_cache_diagnostic(error);
+            return Err(provider_capability_cache_invalidation_error());
+        }
+        Ok(())
+    }
+
+    fn current_cache_epoch(&self, key: &ProviderCapabilityCacheKey) -> Result<u64, ProviderError> {
+        self.tool_capability_cache
+            .lock()
+            .map(|cache| cache.epoch(key))
+            .map_err(|_| provider_capability_cache_error())
+    }
+
+    fn remove_cached_entry(&self, key: &ProviderCapabilityCacheKey) {
+        if let Ok(mut cache) = self.tool_capability_cache.lock() {
+            cache.entries.remove(key);
+        }
+    }
+
+    fn clear_cache_tombstone(&self, key: &ProviderCapabilityCacheKey, epoch: u64) {
+        if let Ok(mut cache) = self.tool_capability_cache.lock()
+            && cache.epoch(key) == epoch
+        {
+            cache.tombstones.remove(key);
+        }
+    }
+
+    fn record_cache_diagnostic(&self, error: ProviderCapabilityCacheError) {
+        let diagnostic = match error {
+            ProviderCapabilityCacheError::Cancelled => "cancelled",
+            ProviderCapabilityCacheError::Deadline => "deadline",
+            ProviderCapabilityCacheError::Unavailable => "unavailable",
+            ProviderCapabilityCacheError::Invalid => "invalid",
+        };
+        if let Ok(mut current) = self.capability_cache_diagnostic.lock() {
+            *current = Some(diagnostic.to_string());
+        }
+    }
+
+    fn probe_and_remember_as_owner(
+        &self,
+        model_name: &str,
+        cancellation: &CancellationToken,
+        epochs: &HashMap<ProviderCapabilityCacheKey, u64>,
+        deadline: Instant,
+    ) -> Result<BoundProviderProtocolNegotiation, ProviderError> {
+        let result = self.probe_tool_capabilities(model_name, cancellation, deadline);
+        let negotiation = result?;
+        if cancellation.is_cancelled() {
+            return Err(capability_probe_cancelled_error());
+        }
+        if Instant::now() >= deadline {
+            return Err(capability_probe_deadline_error());
+        }
+        let cache_key = self.capability_cache_key(model_name, negotiation.metadata.api_protocol);
+        let epoch = epochs.get(&cache_key).copied().unwrap_or_default();
+        if !self.remember_tool_capability_negotiation(&cache_key, &negotiation, epoch)? {
+            if cancellation.is_cancelled() {
+                return Err(capability_probe_cancelled_error());
+            }
+            if Instant::now() >= deadline {
+                return Err(capability_probe_deadline_error());
+            }
+            return Ok(BoundProviderProtocolNegotiation {
+                key: cache_key,
+                negotiation,
+            });
+        }
+        if let Some(_persistent_cache) = &self.persistent_capability_cache {
+            match self.persist_tool_capability_negotiation(
+                &cache_key,
+                &negotiation,
+                cancellation,
+                deadline,
+            ) {
+                Ok(()) => self.clear_cache_tombstone(&cache_key, epoch),
+                Err(ProviderCapabilityCacheError::Cancelled) => {
+                    self.remove_cached_entry(&cache_key);
+                    return Err(capability_probe_cancelled_error());
+                }
+                Err(ProviderCapabilityCacheError::Deadline) => {
+                    self.remove_cached_entry(&cache_key);
+                    return Err(capability_probe_deadline_error());
+                }
+                Err(error) => self.record_cache_diagnostic(error),
+            }
+        } else {
+            self.clear_cache_tombstone(&cache_key, epoch);
+        }
+        if cancellation.is_cancelled() {
+            self.remove_cached_entry(&cache_key);
+            let _ =
+                self.invalidate_tool_capability_negotiation(&cache_key, &CancellationToken::new());
+            return Err(capability_probe_cancelled_error());
+        }
+        if Instant::now() >= deadline {
+            self.remove_cached_entry(&cache_key);
+            let _ =
+                self.invalidate_tool_capability_negotiation(&cache_key, &CancellationToken::new());
+            return Err(capability_probe_deadline_error());
+        }
+        Ok(BoundProviderProtocolNegotiation {
+            key: cache_key,
+            negotiation,
+        })
+    }
+
+    fn probe_as_persistent_owner(
+        &self,
+        model_name: &str,
+        cancellation: &CancellationToken,
+        epochs: &HashMap<ProviderCapabilityCacheKey, u64>,
+        deadline: Instant,
+    ) -> Result<BoundProviderProtocolNegotiation, ProviderError> {
+        let Some(persistent_cache) = &self.persistent_capability_cache else {
+            return self.probe_and_remember_as_owner(model_name, cancellation, epochs, deadline);
+        };
+        let protocols = self.config.api_protocol_candidates();
+        let candidate_keys = if protocols.is_empty() {
+            vec![self.capability_cache_key(model_name, ProviderApiProtocol::OpenAiChatCompletions)]
+        } else {
+            protocols
+                .into_iter()
+                .map(|api_protocol| self.capability_cache_key(model_name, api_protocol))
+                .collect::<Vec<_>>()
+        };
+        let mut lock_keys = candidate_keys.clone();
+        lock_keys.sort_by_key(|key| persistent_cache.key_lock_path(key));
+        lock_keys.dedup();
+        let mut key_locks = Vec::with_capacity(lock_keys.len());
+        for key in &lock_keys {
+            match persistent_cache.acquire_key_lock(key, cancellation, Some(deadline)) {
+                Ok(lock) => key_locks.push(lock),
+                Err(ProviderCapabilityCacheError::Cancelled) => {
+                    return Err(capability_probe_cancelled_error());
+                }
+                Err(ProviderCapabilityCacheError::Deadline) => {
+                    return Err(capability_probe_deadline_error());
+                }
+                Err(ProviderCapabilityCacheError::Unavailable)
+                | Err(ProviderCapabilityCacheError::Invalid) => {
+                    drop(key_locks);
+                    return self.probe_and_remember_as_owner(
+                        model_name,
+                        cancellation,
+                        epochs,
+                        deadline,
+                    );
+                }
+            }
+        }
+        if let Some(now) = unix_time_seconds() {
+            for cache_key in candidate_keys {
+                let loaded = persistent_cache.load_locked_with_global_lock(
+                    &cache_key,
+                    now,
+                    cancellation,
+                    Some(deadline),
+                );
+                if let Ok(Some((negotiation, remaining))) = loaded {
+                    if cancellation.is_cancelled() {
+                        return Err(capability_probe_cancelled_error());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(capability_probe_deadline_error());
+                    }
+                    let epoch = epochs.get(&cache_key).copied().unwrap_or_default();
+                    if self.remember_cached_tool_capability_negotiation(
+                        &cache_key,
+                        &negotiation,
+                        epoch,
+                        remaining,
+                    )? {
+                        return Ok(BoundProviderProtocolNegotiation {
+                            key: cache_key,
+                            negotiation: cache_hit_negotiation(negotiation),
+                        });
+                    }
+                }
+            }
+        }
+        self.probe_and_remember_as_owner(model_name, cancellation, epochs, deadline)
     }
 
     fn negotiate_openai_tool_capabilities(
@@ -1136,23 +2710,47 @@ impl OpenAiProvider {
         model_name: &str,
         cancellation: &CancellationToken,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        self.negotiate_openai_tool_capabilities_bound(model_name, cancellation)
+            .map(|bound| bound.negotiation)
+    }
+
+    fn negotiate_openai_tool_capabilities_bound(
+        &self,
+        model_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<BoundProviderProtocolNegotiation, ProviderError> {
+        let probe_key = self.capability_probe_key(model_name);
+        let deadline = Instant::now() + self.capability_probe_deadline;
+        let mut epochs = HashMap::new();
+        for api_protocol in self.config.api_protocol_candidates() {
+            let key = self.capability_cache_key(model_name, api_protocol);
+            epochs.insert(key.clone(), self.current_cache_epoch(&key)?);
+        }
         loop {
             if cancellation.is_cancelled() {
                 return Err(capability_probe_cancelled_error());
             }
-            let cached = self.cached_tool_capability_negotiation(model_name)?;
-            if let Some(cached) = cached {
-                return Ok(cached);
+            if Instant::now() >= deadline {
+                return Err(capability_probe_deadline_error());
+            }
+            for api_protocol in self.config.api_protocol_candidates() {
+                let cache_key = self.capability_cache_key(model_name, api_protocol);
+                if let Some(cached) =
+                    self.cached_tool_capability_negotiation(&cache_key, cancellation, deadline)?
+                {
+                    return Ok(cached);
+                }
             }
             let mut in_flight = self
                 .tool_capability_probe_in_flight
                 .lock()
                 .map_err(|_| provider_capability_cache_error())?;
-            let (probe_state, owner) = if let Some(probe_state) = in_flight.get(model_name) {
+            let (probe_state, owner) = if let Some(probe_state) = in_flight.get(&probe_key) {
+                probe_state.join();
                 (Arc::clone(probe_state), false)
             } else {
                 let probe_state = Arc::new(CapabilityProbeState::new());
-                in_flight.insert(model_name.to_string(), Arc::clone(&probe_state));
+                in_flight.insert(probe_key.clone(), Arc::clone(&probe_state));
                 (probe_state, true)
             };
             drop(in_flight);
@@ -1160,39 +2758,122 @@ impl OpenAiProvider {
             if owner {
                 let owner_guard = CapabilityProbeOwnerGuard::new(
                     Arc::clone(&self.tool_capability_probe_in_flight),
-                    model_name.to_string(),
+                    probe_key.clone(),
                     Arc::clone(&probe_state),
                 );
-                let result = self.probe_tool_capabilities(model_name, cancellation);
-                let completion = if result
-                    .as_ref()
-                    .is_err_and(|error| error.error.kind == ModelErrorKind::Cancelled)
-                {
-                    CapabilityProbeCompletion::OwnerCancelled
-                } else {
-                    CapabilityProbeCompletion::Result(result.clone())
+                let result =
+                    self.probe_as_persistent_owner(model_name, cancellation, &epochs, deadline);
+                let result = match result {
+                    Err(error) => Err(self.invalidate_fresh_probe_rejection(model_name, error)),
+                    result => result,
+                };
+                let completion = match &result {
+                    Ok(_) => CapabilityProbeCompletion::Result(Box::new(result.clone())),
+                    Err(error) if capability_probe_owner_failure_requires_reselection(error) => {
+                        CapabilityProbeCompletion::OwnerCancelled
+                    }
+                    Err(_) => CapabilityProbeCompletion::Result(Box::new(result.clone())),
                 };
                 owner_guard.finish(completion);
                 return result;
             }
 
-            match probe_state.wait(cancellation)? {
-                CapabilityProbeCompletion::Result(result) => return result,
-                CapabilityProbeCompletion::OwnerCancelled => continue,
+            let completion = match probe_state.wait(cancellation, deadline) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    if probe_state.leave() {
+                        let mut in_flight = self
+                            .tool_capability_probe_in_flight
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if in_flight
+                            .get(&probe_key)
+                            .is_some_and(|current| Arc::ptr_eq(current, &probe_state))
+                        {
+                            in_flight.remove(&probe_key);
+                        }
+                    }
+                    return Err(error);
+                }
+            };
+            if probe_state.leave() {
+                let mut in_flight = self
+                    .tool_capability_probe_in_flight
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if in_flight
+                    .get(&probe_key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &probe_state))
+                {
+                    in_flight.remove(&probe_key);
+                }
+            }
+            match completion {
+                CapabilityProbeCompletion::Result(result) => return *result,
+                CapabilityProbeCompletion::OwnerCancelled => {
+                    let mut in_flight = self
+                        .tool_capability_probe_in_flight
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if in_flight
+                        .get(&probe_key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &probe_state))
+                    {
+                        in_flight.remove(&probe_key);
+                    }
+                    continue;
+                }
             }
         }
+    }
+
+    /// Fresh probe 的稳定能力拒绝也要清除对应实际 protocol key；调用点位于 key-lock
+    /// owner 返回之后，避免在仍持有 probe lock 时递归获取同一锁。
+    fn invalidate_fresh_probe_rejection(
+        &self,
+        model_name: &str,
+        mut error: ProviderError,
+    ) -> ProviderError {
+        if !is_stable_capability_rejection(&error) {
+            return error;
+        }
+        let Some(api_protocol) = error
+            .capability_metadata
+            .as_deref()
+            .map(|metadata| metadata.api_protocol)
+            .filter(|protocol| !matches!(protocol, ProviderApiProtocol::Declared))
+        else {
+            return error;
+        };
+        let key = self.capability_cache_key(model_name, api_protocol);
+        if let Err(invalidation_error) =
+            self.invalidate_tool_capability_negotiation(&key, &CancellationToken::new())
+        {
+            error.error.validation_errors.push(
+                invalidation_error
+                    .error
+                    .code
+                    .unwrap_or_else(|| "provider_capability_cache_invalidation_failed".to_string()),
+            );
+        }
+        error
     }
 
     fn probe_tool_capabilities(
         &self,
         model_name: &str,
         cancellation: &CancellationToken,
+        deadline: Instant,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         let protocols = self.config.api_protocol_candidates();
         let mut accumulated_metadata: Option<ProviderCapabilityMetadata> = None;
         for (index, api_protocol) in protocols.iter().copied().enumerate() {
-            match self.probe_tool_capabilities_for_protocol(model_name, cancellation, api_protocol)
-            {
+            match self.probe_tool_capabilities_for_protocol(
+                model_name,
+                cancellation,
+                api_protocol,
+                deadline,
+            ) {
                 Ok(mut negotiation) => {
                     if let Some(metadata) = accumulated_metadata.take() {
                         merge_capability_metadata(&mut negotiation.metadata, &metadata);
@@ -1201,10 +2882,6 @@ impl OpenAiProvider {
                         .metadata
                         .fallback_count
                         .saturating_add(index as u32);
-                    self.tool_capability_cache
-                        .lock()
-                        .map_err(|_| provider_capability_cache_error())?
-                        .insert(model_name.to_string(), negotiation.clone());
                     return Ok(negotiation);
                 }
                 Err(mut error)
@@ -1240,6 +2917,7 @@ impl OpenAiProvider {
         model_name: &str,
         cancellation: &CancellationToken,
         api_protocol: ProviderApiProtocol,
+        deadline: Instant,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         let mut probe_usage = ModelUsage::default();
         let mut probe_attempt_metadata = ProviderAttemptMetadata::zero();
@@ -1258,6 +2936,9 @@ impl OpenAiProvider {
                         &probe_attempt_metadata,
                     ),
                 ));
+            }
+            if Instant::now() >= deadline {
+                return Err(capability_probe_deadline_error());
             }
             let local_validation = validate_model_request(&profile.request);
             if !local_validation.valid {
@@ -1278,12 +2959,13 @@ impl OpenAiProvider {
                 api_protocol,
                 &mut probe_usage,
                 &mut probe_attempt_metadata,
+                deadline,
             ) {
                 Ok(completion) => completion,
                 Err(error) if is_capability_probe_profile_rejection(&error) => {
                     if index + 1 == profile_count {
                         return Err(capability_probe_failure(
-                            capability_probe_direct_unsupported_error(error),
+                            error,
                             capability_probe_metadata(
                                 api_protocol,
                                 profile.profile,
@@ -1320,14 +3002,10 @@ impl OpenAiProvider {
                     api_protocol,
                     &mut probe_usage,
                     &mut probe_attempt_metadata,
+                    deadline,
                 ) {
                     Ok(completion) => completion,
                     Err(error) => {
-                        let error = if is_capability_probe_profile_rejection(&error) {
-                            capability_probe_tool_reasoning_rejection(error)
-                        } else {
-                            error
-                        };
                         return Err(capability_probe_failure(
                             error,
                             capability_probe_metadata(
@@ -1402,12 +3080,13 @@ impl OpenAiProvider {
                     api_protocol,
                     &mut probe_usage,
                     &mut probe_attempt_metadata,
+                    deadline,
                 ) {
                     Ok(completion) => completion,
                     Err(error) if is_capability_probe_profile_rejection(&error) => {
                         if index + 1 == profile_count {
                             return Err(capability_probe_failure(
-                                capability_probe_direct_unsupported_error(error),
+                                error,
                                 capability_probe_metadata(
                                     api_protocol,
                                     profile.profile,
@@ -1495,6 +3174,7 @@ impl OpenAiProvider {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn complete_capability_probe(
         &self,
         request: &ModelTurnRequest,
@@ -1503,18 +3183,20 @@ impl OpenAiProvider {
         api_protocol: ProviderApiProtocol,
         probe_usage: &mut ModelUsage,
         probe_attempt_metadata: &mut ProviderAttemptMetadata,
+        deadline: Instant,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let model_name = request
             .model_preferences
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        let result = self.complete_with_contract_details(
+        let result = self.complete_with_contract_details_until(
             request,
             cancellation,
             contract,
             api_protocol,
             model_name,
+            Some(deadline),
         );
         match &result {
             Ok(completion) => {
@@ -1564,6 +3246,25 @@ impl OpenAiProvider {
         api_protocol: ProviderApiProtocol,
         model_name: &str,
     ) -> Result<OpenAiCompletion, ProviderError> {
+        self.complete_with_contract_details_until(
+            request,
+            cancellation,
+            capabilities,
+            api_protocol,
+            model_name,
+            None,
+        )
+    }
+
+    fn complete_with_contract_details_until(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        capabilities: &ProviderProtocolContract,
+        api_protocol: ProviderApiProtocol,
+        model_name: &str,
+        probe_deadline: Option<Instant>,
+    ) -> Result<OpenAiCompletion, ProviderError> {
         let runtime = self.runtime.as_ref();
         let started_at = Instant::now();
         let mut metadata = ProviderAttemptMetadata::zero();
@@ -1590,11 +3291,12 @@ impl OpenAiProvider {
             metadata.attempt_count += 1;
             let response =
                 match block_on_provider_future(
-                    &runtime,
+                    runtime,
                     cancellation,
                     "provider_request_send_failed",
                     ProviderErrorStage::RequestSend,
                     self.request_timeout_seconds,
+                    probe_deadline,
                     || {
                         self.client
                             .post(&endpoint)
@@ -1610,9 +3312,10 @@ impl OpenAiProvider {
                     {
                         metadata.retry_count += 1;
                         wait_provider_backoff(
-                            &runtime,
+                            runtime,
                             cancellation,
                             provider_retry_backoff(metadata.retry_count),
+                            probe_deadline,
                         )
                         .map_err(|cancelled| {
                             cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
@@ -1639,9 +3342,10 @@ impl OpenAiProvider {
                 {
                     metadata.retry_count += 1;
                     wait_provider_backoff(
-                        &runtime,
+                        runtime,
                         cancellation,
                         provider_retry_backoff(metadata.retry_count),
+                        probe_deadline,
                     )
                     .map_err(|cancelled| {
                         cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
@@ -1658,9 +3362,10 @@ impl OpenAiProvider {
             }
             let body =
                 match read_bounded_provider_response_body(
-                    &runtime,
+                    runtime,
                     cancellation,
                     self.request_timeout_seconds,
+                    probe_deadline,
                     response,
                 ) {
                     Ok(body) => body,
@@ -1670,9 +3375,10 @@ impl OpenAiProvider {
                     {
                         metadata.retry_count += 1;
                         wait_provider_backoff(
-                            &runtime,
+                            runtime,
                             cancellation,
                             provider_retry_backoff(metadata.retry_count),
+                            probe_deadline,
                         )
                         .map_err(|cancelled| {
                             cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
@@ -1766,6 +3472,7 @@ impl Provider for OpenAiProvider {
                 &self.config,
             ));
         }
+        let mut capability_binding: Option<BoundProviderProtocolNegotiation> = None;
         let (capabilities, capability_metadata, api_protocol) =
             if !request_uses_tool_protocol(request) {
                 (
@@ -1779,12 +3486,13 @@ impl Provider for OpenAiProvider {
                     .model_name
                     .as_deref()
                     .unwrap_or(&self.config.model_name);
-                let negotiation =
-                    self.negotiate_openai_tool_capabilities(effective_model_name, cancellation)?;
-                let api_protocol = negotiation.metadata.api_protocol;
+                let binding = self
+                    .negotiate_openai_tool_capabilities_bound(effective_model_name, cancellation)?;
+                let api_protocol = binding.negotiation.metadata.api_protocol;
+                capability_binding = Some(binding.clone());
                 (
-                    negotiation.contract,
-                    Some(negotiation.metadata),
+                    binding.negotiation.contract,
+                    Some(binding.negotiation.metadata),
                     api_protocol,
                 )
             };
@@ -1803,14 +3511,31 @@ impl Provider for OpenAiProvider {
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        self.complete_with_contract(
+        let result = self.complete_with_contract(
             request,
             cancellation,
             &capabilities,
             api_protocol,
             effective_model_name,
-        )
-        .map_err(|error| attach_capability_metadata(error, &capability_metadata))
+        );
+        let result = if let (Some(binding), Err(error)) = (&capability_binding, &result)
+            && is_stable_capability_rejection(error)
+        {
+            match self.invalidate_tool_capability_negotiation(&binding.key, cancellation) {
+                Ok(()) => result,
+                Err(invalidation_error) => result.map_err(|mut original| {
+                    original.error.validation_errors.push(
+                        invalidation_error.error.code.unwrap_or_else(|| {
+                            "provider_capability_cache_invalidation_failed".to_string()
+                        }),
+                    );
+                    original
+                }),
+            }
+        } else {
+            result
+        };
+        result.map_err(|error| attach_capability_metadata(error, &capability_metadata))
     }
 }
 
@@ -3129,6 +4854,42 @@ fn capability_probe_cancelled_error() -> ProviderError {
     ))
 }
 
+fn capability_probe_deadline_error() -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::Timeout,
+            "provider capability probe deadline exceeded",
+        )
+        .with_provider_diagnostic(
+            "provider_capability_probe_deadline_exceeded",
+            ProviderErrorStage::RequestSend,
+        ),
+    )
+    .with_capability_metadata(capability_probe_metadata(
+        ProviderApiProtocol::Declared,
+        ProviderCapabilityProfile::Declared,
+        0,
+        0,
+        &ModelUsage::default(),
+        &ProviderAttemptMetadata::zero(),
+    ))
+}
+
+fn capability_probe_owner_failure_requires_reselection(error: &ProviderError) -> bool {
+    matches!(
+        error.error.kind,
+        ModelErrorKind::Cancelled | ModelErrorKind::Timeout | ModelErrorKind::NetworkError
+    ) || matches!(
+        error.error.code.as_deref(),
+        Some(
+            "provider_capability_cache_unavailable"
+                | "provider_capability_cache_invalidation_failed"
+                | "provider_capability_probe_deadline_exceeded"
+                | "provider_request_cancelled"
+        )
+    )
+}
+
 fn provider_capability_cache_error() -> ProviderError {
     ProviderError::from_model_error(
         ModelError::new(
@@ -3137,6 +4898,19 @@ fn provider_capability_cache_error() -> ProviderError {
         )
         .with_provider_diagnostic(
             "provider_capability_cache_unavailable",
+            ProviderErrorStage::ClientInitialization,
+        ),
+    )
+}
+
+fn provider_capability_cache_invalidation_error() -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnknownProviderError,
+            "provider capability cache invalidation failed",
+        )
+        .with_provider_diagnostic(
+            "provider_capability_cache_invalidation_failed",
             ProviderErrorStage::ClientInitialization,
         ),
     )
@@ -3195,22 +4969,6 @@ fn capability_probe_failure(
         provider_error
     };
     provider_error.with_capability_metadata(metadata)
-}
-
-// 将 Direct tool 的 HTTP 400 拒绝归一为稳定的能力错误，同时保留尝试诊断。
-fn capability_probe_direct_unsupported_error(error: ProviderError) -> ProviderError {
-    if error.error.http_status != Some(HTTP_STATUS_BAD_REQUEST) {
-        return error;
-    }
-    let provider_attempt_metadata = error.provider_attempt_metadata.clone();
-    let mut provider_error = capability_probe_unsupported_error(*error.error);
-    provider_error.error.code =
-        Some("provider_native_structured_tool_calls_unsupported".to_string());
-    if let Some(metadata) = provider_attempt_metadata {
-        provider_error.with_provider_attempt_metadata(metadata)
-    } else {
-        provider_error
-    }
 }
 
 fn cache_hit_negotiation(
@@ -3383,27 +5141,43 @@ fn provider_tool_reasoning_history_error(
     }
 }
 
-fn capability_probe_tool_reasoning_rejection(error: ProviderError) -> ProviderError {
-    let provider_attempt_metadata = error.provider_attempt_metadata.clone();
-    let mut model_error = *error.error;
-    model_error.kind = ModelErrorKind::UnsupportedCapability;
-    model_error.message =
-        "provider does not support disabling reasoning for native tool calls".to_string();
-    model_error.code = Some("provider_tool_reasoning_mode_unsupported".to_string());
-    let provider_error = ProviderError::from_model_error(model_error);
-    if let Some(metadata) = provider_attempt_metadata {
-        provider_error.with_provider_attempt_metadata(metadata)
-    } else {
-        provider_error
-    }
-}
-
 fn is_capability_probe_profile_rejection(error: &ProviderError) -> bool {
     error.error.stage == Some(ProviderErrorStage::ResponseStatus)
         && matches!(
             error.error.http_status,
             Some(HTTP_STATUS_BAD_REQUEST | HTTP_STATUS_UNPROCESSABLE_ENTITY)
         )
+}
+
+fn is_stable_capability_rejection(error: &ProviderError) -> bool {
+    matches!(
+        error.error.code.as_deref(),
+        Some(
+            "provider_native_structured_tool_calls_unsupported"
+                | "provider_tool_reasoning_mode_unsupported"
+                | "provider_tool_reasoning_mode_not_honored"
+                | "provider_tool_reasoning_history_unsupported"
+        )
+    ) || error
+        .error
+        .validation_errors
+        .iter()
+        .any(|validation_error| {
+            matches!(
+                validation_error.as_str(),
+                "provider_does_not_support_tools"
+                    | "provider_does_not_support_required_tool_choice"
+                    | "provider_does_not_support_parallel_tool_calls"
+                    | "provider_does_not_support_strict_tool_schema"
+                    | "provider_does_not_support_json_mode"
+                    | "provider_does_not_support_system_messages"
+                    | "provider_does_not_support_developer_messages"
+                    | "requested_tools_exceed_provider_limit"
+                    | "requested_output_tokens_exceed_provider_limit"
+                    | "tool_reasoning_disable_not_honored"
+                    | "tool_reasoning_content_requires_adapter_history_support"
+            )
+        })
 }
 
 fn validation_is_unsupported_capability(validation: &ModelValidationResult) -> bool {
@@ -3454,17 +5228,28 @@ fn wait_provider_backoff(
     runtime: &tokio::runtime::Runtime,
     cancellation: &CancellationToken,
     duration: Duration,
+    probe_deadline: Option<Instant>,
 ) -> Result<(), ProviderError> {
     let deadline = Instant::now() + duration;
     loop {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
+        if probe_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(capability_probe_deadline_error());
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Ok(());
         }
-        let poll = remaining.min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
+        let poll = probe_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(remaining)
+            .min(remaining)
+            .min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
+        if poll.is_zero() {
+            return Err(capability_probe_deadline_error());
+        }
         runtime.block_on(async {
             tokio::time::sleep(poll).await;
         });
@@ -3477,6 +5262,7 @@ fn block_on_provider_future<C, F, T>(
     error_code: &'static str,
     error_stage: ProviderErrorStage,
     request_timeout_seconds: u64,
+    probe_deadline: Option<Instant>,
     create_future: C,
 ) -> Result<T, ProviderError>
 where
@@ -3491,13 +5277,17 @@ where
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error());
         }
-        match runtime.block_on(async {
-            tokio::time::timeout(
-                Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS),
-                future.as_mut(),
-            )
-            .await
-        }) {
+        if probe_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(capability_probe_deadline_error());
+        }
+        let poll = probe_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|| Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS))
+            .min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
+        if poll.is_zero() {
+            return Err(capability_probe_deadline_error());
+        }
+        match runtime.block_on(async { tokio::time::timeout(poll, future.as_mut()).await }) {
             Ok(result) => {
                 return result.map_err(|error| {
                     provider_transport_error(
@@ -3517,6 +5307,7 @@ fn read_bounded_provider_response_body(
     runtime: &tokio::runtime::Runtime,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
+    probe_deadline: Option<Instant>,
     mut response: reqwest::Response,
 ) -> Result<Vec<u8>, ProviderError> {
     if response
@@ -3538,6 +5329,7 @@ fn read_bounded_provider_response_body(
             "provider_response_body_read_failed",
             ProviderErrorStage::ResponseBodyRead,
             request_timeout_seconds,
+            probe_deadline,
             || response.chunk(),
         )?;
         let Some(chunk) = chunk else {
@@ -4191,6 +5983,156 @@ mod transport_tests {
         .expect("write provider response");
     }
 
+    #[test]
+    fn capability_cache_sha256_matches_standard_vector() {
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn capability_cache_key_lock_is_exclusive_across_instances() {
+        let directory = tempfile::tempdir().expect("cache lock directory");
+        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
+        let first = ProviderCapabilityCache::new(cache_path.clone()).expect("first cache");
+        let second = ProviderCapabilityCache::new(cache_path).expect("second cache");
+        let key = ProviderCapabilityCacheKey {
+            provider_name: "provider".to_string(),
+            endpoint_sha256: "00".repeat(32),
+            model_name: "model".to_string(),
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            adapter_version: PROVIDER_ADAPTER_VERSION,
+            probe_contract_version: CAPABILITY_PROBE_CONTRACT_VERSION,
+            max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        };
+        let first_lock = first
+            .acquire_key_lock(
+                &key,
+                &CancellationToken::new(),
+                Some(Instant::now() + Duration::from_secs(1)),
+            )
+            .expect("first key lock");
+        let second_result = second.acquire_key_lock(
+            &key,
+            &CancellationToken::new(),
+            Some(Instant::now() + Duration::from_millis(100)),
+        );
+        assert!(matches!(
+            second_result,
+            Err(ProviderCapabilityCacheError::Deadline)
+        ));
+        drop(first_lock);
+    }
+
+    #[test]
+    fn capability_cache_lock_wait_is_cancellable() {
+        let directory = tempfile::tempdir().expect("cache lock directory");
+        let cache = ProviderCapabilityCache::new(
+            directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME),
+        )
+        .expect("cache");
+        let holder = cache
+            .acquire_global_lock(
+                true,
+                &CancellationToken::new(),
+                Some(Instant::now() + Duration::from_secs(1)),
+            )
+            .expect("hold cache lock");
+        let cancellation = CancellationToken::new();
+        let cancellation_for_thread = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            cancellation_for_thread.cancel();
+        });
+        let started = Instant::now();
+        let result = cache.acquire_global_lock(
+            false,
+            &cancellation,
+            Some(Instant::now() + Duration::from_secs(1)),
+        );
+        assert!(matches!(
+            result,
+            Err(ProviderCapabilityCacheError::Cancelled)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(holder);
+        canceller.join().expect("join cache lock canceller");
+    }
+
+    #[test]
+    fn capability_probe_total_deadline_does_not_publish_cache() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind deadline provider");
+        let address = listener.local_addr().expect("deadline provider address");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept deadline provider request");
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("read deadline provider request");
+            seen_tx.send(()).expect("signal deadline request");
+            thread::sleep(Duration::from_millis(250));
+        });
+        let directory = tempfile::tempdir().expect("deadline cache directory");
+        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
+        let mut provider = OpenAiProvider::new_with_cache_path(
+            test_provider_config(format!("http://{address}")),
+            Some(cache_path.clone()),
+        )
+        .expect("deadline provider");
+        provider.capability_probe_deadline = Duration::from_millis(50);
+        let error = provider
+            .negotiate_openai_tool_capabilities("gpt-test", &CancellationToken::new())
+            .expect_err("capability probe deadline must fail closed");
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_capability_probe_deadline_exceeded")
+        );
+        assert!(!cache_path.exists(), "deadline must not publish cache");
+        seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deadline provider request observed");
+        server.join().expect("join deadline provider");
+    }
+
+    #[test]
+    fn failed_persistent_invalidation_leaves_a_tombstone_and_diagnostic() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache_path = directory.path().join(PROVIDER_CAPABILITY_CACHE_FILE_NAME);
+        std::fs::create_dir(&cache_path).expect("unwritable cache target directory");
+        let provider = OpenAiProvider::new_with_cache_path(
+            test_provider_config("http://127.0.0.1:1".to_string()),
+            Some(cache_path),
+        )
+        .expect("provider");
+        let key =
+            provider.capability_cache_key("gpt-test", ProviderApiProtocol::OpenAiChatCompletions);
+        let error = provider
+            .invalidate_tool_capability_negotiation(&key, &CancellationToken::new())
+            .expect_err("persistent invalidation must report the write/read failure");
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_capability_cache_invalidation_failed")
+        );
+        let cache = provider
+            .tool_capability_cache
+            .lock()
+            .expect("cache state lock");
+        assert!(cache.tombstones.contains_key(&key));
+        drop(cache);
+        assert_eq!(
+            provider
+                .capability_cache_diagnostic
+                .lock()
+                .expect("cache diagnostic lock")
+                .as_deref(),
+            Some("unavailable")
+        );
+    }
+
     fn concurrent_provider_server() -> (String, Receiver<usize>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind concurrent provider");
         let address = listener.local_addr().expect("concurrent provider address");
@@ -4508,8 +6450,7 @@ mod transport_tests {
 
     #[test]
     fn runtime_initialization_failure_maps_to_a_stable_provider_blocker() {
-        let error = provider_runtime_error(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let error = provider_runtime_error(std::io::Error::other(
             "synthetic runtime initialization failure",
         ));
         assert_eq!(
