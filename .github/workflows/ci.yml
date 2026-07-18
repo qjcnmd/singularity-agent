@@ -42,7 +42,7 @@ jobs:
 
       - name: Audit locked dependencies
         run: |
-          cargo metadata --workspace --all-features --locked --format-version 1 --no-deps | Out-Null
+          cargo metadata --all-features --locked --format-version 1 --no-deps | Out-Null
           cargo audit --file Cargo.lock --deny warnings
 
       - name: Check locked dependency policy
