@@ -74,7 +74,6 @@ const SECRET_ENV_MARKERS: [&str; 6] = [
 pub enum SandboxFilesystemMode {
     ReadOnly,
     WorkspaceWrite,
-    DangerFullAccess,
 }
 
 /// 命令请求的网络权限。
@@ -1004,7 +1003,7 @@ fn command_request_denial(request: &CommandRequest) -> Option<CommandResult> {
                 ));
             }
         }
-        SandboxFilesystemMode::WorkspaceWrite | SandboxFilesystemMode::DangerFullAccess => {}
+        SandboxFilesystemMode::WorkspaceWrite => {}
     }
     None
 }
@@ -1146,7 +1145,6 @@ mod windows_backend {
     const ELEVATED_FAILURE_PREFIX: &str = "elevated Windows sandbox failed";
     const RESTRICTED_FAILURE_PREFIX: &str = "restricted-token Windows sandbox failed";
     const PROTECTED_PATH_ENFORCEMENT_FAILED: &str = "protected workspace path enforcement failed";
-    const DANGER_FULL_ACCESS_UNSUPPORTED: &str = "danger-full-access requires an explicit unsandboxed executor and is unavailable in the sandbox backend";
 
     #[derive(Debug)]
     struct ResolvedExecutable {
@@ -1408,11 +1406,6 @@ mod windows_backend {
                 SandboxFilesystemMode::WorkspaceWrite => {
                     PermissionProfile::workspace_write_with(&[], network, false, false)
                 }
-                SandboxFilesystemMode::DangerFullAccess => {
-                    return Err(PrepareCommandError::Backend(
-                        DANGER_FULL_ACCESS_UNSUPPORTED.to_string(),
-                    ));
-                }
             };
             let restricted_token_fallback = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
                 &permission_profile,
@@ -1491,11 +1484,6 @@ mod windows_backend {
                 },
                 SandboxFilesystemMode::WorkspaceWrite => {
                     PermissionProfile::workspace_write_with(&[], network, false, false)
-                }
-                SandboxFilesystemMode::DangerFullAccess => {
-                    return Err(PrepareCommandError::Backend(
-                        DANGER_FULL_ACCESS_UNSUPPORTED.to_string(),
-                    ));
                 }
             };
             let restricted_token_fallback = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(

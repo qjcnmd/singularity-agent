@@ -113,7 +113,7 @@ sg run <goal>
 
 ## 5. 项目指令与上下文
 
-普通 Thread runtime 不向上寻找 `.git`：AppServer 使用持久化且已 canonicalize 的 `Thread.cwd` 同时作为 workspace root 与 cwd，调用显式边界的 `core::load_project_instructions(thread.cwd, thread.cwd)`。core 的 `load_project_instructions_from_cwd` 仅保留给有界的独立调用；显式 root→cwd API 按 root 到 cwd 的顺序读取每层的一个项目指令文件：若存在 `AGENTS.override.md` 则选择它，否则选择 `AGENTS.md`：
+普通 Thread runtime 不向上寻找 `.git`：Thread create/fork 先从输入路径逐组件 `nofollow` 绑定 `WorkspaceTools` 根 capability，再持久化与该对象身份一致的 canonical display path；不会先跟随 symlink/junction 后把外部目标当成 workspace。每次 turn 和允许执行的 approval continuation 都在写入 Running turn 或记录 allow decision 前，从持久化路径完成一次根 capability 绑定，并把同一个 `WorkspaceTools` 实例贯穿项目指令、AgentLoop、文件工具和 command cwd；绑定失败不产生新的非终态 turn 或已消费的 continuation。AppServer 使用该绑定的 `Thread.cwd` 同时作为 workspace root 与 cwd，调用显式边界的 `core::load_project_instructions(thread.cwd, thread.cwd)`。core 的 `load_project_instructions_from_cwd` 仅保留给有界的独立调用；显式 root→cwd API 按 root 到 cwd 的顺序读取每层的一个项目指令文件：若存在 `AGENTS.override.md` 则选择它，否则选择 `AGENTS.md`：
 
 - 单文件最大 32 KiB，总计最大 64 KiB。
 - canonical workspace 通过文件系统根 capability 逐分量 `nofollow` 打开，root→cwd 的每层目录都由父目录句柄相对打开；路径解析后插入的 symlink/junction/reparse point 不会成为新的 ambient 逃逸。
@@ -205,7 +205,11 @@ update_plan
 
 Evaluation 中存在两套独立的 exact verification 合同：AgentLoop 内部的 typed verification completion gate 只依据 canonical command-scope digest/count 判断 final answer 是否可接受；Agent stage 完成后，app-server 再从 `AgentLoopResult.tool_results` 独立检查 manifest 的 post-agent smoke，要求 smoke 的 digest/count 精确组成最后一次 edit/patch 之后最后的成功 `command` 后缀多重集合，按同一 canonical cwd、timeout、sandbox/network scope 计算 digest，并为重复 smoke 要求不同的成功 result。前者阻止过早 final，后者决定 `agent` stage 是否 passed；两者都不能用相似命令、旧 mutation 前结果、smoke 后的其他 command 或 timeout/network 设置差异冒充 exact 证据。
 
-默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced；read-only profile 对 Write 做 hard deny，workspace-write 只允许 canonical workspace 内的 direct write，命令仍经过严格 OS sandbox。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。Policy 只比较 `PermissionResource`：workspace path、command scope digest 或 tool id；`ToolId`、`WorkspaceRelativePath` 和 `CommandScopeDigest` 在构造与反序列化时都重验格式，路径拒绝 absolute/drive/ADS、反斜杠、空/`.`/`..` 分量。`PermissionProfile` 不再复制 workspace roots 或 writable directories，workspace capability 由 `WorkspaceTools` 持有。`PermissionDecisionCause` 区分 rule、filesystem profile、network profile、protected resource、no matching rule 和 approval policy；AgentLoop 再投影为 input/visibility/capability/policy/profile/workspace/protected/approval/sandbox/backend/infrastructure/execution/timeout/cancelled 的 `ToolFailureKind`，恢复性由类型和少量稳定 execution code 决定，不解析 human-readable reason。deny/protected/network 先于 approval，approval 不能扩大这些边界。`WorkspaceTools` 在工具准入时一次完成输入校验、canonical workspace binding 和 typed resource 投影，执行及 resume 使用同一份已绑定参数；command scope 绑定 canonical workspace-relative cwd、timeout 与实际 sandbox/network policy。read/list/grep 共享同一 `CancellationToken`，在开始 I/O、目录递归和 entry、固定大小文件块及阻塞读取返回边界检查，取消返回 typed `Cancelled` 并由 Agent 投影为 `tool_cancelled`；edit/patch 不在写入中途异步打断。多文件 patch 先验证全部目标，再写入，并在中途失败时回滚已经修改的文件。
+默认 workspace-write profile 是 network denied、approval on-request、protected paths enforced；read-only profile 对 Write 做 hard deny，workspace-write 只允许 workspace capability 内的 direct write，命令仍经过严格 OS sandbox。read 和 sandbox command 有显式 allow rule；写入仍经过路径敏感性和 protected path 检查。Policy 只比较 `PermissionResource`：workspace path、command scope digest 或 tool id；`ToolId`、`WorkspaceRelativePath` 和 `CommandScopeDigest` 在构造与反序列化时都重验格式，路径拒绝 absolute/drive/ADS、反斜杠、空/`.`/`..` 分量。`PermissionProfile` 不再复制 workspace roots 或 writable directories，workspace capability 由 `WorkspaceTools` 持有。`PermissionDecisionCause` 区分 rule、filesystem profile、network profile、protected resource、no matching rule 和 approval policy；AgentLoop 再投影为 input/visibility/capability/policy/profile/workspace/protected/approval/sandbox/backend/infrastructure/execution/timeout/cancelled 的 `ToolFailureKind`，恢复性由类型和少量稳定 execution code 决定，不解析 human-readable reason。deny/protected/network 先于 approval，approval 不能扩大这些边界。
+
+`WorkspaceTools::new` 从平台根 anchor 逐组件 no-follow 打开并保留 workspace directory capability；构造失败直接返回 typed error，AppServer 和 Evaluation 不会退化为 ambient path I/O。read/list/grep/edit/patch 后续只从该 capability 解析 slash-separated relative components，拒绝 symlink/reparse、非普通文件、无法验证的对象身份及 link count 大于一的文件；Windows 另外从对象 handle 恢复真实相对名称后执行 protected-path 检查，并拒绝 ADS、DOS device、尾随点/空格和短名表达。工具准入完成输入校验和 typed resource 投影，执行及 resume 重新经过同一 capability 边界；command scope 绑定 canonical workspace-relative cwd、timeout 与实际 sandbox/network policy。command 在调用 sandbox 前把 capability directory identity 与 ambient cwd identity 对齐并持有两侧 guard；Windows namespace guard 在执行期间禁止 delete sharing，非 Windows 产品 backend 当前明确 unavailable，不能把一次 path 检查冒充平台 sandbox。
+
+read/list/grep 共享同一 `CancellationToken`，在开始 I/O、目录递归和 entry、固定大小文件块及阻塞读取返回边界检查，取消返回 typed `Cancelled` 并由 Agent 投影为 `tool_cancelled`；edit/patch 不在写入中途异步打断。多文件 patch 在任何目录或文件副作用前读取并验证整批目标、expected content、no-op 与 canonical duplicate；新目录逐层记录 capability identity。每次发布使用父目录 capability 下的 unique create-new temp，写入后复制原目标权限并 sync，再复核临时源、原目标和发布后对象 identity。rename 已成功但发布后复检失败时，错误会携带临时源的已绑定 identity，把当前项与先前项一起纳入条件回滚；中途失败只逆序回滚确认已经发布的对象：原文件通过新的原子发布恢复，本批次新文件按 identity 删除，本批次新目录在文件清理后按 identity 逆序删除。目标被并发替换时保留外部新对象并返回 typed concurrent/rollback failure，不用路径删除未知对象；文件系统无法提供可靠对象身份时归为 capability failure，不误报为路径越界。
 
 edit/patch 只有在目标字节实际变化时才返回成功；no-op 在整批写入前作为可修复 input failure 拒绝，不能更新 completion mutation 状态或生成虚假 changed-file 证据。
 
@@ -243,7 +247,7 @@ CommandToolInput { command, cwd?, timeout_seconds? }
 
 规则：
 
-- thread 产品层只公开 `read-only` 和 `workspace-write`；sandbox backend 内部的 `danger-full-access` 枚举仅用于明确拒绝和 fail-closed 测试，不是可持久化或可选择的 thread 类型。
+- thread 与 sandbox backend 只表达 `read-only` 和 `workspace-write`；不存在 unsandboxed filesystem mode 或本地进程 fallback。
 - network denied 映射到 restricted network，必须使用 elevated offline identity；不能走 unelevated fallback。
 - network allowed 可以在 elevated 路径失败且 restricted token 足够时走 unelevated 路径。
 - 产品层只表达单一 workspace root 与 `denied` / `allowed` 两种网络模式，不要求用户维护 allowlist 或额外读写根目录配置。

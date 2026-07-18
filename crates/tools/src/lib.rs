@@ -6,13 +6,25 @@
 //! 强制执行工作区和受保护路径规则。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{File, Metadata, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt as StdMetadataExt, OpenOptionsExt as StdOpenOptionsExt};
+#[cfg(windows)]
+use std::path::Prefix;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use cap_fs_ext::{DirEntryExt as _, DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::ambient_authority;
+use cap_std::fs::{
+    Dir as CapabilityDir, File as CapabilityFile, Metadata as CapabilityMetadata,
+    OpenOptions as CapabilityOpenOptions, Permissions as CapabilityPermissions,
+};
+#[cfg(windows)]
+use cap_std::fs::{MetadataExt as _, OpenOptionsExt as _};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -59,6 +71,20 @@ const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "reveal hidden",
     "system prompt",
 ];
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(windows)]
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+#[cfg(unix)]
+const ERROR_TOO_MANY_SYMLINKS: i32 = 40;
+#[cfg(windows)]
+const ERROR_STOPPED_ON_SYMLINK: i32 = 681;
 /// 核心 read tool 名称。
 pub const READ_TOOL: &str = "read";
 /// 核心 list tool 名称。
@@ -1299,6 +1325,9 @@ pub enum WorkspaceToolError {
     SandboxUnavailable,
     Cancelled,
     BinaryPattern,
+    ConcurrentMutation(String),
+    HardLinkRejected(String),
+    PathIdentityUnsupported(String),
     ReadFailed(String),
     RollbackFailed(String),
     ExpectedContentMissing(String),
@@ -1315,6 +1344,18 @@ impl fmt::Display for WorkspaceToolError {
             Self::SandboxUnavailable => write!(formatter, "strict sandbox backend unavailable"),
             Self::Cancelled => write!(formatter, "workspace tool execution cancelled"),
             Self::BinaryPattern => write!(formatter, "grep pattern must be valid utf-8 text"),
+            Self::ConcurrentMutation(path) => {
+                write!(
+                    formatter,
+                    "workspace target changed during mutation: {path}"
+                )
+            }
+            Self::HardLinkRejected(path) => {
+                write!(formatter, "workspace hard-linked file is rejected: {path}")
+            }
+            Self::PathIdentityUnsupported(path) => {
+                write!(formatter, "workspace path identity is unsupported: {path}")
+            }
             Self::ReadFailed(message) => write!(formatter, "workspace tool read failed: {message}"),
             Self::RollbackFailed(message) => {
                 write!(formatter, "workspace mutation rollback failed: {message}")
@@ -1469,15 +1510,25 @@ pub struct WorkspacePatchChange {
 #[derive(Clone)]
 pub struct WorkspaceTools {
     workspace_root: PathBuf,
+    workspace_capability: Arc<CapabilityDir>,
+    #[cfg(windows)]
+    workspace_namespace_guards: Arc<Vec<std::fs::File>>,
     sandbox_backend: Option<Arc<dyn SandboxBackend + Send + Sync>>,
     command_environment: CommandEnvironmentPolicy,
 }
 
 impl fmt::Debug for WorkspaceTools {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("WorkspaceTools")
+        let mut debug = formatter.debug_struct("WorkspaceTools");
+        debug
             .field("workspace_root", &self.workspace_root)
+            .field("workspace_capability_bound", &true);
+        #[cfg(windows)]
+        debug.field(
+            "workspace_namespace_guards",
+            &self.workspace_namespace_guards.len(),
+        );
+        debug
             .field(
                 "sandbox_backend",
                 &self.sandbox_backend.as_ref().map(|backend| backend.name()),
@@ -1488,12 +1539,50 @@ impl fmt::Debug for WorkspaceTools {
 
 impl WorkspaceTools {
     /// 将工作区根目录绑定到文件和 command tool。
-    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        Self {
-            workspace_root: workspace_root.into(),
+    ///
+    /// 构造成功时会从稳定平台 anchor 逐组件打开 root directory capability；后续
+    /// 文件操作只使用该 capability 的相对路径；绑定失败会作为 typed error 返回，
+    /// 不会构造一个延迟失败或退化为 ambient path 的工具实例。
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self, WorkspaceToolError> {
+        let workspace_root = absolute_workspace_root(workspace_root.into())?;
+        let capability = bind_workspace_root(&workspace_root)?;
+        let metadata = capability.dir_metadata().map_err(io_error)?;
+        if !metadata.is_dir() || metadata_is_symlink_or_reparse(&metadata) {
+            return Err(WorkspaceToolError::ReadFailed(
+                "workspace root is not a regular directory".to_string(),
+            ));
+        }
+        #[cfg(windows)]
+        let (workspace_root_display, workspace_namespace_guards) =
+            bind_workspace_namespace(&workspace_root, &capability)?;
+        #[cfg(not(windows))]
+        let workspace_root_display = {
+            let canonical = std::fs::canonicalize(&workspace_root).map_err(io_error)?;
+            let namespace = bind_workspace_root(&canonical)?;
+            let capability_identity = directory_object_identity_key(&capability)
+                .map_err(|error| map_capability_error(error, "."))?;
+            let namespace_identity = directory_object_identity_key(&namespace)
+                .map_err(|error| map_capability_error(error, "."))?;
+            if capability_identity != namespace_identity {
+                return Err(WorkspaceToolError::OutsideWorkspace(
+                    "workspace root changed while it was being bound".to_string(),
+                ));
+            }
+            canonical
+        };
+        Ok(Self {
+            workspace_root: workspace_root_display,
+            workspace_capability: Arc::new(capability),
+            #[cfg(windows)]
+            workspace_namespace_guards: Arc::new(workspace_namespace_guards),
             sandbox_backend: None,
             command_environment: CommandEnvironmentPolicy::default(),
-        }
+        })
+    }
+
+    /// 返回与当前目录 capability 身份一致的工作区显示路径。
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
     /// 绑定一个严格 sandbox backend。
@@ -1655,13 +1744,8 @@ impl WorkspaceTools {
         allow_protected: bool,
     ) -> Result<WorkspaceRelativePath, WorkspaceToolError> {
         let resolved = self.resolve_workspace_path(path, allow_protected)?;
-        let relative = self.relative_path(&resolved);
-        WorkspaceRelativePath::from_canonical(if relative.is_empty() {
-            ".".to_string()
-        } else {
-            relative
-        })
-        .map_err(WorkspaceToolError::InvalidInput)
+        WorkspaceRelativePath::from_canonical(resolved.display)
+            .map_err(WorkspaceToolError::InvalidInput)
     }
 
     /// 在执行或变更前校验输入，并解析每个被引用的路径。
@@ -1670,25 +1754,26 @@ impl WorkspaceTools {
             READ_TOOL => {
                 let input: ReadToolInput = preflight_input(input)?;
                 input.validate()?;
-                self.resolve_workspace_path(&input.path, false)?;
+                let target = self.resolve_workspace_path(&input.path, false)?;
+                self.validate_existing_path(&target, false)?;
             }
             LIST_TOOL => {
                 let input: ListToolInput = preflight_input(input)?;
                 input.validate()?;
-                self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
+                let target = self.resolve_optional_workspace_path(input.path.as_deref(), false)?;
+                self.validate_existing_path(&target, true)?;
             }
             GREP_TOOL => {
                 let input: GrepToolInput = preflight_input(input)?;
                 input.validate()?;
-                self.resolve_workspace_path(
-                    input.path.as_deref().unwrap_or("."),
-                    input.path.is_none(),
-                )?;
+                let target = self.resolve_optional_workspace_path(input.path.as_deref(), true)?;
+                self.validate_existing_path(&target, false)?;
             }
             EDIT_TOOL => {
                 let input: EditToolInput = preflight_input(input)?;
                 input.validate()?;
-                self.resolve_workspace_path(&input.path, false)?;
+                let target = self.resolve_workspace_path(&input.path, false)?;
+                self.validate_existing_path(&target, false)?;
             }
             PATCH_TOOL => {
                 let patch: WorkspacePatch = preflight_input(input)?;
@@ -1696,7 +1781,8 @@ impl WorkspaceTools {
                 let mut targets = BTreeSet::new();
                 for change in patch.changes {
                     let target = self.resolve_workspace_path(&change.path, false)?;
-                    if !targets.insert(target) {
+                    self.validate_existing_path(&target, false)?;
+                    if !targets.insert(self.duplicate_target_key(&target)?) {
                         return Err(WorkspaceToolError::InvalidInput(
                             DUPLICATE_PATCH_TARGET.to_string(),
                         ));
@@ -1712,7 +1798,8 @@ impl WorkspaceTools {
                 if !backend.capabilities().supports_command_execution() {
                     return Err(WorkspaceToolError::SandboxUnavailable);
                 }
-                self.resolve_workspace_path(input.cwd.as_deref().unwrap_or("."), false)?;
+                let target = self.resolve_optional_workspace_path(input.cwd.as_deref(), false)?;
+                self.validate_existing_path(&target, true)?;
             }
             _ => {
                 return Err(WorkspaceToolError::InvalidInput(
@@ -1750,9 +1837,9 @@ impl WorkspaceTools {
         let line_end = input.line_end.unwrap_or(usize::MAX);
         let target = self.resolve_workspace_path(&input.path, false)?;
         check_cancelled(cancellation)?;
-        let relative = self.relative_path(&target);
+        let relative = target.display.clone();
         check_cancelled(cancellation)?;
-        let file = File::open(&target).map_err(io_error)?;
+        let file = self.open_file_at(&target)?;
         check_cancelled(cancellation)?;
         let mut reader = CancellableLineReader::new(file);
         let mut line = Vec::new();
@@ -1867,7 +1954,7 @@ impl WorkspaceTools {
         check_cancelled(cancellation)?;
         input.validate()?;
         check_cancelled(cancellation)?;
-        let target = self.resolve_workspace_path(input.path.as_deref().unwrap_or("."), false)?;
+        let target = self.resolve_optional_workspace_path(input.path.as_deref(), false)?;
         check_cancelled(cancellation)?;
         let max_entries = input.max_entries.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
         let max_depth = input.max_depth.unwrap_or(DEFAULT_LIST_MAX_DEPTH);
@@ -1879,7 +1966,9 @@ impl WorkspaceTools {
             recursive: input.recursive,
             max_depth,
         };
-        self.collect_list_entries(&target, 0, &mut state, cancellation)?;
+        self.with_directory_at(&target, |directory| {
+            self.collect_list_entries(directory, &target.display, 0, &mut state, cancellation)
+        })?;
         check_cancelled(cancellation)?;
         state
             .entries
@@ -1923,20 +2012,37 @@ impl WorkspaceTools {
         check_cancelled(cancellation)?;
         input.validate()?;
         check_cancelled(cancellation)?;
-        let root = self
-            .resolve_workspace_path(input.path.as_deref().unwrap_or("."), input.path.is_none())?;
+        let root =
+            self.resolve_optional_workspace_path(input.path.as_deref(), input.path.is_none())?;
         check_cancelled(cancellation)?;
         let max_matches = input.max_matches.unwrap_or(DEFAULT_GREP_MAX_MATCHES);
         let mut matches = Vec::new();
         let collection_limit = max_matches.saturating_add(1);
-        let truncated = self.grep_path(
-            &root,
-            &input.pattern,
-            input.case_sensitive,
-            collection_limit,
-            &mut matches,
-            cancellation,
-        )?;
+        let metadata = self.metadata_at(&root)?;
+        let truncated = if metadata.is_dir() {
+            self.with_directory_at(&root, |directory| {
+                self.grep_directory(
+                    directory,
+                    &root.display,
+                    &input.pattern,
+                    input.case_sensitive,
+                    collection_limit,
+                    &mut matches,
+                    cancellation,
+                )
+            })?
+        } else {
+            let file = self.open_file_at(&root)?;
+            self.grep_file(
+                file,
+                &root.display,
+                &input.pattern,
+                input.case_sensitive,
+                collection_limit,
+                &mut matches,
+                cancellation,
+            )?
+        };
         check_cancelled(cancellation)?;
         matches.truncate(max_matches);
         check_cancelled(cancellation)?;
@@ -1981,13 +2087,13 @@ impl WorkspaceTools {
         let mut targets = BTreeSet::new();
         for change in &patch.changes {
             let target = self.resolve_workspace_path(&change.path, false)?;
-            let relative = self.relative_path(&target);
-            if !targets.insert(target.clone()) {
+            let relative = target.display.clone();
+            if !targets.insert(self.duplicate_target_key(&target)?) {
                 return Err(WorkspaceToolError::InvalidInput(format!(
                     "{DUPLICATE_PATCH_TARGET}: {relative}"
                 )));
             }
-            let original = existing_text_or_empty(&target)?;
+            let (original, original_identity) = self.existing_text_or_empty(&target)?;
             let updated = if let Some(expected) = &change.expected {
                 if !original.contains(expected) {
                     return Err(WorkspaceToolError::ExpectedContentMissing(relative));
@@ -2001,32 +2107,64 @@ impl WorkspaceTools {
                     "workspace mutation made no change: {relative}"
                 )));
             }
-            prepared.push((target, relative, original, updated));
+            prepared.push(PreparedMutation {
+                path: target,
+                relative,
+                original,
+                updated,
+                original_identity,
+            });
         }
-        let originals = prepared
-            .iter()
-            .map(|(path, relative, original, _updated)| {
-                (
-                    path.clone(),
-                    relative.clone(),
-                    original.clone(),
-                    path.exists(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (path, _relative, _original, updated) in &prepared {
-            if let Err(write_error) = atomic_write(path, updated) {
-                if let Err(rollback_error) = rollback_originals(&originals) {
-                    return Err(WorkspaceToolError::RollbackFailed(format!(
-                        "write error: {write_error}; rollback error: {rollback_error}"
-                    )));
+        let mut created_directories = Vec::new();
+        for mutation in &prepared {
+            if let Err(error) =
+                self.ensure_parent_directories(&mutation.path, &mut created_directories)
+            {
+                return match self.remove_created_directories(&mut created_directories) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(WorkspaceToolError::RollbackFailed(format!(
+                        "directory preparation error: {error}; cleanup error: {cleanup_error}"
+                    ))),
+                };
+            }
+        }
+        let mut published = Vec::new();
+        for mutation in &prepared {
+            match self.atomic_write(
+                &mutation.path,
+                &mutation.updated,
+                mutation.original_identity.as_deref(),
+            ) {
+                Ok(published_identity) => published.push(PublishedMutation {
+                    prepared: mutation.clone(),
+                    published_identity,
+                }),
+                Err(write_failure) => {
+                    let AtomicWriteFailure {
+                        error: write_error,
+                        published_identity,
+                    } = write_failure;
+                    if let Some(published_identity) = published_identity {
+                        published.push(PublishedMutation {
+                            prepared: mutation.clone(),
+                            published_identity,
+                        });
+                    }
+                    let file_rollback = self.rollback_published(&published);
+                    let directory_rollback =
+                        self.remove_created_directories(&mut created_directories);
+                    if let Err(rollback_error) = file_rollback.and(directory_rollback) {
+                        return Err(WorkspaceToolError::RollbackFailed(format!(
+                            "write error: {write_error}; rollback error: {rollback_error}"
+                        )));
+                    }
+                    return Err(write_error);
                 }
-                return Err(write_error);
             }
         }
         let changed_files = prepared
             .iter()
-            .map(|(_path, relative, _original, _updated)| relative.clone())
+            .map(|mutation| mutation.relative.clone())
             .collect::<Vec<_>>();
         Ok(ToolOutput::success(json!({
             "changed_files": changed_files,
@@ -2043,15 +2181,14 @@ impl WorkspaceTools {
     /// 仅通过已配置的沙箱运行命令，并将取消传播给命令。
     pub fn command_cancellable(
         &self,
-        mut input: CommandToolInput,
+        input: CommandToolInput,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput, WorkspaceToolError> {
         input.validate()?;
-        let cwd = self.bound_workspace_path(input.effective_cwd(), false)?;
-        input.cwd = Some(cwd.as_str().to_string());
-        let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+        let command_cwd = self.resolve_optional_workspace_path(input.cwd.as_deref(), false)?;
+        let expected_scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
             &input.command,
-            cwd.as_str(),
+            &command_cwd.display,
             input.effective_timeout_seconds(),
             SandboxFilesystemMode::ReadOnly,
             SandboxNetworkMode::Denied,
@@ -2061,7 +2198,7 @@ impl WorkspaceTools {
             input,
             SandboxFilesystemMode::ReadOnly,
             SandboxNetworkMode::Denied,
-            &scope,
+            &expected_scope,
             cancellation,
         )
     }
@@ -2076,6 +2213,8 @@ impl WorkspaceTools {
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput, WorkspaceToolError> {
         input.validate()?;
+        // A failed root binding must not degrade into an ambient command cwd.
+        self.workspace_capability()?;
         let Some(backend) = &self.sandbox_backend else {
             return Err(WorkspaceToolError::SandboxUnavailable);
         };
@@ -2083,26 +2222,25 @@ impl WorkspaceTools {
         if !capabilities.supports_command_execution() {
             return Err(WorkspaceToolError::SandboxUnavailable);
         }
-        let requested_cwd = input.cwd.as_deref().unwrap_or(".");
-        let command_cwd = self.resolve_workspace_path(requested_cwd, false)?;
-        let relative_cwd = self.bound_workspace_path(requested_cwd, false)?;
-        let actual_scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+        let command_cwd = self.resolve_optional_workspace_path(input.cwd.as_deref(), false)?;
+        self.validate_existing_path(&command_cwd, true)?;
+        let actual_scope = command_script_scope_digest_with_policy(
             &input.command,
-            relative_cwd.as_str(),
+            &command_cwd.display,
             input.effective_timeout_seconds(),
             filesystem.clone(),
             network.clone(),
-        ))
-        .map_err(WorkspaceToolError::InvalidInput)?;
-        if actual_scope != *expected_scope {
+        );
+        if actual_scope != expected_scope.as_str() {
             return Err(WorkspaceToolError::InvalidInput(
-                "command scope binding changed before execution".to_string(),
+                "command authorization scope does not match execution input".to_string(),
             ));
         }
+        let bound_command_cwd = self.bind_command_cwd(&command_cwd)?;
         let mut request = CommandScriptRequest::agent_requested_with_policy(
             next_command_id(),
             input.command,
-            command_cwd.to_string_lossy().into_owned(),
+            bound_command_cwd.path.to_string_lossy().into_owned(),
             self.workspace_root.to_string_lossy().into_owned(),
             filesystem,
             network,
@@ -2111,11 +2249,11 @@ impl WorkspaceTools {
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }
-        let scope_digest = expected_scope.as_str().to_string();
         let result = backend.execute_script_cancellable(&request, cancellation);
+        drop(bound_command_cwd);
         let execution = result.sandbox.clone();
         let mut output = command_tool_output(result);
-        output.metadata["result_id"] = json!(scope_digest);
+        output.metadata["result_id"] = json!(expected_scope.as_str());
         output.metadata["audit"] = json!({
             "cwd": request.cwd,
             "timeout_seconds": request.timeout_seconds,
@@ -2124,15 +2262,672 @@ impl WorkspaceTools {
             "sandbox_backend": execution.backend,
             "sandbox_enforcement": execution.enforcement,
             "local_process_fallback": execution.local_process_fallback,
-            "command_scope_digest": scope_digest,
+            "command_scope_digest": expected_scope.as_str(),
             "command_provenance": "agent_requested",
         });
         Ok(output)
     }
 
+    fn workspace_capability(&self) -> Result<&CapabilityDir, WorkspaceToolError> {
+        Ok(self.workspace_capability.as_ref())
+    }
+
+    fn bind_command_cwd(
+        &self,
+        path: &CapabilityRelativePath,
+    ) -> Result<BoundCommandCwd, WorkspaceToolError> {
+        let (actual_relative, capability_guard) = if path.relative == Path::new(".") {
+            (
+                ".".to_string(),
+                self.workspace_capability.try_clone().map_err(io_error)?,
+            )
+        } else {
+            let parent = self
+                .open_parent_directory(&path.relative, false)
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            let directory = open_directory_component(parent.dir(), &parent.name, false)
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            let actual_relative = self
+                .actual_relative_for_directory(&directory, &path.display)
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            (actual_relative, directory)
+        };
+        if is_protected_path(&actual_relative) {
+            return Err(WorkspaceToolError::ProtectedPath(actual_relative));
+        }
+        let capability_identity = directory_object_identity_key(&capability_guard)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        let command_path = normalize_path(&self.workspace_root.join(&actual_relative));
+        #[cfg(windows)]
+        let namespace_guard = {
+            let namespace_guard = open_workspace_namespace_guard(&command_path)?;
+            let guard_identity = standard_file_object_identity_key(&namespace_guard)
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            if capability_identity != guard_identity {
+                return Err(WorkspaceToolError::OutsideWorkspace(
+                    "command cwd changed while it was being bound".to_string(),
+                ));
+            }
+            namespace_guard
+        };
+        #[cfg(not(windows))]
+        let namespace_guard = {
+            // The product backend is explicitly unavailable off Windows today. Still bind the
+            // ambient cwd to the same object so a future platform adapter cannot silently bypass
+            // the workspace capability boundary.
+            let namespace_guard = bind_workspace_root(&command_path)?;
+            let guard_identity = directory_object_identity_key(&namespace_guard)
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            if capability_identity != guard_identity {
+                return Err(WorkspaceToolError::OutsideWorkspace(
+                    "command cwd changed while it was being bound".to_string(),
+                ));
+            }
+            namespace_guard
+        };
+        Ok(BoundCommandCwd {
+            path: command_path,
+            _capability_guard: capability_guard,
+            _namespace_guard: namespace_guard,
+        })
+    }
+
+    fn open_file_at(
+        &self,
+        path: &CapabilityRelativePath,
+    ) -> Result<CapabilityFile, WorkspaceToolError> {
+        self.open_existing_file(path)
+            .map_err(|error| map_capability_error(error, &path.display))?
+            .ok_or_else(|| {
+                WorkspaceToolError::ReadFailed("workspace path is unavailable".to_string())
+            })
+    }
+
+    fn metadata_at(
+        &self,
+        path: &CapabilityRelativePath,
+    ) -> Result<CapabilityMetadata, WorkspaceToolError> {
+        if path.relative == Path::new(".") {
+            return self
+                .workspace_capability()?
+                .dir_metadata()
+                .map_err(io_error);
+        }
+        self.validate_existing_path(path, false)?;
+        let parent = self
+            .open_parent_directory(&path.relative, false)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        parent
+            .dir()
+            .symlink_metadata(&parent.name)
+            .map_err(|error| map_capability_error(classify_io_error(error), &path.display))
+    }
+
+    fn with_directory_at<T>(
+        &self,
+        path: &CapabilityRelativePath,
+        operation: impl FnOnce(&CapabilityDir) -> Result<T, WorkspaceToolError>,
+    ) -> Result<T, WorkspaceToolError> {
+        if path.relative == Path::new(".") {
+            return operation(self.workspace_capability()?);
+        }
+        let parent = self
+            .open_parent_directory(&path.relative, false)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        let directory = open_directory_component(parent.dir(), &parent.name, false)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        let actual_path = self
+            .actual_relative_for_directory(&directory, &path.display)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        if is_protected_path(&actual_path) {
+            return Err(WorkspaceToolError::ProtectedPath(actual_path));
+        }
+        operation(&directory)
+    }
+
+    fn open_parent_directory<'a>(
+        &'a self,
+        relative: &Path,
+        create_missing: bool,
+    ) -> Result<ParentDirectory<'a>, CapabilityAccessError> {
+        let mut components = relative.components().collect::<Vec<_>>();
+        let final_component = components.pop().ok_or(CapabilityAccessError::Unsafe)?;
+        let final_name = normal_component(final_component)?.to_os_string();
+        let root = self.workspace_capability.as_ref();
+        let mut current = None;
+        let mut requested_relative = String::new();
+        let mut actual_relative = String::new();
+        for component in components {
+            let name = normal_component(component)?;
+            let parent = current
+                .as_ref()
+                .map_or(root, |directory: &CapabilityDir| directory);
+            let directory = open_directory_component(parent, name, create_missing)?;
+            requested_relative = join_relative_path(&requested_relative, name);
+            actual_relative =
+                self.actual_relative_for_directory(&directory, &requested_relative)?;
+            if is_protected_path(&actual_relative) {
+                return Err(CapabilityAccessError::Protected(actual_relative));
+            }
+            current = Some(directory);
+        }
+        let directory = match current {
+            Some(directory) => ParentDirectoryKind::Opened(directory),
+            None => ParentDirectoryKind::Root(root),
+        };
+        Ok(ParentDirectory {
+            directory,
+            name: final_name,
+            actual_relative,
+        })
+    }
+
+    fn actual_relative_for_directory(
+        &self,
+        directory: &CapabilityDir,
+        _fallback: &str,
+    ) -> Result<String, CapabilityAccessError> {
+        #[cfg(windows)]
+        {
+            let root = self.workspace_capability.as_ref();
+            relative_path_from_handles(root, directory)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(_fallback.to_string())
+        }
+    }
+
+    fn actual_relative_for_file(
+        &self,
+        file: &CapabilityFile,
+        _fallback: &str,
+    ) -> Result<String, CapabilityAccessError> {
+        #[cfg(windows)]
+        {
+            let root = self.workspace_capability.as_ref();
+            relative_path_from_file_handle(root, file)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(_fallback.to_string())
+        }
+    }
+
+    fn validate_existing_path(
+        &self,
+        path: &CapabilityRelativePath,
+        require_directory: bool,
+    ) -> Result<(), WorkspaceToolError> {
+        if path.relative == Path::new(".") {
+            if require_directory {
+                let metadata = self
+                    .workspace_capability()?
+                    .dir_metadata()
+                    .map_err(io_error)?;
+                if !metadata.is_dir() {
+                    return Err(WorkspaceToolError::ReadFailed(
+                        "workspace path is not a directory".to_string(),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        let Some(opened) = self
+            .open_existing_path(path)
+            .map_err(|error| map_capability_error(error, &path.display))?
+        else {
+            return Ok(());
+        };
+        if require_directory && !opened.is_directory {
+            return Err(WorkspaceToolError::ReadFailed(
+                "workspace path is not a directory".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn existing_text_or_empty(
+        &self,
+        path: &CapabilityRelativePath,
+    ) -> Result<(String, Option<String>), WorkspaceToolError> {
+        if path.relative == Path::new(".") {
+            return Err(WorkspaceToolError::ReadFailed(
+                "workspace path is not a regular file".to_string(),
+            ));
+        }
+        let Some(mut file) = self
+            .open_existing_file(path)
+            .map_err(|error| map_capability_error(error, &path.display))?
+        else {
+            return Ok((String::new(), None));
+        };
+        let identity = file_object_identity_key(&file)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        let mut content = String::new();
+        file.read_to_string(&mut content).map_err(io_error)?;
+        Ok((content, Some(identity)))
+    }
+
+    fn duplicate_target_key(
+        &self,
+        path: &CapabilityRelativePath,
+    ) -> Result<String, WorkspaceToolError> {
+        match self
+            .open_existing_file(path)
+            .map_err(|error| map_capability_error(error, &path.display))?
+        {
+            Some(file) => file_object_identity_key(&file)
+                .map_err(|error| map_capability_error(error, &path.display)),
+            None => Ok(path.key.clone()),
+        }
+    }
+
+    fn open_existing_file(
+        &self,
+        path: &CapabilityRelativePath,
+    ) -> Result<Option<CapabilityFile>, CapabilityAccessError> {
+        match self.open_existing_path(path)? {
+            Some(opened) if opened.is_directory => Err(CapabilityAccessError::NotRegularFile),
+            Some(opened) => opened
+                .file
+                .map(Some)
+                .ok_or(CapabilityAccessError::Unsupported),
+            None => Ok(None),
+        }
+    }
+
+    fn open_existing_path(
+        &self,
+        path: &CapabilityRelativePath,
+    ) -> Result<Option<OpenedWorkspacePath>, CapabilityAccessError> {
+        if path.relative == Path::new(".") {
+            return Ok(Some(OpenedWorkspacePath {
+                is_directory: true,
+                file: None,
+            }));
+        }
+        let mut components = path.relative.components().collect::<Vec<_>>();
+        let root = self.workspace_capability.as_ref();
+        let mut current = None;
+        let mut requested_relative = String::new();
+        while let Some(component) = components.first().copied() {
+            components.remove(0);
+            let name = normal_component(component)?;
+            let parent = current
+                .as_ref()
+                .map_or(root, |directory: &CapabilityDir| directory);
+            let metadata = match parent.symlink_metadata(name) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(classify_io_error(error)),
+            };
+            if metadata_is_symlink_or_reparse(&metadata) {
+                return Err(CapabilityAccessError::Unsafe);
+            }
+            let is_final = components.is_empty();
+            requested_relative = join_relative_path(&requested_relative, name);
+            if metadata.is_dir() {
+                let directory = open_directory_component(parent, name, false)?;
+                let actual_relative =
+                    self.actual_relative_for_directory(&directory, &requested_relative)?;
+                if is_protected_path(&actual_relative) {
+                    return Err(CapabilityAccessError::Protected(actual_relative));
+                }
+                if is_final {
+                    return Ok(Some(OpenedWorkspacePath {
+                        is_directory: true,
+                        file: None,
+                    }));
+                }
+                current = Some(directory);
+            } else if metadata.is_file() {
+                let file = open_file_from_parent(parent, name)?;
+                let actual_relative = self.actual_relative_for_file(&file, &requested_relative)?;
+                if is_protected_path(&actual_relative) {
+                    return Err(CapabilityAccessError::Protected(actual_relative));
+                }
+                if !is_final {
+                    return Err(CapabilityAccessError::NotDirectory);
+                }
+                return Ok(Some(OpenedWorkspacePath {
+                    is_directory: false,
+                    file: Some(file),
+                }));
+            } else {
+                return Err(CapabilityAccessError::NotRegularFile);
+            }
+        }
+        Err(CapabilityAccessError::Unsupported)
+    }
+
+    fn ensure_parent_directories(
+        &self,
+        path: &CapabilityRelativePath,
+        created: &mut Vec<CreatedDirectory>,
+    ) -> Result<(), WorkspaceToolError> {
+        let mut components = path.relative.components().collect::<Vec<_>>();
+        components
+            .pop()
+            .ok_or_else(|| WorkspaceToolError::OutsideWorkspace(path.display.clone()))?;
+        let root = self.workspace_capability.as_ref();
+        let mut current = None;
+        let mut requested_relative = String::new();
+        for component in components {
+            let name = normal_component(component)
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            let parent = current
+                .as_ref()
+                .map_or(root, |directory: &CapabilityDir| directory);
+            let was_created = match parent.symlink_metadata(name) {
+                Ok(metadata) => {
+                    if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+                        return Err(WorkspaceToolError::OutsideWorkspace(path.display.clone()));
+                    }
+                    false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match parent.create_dir(name) {
+                        Ok(()) => true,
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+                        Err(error) => return Err(io_error(error)),
+                    }
+                }
+                Err(error) => return Err(io_error(error)),
+            };
+            let directory = open_directory_component(parent, name, false)
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            requested_relative = join_relative_path(&requested_relative, name);
+            if was_created {
+                let relative = PathBuf::from(&requested_relative);
+                let identity = directory_object_identity_key(&directory)
+                    .map_err(|error| map_capability_error(error, &requested_relative))?;
+                let guard = directory.try_clone().map_err(io_error)?;
+                created.push(CreatedDirectory {
+                    path: CapabilityRelativePath {
+                        relative: relative.clone(),
+                        display: requested_relative.clone(),
+                        key: relative_path_key(&relative),
+                    },
+                    identity,
+                    _guard: Some(guard),
+                });
+            }
+            let actual_relative = self
+                .actual_relative_for_directory(&directory, &requested_relative)
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            if is_protected_path(&actual_relative) {
+                return Err(WorkspaceToolError::ProtectedPath(actual_relative));
+            }
+            current = Some(directory);
+        }
+        Ok(())
+    }
+
+    fn atomic_write(
+        &self,
+        path: &CapabilityRelativePath,
+        content: &str,
+        expected_identity: Option<&str>,
+    ) -> Result<String, AtomicWriteFailure> {
+        self.atomic_write_with_hook(path, content, expected_identity, |_| {})
+    }
+
+    fn atomic_write_with_hook(
+        &self,
+        path: &CapabilityRelativePath,
+        content: &str,
+        expected_identity: Option<&str>,
+        before_rename: impl FnOnce(&OsStr),
+    ) -> Result<String, AtomicWriteFailure> {
+        self.atomic_write_with_hooks(path, content, expected_identity, before_rename, || Ok(()))
+    }
+
+    fn atomic_write_with_hooks(
+        &self,
+        path: &CapabilityRelativePath,
+        content: &str,
+        expected_identity: Option<&str>,
+        before_rename: impl FnOnce(&OsStr),
+        after_rename: impl FnOnce() -> Result<(), WorkspaceToolError>,
+    ) -> Result<String, AtomicWriteFailure> {
+        let parent = self
+            .open_parent_directory(&path.relative, false)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        let initial_target = self
+            .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        if initial_target.as_ref().map(|state| state.identity.as_str()) != expected_identity {
+            return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into());
+        }
+        let original_permissions = initial_target.map(|state| state.permissions);
+        let (temporary_name, mut temporary_file) = create_unique_temp_file(parent.dir())
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        let temporary_identity = file_object_identity_key(&temporary_file)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        let write_result = temporary_file.write_all(content.as_bytes()).and_then(|()| {
+            if let Some(permissions) = original_permissions {
+                temporary_file.set_permissions(permissions)?;
+            }
+            temporary_file.sync_all()
+        });
+        if let Err(error) = write_result {
+            drop(temporary_file);
+            return Err(cleanup_owned_file(
+                parent.dir(),
+                &temporary_name,
+                &temporary_identity,
+                io_error(error),
+            )
+            .into());
+        }
+        before_rename(&temporary_name);
+        let source_identity = open_file_from_parent(parent.dir(), &temporary_name)
+            .and_then(|file| file_object_identity_key(&file))
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        if source_identity != temporary_identity {
+            drop(temporary_file);
+            return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into());
+        }
+        let current_identity = self
+            .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        if current_identity
+            .as_ref()
+            .map(|state| state.identity.as_str())
+            != expected_identity
+        {
+            drop(temporary_file);
+            return Err(cleanup_owned_file(
+                parent.dir(),
+                &temporary_name,
+                &temporary_identity,
+                WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+            )
+            .into());
+        }
+        if let Err(error) = parent
+            .dir()
+            .rename(&temporary_name, parent.dir(), &parent.name)
+        {
+            drop(temporary_file);
+            return Err(cleanup_owned_file(
+                parent.dir(),
+                &temporary_name,
+                &temporary_identity,
+                io_error(error),
+            )
+            .into());
+        }
+        drop(temporary_file);
+        after_rename()
+            .map_err(|error| AtomicWriteFailure::published(error, temporary_identity.clone()))?;
+        let published_state = self
+            .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
+            .map_err(|error| {
+                AtomicWriteFailure::published(
+                    map_capability_error(error, &path.display),
+                    temporary_identity.clone(),
+                )
+            })?
+            .ok_or_else(|| {
+                AtomicWriteFailure::published(
+                    WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                    temporary_identity.clone(),
+                )
+            })?;
+        if published_state.identity != temporary_identity {
+            return Err(AtomicWriteFailure::published(
+                WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                temporary_identity,
+            ));
+        }
+        Ok(published_state.identity)
+    }
+
+    fn atomic_target_state(
+        &self,
+        parent: &CapabilityDir,
+        parent_relative: &str,
+        name: &OsStr,
+    ) -> Result<Option<AtomicTargetState>, CapabilityAccessError> {
+        match parent.symlink_metadata(name) {
+            Ok(metadata) => {
+                if metadata_is_symlink_or_reparse(&metadata) {
+                    return Err(CapabilityAccessError::Unsafe);
+                }
+                if !metadata.is_file() {
+                    return Err(CapabilityAccessError::NotRegularFile);
+                }
+                let file = open_file_from_parent(parent, name)?;
+                let actual = self
+                    .actual_relative_for_file(&file, &join_relative_path(parent_relative, name))?;
+                if is_protected_path(&actual) {
+                    return Err(CapabilityAccessError::Protected(actual));
+                }
+                let identity = file_object_identity_key(&file)?;
+                let permissions = file
+                    .metadata()
+                    .map_err(CapabilityAccessError::Io)?
+                    .permissions();
+                Ok(Some(AtomicTargetState {
+                    identity,
+                    permissions,
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(classify_io_error(error)),
+        }
+    }
+
+    fn rollback_published(
+        &self,
+        published: &[PublishedMutation],
+    ) -> Result<(), WorkspaceToolError> {
+        let mut failures = Vec::new();
+        for mutation in published.iter().rev() {
+            let result = if mutation.prepared.original_identity.is_some() {
+                self.atomic_write(
+                    &mutation.prepared.path,
+                    &mutation.prepared.original,
+                    Some(&mutation.published_identity),
+                )
+                .map(|_| ())
+                .map_err(|failure| failure.error)
+            } else {
+                self.remove_created_file(&mutation.prepared.path, &mutation.published_identity)
+            };
+            if let Err(error) = result {
+                failures.push(format!("{}: {error}", mutation.prepared.relative));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkspaceToolError::RollbackFailed(failures.join("; ")))
+        }
+    }
+
+    fn remove_created_file(
+        &self,
+        path: &CapabilityRelativePath,
+        expected_identity: &str,
+    ) -> Result<(), WorkspaceToolError> {
+        let parent = match self.open_parent_directory(&path.relative, false) {
+            Ok(parent) => parent,
+            Err(CapabilityAccessError::Missing) => return Ok(()),
+            Err(error) => return Err(map_capability_error(error, &path.display)),
+        };
+        let current_identity = self
+            .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        match current_identity {
+            None => Ok(()),
+            Some(state) if state.identity == expected_identity => parent
+                .dir()
+                .remove_file_or_symlink(&parent.name)
+                .map_err(io_error),
+            Some(_) => Err(WorkspaceToolError::ConcurrentMutation(path.display.clone())),
+        }
+    }
+
+    fn remove_created_directories(
+        &self,
+        created: &mut [CreatedDirectory],
+    ) -> Result<(), WorkspaceToolError> {
+        let mut failures = Vec::new();
+        for directory in created.iter_mut().rev() {
+            let result = (|| {
+                let parent = match self.open_parent_directory(&directory.path.relative, false) {
+                    Ok(parent) => parent,
+                    Err(CapabilityAccessError::Missing) => return Ok(()),
+                    Err(error) => {
+                        return Err(map_capability_error(error, &directory.path.display));
+                    }
+                };
+                let opened = match open_directory_component(parent.dir(), &parent.name, false) {
+                    Ok(opened) => opened,
+                    Err(CapabilityAccessError::Missing) => return Ok(()),
+                    Err(error) => {
+                        return Err(map_capability_error(error, &directory.path.display));
+                    }
+                };
+                let identity = directory_object_identity_key(&opened)
+                    .map_err(|error| map_capability_error(error, &directory.path.display))?;
+                if identity != directory.identity {
+                    return Err(WorkspaceToolError::ConcurrentMutation(
+                        directory.path.display.clone(),
+                    ));
+                }
+                drop(opened);
+                drop(directory._guard.take());
+                let reopened = open_directory_component(parent.dir(), &parent.name, false)
+                    .map_err(|error| map_capability_error(error, &directory.path.display))?;
+                let reopened_identity = directory_object_identity_key(&reopened)
+                    .map_err(|error| map_capability_error(error, &directory.path.display))?;
+                if reopened_identity != directory.identity {
+                    return Err(WorkspaceToolError::ConcurrentMutation(
+                        directory.path.display.clone(),
+                    ));
+                }
+                drop(reopened);
+                parent.dir().remove_dir(&parent.name).map_err(io_error)
+            })();
+            if let Err(error) = result {
+                failures.push(format!("{}: {error}", directory.path.display));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkspaceToolError::RollbackFailed(failures.join("; ")))
+        }
+    }
+
     fn collect_list_entries(
         &self,
-        directory: &Path,
+        directory: &CapabilityDir,
+        prefix: &str,
         depth: usize,
         state: &mut ListState,
         cancellation: &dyn Fn() -> bool,
@@ -2142,7 +2937,7 @@ impl WorkspaceTools {
             state.truncated = true;
             return Ok(());
         }
-        let entries = self.sorted_directory_entries(directory, cancellation)?;
+        let entries = self.sorted_directory_entries(directory, prefix, cancellation)?;
         for entry in entries {
             check_cancelled(cancellation)?;
             if is_protected_path(&entry.relative) {
@@ -2159,10 +2954,23 @@ impl WorkspaceTools {
                 return Ok(());
             }
             if state.recursive && entry.is_dir {
-                if depth < state.max_depth {
-                    self.collect_list_entries(&entry.path, depth + 1, state, cancellation)?;
-                } else {
-                    self.mark_depth_boundary(&entry.path, state, cancellation)?;
+                match open_directory_component(directory, &entry.name, false) {
+                    Ok(child) if depth < state.max_depth => {
+                        self.collect_list_entries(
+                            &child,
+                            &entry.relative,
+                            depth + 1,
+                            state,
+                            cancellation,
+                        )?;
+                    }
+                    Ok(child) => {
+                        self.mark_depth_boundary(&child, &entry.relative, state, cancellation)?;
+                    }
+                    Err(CapabilityAccessError::Unsafe | CapabilityAccessError::Missing) => {}
+                    Err(error) => {
+                        return Err(map_capability_error(error, &entry.relative));
+                    }
                 }
             }
         }
@@ -2172,12 +2980,13 @@ impl WorkspaceTools {
 
     fn mark_depth_boundary(
         &self,
-        directory: &Path,
+        directory: &CapabilityDir,
+        prefix: &str,
         state: &mut ListState,
         cancellation: &dyn Fn() -> bool,
     ) -> Result<(), WorkspaceToolError> {
         check_cancelled(cancellation)?;
-        let entries = self.sorted_directory_entries(directory, cancellation)?;
+        let entries = self.sorted_directory_entries(directory, prefix, cancellation)?;
         for entry in entries {
             check_cancelled(cancellation)?;
             if is_protected_path(&entry.relative) {
@@ -2192,31 +3001,33 @@ impl WorkspaceTools {
 
     fn sorted_directory_entries(
         &self,
-        directory: &Path,
+        directory: &CapabilityDir,
+        prefix: &str,
         cancellation: &dyn Fn() -> bool,
     ) -> Result<Vec<DirectoryEntry>, WorkspaceToolError> {
         check_cancelled(cancellation)?;
         let mut entries = Vec::new();
-        let mut directory_entries = std::fs::read_dir(directory).map_err(io_error)?;
+        let mut directory_entries = directory.entries().map_err(io_error)?;
         check_cancelled(cancellation)?;
         loop {
             check_cancelled(cancellation)?;
             let Some(entry) = directory_entries.next() else {
                 break;
             };
-            check_cancelled(cancellation)?;
             let entry = entry.map_err(io_error)?;
-            let path = entry.path();
-            check_cancelled(cancellation)?;
-            let metadata = std::fs::symlink_metadata(&path).map_err(io_error)?;
-            check_cancelled(cancellation)?;
-            let relative = self.relative_path(&path);
-            check_cancelled(cancellation)?;
+            let name = entry.file_name();
+            let file_type = entry.file_type().map_err(io_error)?;
+            #[cfg(windows)]
+            let is_symlink_or_reparse = file_type.is_symlink()
+                || metadata_is_symlink_or_reparse(&entry.full_metadata().map_err(io_error)?);
+            #[cfg(not(windows))]
+            let is_symlink_or_reparse = file_type.is_symlink();
+            let relative = join_relative_path(prefix, &name);
             entries.push(DirectoryEntry {
+                name,
                 relative,
-                is_dir: metadata.is_dir(),
-                is_symlink_or_reparse: metadata_is_symlink_or_reparse(&metadata),
-                path,
+                is_dir: file_type.is_dir() && !is_symlink_or_reparse,
+                is_symlink_or_reparse,
             });
         }
         check_cancelled(cancellation)?;
@@ -2225,9 +3036,11 @@ impl WorkspaceTools {
         Ok(entries)
     }
 
-    fn grep_path(
+    #[allow(clippy::too_many_arguments)]
+    fn grep_directory(
         &self,
-        root: &Path,
+        directory: &CapabilityDir,
+        prefix: &str,
         pattern: &str,
         case_sensitive: bool,
         collection_limit: usize,
@@ -2238,26 +3051,47 @@ impl WorkspaceTools {
         if matches.len() >= collection_limit {
             return Ok(true);
         }
-        check_cancelled(cancellation)?;
-        let metadata = std::fs::symlink_metadata(root).map_err(io_error)?;
-        check_cancelled(cancellation)?;
-        if metadata_is_symlink_or_reparse(&metadata) {
-            return Ok(false);
-        }
-        let relative = self.relative_path(root);
-        check_cancelled(cancellation)?;
-        if is_protected_path(&relative) {
-            return Ok(false);
-        }
-        if metadata.is_dir() {
-            let entries = self.sorted_directory_entries(root, cancellation)?;
-            for entry in entries {
-                check_cancelled(cancellation)?;
-                if is_protected_path(&entry.relative) || entry.is_symlink_or_reparse {
-                    continue;
+        let entries = self.sorted_directory_entries(directory, prefix, cancellation)?;
+        for entry in entries {
+            check_cancelled(cancellation)?;
+            if is_protected_path(&entry.relative) || entry.is_symlink_or_reparse {
+                continue;
+            }
+            if entry.is_dir {
+                let child = match open_directory_component(directory, &entry.name, false) {
+                    Ok(child) => child,
+                    Err(CapabilityAccessError::Unsafe | CapabilityAccessError::Missing) => {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(map_capability_error(error, &entry.relative));
+                    }
+                };
+                if self.grep_directory(
+                    &child,
+                    &entry.relative,
+                    pattern,
+                    case_sensitive,
+                    collection_limit,
+                    matches,
+                    cancellation,
+                )? {
+                    return Ok(true);
                 }
-                if self.grep_path(
-                    &entry.path,
+            } else {
+                let file = match open_file_from_parent(directory, &entry.name) {
+                    Ok(file) => file,
+                    Err(CapabilityAccessError::Unsafe | CapabilityAccessError::Missing) => {
+                        continue;
+                    }
+                    Err(CapabilityAccessError::NotRegularFile) => continue,
+                    Err(error) => {
+                        return Err(map_capability_error(error, &entry.relative));
+                    }
+                };
+                if self.grep_file(
+                    file,
+                    &entry.relative,
                     pattern,
                     case_sensitive,
                     collection_limit,
@@ -2267,14 +3101,22 @@ impl WorkspaceTools {
                     return Ok(true);
                 }
             }
-            check_cancelled(cancellation)?;
-            return Ok(false);
-        }
-        if !metadata.is_file() {
-            return Ok(false);
         }
         check_cancelled(cancellation)?;
-        let file = File::open(root).map_err(io_error)?;
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn grep_file(
+        &self,
+        file: CapabilityFile,
+        relative: &str,
+        pattern: &str,
+        case_sensitive: bool,
+        collection_limit: usize,
+        matches: &mut Vec<Value>,
+        cancellation: &dyn Fn() -> bool,
+    ) -> Result<bool, WorkspaceToolError> {
         check_cancelled(cancellation)?;
         let mut reader = CancellableLineReader::new(file);
         let mut raw_line = Vec::new();
@@ -2325,52 +3167,201 @@ impl WorkspaceTools {
         Ok(false)
     }
 
-    /// 规范化请求路径，并拒绝越出工作区或包含受保护组件的路径。
+    /// 解析一次经过严格验证的工作区相对路径。
     fn resolve_workspace_path(
         &self,
         path: &str,
         allow_protected: bool,
-    ) -> Result<PathBuf, WorkspaceToolError> {
-        let candidate = Path::new(path);
-        let joined = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            self.workspace_root.join(candidate)
-        };
-        let normalized = normalize_path(&joined);
-        let workspace = std::fs::canonicalize(&self.workspace_root).map_err(io_error)?;
-        let resolved = canonicalize_existing_or_parent(&normalized)?;
-        if !resolved.starts_with(&workspace) {
-            return Err(WorkspaceToolError::OutsideWorkspace(path.to_string()));
+    ) -> Result<CapabilityRelativePath, WorkspaceToolError> {
+        let path = CapabilityRelativePath::parse(path)?;
+        if !allow_protected && is_protected_path(&path.display) {
+            return Err(WorkspaceToolError::ProtectedPath(path.display));
         }
-        let relative = resolved
-            .strip_prefix(&workspace)
-            .unwrap_or(resolved.as_path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        let intended_relative = normalized
-            .strip_prefix(&workspace)
-            .unwrap_or(normalized.as_path())
-            .to_string_lossy()
-            .replace('\\', "/");
-        if !allow_protected
-            && (is_protected_path(&relative) || is_protected_path(&intended_relative))
-        {
-            return Err(WorkspaceToolError::ProtectedPath(intended_relative));
-        }
-        Ok(resolved)
+        Ok(path)
     }
 
-    fn relative_path(&self, path: &Path) -> String {
-        let workspace = std::fs::canonicalize(&self.workspace_root)
-            .unwrap_or_else(|_| normalize_path(&self.workspace_root));
-        normalize_path(path)
-            .strip_prefix(&workspace)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .trim_start_matches(['/', '\\'])
-            .replace('\\', "/")
+    fn resolve_optional_workspace_path(
+        &self,
+        path: Option<&str>,
+        allow_protected: bool,
+    ) -> Result<CapabilityRelativePath, WorkspaceToolError> {
+        match path {
+            Some(path) => self.resolve_workspace_path(path, allow_protected),
+            None => Ok(CapabilityRelativePath::root()),
+        }
     }
+}
+
+fn absolute_workspace_root(path: PathBuf) -> Result<PathBuf, WorkspaceToolError> {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .map_err(io_error)?
+    };
+    if absolute.is_absolute() {
+        if absolute
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            return Err(WorkspaceToolError::ReadFailed(
+                "workspace root contains an unsafe component".to_string(),
+            ));
+        }
+        Ok(absolute)
+    } else {
+        Err(WorkspaceToolError::ReadFailed(
+            "workspace root must be an absolute directory".to_string(),
+        ))
+    }
+}
+
+fn bind_workspace_root(workspace_root: &Path) -> Result<CapabilityDir, WorkspaceToolError> {
+    let (anchor, components) = workspace_anchor_and_components(workspace_root)?;
+    let mut capability =
+        CapabilityDir::open_ambient_dir(anchor, ambient_authority()).map_err(io_error)?;
+    let anchor_metadata = capability.dir_metadata().map_err(io_error)?;
+    if !anchor_metadata.is_dir() || metadata_is_symlink_or_reparse(&anchor_metadata) {
+        return Err(WorkspaceToolError::ReadFailed(
+            "workspace root anchor is not a regular directory".to_string(),
+        ));
+    }
+    for component in components {
+        capability = open_directory_component(&capability, &component, false)
+            .map_err(|error| map_capability_error(error, "workspace root"))?;
+    }
+    Ok(capability)
+}
+
+#[cfg(windows)]
+fn bind_workspace_namespace(
+    workspace_root: &Path,
+    capability: &CapabilityDir,
+) -> Result<(PathBuf, Vec<std::fs::File>), WorkspaceToolError> {
+    let (anchor, components) = workspace_anchor_and_components(workspace_root)?;
+    let mut current = anchor;
+    let mut guards = Vec::with_capacity(components.len().saturating_add(1));
+    guards.push(open_workspace_namespace_guard(&current)?);
+    for component in components {
+        current.push(component);
+        guards.push(open_workspace_namespace_guard(&current)?);
+    }
+    let final_guard = guards.last().ok_or_else(|| {
+        WorkspaceToolError::PathIdentityUnsupported(
+            "workspace root guard is unavailable".to_string(),
+        )
+    })?;
+    let capability_identity = directory_object_identity_key(capability)
+        .map_err(|error| map_capability_error(error, "workspace root"))?;
+    let guard_identity = standard_file_object_identity_key(final_guard)
+        .map_err(|error| map_capability_error(error, "workspace root"))?;
+    if capability_identity != guard_identity {
+        return Err(WorkspaceToolError::OutsideWorkspace(
+            "workspace root changed while it was being bound".to_string(),
+        ));
+    }
+    let actual_path = winx::file::get_file_path(final_guard).map_err(|_| {
+        WorkspaceToolError::PathIdentityUnsupported(
+            "workspace root handle path is unavailable".to_string(),
+        )
+    })?;
+    Ok((actual_path, guards))
+}
+
+#[cfg(windows)]
+fn open_workspace_namespace_guard(path: &Path) -> Result<std::fs::File, WorkspaceToolError> {
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let guard = options.open(path).map_err(io_error)?;
+    let metadata = guard.metadata().map_err(io_error)?;
+    if !metadata.is_dir()
+        || StdMetadataExt::file_attributes(&metadata) & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(WorkspaceToolError::OutsideWorkspace(
+            "workspace namespace contains a reparse point".to_string(),
+        ));
+    }
+    Ok(guard)
+}
+
+#[cfg(unix)]
+fn workspace_anchor_and_components(
+    workspace_root: &Path,
+) -> Result<(PathBuf, Vec<OsString>), WorkspaceToolError> {
+    let mut components = Vec::new();
+    for component in workspace_root.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => components.push(name.to_os_string()),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(WorkspaceToolError::ReadFailed(
+                    "workspace root contains an unsafe component".to_string(),
+                ));
+            }
+        }
+    }
+    Ok((PathBuf::from("/"), components))
+}
+
+#[cfg(windows)]
+fn workspace_anchor_and_components(
+    workspace_root: &Path,
+) -> Result<(PathBuf, Vec<OsString>), WorkspaceToolError> {
+    let mut components = workspace_root.components();
+    let prefix = match components.next() {
+        Some(Component::Prefix(prefix)) => prefix,
+        _ => {
+            return Err(WorkspaceToolError::ReadFailed(
+                "workspace root must use a drive or share anchor".to_string(),
+            ));
+        }
+    };
+    if !matches!(
+        prefix.kind(),
+        Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _)
+    ) {
+        return Err(WorkspaceToolError::ReadFailed(
+            "workspace root must use a drive or share anchor".to_string(),
+        ));
+    }
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(WorkspaceToolError::ReadFailed(
+            "workspace root must use an absolute drive or share path".to_string(),
+        ));
+    }
+    let mut anchor = prefix.as_os_str().to_os_string();
+    anchor.push("\\");
+    let mut relative_components = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => {
+                validate_windows_component(name)?;
+                relative_components.push(name.to_os_string());
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(WorkspaceToolError::ReadFailed(
+                    "workspace root contains an unsafe component".to_string(),
+                ));
+            }
+        }
+    }
+    Ok((PathBuf::from(anchor), relative_components))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn workspace_anchor_and_components(
+    _workspace_root: &Path,
+) -> Result<(PathBuf, Vec<OsString>), WorkspaceToolError> {
+    Err(WorkspaceToolError::ReadFailed(
+        "workspace filesystem capability is unsupported on this platform".to_string(),
+    ))
 }
 
 fn preflight_input<T>(input: &Value) -> Result<T, WorkspaceToolError>
@@ -2459,10 +3450,182 @@ impl<R: Read> CancellableLineReader<R> {
 
 #[derive(Debug, Clone)]
 struct DirectoryEntry {
-    path: PathBuf,
+    name: OsString,
     relative: String,
     is_dir: bool,
     is_symlink_or_reparse: bool,
+}
+
+struct BoundCommandCwd {
+    path: PathBuf,
+    _capability_guard: CapabilityDir,
+    #[cfg(windows)]
+    _namespace_guard: std::fs::File,
+    #[cfg(not(windows))]
+    _namespace_guard: CapabilityDir,
+}
+
+#[derive(Clone)]
+struct PreparedMutation {
+    path: CapabilityRelativePath,
+    relative: String,
+    original: String,
+    updated: String,
+    original_identity: Option<String>,
+}
+
+struct PublishedMutation {
+    prepared: PreparedMutation,
+    published_identity: String,
+}
+
+#[derive(Debug)]
+struct AtomicWriteFailure {
+    error: WorkspaceToolError,
+    published_identity: Option<String>,
+}
+
+impl AtomicWriteFailure {
+    fn published(error: WorkspaceToolError, published_identity: String) -> Self {
+        Self {
+            error,
+            published_identity: Some(published_identity),
+        }
+    }
+}
+
+impl From<WorkspaceToolError> for AtomicWriteFailure {
+    fn from(error: WorkspaceToolError) -> Self {
+        Self {
+            error,
+            published_identity: None,
+        }
+    }
+}
+
+struct AtomicTargetState {
+    identity: String,
+    permissions: CapabilityPermissions,
+}
+
+struct CreatedDirectory {
+    path: CapabilityRelativePath,
+    identity: String,
+    _guard: Option<CapabilityDir>,
+}
+
+/// 已验证的工作区相对路径；其 `relative`、显示值和重复键来自同一次解析。
+#[derive(Debug, Clone)]
+struct CapabilityRelativePath {
+    relative: PathBuf,
+    display: String,
+    key: String,
+}
+
+impl CapabilityRelativePath {
+    fn root() -> Self {
+        Self {
+            relative: PathBuf::from("."),
+            display: ".".to_string(),
+            key: ".".to_string(),
+        }
+    }
+
+    fn parse(path: &str) -> Result<Self, WorkspaceToolError> {
+        if path == "." {
+            return Ok(Self::root());
+        }
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+        {
+            return Err(WorkspaceToolError::OutsideWorkspace(
+                "absolute workspace path is not allowed".to_string(),
+            ));
+        }
+        if path.trim().is_empty() || path.contains('\0') || path.contains('\\') {
+            return Err(WorkspaceToolError::InvalidInput(
+                "workspace path must use non-empty slash-separated relative components".to_string(),
+            ));
+        }
+
+        let mut relative = PathBuf::new();
+        let mut component_count = 0usize;
+        for component in path.split('/') {
+            if component.is_empty() {
+                return Err(WorkspaceToolError::InvalidInput(
+                    "workspace path contains an empty component".to_string(),
+                ));
+            }
+            let component_path = Path::new(component);
+            let mut parsed = component_path.components();
+            let name = match (parsed.next(), parsed.next()) {
+                (Some(Component::Normal(name)), None) => name,
+                _ => {
+                    return Err(WorkspaceToolError::InvalidInput(
+                        "workspace path must contain only normal relative components".to_string(),
+                    ));
+                }
+            };
+            #[cfg(windows)]
+            validate_windows_component(name)?;
+            relative.push(name);
+            component_count = component_count.saturating_add(1);
+        }
+        if component_count == 0 {
+            return Err(WorkspaceToolError::InvalidInput(
+                "workspace path must not be empty".to_string(),
+            ));
+        }
+        let display = relative_display(&relative);
+        let key = relative_path_key(&relative);
+        Ok(Self {
+            relative,
+            display,
+            key,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ParentDirectory<'a> {
+    directory: ParentDirectoryKind<'a>,
+    name: OsString,
+    actual_relative: String,
+}
+
+#[derive(Debug)]
+enum ParentDirectoryKind<'a> {
+    Root(&'a CapabilityDir),
+    Opened(CapabilityDir),
+}
+
+impl ParentDirectory<'_> {
+    fn dir(&self) -> &CapabilityDir {
+        match &self.directory {
+            ParentDirectoryKind::Root(directory) => directory,
+            ParentDirectoryKind::Opened(directory) => directory,
+        }
+    }
+}
+
+struct OpenedWorkspacePath {
+    is_directory: bool,
+    file: Option<CapabilityFile>,
+}
+
+#[derive(Debug)]
+enum CapabilityAccessError {
+    Missing,
+    Unsafe,
+    Protected(String),
+    PathIdentityUnsupported,
+    NotDirectory,
+    NotRegularFile,
+    HardLinked,
+    Unsupported,
+    Io(std::io::Error),
 }
 
 struct ListState {
@@ -2526,20 +3689,521 @@ fn validate_nonempty_path(name: &str, path: &str) -> Result<(), WorkspaceToolErr
     Ok(())
 }
 
-fn metadata_is_symlink_or_reparse(metadata: &Metadata) -> bool {
+fn normal_component(component: Component<'_>) -> Result<&OsStr, CapabilityAccessError> {
+    match component {
+        Component::Normal(name) => Ok(name),
+        Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Err(CapabilityAccessError::Unsafe)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_component(name: &OsStr) -> Result<(), WorkspaceToolError> {
+    let name = name.to_string_lossy();
+    let upper = name.to_ascii_uppercase();
+    let stem = upper.split('.').next().unwrap_or_default();
+    let dos_device = matches!(
+        stem,
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM0"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT0"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "CONIN$"
+            | "CONOUT$"
+            | "CLOCK$"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
+    );
+    let short_name_alias = stem.rsplit_once('~').is_some_and(|(prefix, suffix)| {
+        !prefix.is_empty()
+            && !suffix.is_empty()
+            && suffix.len() <= 6
+            && suffix.chars().all(|character| character.is_ascii_digit())
+    });
+    if name.contains(':')
+        || name.ends_with('.')
+        || name.ends_with(' ')
+        || dos_device
+        || short_name_alias
+    {
+        return Err(WorkspaceToolError::InvalidInput(
+            "workspace path contains an unsupported Windows component".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn classify_io_error(error: std::io::Error) -> CapabilityAccessError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        CapabilityAccessError::Missing
+    } else if is_symlink_io_error(&error) {
+        CapabilityAccessError::Unsafe
+    } else {
+        CapabilityAccessError::Io(error)
+    }
+}
+
+fn map_capability_error(error: CapabilityAccessError, relative: &str) -> WorkspaceToolError {
+    match error {
+        CapabilityAccessError::Missing => {
+            WorkspaceToolError::ReadFailed("workspace path is unavailable".to_string())
+        }
+        CapabilityAccessError::Unsafe => WorkspaceToolError::OutsideWorkspace(relative.to_string()),
+        CapabilityAccessError::Protected(path) => WorkspaceToolError::ProtectedPath(path),
+        CapabilityAccessError::PathIdentityUnsupported => {
+            WorkspaceToolError::PathIdentityUnsupported(relative.to_string())
+        }
+        CapabilityAccessError::NotDirectory => {
+            WorkspaceToolError::ReadFailed("workspace path is not a directory".to_string())
+        }
+        CapabilityAccessError::NotRegularFile => {
+            WorkspaceToolError::ReadFailed("workspace path is not a regular file".to_string())
+        }
+        CapabilityAccessError::HardLinked => {
+            WorkspaceToolError::HardLinkRejected(relative.to_string())
+        }
+        CapabilityAccessError::Unsupported => {
+            WorkspaceToolError::PathIdentityUnsupported(relative.to_string())
+        }
+        CapabilityAccessError::Io(error) => io_error(error),
+    }
+}
+
+fn open_directory_component(
+    parent: &CapabilityDir,
+    name: &OsStr,
+    create_missing: bool,
+) -> Result<CapabilityDir, CapabilityAccessError> {
+    match parent.symlink_metadata(name) {
+        Ok(metadata) => {
+            if metadata_is_symlink_or_reparse(&metadata) {
+                return Err(CapabilityAccessError::Unsafe);
+            }
+            if !metadata.is_dir() {
+                return Err(CapabilityAccessError::NotDirectory);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+            match parent.create_dir(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(classify_io_error(error)),
+            }
+        }
+        Err(error) => return Err(classify_io_error(error)),
+    }
+    let directory = parent.open_dir_nofollow(name).map_err(classify_io_error)?;
+    let metadata = directory.dir_metadata().map_err(classify_io_error)?;
+    if metadata_is_symlink_or_reparse(&metadata) {
+        return Err(CapabilityAccessError::Unsafe);
+    }
+    if !metadata.is_dir() {
+        return Err(CapabilityAccessError::NotDirectory);
+    }
+    Ok(directory)
+}
+
+fn open_file_from_parent(
+    parent: &CapabilityDir,
+    name: &OsStr,
+) -> Result<CapabilityFile, CapabilityAccessError> {
+    let metadata = parent.symlink_metadata(name).map_err(classify_io_error)?;
+    if metadata_is_symlink_or_reparse(&metadata) {
+        return Err(CapabilityAccessError::Unsafe);
+    }
+    if !metadata.is_file() {
+        return Err(CapabilityAccessError::NotRegularFile);
+    }
+    let file = parent
+        .open_with(name, &nofollow_file_options(true, false, false))
+        .map_err(classify_io_error)?;
+    let metadata = file.metadata().map_err(classify_io_error)?;
+    if metadata_is_symlink_or_reparse(&metadata) {
+        return Err(CapabilityAccessError::Unsafe);
+    }
+    if !metadata.is_file() {
+        return Err(CapabilityAccessError::NotRegularFile);
+    }
+    reject_multiple_hard_links(&file)?;
+    Ok(file)
+}
+
+fn create_unique_temp_file(
+    parent: &CapabilityDir,
+) -> Result<(OsString, CapabilityFile), CapabilityAccessError> {
+    for _ in 0..MUTATION_TEMP_FILE_ATTEMPTS {
+        let sequence = MUTATION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_name = OsString::from(format!(
+            ".singularity-tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        match parent.open_with(&temp_name, &nofollow_file_options(false, true, true)) {
+            Ok(file) => return Ok((temp_name, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(classify_io_error(error)),
+        }
+    }
+    Err(CapabilityAccessError::Io(std::io::Error::other(
+        "failed to allocate workspace temporary file",
+    )))
+}
+
+fn cleanup_owned_file(
+    parent: &CapabilityDir,
+    name: &OsStr,
+    expected_identity: &str,
+    failure: WorkspaceToolError,
+) -> WorkspaceToolError {
+    let current_identity = match open_file_from_parent(parent, name)
+        .and_then(|file| file_object_identity_key(&file))
+    {
+        Ok(identity) => identity,
+        Err(CapabilityAccessError::Missing) => return failure,
+        Err(_) => {
+            return WorkspaceToolError::RollbackFailed(
+                "workspace temporary file identity check failed".to_string(),
+            );
+        }
+    };
+    if current_identity != expected_identity {
+        return WorkspaceToolError::RollbackFailed(
+            "workspace temporary file was replaced before cleanup".to_string(),
+        );
+    }
+    match parent.remove_file_or_symlink(name) {
+        Ok(()) => failure,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => failure,
+        Err(_) => WorkspaceToolError::RollbackFailed(
+            "workspace temporary file cleanup failed".to_string(),
+        ),
+    }
+}
+
+fn reject_multiple_hard_links(file: &CapabilityFile) -> Result<(), CapabilityAccessError> {
+    let links = file_link_count(file)?;
+    if links > 1 {
+        Err(CapabilityAccessError::HardLinked)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn file_link_count(file: &CapabilityFile) -> Result<u64, CapabilityAccessError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let links = file
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std()
+        .metadata()
+        .map(|metadata| metadata.nlink())
+        .map_err(|_| CapabilityAccessError::Unsupported)?;
+    if links == 0 {
+        Err(CapabilityAccessError::Unsupported)
+    } else {
+        Ok(links)
+    }
+}
+
+#[cfg(windows)]
+fn file_link_count(file: &CapabilityFile) -> Result<u64, CapabilityAccessError> {
+    let standard_file = file
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std();
+    let links = winx::winapi_util::file::information(&standard_file)
+        .map(|information| information.number_of_links())
+        .map_err(|_| CapabilityAccessError::Unsupported)?;
+    if links == 0 {
+        Err(CapabilityAccessError::Unsupported)
+    } else {
+        Ok(links)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_link_count(_file: &CapabilityFile) -> Result<u64, CapabilityAccessError> {
+    Err(CapabilityAccessError::Unsupported)
+}
+
+#[cfg(unix)]
+fn file_object_identity_key(file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std()
+        .metadata()
+        .map_err(CapabilityAccessError::Io)?;
+    if metadata.dev() == 0 && metadata.ino() == 0 {
+        return Err(CapabilityAccessError::Unsupported);
+    }
+    Ok(format!("object:{:x}:{:x}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_object_identity_key(file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
+    let standard_file = file
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std();
+    let information = winx::winapi_util::file::information(&standard_file)
+        .map_err(|_| CapabilityAccessError::Unsupported)?;
+    let volume = information.volume_serial_number();
+    let index = information.file_index();
+    if volume == 0 || index == 0 {
+        return Err(CapabilityAccessError::Unsupported);
+    }
+    Ok(format!("object:{volume:x}:{index:x}"))
+}
+
+#[cfg(windows)]
+fn directory_object_identity_key(
+    directory: &CapabilityDir,
+) -> Result<String, CapabilityAccessError> {
+    let standard_file = directory
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std_file();
+    standard_file_object_identity_key(&standard_file)
+}
+
+#[cfg(unix)]
+fn directory_object_identity_key(
+    directory: &CapabilityDir,
+) -> Result<String, CapabilityAccessError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = directory
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std_file()
+        .metadata()
+        .map_err(CapabilityAccessError::Io)?;
+    if metadata.dev() == 0 && metadata.ino() == 0 {
+        return Err(CapabilityAccessError::PathIdentityUnsupported);
+    }
+    Ok(format!("object:{:x}:{:x}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn directory_object_identity_key(
+    _directory: &CapabilityDir,
+) -> Result<String, CapabilityAccessError> {
+    Err(CapabilityAccessError::PathIdentityUnsupported)
+}
+
+#[cfg(windows)]
+fn standard_file_object_identity_key(
+    file: &std::fs::File,
+) -> Result<String, CapabilityAccessError> {
+    let information = winx::winapi_util::file::information(file)
+        .map_err(|_| CapabilityAccessError::PathIdentityUnsupported)?;
+    let volume = information.volume_serial_number();
+    let index = information.file_index();
+    if volume == 0 || index == 0 {
+        return Err(CapabilityAccessError::PathIdentityUnsupported);
+    }
+    Ok(format!("object:{volume:x}:{index:x}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_object_identity_key(_file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
+    Err(CapabilityAccessError::Unsupported)
+}
+
+#[cfg(windows)]
+// Handle paths are used only to recover the actual entry spelling for the
+// protected-path check. They never feed an open, traversal, or rename call.
+fn relative_path_from_handles(
+    root: &CapabilityDir,
+    directory: &CapabilityDir,
+) -> Result<String, CapabilityAccessError> {
+    let root_path = winx::file::get_file_path(
+        &root
+            .try_clone()
+            .map_err(CapabilityAccessError::Io)?
+            .into_std_file(),
+    )
+    .map_err(|_| CapabilityAccessError::PathIdentityUnsupported)?;
+    let directory_path = winx::file::get_file_path(
+        &directory
+            .try_clone()
+            .map_err(CapabilityAccessError::Io)?
+            .into_std_file(),
+    )
+    .map_err(|_| CapabilityAccessError::PathIdentityUnsupported)?;
+    relative_windows_handle_path(&root_path, &directory_path)
+}
+
+#[cfg(windows)]
+fn relative_path_from_file_handle(
+    root: &CapabilityDir,
+    file: &CapabilityFile,
+) -> Result<String, CapabilityAccessError> {
+    let root_path = winx::file::get_file_path(
+        &root
+            .try_clone()
+            .map_err(CapabilityAccessError::Io)?
+            .into_std_file(),
+    )
+    .map_err(|_| CapabilityAccessError::PathIdentityUnsupported)?;
+    let file_path = winx::file::get_file_path(
+        &file
+            .try_clone()
+            .map_err(CapabilityAccessError::Io)?
+            .into_std(),
+    )
+    .map_err(|_| CapabilityAccessError::PathIdentityUnsupported)?;
+    relative_windows_handle_path(&root_path, &file_path)
+}
+
+#[cfg(windows)]
+fn relative_windows_handle_path(
+    root: &Path,
+    object: &Path,
+) -> Result<String, CapabilityAccessError> {
+    let (root_keys, _) = windows_handle_components(root)?;
+    let (object_keys, object_names) = windows_handle_components(object)?;
+    if object_keys.len() < root_keys.len() || object_keys[..root_keys.len()] != root_keys[..] {
+        return Err(CapabilityAccessError::Unsafe);
+    }
+    let root_normal_count = root
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    let relative = object_names
+        .into_iter()
+        .skip(root_normal_count)
+        .collect::<PathBuf>();
+    Ok(relative_display(&relative))
+}
+
+#[cfg(windows)]
+fn windows_handle_components(
+    path: &Path,
+) -> Result<(Vec<String>, Vec<OsString>), CapabilityAccessError> {
+    let mut keys = Vec::new();
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => keys.push(format!(
+                "prefix:{}",
+                windows_case_key(&prefix.as_os_str().to_string_lossy())
+            )),
+            Component::RootDir => keys.push("root".to_string()),
+            Component::Normal(name) => {
+                keys.push(format!(
+                    "normal:{}",
+                    windows_case_key(&name.to_string_lossy())
+                ));
+                names.push(name.to_os_string());
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(CapabilityAccessError::PathIdentityUnsupported);
+            }
+        }
+    }
+    Ok((keys, names))
+}
+
+fn nofollow_file_options(read: bool, write: bool, create_new: bool) -> CapabilityOpenOptions {
+    let mut options = CapabilityOpenOptions::new();
+    options
+        .read(read)
+        .write(write)
+        .create_new(create_new)
+        .follow(FollowSymlinks::No);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+}
+
+fn is_symlink_io_error(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(ERROR_TOO_MANY_SYMLINKS) {
+        return true;
+    }
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(ERROR_STOPPED_ON_SYMLINK) {
+        return true;
+    }
+    false
+}
+
+fn join_relative_path(prefix: &str, name: &OsStr) -> String {
+    let name = name.to_string_lossy().replace('\\', "/");
+    if prefix.is_empty() || prefix == "." {
+        name
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+fn relative_display(relative: &Path) -> String {
+    let display = relative
+        .to_string_lossy()
+        .trim_start_matches(['/', '\\'])
+        .replace('\\', "/");
+    if display.is_empty() {
+        ".".to_string()
+    } else {
+        display
+    }
+}
+
+fn relative_path_key(relative: &Path) -> String {
+    let display = relative_display(relative);
+    #[cfg(windows)]
+    let normalized = windows_case_key(&display);
+    #[cfg(not(windows))]
+    let normalized = display;
+    format!("path:{normalized}")
+}
+
+#[cfg(windows)]
+fn windows_case_key(value: &str) -> String {
+    value.chars().flat_map(char::to_lowercase).collect()
+}
+
+fn metadata_is_symlink_or_reparse(metadata: &CapabilityMetadata) -> bool {
     metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata)
 }
 
 #[cfg(windows)]
-fn metadata_is_reparse_point(metadata: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+fn metadata_is_reparse_point(metadata: &CapabilityMetadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(not(windows))]
-fn metadata_is_reparse_point(_metadata: &Metadata) -> bool {
+fn metadata_is_reparse_point(_metadata: &CapabilityMetadata) -> bool {
     false
 }
 
@@ -2760,28 +4424,6 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf, WorkspaceToolError> {
-    if path.exists() {
-        return std::fs::canonicalize(path).map_err(io_error);
-    }
-    let mut missing_components = Vec::new();
-    let mut ancestor = path;
-    while !ancestor.exists() {
-        let name = ancestor.file_name().ok_or_else(|| {
-            WorkspaceToolError::ReadFailed(format!("path does not exist: {}", path.display()))
-        })?;
-        missing_components.push(name.to_owned());
-        ancestor = ancestor.parent().ok_or_else(|| {
-            WorkspaceToolError::ReadFailed(format!("path has no parent: {}", path.display()))
-        })?;
-    }
-    let mut resolved = std::fs::canonicalize(ancestor).map_err(io_error)?;
-    for component in missing_components.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(normalize_path(&resolved))
-}
-
 fn is_binary(bytes: &[u8]) -> bool {
     bytes.contains(&0)
 }
@@ -2798,86 +4440,6 @@ fn artifact_ref(prefix: &str, path: &str) -> String {
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect::<String>();
     format!("{prefix}{sanitized}")
-}
-
-/// 通过临时文件替换一个文件，使调用方能够回滚多文件变更。
-fn atomic_write(path: &Path, content: &str) -> Result<(), WorkspaceToolError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(io_error)?;
-    }
-    let (temp_path, mut temp_file) = create_unique_temp_file(path)?;
-    if let Err(error) = temp_file
-        .write_all(content.as_bytes())
-        .and_then(|()| temp_file.sync_all())
-    {
-        drop(temp_file);
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(io_error(error));
-    }
-    drop(temp_file);
-    std::fs::rename(&temp_path, path).map_err(|error| {
-        let _ = std::fs::remove_file(&temp_path);
-        io_error(error)
-    })
-}
-
-fn create_unique_temp_file(path: &Path) -> Result<(PathBuf, File), WorkspaceToolError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspace-file");
-    for _ in 0..MUTATION_TEMP_FILE_ATTEMPTS {
-        let sequence = MUTATION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp_path = parent.join(format!(
-            ".{file_name}.singularity-tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(file) => return Ok((temp_path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(io_error(error)),
-        }
-    }
-    Err(WorkspaceToolError::ReadFailed(format!(
-        "failed to allocate unique temporary file for {}",
-        path.display()
-    )))
-}
-
-fn existing_text_or_empty(path: &Path) -> Result<String, WorkspaceToolError> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => Ok(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(io_error(error)),
-    }
-}
-
-fn rollback_originals(
-    originals: &[(PathBuf, String, String, bool)],
-) -> Result<(), WorkspaceToolError> {
-    let mut failures = Vec::new();
-    for (path, relative, original, existed) in originals {
-        let result = if *existed {
-            atomic_write(path, original)
-        } else if path.exists() {
-            std::fs::remove_file(path).map_err(io_error)
-        } else {
-            Ok(())
-        };
-        if let Err(error) = result {
-            failures.push(format!("{relative}: {error}"));
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(WorkspaceToolError::RollbackFailed(failures.join("; ")))
-    }
 }
 
 fn io_error(error: std::io::Error) -> WorkspaceToolError {
@@ -2988,7 +4550,7 @@ mod cancellation_tests {
         let workspace = test_workspace("read-boundary");
         let content = "x".repeat(FILE_READ_CHUNK_SIZE.saturating_mul(3));
         std::fs::write(workspace.join("lines.txt"), content).expect("write lines");
-        let tools = WorkspaceTools::new(&workspace);
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let checks = AtomicUsize::new(0);
 
         let result = tools.read_with_cancellation_check(
@@ -3022,7 +4584,7 @@ mod cancellation_tests {
             std::fs::write(directory.join("nested").join("deep.txt"), "deep\n")
                 .expect("write deep file");
         }
-        let tools = WorkspaceTools::new(&workspace);
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let checks = AtomicUsize::new(0);
 
         let result = tools.list_with_cancellation_check(
@@ -3054,7 +4616,7 @@ mod cancellation_tests {
                 .expect("write grep file");
             }
         }
-        let tools = WorkspaceTools::new(&workspace);
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let checks = AtomicUsize::new(0);
 
         let result = tools.grep_with_cancellation_check(
@@ -3069,6 +4631,275 @@ mod cancellation_tests {
 
         assert!(matches!(result, Err(WorkspaceToolError::Cancelled)));
         assert!(checks.load(Ordering::SeqCst) >= 45);
+        remove_workspace(&workspace);
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+
+    fn test_workspace(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "singularity-tools-mutation-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create test workspace");
+        path
+    }
+
+    fn remove_workspace(path: &Path) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn atomic_write_rejects_target_replacement_and_cleans_its_temp_file() {
+        let workspace = test_workspace("target-replacement");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_identity) = tools.existing_text_or_empty(&path).expect("read original");
+
+        let result =
+            tools.atomic_write_with_hook(&path, "after", original_identity.as_deref(), |_| {
+                std::fs::remove_file(&target).expect("remove original");
+                std::fs::write(&target, "concurrent").expect("write concurrent target");
+            });
+
+        assert!(matches!(
+            result,
+            Err(AtomicWriteFailure {
+                error: WorkspaceToolError::ConcurrentMutation(_),
+                published_identity: None,
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "concurrent");
+        assert!(
+            std::fs::read_dir(&workspace)
+                .expect("read workspace")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("singularity-tmp"))
+        );
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn atomic_write_does_not_delete_a_replaced_temp_source() {
+        let workspace = test_workspace("temp-replacement");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_identity) = tools.existing_text_or_empty(&path).expect("read original");
+        let mut replacement_path = None;
+
+        let result = tools.atomic_write_with_hook(
+            &path,
+            "after",
+            original_identity.as_deref(),
+            |temporary_name| {
+                let temporary_path = workspace.join(temporary_name);
+                std::fs::remove_file(&temporary_path).expect("remove owned temp");
+                std::fs::write(&temporary_path, "concurrent temp").expect("write replacement temp");
+                replacement_path = Some(temporary_path);
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(AtomicWriteFailure {
+                error: WorkspaceToolError::ConcurrentMutation(_),
+                published_identity: None,
+            })
+        ));
+        let replacement_path = replacement_path.expect("replacement path");
+        assert_eq!(
+            std::fs::read_to_string(&replacement_path).unwrap(),
+            "concurrent temp"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn rollback_restores_only_published_mutations() {
+        let workspace = test_workspace("published-rollback");
+        std::fs::write(workspace.join("existing.txt"), "before").expect("write existing target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let existing_path = CapabilityRelativePath::parse("existing.txt").expect("existing path");
+        let created_path = CapabilityRelativePath::parse("created.txt").expect("created path");
+        let (original, original_identity) = tools
+            .existing_text_or_empty(&existing_path)
+            .expect("read existing");
+        let existing_published = tools
+            .atomic_write(&existing_path, "after", original_identity.as_deref())
+            .expect("publish existing");
+        let created_published = tools
+            .atomic_write(&created_path, "created", None)
+            .expect("publish created");
+        let published = vec![
+            PublishedMutation {
+                prepared: PreparedMutation {
+                    path: existing_path,
+                    relative: "existing.txt".to_string(),
+                    original,
+                    updated: "after".to_string(),
+                    original_identity,
+                },
+                published_identity: existing_published,
+            },
+            PublishedMutation {
+                prepared: PreparedMutation {
+                    path: created_path,
+                    relative: "created.txt".to_string(),
+                    original: String::new(),
+                    updated: "created".to_string(),
+                    original_identity: None,
+                },
+                published_identity: created_published,
+            },
+        ];
+
+        tools
+            .rollback_published(&published)
+            .expect("rollback published mutations");
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("existing.txt")).unwrap(),
+            "before"
+        );
+        assert!(!workspace.join("created.txt").exists());
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn post_publish_failure_includes_current_mutation_in_safe_rollback() {
+        let workspace = test_workspace("post-publish-rollback");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (original, original_identity) =
+            tools.existing_text_or_empty(&path).expect("read original");
+
+        let failure = tools
+            .atomic_write_with_hooks(
+                &path,
+                "published",
+                original_identity.as_deref(),
+                |_| {},
+                || {
+                    Err(WorkspaceToolError::ConcurrentMutation(
+                        "target.txt".to_string(),
+                    ))
+                },
+            )
+            .expect_err("post-publish verification fails");
+        let published_identity = failure
+            .published_identity
+            .expect("failure retains published identity");
+        let published = vec![PublishedMutation {
+            prepared: PreparedMutation {
+                path,
+                relative: "target.txt".to_string(),
+                original,
+                updated: "published".to_string(),
+                original_identity,
+            },
+            published_identity,
+        }];
+
+        tools
+            .rollback_published(&published)
+            .expect("rollback current published mutation");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn rollback_preserves_a_concurrently_replaced_published_target() {
+        let workspace = test_workspace("rollback-concurrent");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (original, original_identity) =
+            tools.existing_text_or_empty(&path).expect("read original");
+        let published_identity = tools
+            .atomic_write(&path, "published", original_identity.as_deref())
+            .expect("publish mutation");
+        std::fs::remove_file(&target).expect("remove published target");
+        std::fs::write(&target, "concurrent").expect("write concurrent target");
+        let published = vec![PublishedMutation {
+            prepared: PreparedMutation {
+                path,
+                relative: "target.txt".to_string(),
+                original,
+                updated: "published".to_string(),
+                original_identity,
+            },
+            published_identity,
+        }];
+
+        assert!(matches!(
+            tools.rollback_published(&published),
+            Err(WorkspaceToolError::RollbackFailed(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "concurrent");
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn failed_batch_cleanup_removes_only_its_nested_directories() {
+        let workspace = test_workspace("directory-cleanup");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("new/nested/file.txt").expect("relative path");
+        let mut created = Vec::new();
+
+        tools
+            .ensure_parent_directories(&path, &mut created)
+            .expect("create parents");
+        assert!(workspace.join("new/nested").is_dir());
+        tools
+            .remove_created_directories(&mut created)
+            .expect("remove created parents");
+
+        assert!(!workspace.join("new").exists());
+        remove_workspace(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_patch_preserves_existing_unix_file_mode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let workspace = test_workspace("unix-mode");
+        let target = workspace.join("script.sh");
+        std::fs::write(&target, "#!/bin/sh\necho before\n").expect("write script");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751))
+            .expect("set executable mode");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+
+        tools
+            .patch(
+                WorkspacePatch {
+                    changes: vec![WorkspacePatchChange {
+                        path: "script.sh".to_string(),
+                        expected: Some("before".to_string()),
+                        replacement: "after".to_string(),
+                    }],
+                },
+                &ToolBrokerDecision::Allow,
+            )
+            .expect("patch script");
+
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o751);
         remove_workspace(&workspace);
     }
 }

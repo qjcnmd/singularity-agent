@@ -4157,6 +4157,18 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         AgentLoopToolError::Workspace(WorkspaceToolError::BinaryPattern) => {
             (ToolFailureKind::Execution, "binary_pattern")
         }
+        AgentLoopToolError::Workspace(WorkspaceToolError::ConcurrentMutation(_)) => (
+            ToolFailureKind::Infrastructure,
+            "workspace_concurrent_mutation",
+        ),
+        AgentLoopToolError::Workspace(WorkspaceToolError::HardLinkRejected(_)) => (
+            ToolFailureKind::WorkspaceBoundary,
+            "workspace_hard_link_rejected",
+        ),
+        AgentLoopToolError::Workspace(WorkspaceToolError::PathIdentityUnsupported(_)) => (
+            ToolFailureKind::Capability,
+            "workspace_identity_unsupported",
+        ),
         AgentLoopToolError::Workspace(WorkspaceToolError::ReadFailed(_)) => {
             (ToolFailureKind::Execution, "tool_read_failed")
         }
@@ -4188,6 +4200,15 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         AgentLoopToolError::Workspace(WorkspaceToolError::Cancelled) => "tool execution cancelled",
         AgentLoopToolError::Workspace(WorkspaceToolError::RollbackFailed(_)) => {
             "workspace rollback failed"
+        }
+        AgentLoopToolError::Workspace(WorkspaceToolError::ConcurrentMutation(_)) => {
+            "workspace target changed during execution"
+        }
+        AgentLoopToolError::Workspace(WorkspaceToolError::HardLinkRejected(_)) => {
+            "workspace hard-linked file is not trusted"
+        }
+        AgentLoopToolError::Workspace(WorkspaceToolError::PathIdentityUnsupported(_)) => {
+            "workspace object identity cannot be verified"
         }
         _ => {
             return ToolOutput::failure_with_kind(
@@ -4386,6 +4407,39 @@ mod cancellation_tests {
         assert_eq!(result.error_code.as_deref(), Some("tool_cancelled"));
         assert_eq!(result.failure_kind, Some(ToolFailureKind::Cancelled));
         assert_eq!(result.to_message_payload()["ok"], false);
+    }
+
+    #[test]
+    fn workspace_identity_failures_map_to_stable_safe_tool_results() {
+        let cases = [
+            (
+                WorkspaceToolError::ConcurrentMutation("secret-target".to_string()),
+                ToolFailureKind::Infrastructure,
+                "workspace_concurrent_mutation",
+                "workspace target changed during execution",
+            ),
+            (
+                WorkspaceToolError::HardLinkRejected("secret-target".to_string()),
+                ToolFailureKind::WorkspaceBoundary,
+                "workspace_hard_link_rejected",
+                "workspace hard-linked file is not trusted",
+            ),
+            (
+                WorkspaceToolError::PathIdentityUnsupported("secret-target".to_string()),
+                ToolFailureKind::Capability,
+                "workspace_identity_unsupported",
+                "workspace object identity cannot be verified",
+            ),
+        ];
+
+        for (error, expected_kind, expected_code, expected_summary) in cases {
+            let output = workspace_tool_failure(AgentLoopToolError::Workspace(error));
+            assert!(!output.ok);
+            assert_eq!(output.failure_kind, Some(expected_kind));
+            assert_eq!(output.error_code.as_deref(), Some(expected_code));
+            assert_eq!(output.content["summary"], expected_summary);
+            assert!(!output.content.to_string().contains("secret-target"));
+        }
     }
 
     #[test]

@@ -1628,6 +1628,8 @@ dependencies = [
 name = "singularity_tools"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "schemars",
  "serde",
  "serde_json",
@@ -1635,6 +1637,7 @@ dependencies = [
  "singularity_core",
  "singularity_policy",
  "singularity_sandbox",
+ "winx",
 ]
 
 [[package]]

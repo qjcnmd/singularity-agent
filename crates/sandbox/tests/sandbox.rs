@@ -2,13 +2,13 @@
 
 use schemars::schema_for;
 use singularity_core::CancellationToken;
+#[cfg(windows)]
+use singularity_sandbox::SandboxNetworkMode;
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
     CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
     WindowsSandboxBackend, bound_command_output,
 };
-#[cfg(windows)]
-use singularity_sandbox::{SandboxFilesystemMode, SandboxNetworkMode};
 use std::path::Path;
 
 const SANDBOX_SRC: &str = include_str!("../src/lib.rs");
@@ -363,32 +363,6 @@ fn windows_backend_reports_missing_host_tool_as_executable_unavailable() {
         result.stderr_preview,
         "sandbox command executable unavailable: required executable 'singularity-tool-that-does-not-exist' was not found on host PATH"
     );
-    assert!(!result.sandbox.local_process_fallback);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_backend_rejects_danger_full_access_without_implicit_fallback() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let mut request = CommandRequest::project_verification(
-        "command_danger",
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo denied".to_string(),
-        ],
-        path_str(workspace.path()),
-        path_str(workspace.path()),
-    );
-    request.filesystem.mode = SandboxFilesystemMode::DangerFullAccess;
-
-    let result = WindowsSandboxBackend::new().execute(&request);
-
-    assert_eq!(
-        result.execution_status,
-        CommandExecutionStatus::BackendError
-    );
-    assert!(result.stderr_preview.contains("danger-full-access"));
     assert!(!result.sandbox.local_process_fallback);
 }
 

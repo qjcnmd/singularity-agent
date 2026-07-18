@@ -528,7 +528,7 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
     std::fs::write(workspace.join("binary.bin"), b"abc\0def").expect("write binary");
     let outside = workspace.parent().unwrap().join("outside.txt");
     std::fs::write(&outside, "outside").expect("write outside");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let read = tools
         .read(ReadToolInput {
@@ -666,7 +666,7 @@ fn workspace_read_list_and_grep_pre_cancelled_skip_io() {
     let workspace = test_workspace("pre-cancelled-read-list-grep");
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     assert!(matches!(
         tools.read_cancellable(
@@ -712,7 +712,7 @@ fn workspace_read_list_and_grep_pre_cancelled_skip_io() {
 fn workspace_read_supports_line_ranges_pagination_and_strict_limits() {
     let workspace = test_workspace("read-lines");
     std::fs::write(workspace.join("lines.txt"), "one\ntwo\nthree\nfour\n").expect("write lines");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let page = tools
         .read(ReadToolInput {
@@ -820,7 +820,7 @@ fn workspace_list_is_sorted_recursive_depth_bounded_and_truncated_correctly() {
     )
     .expect("write deep");
     std::fs::write(workspace.join(".env"), "TOKEN=secret").expect("write env");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let direct = tools
         .list(ListToolInput {
@@ -930,7 +930,7 @@ fn workspace_list_skips_symlinks_and_protected_paths() {
         panic!("create symlink: {error}");
     }
 
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
     let listed = tools
         .list(ListToolInput {
             path: None,
@@ -953,7 +953,7 @@ fn workspace_grep_supports_case_control_and_deterministic_order() {
     let workspace = test_workspace("grep-case");
     std::fs::write(workspace.join("b.txt"), "Needle\n").expect("write b");
     std::fs::write(workspace.join("a.txt"), "needle\nNEEDLE\n").expect("write a");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let sensitive = tools
         .grep(GrepToolInput {
@@ -1138,7 +1138,7 @@ fn workspace_grep_only_marks_truncated_after_an_extra_cross_file_match() {
     let workspace = test_workspace("grep-exact-cross-file-limit");
     std::fs::write(workspace.join("a.txt"), "needle\n").expect("write first file");
     std::fs::write(workspace.join("b.txt"), "no match\n").expect("write second file");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let exact = tools
         .grep(GrepToolInput {
@@ -1332,7 +1332,7 @@ fn workspace_tool_inputs_reject_unknown_fields_and_empty_mutations() {
     assert!(default_grep.case_sensitive);
 
     let workspace = test_workspace("invalid-inputs");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
     assert!(matches!(
         tools.read(ReadToolInput {
             path: " ".to_string(),
@@ -1431,7 +1431,7 @@ fn workspace_tools_reject_symlink_escape() {
         }
         panic!("create symlink: {error}");
     }
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     assert!(matches!(
         tools.read(ReadToolInput {
@@ -1459,6 +1459,385 @@ fn workspace_tools_reject_symlink_escape() {
 }
 
 #[test]
+fn workspace_paths_reject_ambient_and_aliasing_forms() {
+    let workspace = test_workspace("strict-relative-paths");
+    std::fs::write(workspace.join("file.txt"), "content").expect("write file");
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+    let mut invalid_paths = vec![
+        String::new(),
+        " ".to_string(),
+        "./file.txt".to_string(),
+        "../file.txt".to_string(),
+        "nested/../file.txt".to_string(),
+        "nested//file.txt".to_string(),
+    ];
+    #[cfg(windows)]
+    invalid_paths.extend(
+        [
+            ".env::$DATA",
+            ".git.",
+            "foo/foo.",
+            "foo ",
+            "CON",
+            "foo/CON.txt",
+            "PROGRA~1/file.txt",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+
+    for path in invalid_paths {
+        assert!(
+            matches!(
+                tools.read(ReadToolInput {
+                    path: path.clone(),
+                    max_chars: None,
+                    line_start: None,
+                    line_end: None,
+                }),
+                Err(WorkspaceToolError::InvalidInput(_))
+            ),
+            "path should be rejected before capability I/O: {path:?}"
+        );
+    }
+    for path in ["/file.txt", path_str(&workspace.join("file.txt"))] {
+        assert!(matches!(
+            tools.read(ReadToolInput {
+                path: path.to_string(),
+                max_chars: None,
+                line_start: None,
+                line_end: None,
+            }),
+            Err(WorkspaceToolError::OutsideWorkspace(_))
+        ));
+    }
+
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_patch_rejects_final_reparse_after_preflight() {
+    let workspace = test_workspace("patch-final-reparse");
+    let outside = workspace.with_file_name(format!(
+        "{}-outside.txt",
+        workspace
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+    ));
+    let target = workspace.join("target.txt");
+    std::fs::write(&outside, "outside").expect("write outside");
+    std::fs::write(&target, "before").expect("write target");
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+    let patch_input = serde_json::json!({
+        "changes": [{
+            "path": "target.txt",
+            "expected": "before",
+            "replacement": "after"
+        }]
+    });
+    tools
+        .preflight("patch", &patch_input)
+        .expect("preflight regular target");
+    std::fs::remove_file(&target).expect("remove regular target");
+    if let Err(error) = create_file_symlink(&outside, &target) {
+        if symlink_is_not_available(&error) {
+            remove_workspace(&workspace);
+            let _ = std::fs::remove_file(&outside);
+            return;
+        }
+        panic!("create final symlink: {error}");
+    }
+
+    assert!(matches!(
+        tools.patch(
+            WorkspacePatch {
+                changes: vec![WorkspacePatchChange {
+                    path: "target.txt".to_string(),
+                    expected: Some("before".to_string()),
+                    replacement: "after".to_string(),
+                }],
+            },
+            &ToolBrokerDecision::Allow,
+        ),
+        Err(WorkspaceToolError::OutsideWorkspace(_))
+    ));
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside");
+    drop(tools);
+    remove_workspace(&workspace);
+    let _ = std::fs::remove_file(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_root_binding_rejects_symlink_components() {
+    let actual = test_workspace("symlink-root");
+    let link = actual.with_file_name(format!(
+        "{}-link",
+        actual
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+    ));
+    if let Err(error) = create_dir_symlink(&actual, &link) {
+        if symlink_is_not_available(&error) {
+            remove_workspace(&actual);
+            return;
+        }
+        panic!("create root symlink: {error}");
+    }
+
+    assert!(WorkspaceTools::new(&link).is_err());
+    let _ = std::fs::remove_dir(&link);
+    remove_workspace(&actual);
+}
+
+#[cfg(windows)]
+#[test]
+fn workspace_root_binding_rejects_junction_components() {
+    let actual = test_workspace("junction-root");
+    let link = actual.with_file_name(format!(
+        "{}-link",
+        actual
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+    ));
+    if create_dir_junction(&actual, &link).is_err() {
+        remove_workspace(&actual);
+        return;
+    }
+
+    assert!(WorkspaceTools::new(&link).is_err());
+    let _ = std::fs::remove_dir(&link);
+    remove_workspace(&actual);
+}
+
+#[test]
+fn workspace_capability_survives_workspace_path_replacement() {
+    let workspace = test_workspace("capability-path-replacement");
+    let moved_workspace = workspace.with_file_name(format!(
+        "{}-moved",
+        workspace
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+    ));
+    std::fs::write(workspace.join("value.txt"), "bound\n").expect("write bound value");
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace capability");
+
+    if let Err(error) = std::fs::rename(&workspace, &moved_workspace) {
+        drop(tools);
+        remove_workspace(&workspace);
+        remove_workspace(&moved_workspace);
+        if cfg!(windows)
+            && (matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) || error.raw_os_error() == Some(32))
+        {
+            return;
+        }
+        panic!("replace workspace path: {error}");
+    }
+    std::fs::create_dir(&workspace).expect("create replacement workspace");
+    std::fs::write(workspace.join("value.txt"), "ambient replacement\n")
+        .expect("write replacement value");
+
+    assert!(matches!(
+        tools
+            .clone()
+            .with_sandbox_backend(RecordingSandboxBackend)
+            .command(CommandToolInput {
+                command: "must-not-run".to_string(),
+                cwd: None,
+                timeout_seconds: Some(5),
+            }),
+        Err(WorkspaceToolError::OutsideWorkspace(_))
+    ));
+
+    let read = tools
+        .read(ReadToolInput {
+            path: "value.txt".to_string(),
+            max_chars: None,
+            line_start: None,
+            line_end: None,
+        })
+        .expect("read bound value");
+    assert_eq!(read.content["preview"], "bound\n");
+    tools
+        .edit(
+            EditToolInput {
+                path: "value.txt".to_string(),
+                expected: "bound".to_string(),
+                replacement: "updated".to_string(),
+            },
+            &ToolBrokerDecision::Allow,
+        )
+        .expect("edit bound value");
+    assert_eq!(
+        std::fs::read_to_string(moved_workspace.join("value.txt")).expect("read moved value"),
+        "updated\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("value.txt")).expect("read replacement value"),
+        "ambient replacement\n"
+    );
+
+    drop(tools);
+    remove_workspace(&workspace);
+    remove_workspace(&moved_workspace);
+}
+
+#[test]
+fn workspace_tools_reject_hard_linked_files_before_read_or_mutation() {
+    let workspace = test_workspace("hard-link-boundary");
+    let target = workspace.join("target.txt");
+    let outside = workspace.with_file_name(format!(
+        "{}-outside.txt",
+        workspace
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+    ));
+    std::fs::write(&target, "protected content\n").expect("write target");
+    if let Err(error) = std::fs::hard_link(&target, &outside) {
+        if hard_link_is_not_available(&error) {
+            remove_workspace(&workspace);
+            let _ = std::fs::remove_file(&outside);
+            return;
+        }
+        panic!("create hard link: {error}");
+    }
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+
+    assert!(matches!(
+        tools.read(ReadToolInput {
+            path: "target.txt".to_string(),
+            max_chars: None,
+            line_start: None,
+            line_end: None,
+        }),
+        Err(WorkspaceToolError::HardLinkRejected(_))
+    ));
+    assert!(matches!(
+        tools.edit(
+            EditToolInput {
+                path: "target.txt".to_string(),
+                expected: "protected".to_string(),
+                replacement: "changed".to_string(),
+            },
+            &ToolBrokerDecision::Allow
+        ),
+        Err(WorkspaceToolError::HardLinkRejected(_))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "protected content\n"
+    );
+
+    drop(tools);
+    remove_workspace(&workspace);
+    let _ = std::fs::remove_file(&outside);
+}
+
+#[cfg(windows)]
+#[test]
+fn workspace_patch_rejects_unicode_case_aliases_before_writing() {
+    let workspace = test_workspace("unicode-case-alias");
+    std::fs::write(workspace.join("Ä.txt"), "before").expect("write unicode target");
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+
+    let existing = tools.patch(
+        WorkspacePatch {
+            changes: vec![
+                WorkspacePatchChange {
+                    path: "Ä.txt".to_string(),
+                    expected: None,
+                    replacement: "first".to_string(),
+                },
+                WorkspacePatchChange {
+                    path: "ä.TXT".to_string(),
+                    expected: None,
+                    replacement: "second".to_string(),
+                },
+            ],
+        },
+        &ToolBrokerDecision::Allow,
+    );
+    assert!(matches!(
+        existing,
+        Err(WorkspaceToolError::InvalidInput(message)) if message.contains("duplicate")
+    ));
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("Ä.txt")).unwrap(),
+        "before"
+    );
+
+    let missing = tools.patch(
+        WorkspacePatch {
+            changes: vec![
+                WorkspacePatchChange {
+                    path: "Ä-new.txt".to_string(),
+                    expected: None,
+                    replacement: "first".to_string(),
+                },
+                WorkspacePatchChange {
+                    path: "ä-NEW.TXT".to_string(),
+                    expected: None,
+                    replacement: "second".to_string(),
+                },
+            ],
+        },
+        &ToolBrokerDecision::Allow,
+    );
+    assert!(matches!(
+        missing,
+        Err(WorkspaceToolError::InvalidInput(message)) if message.contains("duplicate")
+    ));
+    assert!(!workspace.join("Ä-new.txt").exists());
+    remove_workspace(&workspace);
+}
+
+#[cfg(windows)]
+#[test]
+fn workspace_tools_reject_junction_escape() {
+    let workspace = test_workspace("junction-escape");
+    let outside_dir = workspace.with_file_name(format!(
+        "{}-outside",
+        workspace
+            .file_name()
+            .expect("workspace name")
+            .to_string_lossy()
+    ));
+    std::fs::create_dir_all(&outside_dir).expect("create outside directory");
+    std::fs::write(outside_dir.join("payload.txt"), "outside payload")
+        .expect("write outside payload");
+    let link = workspace.join("linked-dir");
+    if create_dir_junction(&outside_dir, &link).is_err() {
+        remove_workspace(&workspace);
+        remove_workspace(&outside_dir);
+        return;
+    }
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+
+    assert!(matches!(
+        tools.read(ReadToolInput {
+            path: "linked-dir/payload.txt".to_string(),
+            max_chars: None,
+            line_start: None,
+            line_end: None,
+        }),
+        Err(WorkspaceToolError::OutsideWorkspace(_))
+    ));
+
+    drop(tools);
+    std::fs::remove_dir(&link).expect("remove junction");
+    remove_workspace(&workspace);
+    remove_workspace(&outside_dir);
+}
+
+#[test]
 fn workspace_grep_skips_symlinked_directories() {
     let workspace = test_workspace("grep-symlink-dir");
     let outside_dir = workspace.parent().unwrap().join("outside-dir");
@@ -1478,7 +1857,7 @@ fn workspace_grep_skips_symlinked_directories() {
     std::fs::write(inside_dir.join("match.txt"), "inside secret").expect("write inside");
     let inside_link = workspace.join("inside-link");
     create_dir_symlink(&inside_dir, &inside_link).expect("create inside dir symlink");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let matches = tools
         .grep(GrepToolInput {
@@ -1508,7 +1887,7 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
     std::fs::write(&app, "status = old\n").expect("write app");
     std::fs::write(&other, "other\n").expect("write other");
     std::fs::write(workspace.join(".env"), "TOKEN=secret").expect("write env");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let denied = tools.edit(
         EditToolInput {
@@ -1685,7 +2064,7 @@ fn workspace_patch_rejects_duplicate_canonical_targets_before_writing() {
     let workspace = test_workspace("patch-duplicate-target");
     let target = workspace.join("app.txt");
     std::fs::write(&target, "before").expect("write target");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let result = tools.patch(
         WorkspacePatch {
@@ -1717,7 +2096,7 @@ fn workspace_patch_uses_unique_temp_files_without_overwriting_user_files() {
     let legacy_temp = workspace.join("app.tmp-write");
     std::fs::write(&target, "before").expect("write target");
     std::fs::write(&legacy_temp, "user-owned").expect("write user temp");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     tools
         .patch(
@@ -1738,10 +2117,35 @@ fn workspace_patch_uses_unique_temp_files_without_overwriting_user_files() {
 }
 
 #[test]
+fn workspace_patch_temp_name_does_not_exceed_a_valid_long_target_name() {
+    let workspace = test_workspace("patch-long-name");
+    let file_name = format!("{}.txt", "x".repeat(200));
+    let target = workspace.join(&file_name);
+    std::fs::write(&target, "before").expect("write long-name target");
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+
+    tools
+        .patch(
+            WorkspacePatch {
+                changes: vec![WorkspacePatchChange {
+                    path: file_name,
+                    expected: Some("before".to_string()),
+                    replacement: "after".to_string(),
+                }],
+            },
+            &ToolBrokerDecision::Allow,
+        )
+        .expect("patch long-name target");
+
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "after");
+    remove_workspace(&workspace);
+}
+
+#[test]
 fn workspace_patch_does_not_treat_unreadable_existing_path_as_empty_file() {
     let workspace = test_workspace("patch-unreadable-existing");
     std::fs::create_dir(workspace.join("target")).expect("create target dir");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     assert!(matches!(
         tools.patch(
@@ -1768,7 +2172,7 @@ fn workspace_patch_rolls_back_created_files_on_later_failure() {
     let created = workspace.join("created.txt");
     std::fs::write(&existing, "before").expect("write existing");
     std::fs::create_dir(workspace.join("blocked.txt")).expect("create blocked dir");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let failed_patch = tools.patch(
         WorkspacePatch {
@@ -1851,7 +2255,7 @@ fn command_tool_defaults_to_bounded_cwd_and_timeout() {
 #[test]
 fn workspace_command_tool_fails_closed_without_sandbox_backend() {
     let workspace = test_workspace("command-no-backend");
-    let tools = WorkspaceTools::new(&workspace);
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
 
     let result = tools.command(CommandToolInput {
         command: "must-not-run".to_string(),
@@ -1867,9 +2271,24 @@ fn workspace_command_tool_fails_closed_without_sandbox_backend() {
 }
 
 #[test]
+fn workspace_tools_construction_fails_closed_for_a_missing_root() {
+    let workspace = test_workspace("missing-root");
+    let missing = workspace.join("missing");
+
+    assert!(matches!(
+        WorkspaceTools::new(&missing),
+        Err(WorkspaceToolError::ReadFailed(_))
+    ));
+
+    remove_workspace(&workspace);
+}
+
+#[test]
 fn workspace_command_tool_rejects_non_strict_backend_without_execution() {
     let workspace = test_workspace("command-non-strict");
-    let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(NonStrictSandboxBackend);
+    let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
+        .with_sandbox_backend(NonStrictSandboxBackend);
 
     let result = tools.command(CommandToolInput {
         command: "must-not-run".to_string(),
@@ -1887,7 +2306,9 @@ fn workspace_command_tool_rejects_non_strict_backend_without_execution() {
 #[test]
 fn workspace_command_tool_uses_strict_backend_and_returns_safe_output() {
     let workspace = test_workspace("command-strict");
-    let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(RecordingSandboxBackend);
+    let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
+        .with_sandbox_backend(RecordingSandboxBackend);
 
     let result = tools
         .command(CommandToolInput {
@@ -1962,6 +2383,7 @@ fn tool_result_payload_preserves_safe_structured_content() {
 fn workspace_command_tool_propagates_evaluation_environment_policy() {
     let workspace = test_workspace("command-evaluation-environment");
     let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
         .with_sandbox_backend(EvaluationEnvironmentBackend)
         .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated);
 
@@ -1980,7 +2402,9 @@ fn workspace_command_tool_propagates_evaluation_environment_policy() {
 #[test]
 fn workspace_command_tool_records_fixed_read_only_offline_audit() {
     let workspace = test_workspace("command-read-only-audit");
-    let tools = WorkspaceTools::new(&workspace).with_sandbox_backend(DangerAuditSandboxBackend);
+    let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
+        .with_sandbox_backend(DangerAuditSandboxBackend);
 
     let result = tools
         .command(CommandToolInput {
@@ -2218,6 +2642,29 @@ fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(target, link)
 }
 
+#[cfg(windows)]
+fn create_dir_junction(target: &Path, link: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt as _;
+
+    let link = format!("\"{}\"", link.display());
+    let target = format!("\"{}\"", target.display());
+    let output = std::process::Command::new("cmd.exe")
+        .raw_arg("/d /c ")
+        .raw_arg("mklink")
+        .raw_arg("/J")
+        .raw_arg(&link)
+        .raw_arg(&target)
+        .output()?;
+    if output.status.success() && std::fs::symlink_metadata(link.trim_matches('\"')).is_ok() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "junction fixture unavailable",
+        ))
+    }
+}
+
 #[cfg(unix)]
 fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
@@ -2236,5 +2683,19 @@ fn symlink_is_not_available(error: &std::io::Error) -> bool {
     ) || matches!(
         error.kind(),
         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+    )
+}
+
+fn hard_link_is_not_available(error: &std::io::Error) -> bool {
+    const WINDOWS_ERROR_INVALID_FUNCTION: i32 = 1;
+    const WINDOWS_ERROR_NOT_SUPPORTED: i32 = 50;
+    matches!(
+        error.raw_os_error(),
+        Some(WINDOWS_ERROR_INVALID_FUNCTION) | Some(WINDOWS_ERROR_NOT_SUPPORTED)
+    ) || matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::CrossesDevices
     )
 }

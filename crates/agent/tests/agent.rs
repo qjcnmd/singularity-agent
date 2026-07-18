@@ -268,7 +268,9 @@ fn agent_loop_with_capabilities_and_plan(
         agent_tool_broker_for_test(include_plan),
         policy,
     )
-    .with_workspace_tools(WorkspaceTools::new(env!("CARGO_MANIFEST_DIR")))
+    .with_workspace_tools(
+        WorkspaceTools::new(env!("CARGO_MANIFEST_DIR")).expect("bind workspace tools"),
+    )
 }
 
 fn agent_tool_broker_for_test(include_plan: bool) -> ToolBroker {
@@ -500,7 +502,9 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
         allow_read_execute_policy(),
     )
     .with_workspace_tools(
-        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
     );
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(3);
     let blocked = agent_loop.run(&input);
@@ -712,7 +716,7 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
         policy,
         Arc::new(Mutex::new(Vec::new())),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -759,7 +763,7 @@ fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() 
         allow_read_policy(),
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -948,7 +952,7 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
             ..ProviderProtocolContract::default()
         },
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -1030,7 +1034,7 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
             ..ProviderProtocolContract::default()
         },
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3));
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -1099,7 +1103,7 @@ fn agent_loop_rejects_a_mutating_batch_without_partial_write() {
             ..ProviderProtocolContract::default()
         },
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&AgentLoopInput::new("thread_1", "turn_1", "change file").with_max_turns(3));
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -1161,7 +1165,7 @@ fn agent_loop_does_not_create_partial_approval_for_a_batch() {
             ..ProviderProtocolContract::default()
         },
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3));
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -1287,7 +1291,7 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
         response,
         PolicyEngine::new(PermissionProfile::workspace_write()),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()));
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"));
     let blocked = agent_loop.run(&input);
     let pending = blocked.pending_tool_calls[0].clone();
     let checkpoint = blocked
@@ -1368,7 +1372,7 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
         PolicyEngine::new(PermissionProfile::workspace_write()),
         Arc::new(Mutex::new(Vec::new())),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()));
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"));
 
     let blocked = agent_loop.run(&input);
     assert_eq!(blocked.status, AgentStatus::Blocked);
@@ -1724,7 +1728,7 @@ fn agent_loop_executes_workspace_read_tool_with_safe_tool_result() {
     ));
 
     let result = agent_loop_with_response(response, allow_read_policy())
-        .with_workspace_tools(WorkspaceTools::new(dir.path()))
+        .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
         .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -1765,7 +1769,7 @@ fn agent_loop_rechecks_context_budget_before_each_model_request() {
         allow_read_policy(),
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -1828,7 +1832,11 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
         Arc::clone(&seen_requests),
         capabilities,
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(LargeOutputBackend))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(LargeOutputBackend),
+    )
     .run(
         &AgentLoopInput::new("thread_1", "turn_1", "run the command")
             .with_max_turns(3)
@@ -1939,7 +1947,11 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
         policy,
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -2001,7 +2013,7 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
         policy,
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(workspace.path()))
+    .with_workspace_tools(WorkspaceTools::new(workspace.path()).expect("bind workspace tools"))
     .run(&AgentLoopInput::new("thread_1", "turn_1", "read if allowed").with_max_turns(3));
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -2134,7 +2146,11 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         Arc::new(Mutex::new(Vec::new())),
         capabilities,
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(LargeOutputBackend));
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(LargeOutputBackend),
+    );
 
     let blocked = agent_loop.run(&input);
     assert_eq!(blocked.status, AgentStatus::Blocked);
@@ -2220,7 +2236,11 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
         ),
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
     .run(&input);
 
     assert!(result.error.is_none(), "error={:?}", result.error);
@@ -2317,7 +2337,11 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         policy,
         seen_requests.clone(),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -2399,7 +2423,11 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
         policy,
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -2475,7 +2503,7 @@ fn agent_loop_validates_patch_arguments_before_policy() {
         malformed_response,
         PolicyEngine::new(PermissionProfile::workspace_write()),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -2531,7 +2559,7 @@ fn agent_loop_command_fails_closed_without_sandbox_backend() {
         policy,
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -2599,7 +2627,11 @@ fn agent_loop_command_uses_strict_sandbox_backend_when_injected() {
         policy,
         Arc::new(Mutex::new(Vec::new())),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -2650,11 +2682,13 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
         policy,
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(
-        AgentFailThenSucceedBackend {
-            calls: AtomicUsize::new(0),
-        },
-    ))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentFailThenSucceedBackend {
+                calls: AtomicUsize::new(0),
+            }),
+    )
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -2724,11 +2758,13 @@ fn agent_loop_returns_unavailable_executable_to_model_for_repair() {
         policy,
         Arc::clone(&seen_requests),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(
-        AgentExecutableUnavailableBackend {
-            calls: AtomicUsize::new(0),
-        },
-    ))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentExecutableUnavailableBackend {
+                calls: AtomicUsize::new(0),
+            }),
+    )
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -2774,9 +2810,11 @@ fn agent_loop_cancels_a_running_sandbox_command() {
         )
         .for_operation(PermissionOperation::Execute),
     );
-    let workspace = WorkspaceTools::new(dir.path()).with_sandbox_backend(BlockingCommandBackend {
-        started: Mutex::new(Some(started_tx)),
-    });
+    let workspace = WorkspaceTools::new(dir.path())
+        .expect("bind workspace tools")
+        .with_sandbox_backend(BlockingCommandBackend {
+            started: Mutex::new(Some(started_tx)),
+        });
     let worker = thread::spawn(move || {
         agent_loop_with_response(command_response, policy)
             .with_workspace_tools(workspace)
@@ -2854,7 +2892,9 @@ fn agent_loop_rejects_model_selected_network_before_approval() {
 
     let result = agent_loop_with_response(response, policy)
         .with_workspace_tools(
-            WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend),
+            WorkspaceTools::new(dir.path())
+                .expect("bind workspace tools")
+                .with_sandbox_backend(AgentStrictBackend),
         )
         .run(&input);
 
@@ -2920,7 +2960,11 @@ fn agent_loop_uses_exact_command_binding_without_exposing_execution_policy() {
         ToolBroker::new(registry),
         policy,
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend));
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    );
 
     let result = agent_loop
         .run(&AgentLoopInput::new("thread_1", "turn_1", "run the exact command").with_max_turns(2));
@@ -3003,7 +3047,11 @@ fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume(
         ToolBroker::new(registry),
         PolicyEngine::new(PermissionProfile::workspace_write()),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend));
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    );
 
     let result = agent_loop.run(&input);
 
@@ -3092,7 +3140,11 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
         policy,
         Arc::new(Mutex::new(Vec::new())),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()).with_sandbox_backend(AgentStrictBackend))
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
     .run(&input);
     let run_status = result.to_run_status();
 
@@ -3363,7 +3415,7 @@ fn agent_loop_approval_grant_matches_request_id_and_is_single_use() {
         PolicyEngine::new(PermissionProfile::workspace_write()),
         Arc::new(Mutex::new(Vec::new())),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Blocked);
@@ -3413,7 +3465,7 @@ fn agent_loop_approval_grant_does_not_override_sensitive_resource_deny() {
             response,
             PolicyEngine::new(PermissionProfile::workspace_write()),
         )
-        .with_workspace_tools(WorkspaceTools::new(dir.path()))
+        .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
         .run(&input);
 
         assert_eq!(result.status, AgentStatus::Failed, "{sensitive_path}");
@@ -3463,7 +3515,7 @@ fn agent_loop_patch_grant_does_not_override_sensitive_resource_deny() {
         response,
         PolicyEngine::new(PermissionProfile::workspace_write()),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -3529,7 +3581,7 @@ fn agent_loop_patch_policy_checks_every_change_path_before_writing() {
         );
 
     let result = agent_loop_with_response(response, policy)
-        .with_workspace_tools(WorkspaceTools::new(dir.path()))
+        .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
         .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -3585,7 +3637,7 @@ fn agent_loop_patch_approval_request_covers_unapproved_change_path() {
     );
 
     let result = agent_loop_with_response(response, policy)
-        .with_workspace_tools(WorkspaceTools::new(dir.path()))
+        .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
         .run(&input);
 
     assert_eq!(result.status, AgentStatus::Blocked);
@@ -3651,7 +3703,7 @@ fn agent_loop_approval_grant_requires_exact_resource_set() {
         response,
         PolicyEngine::new(PermissionProfile::workspace_write()),
     )
-    .with_workspace_tools(WorkspaceTools::new(dir.path()))
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Blocked);
@@ -3683,7 +3735,7 @@ fn agent_loop_denies_sensitive_workspace_tool_before_execution() {
     ));
 
     let result = agent_loop_with_response(response, allow_read_policy())
-        .with_workspace_tools(WorkspaceTools::new(dir.path()))
+        .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
         .run(&input);
 
     assert_eq!(result.status, AgentStatus::Failed);
@@ -4372,7 +4424,9 @@ fn verified_completed_plan_enters_tool_free_finalization() {
         allow_read_execute_policy(),
     )
     .with_workspace_tools(
-        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
     )
     .run(
         &AgentLoopInput::new("thread_1", "turn_1", "finish and verify")
@@ -4538,7 +4592,9 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
             allow_read_execute_policy(),
         )
         .with_workspace_tools(
-            WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+            WorkspaceTools::new(workspace.path())
+                .expect("bind workspace tools")
+                .with_sandbox_backend(AgentStrictBackend),
         )
         .with_cancellation_token(cancellation);
 
@@ -4736,7 +4792,9 @@ fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments()
         ProviderProtocolContract::default(),
     )
     .with_workspace_tools(
-        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
     )
     .run(&AgentLoopInput::new("thread_1", "turn_1", "verify").with_max_turns(4));
 
@@ -4846,7 +4904,9 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         ProviderProtocolContract::default(),
     )
     .with_workspace_tools(
-        WorkspaceTools::new(workspace.path()).with_sandbox_backend(AgentStrictBackend),
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
     );
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(3);
     let blocked = agent_loop.run(&input);

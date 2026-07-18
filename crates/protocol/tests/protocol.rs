@@ -44,7 +44,7 @@ fn thread_policy_params_round_trip_and_reject_unknown_public_values() {
     );
 
     for value in [
-        serde_json::json!({"sandboxMode": "danger-full-access"}),
+        serde_json::json!({"sandboxMode": "unsupported-mode"}),
         serde_json::json!({"approvalPolicy": "untrusted"}),
     ] {
         let result = serde_json::from_value::<ThreadStartParams>(value);

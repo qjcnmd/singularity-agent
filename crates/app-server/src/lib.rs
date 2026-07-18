@@ -95,6 +95,14 @@ pub enum AppServerError {
 pub type AppServerResult<T> = Result<T, AppServerError>;
 type ApprovalCheckpoint = (ApprovalRequest, Value);
 
+struct AgentLoopInvocation<'a> {
+    thread: &'a Thread,
+    params: &'a TurnStartParams,
+    turn_id: &'a str,
+    history: &'a [ConversationMessage],
+    cancellation: &'a CancellationToken,
+}
+
 /// 协调线程、turn、approval、追踪和工作线程的有状态 JSON-RPC 服务。
 pub struct AppServer {
     store: SessionStore,
@@ -461,7 +469,7 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
-        if let Err(error) = workspace_root(&thread) {
+        if let Err(error) = workspace_tools_for_thread(&thread, Arc::clone(&self.sandbox_backend)) {
             return invalid_request_response(message.id, error);
         }
         match self.store.update_thread_status(
@@ -612,10 +620,14 @@ impl AppServer {
             );
             return Ok(());
         }
-        if let Err(error) = workspace_root(&thread) {
-            emit_messages(&mut emit, invalid_request_response(message.id, error)?);
-            return Ok(());
-        }
+        let workspace_tools =
+            match workspace_tools_for_thread(&thread, Arc::clone(&self.sandbox_backend)) {
+                Ok(tools) => tools,
+                Err(error) => {
+                    emit_messages(&mut emit, invalid_request_response(message.id, error)?);
+                    return Ok(());
+                }
+            };
         let capability = agent_loop_capability(self.sandbox_backend.as_ref());
         if !agent_loop_capability_ready(&capability) {
             emit_messages(
@@ -676,6 +688,7 @@ impl AppServer {
             &turn.turn_id,
             &started.history.messages,
             &cancellation,
+            workspace_tools,
         )?;
         let committed = self.commit_turn_run_status(turn, &status, &cancellation)?;
         let terminal_events = self.committed_turn_events(&committed)?;
@@ -720,6 +733,7 @@ impl AppServer {
         turn_id: &str,
         history: &[ConversationMessage],
         cancellation: &CancellationToken,
+        workspace_tools: WorkspaceTools,
     ) -> AppServerResult<AgentRunStatus> {
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
@@ -731,14 +745,14 @@ impl AppServer {
                 );
             }
         };
-        match self.run_agent_loop_with_provider(
-            provider,
+        let invocation = AgentLoopInvocation {
             thread,
             params,
             turn_id,
             history,
             cancellation,
-        ) {
+        };
+        match self.run_agent_loop_with_provider_and_tools(provider, invocation, workspace_tools) {
             Err(AppServerError::ProjectInstructions(error)) => {
                 Ok(AgentRunStatus::failed(error.to_string()).with_status(AgentStatus::Failed))
             }
@@ -756,6 +770,7 @@ impl AppServer {
         decision: &ApprovalDecision,
         pending_tool_call: Option<Value>,
         cancellation: &CancellationToken,
+        prepared_workspace_tools: Option<WorkspaceTools>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<ApprovalCheckpoint>)>> {
         if !agent_loop_ready(self.sandbox_backend.as_ref()) {
             return Ok(None);
@@ -791,6 +806,7 @@ impl AppServer {
             pending_tool_call,
             provider,
             cancellation,
+            prepared_workspace_tools,
         )
     }
 
@@ -802,6 +818,7 @@ impl AppServer {
         pending_tool_call: Option<Value>,
         provider: P,
         cancellation: &CancellationToken,
+        prepared_workspace_tools: Option<WorkspaceTools>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<ApprovalCheckpoint>)>>
     where
         P: Provider,
@@ -848,20 +865,21 @@ impl AppServer {
         if thread.status != singularity_protocol::ThreadStatus::Active {
             return Ok(None);
         }
-        let workspace_root = match workspace_root(&thread) {
-            Ok(workspace_root) => workspace_root,
-            Err(error) => {
+        let workspace_tools = match prepared_workspace_tools {
+            Some(workspace_tools) => workspace_tools,
+            None => {
                 let run_status = approval_terminal_status(
                     &thread,
                     decision,
                     Some(&pending_tool_call),
                     AgentStatus::Failed,
                     "unavailable",
-                    error,
+                    "workspace capability was not prepared",
                 );
                 return Ok(Some((turn, run_status, Vec::new())));
             }
         };
+        let workspace_root = workspace_tools.workspace_root().to_path_buf();
         let user_input = self.store.get_turn_user_input(turn_id)?;
         let params = TurnStartParams {
             thread_id: turn.thread_id.clone(),
@@ -900,10 +918,7 @@ impl AppServer {
             }
         };
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(workspace_tools(
-                workspace_root,
-                Arc::clone(&self.sandbox_backend),
-            ))
+            .with_workspace_tools(workspace_tools)
             .with_cancellation_token(cancellation.clone())
             .resume_pending_tool_call(&loop_input, &pending, &pending_tool_call);
         let mut run_status = result.to_run_status();
@@ -934,6 +949,7 @@ impl AppServer {
         Ok(Some((turn, run_status, next_approvals)))
     }
 
+    #[cfg(test)]
     fn run_agent_loop_with_provider<P>(
         &self,
         provider: P,
@@ -946,19 +962,46 @@ impl AppServer {
     where
         P: Provider,
     {
+        let workspace_tools = workspace_tools_for_thread(thread, Arc::clone(&self.sandbox_backend))
+            .map_err(AppServerError::Workspace)?;
+        let invocation = AgentLoopInvocation {
+            thread,
+            params,
+            turn_id,
+            history,
+            cancellation,
+        };
+        self.run_agent_loop_with_provider_and_tools(provider, invocation, workspace_tools)
+    }
+
+    fn run_agent_loop_with_provider_and_tools<P>(
+        &self,
+        provider: P,
+        invocation: AgentLoopInvocation<'_>,
+        workspace_tools: WorkspaceTools,
+    ) -> AppServerResult<AgentRunStatus>
+    where
+        P: Provider,
+    {
         let registry = workspace_tool_registry();
-        let workspace_root = workspace_root(thread).map_err(AppServerError::Workspace)?;
-        let policy = workspace_policy(thread.sandbox_mode, thread.approval_policy);
-        let loop_input = agent_loop_input(thread, params, turn_id, &workspace_root, history)?;
+        let workspace_root = workspace_tools.workspace_root().to_path_buf();
+        let policy = workspace_policy(
+            invocation.thread.sandbox_mode,
+            invocation.thread.approval_policy,
+        );
+        let loop_input = agent_loop_input(
+            invocation.thread,
+            invocation.params,
+            invocation.turn_id,
+            &workspace_root,
+            invocation.history,
+        )?;
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(workspace_tools(
-                workspace_root,
-                Arc::clone(&self.sandbox_backend),
-            ))
-            .with_cancellation_token(cancellation.clone())
+            .with_workspace_tools(workspace_tools)
+            .with_cancellation_token(invocation.cancellation.clone())
             .run(&loop_input);
         let mut run_status = result.to_run_status();
-        if cancellation.is_cancelled() {
+        if invocation.cancellation.is_cancelled() {
             mark_run_cancelled(&mut run_status);
             return Ok(run_status);
         }
@@ -967,7 +1010,7 @@ impl AppServer {
             Err(AppServerError::Store(StoreError::InvalidState(message)))
                 if message == "pending approval requires a running or blocked turn" =>
             {
-                let turn = self.store.get_turn(turn_id)?;
+                let turn = self.store.get_turn(invocation.turn_id)?;
                 if turn.agent_loop_status == AgentStatus::CancelRequested.as_str()
                     || turn.status == TurnStatus::Interrupted
                 {
@@ -1243,14 +1286,17 @@ impl AppServer {
         let pending_thread = self.store.get_thread(&pending_request.thread_id)?;
         let continues_execution =
             is_tool_continuation && matches!(decision.outcome, ApprovalOutcome::Allow);
-        if continues_execution {
+        let continuation_workspace = if continues_execution {
             if pending_thread.status != singularity_protocol::ThreadStatus::Active {
                 return invalid_request_response(message.id, THREAD_ARCHIVED_CONTINUATION);
             }
-            if let Err(error) = workspace_root(&pending_thread) {
-                return invalid_request_response(message.id, error);
+            match workspace_tools_for_thread(&pending_thread, Arc::clone(&self.sandbox_backend)) {
+                Ok(tools) => Some(tools),
+                Err(error) => return invalid_request_response(message.id, error),
             }
-        }
+        } else {
+            None
+        };
         let _execution_guard = if continues_execution {
             let Some(guard) = self
                 .store
@@ -1328,6 +1374,7 @@ impl AppServer {
                 &decision,
                 pending_tool_call.clone(),
                 &cancellation,
+                continuation_workspace.clone(),
             )?;
             let terminal = if let Some(resumed) = resumed {
                 Some(resumed)
@@ -1801,18 +1848,15 @@ fn canonical_thread_cwd(cwd: Option<&str>) -> Result<String, String> {
         None => std::env::current_dir()
             .map_err(|error| format!("failed to read current directory: {error}"))?,
     };
-    let canonical = path
-        .canonicalize()
-        .map_err(|error| format!("failed to canonicalize thread cwd: {error}"))?;
-    if !canonical.is_dir() {
-        return Err("thread cwd must be an existing directory".to_string());
-    }
-    canonical
+    let workspace_tools =
+        WorkspaceTools::new(path).map_err(|error| format!("failed to bind thread cwd: {error}"))?;
+    workspace_tools
+        .workspace_root()
         .to_str()
         .map(str::to_string)
         .ok_or_else(|| "thread cwd is not valid UTF-8".to_string())
 }
-fn workspace_root(thread: &Thread) -> Result<PathBuf, String> {
+fn workspace_path(thread: &Thread) -> Result<PathBuf, String> {
     let cwd = thread
         .cwd
         .as_deref()
@@ -1822,20 +1866,27 @@ fn workspace_root(thread: &Thread) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err("thread does not have an absolute workspace".to_string());
     }
-    let canonical = path
-        .canonicalize()
-        .map_err(|error| format!("failed to canonicalize thread workspace: {error}"))?;
-    if !canonical.is_dir() {
-        return Err("thread workspace must be an existing directory".to_string());
-    }
-    Ok(canonical)
+    Ok(path.to_path_buf())
 }
 
+fn workspace_tools_for_thread(
+    thread: &Thread,
+    sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
+) -> Result<WorkspaceTools, String> {
+    let workspace_path = workspace_path(thread)?;
+    WorkspaceTools::new(workspace_path)
+        .map(|tools| tools.with_shared_sandbox_backend(sandbox_backend))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
 fn workspace_tools(
     workspace_root: PathBuf,
     sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
-) -> WorkspaceTools {
-    WorkspaceTools::new(workspace_root).with_shared_sandbox_backend(sandbox_backend)
+) -> AppServerResult<WorkspaceTools> {
+    WorkspaceTools::new(workspace_root)
+        .map(|tools| tools.with_shared_sandbox_backend(sandbox_backend))
+        .map_err(|error| AppServerError::Workspace(error.to_string()))
 }
 
 fn agent_loop_input(
@@ -2206,6 +2257,95 @@ mod tests {
         assert!(original.is_cancelled());
         let (late, _late_guard) = server.activate_turn("turn_2").expect("late activation");
         assert!(late.is_cancelled());
+    }
+
+    #[test]
+    fn workspace_tool_binding_failure_is_a_typed_app_server_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("missing-workspace");
+
+        assert!(matches!(
+            workspace_tools(missing, Arc::new(CompletedSandboxBackend)),
+            Err(AppServerError::Workspace(message))
+                if message.contains("workspace tool read failed")
+        ));
+    }
+
+    #[test]
+    fn workspace_binding_failure_precedes_running_turn_persistence() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(None, Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        std::fs::remove_dir(&workspace).expect("remove workspace before turn");
+        let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+
+        let response = server
+            .turn_start(JsonRpcMessage::request(
+                Method::TurnStart,
+                json!(1),
+                json!({
+                    "threadId": thread.thread_id,
+                    "input": [{"type": "text", "text": "must not persist"}],
+                }),
+            ))
+            .expect("turn response");
+
+        assert!(
+            response[0]["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("workspace tool read failed")
+        );
+        let history = server
+            .store
+            .read_thread_history(&thread.thread_id, None, 8)
+            .expect("thread history");
+        assert!(history.messages.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persisted_workspace_replacement_with_junction_is_not_rebound() {
+        use std::os::windows::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let workspace = dir.path().join("workspace");
+        let retained = dir.path().join("retained-workspace");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        std::fs::create_dir(&outside).expect("create outside");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(None, Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        std::fs::rename(&workspace, &retained).expect("replace workspace namespace");
+        let link_arg = format!("\"{}\"", workspace.display());
+        let target_arg = format!("\"{}\"", outside.display());
+        let output = std::process::Command::new("cmd.exe")
+            .raw_arg("/d /c ")
+            .raw_arg("mklink")
+            .raw_arg("/J")
+            .raw_arg(&link_arg)
+            .raw_arg(&target_arg)
+            .output()
+            .expect("create junction process");
+        if !output.status.success() {
+            return;
+        }
+
+        let error = workspace_tools_for_thread(&thread, Arc::new(CompletedSandboxBackend))
+            .expect_err("replacement junction must fail closed");
+        assert!(
+            error.contains("workspace tool read failed")
+                || error.contains("workspace root")
+                || error.contains("reparse"),
+            "unexpected workspace binding error: {error}"
+        );
+        std::fs::remove_dir(&workspace).expect("remove junction");
     }
 
     #[test]
@@ -2859,6 +2999,7 @@ mod tests {
                 None,
                 provider,
                 &CancellationToken::new(),
+                None,
             )
             .expect("resume");
 
@@ -2977,6 +3118,11 @@ mod tests {
                     seen_requests: Arc::clone(&seen_requests),
                 },
                 &CancellationToken::new(),
+                Some(
+                    WorkspaceTools::new(&workspace)
+                        .expect("bind workspace tools")
+                        .with_sandbox_backend(CompletedSandboxBackend),
+                ),
             )
             .expect("resume")
             .expect("terminal status");
@@ -3363,6 +3509,7 @@ mod tests {
                     seen_requests: Arc::clone(&seen_requests),
                 },
                 &CancellationToken::new(),
+                None,
             )
             .expect("resume")
             .expect("terminal status");
@@ -3397,6 +3544,7 @@ mod tests {
                     seen_requests: Arc::clone(&seen_requests),
                 },
                 &CancellationToken::new(),
+                None,
             )
             .expect("resume")
             .expect("terminal status");
@@ -3593,6 +3741,11 @@ mod tests {
                 Some(pending_payload),
                 resumed_provider,
                 &CancellationToken::new(),
+                Some(
+                    WorkspaceTools::new(&workspace)
+                        .expect("bind workspace tools")
+                        .with_sandbox_backend(CompletedSandboxBackend),
+                ),
             )
             .expect("resume")
             .expect("resumed");
@@ -3791,6 +3944,11 @@ mod tests {
                     seen_requests: Arc::clone(&resumed_seen_requests),
                 },
                 &CancellationToken::new(),
+                Some(
+                    WorkspaceTools::new(&workspace)
+                        .expect("bind workspace tools")
+                        .with_sandbox_backend(CompletedSandboxBackend),
+                ),
             )
             .expect("resume")
             .expect("terminal status");

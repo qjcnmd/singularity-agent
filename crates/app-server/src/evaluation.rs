@@ -1323,13 +1323,20 @@ fn run_agent_stage(
     if let Some(instructions) = project_instructions {
         input = input.with_project_instructions(instructions);
     }
+    let workspace_tools = match WorkspaceTools::new(agent_dir) {
+        Ok(tools) => tools
+            .with_shared_sandbox_backend(sandbox_backend)
+            .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated),
+        Err(error) => {
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error.to_string()),
+                command_diagnostics,
+            );
+        }
+    };
     let agent_started = Instant::now();
     let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-        .with_workspace_tools(
-            WorkspaceTools::new(agent_dir)
-                .with_shared_sandbox_backend(sandbox_backend)
-                .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated),
-        )
+        .with_workspace_tools(workspace_tools)
         .run(&input);
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let run_status = result.to_run_status();

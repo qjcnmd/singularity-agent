@@ -1121,7 +1121,7 @@ fn invalid_thread_policy_snapshot_value_fails_closed() {
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
     connection
         .execute(
-            r#"update threads set sandbox_mode = '"danger-full-access"'"#,
+            r#"update threads set sandbox_mode = '"unsupported-mode"'"#,
             [],
         )
         .expect("tamper sandbox mode");
