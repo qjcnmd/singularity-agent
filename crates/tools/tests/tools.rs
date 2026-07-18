@@ -9,10 +9,11 @@ use singularity_sandbox::{
 use singularity_tools::{
     AgentControlToolExecutor, CommandToolInput, EditToolInput, GrepToolInput, ListToolInput,
     ReadToolInput, ToolAuthorization, ToolBroker, ToolBrokerDecision, ToolCallRequest,
-    ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolFailureKind,
+    ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolExposure, ToolFailureKind,
     ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspacePatch,
     WorkspacePatchChange, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
-    command_scope_digest, command_script_scope_digest, workspace_tool_specs,
+    command_scope_digest, command_script_scope_digest, workspace_tool_entries,
+    workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,6 +64,51 @@ fn validate_object_input(input: &serde_json::Value) -> Result<(), ToolInputValid
         .is_object()
         .then_some(())
         .ok_or_else(|| ToolInputValidationError::new("input_must_be_object"))
+}
+
+fn contract_mismatch_cases() -> Vec<(&'static str, ToolEntry)> {
+    let mut wrong_capability = test_tool_spec(
+        "update_plan",
+        "Update the plan",
+        serde_json::json!({"type": "object"}),
+    );
+    wrong_capability.capability = ToolCapability::WorkspaceRead;
+
+    let mut wrong_authorization = test_tool_spec(
+        "update_plan",
+        "Update the plan",
+        serde_json::json!({"type": "object"}),
+    );
+    wrong_authorization.authorization = ToolAuthorization::WorkspaceRead;
+
+    let mut wrong_execution_mode = test_tool_spec(
+        "update_plan",
+        "Update the plan",
+        serde_json::json!({"type": "object"}),
+    );
+    wrong_execution_mode.spec.execution_mode = ToolExecutionMode::ParallelRead;
+
+    let mut wrong_exposure = test_tool_spec(
+        "update_plan",
+        "Update the plan",
+        serde_json::json!({"type": "object"}),
+    );
+    wrong_exposure.exposure = ToolExposure::Internal;
+
+    let mut wrong_spec_name = test_tool_spec(
+        "update_plan",
+        "Update the plan",
+        serde_json::json!({"type": "object"}),
+    );
+    wrong_spec_name.spec.name = "other_tool".to_string();
+
+    vec![
+        ("capability", wrong_capability),
+        ("authorization", wrong_authorization),
+        ("execution_mode", wrong_execution_mode),
+        ("exposure", wrong_exposure),
+        ("spec_name", wrong_spec_name),
+    ]
 }
 
 #[test]
@@ -222,6 +268,84 @@ fn registry_rejects_duplicate_tools() {
     let result = ToolOutput::success(serde_json::json!({"ok": true}));
     let tool_result = ToolResult::from_result(&envelope, &result);
     assert_eq!(tool_result.tool_name, "read");
+}
+
+#[test]
+fn registry_rejects_executor_contract_mismatches_before_broker_execution() {
+    for (mismatch, entry) in contract_mismatch_cases() {
+        let name = entry.id.as_str().to_string();
+        let mut registry = ToolRegistry::default();
+        assert!(
+            registry.register(entry).is_err(),
+            "{mismatch} mismatch must be rejected during registration"
+        );
+
+        let broker = ToolBroker::new(registry);
+        let envelope = ToolCallRequest::new("call_1", name, "{}");
+        let mut executor_called = false;
+        let result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_, _| {
+            executor_called = true;
+            ToolOutput::success(serde_json::json!({"unexpected": true}))
+        });
+
+        assert!(!executor_called, "{mismatch} mismatch reached the executor");
+        assert_eq!(result.error_code.as_deref(), Some("unknown_tool"));
+    }
+}
+
+#[test]
+fn broker_binds_valid_workspace_and_agent_control_entries() {
+    let workspace = test_workspace("registry-valid-bindings");
+    let workspace_tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+    let mut broker = ToolBroker::default();
+    broker
+        .register(
+            workspace_tool_entries()
+                .into_iter()
+                .find(|entry| {
+                    entry.executor == ToolExecutor::Workspace(WorkspaceToolExecutor::Read)
+                })
+                .expect("read entry"),
+        )
+        .expect("register read entry");
+    broker
+        .register(test_tool_spec(
+            "update_plan",
+            "Update the plan",
+            serde_json::json!({"type": "object"}),
+        ))
+        .expect("register agent control entry");
+
+    let read = broker
+        .bind_authorization(
+            "read",
+            serde_json::json!({"path": "."}),
+            Some(&workspace_tools),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        )
+        .expect("bind workspace read entry");
+    assert_eq!(
+        read.executor,
+        ToolExecutor::Workspace(WorkspaceToolExecutor::Read)
+    );
+    assert_eq!(read.execution_mode, ToolExecutionMode::ParallelRead);
+
+    let update_plan = broker
+        .bind_authorization(
+            "update_plan",
+            serde_json::json!({"steps": []}),
+            Some(&workspace_tools),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        )
+        .expect("bind agent control entry");
+    assert_eq!(
+        update_plan.executor,
+        ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan)
+    );
+    assert_eq!(update_plan.execution_mode, ToolExecutionMode::Exclusive);
+    remove_workspace(&workspace);
 }
 
 #[test]

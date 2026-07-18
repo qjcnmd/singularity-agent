@@ -46,6 +46,7 @@ const INVALID_TOOL_ARGUMENTS_ERROR: &str = "invalid_tool_arguments";
 const TOOL_DENIED_ERROR: &str = "tool_denied";
 const TOOL_APPROVAL_REQUIRED_ERROR: &str = "approval_required";
 const TOOL_SANDBOX_UNAVAILABLE_ERROR: &str = "sandbox_unavailable";
+const TOOL_CONTRACT_INVALID_ERROR: &str = "tool_contract_invalid";
 const WORKSPACE_MUTATION_NOT_APPROVED: &str = "workspace mutation requires allowed tool decision";
 const DUPLICATE_PATCH_TARGET: &str = "patch contains duplicate canonical target";
 const MUTATION_TEMP_FILE_ATTEMPTS: usize = 64;
@@ -164,6 +165,56 @@ pub enum ToolAuthorization {
 pub enum ToolExposure {
     Model,
     Internal,
+}
+
+/// 每个 typed executor 的稳定能力、可见性、授权和并发合同。
+#[derive(Debug, Clone, Copy)]
+struct ToolExecutorContract {
+    capability: ToolCapability,
+    exposure: ToolExposure,
+    authorization: ToolAuthorization,
+    execution_mode: ToolExecutionMode,
+}
+
+impl ToolExecutor {
+    fn contract(self) -> ToolExecutorContract {
+        match self {
+            Self::Workspace(WorkspaceToolExecutor::Read | WorkspaceToolExecutor::List) => {
+                ToolExecutorContract {
+                    capability: ToolCapability::WorkspaceRead,
+                    exposure: ToolExposure::Model,
+                    authorization: ToolAuthorization::WorkspaceRead,
+                    execution_mode: ToolExecutionMode::ParallelRead,
+                }
+            }
+            Self::Workspace(WorkspaceToolExecutor::Grep) => ToolExecutorContract {
+                capability: ToolCapability::WorkspaceSearch,
+                exposure: ToolExposure::Model,
+                authorization: ToolAuthorization::WorkspaceRead,
+                execution_mode: ToolExecutionMode::ParallelRead,
+            },
+            Self::Workspace(WorkspaceToolExecutor::Edit | WorkspaceToolExecutor::Patch) => {
+                ToolExecutorContract {
+                    capability: ToolCapability::WorkspaceWrite,
+                    exposure: ToolExposure::Model,
+                    authorization: ToolAuthorization::WorkspaceWrite,
+                    execution_mode: ToolExecutionMode::Exclusive,
+                }
+            }
+            Self::Workspace(WorkspaceToolExecutor::Command) => ToolExecutorContract {
+                capability: ToolCapability::CommandExecution,
+                exposure: ToolExposure::Model,
+                authorization: ToolAuthorization::Command,
+                execution_mode: ToolExecutionMode::Exclusive,
+            },
+            Self::AgentControl(AgentControlToolExecutor::UpdatePlan) => ToolExecutorContract {
+                capability: ToolCapability::PlanManagement,
+                exposure: ToolExposure::Model,
+                authorization: ToolAuthorization::AgentControl,
+                execution_mode: ToolExecutionMode::Exclusive,
+            },
+        }
+    }
 }
 
 /// tool 到达执行阶段前返回的结构化校验代码。
@@ -409,10 +460,7 @@ impl ToolEntry {
         executor: ToolExecutor,
     ) -> Result<Self, String> {
         let id = ToolId::new(spec.name.clone())?;
-        if version == 0 {
-            return Err(format!("tool {} version must be positive", spec.name));
-        }
-        Ok(Self {
+        let entry = Self {
             id,
             version,
             capability,
@@ -420,7 +468,48 @@ impl ToolEntry {
             authorization,
             executor,
             spec,
-        })
+        };
+        entry.validate_consistency()?;
+        Ok(entry)
+    }
+
+    fn validate_consistency(&self) -> Result<(), String> {
+        if self.version == 0 {
+            return Err(format!(
+                "tool {} version must be positive",
+                self.id.as_str()
+            ));
+        }
+        if self.spec.name != self.id.as_str() {
+            return Err("tool entry id and schema name differ".to_string());
+        }
+
+        let expected = self.executor.contract();
+        if self.capability != expected.capability {
+            return Err(format!(
+                "tool {} capability does not match its executor contract",
+                self.id.as_str()
+            ));
+        }
+        if self.exposure != expected.exposure {
+            return Err(format!(
+                "tool {} exposure does not match its executor contract",
+                self.id.as_str()
+            ));
+        }
+        if self.authorization != expected.authorization {
+            return Err(format!(
+                "tool {} authorization does not match its executor contract",
+                self.id.as_str()
+            ));
+        }
+        if self.spec.execution_mode != expected.execution_mode {
+            return Err(format!(
+                "tool {} execution mode does not match its executor contract",
+                self.id.as_str()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -720,9 +809,7 @@ impl ToolRegistry {
     /// 注册一个新的 tool 定义。
     pub fn register(&mut self, entry: ToolEntry) -> Result<(), String> {
         validate_tool_name(entry.id.as_str())?;
-        if entry.spec.name != entry.id.as_str() {
-            return Err("tool entry id and schema name differ".to_string());
-        }
+        entry.validate_consistency()?;
         if self.tools.contains_key(entry.id.as_str()) {
             return Err(format!("tool already registered: {}", entry.id.as_str()));
         }
@@ -929,6 +1016,9 @@ impl ToolBroker {
         let entry = self.registry.entry(name).ok_or_else(|| {
             WorkspaceToolError::InvalidInput("tool is not registered".to_string())
         })?;
+        entry
+            .validate_consistency()
+            .map_err(WorkspaceToolError::InvalidInput)?;
         match entry.executor {
             ToolExecutor::Workspace(executor) => {
                 let workspace_tools = workspace_tools.ok_or_else(|| {
@@ -977,6 +1067,14 @@ impl ToolBroker {
                 "tool is not registered",
             );
         };
+        if entry.validate_consistency().is_err() {
+            return ToolResult::failed_with_kind(
+                envelope,
+                ToolFailureKind::Infrastructure,
+                TOOL_CONTRACT_INVALID_ERROR,
+                "tool registration contract is invalid",
+            );
+        }
         if decision.is_allowed() {
             let input = match serde_json::from_str::<Value>(&envelope.raw_arguments) {
                 Ok(input) => input,
@@ -4901,5 +4999,60 @@ mod mutation_tests {
 
         assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o751);
         remove_workspace(&workspace);
+    }
+}
+
+#[cfg(test)]
+mod registry_contract_tests {
+    use super::*;
+
+    fn accept_input(_: &Value) -> Result<(), ToolInputValidationError> {
+        Ok(())
+    }
+
+    #[test]
+    fn agent_control_binding_rejects_inconsistent_authorization() {
+        let mut entry = ToolEntry::model(
+            ToolSpec::new(
+                "update_plan",
+                "Update the plan",
+                json!({"type": "object"}),
+                ToolExecutionMode::Exclusive,
+                accept_input,
+            ),
+            1,
+            ToolCapability::PlanManagement,
+            ToolAuthorization::AgentControl,
+            ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan),
+        )
+        .expect("valid agent control entry");
+        entry.authorization = ToolAuthorization::WorkspaceRead;
+
+        let name = entry.id.as_str().to_string();
+        let mut registry = ToolRegistry::default();
+        registry.tools.insert(name.clone(), entry);
+        let broker = ToolBroker::new(registry);
+
+        let result = broker.bind_authorization(
+            &name,
+            json!({"steps": []}),
+            None,
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        );
+
+        assert!(matches!(result, Err(WorkspaceToolError::InvalidInput(_))));
+
+        let envelope = ToolCallRequest::new(&name, &name, "{}");
+        let mut executor_called = false;
+        let result = broker.execute(&envelope, ToolBrokerDecision::Allow, |_, _| {
+            executor_called = true;
+            ToolOutput::success(json!({"unexpected": true}))
+        });
+        assert!(!executor_called);
+        assert_eq!(
+            result.error_code.as_deref(),
+            Some(TOOL_CONTRACT_INVALID_ERROR)
+        );
     }
 }
