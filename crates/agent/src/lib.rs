@@ -41,7 +41,8 @@ use thiserror::Error;
 
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
-const APPROVAL_CHECKPOINT_VERSION: u32 = 1;
+const APPROVAL_CHECKPOINT_VERSION: u32 = 2;
+const LEGACY_APPROVAL_CHECKPOINT_VERSION: u32 = 1;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -573,7 +574,9 @@ pub struct AgentLoopResult {
     pub pending_tool_calls: Vec<PendingToolCall>,
     #[serde(skip)]
     #[schemars(skip)]
+    /// Typed checkpoints are encoded here only at the public persistence boundary.
     pub approval_checkpoints: Vec<Value>,
+    /// Public projection of the ordered internal tool-result occurrences.
     pub tool_results: Vec<ToolResult>,
     pub verification: AgentVerification,
     pub plan: Option<AgentPlan>,
@@ -605,15 +608,15 @@ pub struct AgentLoopResult {
 impl AgentLoopResult {
     /// 读取指定 approval request 的 checkpoint。
     pub fn approval_checkpoint(&self, request_id: &str) -> Option<Value> {
-        self.approval_checkpoints
+        let checkpoint_index = self
+            .approval_requests
             .iter()
-            .find(|checkpoint| {
-                checkpoint
-                    .get("request_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value == request_id)
-            })
-            .cloned()
+            .position(|request| request.request_id == request_id)?;
+        let checkpoint = self.approval_checkpoints.get(checkpoint_index)?;
+        let checkpoint = ApprovalCheckpointCodec::decode(checkpoint).ok()?;
+        (checkpoint.pending_tool_call.request_id == request_id)
+            .then(|| ApprovalCheckpointCodec::encode(&checkpoint).ok())
+            .flatten()
     }
 
     /// 将内部结果投影为持久化运行状态。
@@ -997,22 +1000,32 @@ struct RepairFailureState {
     consecutive_count: u32,
 }
 
-/// ToolResult 在当前模型历史中的安全 occurrence 状态。
-///
-/// occurrence 使用 `tool_results` 的真实追加顺序隐式编号；它不依赖可能跨 turn 重复的
-/// `tool_call_id`。只有 `Visible` 结果参与公开消息与内部 accounting 的配对。
+/// 一个 tool result occurrence 的模型投影状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ToolResultContextBinding {
+enum ToolResultVisibility {
     Hidden,
     Visible,
     Compacted,
     Omitted,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CheckpointToolResult {
+/// 一个 tool result occurrence 的唯一运行时记录。
+///
+/// 结果本体以及其可见性共同维护 occurrence 顺序；token accounting、审计 metadata 和
+/// workspace observation 随结果一起进入集中式 checkpoint 编解码，而不再依赖平行数组。
+#[derive(Debug, Clone, PartialEq)]
+struct ToolResultOccurrence {
     result: ToolResult,
+    visibility: ToolResultVisibility,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolResultOccurrenceWire {
+    result: ToolResult,
+    #[serde(default)]
+    visibility: Option<ToolResultVisibility>,
     #[serde(default)]
     result_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1022,28 +1035,88 @@ struct CheckpointToolResult {
     workspace_observation: Option<WorkspaceObservation>,
 }
 
-impl CheckpointToolResult {
-    fn from_tool_result(result: &ToolResult) -> Self {
-        Self {
-            result: result.clone(),
-            result_id: result.result_id.clone(),
-            context_token_count: result.context_token_count(),
-            audit_metadata: result.audit_metadata().cloned(),
-            workspace_observation: result.workspace_observation().cloned(),
+impl Serialize for ToolResultOccurrence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ToolResultOccurrenceWire {
+            result: self.result.clone(),
+            visibility: Some(self.visibility),
+            result_id: self.result.result_id.clone(),
+            context_token_count: self.result.context_token_count(),
+            audit_metadata: self.result.audit_metadata().cloned(),
+            workspace_observation: self.result.workspace_observation().cloned(),
         }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolResultOccurrence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ToolResultOccurrenceWire::deserialize(deserializer)?;
+        let visibility = wire.visibility.ok_or_else(|| {
+            serde::de::Error::custom("tool result occurrence visibility is missing")
+        })?;
+        Self::from_wire(wire, visibility).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ToolResultOccurrence {
+    fn new(result: ToolResult, visibility: ToolResultVisibility) -> Self {
+        Self { result, visibility }
     }
 
-    fn into_tool_result(self, binding: ToolResultContextBinding) -> Result<ToolResult, String> {
-        let mut result = self.result;
-        result.result_id = self.result_id;
+    fn result(&self) -> &ToolResult {
+        &self.result
+    }
+
+    fn into_result(self) -> ToolResult {
+        self.result
+    }
+
+    fn visibility(&self) -> ToolResultVisibility {
+        self.visibility
+    }
+
+    fn set_visibility(&mut self, visibility: ToolResultVisibility) {
+        self.visibility = visibility;
+    }
+
+    fn from_wire(
+        wire: ToolResultOccurrenceWire,
+        visibility: ToolResultVisibility,
+    ) -> Result<Self, String> {
+        Self::from_parts(
+            wire.result,
+            visibility,
+            wire.result_id,
+            wire.context_token_count,
+            wire.audit_metadata,
+            wire.workspace_observation,
+        )
+    }
+
+    fn from_parts(
+        mut result: ToolResult,
+        visibility: ToolResultVisibility,
+        result_id: Option<String>,
+        context_token_count: Option<u32>,
+        audit_metadata: Option<Value>,
+        workspace_observation: Option<WorkspaceObservation>,
+    ) -> Result<Self, String> {
+        result.result_id = result_id;
         if result.failure_kind == Some(ToolFailureKind::Approval)
-            && binding != ToolResultContextBinding::Hidden
+            && visibility != ToolResultVisibility::Hidden
         {
             return Err("approval checkpoint hidden tool result binding is invalid".to_string());
         }
         let reconstructable = result.reconstruct_context_token_count();
         let lower_bound = result.context_token_count_lower_bound();
-        let context_token_count = match self.context_token_count {
+        let context_token_count = match context_token_count {
             Some(context_token_count)
                 if reconstructable.is_some_and(|expected| expected != context_token_count) =>
             {
@@ -1061,7 +1134,7 @@ impl CheckpointToolResult {
                         .to_string(),
                 );
             }
-            None if binding == ToolResultContextBinding::Hidden
+            None if visibility == ToolResultVisibility::Hidden
                 && result.failure_kind == Some(ToolFailureKind::Approval) =>
             {
                 None
@@ -1077,19 +1150,64 @@ impl CheckpointToolResult {
         if let Some(context_token_count) = context_token_count {
             result = result.with_context_token_count(context_token_count);
         }
-        if let Some(audit_metadata) = self.audit_metadata {
+        if let Some(audit_metadata) = audit_metadata {
             result = result.with_audit(audit_metadata);
         }
-        if let Some(observation) = self.workspace_observation {
+        if let Some(observation) = workspace_observation {
             result = result.with_workspace_observation(observation);
         }
-        Ok(result)
+        let occurrence = Self { result, visibility };
+        occurrence.validate()?;
+        Ok(occurrence)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.result.tool_call_id.trim().is_empty() {
+            return Err("tool result occurrence tool call id is missing".to_string());
+        }
+        if self.visibility == ToolResultVisibility::Hidden
+            && self.result.failure_kind != Some(ToolFailureKind::Approval)
+        {
+            return Err("hidden tool result occurrence is not an approval result".to_string());
+        }
+        if !(self.visibility == ToolResultVisibility::Hidden
+            && self.result.failure_kind == Some(ToolFailureKind::Approval))
+            && self.result.context_token_count().is_none()
+        {
+            return Err("tool result occurrence context token accounting is missing".to_string());
+        }
+        Ok(())
     }
 }
 
-/// 用于安全恢复受 approval 控制的 tool call 的可序列化暂停状态。
+/// 版本化 approval checkpoint 的持久化投影。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentLoopCheckpoint {
+struct ApprovalCheckpoint {
+    #[serde(flatten)]
+    pending_tool_call: PendingToolCall,
+    checkpoint_version: u32,
+    thread_id: String,
+    turn_id: String,
+    project_instructions_digest: Option<String>,
+    messages: Vec<ModelMessage>,
+    tool_result_occurrences: Vec<ToolResultOccurrence>,
+    used_approval_grants: Vec<String>,
+    approval_count: u32,
+    model_turns: u32,
+    completion: CompletionTracker,
+    last_completion_error: Option<String>,
+    plan: Option<AgentPlan>,
+    plan_update_count: u32,
+    recovery_metrics: AgentRecoveryMetrics,
+    model_usage: ModelUsage,
+    provider_attempts: ProviderAttemptMetadata,
+    context_trace: Option<AgentContextTrace>,
+    seen_tool_call_fingerprints: Vec<String>,
+    last_repair_failure: Option<RepairFailureState>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyApprovalCheckpoint {
     #[serde(flatten)]
     pending_tool_call: PendingToolCall,
     checkpoint_version: u32,
@@ -1098,7 +1216,7 @@ struct AgentLoopCheckpoint {
     #[serde(default)]
     project_instructions_digest: Option<String>,
     messages: Vec<ModelMessage>,
-    tool_results: Vec<CheckpointToolResult>,
+    tool_results: Vec<ToolResultOccurrenceWire>,
     used_approval_grants: Vec<String>,
     approval_count: u32,
     model_turns: u32,
@@ -1117,20 +1235,252 @@ struct AgentLoopCheckpoint {
     #[serde(default)]
     context_trace: Option<AgentContextTrace>,
     #[serde(default)]
-    tool_result_context_bindings: Vec<ToolResultContextBinding>,
+    tool_result_context_bindings: Option<Vec<ToolResultVisibility>>,
     #[serde(default)]
     seen_tool_call_fingerprints: Vec<String>,
     #[serde(default)]
     last_repair_failure: Option<RepairFailureState>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CheckpointVersion {
+    checkpoint_version: u32,
+}
+
+struct ApprovalCheckpointCodec;
+
+impl ApprovalCheckpointCodec {
+    fn encode(checkpoint: &ApprovalCheckpoint) -> Result<Value, String> {
+        serde_json::to_value(checkpoint)
+            .map_err(|error| format!("approval checkpoint serialization failed: {error}"))
+    }
+
+    fn decode(payload: &Value) -> Result<ApprovalCheckpoint, String> {
+        let version: CheckpointVersion = serde_json::from_value(payload.clone())
+            .map_err(|error| format!("invalid approval checkpoint version: {error}"))?;
+        let checkpoint = match version.checkpoint_version {
+            APPROVAL_CHECKPOINT_VERSION => {
+                Self::validate_keys(
+                    payload,
+                    &[
+                        "request_id",
+                        "tool_call_id",
+                        "tool_name",
+                        "raw_arguments",
+                        "resources",
+                        "checkpoint_version",
+                        "thread_id",
+                        "turn_id",
+                        "project_instructions_digest",
+                        "messages",
+                        "tool_result_occurrences",
+                        "used_approval_grants",
+                        "approval_count",
+                        "model_turns",
+                        "completion",
+                        "last_completion_error",
+                        "plan",
+                        "plan_update_count",
+                        "recovery_metrics",
+                        "model_usage",
+                        "provider_attempts",
+                        "context_trace",
+                        "seen_tool_call_fingerprints",
+                        "last_repair_failure",
+                    ],
+                )?;
+                serde_json::from_value(payload.clone())
+                    .map_err(|error| format!("invalid approval checkpoint: {error}"))?
+            }
+            LEGACY_APPROVAL_CHECKPOINT_VERSION => {
+                Self::validate_keys(
+                    payload,
+                    &[
+                        "request_id",
+                        "tool_call_id",
+                        "tool_name",
+                        "raw_arguments",
+                        "resources",
+                        "checkpoint_version",
+                        "thread_id",
+                        "turn_id",
+                        "project_instructions_digest",
+                        "messages",
+                        "tool_results",
+                        "used_approval_grants",
+                        "approval_count",
+                        "model_turns",
+                        "completion",
+                        "last_completion_error",
+                        "plan",
+                        "plan_update_count",
+                        "recovery_metrics",
+                        "model_usage",
+                        "provider_attempts",
+                        "context_trace",
+                        "tool_result_context_bindings",
+                        "seen_tool_call_fingerprints",
+                        "last_repair_failure",
+                    ],
+                )?;
+                Self::migrate_legacy(payload)?
+            }
+            _ => return Err("unsupported approval checkpoint version".to_string()),
+        };
+        checkpoint.validate_serialized()?;
+        Ok(checkpoint)
+    }
+
+    fn validate_keys(payload: &Value, allowed: &[&str]) -> Result<(), String> {
+        let object = payload
+            .as_object()
+            .ok_or_else(|| "approval checkpoint must be a JSON object".to_string())?;
+        if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(format!("approval checkpoint contains unknown field: {key}"));
+        }
+        Ok(())
+    }
+
+    fn migrate_legacy(payload: &Value) -> Result<ApprovalCheckpoint, String> {
+        let legacy: LegacyApprovalCheckpoint = serde_json::from_value(payload.clone())
+            .map_err(|error| format!("invalid legacy approval checkpoint: {error}"))?;
+        if legacy.checkpoint_version != LEGACY_APPROVAL_CHECKPOINT_VERSION {
+            return Err("unsupported approval checkpoint version".to_string());
+        }
+        let bindings_present = legacy.tool_result_context_bindings.is_some();
+        let bindings = legacy.tool_result_context_bindings.unwrap_or_default();
+        if !legacy.tool_results.is_empty() && !bindings_present {
+            return Err(
+                "approval checkpoint tool result occurrence bindings are missing for non-empty results"
+                    .to_string(),
+            );
+        }
+        if bindings.len() != legacy.tool_results.len() {
+            return Err(
+                "approval checkpoint tool result occurrence bindings are invalid".to_string(),
+            );
+        }
+        let tool_result_occurrences = legacy
+            .tool_results
+            .into_iter()
+            .zip(bindings)
+            .map(|(wire, visibility)| ToolResultOccurrence::from_wire(wire, visibility))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ApprovalCheckpoint {
+            pending_tool_call: legacy.pending_tool_call,
+            checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
+            thread_id: legacy.thread_id,
+            turn_id: legacy.turn_id,
+            project_instructions_digest: legacy.project_instructions_digest,
+            messages: legacy.messages,
+            tool_result_occurrences,
+            used_approval_grants: legacy.used_approval_grants,
+            approval_count: legacy.approval_count,
+            model_turns: legacy.model_turns,
+            completion: legacy.completion,
+            last_completion_error: legacy.last_completion_error,
+            plan: legacy.plan,
+            plan_update_count: legacy.plan_update_count,
+            recovery_metrics: legacy.recovery_metrics,
+            model_usage: legacy.model_usage,
+            provider_attempts: legacy.provider_attempts,
+            context_trace: legacy.context_trace,
+            seen_tool_call_fingerprints: legacy.seen_tool_call_fingerprints,
+            last_repair_failure: legacy.last_repair_failure,
+        })
+    }
+}
+
+impl ApprovalCheckpoint {
+    fn validate_serialized(&self) -> Result<(), String> {
+        if self.checkpoint_version != APPROVAL_CHECKPOINT_VERSION {
+            return Err("unsupported approval checkpoint version".to_string());
+        }
+        if self.model_turns == 0 {
+            return Err("approval checkpoint model-turn offset is invalid".to_string());
+        }
+        if self.approval_count == 0 {
+            return Err("approval checkpoint approval count is invalid".to_string());
+        }
+        if self.messages.is_empty() {
+            return Err("approval checkpoint messages are missing".to_string());
+        }
+        let used_approval_grants = self.used_approval_grants.iter().collect::<BTreeSet<_>>();
+        if used_approval_grants.len() != self.used_approval_grants.len() {
+            return Err("approval checkpoint contains duplicate grants".to_string());
+        }
+        if let Some(plan) = &self.plan {
+            plan.validate()
+                .map_err(|error| format!("approval checkpoint plan is invalid: {error}"))?;
+            if self.plan_update_count == 0 {
+                return Err("approval checkpoint plan update count is invalid".to_string());
+            }
+        } else if self.plan_update_count != 0 {
+            return Err("approval checkpoint plan update count is invalid".to_string());
+        }
+        let seen_tool_call_fingerprints = self
+            .seen_tool_call_fingerprints
+            .iter()
+            .collect::<BTreeSet<_>>();
+        if seen_tool_call_fingerprints.len() != self.seen_tool_call_fingerprints.len()
+            || seen_tool_call_fingerprints
+                .iter()
+                .any(|fingerprint| !is_sha256_fingerprint(fingerprint))
+        {
+            return Err("approval checkpoint tool-call fingerprint state is invalid".to_string());
+        }
+        if self.last_repair_failure.as_ref().is_some_and(|failure| {
+            failure.consecutive_count == 0 || !is_sha256_fingerprint(&failure.signature)
+        }) {
+            return Err("approval checkpoint repair state is invalid".to_string());
+        }
+        if self.provider_attempts.retry_count > self.provider_attempts.attempt_count {
+            return Err("approval checkpoint provider attempt state is invalid".to_string());
+        }
+        if self.context_trace.as_ref().is_some_and(|trace| {
+            if trace.compaction_count == 0 {
+                return trace.compacted_message_count != 0
+                    || trace.last_compaction_before_tokens.is_some()
+                    || trace.last_compaction_after_tokens.is_some();
+            }
+            trace.compacted_message_count < trace.compaction_count
+                || trace.last_compaction_before_tokens.is_none()
+                || trace.last_compaction_after_tokens.is_none()
+                || trace.last_compaction_after_tokens >= trace.last_compaction_before_tokens
+        }) {
+            return Err("approval checkpoint context compaction state is invalid".to_string());
+        }
+        if !self.completion.is_consistent() {
+            return Err("approval checkpoint workspace revision state is invalid".to_string());
+        }
+        for occurrence in &self.tool_result_occurrences {
+            occurrence.validate()?;
+        }
+        if self
+            .context_trace
+            .as_ref()
+            .map_or(0, |trace| trace.compaction_count)
+            == 0
+            && self.tool_result_occurrences.iter().any(|occurrence| {
+                matches!(
+                    occurrence.visibility(),
+                    ToolResultVisibility::Compacted | ToolResultVisibility::Omitted
+                )
+            })
+        {
+            return Err("approval checkpoint compaction occurrence state is invalid".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// 在形成 `AgentLoopResult` 前跨模型提供方 turn 累积的可变状态。
 struct AgentLoopState {
     messages: Vec<ModelMessage>,
-    tool_results: Vec<ToolResult>,
+    tool_result_occurrences: Vec<ToolResultOccurrence>,
     approval_requests: Vec<ApprovalRequest>,
     pending_tool_calls: Vec<PendingToolCall>,
-    approval_checkpoints: Vec<Value>,
+    approval_checkpoints: Vec<ApprovalCheckpoint>,
     used_approval_grants: BTreeSet<String>,
     prior_approval_count: u32,
     completion: CompletionTracker,
@@ -1140,7 +1490,6 @@ struct AgentLoopState {
     recovery_metrics: AgentRecoveryMetrics,
     model_usage: ModelUsage,
     provider_attempts: ProviderAttemptMetadata,
-    tool_result_context_bindings: Vec<ToolResultContextBinding>,
     seen_tool_call_fingerprints: BTreeSet<String>,
     last_repair_failure: Option<RepairFailureState>,
     model_turn_limit: u32,
@@ -1157,7 +1506,7 @@ impl AgentLoopState {
     ) -> Self {
         Self {
             messages,
-            tool_results: Vec::new(),
+            tool_result_occurrences: Vec::new(),
             approval_requests: Vec::new(),
             pending_tool_calls: Vec::new(),
             approval_checkpoints: Vec::new(),
@@ -1170,7 +1519,6 @@ impl AgentLoopState {
             recovery_metrics: AgentRecoveryMetrics::default(),
             model_usage: ModelUsage::default(),
             provider_attempts: ProviderAttemptMetadata::default(),
-            tool_result_context_bindings: Vec::new(),
             seen_tool_call_fingerprints: BTreeSet::new(),
             last_repair_failure: None,
             model_turn_limit,
@@ -1204,17 +1552,28 @@ impl AgentLoopState {
             .prior_approval_count
             .saturating_add(self.approval_requests.len() as u32);
         let public_plan = self.plan.as_ref().map(safe_agent_plan);
+        let approval_checkpoints = self
+            .approval_checkpoints
+            .iter()
+            .map(ApprovalCheckpointCodec::encode)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("AgentLoop approval checkpoints serialize");
+        let tool_results = self
+            .tool_result_occurrences
+            .into_iter()
+            .map(ToolResultOccurrence::into_result)
+            .collect::<Vec<_>>();
         AgentLoopResult {
             status,
             completed,
             final_answer,
             model_turns,
-            tool_calls: self.tool_results.len() as u32,
+            tool_calls: tool_results.len() as u32,
             approval_count,
             approval_requests: self.approval_requests,
             pending_tool_calls: self.pending_tool_calls,
-            approval_checkpoints: self.approval_checkpoints,
-            tool_results: self.tool_results,
+            approval_checkpoints,
+            tool_results,
             verification: self.completion.summary(),
             plan: public_plan,
             plan_update_count: self.plan_update_count,
@@ -1296,19 +1655,15 @@ impl AgentLoopState {
         input: &AgentLoopInput,
         pending_tool_call: &PendingToolCall,
         model_turns: u32,
-    ) -> Value {
-        let checkpoint = AgentLoopCheckpoint {
+    ) -> Result<ApprovalCheckpoint, String> {
+        let checkpoint = ApprovalCheckpoint {
             pending_tool_call: pending_tool_call.clone(),
             checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
             thread_id: input.thread_id.clone(),
             turn_id: input.turn_id.clone(),
             project_instructions_digest: input.project_instructions_digest.clone(),
             messages: self.messages.clone(),
-            tool_results: self
-                .tool_results
-                .iter()
-                .map(CheckpointToolResult::from_tool_result)
-                .collect(),
+            tool_result_occurrences: self.tool_result_occurrences.clone(),
             used_approval_grants: self.used_approval_grants.iter().cloned().collect(),
             approval_count: self.approval_count(),
             model_turns,
@@ -1320,11 +1675,11 @@ impl AgentLoopState {
             model_usage: self.model_usage.clone(),
             provider_attempts: self.provider_attempts.clone(),
             context_trace: self.context_trace.clone(),
-            tool_result_context_bindings: self.tool_result_context_bindings.clone(),
             seen_tool_call_fingerprints: self.seen_tool_call_fingerprints.iter().cloned().collect(),
             last_repair_failure: self.last_repair_failure.clone(),
         };
-        serde_json::to_value(checkpoint).expect("AgentLoop checkpoint serializes")
+        checkpoint.validate_serialized()?;
+        Ok(checkpoint)
     }
 
     fn allows_final(&self) -> bool {
@@ -1435,15 +1790,17 @@ impl AgentLoopState {
     ) {
         self.messages
             .push(tool_result_message(&tool_result, provider_tool_name));
-        self.tool_results.push(tool_result);
-        self.tool_result_context_bindings
-            .push(ToolResultContextBinding::Visible);
+        self.tool_result_occurrences.push(ToolResultOccurrence::new(
+            tool_result,
+            ToolResultVisibility::Visible,
+        ));
     }
 
     fn append_hidden_tool_result(&mut self, tool_result: ToolResult) {
-        self.tool_results.push(tool_result);
-        self.tool_result_context_bindings
-            .push(ToolResultContextBinding::Hidden);
+        self.tool_result_occurrences.push(ToolResultOccurrence::new(
+            tool_result,
+            ToolResultVisibility::Hidden,
+        ));
     }
 }
 
@@ -1599,8 +1956,7 @@ where
             if !model_request_fits_context(
                 &tool_view.tools,
                 &state.messages,
-                &state.tool_results,
-                &state.tool_result_context_bindings,
+                &state.tool_result_occurrences,
                 budget,
             ) {
                 let Some(compaction) = compact_model_messages(&tool_view.tools, &state, budget)
@@ -1617,7 +1973,7 @@ where
                     context_trace.record_compaction(&compaction);
                 }
                 state.messages = compaction.messages;
-                state.tool_result_context_bindings = compaction.tool_result_context_bindings;
+                state.tool_result_occurrences = compaction.tool_result_occurrences;
             }
             let request = model_turn_request(
                 input,
@@ -2230,22 +2586,20 @@ where
                 &prepared,
                 reason,
             ));
-            state.pending_tool_calls.push(PendingToolCall::new(
+            let pending = PendingToolCall::new(
                 input,
                 &prepared.call,
                 prepared
                     .bound
                     .as_ref()
                     .expect("admitted tool call is bound"),
-            ));
-            let pending = state
-                .pending_tool_calls
-                .last()
-                .expect("pending tool call was just inserted")
-                .clone();
-            state
-                .approval_checkpoints
-                .push(state.checkpoint(input, &pending, next_model_turn));
+            );
+            state.pending_tool_calls.push(pending.clone());
+            let checkpoint = match state.checkpoint(input, &pending, next_model_turn) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return ToolBatchControl::Failed(error),
+            };
+            state.approval_checkpoints.push(checkpoint);
             let result = self.execute_tool(&prepared, decision, state);
             state.append_hidden_tool_result(result);
             return ToolBatchControl::Blocked;
@@ -2936,24 +3290,17 @@ fn context_budget(
 fn model_request_fits_context(
     tools: &[ModelToolSchema],
     messages: &[ModelMessage],
-    tool_results: &[ToolResult],
-    tool_result_context_bindings: &[ToolResultContextBinding],
+    tool_result_occurrences: &[ToolResultOccurrence],
     budget: &ContextBudget,
 ) -> bool {
-    model_request_token_count(
-        tools,
-        messages,
-        tool_results,
-        tool_result_context_bindings,
-        budget,
-    ) <= budget.model_context_window
+    model_request_token_count(tools, messages, tool_result_occurrences, budget)
+        <= budget.model_context_window
 }
 
 fn model_request_token_count(
     tools: &[ModelToolSchema],
     messages: &[ModelMessage],
-    tool_results: &[ToolResult],
-    tool_result_context_bindings: &[ToolResultContextBinding],
+    tool_result_occurrences: &[ToolResultOccurrence],
     budget: &ContextBudget,
 ) -> u32 {
     let projected_messages = messages
@@ -2992,7 +3339,7 @@ fn model_request_token_count(
     let payload_tokens = serde_json::to_string(&(projected_messages, projected_tools))
         .map_or(u32::MAX, |payload| approximate_token_count(&payload));
     let tool_result_accounting =
-        tool_result_context_token_adjustment(messages, tool_results, tool_result_context_bindings);
+        tool_result_context_token_adjustment(messages, tool_result_occurrences);
     let message_framing = u32::try_from(messages.len())
         .unwrap_or(u32::MAX)
         .saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
@@ -3006,11 +3353,9 @@ fn model_request_token_count(
 /// 将真实追加顺序中的 tool occurrence 与安全结果 accounting 对齐；压缩占位消息不重复计入。
 fn tool_result_context_token_adjustment(
     messages: &[ModelMessage],
-    tool_results: &[ToolResult],
-    tool_result_context_bindings: &[ToolResultContextBinding],
+    tool_result_occurrences: &[ToolResultOccurrence],
 ) -> u32 {
-    let Some(occurrences) =
-        tool_result_message_occurrences(messages, tool_results, tool_result_context_bindings)
+    let Some(occurrences) = tool_result_message_occurrences(messages, tool_result_occurrences)
     else {
         return u32::MAX;
     };
@@ -3018,14 +3363,12 @@ fn tool_result_context_token_adjustment(
         .into_iter()
         .filter_map(|occurrence| {
             let message_index = occurrence.tool_index?;
-            let result_index = occurrence.result_index;
-            let binding = occurrence.binding;
-            if binding != ToolResultContextBinding::Visible {
+            let occurrence_record = tool_result_occurrences.get(occurrence.result_index)?;
+            if occurrence_record.visibility() != ToolResultVisibility::Visible {
                 return None;
             }
             let message = messages.get(message_index)?;
-            let tool_result = tool_results.get(result_index)?;
-            let context_token_count = tool_result.context_token_count()?;
+            let context_token_count = occurrence_record.result().context_token_count()?;
             Some(context_token_count.saturating_sub(approximate_token_count(&message.content)))
         })
         .fold(0, u32::saturating_add)
@@ -3036,27 +3379,19 @@ struct ToolResultMessageOccurrence {
     assistant_index: usize,
     tool_index: Option<usize>,
     result_index: usize,
-    binding: ToolResultContextBinding,
+    visibility: ToolResultVisibility,
 }
 
-/// 按 occurrence 顺序验证当前 tool message 与 `ToolResult` 的一一绑定。
+/// 按 occurrence 顺序验证当前 tool message 与结果的一一绑定。
 fn tool_result_message_occurrences(
     messages: &[ModelMessage],
-    tool_results: &[ToolResult],
-    tool_result_context_bindings: &[ToolResultContextBinding],
+    tool_result_occurrences: &[ToolResultOccurrence],
 ) -> Option<Vec<ToolResultMessageOccurrence>> {
-    if tool_results.len() != tool_result_context_bindings.len() {
+    if tool_result_occurrences
+        .iter()
+        .any(|occurrence| occurrence.validate().is_err())
+    {
         return None;
-    }
-    for (result, binding) in tool_results.iter().zip(tool_result_context_bindings) {
-        if result.tool_call_id.trim().is_empty() {
-            return None;
-        }
-        if *binding == ToolResultContextBinding::Hidden
-            && result.failure_kind != Some(ToolFailureKind::Approval)
-        {
-            return None;
-        }
     }
     if messages.iter().any(|message| {
         message.role == ModelRole::Assistant && has_duplicate_tool_call_ids(&message.tool_calls)
@@ -3077,11 +3412,12 @@ fn tool_result_message_occurrences(
                 })
         })
         .collect::<Vec<_>>();
-    let result_occurrences = tool_result_context_bindings
+    let result_occurrences = tool_result_occurrences
         .iter()
         .enumerate()
-        .filter_map(|(index, binding)| {
-            (*binding != ToolResultContextBinding::Omitted).then_some((index, *binding))
+        .filter_map(|(index, occurrence)| {
+            (occurrence.visibility() != ToolResultVisibility::Omitted)
+                .then_some((index, occurrence.visibility()))
         })
         .collect::<Vec<_>>();
     if assistant_calls.len() != result_occurrences.len() {
@@ -3091,13 +3427,13 @@ fn tool_result_message_occurrences(
         .into_iter()
         .zip(result_occurrences)
         .map(
-            |((assistant_index, _call_index, call_id), (result_index, binding))| {
-                let result = tool_results.get(result_index)?;
+            |((assistant_index, _call_index, call_id), (result_index, visibility))| {
+                let result = tool_result_occurrences.get(result_index)?.result();
                 (call_id == result.tool_call_id).then_some(ToolResultMessageOccurrence {
                     assistant_index,
                     tool_index: None,
                     result_index,
-                    binding,
+                    visibility,
                 })
             },
         )
@@ -3112,8 +3448,8 @@ fn tool_result_message_occurrences(
         .iter()
         .filter(|occurrence| {
             matches!(
-                occurrence.binding,
-                ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted
+                occurrence.visibility,
+                ToolResultVisibility::Visible | ToolResultVisibility::Compacted
             )
         })
         .map(|occurrence| occurrence.result_index)
@@ -3126,7 +3462,7 @@ fn tool_result_message_occurrences(
         .zip(visible_result_occurrences)
     {
         let message = messages.get(tool_index)?;
-        let result = tool_results.get(result_index)?;
+        let result = tool_result_occurrences.get(result_index)?.result();
         if message.tool_call_id.as_deref() != Some(result.tool_call_id.as_str()) {
             return None;
         }
@@ -3136,23 +3472,23 @@ fn tool_result_message_occurrences(
         if occurrence.tool_index.replace(tool_index).is_some() {
             return None;
         }
-        match occurrence.binding {
-            ToolResultContextBinding::Visible if has_compaction_marker(message) => {
+        match occurrence.visibility {
+            ToolResultVisibility::Visible if has_compaction_marker(message) => {
                 return None;
             }
-            ToolResultContextBinding::Compacted if !is_compacted_tool_result_message(message) => {
+            ToolResultVisibility::Compacted if !is_compacted_tool_result_message(message) => {
                 return None;
             }
-            ToolResultContextBinding::Hidden | ToolResultContextBinding::Omitted => {
+            ToolResultVisibility::Hidden | ToolResultVisibility::Omitted => {
                 return None;
             }
-            ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted => {}
+            ToolResultVisibility::Visible | ToolResultVisibility::Compacted => {}
         }
     }
     if occurrences.iter().any(|occurrence| {
         matches!(
-            occurrence.binding,
-            ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted
+            occurrence.visibility,
+            ToolResultVisibility::Visible | ToolResultVisibility::Compacted
         ) && occurrence.tool_index.is_none()
     }) {
         return None;
@@ -3163,7 +3499,7 @@ fn tool_result_message_occurrences(
 #[derive(Debug)]
 struct ContextCompactionOutcome {
     messages: Vec<ModelMessage>,
-    tool_result_context_bindings: Vec<ToolResultContextBinding>,
+    tool_result_occurrences: Vec<ToolResultOccurrence>,
     compacted_message_count: u32,
     before_tokens: u32,
     after_tokens: u32,
@@ -3178,18 +3514,14 @@ fn compact_model_messages(
     let before_tokens = model_request_token_count(
         tools,
         &state.messages,
-        &state.tool_results,
-        &state.tool_result_context_bindings,
+        &state.tool_result_occurrences,
         budget,
     );
     if before_tokens <= budget.model_context_window {
         return None;
     }
-    let occurrences = tool_result_message_occurrences(
-        &state.messages,
-        &state.tool_results,
-        &state.tool_result_context_bindings,
-    )?;
+    let occurrences =
+        tool_result_message_occurrences(&state.messages, &state.tool_result_occurrences)?;
 
     let authority_indices = state
         .messages
@@ -3230,14 +3562,13 @@ fn compact_model_messages(
         compaction_summary(state, compacted_message_count),
     ));
     messages.push(state.messages[current_user_index].clone());
-    let mut tool_result_context_bindings = state
-        .tool_result_context_bindings
+    let mut tool_result_occurrences = state
+        .tool_result_occurrences
         .iter()
-        .map(|binding| match binding {
-            ToolResultContextBinding::Hidden => ToolResultContextBinding::Omitted,
-            ToolResultContextBinding::Visible
-            | ToolResultContextBinding::Compacted
-            | ToolResultContextBinding::Omitted => ToolResultContextBinding::Omitted,
+        .cloned()
+        .map(|mut occurrence| {
+            occurrence.set_visibility(ToolResultVisibility::Omitted);
+            occurrence
         })
         .collect::<Vec<_>>();
     if let Some(assistant_index) = latest_tool_assistant
@@ -3247,34 +3578,29 @@ fn compact_model_messages(
         for occurrence in occurrences.iter().filter(|occurrence| {
             occurrence.assistant_index == assistant_index
                 && matches!(
-                    occurrence.binding,
-                    ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted
+                    occurrence.visibility,
+                    ToolResultVisibility::Visible | ToolResultVisibility::Compacted
                 )
         }) {
             let tool_index = occurrence.tool_index?;
             let result_index = occurrence.result_index;
             messages.push(compacted_tool_result_message(
                 &state.messages[tool_index],
-                state.tool_results.get(result_index),
+                state.tool_result_occurrences.get(result_index),
             ));
-            let binding = tool_result_context_bindings.get_mut(result_index)?;
-            *binding = ToolResultContextBinding::Compacted;
+            let occurrence = tool_result_occurrences.get_mut(result_index)?;
+            occurrence.set_visibility(ToolResultVisibility::Compacted);
         }
     }
 
-    let after_tokens = model_request_token_count(
-        tools,
-        &messages,
-        &state.tool_results,
-        &tool_result_context_bindings,
-        budget,
-    );
+    let after_tokens =
+        model_request_token_count(tools, &messages, &tool_result_occurrences, budget);
     if after_tokens >= before_tokens || after_tokens > budget.model_context_window {
         return None;
     }
     Some(ContextCompactionOutcome {
         messages,
-        tool_result_context_bindings,
+        tool_result_occurrences,
         compacted_message_count,
         before_tokens,
         after_tokens,
@@ -3284,8 +3610,8 @@ fn compact_model_messages(
 fn latest_complete_tool_assistant(occurrences: &[ToolResultMessageOccurrence]) -> Option<usize> {
     for occurrence in occurrences.iter().rev() {
         if matches!(
-            occurrence.binding,
-            ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted
+            occurrence.visibility,
+            ToolResultVisibility::Visible | ToolResultVisibility::Compacted
         ) {
             occurrence.tool_index?;
             return Some(occurrence.assistant_index);
@@ -3324,13 +3650,13 @@ fn is_compacted_tool_result_message(message: &ModelMessage) -> bool {
 
 fn compacted_tool_result_message(
     original: &ModelMessage,
-    tool_result: Option<&ToolResult>,
+    occurrence: Option<&ToolResultOccurrence>,
 ) -> ModelMessage {
     let content = json!({
         "compacted": true,
-        "ok": tool_result.is_some_and(|result| result.ok),
-        "error_code": tool_result.and_then(|result| result.error_code.as_deref()),
-        "truncated": tool_result.is_some_and(|result| result.truncated),
+        "ok": occurrence.is_some_and(|occurrence| occurrence.result().ok),
+        "error_code": occurrence.and_then(|occurrence| occurrence.result().error_code.as_deref()),
+        "truncated": occurrence.is_some_and(|occurrence| occurrence.result().truncated),
         "instruction": COMPACTED_TOOL_RESULT_INSTRUCTION
     });
     let mut message = ModelMessage::text(ModelRole::Tool, content.to_string());
@@ -3368,15 +3694,15 @@ fn compaction_summary(state: &AgentLoopState, compacted_message_count: u32) -> S
         })
     });
     let failed_tool_result_count = state
-        .tool_results
+        .tool_result_occurrences
         .iter()
-        .filter(|result| !result.ok)
+        .filter(|occurrence| !occurrence.result().ok)
         .count();
     json!({
         "type": "agent_context_compaction",
         "notice": "Older messages and raw tool output were omitted. Do not assume omitted evidence; inspect the workspace again when needed.",
         "compacted_message_count": compacted_message_count,
-        "tool_result_count": state.tool_results.len(),
+        "tool_result_count": state.tool_result_occurrences.len(),
         "failed_tool_result_count": failed_tool_result_count,
         "plan": plan,
         "verification": {
@@ -3514,11 +3840,7 @@ fn restore_checkpoint(
     payload: &Value,
     tool_broker: &ToolBroker,
 ) -> Result<(AgentLoopState, u32), String> {
-    let checkpoint: AgentLoopCheckpoint = serde_json::from_value(payload.clone())
-        .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
-    if checkpoint.checkpoint_version != APPROVAL_CHECKPOINT_VERSION {
-        return Err("unsupported approval checkpoint version".to_string());
-    }
+    let checkpoint = ApprovalCheckpointCodec::decode(payload)?;
     if checkpoint.thread_id != input.thread_id {
         return Err("approval checkpoint thread mismatch".to_string());
     }
@@ -3537,15 +3859,6 @@ fn restore_checkpoint(
         || checkpoint.pending_tool_call.request_id != expected_request_id
     {
         return Err("approval checkpoint request mismatch".to_string());
-    }
-    if checkpoint.model_turns == 0 {
-        return Err("approval checkpoint model-turn offset is invalid".to_string());
-    }
-    if checkpoint.approval_count == 0 {
-        return Err("approval checkpoint approval count is invalid".to_string());
-    }
-    if checkpoint.messages.is_empty() {
-        return Err("approval checkpoint messages are missing".to_string());
     }
     let last_message = checkpoint
         .messages
@@ -3584,106 +3897,20 @@ fn restore_checkpoint(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    if used_approval_grants.len() != checkpoint.used_approval_grants.len() {
-        return Err("approval checkpoint contains duplicate grants".to_string());
-    }
     if used_approval_grants.contains(&pending.request_id) {
         return Err("approval checkpoint consumed the pending grant".to_string());
     }
-    if let Some(plan) = &checkpoint.plan {
-        plan.validate()
-            .map_err(|error| format!("approval checkpoint plan is invalid: {error}"))?;
-        if checkpoint.plan_update_count == 0 {
-            return Err("approval checkpoint plan update count is invalid".to_string());
-        }
-    } else if checkpoint.plan_update_count != 0 {
-        return Err("approval checkpoint plan update count is invalid".to_string());
-    }
-    let seen_tool_call_fingerprints = checkpoint
-        .seen_tool_call_fingerprints
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if seen_tool_call_fingerprints.len() != checkpoint.seen_tool_call_fingerprints.len()
-        || seen_tool_call_fingerprints
-            .iter()
-            .any(|fingerprint| !is_sha256_fingerprint(fingerprint))
-    {
-        return Err("approval checkpoint tool-call fingerprint state is invalid".to_string());
-    }
-    if checkpoint
-        .last_repair_failure
-        .as_ref()
-        .is_some_and(|failure| {
-            failure.consecutive_count == 0 || !is_sha256_fingerprint(&failure.signature)
-        })
-    {
-        return Err("approval checkpoint repair state is invalid".to_string());
-    }
-    if checkpoint.provider_attempts.retry_count > checkpoint.provider_attempts.attempt_count {
-        return Err("approval checkpoint provider attempt state is invalid".to_string());
-    }
-    if checkpoint.context_trace.as_ref().is_some_and(|trace| {
-        if trace.compaction_count == 0 {
-            return trace.compacted_message_count != 0
-                || trace.last_compaction_before_tokens.is_some()
-                || trace.last_compaction_after_tokens.is_some();
-        }
-        trace.compacted_message_count < trace.compaction_count
-            || trace.last_compaction_before_tokens.is_none()
-            || trace.last_compaction_after_tokens.is_none()
-            || trace.last_compaction_after_tokens >= trace.last_compaction_before_tokens
-    }) {
-        return Err("approval checkpoint context compaction state is invalid".to_string());
-    }
-    if !checkpoint.completion.is_consistent() {
-        return Err("approval checkpoint workspace revision state is invalid".to_string());
-    }
-    let context_bindings_present = payload.get("tool_result_context_bindings").is_some();
-    if !context_bindings_present && !checkpoint.tool_results.is_empty() {
-        return Err(
-            "approval checkpoint tool result occurrence bindings are missing for non-empty results"
-                .to_string(),
-        );
-    }
-    if checkpoint.tool_result_context_bindings.len() != checkpoint.tool_results.len() {
-        return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
-    }
-    let tool_result_context_bindings = checkpoint.tool_result_context_bindings.clone();
-    let compaction_count = checkpoint
-        .context_trace
-        .as_ref()
-        .map_or(0, |trace| trace.compaction_count);
-    if compaction_count == 0
-        && tool_result_context_bindings.iter().any(|binding| {
-            matches!(
-                binding,
-                ToolResultContextBinding::Compacted | ToolResultContextBinding::Omitted
-            )
-        })
-    {
-        return Err("approval checkpoint compaction occurrence state is invalid".to_string());
-    }
-    let tool_results = checkpoint
-        .tool_results
-        .into_iter()
-        .zip(tool_result_context_bindings.iter().copied())
-        .map(|(tool_result, binding)| tool_result.into_tool_result(binding))
-        .collect::<Result<Vec<_>, _>>()?;
+    let tool_result_occurrences = checkpoint.tool_result_occurrences;
     let checkpoint_history_messages = &checkpoint.messages[..checkpoint.messages.len() - 1];
-    if tool_result_message_occurrences(
-        checkpoint_history_messages,
-        &tool_results,
-        &tool_result_context_bindings,
-    )
-    .is_none()
+    if tool_result_message_occurrences(checkpoint_history_messages, &tool_result_occurrences)
+        .is_none()
     {
         return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
     }
     let mut derived_completion =
         CompletionTracker::from_requirements(&input.verification_requirements)?;
-    for tool_result in &tool_results {
-        derived_completion.observe(tool_result);
+    for occurrence in &tool_result_occurrences {
+        derived_completion.observe(occurrence.result());
     }
     if !derived_completion.is_consistent() {
         return Err("approval checkpoint derived workspace revision state is invalid".to_string());
@@ -3691,16 +3918,22 @@ fn restore_checkpoint(
     if derived_completion != checkpoint.completion {
         return Err("approval checkpoint completion state mismatch".to_string());
     }
-    let derived_plan_update_count = tool_results
+    let derived_plan_update_count = tool_result_occurrences
         .iter()
-        .filter(|tool_result| tool_result.tool_name == UPDATE_PLAN_TOOL && tool_result.ok)
+        .filter(|occurrence| {
+            occurrence.result().tool_name == UPDATE_PLAN_TOOL && occurrence.result().ok
+        })
         .count() as u32;
     if derived_plan_update_count != checkpoint.plan_update_count {
         return Err("approval checkpoint plan update count mismatch".to_string());
     }
+    let seen_tool_call_fingerprints = checkpoint
+        .seen_tool_call_fingerprints
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut state = AgentLoopState::new(checkpoint.messages, input.max_turns.max(1), None);
-    state.tool_results = tool_results;
-    state.tool_result_context_bindings = tool_result_context_bindings;
+    state.tool_result_occurrences = tool_result_occurrences;
     state.used_approval_grants = used_approval_grants;
     state.prior_approval_count = checkpoint.approval_count;
     state.completion = derived_completion;
@@ -4040,7 +4273,7 @@ fn provider_history_assistant_message(
     model_visible_calls: &[ModelToolCall],
     execution_calls: &[ModelToolCall],
 ) -> ModelMessage {
-    // 在 state/tool_results 中保留拒绝调用的诊断信息，但不把 provider 原始名称或参数重放到下一次请求。
+    // 在内部 occurrence 中保留拒绝调用的诊断信息，但不把 provider 原始名称或参数重放到下一次请求。
     debug_assert_eq!(model_visible_calls.len(), execution_calls.len());
     let mut message = original
         .cloned()
@@ -4834,24 +5067,39 @@ mod context_accounting_tests {
     fn tool_result_accounting_uses_occurrence_order_for_duplicate_ids_and_placeholders() {
         let mut hidden = ToolResult::summary("same_call", TOOL_COMMAND, false, "approval");
         hidden.failure_kind = Some(ToolFailureKind::Approval);
-        let results = vec![
-            ToolResult::summary("same_call", TOOL_COMMAND, true, "first")
-                .with_context_token_count(100),
-            hidden.with_context_token_count(200),
-            ToolResult::summary("same_call", TOOL_COMMAND, true, "second")
-                .with_context_token_count(20),
-            ToolResult::summary("same_call", TOOL_COMMAND, true, "compacted")
-                .with_context_token_count(300),
-            ToolResult::summary("other_call", TOOL_COMMAND, true, "other compacted")
-                .with_context_token_count(400),
+        let occurrences = vec![
+            ToolResultOccurrence::new(
+                ToolResult::summary("same_call", TOOL_COMMAND, true, "first")
+                    .with_context_token_count(100),
+                ToolResultVisibility::Visible,
+            ),
+            ToolResultOccurrence::new(
+                hidden.with_context_token_count(200),
+                ToolResultVisibility::Hidden,
+            ),
+            ToolResultOccurrence::new(
+                ToolResult::summary("same_call", TOOL_COMMAND, true, "second")
+                    .with_context_token_count(20),
+                ToolResultVisibility::Visible,
+            ),
+            ToolResultOccurrence::new(
+                ToolResult::summary("same_call", TOOL_COMMAND, true, "compacted")
+                    .with_context_token_count(300),
+                ToolResultVisibility::Compacted,
+            ),
+            ToolResultOccurrence::new(
+                ToolResult::summary("other_call", TOOL_COMMAND, true, "other compacted")
+                    .with_context_token_count(400),
+                ToolResultVisibility::Compacted,
+            ),
         ];
         let compacted_message = compacted_tool_result_message(
             &tool_message("same_call", "original tool message"),
-            results.get(3),
+            occurrences.get(3),
         );
         let other_compacted_message = compacted_tool_result_message(
             &tool_message("other_call", "original other tool message"),
-            results.get(4),
+            occurrences.get(4),
         );
         let messages = vec![
             assistant_tool_message(&["same_call"]),
@@ -4863,43 +5111,32 @@ mod context_accounting_tests {
             compacted_message,
             other_compacted_message,
         ];
-        let bindings = vec![
-            ToolResultContextBinding::Visible,
-            ToolResultContextBinding::Hidden,
-            ToolResultContextBinding::Visible,
-            ToolResultContextBinding::Compacted,
-            ToolResultContextBinding::Compacted,
-        ];
         let expected = 100u32
             .saturating_sub(approximate_token_count("first public payload"))
             .saturating_add(20u32.saturating_sub(approximate_token_count("second public payload")));
 
         assert_eq!(
-            tool_result_context_token_adjustment(&messages, &results, &bindings),
+            tool_result_context_token_adjustment(&messages, &occurrences),
             expected
         );
     }
 
     #[test]
     fn tool_result_occurrence_rejects_visible_result_marked_compacted() {
-        let results = vec![ToolResult::summary(
-            "call_1",
-            TOOL_COMMAND,
-            true,
-            "safe public payload",
+        let occurrences = vec![ToolResultOccurrence::new(
+            ToolResult::summary("call_1", TOOL_COMMAND, true, "safe public payload"),
+            ToolResultVisibility::Compacted,
         )];
         let messages = vec![
             assistant_tool_message(&["call_1"]),
             tool_message("call_1", "safe public payload"),
         ];
-        let bindings = [ToolResultContextBinding::Compacted];
-
         assert!(
-            tool_result_message_occurrences(&messages, &results, &bindings).is_none(),
+            tool_result_message_occurrences(&messages, &occurrences).is_none(),
             "a normal tool payload cannot satisfy a compacted checkpoint binding"
         );
         assert_eq!(
-            tool_result_context_token_adjustment(&messages, &results, &bindings),
+            tool_result_context_token_adjustment(&messages, &occurrences),
             u32::MAX
         );
     }
@@ -4914,30 +5151,47 @@ mod context_accounting_tests {
         let expected = result
             .context_token_count()
             .expect("safe result accounting");
-        let mut legacy = CheckpointToolResult::from_tool_result(&result);
+        let mut legacy = ToolResultOccurrenceWire {
+            result: result.clone(),
+            visibility: None,
+            result_id: result.result_id.clone(),
+            context_token_count: result.context_token_count(),
+            audit_metadata: result.audit_metadata().cloned(),
+            workspace_observation: result.workspace_observation().cloned(),
+        };
         legacy.context_token_count = None;
-        let restored = legacy
-            .into_tool_result(ToolResultContextBinding::Visible)
+        let restored = ToolResultOccurrence::from_wire(legacy, ToolResultVisibility::Visible)
             .expect("small safe legacy result remains compatible");
-        assert_eq!(restored.context_token_count(), Some(expected));
+        assert_eq!(restored.result().context_token_count(), Some(expected));
 
-        let mut inconsistent = CheckpointToolResult::from_tool_result(&result);
+        let mut inconsistent = ToolResultOccurrenceWire {
+            result: result.clone(),
+            visibility: None,
+            result_id: result.result_id.clone(),
+            context_token_count: result.context_token_count(),
+            audit_metadata: result.audit_metadata().cloned(),
+            workspace_observation: result.workspace_observation().cloned(),
+        };
         inconsistent.context_token_count = Some(expected.saturating_add(1));
         assert!(
-            inconsistent
-                .into_tool_result(ToolResultContextBinding::Visible)
-                .is_err()
+            ToolResultOccurrence::from_wire(inconsistent, ToolResultVisibility::Visible).is_err()
         );
 
         let large = ToolResult::from_result(
             &envelope,
             &ToolOutput::success(json!({"stdout": "large-safe-output".repeat(2_000)})),
         );
-        let mut untrusted_legacy = CheckpointToolResult::from_tool_result(&large);
+        let mut untrusted_legacy = ToolResultOccurrenceWire {
+            result: large.clone(),
+            visibility: None,
+            result_id: large.result_id.clone(),
+            context_token_count: large.context_token_count(),
+            audit_metadata: large.audit_metadata().cloned(),
+            workspace_observation: large.workspace_observation().cloned(),
+        };
         untrusted_legacy.context_token_count = None;
         assert!(
-            untrusted_legacy
-                .into_tool_result(ToolResultContextBinding::Visible)
+            ToolResultOccurrence::from_wire(untrusted_legacy, ToolResultVisibility::Visible)
                 .is_err()
         );
     }

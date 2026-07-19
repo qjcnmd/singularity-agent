@@ -514,17 +514,9 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
     assert_eq!(blocked.status, AgentStatus::Blocked);
     assert_eq!(negotiation_calls.load(Ordering::SeqCst), 1);
     let pending = blocked.pending_tool_calls[0].clone();
-    let mut checkpoint = blocked
+    let checkpoint = blocked
         .approval_checkpoint(&pending.request_id)
         .expect("approval checkpoint");
-    checkpoint["provider_protocol_contract"] = serde_json::json!({
-        "supports_strict_tool_schema": false,
-        "supports_parallel_tool_calls": false
-    });
-    checkpoint["provider_capability_metadata"] = serde_json::json!({
-        "profile": "declared",
-        "cache_hit": true
-    });
 
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
         pending.request_id.clone(),
@@ -1257,11 +1249,11 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         }),
     ));
 
-    let result = agent_loop_with_response(
+    let agent_loop = agent_loop_with_response(
         response,
         PolicyEngine::new(PermissionProfile::workspace_write()),
-    )
-    .run(&input);
+    );
+    let result = agent_loop.run(&input);
 
     assert_eq!(result.status, AgentStatus::Blocked);
     let pending = &result.pending_tool_calls[0];
@@ -1269,7 +1261,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     let checkpoint = result
         .approval_checkpoint(&pending.request_id)
         .expect("approval checkpoint");
-    assert_eq!(checkpoint["checkpoint_version"], 1);
+    assert_eq!(checkpoint["checkpoint_version"], 2);
     assert_eq!(checkpoint["thread_id"], "thread_1");
     assert_eq!(checkpoint["turn_id"], "turn_1");
     assert_eq!(checkpoint["request_id"], "approval_turn_1_call_1");
@@ -1277,7 +1269,8 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     assert_eq!(checkpoint["approval_count"], 1);
     assert_eq!(checkpoint["model_turns"], 1);
     assert_eq!(checkpoint["used_approval_grants"], serde_json::json!([]));
-    assert_eq!(checkpoint["tool_results"], serde_json::json!([]));
+    assert_eq!(checkpoint["tool_result_occurrences"], serde_json::json!([]));
+    assert!(checkpoint.get("tool_result_context_bindings").is_none());
     let messages = checkpoint["messages"]
         .as_array()
         .expect("checkpoint messages");
@@ -1290,6 +1283,63 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     assert!(!public_result.contains("checkpoint_version"));
     assert!(!public_result.contains("raw_arguments"));
     assert!(!public_result.contains("before approval"));
+
+    assert_eq!(
+        checkpoint,
+        result
+            .approval_checkpoint(&pending.request_id)
+            .expect("checkpoint roundtrip")
+    );
+    let grant = ApprovalGrant::allow(
+        pending.request_id.clone(),
+        pending.tool_name.clone(),
+        pending.resources.clone(),
+    );
+    let mut future_checkpoint = checkpoint.clone();
+    future_checkpoint["checkpoint_version"] = serde_json::json!(999);
+    let future = agent_loop.resume_pending_tool_call(
+        &input.clone().with_approval_grant(grant.clone()),
+        pending,
+        &future_checkpoint,
+    );
+    assert_eq!(future.status, AgentStatus::Failed);
+    assert_eq!(
+        future.error.as_deref(),
+        Some("unsupported approval checkpoint version")
+    );
+
+    let mut unknown_field_checkpoint = checkpoint.clone();
+    unknown_field_checkpoint["unexpected"] = serde_json::json!("must reject");
+    let unknown_field = agent_loop.resume_pending_tool_call(
+        &input.clone().with_approval_grant(grant.clone()),
+        pending,
+        &unknown_field_checkpoint,
+    );
+    assert_eq!(unknown_field.status, AgentStatus::Failed);
+    assert!(
+        unknown_field
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown field"))
+    );
+
+    let mut incomplete_checkpoint = checkpoint.clone();
+    incomplete_checkpoint
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("tool_result_occurrences");
+    let incomplete = agent_loop.resume_pending_tool_call(
+        &input.with_approval_grant(grant),
+        pending,
+        &incomplete_checkpoint,
+    );
+    assert_eq!(incomplete.status, AgentStatus::Failed);
+    assert!(
+        incomplete
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("invalid approval checkpoint"))
+    );
 }
 
 #[test]
@@ -1319,10 +1369,13 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
         .approval_checkpoint(&pending.request_id)
         .expect("approval checkpoint");
     let mut legacy_checkpoint = checkpoint.clone();
+    legacy_checkpoint["checkpoint_version"] = serde_json::json!(1);
+    legacy_checkpoint["tool_results"] = legacy_checkpoint["tool_result_occurrences"].clone();
     legacy_checkpoint
         .as_object_mut()
         .expect("checkpoint object")
-        .remove("tool_result_context_bindings");
+        .remove("tool_result_occurrences");
+    legacy_checkpoint["tool_result_context_bindings"] = serde_json::json!([]);
     let resume_input = input.clone().with_approval_grant(ApprovalGrant::allow(
         pending.request_id.clone(),
         pending.tool_name.clone(),
@@ -1339,6 +1392,121 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
     assert_eq!(
         std::fs::read_to_string(file_path).expect("read file"),
         "after"
+    );
+}
+
+#[test]
+fn approval_pause_resume_matches_uninterrupted_history_and_result_order() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("README.md"), "stable").expect("write fixture");
+    let ask_readme = PermissionRule::new(
+        "ask_readme",
+        SettingsScope::Project,
+        PermissionDecisionOutcome::Ask,
+    )
+    .for_operation(PermissionOperation::Read)
+    .for_resource(workspace_resource("README.md"));
+    let policy = allow_read_policy().with_rule(ask_readme);
+    let input = AgentLoopInput::new("thread_1", "turn_1", "read the file").with_max_turns(2);
+    let grant = ApprovalGrant::allow(
+        "approval_turn_1_call_1",
+        tool_id("read"),
+        [workspace_resource("README.md")],
+    );
+    let read_response = || {
+        let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+        response.tool_calls.push(tool_call(
+            "call_1",
+            "read",
+            serde_json::json!({
+                "path": "README.md",
+                "max_chars": null,
+                "line_start": null,
+                "line_end": null
+            }),
+        ));
+        response
+    };
+    let final_response =
+        || ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+
+    let uninterrupted_requests = Arc::new(Mutex::new(Vec::new()));
+    let uninterrupted = AgentLoop::new(
+        StaticProvider {
+            responses: vec![read_response(), final_response()],
+            seen_requests: Arc::clone(&uninterrupted_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_policy(),
+    )
+    .with_workspace_tools(WorkspaceTools::new(workspace.path()).expect("bind workspace tools"));
+    let uninterrupted_result = uninterrupted.run(&input.clone().with_approval_grant(grant.clone()));
+    assert_eq!(uninterrupted_result.status, AgentStatus::Completed);
+
+    let paused_requests = Arc::new(Mutex::new(Vec::new()));
+    let paused = AgentLoop::new(
+        StaticProvider {
+            responses: vec![read_response(), final_response()],
+            seen_requests: Arc::clone(&paused_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        policy.clone(),
+    )
+    .with_workspace_tools(WorkspaceTools::new(workspace.path()).expect("bind workspace tools"));
+    let blocked = paused.run(&input);
+    assert_eq!(blocked.status, AgentStatus::Blocked);
+    let pending = blocked.pending_tool_calls[0].clone();
+    let checkpoint = blocked
+        .approval_checkpoint(&pending.request_id)
+        .expect("approval checkpoint");
+    let resumed_grant = ApprovalGrant::allow(
+        pending.request_id.clone(),
+        pending.tool_name.clone(),
+        pending.resources.clone(),
+    );
+
+    let resumed_requests = Arc::new(Mutex::new(Vec::new()));
+    let resumed_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![final_response()],
+            seen_requests: Arc::clone(&resumed_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        policy,
+    )
+    .with_workspace_tools(WorkspaceTools::new(workspace.path()).expect("bind workspace tools"));
+    let resumed = resumed_loop.resume_pending_tool_call(
+        &input.with_approval_grant(resumed_grant),
+        &pending,
+        &checkpoint,
+    );
+
+    assert_eq!(resumed.status, uninterrupted_result.status);
+    assert_eq!(resumed.model_turns, uninterrupted_result.model_turns);
+    assert_eq!(resumed.verification, uninterrupted_result.verification);
+    assert_eq!(resumed.tool_results, uninterrupted_result.tool_results);
+    let uninterrupted_requests = uninterrupted_requests.lock().expect("requests");
+    let resumed_requests = resumed_requests.lock().expect("requests");
+    assert_eq!(uninterrupted_requests.len(), 2);
+    assert_eq!(resumed_requests.len(), 1);
+    assert_eq!(
+        uninterrupted_requests[1].messages,
+        resumed_requests[0].messages
+    );
+    assert_eq!(
+        uninterrupted_result
+            .tool_results
+            .iter()
+            .map(|result| (&result.tool_call_id, &result.tool_name))
+            .collect::<Vec<_>>(),
+        resumed
+            .tool_results
+            .iter()
+            .map(|result| (&result.tool_call_id, &result.tool_name))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2253,7 +2421,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         checkpoint["completion"]["terminal_command_revisions"],
         serde_json::json!([1])
     );
-    let checkpoint_command = checkpoint["tool_results"]
+    let checkpoint_command = checkpoint["tool_result_occurrences"]
         .as_array()
         .expect("checkpoint tool results")
         .iter()
@@ -2285,7 +2453,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     );
 
     let mut missing_context_count = checkpoint.clone();
-    missing_context_count["tool_results"]
+    missing_context_count["tool_result_occurrences"]
         .as_array_mut()
         .expect("checkpoint tool results")
         .iter_mut()
@@ -2308,7 +2476,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     );
 
     let mut low_context_count = checkpoint.clone();
-    low_context_count["tool_results"]
+    low_context_count["tool_result_occurrences"]
         .as_array_mut()
         .expect("checkpoint tool results")
         .iter_mut()
@@ -2323,14 +2491,14 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
             .is_some_and(|error| error.contains("context token"))
     );
 
-    let command_result_index = checkpoint["tool_results"]
+    let command_result_index = checkpoint["tool_result_occurrences"]
         .as_array()
         .expect("checkpoint tool results")
         .iter()
         .position(|result| result["result"]["tool_name"] == "command")
         .expect("checkpoint command result");
     let mut compacted_binding = checkpoint.clone();
-    compacted_binding["tool_result_context_bindings"][command_result_index] =
+    compacted_binding["tool_result_occurrences"][command_result_index]["visibility"] =
         serde_json::json!("visible");
     let compacted_binding_result =
         resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &compacted_binding);
@@ -2343,7 +2511,7 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     );
 
     let mut visible_approval_with_count = checkpoint.clone();
-    visible_approval_with_count["tool_results"][command_result_index]["result"]["failure_kind"] =
+    visible_approval_with_count["tool_result_occurrences"][command_result_index]["result"]["failure_kind"] =
         serde_json::json!("approval");
     let visible_approval_with_count_result = resumed_agent_loop.resume_pending_tool_call(
         &resumed_input,
@@ -2362,9 +2530,9 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     );
 
     let mut visible_approval_missing_count = checkpoint.clone();
-    visible_approval_missing_count["tool_results"][command_result_index]["result"]["failure_kind"] =
+    visible_approval_missing_count["tool_result_occurrences"][command_result_index]["result"]["failure_kind"] =
         serde_json::json!("approval");
-    visible_approval_missing_count["tool_results"][command_result_index]
+    visible_approval_missing_count["tool_result_occurrences"][command_result_index]
         .as_object_mut()
         .expect("checkpoint command object")
         .remove("context_token_count");
@@ -2381,8 +2549,47 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
             .is_some_and(|error| error.contains("hidden tool result binding"))
     );
 
+    let mut legacy_checkpoint = checkpoint.clone();
+    let mut legacy_results = legacy_checkpoint["tool_result_occurrences"]
+        .as_array()
+        .expect("checkpoint occurrences")
+        .clone();
+    let legacy_bindings = legacy_results
+        .iter()
+        .map(|occurrence| occurrence["visibility"].clone())
+        .collect::<Vec<_>>();
+    for occurrence in &mut legacy_results {
+        occurrence
+            .as_object_mut()
+            .expect("checkpoint occurrence object")
+            .remove("visibility");
+    }
+    legacy_checkpoint["checkpoint_version"] = serde_json::json!(1);
+    legacy_checkpoint["tool_results"] = serde_json::Value::Array(legacy_results);
+    legacy_checkpoint["tool_result_context_bindings"] = serde_json::Value::Array(legacy_bindings);
+    legacy_checkpoint
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("tool_result_occurrences");
+    let mut missing_legacy_bindings = legacy_checkpoint.clone();
+    missing_legacy_bindings
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("tool_result_context_bindings");
+    let missing_legacy = resumed_agent_loop.resume_pending_tool_call(
+        &resumed_input,
+        &pending,
+        &missing_legacy_bindings,
+    );
+    assert_eq!(missing_legacy.status, AgentStatus::Failed);
+    assert!(
+        missing_legacy
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("bindings are missing"))
+    );
     let resumed =
-        resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
+        resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &legacy_checkpoint);
 
     assert_eq!(
         resumed.status,
