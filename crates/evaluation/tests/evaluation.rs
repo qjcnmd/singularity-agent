@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-//! Evaluation v5/v7/v3 schema、task/trial 指标和证据绑定合同测试。
+//! Evaluation v5/v7/v2 schema、task/trial 指标和证据绑定合同测试。
 
 use serde_json::{Value, json};
 use singularity_evaluation::{
@@ -262,7 +262,7 @@ fn trial_evidence(trial: &EvaluationTrialResult, complete: bool) -> EvaluationTr
 fn evidence_for(result: &EvaluationResult, complete: bool) -> EvaluationEvidence {
     let task = &result.tasks[0];
     EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V3,
+        schema_version: EvaluationEvidenceSchemaVersion::V2,
         run_id: result.run_id.clone(),
         manifest_digest: DIGEST.to_string(),
         task_selection_digest: task_selection_digest(std::slice::from_ref(&task.task_id)),
@@ -483,7 +483,7 @@ fn unsupported_result_v5_and_evidence_v1_fail_closed() {
 
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut future = serde_json::to_value(evidence_for(&result, false)).expect("evidence JSON");
-    future["schema_version"] = json!("evaluation.evidence/v4");
+    future["schema_version"] = json!("evaluation.evidence/v3");
     assert!(matches!(
         EvaluationEvidence::from_json_str(&serde_json::to_string(&future).expect("JSON")),
         Err(EvaluationError::UnsupportedSchemaVersion { .. })
@@ -491,7 +491,7 @@ fn unsupported_result_v5_and_evidence_v1_fail_closed() {
 }
 
 #[test]
-fn previous_result_and_evidence_schemas_migrate_into_one_current_path() {
+fn previous_result_migrates_and_current_v2_evidence_binds_to_v7_result() {
     let result = result_for(task_result(vec![passed_trial(1), failed_trial(2)]), 2);
     let mut legacy_result = serde_json::to_value(&result).expect("result JSON");
     legacy_result["schema_version"] = json!("evaluation.result/v6");
@@ -522,24 +522,22 @@ fn previous_result_and_evidence_schemas_migrate_into_one_current_path() {
         json!("evaluation.result/v7")
     );
 
-    let mut legacy_evidence =
-        serde_json::to_value(evidence_for(&result, true)).expect("evidence JSON");
-    legacy_evidence["schema_version"] = json!("evaluation.evidence/v2");
-    let migrated_evidence = EvaluationEvidence::from_json_str(
-        &serde_json::to_string(&legacy_evidence).expect("legacy evidence JSON"),
+    let evidence = evidence_for(&migrated, true);
+    let parsed_evidence = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&evidence).expect("current evidence JSON"),
     )
-    .expect("supported v2 evidence migrates");
-    migrated_evidence
+    .expect("current v2 evidence parses directly");
+    parsed_evidence
         .validate_against_result(&migrated)
-        .expect("migrated evidence binds to migrated result");
+        .expect("current v2 evidence binds to v7 result");
     assert_eq!(
-        serde_json::to_value(migrated_evidence).expect("migrated evidence JSON")["schema_version"],
-        json!("evaluation.evidence/v3")
+        serde_json::to_value(parsed_evidence).expect("current evidence JSON")["schema_version"],
+        json!("evaluation.evidence/v2")
     );
 }
 
 #[test]
-fn evidence_v3_binds_every_trial_and_safe_reproducibility_identity() {
+fn evidence_v2_binds_every_trial_and_safe_reproducibility_identity() {
     let result = result_for(task_result(vec![passed_trial(1), passed_trial(2)]), 2);
     let evidence = evidence_for(&result, true);
     evidence
