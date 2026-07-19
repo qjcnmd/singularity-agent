@@ -62,12 +62,28 @@ const DEFAULT_GREP_MAX_MATCHES: usize = 200;
 const MAX_GREP_MAX_MATCHES: usize = 10_000;
 const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_COMMAND_SCRIPT_CHARS: usize = 8_000;
-const LARGE_OUTPUT_ARTIFACT_THRESHOLD: usize = 4_096;
 const DEFAULT_RESULT_PREVIEW_MAX_CHARS: usize = 4_096;
 const FILE_READ_CHUNK_SIZE: usize = 8 * 1024;
 const BINARY_CONTENT_PREVIEW: &str = "[binary content omitted]";
-const DIFF_ARTIFACT_PREFIX: &str = "artifact://diff/";
-const RESULT_ARTIFACT_PREFIX: &str = "artifact://result/";
+const ARTIFACT_REFERENCE_OMITTED: &str = "[artifact reference omitted]";
+const TRUNCATED_OUTPUT_OMITTED: &str = "[truncated output omitted]";
+const MAX_TRUNCATED_SUMMARY_STRING_CHARS: usize = 512;
+const TRUNCATED_RAW_OUTPUT_KEYS: [&str; 14] = [
+    "api_key",
+    "authorization",
+    "body",
+    "content",
+    "data",
+    "full_output",
+    "output",
+    "password",
+    "raw",
+    "raw_output",
+    "secret",
+    "stderr",
+    "stdout",
+    "token",
+];
 const PROMPT_INJECTION_MARKERS: [&str; 4] = [
     "developer message",
     "ignore previous",
@@ -1227,7 +1243,6 @@ pub struct ToolResult {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<ToolFailureKind>,
-    pub artifact_refs: Vec<String>,
     #[serde(skip)]
     pub result_id: Option<String>,
     pub truncated: bool,
@@ -1254,7 +1269,6 @@ impl ToolResult {
             preview: Some(redact_public_text(&preview.into())),
             error_code: None,
             failure_kind: None,
-            artifact_refs: Vec::new(),
             result_id: None,
             truncated: false,
             audit_metadata: None,
@@ -1286,11 +1300,6 @@ impl ToolResult {
 
     /// 将执行器输出投影为模型和 trace 可用结果。
     pub fn from_result(envelope: &ToolCallRequest, result: &ToolOutput) -> Self {
-        let result_content = result.content.to_string();
-        let content_is_safe = redact_public_text(&result_content) == result_content;
-        let (bounded_preview, preview_truncated) =
-            bounded_text(&result_content, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
-        let preview = redact_public_text(&bounded_preview);
         let source_truncated = result.truncated
             || result
                 .content
@@ -1302,8 +1311,20 @@ impl ToolResult {
                 .get("output_truncated")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+        let sanitized_content = sanitize_public_value(result.content.clone());
+        let public_content = if source_truncated
+            || sanitized_content.to_string().chars().count() > DEFAULT_RESULT_PREVIEW_MAX_CHARS
+        {
+            summarize_truncated_value(sanitized_content)
+        } else {
+            sanitized_content
+        };
+        let result_content = public_content.to_string();
+        let content_is_safe = redact_public_text(&result_content) == result_content;
+        let (bounded_preview, preview_truncated) =
+            bounded_text(&result_content, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
+        let preview = redact_public_text(&bounded_preview);
         let truncated = source_truncated || preview_truncated;
-        let artifact_refs = result_artifact_refs(&result.content, &result.metadata);
         let result_id = result_id(&result.content, &result.metadata);
         let mut tool_result = Self {
             error_code: result.error_code.clone(),
@@ -1317,15 +1338,10 @@ impl ToolResult {
             )
         };
         if content_is_safe && !source_truncated && !preview_truncated {
-            tool_result.content = Some(result.content.clone());
+            tool_result.content = Some(public_content);
             tool_result.preview = None;
         }
-        tool_result.artifact_refs = artifact_refs;
         tool_result.result_id = result_id;
-        if truncated && !tool_result.artifact_refs.is_empty() {
-            tool_result.content = None;
-            tool_result.preview = None;
-        }
         tool_result.audit_metadata = result.metadata.get("audit").cloned();
         tool_result.workspace_observation = result
             .metadata
@@ -1370,11 +1386,6 @@ impl ToolResult {
     }
 
     pub fn to_message_payload(&self) -> Value {
-        let artifact_refs = self
-            .artifact_refs
-            .iter()
-            .filter_map(|value| safe_reference(value))
-            .collect::<Vec<_>>();
         let mut payload = json!({
             "ok": self.ok,
             "tool_name": self.tool_name,
@@ -1388,15 +1399,13 @@ impl ToolResult {
             payload["failure_kind"] =
                 serde_json::to_value(failure_kind).unwrap_or_else(|_| json!("execution"));
         }
-        if !artifact_refs.is_empty() {
-            payload["artifact_refs"] = json!(artifact_refs);
-        }
         if let Some(content) = self.content.as_ref() {
+            let content = sanitize_public_value(content.clone());
             let serialized = content.to_string();
             let (bounded_preview, content_truncated) =
                 bounded_text(&serialized, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
             if !content_truncated && redact_public_text(&serialized) == serialized {
-                payload["content"] = content.clone();
+                payload["content"] = content;
             } else {
                 payload["preview"] = json!(redact_public_text(&bounded_preview));
                 payload["truncated"] = json!(self.truncated || content_truncated);
@@ -1407,19 +1416,6 @@ impl ToolResult {
         }
         payload
     }
-}
-
-fn result_artifact_refs(content: &Value, metadata: &Value) -> Vec<String> {
-    let mut refs = Vec::new();
-    refs.extend(value_string(content.get("artifact_ref")));
-    refs.extend(value_string(content.get("diff_ref")));
-    refs.extend(value_string(metadata.get("artifact_ref")));
-    refs.extend(value_string(metadata.get("diff_ref")));
-    refs.extend(value_string_array(content.get("artifact_refs")));
-    refs.extend(value_string_array(metadata.get("artifact_refs")));
-    refs.sort();
-    refs.dedup();
-    refs
 }
 
 fn result_id(content: &Value, metadata: &Value) -> Option<String> {
@@ -1436,28 +1432,67 @@ fn value_string(value: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn safe_reference(value: &str) -> Option<String> {
-    let lowered = value.to_ascii_lowercase();
-    if contains_sensitive_text(value)
-        || PROMPT_INJECTION_MARKERS
-            .iter()
-            .any(|marker| lowered.contains(marker))
-    {
-        None
-    } else {
-        Some(value.to_string())
+fn sanitize_public_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(sanitize_public_value).collect())
+        }
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    if is_artifact_reference_key(&key) {
+                        None
+                    } else {
+                        Some((key, sanitize_public_value(value)))
+                    }
+                })
+                .collect(),
+        ),
+        Value::String(value) if contains_artifact_reference(&value) => {
+            Value::String(ARTIFACT_REFERENCE_OMITTED.to_string())
+        }
+        other => other,
     }
 }
 
-fn value_string_array(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .collect()
+fn summarize_truncated_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(summarize_truncated_value).collect())
+        }
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    if is_truncated_raw_output_key(&key) {
+                        None
+                    } else {
+                        Some((key, summarize_truncated_value(value)))
+                    }
+                })
+                .collect(),
+        ),
+        Value::String(value) if value.chars().count() > MAX_TRUNCATED_SUMMARY_STRING_CHARS => {
+            Value::String(TRUNCATED_OUTPUT_OMITTED.to_string())
+        }
+        other => other,
+    }
+}
+
+fn is_truncated_raw_output_key(key: &str) -> bool {
+    TRUNCATED_RAW_OUTPUT_KEYS.contains(&key.to_ascii_lowercase().as_str())
+}
+
+fn is_artifact_reference_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "artifact_ref" | "artifact_refs" | "diff_ref" | "diff_refs"
+    )
+}
+
+fn contains_artifact_reference(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("artifact://")
 }
 
 /// 工作区 tool 返回的工作区边界、受保护路径、沙箱和变更错误。
@@ -2112,7 +2147,6 @@ impl WorkspaceTools {
         let mut actual_line_start = None;
         let mut actual_line_end = None;
         let mut total_lines = 0usize;
-        let mut total_bytes = 0usize;
         let mut last_line_partial = false;
 
         loop {
@@ -2124,7 +2158,6 @@ impl WorkspaceTools {
                 break;
             }
             total_lines = total_lines.saturating_add(1);
-            total_bytes = total_bytes.saturating_add(bytes_read);
             if is_binary(&line) {
                 check_cancelled(cancellation)?;
                 return Ok(ToolOutput::success(json!({
@@ -2135,7 +2168,6 @@ impl WorkspaceTools {
                     "line_start": Value::Null,
                     "line_end": Value::Null,
                     "total_lines": total_lines,
-                    "artifact_ref": artifact_ref(RESULT_ARTIFACT_PREFIX, &relative),
                 })));
             }
             let text = std::str::from_utf8(&line)
@@ -2173,11 +2205,6 @@ impl WorkspaceTools {
                 None
             }
         });
-        let artifact = if preview_truncated || total_bytes > LARGE_OUTPUT_ARTIFACT_THRESHOLD {
-            Value::String(artifact_ref(RESULT_ARTIFACT_PREFIX, &relative))
-        } else {
-            Value::Null
-        };
         let mut output = json!({
             "path": relative,
             "binary": false,
@@ -2187,7 +2214,6 @@ impl WorkspaceTools {
             "line_end": actual_line_end,
             "total_lines": total_lines,
             "partial_line": last_line_partial,
-            "artifact_ref": artifact,
         });
         if let Some(next_line_start) = next_line_start {
             output["next_line_start"] = json!(next_line_start);
@@ -2433,7 +2459,6 @@ impl WorkspaceTools {
         let revision = self.advance_workspace_revision()?;
         let mut output = ToolOutput::success(json!({
             "changed_files": changed_files,
-            "diff_ref": artifact_ref(DIFF_ARTIFACT_PREFIX, &changed_files.join(",")),
             "rolled_back": false,
         }));
         Self::attach_workspace_observation(&mut output, &WorkspaceObservation::changed(revision))?;
@@ -4704,6 +4729,8 @@ fn redact_public_text(text: &str) -> String {
             .any(|marker| lowered.contains(marker))
     {
         REDACTED_TOOL_OUTPUT.to_string()
+    } else if contains_artifact_reference(text) {
+        ARTIFACT_REFERENCE_OMITTED.to_string()
     } else {
         text.to_string()
     }
@@ -4731,14 +4758,6 @@ fn bounded_text(content: &str, max_chars: usize) -> (String, bool) {
     let preview = content.chars().take(max_chars).collect::<String>();
     let truncated = content.chars().count() > preview.chars().count();
     (preview, truncated)
-}
-
-fn artifact_ref(prefix: &str, path: &str) -> String {
-    let sanitized = path
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect::<String>();
-    format!("{prefix}{sanitized}")
 }
 
 fn io_error(error: std::io::Error) -> WorkspaceToolError {

@@ -2414,7 +2414,7 @@ impl AppServer {
         let params: ArtifactFetchParams = parse_params(&message)?;
         match self.store.get_artifact_ref(&params.artifact_id) {
             Ok(artifact) => json_response(message.required_id(), ArtifactFetchResult { artifact }),
-            Err(StoreError::NotFound(_)) => {
+            Err(StoreError::NotFound(_) | StoreError::InvalidState(_)) => {
                 not_found_response(message.required_id(), ARTIFACT_NOT_FOUND)
             }
             Err(error) => Err(error.into()),

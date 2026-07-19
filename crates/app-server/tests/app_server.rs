@@ -6,7 +6,8 @@ use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
     WorkspaceRelativePath,
 };
-use singularity_store::{SessionStore, StoreError};
+use singularity_protocol::ItemKind;
+use singularity_store::{RegisterArtifactRefParams, SessionStore, StoreError};
 #[cfg(windows)]
 use std::collections::VecDeque;
 use std::io::Write;
@@ -1766,6 +1767,81 @@ fn app_server_maps_store_boundary_failures_to_json_rpc_errors() {
         missing_artifact[0]["error"]["message"],
         "Artifact not found"
     );
+}
+
+#[test]
+fn artifact_fetch_returns_only_registered_bound_artifacts_and_hides_deleted_threads() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let item = store
+        .append_item(
+            &turn.turn_id,
+            ItemKind::FileChange,
+            serde_json::json!({"changed_files": ["safe/result.txt"]}),
+        )
+        .expect("item");
+    let digest = format!("sha256:{}", "d".repeat(64));
+    let artifact = store
+        .register_artifact_ref(RegisterArtifactRefParams {
+            run_id: &thread.thread_id,
+            item_id: Some(&item.item_id),
+            kind: "file",
+            uri: "artifact://safe/result.txt",
+            content_digest: &digest,
+            summary: "safe result",
+            metadata: serde_json::json!({"path": "safe/result.txt"}),
+        })
+        .expect("artifact");
+    assert!(matches!(
+        store.register_artifact_ref(RegisterArtifactRefParams {
+            run_id: "synthetic_run",
+            item_id: None,
+            kind: "file",
+            uri: "artifact://synthetic/result.txt",
+            content_digest: &digest,
+            summary: "must fail",
+            metadata: serde_json::json!({}),
+        }),
+        Err(StoreError::NotFound(message)) if message == "artifact run synthetic_run"
+    ));
+    store
+        .update_turn_status(&turn.turn_id, singularity_protocol::TurnStatus::Completed)
+        .expect("complete turn");
+
+    let mut server = app_server(store);
+    server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .expect("initialize");
+    server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
+        .expect("initialized");
+    let fetched = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"artifact/fetch","id":2,"params":{{"artifactId":"{}"}}}}"#,
+            artifact.artifact_id
+        ))
+        .expect("fetch artifact");
+    assert_eq!(
+        fetched[0]["result"]["artifact"]["artifactId"],
+        artifact.artifact_id
+    );
+
+    let deleter = SessionStore::open(&db_path).expect("reopen store");
+    deleter
+        .delete_thread(&thread.thread_id)
+        .expect("delete thread");
+    let deleted = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"artifact/fetch","id":3,"params":{{"artifactId":"{}"}}}}"#,
+            artifact.artifact_id
+        ))
+        .expect("fetch deleted artifact");
+    assert_eq!(deleted[0]["error"]["message"], "Artifact not found");
 }
 
 #[test]

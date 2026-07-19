@@ -3407,14 +3407,26 @@ fn trace_tail_returns_the_bounded_latest_window_in_chronological_order() {
 fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let item = store
+        .append_item(
+            &turn.turn_id,
+            ItemKind::FileChange,
+            serde_json::json!({"changed_files": ["safe/result.txt"]}),
+        )
+        .expect("item");
+    let content_digest = format!("sha256:{}", "a".repeat(64));
 
     let artifact = store
         .register_artifact_ref(RegisterArtifactRefParams {
-            run_id: "run_1",
-            item_id: Some("item_1"),
+            run_id: &thread.thread_id,
+            item_id: Some(&item.item_id),
             kind: "file",
             uri: "artifact://safe/result.txt",
-            content_digest: "sha256:abc",
+            content_digest: &content_digest,
             summary: "contains token output",
             metadata: serde_json::json!({
                 "path": "safe/result.txt",
@@ -3433,9 +3445,189 @@ fn artifact_refs_are_durable_and_redact_secret_like_metadata() {
         .expect("fetched");
     assert_eq!(fetched, artifact);
     assert_eq!(
-        store.list_artifact_refs("run_1").expect("list")[0].artifact_id,
+        store.list_artifact_refs(&thread.thread_id).expect("list")[0].artifact_id,
         artifact.artifact_id
     );
+
+    let connection =
+        rusqlite::Connection::open(dir.path().join("sessions.sqlite3")).expect("reopen sqlite");
+    connection
+        .execute(
+            "update artifact_refs set metadata = ?1 where artifact_id = ?2",
+            rusqlite::params![
+                serde_json::json!({"note": "token=raw"}).to_string(),
+                artifact.artifact_id
+            ],
+        )
+        .expect("tamper metadata");
+    let tampered = store.get_artifact_ref(&artifact.artifact_id);
+    assert!(matches!(
+        tampered,
+        Err(StoreError::InvalidState(message)) if message.contains("unredacted sensitive")
+    ));
+}
+
+// 验证 artifact registration 在同一事务内拒绝不存在、错绑和重复引用，并随 thread 删除。
+#[test]
+fn artifact_registration_enforces_thread_turn_item_binding_and_deletion() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let item = store
+        .append_item(
+            &turn.turn_id,
+            ItemKind::FileChange,
+            serde_json::json!({"changed_files": ["safe/result.txt"]}),
+        )
+        .expect("item");
+    let other_thread = store.create_thread(None, None).expect("other thread");
+    let other_turn = store
+        .create_turn(&other_thread.thread_id, "running")
+        .expect("other turn");
+    let other_item = store
+        .append_item(
+            &other_turn.turn_id,
+            ItemKind::FileChange,
+            serde_json::json!({"changed_files": ["other.txt"]}),
+        )
+        .expect("other item");
+    let content_digest = format!("sha256:{}", "b".repeat(64));
+    fn registration<'a>(
+        run_id: &'a str,
+        item_id: Option<&'a str>,
+        content_digest: &'a str,
+    ) -> RegisterArtifactRefParams<'a> {
+        RegisterArtifactRefParams {
+            run_id,
+            item_id,
+            kind: "file",
+            uri: "artifact://safe/result.txt",
+            content_digest,
+            summary: "safe result",
+            metadata: serde_json::json!({"path": "safe/result.txt"}),
+        }
+    }
+
+    assert!(matches!(
+        store.register_artifact_ref(registration(
+            "missing_thread",
+            None,
+            &content_digest
+        )),
+        Err(StoreError::NotFound(message)) if message == "artifact run missing_thread"
+    ));
+    assert!(matches!(
+        store.register_artifact_ref(registration(
+            &turn.turn_id,
+            Some(&item.item_id),
+            &content_digest
+        )),
+        Err(StoreError::InvalidState(message)) if message.contains("run_id must identify a thread")
+    ));
+    assert!(matches!(
+        store.register_artifact_ref(registration(
+            &thread.thread_id,
+            Some("missing_item"),
+            &content_digest
+        )),
+        Err(StoreError::NotFound(message)) if message == "artifact item missing_item"
+    ));
+    assert!(matches!(
+        store.register_artifact_ref(registration(
+            &thread.thread_id,
+            Some(&other_item.item_id),
+            &content_digest
+        )),
+        Err(StoreError::InvalidState(message)) if message.contains("item does not belong to run")
+    ));
+
+    let artifact = store
+        .register_artifact_ref(registration(
+            &thread.thread_id,
+            Some(&item.item_id),
+            &content_digest,
+        ))
+        .expect("valid artifact");
+    assert!(matches!(
+        store.register_artifact_ref(registration(
+            &thread.thread_id,
+            Some(&item.item_id),
+            &content_digest,
+        )),
+        Err(StoreError::AlreadyExists(message)) if message.contains("artifact")
+    ));
+
+    store
+        .update_turn_status(&turn.turn_id, TurnStatus::Completed)
+        .expect("complete turn");
+    store
+        .delete_thread(&thread.thread_id)
+        .expect("delete thread");
+    assert!(matches!(
+        store.get_artifact_ref(&artifact.artifact_id),
+        Err(StoreError::NotFound(message)) if message == format!("artifact {}", artifact.artifact_id)
+    ));
+}
+
+// 验证 artifact 的公共字段合同在任何写入前拒绝歧义或不可验证输入。
+#[test]
+fn artifact_registration_rejects_invalid_public_contract_fields() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let item = store
+        .append_item(
+            &turn.turn_id,
+            ItemKind::FileChange,
+            serde_json::json!({"changed_files": ["safe/result.txt"]}),
+        )
+        .expect("item");
+    let content_digest = format!("sha256:{}", "c".repeat(64));
+    let valid = || RegisterArtifactRefParams {
+        run_id: &thread.thread_id,
+        item_id: Some(&item.item_id),
+        kind: "file",
+        uri: "artifact://safe/result.txt",
+        content_digest: &content_digest,
+        summary: "safe result",
+        metadata: serde_json::json!({"path": "safe/result.txt"}),
+    };
+
+    let mut invalid_kind = valid();
+    invalid_kind.kind = "";
+    assert!(matches!(
+        store.register_artifact_ref(invalid_kind),
+        Err(StoreError::InvalidState(message)) if message.contains("artifact kind")
+    ));
+
+    let mut invalid_uri = valid();
+    invalid_uri.uri = "file://outside/result.txt";
+    assert!(matches!(
+        store.register_artifact_ref(invalid_uri),
+        Err(StoreError::InvalidState(message)) if message.contains("artifact uri")
+    ));
+
+    let mut invalid_digest = valid();
+    invalid_digest.content_digest = "sha256:short";
+    assert!(matches!(
+        store.register_artifact_ref(invalid_digest),
+        Err(StoreError::InvalidState(message)) if message.contains("artifact content digest")
+    ));
+
+    let mut invalid_metadata = valid();
+    invalid_metadata.metadata = serde_json::json!({
+        "artifact_ref": "artifact://unregistered",
+    });
+    assert!(matches!(
+        store.register_artifact_ref(invalid_metadata),
+        Err(StoreError::InvalidState(message)) if message.contains("artifact metadata")
+    ));
 }
 
 // 验证 v5 数据库重开时补齐稳定的 turn/item sequence。
@@ -3804,7 +3996,8 @@ fn history_excludes_non_completed_turns_and_non_conversation_items() {
             item_id: None,
             kind: "file",
             uri: "artifact://history/result.txt",
-            content_digest: "sha256:history",
+            content_digest:
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             summary: "artifact metadata",
             metadata: serde_json::json!({"safe": true}),
         })

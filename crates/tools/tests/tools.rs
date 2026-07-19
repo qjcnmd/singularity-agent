@@ -550,7 +550,7 @@ fn broker_executes_allowed_tool_and_tool_result_payload_stays_safe() {
 }
 
 #[test]
-fn broker_tool_result_omits_preview_for_truncated_artifact_result() {
+fn broker_tool_result_keeps_bounded_preview_without_unregistered_artifact_ref() {
     let mut broker = ToolBroker::default();
     broker
         .register(test_tool_spec(
@@ -570,14 +570,13 @@ fn broker_tool_result_omits_preview_for_truncated_artifact_result() {
         output
     });
     let payload = tool_result.to_message_payload();
+    let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
     assert!(tool_result.truncated);
-    assert!(tool_result.preview.is_none());
-    assert!(payload.get("preview").is_none());
-    assert_eq!(
-        payload["artifact_refs"],
-        serde_json::json!(["artifact://result/readme"])
-    );
+    assert!(tool_result.preview.is_some());
+    assert!(payload.get("preview").is_some());
+    assert!(payload.get("artifact_refs").is_none());
+    assert!(!serialized.contains("artifact://result/readme"));
 }
 
 #[test]
@@ -604,7 +603,7 @@ fn source_truncation_with_only_internal_result_id_keeps_bounded_preview() {
 }
 
 #[test]
-fn truncated_tool_result_payload_is_a_reference_only_safe_snapshot() {
+fn truncated_tool_result_payload_is_a_bounded_safe_snapshot_without_artifact_ref() {
     let envelope = ToolCallRequest::new(
         "call_1",
         "search",
@@ -627,19 +626,14 @@ fn truncated_tool_result_payload_is_a_reference_only_safe_snapshot() {
     let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
-    assert_eq!(
-        payload,
-        serde_json::json!({
-            "ok": true,
-            "tool_name": "search",
-            "tool_call_id": "call_1",
-            "artifact_refs": ["artifact://result/full-output"],
-            "truncated": true,
-        })
-    );
-    assert!(tool_result.preview.is_none());
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["tool_name"], "search");
+    assert_eq!(payload["tool_call_id"], "call_1");
+    assert_eq!(payload["truncated"], true);
+    assert!(tool_result.preview.is_some());
     assert!(payload.get("content").is_none());
-    assert!(payload.get("preview").is_none());
+    assert!(payload.get("preview").is_some());
+    assert!(payload.get("artifact_refs").is_none());
     for leaked in [
         "raw_arguments",
         "run_internal_1",
@@ -648,13 +642,14 @@ fn truncated_tool_result_payload_is_a_reference_only_safe_snapshot() {
         "FULL_OUTPUT_SHOULD_NOT_BE_VISIBLE",
         "token=abc123",
         "abc123",
+        "artifact://result/full-output",
     ] {
         assert!(!serialized.contains(leaked), "{leaked} leaked to payload");
     }
 }
 
 #[test]
-fn tool_result_carries_artifact_and_result_refs_from_tool_output() {
+fn tool_result_does_not_project_unregistered_artifact_refs_from_tool_output() {
     let envelope = ToolCallRequest::new("call_1", "patch", r#"{"changes":[]}"#);
     let mut result = ToolOutput::success(serde_json::json!({
         "changed_files": ["README.md"],
@@ -668,17 +663,12 @@ fn tool_result_carries_artifact_and_result_refs_from_tool_output() {
 
     let tool_result = ToolResult::from_result(&envelope, &result);
     let payload = tool_result.to_message_payload();
+    let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
-    assert_eq!(
-        tool_result.artifact_refs,
-        vec![
-            "artifact://audit/readme".to_string(),
-            "artifact://diff/readme".to_string(),
-            "artifact://result/readme".to_string()
-        ]
-    );
     assert_eq!(tool_result.result_id.as_deref(), Some("tool_result_1"));
     assert!(payload.get("result_id").is_none());
+    assert!(payload.get("artifact_refs").is_none());
+    assert!(!serialized.contains("artifact://"));
 }
 
 #[test]
@@ -694,13 +684,11 @@ fn tool_result_payload_redacts_sensitive_artifact_refs() {
     let payload = tool_result.to_message_payload();
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
 
-    assert_eq!(
-        payload["artifact_refs"],
-        serde_json::json!(["artifact://result/readme"])
-    );
+    assert!(payload.get("artifact_refs").is_none());
     assert!(payload.get("result_id").is_none());
     assert!(!serialized.contains(".env"));
     assert!(!serialized.contains("id_rsa"));
+    assert!(!serialized.contains("artifact://"));
 }
 
 #[test]
@@ -731,12 +719,7 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         .expect("read");
     assert_eq!(read.content["preview"], "alpha");
     assert_eq!(read.content["truncated"], true);
-    assert!(
-        read.content["artifact_ref"]
-            .as_str()
-            .unwrap()
-            .starts_with("artifact://")
-    );
+    assert!(read.content.get("artifact_ref").is_none());
 
     let binary = tools
         .read(ReadToolInput {
@@ -748,6 +731,7 @@ fn workspace_read_list_and_grep_tools_enforce_workspace_and_bounds() {
         .expect("binary read");
     assert_eq!(binary.content["binary"], true);
     assert_eq!(binary.content["preview"], "[binary content omitted]");
+    assert!(binary.content.get("artifact_ref").is_none());
 
     assert!(matches!(
         tools.read(ReadToolInput {
@@ -2106,12 +2090,7 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
         edited.content["changed_files"],
         serde_json::json!(["app.txt"])
     );
-    assert!(
-        edited.content["diff_ref"]
-            .as_str()
-            .unwrap()
-            .starts_with("artifact://")
-    );
+    assert!(edited.content.get("diff_ref").is_none());
 
     assert!(matches!(
         tools.edit(

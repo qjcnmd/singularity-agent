@@ -23,7 +23,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use singularity_core::contains_sensitive_text;
+use singularity_core::{contains_sensitive_text, is_protected_path};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest,
     PermissionProfileName, PermissionResource, ToolId, WorkspaceRelativePath,
@@ -128,6 +128,12 @@ const REDACTED_ARTIFACT_VALUE: &str = "[redacted]";
 const REDACTED_USER_INPUT: &str = "[redacted sensitive user input]";
 const REDACTED_ASSISTANT_OUTPUT: &str = "[redacted sensitive assistant output]";
 const TRACE_HASH_PREFIX: &str = "sha256:";
+const ARTIFACT_URI_PREFIX: &str = "artifact://";
+const ARTIFACT_KIND_MAX_BYTES: usize = 64;
+const ARTIFACT_TEXT_MAX_BYTES: usize = 4_096;
+const ARTIFACT_METADATA_MAX_BYTES: usize = 16 * 1024;
+const ARTIFACT_METADATA_MAX_DEPTH: usize = 8;
+const SHA256_HEX_LENGTH: usize = 64;
 const SENSITIVE_ARTIFACT_MARKERS: [&str; 5] =
     ["api_key", "authorization", "password", "secret", "token"];
 const APPROVAL_BINDING_REQUIRED: &str =
@@ -5729,18 +5735,36 @@ impl SessionStore {
             summary,
             metadata,
         } = params;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        validate_artifact_binding(&transaction, run_id, item_id)?;
+        let content_digest =
+            validate_artifact_fields(kind, uri, content_digest, summary, &metadata)?;
+        let duplicate = transaction
+            .query_row(
+                "select artifact_id from artifact_refs
+                 where run_id = ?1 and kind = ?2 and uri = ?3 and content_digest = ?4
+                   and ((item_id = ?5) or (item_id is null and ?5 is null))
+                 limit 1",
+                params![run_id, kind, uri, content_digest, item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(artifact_id) = duplicate {
+            return Err(StoreError::AlreadyExists(format!("artifact {artifact_id}")));
+        }
         let artifact = ArtifactRef {
             artifact_id: format!("artifact_{}", short_id()),
             run_id: run_id.to_string(),
             item_id: item_id.map(str::to_string),
             kind: kind.to_string(),
-            uri: redact_secret_like_text(uri),
-            content_digest: content_digest.to_string(),
+            uri: uri.to_string(),
+            content_digest,
             summary: redact_secret_like_text(summary),
             redacted: artifact_needs_redaction(uri, summary, &metadata),
             metadata: redact_secret_like_value(metadata),
         };
-        self.connection.execute(
+        transaction.execute(
             "insert into artifact_refs(artifact_id, run_id, item_id, kind, uri, content_digest, summary, metadata, redacted) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 artifact.artifact_id,
@@ -5754,12 +5778,14 @@ impl SessionStore {
                 artifact.redacted,
             ],
         )?;
+        transaction.commit()?;
         Ok(artifact)
     }
 
     /// 读取指定 artifact ref。
     pub fn get_artifact_ref(&self, artifact_id: &str) -> StoreResult<ArtifactRef> {
-        self.connection
+        let artifact = self
+            .connection
             .query_row(
                 "select artifact_id, run_id, item_id, kind, uri, content_digest, summary, metadata, redacted from artifact_refs where artifact_id = ?1",
                 params![artifact_id],
@@ -5770,20 +5796,26 @@ impl SessionStore {
                     StoreError::NotFound(format!("artifact {artifact_id}"))
                 }
                 other => StoreError::Sqlite(other),
-            })
+            })?;
+        validate_stored_artifact(&self.connection, &artifact)?;
+        Ok(artifact)
     }
 
     /// 列出 run 关联的 artifact refs。
     pub fn list_artifact_refs(&self, run_id: &str) -> StoreResult<Vec<ArtifactRef>> {
+        validate_artifact_run(&self.connection, run_id)?;
         let mut statement = self.connection.prepare(
             "select artifact_id, run_id, item_id, kind, uri, content_digest, summary, metadata, redacted from artifact_refs where run_id = ?1 order by rowid",
         )?;
         let rows = statement.query_map(params![run_id], artifact_from_row)?;
-        let mut artifacts = Vec::new();
-        for row in rows {
-            artifacts.push(row?);
+        let artifacts = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut validated = Vec::with_capacity(artifacts.len());
+        for artifact in artifacts {
+            validate_stored_artifact(&self.connection, &artifact)?;
+            validated.push(artifact);
         }
-        Ok(artifacts)
+        Ok(validated)
     }
 
     /// 返回已应用 migration id 的持久化顺序。
@@ -7027,6 +7059,270 @@ fn insert_approval(connection: &Connection, request: &ApprovalRequest) -> StoreR
 // 生成用于持久化记录的短随机 id。
 fn short_id() -> String {
     Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+// 验证 artifact registration 的 thread/turn/item 绑定。
+fn validate_artifact_binding(
+    connection: &Connection,
+    run_id: &str,
+    item_id: Option<&str>,
+) -> StoreResult<()> {
+    validate_artifact_run(connection, run_id)?;
+    if let Some(item_id) = item_id {
+        validate_artifact_item(connection, run_id, item_id)?;
+    }
+    Ok(())
+}
+
+// 读取时重新验证持久化 artifact，避免数据库中被篡改的 ref 进入公共 fetch。
+fn validate_stored_artifact(connection: &Connection, artifact: &ArtifactRef) -> StoreResult<()> {
+    validate_artifact_id(&artifact.artifact_id)?;
+    validate_artifact_binding(connection, &artifact.run_id, artifact.item_id.as_deref())?;
+    let normalized_digest = validate_artifact_fields(
+        &artifact.kind,
+        &artifact.uri,
+        &artifact.content_digest,
+        &artifact.summary,
+        &artifact.metadata,
+    )?;
+    if normalized_digest != artifact.content_digest {
+        return Err(StoreError::InvalidState(format!(
+            "artifact {} content digest is not canonical",
+            artifact.artifact_id
+        )));
+    }
+    if redact_secret_like_text(&artifact.uri) != artifact.uri
+        || redact_secret_like_text(&artifact.summary) != artifact.summary
+        || redact_secret_like_value(artifact.metadata.clone()) != artifact.metadata
+    {
+        return Err(StoreError::InvalidState(format!(
+            "artifact {} contains unredacted sensitive data",
+            artifact.artifact_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_run(connection: &Connection, run_id: &str) -> StoreResult<()> {
+    if run_id.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "artifact run_id must not be empty".to_string(),
+        ));
+    }
+    let thread_exists = connection
+        .query_row(
+            "select 1 from threads where thread_id = ?1",
+            params![run_id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if thread_exists.is_some() {
+        return Ok(());
+    }
+    let turn_exists = connection
+        .query_row(
+            "select 1 from turns where turn_id = ?1",
+            params![run_id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if turn_exists.is_some() {
+        return Err(StoreError::InvalidState(
+            "artifact run_id must identify a thread, not a turn".to_string(),
+        ));
+    }
+    Err(StoreError::NotFound(format!("artifact run {run_id}")))
+}
+
+fn validate_artifact_item(connection: &Connection, run_id: &str, item_id: &str) -> StoreResult<()> {
+    if item_id.trim().is_empty() {
+        return Err(StoreError::InvalidState(
+            "artifact item_id must not be empty".to_string(),
+        ));
+    }
+    let turn_id = connection
+        .query_row(
+            "select turn_id from items where item_id = ?1",
+            params![item_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(format!("artifact item {item_id}")))?;
+    let item_thread_id = connection
+        .query_row(
+            "select thread_id from turns where turn_id = ?1",
+            params![turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::InvalidState(format!(
+                "artifact item {item_id} references a missing turn"
+            )),
+            other => StoreError::Sqlite(other),
+        })?;
+    if item_thread_id != run_id {
+        return Err(StoreError::InvalidState(
+            "artifact item does not belong to run".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_fields(
+    kind: &str,
+    uri: &str,
+    content_digest: &str,
+    summary: &str,
+    metadata: &Value,
+) -> StoreResult<String> {
+    if kind.trim().is_empty()
+        || kind.len() > ARTIFACT_KIND_MAX_BYTES
+        || !kind.chars().enumerate().all(|(index, character)| {
+            (index == 0 && character.is_ascii_alphanumeric())
+                || (index > 0
+                    && (character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')))
+        })
+        || contains_artifact_reference(kind)
+    {
+        return Err(StoreError::InvalidState(
+            "artifact kind is invalid".to_string(),
+        ));
+    }
+    validate_artifact_text("uri", uri)?;
+    let Some(uri_path) = uri.strip_prefix(ARTIFACT_URI_PREFIX) else {
+        return Err(StoreError::InvalidState(
+            "artifact uri must use artifact://".to_string(),
+        ));
+    };
+    if uri_path.is_empty()
+        || contains_sensitive_text(uri)
+        || is_protected_path(uri_path)
+        || contains_artifact_reference(uri_path)
+    {
+        return Err(StoreError::InvalidState(
+            "artifact uri is not safe".to_string(),
+        ));
+    }
+    validate_artifact_text("summary", summary)?;
+    if contains_artifact_reference(summary) {
+        return Err(StoreError::InvalidState(
+            "artifact summary contains an unregistered reference".to_string(),
+        ));
+    }
+    let normalized_digest = validate_artifact_digest(content_digest)?;
+    validate_artifact_metadata(metadata)?;
+    Ok(normalized_digest)
+}
+
+fn validate_artifact_id(artifact_id: &str) -> StoreResult<()> {
+    if artifact_id.len() <= "artifact_".len()
+        || artifact_id.len() > ARTIFACT_TEXT_MAX_BYTES
+        || !artifact_id.starts_with("artifact_")
+        || !artifact_id["artifact_".len()..]
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return Err(StoreError::InvalidState(
+            "artifact id is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_text(field: &str, value: &str) -> StoreResult<()> {
+    if value.trim().is_empty()
+        || value.len() > ARTIFACT_TEXT_MAX_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidState(format!(
+            "artifact {field} is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_digest(value: &str) -> StoreResult<String> {
+    let Some(hex) = value.strip_prefix(TRACE_HASH_PREFIX) else {
+        return Err(StoreError::InvalidState(
+            "artifact content digest must use sha256".to_string(),
+        ));
+    };
+    if hex.len() != SHA256_HEX_LENGTH || !hex.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(StoreError::InvalidState(
+            "artifact content digest is invalid".to_string(),
+        ));
+    }
+    Ok(format!("{TRACE_HASH_PREFIX}{}", hex.to_ascii_lowercase()))
+}
+
+fn validate_artifact_metadata(value: &Value) -> StoreResult<()> {
+    let size = serde_json::to_vec(value)?.len();
+    if size > ARTIFACT_METADATA_MAX_BYTES {
+        return Err(StoreError::InvalidState(
+            "artifact metadata is too large".to_string(),
+        ));
+    }
+    validate_artifact_metadata_value(value, 0)
+}
+
+fn validate_artifact_metadata_value(value: &Value, depth: usize) -> StoreResult<()> {
+    if depth > ARTIFACT_METADATA_MAX_DEPTH {
+        return Err(StoreError::InvalidState(
+            "artifact metadata is too deeply nested".to_string(),
+        ));
+    }
+    match value {
+        Value::Object(entries) => {
+            for (key, value) in entries {
+                if key.trim().is_empty()
+                    || key.len() > ARTIFACT_TEXT_MAX_BYTES
+                    || key.chars().any(char::is_control)
+                    || is_artifact_reference_key(key)
+                {
+                    return Err(StoreError::InvalidState(
+                        "artifact metadata contains an invalid reference field".to_string(),
+                    ));
+                }
+                validate_artifact_metadata_value(value, depth + 1)?;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                validate_artifact_metadata_value(value, depth + 1)?;
+            }
+        }
+        Value::String(text) => {
+            if text.chars().any(char::is_control)
+                || contains_artifact_reference(text)
+                || is_protected_path(text)
+            {
+                return Err(StoreError::InvalidState(
+                    "artifact metadata contains unsafe text".to_string(),
+                ));
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn is_artifact_reference_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "artifact_ref"
+            | "artifact_refs"
+            | "artifactref"
+            | "artifactrefs"
+            | "diff_ref"
+            | "diff_refs"
+            | "diffref"
+            | "diffrefs"
+    )
+}
+
+fn contains_artifact_reference(value: &str) -> bool {
+    value.to_ascii_lowercase().contains(ARTIFACT_URI_PREFIX)
 }
 
 // 将 artifact_refs 行解码为 ArtifactRef。
