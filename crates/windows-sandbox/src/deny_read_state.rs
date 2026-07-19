@@ -327,7 +327,7 @@ pub fn acquire_registered_runner_lease(
         .ok_or_else(|| anyhow::anyhow!("infinite deny-read runner lease wait timed out"))?;
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
     let lock = lock_state(&state_path)?;
-    let state = load_state(lock.path())?;
+    let state = load_state_for_runner(lock.path())?;
     if !state.active_runner_leases.contains(lease_name) {
         anyhow::bail!("deny-read runner lease is no longer registered");
     }
@@ -721,6 +721,18 @@ fn merge_tracked_paths(
 }
 
 fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
+    load_state_inner(path, true)
+}
+
+/// Loads state for the sandbox runner without probing protected paths as the restricted user.
+/// The elevated parent validates path identities before writing the state and protects the state
+/// file from the runner; repeating those probes in the runner would necessarily hit its own
+/// deny-read ACLs.
+fn load_state_for_runner(path: &Path) -> Result<PersistentDenyReadAclState> {
+    load_state_inner(path, false)
+}
+
+fn load_state_inner(path: &Path, validate_paths: bool) -> Result<PersistentDenyReadAclState> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -729,9 +741,11 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                 Some(version) if version == u64::from(DENY_READ_ACL_STATE_VERSION) => {
                     let state: PersistentDenyReadAclState = serde_json::from_value(value)
                         .with_context(|| format!("parse deny-read ACL state {}", path.display()))?;
-                    validate_state_paths(&state).with_context(|| {
-                        format!("validate deny-read ACL state paths {}", path.display())
-                    })?;
+                    if validate_paths {
+                        validate_state_paths(&state).with_context(|| {
+                            format!("validate deny-read ACL state paths {}", path.display())
+                        })?;
+                    }
                     validate_state(&state).with_context(|| {
                         format!("validate deny-read ACL state {}", path.display())
                     })?;
@@ -754,12 +768,14 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         active_runner_leases: previous.active_runner_leases,
                         ..PersistentDenyReadAclState::default()
                     };
-                    validate_state_paths(&state).with_context(|| {
-                        format!(
-                            "validate version 3 deny-read ACL state paths {}",
-                            path.display()
-                        )
-                    })?;
+                    if validate_paths {
+                        validate_state_paths(&state).with_context(|| {
+                            format!(
+                                "validate version 3 deny-read ACL state paths {}",
+                                path.display()
+                            )
+                        })?;
+                    }
                     validate_state(&state).with_context(|| {
                         format!("validate version 3 deny-read ACL state {}", path.display())
                     })?;
@@ -783,12 +799,14 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         ),
                         ..PersistentDenyReadAclState::default()
                     };
-                    validate_state_paths(&state).with_context(|| {
-                        format!(
-                            "validate version 2 deny-read ACL state paths {}",
-                            path.display()
-                        )
-                    })?;
+                    if validate_paths {
+                        validate_state_paths(&state).with_context(|| {
+                            format!(
+                                "validate version 2 deny-read ACL state paths {}",
+                                path.display()
+                            )
+                        })?;
+                    }
                     validate_state(&state).with_context(|| {
                         format!("validate version 2 deny-read ACL state {}", path.display())
                     })?;
@@ -807,12 +825,14 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         legacy_unmanaged_principals: legacy.principals,
                         ..PersistentDenyReadAclState::default()
                     };
-                    validate_state_paths(&state).with_context(|| {
-                        format!(
-                            "validate legacy deny-read ACL state paths {}",
-                            path.display()
-                        )
-                    })?;
+                    if validate_paths {
+                        validate_state_paths(&state).with_context(|| {
+                            format!(
+                                "validate legacy deny-read ACL state paths {}",
+                                path.display()
+                            )
+                        })?;
+                    }
                     validate_state(&state).with_context(|| {
                         format!("validate legacy deny-read ACL state {}", path.display())
                     })?;
@@ -908,6 +928,7 @@ mod tests {
     use super::ManagedDenyReadAcl;
     use super::PersistentDenyReadAclState;
     use super::load_state;
+    use super::load_state_for_runner;
     use super::lock_state;
     use super::merge_tracked_paths;
     use super::reconcile_runner_leases;
@@ -1006,6 +1027,34 @@ mod tests {
                 PathBuf::from(r"C:\workspace\.git")
             ]
         );
+    }
+
+    #[test]
+    fn runner_state_loader_does_not_probe_protected_paths() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let state_path = temp.path().join(DENY_READ_ACL_STATE_FILE);
+        let lease_name = format!(
+            r"Global\SingularityDenyReadRunner_{}",
+            "a".repeat(super::RUNNER_LEASE_NONCE_HEX_LEN)
+        );
+        let state = serde_json::json!({
+            "version": 4,
+            "principals": {
+                "S-1-5-21-test": [{
+                    "path": r"C:\Windows\System32\config\SAM",
+                    "fingerprint": {"entries": [{"flags": 0, "mask": 1}]}
+                }]
+            },
+            "active_runner_leases": [lease_name]
+        });
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec(&state).expect("serialize runner state fixture"),
+        )
+        .expect("write runner state fixture");
+
+        let loaded = load_state_for_runner(&state_path).expect("load runner state");
+        assert_eq!(loaded.active_runner_leases.len(), 1);
     }
 
     #[test]
