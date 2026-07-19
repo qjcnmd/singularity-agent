@@ -1,11 +1,13 @@
 //! `AppServer` 的标准输入输出（stdio）传输层。
 //!
 //! 输入独立读取；请求工作线程准入队列和传输队列均有界，由单一写入方串行化 JSON 行输出，
-//! 事件通知采用有界的尽力而为队列；控制响应始终使用独立的有界队列。
+//! state/gap 事件在事件队列中可靠阻塞；progress 事件共用该有界队列但可丢弃，控制响应保持独立。
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,7 +18,8 @@ use singularity_app_server::{AppServer, AppServerCancellationHandle, AppServerEr
 use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
 use singularity_model::{PROVIDER_CAPABILITY_CACHE_FILE_NAME, ProviderConfigSnapshot};
 use singularity_protocol::{
-    JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
+    EventClass, EventDelivery, EventGap, EventGapReason, EventMetadata, JsonRpcBatchItem,
+    JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
 };
 use singularity_store::SessionStore;
 
@@ -36,14 +39,38 @@ const CACHE_KEY_LOCK_FILE_PREFIX: &str = ".provider-capability-cache.key-lock-";
 
 #[derive(Clone)]
 struct OutputChannels {
-    control: SyncSender<Value>,
-    event: SyncSender<Value>,
+    control: SyncSender<QueuedOutput>,
+    event: SyncSender<QueuedOutput>,
+    pending_event_gap: Arc<Mutex<Option<PendingEventGap>>>,
+    send_lock: Arc<Mutex<()>>,
+    order_state: Arc<Mutex<OutputOrderState>>,
+}
+
+#[derive(Debug)]
+struct QueuedOutput {
+    order: u64,
+    message: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingEventGap {
+    from_cursor: u64,
+    to_cursor: u64,
+    from_order: u64,
+    to_order: u64,
+}
+
+#[derive(Debug, Default)]
+struct OutputOrderState {
+    next_order: u64,
+    in_flight: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputKind {
     Control,
     Event,
+    ReliableEvent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,17 +114,27 @@ fn run() -> Result<(), String> {
     );
     let mut server = AppServer::new(store, provider_snapshot);
     let cancellation = server.cancellation_handle();
-    let (control_tx, control_rx) = mpsc::sync_channel::<Value>(CONTROL_QUEUE_CAPACITY);
-    let (event_tx, event_rx) = mpsc::sync_channel::<Value>(EVENT_QUEUE_CAPACITY);
+    let (control_tx, control_rx) = mpsc::sync_channel::<QueuedOutput>(CONTROL_QUEUE_CAPACITY);
+    let (event_tx, event_rx) = mpsc::sync_channel::<QueuedOutput>(EVENT_QUEUE_CAPACITY);
     let outputs = OutputChannels {
         control: control_tx,
         event: event_tx,
+        pending_event_gap: Arc::new(Mutex::new(None)),
+        send_lock: Arc::new(Mutex::new(())),
+        order_state: Arc::new(Mutex::new(OutputOrderState::default())),
     };
     let (writer_error_tx, writer_error_rx) = mpsc::channel::<String>();
     let writer_cancellation = cancellation.clone();
+    let writer_order_state = Arc::clone(&outputs.order_state);
     let writer = thread::spawn(move || -> Result<(), String> {
         let mut stdout = io::stdout().lock();
-        let result = write_output_queue(control_rx, event_rx, &mut stdout, &writer_cancellation);
+        let result = write_output_queue(
+            control_rx,
+            event_rx,
+            &mut stdout,
+            &writer_cancellation,
+            writer_order_state,
+        );
         if let Err(error) = &result {
             let _ = writer_error_tx.send(error.clone());
         }
@@ -292,12 +329,14 @@ fn run() -> Result<(), String> {
         .and_then(|()| {
             join_request_workers_during_shutdown(&mut request_workers, shutdown_deadline)
         });
+    let gap_result = flush_pending_event_gap(&outputs, &cancellation);
     drop(outputs);
     let writer_result = join_writer_during_shutdown(writer, shutdown_deadline);
     request_worker_result?;
     if let Some(error) = terminal_error {
         return Err(error);
     }
+    gap_result?;
     writer_result?;
     Ok(())
 }
@@ -377,7 +416,8 @@ fn dispatch_batch(
         }
     }
     for notification in notifications {
-        send_output(outputs, OutputKind::Event, cancellation, notification)?;
+        let kind = classify_output(&notification);
+        send_output(outputs, kind, cancellation, notification)?;
     }
     if responses.is_empty() {
         return Ok(());
@@ -510,7 +550,18 @@ fn join_request_worker(worker: JoinHandle<Result<(), String>>) -> Result<(), Str
 
 fn classify_output(value: &Value) -> OutputKind {
     match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
-        Ok(JsonRpcMessage::Notification(_)) => OutputKind::Event,
+        Ok(JsonRpcMessage::Notification(notification)) => match notification.params.get("event") {
+            Some(metadata) => match serde_json::from_value::<EventMetadata>(metadata.clone()) {
+                Ok(metadata)
+                    if metadata.class == EventClass::Progress
+                        && metadata.delivery == EventDelivery::BestEffort =>
+                {
+                    OutputKind::Event
+                }
+                Ok(_) | Err(_) => OutputKind::ReliableEvent,
+            },
+            None => OutputKind::ReliableEvent,
+        },
         Ok(JsonRpcMessage::Request(_))
         | Ok(JsonRpcMessage::Success(_))
         | Ok(JsonRpcMessage::Error(_))
@@ -518,87 +569,284 @@ fn classify_output(value: &Value) -> OutputKind {
     }
 }
 
-/// 按类型入队；事件队列满时只丢弃当前连接的事件，不停止其他活动 turn。
+/// 按事件交付合同入队；控制与 state/gap 阻塞 backpressure，progress 可丢弃但记录 gap。
 fn send_output(
     outputs: &OutputChannels,
     kind: OutputKind,
     cancellation: &dyn ExecutionStop,
     message: Value,
 ) -> Result<OutputSendStatus, String> {
-    let sender = match kind {
-        OutputKind::Control => &outputs.control,
-        OutputKind::Event => &outputs.event,
+    let _send_guard = outputs
+        .send_lock
+        .lock()
+        .map_err(|_| "output ordering state poisoned".to_string())?;
+    flush_pending_event_gap_locked(outputs, cancellation)?;
+    let order = reserve_output_order(outputs)?;
+    drop(_send_guard);
+    match kind {
+        OutputKind::Control => outputs
+            .control
+            .send(QueuedOutput { order, message })
+            .map(|()| {
+                complete_output_order(outputs, order);
+                OutputSendStatus::Enqueued
+            })
+            .map_err(|_| {
+                complete_output_order(outputs, order);
+                cancellation.request_execution_stop();
+                "stdout transport unavailable".to_string()
+            }),
+        OutputKind::ReliableEvent => outputs
+            .event
+            .send(QueuedOutput { order, message })
+            .map(|()| {
+                complete_output_order(outputs, order);
+                OutputSendStatus::Enqueued
+            })
+            .map_err(|_| {
+                complete_output_order(outputs, order);
+                cancellation.request_execution_stop();
+                "stdout transport unavailable".to_string()
+            }),
+        OutputKind::Event => match outputs.event.try_send(QueuedOutput { order, message }) {
+            Ok(()) => {
+                complete_output_order(outputs, order);
+                Ok(OutputSendStatus::Enqueued)
+            }
+            Err(TrySendError::Full(output)) => {
+                record_event_gap(outputs, &output.message, order)?;
+                Ok(OutputSendStatus::EventDropped)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                complete_output_order(outputs, order);
+                cancellation.request_execution_stop();
+                Err("stdout transport unavailable".to_string())
+            }
+        },
+    }
+}
+
+/// 将待发送 gap 放入控制队列，保证它先于同一请求的匹配响应写出。
+fn flush_pending_event_gap(
+    outputs: &OutputChannels,
+    cancellation: &dyn ExecutionStop,
+) -> Result<(), String> {
+    let _send_guard = outputs
+        .send_lock
+        .lock()
+        .map_err(|_| "output ordering state poisoned".to_string())?;
+    flush_pending_event_gap_locked(outputs, cancellation)
+}
+
+fn flush_pending_event_gap_locked(
+    outputs: &OutputChannels,
+    cancellation: &dyn ExecutionStop,
+) -> Result<(), String> {
+    let pending = outputs
+        .pending_event_gap
+        .lock()
+        .map_err(|_| "event gap state poisoned".to_string())?
+        .take();
+    let Some(pending) = pending else {
+        return Ok(());
     };
-    match sender.try_send(message) {
-        Ok(()) => Ok(OutputSendStatus::Enqueued),
-        Err(TrySendError::Full(_)) if kind == OutputKind::Event => {
-            Ok(OutputSendStatus::EventDropped)
-        }
-        Err(TrySendError::Full(_)) => {
+    let gap = EventGap {
+        reason: EventGapReason::ProgressDropped,
+        from_cursor: pending.from_cursor,
+        to_cursor: pending.to_cursor,
+    };
+    let metadata = EventMetadata {
+        sequence: pending.to_cursor,
+        cursor: pending.to_cursor,
+        class: EventClass::Gap,
+        delivery: EventDelivery::Gap,
+        recovery_query: None,
+        gap: Some(gap.clone()),
+    };
+    let message = JsonRpcMessage::notification(
+        "event/gap",
+        &serde_json::json!({
+            "gap": gap,
+            "event": metadata,
+        }),
+    )
+    .map_err(|_| "failed to serialize event gap".to_string())?
+    .to_wire_value();
+    outputs
+        .control
+        .send(QueuedOutput {
+            order: pending.from_order,
+            message,
+        })
+        .map_err(|_| {
             cancellation.request_execution_stop();
-            Err("stdout control transport overload".to_string())
+            "stdout transport unavailable".to_string()
+        })?;
+    complete_output_order_range(outputs, pending.from_order, pending.to_order);
+    Ok(())
+}
+
+/// 合并连续丢弃的 progress cursor；state 事件不允许走此路径。
+fn record_event_gap(outputs: &OutputChannels, message: &Value, order: u64) -> Result<(), String> {
+    let metadata = message
+        .get("params")
+        .and_then(|params| params.get("event"))
+        .cloned()
+        .ok_or_else(|| "progress event is missing typed delivery metadata".to_string())
+        .and_then(|value| {
+            serde_json::from_value::<EventMetadata>(value)
+                .map_err(|_| "progress event has invalid delivery metadata".to_string())
+        })?;
+    if metadata.sequence == 0
+        || metadata.cursor != metadata.sequence
+        || metadata.class != EventClass::Progress
+        || metadata.delivery != EventDelivery::BestEffort
+    {
+        return Err("only typed best-effort progress events may be dropped".to_string());
+    }
+    let mut pending = outputs
+        .pending_event_gap
+        .lock()
+        .map_err(|_| "event gap state poisoned".to_string())?;
+    match pending.as_mut() {
+        None => {
+            *pending = Some(PendingEventGap {
+                from_cursor: metadata.cursor,
+                to_cursor: metadata.cursor,
+                from_order: order,
+                to_order: order,
+            });
         }
-        Err(TrySendError::Disconnected(_)) => {
-            cancellation.request_execution_stop();
-            Err("stdout transport unavailable".to_string())
+        Some(pending)
+            if metadata.cursor == pending.to_cursor.saturating_add(1)
+                && order == pending.to_order.saturating_add(1) =>
+        {
+            pending.to_cursor = metadata.cursor;
+            pending.to_order = order;
+        }
+        Some(_) => return Err("non-contiguous dropped progress cursor".to_string()),
+    }
+    Ok(())
+}
+
+fn reserve_output_order(outputs: &OutputChannels) -> Result<u64, String> {
+    let mut state = outputs
+        .order_state
+        .lock()
+        .map_err(|_| "output ordering state poisoned".to_string())?;
+    let order = state.next_order;
+    state.next_order = state
+        .next_order
+        .checked_add(1)
+        .ok_or_else(|| "output order exhausted".to_string())?;
+    state.in_flight.insert(order);
+    Ok(order)
+}
+
+fn complete_output_order(outputs: &OutputChannels, order: u64) {
+    if let Ok(mut state) = outputs.order_state.lock() {
+        state.in_flight.remove(&order);
+    }
+}
+
+fn complete_output_order_range(outputs: &OutputChannels, from_order: u64, to_order: u64) {
+    if let Ok(mut state) = outputs.order_state.lock() {
+        for order in from_order..=to_order {
+            state.in_flight.remove(&order);
         }
     }
 }
 
-/// 以控制响应优先、各自 FIFO 的顺序从两个有界队列取出一条 frame。
+/// 按发送顺序从两个有界队列取出一条 frame，避免 progress 被后续 control 越过。
 fn next_output(
-    control_rx: &Receiver<Value>,
-    event_rx: &Receiver<Value>,
+    control_rx: &Receiver<QueuedOutput>,
+    event_rx: &Receiver<QueuedOutput>,
     control_open: &mut bool,
     event_open: &mut bool,
-) -> Option<Value> {
+    order_state: &Arc<Mutex<OutputOrderState>>,
+    pending: &mut BTreeMap<u64, QueuedOutput>,
+) -> Option<QueuedOutput> {
     loop {
         if *control_open {
             match control_rx.try_recv() {
-                Ok(message) => return Some(message),
+                Ok(message) => {
+                    pending.insert(message.order, message);
+                }
                 Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => *control_open = false,
+                Err(TryRecvError::Disconnected) => {
+                    *control_open = false;
+                }
             }
         }
         if *event_open {
             match event_rx.try_recv() {
-                Ok(message) => return Some(message),
+                Ok(message) => {
+                    pending.insert(message.order, message);
+                }
                 Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => *event_open = false,
+                Err(TryRecvError::Disconnected) => {
+                    *event_open = false;
+                }
             }
         }
-        if !*control_open && !*event_open {
+        if let Some(order) = pending.keys().next().copied() {
+            let earlier_in_flight = order_state
+                .lock()
+                .map(|state| state.in_flight.iter().any(|in_flight| *in_flight < order))
+                .unwrap_or(true);
+            if !earlier_in_flight {
+                return pending.remove(&order);
+            }
+        } else if !*control_open && !*event_open {
             return None;
         }
+        let mut received = false;
         if *control_open {
             match control_rx.recv_timeout(INPUT_POLL_INTERVAL) {
-                Ok(message) => return Some(message),
+                Ok(message) => {
+                    pending.insert(message.order, message);
+                    received = true;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => *control_open = false,
             }
-        } else if *event_open {
+        }
+        if *event_open {
             match event_rx.recv_timeout(INPUT_POLL_INTERVAL) {
-                Ok(message) => return Some(message),
+                Ok(message) => {
+                    pending.insert(message.order, message);
+                    received = true;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => *event_open = false,
             }
+        }
+        if !received && !*control_open && !*event_open {
+            return None;
         }
     }
 }
 
 /// 串行写出控制与事件 frame；真实写入或 flush 失败才触发全局停止。
 fn write_output_queue(
-    control_rx: Receiver<Value>,
-    event_rx: Receiver<Value>,
+    control_rx: Receiver<QueuedOutput>,
+    event_rx: Receiver<QueuedOutput>,
     stdout: &mut impl Write,
     cancellation: &dyn ExecutionStop,
+    order_state: Arc<Mutex<OutputOrderState>>,
 ) -> Result<(), String> {
     let mut control_open = true;
     let mut event_open = true;
-    while let Some(message) =
-        next_output(&control_rx, &event_rx, &mut control_open, &mut event_open)
-    {
-        if let Err(error) = write_json_line(stdout, &message) {
+    let mut pending = BTreeMap::new();
+    while let Some(output) = next_output(
+        &control_rx,
+        &event_rx,
+        &mut control_open,
+        &mut event_open,
+        &order_state,
+        &mut pending,
+    ) {
+        if let Err(error) = write_json_line(stdout, &output.message) {
             cancellation.request_execution_stop();
             return Err(format!("failed to write response: {error}"));
         }
@@ -851,10 +1099,64 @@ mod tests {
     fn test_output_channels(
         control_capacity: usize,
         event_capacity: usize,
-    ) -> (OutputChannels, Receiver<Value>, Receiver<Value>) {
+    ) -> (
+        OutputChannels,
+        Receiver<QueuedOutput>,
+        Receiver<QueuedOutput>,
+    ) {
         let (control, control_rx) = mpsc::sync_channel(control_capacity);
         let (event, event_rx) = mpsc::sync_channel(event_capacity);
-        (OutputChannels { control, event }, control_rx, event_rx)
+        (
+            OutputChannels {
+                control,
+                event,
+                pending_event_gap: Arc::new(Mutex::new(None)),
+                send_lock: Arc::new(Mutex::new(())),
+                order_state: Arc::new(Mutex::new(OutputOrderState::default())),
+            },
+            control_rx,
+            event_rx,
+        )
+    }
+
+    fn progress_event(cursor: u64) -> Value {
+        JsonRpcMessage::notification(
+            "item/agentMessage/delta",
+            &serde_json::json!({
+                "item": {"item_id": "item_progress"},
+                "delta": "progress",
+                "event": EventMetadata {
+                    sequence: cursor,
+                    cursor,
+                    class: EventClass::Progress,
+                    delivery: EventDelivery::BestEffort,
+                    recovery_query: None,
+                    gap: None,
+                },
+            }),
+        )
+        .expect("progress event")
+        .to_wire_value()
+    }
+
+    fn reliable_state_event(cursor: u64) -> Value {
+        JsonRpcMessage::notification(
+            "turn/diff/updated",
+            &serde_json::json!({
+                "turnId": "turn_state",
+                "diff": {"files": []},
+                "event": EventMetadata {
+                    sequence: cursor,
+                    cursor,
+                    class: EventClass::State,
+                    delivery: EventDelivery::Reliable,
+                    recovery_query: None,
+                    gap: None,
+                },
+            }),
+        )
+        .expect("state event")
+        .to_wire_value()
     }
 
     #[test]
@@ -980,8 +1282,8 @@ mod tests {
     }
 
     #[test]
-    fn control_queue_fails_closed_when_backpressure_limit_is_reached() {
-        let (outputs, _control_rx, _event_rx) = test_output_channels(1, 1);
+    fn control_queue_uses_bounded_backpressure_without_stopping_execution() {
+        let (outputs, control_rx, _event_rx) = test_output_channels(1, 1);
         let cancellation = CancellationProbe::default();
         send_output(
             &outputs,
@@ -991,16 +1293,35 @@ mod tests {
         )
         .expect("first output fits");
 
-        let error = send_output(
-            &outputs,
-            OutputKind::Control,
-            &cancellation,
-            serde_json::json!({"second": true}),
-        )
-        .expect_err("full control queue must fail closed");
-
-        assert_eq!(error, "stdout control transport overload");
-        assert_eq!(cancellation.request_count(), 1);
+        let (attempted_sender, attempted_receiver) = mpsc::channel();
+        let sender_outputs = outputs.clone();
+        let sender_cancellation = cancellation.clone();
+        let sender = thread::spawn(move || {
+            attempted_sender.send(()).expect("control send attempted");
+            send_output(
+                &sender_outputs,
+                OutputKind::Control,
+                &sender_cancellation,
+                serde_json::json!({"second": true}),
+            )
+            .expect("bounded control send");
+        });
+        attempted_receiver.recv().expect("control send attempt");
+        assert!(
+            !sender.is_finished(),
+            "full control queue must backpressure"
+        );
+        assert_eq!(cancellation.request_count(), 0);
+        assert_eq!(
+            control_rx.recv().expect("first control output").message["first"],
+            true
+        );
+        sender.join().expect("control sender");
+        assert_eq!(
+            control_rx.recv().expect("second control output").message["second"],
+            true
+        );
+        assert_eq!(cancellation.request_count(), 0);
     }
 
     #[test]
@@ -1012,7 +1333,7 @@ mod tests {
             &outputs,
             OutputKind::Event,
             &first_turn_cancellation,
-            serde_json::json!({"event": 1}),
+            progress_event(1),
         )
         .expect("first event fits");
 
@@ -1020,7 +1341,7 @@ mod tests {
             &outputs,
             OutputKind::Event,
             &first_turn_cancellation,
-            serde_json::json!({"event": 2}),
+            progress_event(2),
         )
         .expect("event pressure must not stop execution");
 
@@ -1030,21 +1351,57 @@ mod tests {
     }
 
     #[test]
-    fn control_output_remains_available_and_is_written_before_events() {
-        let (outputs, control_rx, event_rx) = test_output_channels(1, 1);
+    fn reliable_state_event_blocks_on_event_queue_without_global_stop() {
+        let (outputs, _control_rx, event_rx) = test_output_channels(1, 1);
         let cancellation = CancellationProbe::default();
         send_output(
             &outputs,
             OutputKind::Event,
             &cancellation,
-            serde_json::json!({"kind": "event"}),
+            progress_event(1),
+        )
+        .expect("progress event fits");
+        let (attempted_sender, attempted_receiver) = mpsc::channel();
+        let sender_outputs = outputs.clone();
+        let sender_cancellation = cancellation.clone();
+        let sender = thread::spawn(move || {
+            attempted_sender.send(()).expect("state send attempted");
+            send_output(
+                &sender_outputs,
+                OutputKind::ReliableEvent,
+                &sender_cancellation,
+                reliable_state_event(2),
+            )
+            .expect("reliable state event");
+        });
+        attempted_receiver.recv().expect("state send attempt");
+        assert!(
+            !sender.is_finished(),
+            "state event must apply bounded backpressure"
+        );
+        assert_eq!(cancellation.request_count(), 0);
+        assert_eq!(event_rx.recv().expect("progress output").order, 0);
+        sender.join().expect("state sender");
+        assert_eq!(event_rx.recv().expect("state output").order, 1);
+        assert_eq!(cancellation.request_count(), 0);
+    }
+
+    #[test]
+    fn gap_is_written_before_matching_control_output_when_progress_queue_is_full() {
+        let (outputs, control_rx, event_rx) = test_output_channels(2, 1);
+        let cancellation = CancellationProbe::default();
+        send_output(
+            &outputs,
+            OutputKind::Event,
+            &cancellation,
+            progress_event(1),
         )
         .expect("event fits");
         send_output(
             &outputs,
             OutputKind::Event,
             &cancellation,
-            serde_json::json!({"kind": "dropped"}),
+            progress_event(2),
         )
         .expect("event pressure is a recoverable drop");
         send_output(
@@ -1054,18 +1411,29 @@ mod tests {
             serde_json::json!({"kind": "control"}),
         )
         .expect("control remains available while events are full");
+        let order_state = Arc::clone(&outputs.order_state);
         drop(outputs);
 
         let mut stdout = Vec::new();
-        write_output_queue(control_rx, event_rx, &mut stdout, &cancellation)
-            .expect("writer drains both queues");
+        write_output_queue(
+            control_rx,
+            event_rx,
+            &mut stdout,
+            &cancellation,
+            order_state,
+        )
+        .expect("writer drains both queues");
         let lines = String::from_utf8(stdout).expect("writer output is UTF-8");
         let values = lines
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("JSONL frame"))
             .collect::<Vec<_>>();
-        assert_eq!(values[0]["kind"], "control");
-        assert_eq!(values[1]["kind"], "event");
+        assert_eq!(values[0]["params"]["event"]["sequence"], 1);
+        assert_eq!(values[1]["method"], "event/gap");
+        assert_eq!(values[1]["params"]["event"]["sequence"], 2);
+        assert_eq!(values[1]["params"]["event"]["gap"]["fromCursor"], 2);
+        assert_eq!(values[1]["params"]["event"]["gap"]["toCursor"], 2);
+        assert_eq!(values[2]["kind"], "control");
         assert_eq!(cancellation.request_count(), 0);
     }
 
@@ -1092,11 +1460,18 @@ mod tests {
             serde_json::json!({"kind": "control"}),
         )
         .expect("control fits");
+        let order_state = Arc::clone(&outputs.order_state);
         drop(outputs);
 
         let mut stdout = DisconnectedWriter;
-        let error = write_output_queue(control_rx, event_rx, &mut stdout, &cancellation)
-            .expect_err("writer disconnect is transport-fatal");
+        let error = write_output_queue(
+            control_rx,
+            event_rx,
+            &mut stdout,
+            &cancellation,
+            order_state,
+        )
+        .expect_err("writer disconnect is transport-fatal");
 
         assert!(error.starts_with("failed to write response:"));
         assert_eq!(cancellation.request_count(), 1);
@@ -1125,7 +1500,7 @@ mod tests {
 
         let outputs = receiver.try_iter().collect::<Vec<_>>();
         assert_eq!(outputs.len(), 1);
-        let responses = outputs[0].as_array().expect("batch response array");
+        let responses = outputs[0].message.as_array().expect("batch response array");
         assert_eq!(responses.len(), 4);
         assert_eq!(responses[0]["id"], 1);
         assert_eq!(responses[1]["id"], 2);
@@ -1176,7 +1551,10 @@ mod tests {
         )
         .expect("dispatch empty batch");
 
-        let response = receiver.try_recv().expect("invalid request response");
+        let response = receiver
+            .try_recv()
+            .expect("invalid request response")
+            .message;
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], Value::Null);
         assert_eq!(response["error"]["code"], -32600);

@@ -2,7 +2,7 @@
 
 mod shared;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -26,9 +26,10 @@ fn main() {
 fn run(scenario_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let scenario: Value = serde_json::from_reader(File::open(scenario_path)?)?;
     let mut stdout = io::stdout().lock();
+    let mut next_event_sequence = 1_u64;
 
     if let Some(actions) = scenario.get("startup").and_then(Value::as_array) {
-        execute_actions(actions, &Value::Null, &mut stdout)?;
+        execute_actions(actions, &Value::Null, &mut stdout, &mut next_event_sequence)?;
     }
 
     let methods = scenario
@@ -63,7 +64,7 @@ fn run(scenario_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let actions = interactions[interaction_index]
             .as_array()
             .ok_or("method interaction must be an action array")?;
-        execute_actions(actions, &request, &mut stdout)?;
+        execute_actions(actions, &request, &mut stdout, &mut next_event_sequence)?;
     }
 
     Ok(())
@@ -74,6 +75,7 @@ fn execute_actions(
     actions: &[Value],
     request: &Value,
     stdout: &mut impl Write,
+    next_event_sequence: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for action in actions {
         if let Some(response) = action.get("respond") {
@@ -87,7 +89,9 @@ fn execute_actions(
             );
             write_json(stdout, &Value::Object(response))?;
         } else if let Some(message) = action.get("send") {
-            write_json(stdout, message)?;
+            let mut message = message.clone();
+            decorate_event(&mut message, next_event_sequence)?;
+            write_json(stdout, &message)?;
         } else if let Some(capture) = action.get("capture") {
             let path = capture
                 .get("path")
@@ -121,6 +125,72 @@ fn execute_actions(
         }
     }
 
+    Ok(())
+}
+
+fn decorate_event(
+    message: &mut Value,
+    next_event_sequence: &mut u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(method) = message
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+    let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    if let Some(existing) = params.get("event") {
+        if let Some(sequence) = existing.get("sequence").and_then(Value::as_u64) {
+            *next_event_sequence = (*next_event_sequence).max(sequence.saturating_add(1));
+        }
+        return Ok(());
+    }
+    if method == "event/gap" {
+        return Ok(());
+    }
+    let is_progress = matches!(
+        method.as_str(),
+        "item/agentMessage/delta" | "item/commandExecution/outputDelta"
+    );
+    let class = if is_progress { "progress" } else { "state" };
+    let delivery = if is_progress {
+        "best_effort"
+    } else {
+        "reliable"
+    };
+    let recovery_query = match method.as_str() {
+        "thread/started" => params
+            .get("thread")
+            .and_then(|thread| thread.get("thread_id"))
+            .and_then(Value::as_str)
+            .map(|thread_id| json!({"method":"thread/read","params":{"threadId":thread_id}})),
+        "turn/started" | "turn/completed" => params
+            .get("turn")
+            .and_then(|turn| turn.get("turn_id"))
+            .and_then(Value::as_str)
+            .map(|turn_id| json!({"method":"turn/status","params":{"turnId":turn_id}})),
+        "turn/plan/updated" => params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .map(|turn_id| json!({"method":"turn/status","params":{"turnId":turn_id}})),
+        "approval/requested" => Some(json!({"method":"approval/list","params":{}})),
+        _ => None,
+    };
+    let sequence = *next_event_sequence;
+    *next_event_sequence = (*next_event_sequence).saturating_add(1);
+    let mut metadata = json!({
+        "sequence": sequence,
+        "cursor": sequence,
+        "class": class,
+        "delivery": delivery,
+    });
+    if let Some(query) = recovery_query {
+        metadata["recoveryQuery"] = query;
+    }
+    params.insert("event".to_string(), metadata);
     Ok(())
 }
 

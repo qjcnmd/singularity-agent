@@ -11,7 +11,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread::{Builder as ThreadBuilder, JoinHandle};
 use std::time::Duration;
 
@@ -34,9 +34,10 @@ use singularity_policy::{
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ApprovalCenterResult,
     ApprovalDecisionResult, ApprovalListResult, ArtifactFetchParams, ArtifactFetchResult,
-    ConversationMessage, ConversationRole, EvalRunParams, EventSubscribeParams,
-    EventSubscribeResult, InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage,
-    Method, ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
+    ConversationMessage, ConversationRole, EvalRunParams, EventClass, EventDelivery, EventGap,
+    EventGapReason, EventMetadata, EventRecoveryQuery, EventSubscribeParams, EventSubscribeResult,
+    InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage, Method,
+    ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
     TraceEvent, TraceListParams, TraceListResult, TraceShowParams, TraceShowResult,
@@ -286,7 +287,7 @@ pub struct AppServer {
     store: SessionStore,
     initialized: bool,
     initialized_acknowledged: bool,
-    event_filter: Arc<RwLock<Option<Vec<String>>>>,
+    event_filter: Arc<Mutex<EventSubscriptionState>>,
     shutdown_requested: bool,
     sandbox_backend: Arc<dyn SandboxBackend + Send + Sync>,
     provider_snapshot: ProviderConfigSnapshot,
@@ -299,6 +300,13 @@ pub struct AppServer {
 pub struct AppServerCancellationHandle {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     execution_stopped: Arc<AtomicBool>,
+}
+
+/// 每个 stdio app-server 生命周期共享的事件订阅和传输 cursor。
+#[derive(Debug, Default)]
+struct EventSubscriptionState {
+    event_types: Option<Vec<String>>,
+    cursor: u64,
 }
 
 impl AppServerCancellationHandle {
@@ -520,7 +528,7 @@ impl AppServer {
             store,
             initialized: false,
             initialized_acknowledged: false,
-            event_filter: Arc::new(RwLock::new(None)),
+            event_filter: Arc::new(Mutex::new(EventSubscriptionState::default())),
             shutdown_requested: false,
             sandbox_backend: Arc::new(WindowsSandboxBackend::new()),
             provider_snapshot,
@@ -561,7 +569,7 @@ impl AppServer {
         }
     }
 
-    /// 为请求工作线程打开独立的存储连接，同时共享停止状态。
+    /// 为请求工作线程打开独立的存储连接，同时共享停止和事件订阅状态。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
             store: self.store.trusted_reopen()?,
@@ -1100,6 +1108,23 @@ impl AppServer {
                 );
             }
         };
+        let approval_events = match self.pending_approval_events_for_turn(&turn.turn_id) {
+            Ok(events) => events,
+            Err(error) => {
+                let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
+                return self.finish_turn_failure(
+                    &mut emit,
+                    &turn,
+                    &cancellation,
+                    monitor_outcome,
+                    monitor_failure_or(
+                        monitor_outcome,
+                        turn_failure_from_error(&error, TurnFailureStage::EventNotification),
+                    ),
+                );
+            }
+        };
+        emit_messages(&mut emit, approval_events);
         let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
         if monitor_outcome == Some(CancellationMonitorOutcome::InfrastructureFailure) {
             return self.finish_turn_failure(
@@ -2178,6 +2203,9 @@ impl AppServer {
                 None
             }
         };
+        let has_next_approvals = terminal
+            .as_ref()
+            .is_some_and(|(_, _, next_approvals)| !next_approvals.is_empty());
         if let Some((turn, run_status, next_approvals)) = terminal {
             let mut effective_status = run_status.clone();
             if monitor_outcome == Some(CancellationMonitorOutcome::UserCancellation)
@@ -2222,6 +2250,9 @@ impl AppServer {
                     }
                 }
             }
+        }
+        if has_next_approvals {
+            messages.extend(self.pending_approval_events_for_turn(&recorded.turn.turn_id)?);
         }
         messages.push(approval_decision_response(
             message.required_id(),
@@ -2396,18 +2427,38 @@ impl AppServer {
 
     fn event_subscribe(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: EventSubscribeParams = parse_params(&message)?;
-        *self
-            .event_filter
-            .write()
-            .map_err(|_| AppServerError::Workspace("event subscription state poisoned".into()))? =
-            Some(params.event_types.clone());
-        json_response(
+        let (cursor, gap) = {
+            let mut state = self.event_filter.lock().map_err(|_| {
+                AppServerError::Workspace("event subscription state poisoned".into())
+            })?;
+            if params.cursor == Some(0) || params.cursor.is_some_and(|cursor| cursor > state.cursor)
+            {
+                return Err(AppServerError::InvalidParams(
+                    "event subscription cursor is outside the observed range".to_string(),
+                ));
+            }
+            state.event_types = Some(params.event_types.clone());
+            let cursor = next_event_cursor(&mut state.cursor)?;
+            let from_cursor = params.cursor.map_or(1, |cursor| cursor.saturating_add(1));
+            (
+                cursor,
+                EventGap {
+                    reason: EventGapReason::CursorNotReplayed,
+                    from_cursor,
+                    to_cursor: cursor,
+                },
+            )
+        };
+        let mut messages = vec![self.event_gap_notification(cursor, gap)?];
+        messages.extend(json_response(
             message.required_id(),
             EventSubscribeResult {
                 subscription_id: EVENT_SUBSCRIPTION_ID.to_string(),
                 event_types: params.event_types,
+                cursor,
             },
-        )
+        )?);
+        Ok(messages)
     }
 
     fn artifact_fetch(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -2422,18 +2473,63 @@ impl AppServer {
     }
 
     fn event_notification(&self, event: AppEvent) -> AppServerResult<Option<Value>> {
-        let event_filter = self
+        let mut state = self
             .event_filter
-            .read()
-            .map_err(|_| AppServerError::Workspace("event subscription state poisoned".into()))?
-            .clone();
-        if event_filter
-            .as_ref()
-            .is_some_and(|event_types| !event_types.iter().any(|method| method == event.method()))
-        {
+            .lock()
+            .map_err(|_| AppServerError::Workspace("event subscription state poisoned".into()))?;
+        let Some(event_types) = state.event_types.as_ref() else {
+            return Ok(None);
+        };
+        if !event_types.iter().any(|method| method == event.method()) {
             return Ok(None);
         }
-        Ok(Some(event.to_notification().to_wire_value()))
+        let cursor = next_event_cursor(&mut state.cursor)?;
+        let (class, delivery, recovery_query) = event_contract(&event);
+        Ok(Some(
+            event
+                .to_notification_with_metadata(EventMetadata {
+                    sequence: cursor,
+                    cursor,
+                    class,
+                    delivery,
+                    recovery_query,
+                    gap: None,
+                })
+                .to_wire_value(),
+        ))
+    }
+
+    fn event_gap_notification(&self, cursor: u64, gap: EventGap) -> AppServerResult<Value> {
+        Ok(AppEvent {
+            method: "event/gap".to_string(),
+            params: json!({"gap": gap.clone()}),
+        }
+        .to_notification_with_metadata(EventMetadata {
+            sequence: cursor,
+            cursor,
+            class: EventClass::Gap,
+            delivery: EventDelivery::Gap,
+            recovery_query: None,
+            gap: Some(gap),
+        })
+        .to_wire_value())
+    }
+
+    fn pending_approval_events_for_turn(&self, turn_id: &str) -> AppServerResult<Vec<Value>> {
+        let approvals = self
+            .store
+            .list_pending_approvals()?
+            .into_iter()
+            .filter(|request| request.turn_id == turn_id);
+        let mut messages = Vec::new();
+        for request in approvals {
+            if let Some(message) =
+                self.event_notification(AppEvent::approval_requested(&request))?
+            {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
     }
 
     fn committed_turn_events(
@@ -2539,6 +2635,56 @@ impl AppServer {
             }
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+fn next_event_cursor(cursor: &mut u64) -> AppServerResult<u64> {
+    *cursor = cursor
+        .checked_add(1)
+        .ok_or_else(|| AppServerError::Workspace("event cursor exhausted".to_string()))?;
+    Ok(*cursor)
+}
+
+fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery, Option<EventRecoveryQuery>) {
+    match event.method.as_str() {
+        "item/agentMessage/delta" | "item/commandExecution/outputDelta" => {
+            (EventClass::Progress, EventDelivery::BestEffort, None)
+        }
+        "thread/started" => (
+            EventClass::State,
+            EventDelivery::Reliable,
+            event.params["thread"]["thread_id"]
+                .as_str()
+                .map(|thread_id| EventRecoveryQuery::ThreadRead {
+                    thread_id: thread_id.to_string(),
+                }),
+        ),
+        "turn/started" | "turn/completed" => (
+            EventClass::State,
+            EventDelivery::Reliable,
+            event.params["turn"]["turn_id"].as_str().map(|turn_id| {
+                EventRecoveryQuery::TurnStatus {
+                    turn_id: turn_id.to_string(),
+                }
+            }),
+        ),
+        "approval/requested" => (
+            EventClass::State,
+            EventDelivery::Reliable,
+            Some(EventRecoveryQuery::ApprovalList(
+                singularity_protocol::EmptyParams {},
+            )),
+        ),
+        "turn/plan/updated" => (
+            EventClass::State,
+            EventDelivery::Reliable,
+            event.params["turnId"]
+                .as_str()
+                .map(|turn_id| EventRecoveryQuery::TurnStatus {
+                    turn_id: turn_id.to_string(),
+                }),
+        ),
+        _ => (EventClass::State, EventDelivery::Reliable, None),
     }
 }
 
@@ -3650,7 +3796,7 @@ mod tests {
         let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
         let filter = Arc::clone(&server.event_filter);
         let poisoned = std::thread::spawn(move || {
-            let _guard = filter.write().expect("event filter");
+            let _guard = filter.lock().expect("event filter");
             panic!("poison event filter");
         })
         .join();

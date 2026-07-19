@@ -192,9 +192,20 @@ fn app_server_enforces_initialize_and_emits_item_events() {
             r#"{"jsonrpc":"2.0","method":"event/subscribe","id":32,"params":{"eventTypes":["thread/started","turn/started"]}}"#,
         )
         .unwrap();
+    assert_eq!(subscription[0]["method"], "event/gap");
     assert_eq!(
-        subscription[0]["result"]["eventTypes"],
+        subscription[0]["params"]["event"]["gap"]["reason"],
+        "cursor_not_replayed"
+    );
+    assert!(subscription[0]["params"]["event"]["cursor"] > 0);
+    let subscription_result = result_message(&subscription);
+    assert_eq!(
+        subscription_result["eventTypes"],
         serde_json::json!(["thread/started", "turn/started"])
+    );
+    assert_eq!(
+        subscription_result["cursor"],
+        subscription[0]["params"]["event"]["cursor"]
     );
 
     let thread = server
@@ -217,6 +228,16 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         thread
             .iter()
             .any(|message| message["method"] == "thread/started")
+    );
+    let thread_started = thread
+        .iter()
+        .find(|message| message["method"] == "thread/started")
+        .expect("thread started event");
+    assert_eq!(thread_started["params"]["event"]["class"], "state");
+    assert_eq!(thread_started["params"]["event"]["delivery"], "reliable");
+    assert_eq!(
+        thread_started["params"]["event"]["recoveryQuery"]["method"],
+        "thread/read"
     );
 
     let list = server
@@ -367,6 +388,44 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         ))
         .unwrap();
     assert_eq!(deleted[0]["result"]["deleted"], true);
+}
+
+#[test]
+fn event_subscription_is_inactive_until_explicit_and_rejects_invalid_cursor() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+    let mut server = app_server(store);
+    server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+        )
+        .expect("initialize");
+    server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
+        .expect("initialized");
+
+    let before_subscribe = server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{"model":"gpt-test"}}"#,
+        )
+        .expect("thread start");
+    assert!(
+        before_subscribe
+            .iter()
+            .all(|message| message["method"] != "thread/started")
+    );
+    assert!(
+        before_subscribe
+            .iter()
+            .any(|message| message["result"].is_object())
+    );
+
+    let invalid = server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"event/subscribe","id":3,"params":{"eventTypes":[],"cursor":0}}"#,
+        )
+        .expect("invalid cursor response");
+    assert_eq!(invalid[0]["error"]["code"], -32602);
 }
 
 #[test]

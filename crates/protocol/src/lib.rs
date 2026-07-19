@@ -917,10 +917,12 @@ pub struct ApprovalDecisionResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// 事件订阅请求参数。
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// 事件订阅请求参数；cursor 只用于声明客户端已观察到的边界。
 pub struct EventSubscribeParams {
-    #[serde(rename = "eventTypes")]
     pub event_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -930,6 +932,7 @@ pub struct EventSubscribeResult {
     pub subscription_id: String,
     #[serde(rename = "eventTypes")]
     pub event_types: Vec<String>,
+    pub cursor: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1166,6 +1169,91 @@ pub struct AppEvent {
     pub params: Value,
 }
 
+/// 事件的稳定语义分类；客户端据此选择可靠处理或可观察丢弃。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventClass {
+    State,
+    Progress,
+    Gap,
+}
+
+/// 事件在 stdio 传输上的交付合同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventDelivery {
+    Reliable,
+    BestEffort,
+    Gap,
+}
+
+/// 可由现有 JSON-RPC 查询重建的事件恢复入口。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "method", content = "params")]
+pub enum EventRecoveryQuery {
+    #[serde(rename = "thread/read")]
+    ThreadRead {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+    },
+    #[serde(rename = "turn/status")]
+    TurnStatus {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+    },
+    #[serde(rename = "approval/list")]
+    ApprovalList(EmptyParams),
+    #[serde(rename = "trace/list")]
+    TraceList {
+        #[serde(rename = "runId")]
+        run_id: String,
+    },
+}
+
+impl EventRecoveryQuery {
+    /// 返回恢复入口的公共 method 名，供客户端严格校验。
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::ThreadRead { .. } => "thread/read",
+            Self::TurnStatus { .. } => "turn/status",
+            Self::ApprovalList(_) => "approval/list",
+            Self::TraceList { .. } => "trace/list",
+        }
+    }
+}
+
+/// 事件丢失或未重放的可观察范围。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventGap {
+    pub reason: EventGapReason,
+    pub from_cursor: u64,
+    pub to_cursor: u64,
+}
+
+/// 事件 gap 的稳定原因分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EventGapReason {
+    CursorNotReplayed,
+    ProgressDropped,
+    ClientDisconnected,
+}
+
+/// JSON-RPC notification 中附带的严格事件元数据。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventMetadata {
+    pub sequence: u64,
+    pub cursor: u64,
+    pub class: EventClass,
+    pub delivery: EventDelivery,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_query: Option<EventRecoveryQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<EventGap>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 /// thread 生命周期 notification 的类型化参数。
 pub struct ThreadEventParams {
@@ -1235,6 +1323,14 @@ impl AppEvent {
         }
     }
 
+    /// 构造待处理 approval 请求事件。
+    pub fn approval_requested(request: &singularity_policy::ApprovalRequest) -> Self {
+        Self {
+            method: "approval/requested".to_string(),
+            params: serde_json::json!({"approval": request}),
+        }
+    }
+
     /// 构造 item started 事件。
     pub fn item_started(item_id: impl Into<String>) -> Self {
         Self::item_event("item/started", item_id)
@@ -1298,6 +1394,20 @@ impl AppEvent {
     /// 将应用事件包装为 JSON-RPC 通知。
     pub fn to_notification(&self) -> JsonRpcMessage {
         JsonRpcMessage::notification(self.method.clone(), &self.params)
+            .expect("application event params serialize")
+    }
+
+    /// 将带有严格传输元数据的应用事件包装为 JSON-RPC 通知。
+    pub fn to_notification_with_metadata(&self, metadata: EventMetadata) -> JsonRpcMessage {
+        let mut params = match self.params.clone() {
+            Value::Object(params) => params,
+            _ => serde_json::Map::new(),
+        };
+        params.insert(
+            "event".to_string(),
+            serde_json::to_value(metadata).expect("event metadata serializes"),
+        );
+        JsonRpcMessage::notification(self.method.clone(), Value::Object(params))
             .expect("application event params serialize")
     }
 }

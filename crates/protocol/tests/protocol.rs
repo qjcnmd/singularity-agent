@@ -4,12 +4,12 @@ use singularity_core::ClientInfo;
 use singularity_policy::{ApprovalPolicy, PermissionProfileName};
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ArtifactFetchParams, ArtifactRef,
-    ConversationMessage, ConversationRole, EventSubscribeParams, InitializeParams,
-    InitializeResult, ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage,
-    JsonRpcPayload, METHOD_REGISTRY, Method, ProviderConfigurationStatus, ThreadIdParams,
-    ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceListParams,
-    TraceShowParams, TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus,
-    parse_json_rpc_payload,
+    ConversationMessage, ConversationRole, EventClass, EventDelivery, EventGap, EventGapReason,
+    EventMetadata, EventRecoveryQuery, EventSubscribeParams, InitializeParams, InitializeResult,
+    ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload,
+    METHOD_REGISTRY, Method, ProviderConfigurationStatus, ThreadIdParams, ThreadReadParams,
+    ThreadReadResult, ThreadStartParams, ThreadStatus, TraceListParams, TraceShowParams,
+    TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus, parse_json_rpc_payload,
 };
 
 #[test]
@@ -205,6 +205,58 @@ fn initialize_and_thread_start_params_have_codex_style_wire_shape() {
 }
 
 #[test]
+fn event_metadata_is_typed_and_recovery_queries_are_bounded() {
+    let event = AppEvent::turn_completed(&singularity_protocol::Turn {
+        turn_id: "turn_1".to_string(),
+        thread_id: "thread_1".to_string(),
+        status: singularity_protocol::TurnStatus::Completed,
+        agent_loop_status: "completed".to_string(),
+    });
+    let value = event
+        .to_notification_with_metadata(EventMetadata {
+            sequence: 4,
+            cursor: 4,
+            class: EventClass::State,
+            delivery: EventDelivery::Reliable,
+            recovery_query: Some(EventRecoveryQuery::TurnStatus {
+                turn_id: "turn_1".to_string(),
+            }),
+            gap: None,
+        })
+        .to_wire_value();
+    assert_eq!(value["params"]["event"]["sequence"], 4);
+    assert_eq!(value["params"]["event"]["delivery"], "reliable");
+    assert_eq!(
+        value["params"]["event"]["recoveryQuery"]["method"],
+        "turn/status"
+    );
+
+    let gap = EventMetadata {
+        sequence: 5,
+        cursor: 5,
+        class: EventClass::Gap,
+        delivery: EventDelivery::Gap,
+        recovery_query: None,
+        gap: Some(EventGap {
+            reason: EventGapReason::ProgressDropped,
+            from_cursor: 5,
+            to_cursor: 5,
+        }),
+    };
+    assert!(
+        serde_json::from_value::<EventMetadata>(serde_json::json!({
+            "sequence": 5,
+            "cursor": 5,
+            "class": "gap",
+            "delivery": "gap",
+            "gap": serde_json::to_value(gap).unwrap(),
+            "recoveryQuery": {"method": "store/resync", "params": {}}
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn agent_capability_uses_the_canonical_agent_loop_wire_name() {
     let result = AgentCapabilityResult {
         agent_loop: AgentLoopCapabilityStatus {
@@ -371,7 +423,8 @@ fn protocol_v1_id_params_are_camel_case_on_wire() {
     );
     assert_eq!(
         serde_json::to_value(EventSubscribeParams {
-            event_types: vec!["turn/started".to_string()]
+            event_types: vec!["turn/started".to_string()],
+            cursor: None,
         })
         .unwrap(),
         serde_json::json!({"eventTypes": ["turn/started"]})

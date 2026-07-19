@@ -67,9 +67,32 @@ impl Scenario {
     }
 
     fn initialized(self) -> Self {
-        self.respond(
+        let scenario = self.respond(
             "initialize",
             json!({"userAgent":"fake","platformFamily":"local","platformOs":"test"}),
+        );
+        scenario.interaction(
+            "event/subscribe",
+            vec![
+                send(json!({
+                    "method": "event/gap",
+                    "params": {
+                        "gap": {"reason": "cursor_not_replayed", "fromCursor": 1, "toCursor": 1},
+                        "event": {
+                            "sequence": 1,
+                            "cursor": 1,
+                            "class": "gap",
+                            "delivery": "gap",
+                            "gap": {"reason": "cursor_not_replayed", "fromCursor": 1, "toCursor": 1}
+                        }
+                    }
+                })),
+                respond(json!({
+                    "subscriptionId": "subscription_app_server_events",
+                    "eventTypes": [],
+                    "cursor": 1
+                })),
+            ],
         )
     }
 
@@ -1288,6 +1311,103 @@ fn cli_run_returns_when_turn_response_has_no_notifications() {
 
     assert!(output.status.success(), "stderr={}", stderr(&output));
     assert!(stdout(&output).contains("thread thread_fake"));
+}
+
+#[test]
+fn cli_initialize_requires_cursor_gap_before_subscription_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .respond(
+                "initialize",
+                json!({"userAgent":"fake","platformFamily":"local","platformOs":"test"}),
+            )
+            .respond(
+                "event/subscribe",
+                json!({
+                    "subscriptionId":"subscription_app_server_events",
+                    "eventTypes":[],
+                    "cursor":1
+                }),
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .arg("threads")
+        .output()
+        .expect("threads cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("cursor-not-replayed gap"));
+}
+
+#[test]
+fn cli_rejects_undeclared_sequence_gap_before_matching_response() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .interaction(
+                "thread/list",
+                vec![
+                    send(json!({
+                        "method":"thread/started",
+                        "params":{
+                            "thread":{"thread_id":"thread_gap","model":null,"cwd":null,"status":"active","sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+                            "event":{"sequence":4,"cursor":4,"class":"state","delivery":"reliable","recoveryQuery":{"method":"thread/read","params":{"threadId":"thread_gap"}}}
+                        }
+                    })),
+                    respond(json!({"threads":[]})),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .arg("threads")
+        .output()
+        .expect("threads cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("event cursor gap is not declared"));
+}
+
+#[test]
+fn cli_rejects_unsupported_event_recovery_query() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .interaction(
+                "thread/list",
+                vec![
+                    send(json!({
+                        "method":"turn/diff/updated",
+                        "params":{
+                            "turnId":"turn_diff",
+                            "event":{"sequence":2,"cursor":2,"class":"state","delivery":"reliable","recoveryQuery":{"method":"store/resync","params":{}}}
+                        }
+                    })),
+                    respond(json!({"threads":[]})),
+                ],
+            )
+            .shutdown(),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .arg("threads")
+        .output()
+        .expect("threads cli");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("invalid typed metadata"));
 }
 
 // 验证匹配响应到达后不等待其后的无关消息。
