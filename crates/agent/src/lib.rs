@@ -34,7 +34,8 @@ use singularity_tools::{
     ToolBrokerDecision, ToolCallRequest, ToolCapability, ToolEntry, ToolExecutionMode,
     ToolExecutor, ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec,
     WorkspaceMutation, WorkspaceObservation, WorkspacePatch, WorkspaceRevision, WorkspaceToolError,
-    WorkspaceToolExecutor, WorkspaceTools, command_script_scope_digest_with_policy,
+    WorkspaceToolExecutor, WorkspaceTools, approximate_token_count,
+    command_script_scope_digest_with_policy,
 };
 use thiserror::Error;
 
@@ -42,11 +43,11 @@ const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
 const APPROVAL_CHECKPOINT_VERSION: u32 = 1;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
-const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
 const MODEL_MESSAGE_FRAMING_TOKENS: u32 = 4;
 const MODEL_REQUEST_FIXED_OVERHEAD_TOKENS: u32 = 256;
+const COMPACTED_TOOL_RESULT_INSTRUCTION: &str = "The prior tool output was omitted to fit the context window. Re-read the relevant file or rerun a safe command if exact output is needed.";
 const EMPTY_FINAL_ANSWER_ERROR: &str = "empty final answer";
 const CURRENT_TURN_CONTEXT_OVERFLOW_ERROR: &str = "current turn exceeds the model context budget";
 const MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR: &str = "model request exceeds the model context budget";
@@ -996,11 +997,26 @@ struct RepairFailureState {
     consecutive_count: u32,
 }
 
+/// ToolResult 在当前模型历史中的安全 occurrence 状态。
+///
+/// occurrence 使用 `tool_results` 的真实追加顺序隐式编号；它不依赖可能跨 turn 重复的
+/// `tool_call_id`。只有 `Visible` 结果参与公开消息与内部 accounting 的配对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolResultContextBinding {
+    Hidden,
+    Visible,
+    Compacted,
+    Omitted,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CheckpointToolResult {
     result: ToolResult,
     #[serde(default)]
     result_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_token_count: Option<u32>,
     audit_metadata: Option<Value>,
     #[serde(default)]
     workspace_observation: Option<WorkspaceObservation>,
@@ -1011,21 +1027,63 @@ impl CheckpointToolResult {
         Self {
             result: result.clone(),
             result_id: result.result_id.clone(),
+            context_token_count: result.context_token_count(),
             audit_metadata: result.audit_metadata().cloned(),
             workspace_observation: result.workspace_observation().cloned(),
         }
     }
 
-    fn into_tool_result(self) -> ToolResult {
+    fn into_tool_result(self, binding: ToolResultContextBinding) -> Result<ToolResult, String> {
         let mut result = self.result;
         result.result_id = self.result_id;
+        if result.failure_kind == Some(ToolFailureKind::Approval)
+            && binding != ToolResultContextBinding::Hidden
+        {
+            return Err("approval checkpoint hidden tool result binding is invalid".to_string());
+        }
+        let reconstructable = result.reconstruct_context_token_count();
+        let lower_bound = result.context_token_count_lower_bound();
+        let context_token_count = match self.context_token_count {
+            Some(context_token_count)
+                if reconstructable.is_some_and(|expected| expected != context_token_count) =>
+            {
+                return Err(
+                    "approval checkpoint tool result context token accounting is inconsistent"
+                        .to_string(),
+                );
+            }
+            Some(context_token_count) if context_token_count >= lower_bound => {
+                Some(context_token_count)
+            }
+            Some(_) => {
+                return Err(
+                    "approval checkpoint tool result context token accounting is inconsistent"
+                        .to_string(),
+                );
+            }
+            None if binding == ToolResultContextBinding::Hidden
+                && result.failure_kind == Some(ToolFailureKind::Approval) =>
+            {
+                None
+            }
+            None if let Some(reconstructed) = reconstructable => Some(reconstructed),
+            None => {
+                return Err(
+                    "approval checkpoint tool result context token accounting is missing"
+                        .to_string(),
+                );
+            }
+        };
+        if let Some(context_token_count) = context_token_count {
+            result = result.with_context_token_count(context_token_count);
+        }
         if let Some(audit_metadata) = self.audit_metadata {
             result = result.with_audit(audit_metadata);
         }
         if let Some(observation) = self.workspace_observation {
             result = result.with_workspace_observation(observation);
         }
-        result
+        Ok(result)
     }
 }
 
@@ -1059,6 +1117,8 @@ struct AgentLoopCheckpoint {
     #[serde(default)]
     context_trace: Option<AgentContextTrace>,
     #[serde(default)]
+    tool_result_context_bindings: Vec<ToolResultContextBinding>,
+    #[serde(default)]
     seen_tool_call_fingerprints: Vec<String>,
     #[serde(default)]
     last_repair_failure: Option<RepairFailureState>,
@@ -1080,6 +1140,7 @@ struct AgentLoopState {
     recovery_metrics: AgentRecoveryMetrics,
     model_usage: ModelUsage,
     provider_attempts: ProviderAttemptMetadata,
+    tool_result_context_bindings: Vec<ToolResultContextBinding>,
     seen_tool_call_fingerprints: BTreeSet<String>,
     last_repair_failure: Option<RepairFailureState>,
     model_turn_limit: u32,
@@ -1109,6 +1170,7 @@ impl AgentLoopState {
             recovery_metrics: AgentRecoveryMetrics::default(),
             model_usage: ModelUsage::default(),
             provider_attempts: ProviderAttemptMetadata::default(),
+            tool_result_context_bindings: Vec::new(),
             seen_tool_call_fingerprints: BTreeSet::new(),
             last_repair_failure: None,
             model_turn_limit,
@@ -1258,6 +1320,7 @@ impl AgentLoopState {
             model_usage: self.model_usage.clone(),
             provider_attempts: self.provider_attempts.clone(),
             context_trace: self.context_trace.clone(),
+            tool_result_context_bindings: self.tool_result_context_bindings.clone(),
             seen_tool_call_fingerprints: self.seen_tool_call_fingerprints.iter().cloned().collect(),
             last_repair_failure: self.last_repair_failure.clone(),
         };
@@ -1363,6 +1426,24 @@ impl AgentLoopState {
             consecutive_count,
         });
         (consecutive_count >= 2).then_some(REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string())
+    }
+
+    fn append_visible_tool_result(
+        &mut self,
+        tool_result: ToolResult,
+        provider_tool_name: Option<&str>,
+    ) {
+        self.messages
+            .push(tool_result_message(&tool_result, provider_tool_name));
+        self.tool_results.push(tool_result);
+        self.tool_result_context_bindings
+            .push(ToolResultContextBinding::Visible);
+    }
+
+    fn append_hidden_tool_result(&mut self, tool_result: ToolResult) {
+        self.tool_results.push(tool_result);
+        self.tool_result_context_bindings
+            .push(ToolResultContextBinding::Hidden);
     }
 }
 
@@ -1515,7 +1596,13 @@ where
                 }
             };
             let visible_tool_names = tool_view.visible_tool_names.clone();
-            if !model_request_fits_context(&tool_view.tools, &state.messages, budget) {
+            if !model_request_fits_context(
+                &tool_view.tools,
+                &state.messages,
+                &state.tool_results,
+                &state.tool_result_context_bindings,
+                budget,
+            ) {
                 let Some(compaction) = compact_model_messages(&tool_view.tools, &state, budget)
                 else {
                     return state.finish(
@@ -1530,6 +1617,7 @@ where
                     context_trace.record_compaction(&compaction);
                 }
                 state.messages = compaction.messages;
+                state.tool_result_context_bindings = compaction.tool_result_context_bindings;
             }
             let request = model_turn_request(
                 input,
@@ -1611,6 +1699,18 @@ where
                 let model_error = model_response_validation_error(vec![
                     "assistant_tool_calls_mismatch".to_string(),
                 ]);
+                return state.finish_with_model_error(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    actual_model_turns,
+                    Some(model_error.message.clone()),
+                    Some(&model_error),
+                );
+            }
+            if has_duplicate_tool_call_ids(&response.tool_calls) {
+                let model_error =
+                    model_response_validation_error(vec!["duplicate_tool_call_id".to_string()]);
                 return state.finish_with_model_error(
                     AgentStatus::Failed,
                     false,
@@ -1857,10 +1957,15 @@ where
         } else {
             tool_result
         };
-        let failed_tool_result = !tool_result.ok;
+        let non_repairable_error = (!tool_result.ok && !is_repairable_tool_result(&tool_result))
+            .then(|| {
+                tool_result
+                    .error_code
+                    .clone()
+                    .unwrap_or_else(|| "tool_execution_failed".to_string())
+            });
         let recovery_feedback = state.observe_tool_result(&tool_result, &tool_call_fingerprint);
-        state.messages.push(tool_result_message(&tool_result, None));
-        state.tool_results.push(tool_result.clone());
+        state.append_visible_tool_result(tool_result, None);
         if let Some(feedback) = recovery_feedback {
             state
                 .messages
@@ -1869,11 +1974,7 @@ where
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
         }
-        if failed_tool_result && !is_repairable_tool_result(&tool_result) {
-            let error_code = tool_result
-                .error_code
-                .as_deref()
-                .unwrap_or("tool_execution_failed");
+        if let Some(error_code) = non_repairable_error {
             return state.finish(
                 AgentStatus::Failed,
                 false,
@@ -2146,7 +2247,7 @@ where
                 .approval_checkpoints
                 .push(state.checkpoint(input, &pending, next_model_turn));
             let result = self.execute_tool(&prepared, decision, state);
-            state.tool_results.push(result);
+            state.append_hidden_tool_result(result);
             return ToolBatchControl::Blocked;
         }
         state.used_approval_grants = staged_approval_grants;
@@ -2424,10 +2525,7 @@ where
             }
             let provider_tool_name = (prepared.call.parse_status != ModelToolParseStatus::Valid)
                 .then_some(PROVIDER_HISTORY_REJECTED_TOOL);
-            state
-                .messages
-                .push(tool_result_message(&result, provider_tool_name));
-            state.tool_results.push(result);
+            state.append_visible_tool_result(result, provider_tool_name);
             if let Some(feedback) = recovery_feedback {
                 state
                     .messages
@@ -2724,22 +2822,6 @@ impl AgentContextItem {
     }
 }
 
-fn approximate_token_count(content: &str) -> u32 {
-    let mut ascii_chars = 0usize;
-    let mut non_ascii_chars = 0usize;
-    for character in content.chars() {
-        if character.is_ascii() {
-            ascii_chars = ascii_chars.saturating_add(1);
-        } else {
-            non_ascii_chars = non_ascii_chars.saturating_add(1);
-        }
-    }
-    let ascii_tokens = ascii_chars.saturating_add(APPROXIMATE_ASCII_CHARS_PER_TOKEN - 1)
-        / APPROXIMATE_ASCII_CHARS_PER_TOKEN;
-    let estimated = ascii_tokens.saturating_add(non_ascii_chars);
-    u32::try_from(estimated.max(1)).unwrap_or(u32::MAX)
-}
-
 #[derive(Debug, Clone)]
 struct ContextBudget {
     model_context_window: u32,
@@ -2854,14 +2936,24 @@ fn context_budget(
 fn model_request_fits_context(
     tools: &[ModelToolSchema],
     messages: &[ModelMessage],
+    tool_results: &[ToolResult],
+    tool_result_context_bindings: &[ToolResultContextBinding],
     budget: &ContextBudget,
 ) -> bool {
-    model_request_token_count(tools, messages, budget) <= budget.model_context_window
+    model_request_token_count(
+        tools,
+        messages,
+        tool_results,
+        tool_result_context_bindings,
+        budget,
+    ) <= budget.model_context_window
 }
 
 fn model_request_token_count(
     tools: &[ModelToolSchema],
     messages: &[ModelMessage],
+    tool_results: &[ToolResult],
+    tool_result_context_bindings: &[ToolResultContextBinding],
     budget: &ContextBudget,
 ) -> u32 {
     let projected_messages = messages
@@ -2899,18 +2991,179 @@ fn model_request_token_count(
         .collect::<Vec<_>>();
     let payload_tokens = serde_json::to_string(&(projected_messages, projected_tools))
         .map_or(u32::MAX, |payload| approximate_token_count(&payload));
+    let tool_result_accounting =
+        tool_result_context_token_adjustment(messages, tool_results, tool_result_context_bindings);
     let message_framing = u32::try_from(messages.len())
         .unwrap_or(u32::MAX)
         .saturating_mul(MODEL_MESSAGE_FRAMING_TOKENS);
     payload_tokens
+        .saturating_add(tool_result_accounting)
         .saturating_add(budget.reserved_output_tokens)
         .saturating_add(message_framing)
         .saturating_add(budget.fixed_overhead_tokens)
 }
 
+/// 将真实追加顺序中的 tool occurrence 与安全结果 accounting 对齐；压缩占位消息不重复计入。
+fn tool_result_context_token_adjustment(
+    messages: &[ModelMessage],
+    tool_results: &[ToolResult],
+    tool_result_context_bindings: &[ToolResultContextBinding],
+) -> u32 {
+    let Some(occurrences) =
+        tool_result_message_occurrences(messages, tool_results, tool_result_context_bindings)
+    else {
+        return u32::MAX;
+    };
+    occurrences
+        .into_iter()
+        .filter_map(|occurrence| {
+            let message_index = occurrence.tool_index?;
+            let result_index = occurrence.result_index;
+            let binding = occurrence.binding;
+            if binding != ToolResultContextBinding::Visible {
+                return None;
+            }
+            let message = messages.get(message_index)?;
+            let tool_result = tool_results.get(result_index)?;
+            let context_token_count = tool_result.context_token_count()?;
+            Some(context_token_count.saturating_sub(approximate_token_count(&message.content)))
+        })
+        .fold(0, u32::saturating_add)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToolResultMessageOccurrence {
+    assistant_index: usize,
+    tool_index: Option<usize>,
+    result_index: usize,
+    binding: ToolResultContextBinding,
+}
+
+/// 按 occurrence 顺序验证当前 tool message 与 `ToolResult` 的一一绑定。
+fn tool_result_message_occurrences(
+    messages: &[ModelMessage],
+    tool_results: &[ToolResult],
+    tool_result_context_bindings: &[ToolResultContextBinding],
+) -> Option<Vec<ToolResultMessageOccurrence>> {
+    if tool_results.len() != tool_result_context_bindings.len() {
+        return None;
+    }
+    for (result, binding) in tool_results.iter().zip(tool_result_context_bindings) {
+        if result.tool_call_id.trim().is_empty() {
+            return None;
+        }
+        if *binding == ToolResultContextBinding::Hidden
+            && result.failure_kind != Some(ToolFailureKind::Approval)
+        {
+            return None;
+        }
+    }
+    if messages.iter().any(|message| {
+        message.role == ModelRole::Assistant && has_duplicate_tool_call_ids(&message.tool_calls)
+    }) {
+        return None;
+    }
+    let assistant_calls = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == ModelRole::Assistant)
+        .flat_map(|(assistant_index, message)| {
+            message
+                .tool_calls
+                .iter()
+                .enumerate()
+                .map(move |(call_index, call)| {
+                    (assistant_index, call_index, call.tool_call_id.as_str())
+                })
+        })
+        .collect::<Vec<_>>();
+    let result_occurrences = tool_result_context_bindings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, binding)| {
+            (*binding != ToolResultContextBinding::Omitted).then_some((index, *binding))
+        })
+        .collect::<Vec<_>>();
+    if assistant_calls.len() != result_occurrences.len() {
+        return None;
+    }
+    let mut occurrences = assistant_calls
+        .into_iter()
+        .zip(result_occurrences)
+        .map(
+            |((assistant_index, _call_index, call_id), (result_index, binding))| {
+                let result = tool_results.get(result_index)?;
+                (call_id == result.tool_call_id).then_some(ToolResultMessageOccurrence {
+                    assistant_index,
+                    tool_index: None,
+                    result_index,
+                    binding,
+                })
+            },
+        )
+        .collect::<Option<Vec<_>>>()?;
+
+    let tool_message_indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == ModelRole::Tool).then_some(index))
+        .collect::<Vec<_>>();
+    let visible_result_occurrences = occurrences
+        .iter()
+        .filter(|occurrence| {
+            matches!(
+                occurrence.binding,
+                ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted
+            )
+        })
+        .map(|occurrence| occurrence.result_index)
+        .collect::<Vec<_>>();
+    if tool_message_indices.len() != visible_result_occurrences.len() {
+        return None;
+    }
+    for (tool_index, result_index) in tool_message_indices
+        .into_iter()
+        .zip(visible_result_occurrences)
+    {
+        let message = messages.get(tool_index)?;
+        let result = tool_results.get(result_index)?;
+        if message.tool_call_id.as_deref() != Some(result.tool_call_id.as_str()) {
+            return None;
+        }
+        let occurrence = occurrences
+            .iter_mut()
+            .find(|occurrence| occurrence.result_index == result_index)?;
+        if occurrence.tool_index.replace(tool_index).is_some() {
+            return None;
+        }
+        match occurrence.binding {
+            ToolResultContextBinding::Visible if has_compaction_marker(message) => {
+                return None;
+            }
+            ToolResultContextBinding::Compacted if !is_compacted_tool_result_message(message) => {
+                return None;
+            }
+            ToolResultContextBinding::Hidden | ToolResultContextBinding::Omitted => {
+                return None;
+            }
+            ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted => {}
+        }
+    }
+    if occurrences.iter().any(|occurrence| {
+        matches!(
+            occurrence.binding,
+            ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted
+        ) && occurrence.tool_index.is_none()
+    }) {
+        return None;
+    }
+    Some(occurrences)
+}
+
 #[derive(Debug)]
 struct ContextCompactionOutcome {
     messages: Vec<ModelMessage>,
+    tool_result_context_bindings: Vec<ToolResultContextBinding>,
     compacted_message_count: u32,
     before_tokens: u32,
     after_tokens: u32,
@@ -2922,10 +3175,21 @@ fn compact_model_messages(
     state: &AgentLoopState,
     budget: &ContextBudget,
 ) -> Option<ContextCompactionOutcome> {
-    let before_tokens = model_request_token_count(tools, &state.messages, budget);
+    let before_tokens = model_request_token_count(
+        tools,
+        &state.messages,
+        &state.tool_results,
+        &state.tool_result_context_bindings,
+        budget,
+    );
     if before_tokens <= budget.model_context_window {
         return None;
     }
+    let occurrences = tool_result_message_occurrences(
+        &state.messages,
+        &state.tool_results,
+        &state.tool_result_context_bindings,
+    )?;
 
     let authority_indices = state
         .messages
@@ -2943,11 +3207,11 @@ fn compact_model_messages(
         .messages
         .iter()
         .rposition(|message| message.role == ModelRole::User)?;
-    let latest_tool_pair = latest_complete_tool_pair(&state.messages);
+    let latest_tool_assistant = latest_complete_tool_assistant(&occurrences);
 
     let mut preserved_indices = authority_indices.clone();
     preserved_indices.insert(current_user_index);
-    if let Some((assistant_index, _tool_index)) = latest_tool_pair {
+    if let Some(assistant_index) = latest_tool_assistant {
         preserved_indices.insert(assistant_index);
     }
     let compacted_message_count =
@@ -2966,67 +3230,108 @@ fn compact_model_messages(
         compaction_summary(state, compacted_message_count),
     ));
     messages.push(state.messages[current_user_index].clone());
-    if let Some((assistant_index, tool_index)) = latest_tool_pair
+    let mut tool_result_context_bindings = state
+        .tool_result_context_bindings
+        .iter()
+        .map(|binding| match binding {
+            ToolResultContextBinding::Hidden => ToolResultContextBinding::Omitted,
+            ToolResultContextBinding::Visible
+            | ToolResultContextBinding::Compacted
+            | ToolResultContextBinding::Omitted => ToolResultContextBinding::Omitted,
+        })
+        .collect::<Vec<_>>();
+    if let Some(assistant_index) = latest_tool_assistant
         && assistant_index > current_user_index
     {
         messages.push(state.messages[assistant_index].clone());
-        messages.push(compacted_tool_result_message(
-            &state.messages[tool_index],
-            &state.tool_results,
-        ));
+        for occurrence in occurrences.iter().filter(|occurrence| {
+            occurrence.assistant_index == assistant_index
+                && matches!(
+                    occurrence.binding,
+                    ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted
+                )
+        }) {
+            let tool_index = occurrence.tool_index?;
+            let result_index = occurrence.result_index;
+            messages.push(compacted_tool_result_message(
+                &state.messages[tool_index],
+                state.tool_results.get(result_index),
+            ));
+            let binding = tool_result_context_bindings.get_mut(result_index)?;
+            *binding = ToolResultContextBinding::Compacted;
+        }
     }
 
-    let after_tokens = model_request_token_count(tools, &messages, budget);
+    let after_tokens = model_request_token_count(
+        tools,
+        &messages,
+        &state.tool_results,
+        &tool_result_context_bindings,
+        budget,
+    );
     if after_tokens >= before_tokens || after_tokens > budget.model_context_window {
         return None;
     }
     Some(ContextCompactionOutcome {
         messages,
+        tool_result_context_bindings,
         compacted_message_count,
         before_tokens,
         after_tokens,
     })
 }
 
-fn latest_complete_tool_pair(messages: &[ModelMessage]) -> Option<(usize, usize)> {
-    for tool_index in (0..messages.len()).rev() {
-        let tool_message = &messages[tool_index];
-        if tool_message.role != ModelRole::Tool {
-            continue;
-        }
-        let Some(tool_call_id) = tool_message.tool_call_id.as_deref() else {
-            continue;
-        };
-        if let Some(assistant_index) = (0..tool_index).rev().find(|index| {
-            let message = &messages[*index];
-            message.role == ModelRole::Assistant
-                && message
-                    .tool_calls
-                    .iter()
-                    .any(|call| call.tool_call_id == tool_call_id)
-        }) {
-            return Some((assistant_index, tool_index));
+fn latest_complete_tool_assistant(occurrences: &[ToolResultMessageOccurrence]) -> Option<usize> {
+    for occurrence in occurrences.iter().rev() {
+        if matches!(
+            occurrence.binding,
+            ToolResultContextBinding::Visible | ToolResultContextBinding::Compacted
+        ) {
+            occurrence.tool_index?;
+            return Some(occurrence.assistant_index);
         }
     }
     None
 }
 
+/// 识别 tool 消息是否声称为 compaction 占位。
+fn has_compaction_marker(message: &ModelMessage) -> bool {
+    message.role == ModelRole::Tool
+        && serde_json::from_str::<Value>(&message.content)
+            .ok()
+            .and_then(|payload| payload.get("compacted").and_then(Value::as_bool))
+            == Some(true)
+}
+
+/// 只接受 AgentLoop 自己生成的有界 compaction tool 占位。
+fn is_compacted_tool_result_message(message: &ModelMessage) -> bool {
+    if message.role != ModelRole::Tool {
+        return false;
+    }
+    let Ok(Value::Object(payload)) = serde_json::from_str::<Value>(&message.content) else {
+        return false;
+    };
+    payload.len() == 5
+        && payload.get("compacted") == Some(&Value::Bool(true))
+        && payload.get("ok").is_some_and(Value::is_boolean)
+        && payload
+            .get("error_code")
+            .is_some_and(|value| value.is_null() || value.is_string())
+        && payload.get("truncated").is_some_and(Value::is_boolean)
+        && payload.get("instruction").and_then(Value::as_str)
+            == Some(COMPACTED_TOOL_RESULT_INSTRUCTION)
+}
+
 fn compacted_tool_result_message(
     original: &ModelMessage,
-    tool_results: &[ToolResult],
+    tool_result: Option<&ToolResult>,
 ) -> ModelMessage {
-    let tool_result = original.tool_call_id.as_deref().and_then(|tool_call_id| {
-        tool_results
-            .iter()
-            .rev()
-            .find(|result| result.tool_call_id == tool_call_id)
-    });
     let content = json!({
         "compacted": true,
         "ok": tool_result.is_some_and(|result| result.ok),
         "error_code": tool_result.and_then(|result| result.error_code.as_deref()),
         "truncated": tool_result.is_some_and(|result| result.truncated),
-        "instruction": "The prior tool output was omitted to fit the context window. Re-read the relevant file or rerun a safe command if exact output is needed."
+        "instruction": COMPACTED_TOOL_RESULT_INSTRUCTION
     });
     let mut message = ModelMessage::text(ModelRole::Tool, content.to_string());
     message.tool_call_id = original.tool_call_id.clone();
@@ -3334,11 +3639,47 @@ fn restore_checkpoint(
     if !checkpoint.completion.is_consistent() {
         return Err("approval checkpoint workspace revision state is invalid".to_string());
     }
+    let context_bindings_present = payload.get("tool_result_context_bindings").is_some();
+    if !context_bindings_present && !checkpoint.tool_results.is_empty() {
+        return Err(
+            "approval checkpoint tool result occurrence bindings are missing for non-empty results"
+                .to_string(),
+        );
+    }
+    if checkpoint.tool_result_context_bindings.len() != checkpoint.tool_results.len() {
+        return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
+    }
+    let tool_result_context_bindings = checkpoint.tool_result_context_bindings.clone();
+    let compaction_count = checkpoint
+        .context_trace
+        .as_ref()
+        .map_or(0, |trace| trace.compaction_count);
+    if compaction_count == 0
+        && tool_result_context_bindings.iter().any(|binding| {
+            matches!(
+                binding,
+                ToolResultContextBinding::Compacted | ToolResultContextBinding::Omitted
+            )
+        })
+    {
+        return Err("approval checkpoint compaction occurrence state is invalid".to_string());
+    }
     let tool_results = checkpoint
         .tool_results
         .into_iter()
-        .map(CheckpointToolResult::into_tool_result)
-        .collect::<Vec<_>>();
+        .zip(tool_result_context_bindings.iter().copied())
+        .map(|(tool_result, binding)| tool_result.into_tool_result(binding))
+        .collect::<Result<Vec<_>, _>>()?;
+    let checkpoint_history_messages = &checkpoint.messages[..checkpoint.messages.len() - 1];
+    if tool_result_message_occurrences(
+        checkpoint_history_messages,
+        &tool_results,
+        &tool_result_context_bindings,
+    )
+    .is_none()
+    {
+        return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
+    }
     let mut derived_completion =
         CompletionTracker::from_requirements(&input.verification_requirements)?;
     for tool_result in &tool_results {
@@ -3359,6 +3700,7 @@ fn restore_checkpoint(
     }
     let mut state = AgentLoopState::new(checkpoint.messages, input.max_turns.max(1), None);
     state.tool_results = tool_results;
+    state.tool_result_context_bindings = tool_result_context_bindings;
     state.used_approval_grants = used_approval_grants;
     state.prior_approval_count = checkpoint.approval_count;
     state.completion = derived_completion;
@@ -3388,6 +3730,13 @@ fn model_response_validation_error(validation_errors: Vec<String>) -> ModelError
     );
     error.validation_errors = validation_errors;
     error
+}
+
+fn has_duplicate_tool_call_ids(calls: &[ModelToolCall]) -> bool {
+    let mut ids = BTreeSet::new();
+    calls
+        .iter()
+        .any(|call| !ids.insert(call.tool_call_id.as_str()))
 }
 
 fn failed_result(error: impl Into<String>) -> AgentLoopResult {
@@ -4453,6 +4802,145 @@ fn command_workspace_tool_failure(
         "command_provenance": "agent_requested",
     });
     output
+}
+
+#[cfg(test)]
+mod context_accounting_tests {
+    use super::*;
+
+    fn tool_message(tool_call_id: &str, content: &str) -> ModelMessage {
+        let mut message = ModelMessage::text(ModelRole::Tool, content);
+        message.tool_call_id = Some(tool_call_id.to_string());
+        message
+    }
+
+    fn assistant_tool_message(tool_call_ids: &[&str]) -> ModelMessage {
+        ModelMessage::assistant_tool_calls(
+            tool_call_ids
+                .iter()
+                .map(|tool_call_id| ModelToolCall {
+                    tool_call_id: (*tool_call_id).to_string(),
+                    tool_name: TOOL_COMMAND.to_string(),
+                    arguments: json!({}),
+                    raw_arguments: "{}".to_string(),
+                    parse_status: ModelToolParseStatus::Valid,
+                    validation_errors: Vec::new(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn tool_result_accounting_uses_occurrence_order_for_duplicate_ids_and_placeholders() {
+        let mut hidden = ToolResult::summary("same_call", TOOL_COMMAND, false, "approval");
+        hidden.failure_kind = Some(ToolFailureKind::Approval);
+        let results = vec![
+            ToolResult::summary("same_call", TOOL_COMMAND, true, "first")
+                .with_context_token_count(100),
+            hidden.with_context_token_count(200),
+            ToolResult::summary("same_call", TOOL_COMMAND, true, "second")
+                .with_context_token_count(20),
+            ToolResult::summary("same_call", TOOL_COMMAND, true, "compacted")
+                .with_context_token_count(300),
+            ToolResult::summary("other_call", TOOL_COMMAND, true, "other compacted")
+                .with_context_token_count(400),
+        ];
+        let compacted_message = compacted_tool_result_message(
+            &tool_message("same_call", "original tool message"),
+            results.get(3),
+        );
+        let other_compacted_message = compacted_tool_result_message(
+            &tool_message("other_call", "original other tool message"),
+            results.get(4),
+        );
+        let messages = vec![
+            assistant_tool_message(&["same_call"]),
+            tool_message("same_call", "first public payload"),
+            assistant_tool_message(&["same_call"]),
+            assistant_tool_message(&["same_call"]),
+            tool_message("same_call", "second public payload"),
+            assistant_tool_message(&["same_call", "other_call"]),
+            compacted_message,
+            other_compacted_message,
+        ];
+        let bindings = vec![
+            ToolResultContextBinding::Visible,
+            ToolResultContextBinding::Hidden,
+            ToolResultContextBinding::Visible,
+            ToolResultContextBinding::Compacted,
+            ToolResultContextBinding::Compacted,
+        ];
+        let expected = 100u32
+            .saturating_sub(approximate_token_count("first public payload"))
+            .saturating_add(20u32.saturating_sub(approximate_token_count("second public payload")));
+
+        assert_eq!(
+            tool_result_context_token_adjustment(&messages, &results, &bindings),
+            expected
+        );
+    }
+
+    #[test]
+    fn tool_result_occurrence_rejects_visible_result_marked_compacted() {
+        let results = vec![ToolResult::summary(
+            "call_1",
+            TOOL_COMMAND,
+            true,
+            "safe public payload",
+        )];
+        let messages = vec![
+            assistant_tool_message(&["call_1"]),
+            tool_message("call_1", "safe public payload"),
+        ];
+        let bindings = [ToolResultContextBinding::Compacted];
+
+        assert!(
+            tool_result_message_occurrences(&messages, &results, &bindings).is_none(),
+            "a normal tool payload cannot satisfy a compacted checkpoint binding"
+        );
+        assert_eq!(
+            tool_result_context_token_adjustment(&messages, &results, &bindings),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn checkpoint_rebuilds_only_full_safe_small_result_accounting() {
+        let envelope = ToolCallRequest::new("call_1", TOOL_COMMAND, "{}");
+        let result = ToolResult::from_result(
+            &envelope,
+            &ToolOutput::success(json!({"summary": "small-safe-output"})),
+        );
+        let expected = result
+            .context_token_count()
+            .expect("safe result accounting");
+        let mut legacy = CheckpointToolResult::from_tool_result(&result);
+        legacy.context_token_count = None;
+        let restored = legacy
+            .into_tool_result(ToolResultContextBinding::Visible)
+            .expect("small safe legacy result remains compatible");
+        assert_eq!(restored.context_token_count(), Some(expected));
+
+        let mut inconsistent = CheckpointToolResult::from_tool_result(&result);
+        inconsistent.context_token_count = Some(expected.saturating_add(1));
+        assert!(
+            inconsistent
+                .into_tool_result(ToolResultContextBinding::Visible)
+                .is_err()
+        );
+
+        let large = ToolResult::from_result(
+            &envelope,
+            &ToolOutput::success(json!({"stdout": "large-safe-output".repeat(2_000)})),
+        );
+        let mut untrusted_legacy = CheckpointToolResult::from_tool_result(&large);
+        untrusted_legacy.context_token_count = None;
+        assert!(
+            untrusted_legacy
+                .into_tool_result(ToolResultContextBinding::Visible)
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

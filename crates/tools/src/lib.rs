@@ -63,6 +63,7 @@ const MAX_GREP_MAX_MATCHES: usize = 10_000;
 const MAX_COMMAND_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_COMMAND_SCRIPT_CHARS: usize = 8_000;
 const DEFAULT_RESULT_PREVIEW_MAX_CHARS: usize = 4_096;
+const APPROXIMATE_ASCII_CHARS_PER_TOKEN: usize = 4;
 const FILE_READ_CHUNK_SIZE: usize = 8 * 1024;
 const BINARY_CONTENT_PREVIEW: &str = "[binary content omitted]";
 const ARTIFACT_REFERENCE_OMITTED: &str = "[artifact reference omitted]";
@@ -1245,6 +1246,9 @@ pub struct ToolResult {
     pub failure_kind: Option<ToolFailureKind>,
     #[serde(skip)]
     pub result_id: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    context_token_count: Option<u32>,
     pub truncated: bool,
     #[serde(skip)]
     audit_metadata: Option<Value>,
@@ -1261,7 +1265,7 @@ impl ToolResult {
         ok: bool,
         preview: impl Into<String>,
     ) -> Self {
-        Self {
+        let mut result = Self {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             ok,
@@ -1270,10 +1274,15 @@ impl ToolResult {
             error_code: None,
             failure_kind: None,
             result_id: None,
+            context_token_count: None,
             truncated: false,
             audit_metadata: None,
             workspace_observation: None,
-        }
+        };
+        result.context_token_count = Some(approximate_token_count(
+            &result.to_message_payload().to_string(),
+        ));
+        result
     }
 
     /// 附加内部审计 metadata，不进入模型公开内容。
@@ -1285,6 +1294,41 @@ impl ToolResult {
     /// 返回内部审计 metadata。
     pub fn audit_metadata(&self) -> Option<&Value> {
         self.audit_metadata.as_ref()
+    }
+
+    /// 返回由脱敏安全结果派生的内部上下文 accounting，不进入公开 payload。
+    pub fn context_token_count(&self) -> Option<u32> {
+        self.context_token_count
+    }
+
+    /// 从未截断且仍保留完整安全 `content` 的结果重建可信 accounting。
+    pub fn reconstruct_context_token_count(&self) -> Option<u32> {
+        if self.truncated || self.preview.is_some() {
+            return None;
+        }
+        let content = self.content.as_ref()?;
+        let payload = self.to_message_payload();
+        if payload.get("content") != Some(content) {
+            return None;
+        }
+        Some(safe_context_token_count(content))
+    }
+
+    /// 返回当前安全模型投影可证明的 accounting 下界。
+    pub fn context_token_count_lower_bound(&self) -> u32 {
+        let payload = self.to_message_payload();
+        let accounted_value = payload
+            .get("content")
+            .or_else(|| payload.get("preview"))
+            .unwrap_or(&payload);
+        serde_json::to_string(accounted_value)
+            .map_or(u32::MAX, |serialized| approximate_token_count(&serialized))
+    }
+
+    /// 从 approval checkpoint 恢复内部上下文 accounting。
+    pub fn with_context_token_count(mut self, token_count: u32) -> Self {
+        self.context_token_count = Some(token_count);
+        self
     }
 
     /// 返回只供 completion/checkpoint 使用的 workspace observation。
@@ -1312,9 +1356,11 @@ impl ToolResult {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
         let sanitized_content = sanitize_public_value(result.content.clone());
-        let public_content = if source_truncated
-            || sanitized_content.to_string().chars().count() > DEFAULT_RESULT_PREVIEW_MAX_CHARS
-        {
+        let context_token_count = safe_context_token_count(&sanitized_content);
+        let sanitized_content_chars = sanitized_content.to_string().chars().count();
+        let public_content_summarized =
+            source_truncated || sanitized_content_chars > DEFAULT_RESULT_PREVIEW_MAX_CHARS;
+        let public_content = if public_content_summarized {
             summarize_truncated_value(sanitized_content)
         } else {
             sanitized_content
@@ -1324,7 +1370,7 @@ impl ToolResult {
         let (bounded_preview, preview_truncated) =
             bounded_text(&result_content, DEFAULT_RESULT_PREVIEW_MAX_CHARS);
         let preview = redact_public_text(&bounded_preview);
-        let truncated = source_truncated || preview_truncated;
+        let truncated = public_content_summarized || preview_truncated;
         let result_id = result_id(&result.content, &result.metadata);
         let mut tool_result = Self {
             error_code: result.error_code.clone(),
@@ -1337,6 +1383,7 @@ impl ToolResult {
                 preview,
             )
         };
+        tool_result.context_token_count = Some(context_token_count);
         if content_is_safe && !source_truncated && !preview_truncated {
             tool_result.content = Some(public_content);
             tool_result.preview = None;
@@ -1493,6 +1540,53 @@ fn is_artifact_reference_key(key: &str) -> bool {
 
 fn contains_artifact_reference(value: &str) -> bool {
     value.to_ascii_lowercase().contains("artifact://")
+}
+
+/// 只用递归脱敏后的值计算内部 accounting；原始结果不会从该函数返回或持久化。
+fn safe_context_token_count(value: &Value) -> u32 {
+    let accounting_value = redact_context_value(value.clone());
+    serde_json::to_string(&accounting_value)
+        .map_or(u32::MAX, |serialized| approximate_token_count(&serialized))
+}
+
+/// 为 accounting 递归移除 artifact key，并把敏感文本替换为固定安全摘要。
+fn redact_context_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_context_value).collect())
+        }
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    if is_artifact_reference_key(&key) {
+                        None
+                    } else {
+                        Some((key, redact_context_value(value)))
+                    }
+                })
+                .collect(),
+        ),
+        Value::String(value) => Value::String(redact_public_text(&value)),
+        other => other,
+    }
+}
+
+/// 按当前 provider request budget 使用的保守字符规则估算 token 数。
+pub fn approximate_token_count(content: &str) -> u32 {
+    let mut ascii_chars = 0usize;
+    let mut non_ascii_chars = 0usize;
+    for character in content.chars() {
+        if character.is_ascii() {
+            ascii_chars = ascii_chars.saturating_add(1);
+        } else {
+            non_ascii_chars = non_ascii_chars.saturating_add(1);
+        }
+    }
+    let ascii_tokens = ascii_chars.saturating_add(APPROXIMATE_ASCII_CHARS_PER_TOKEN - 1)
+        / APPROXIMATE_ASCII_CHARS_PER_TOKEN;
+    let estimated = ascii_tokens.saturating_add(non_ascii_chars);
+    u32::try_from(estimated.max(1)).unwrap_or(u32::MAX)
 }
 
 /// 工作区 tool 返回的工作区边界、受保护路径、沙箱和变更错误。

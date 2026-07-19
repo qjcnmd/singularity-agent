@@ -1221,6 +1221,25 @@ fn agent_loop_fails_closed_on_mismatched_assistant_tool_calls() {
         Some(singularity_model::ProviderErrorStage::ResponseValidation)
     );
     assert!(result.tool_results.is_empty());
+
+    let mut duplicate_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    duplicate_response.tool_calls.push(tool_call(
+        "same_call",
+        "read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    duplicate_response.tool_calls.push(tool_call(
+        "same_call",
+        "read",
+        serde_json::json!({"path": "CHANGELOG.md"}),
+    ));
+    let duplicate = agent_loop_with_response(duplicate_response, allow_read_policy()).run(&input);
+    assert_eq!(duplicate.status, AgentStatus::Failed);
+    assert!(duplicate.error.as_deref().is_some_and(|error| {
+        error.contains("model response validation failed")
+            && error.contains("duplicate_tool_call_id")
+    }));
 }
 
 #[test]
@@ -1299,13 +1318,18 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
     let checkpoint = blocked
         .approval_checkpoint(&pending.request_id)
         .expect("approval checkpoint");
+    let mut legacy_checkpoint = checkpoint.clone();
+    legacy_checkpoint
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("tool_result_context_bindings");
     let resume_input = input.clone().with_approval_grant(ApprovalGrant::allow(
         pending.request_id.clone(),
         pending.tool_name.clone(),
         pending.resources.clone(),
     ));
 
-    let resumed = agent_loop.resume_pending_tool_call(&resume_input, &pending, &checkpoint);
+    let resumed = agent_loop.resume_pending_tool_call(&resume_input, &pending, &legacy_checkpoint);
 
     assert_eq!(resumed.status, AgentStatus::Failed);
     assert_eq!(resumed.model_turns, 1);
@@ -1876,6 +1900,63 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
 }
 
 #[test]
+fn agent_loop_pairs_duplicate_tool_call_ids_by_result_occurrence_for_compaction() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut first_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    first_response.tool_calls.push(tool_call(
+        "reused_call",
+        "command",
+        serde_json::json!({
+            "command": test_command_script("small-first"),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let mut second_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    second_response.tool_calls.push(tool_call(
+        "reused_call",
+        "command",
+        serde_json::json!({
+            "command": test_command_script("large-second"),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_capabilities(
+        vec![first_response, second_response, final_response],
+        allow_read_execute_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract {
+            max_context_tokens: 1_500,
+            max_output_tokens: 128,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(SequencedOutputBackend::default()),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "run both commands").with_max_turns(3));
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(
+        result
+            .context_trace
+            .as_ref()
+            .expect("context trace")
+            .compaction_count,
+        1
+    );
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 3);
+}
+
+#[test]
 fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicates() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "before").expect("write file");
@@ -2202,6 +2283,104 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
             .expect("bind resumed workspace tools")
             .with_sandbox_backend(LargeOutputBackend),
     );
+
+    let mut missing_context_count = checkpoint.clone();
+    missing_context_count["tool_results"]
+        .as_array_mut()
+        .expect("checkpoint tool results")
+        .iter_mut()
+        .find(|result| result["result"]["tool_name"] == "command")
+        .expect("checkpoint command result")
+        .as_object_mut()
+        .expect("checkpoint command object")
+        .remove("context_token_count");
+    let missing = resumed_agent_loop.resume_pending_tool_call(
+        &resumed_input,
+        &pending,
+        &missing_context_count,
+    );
+    assert_eq!(missing.status, AgentStatus::Failed);
+    assert!(
+        missing
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("context token"))
+    );
+
+    let mut low_context_count = checkpoint.clone();
+    low_context_count["tool_results"]
+        .as_array_mut()
+        .expect("checkpoint tool results")
+        .iter_mut()
+        .find(|result| result["result"]["tool_name"] == "command")
+        .expect("checkpoint command result")["context_token_count"] = serde_json::json!(1);
+    let low =
+        resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &low_context_count);
+    assert_eq!(low.status, AgentStatus::Failed);
+    assert!(
+        low.error
+            .as_deref()
+            .is_some_and(|error| error.contains("context token"))
+    );
+
+    let command_result_index = checkpoint["tool_results"]
+        .as_array()
+        .expect("checkpoint tool results")
+        .iter()
+        .position(|result| result["result"]["tool_name"] == "command")
+        .expect("checkpoint command result");
+    let mut compacted_binding = checkpoint.clone();
+    compacted_binding["tool_result_context_bindings"][command_result_index] =
+        serde_json::json!("visible");
+    let compacted_binding_result =
+        resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &compacted_binding);
+    assert_eq!(compacted_binding_result.status, AgentStatus::Failed);
+    assert!(
+        compacted_binding_result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("tool result occurrence bindings"))
+    );
+
+    let mut visible_approval_with_count = checkpoint.clone();
+    visible_approval_with_count["tool_results"][command_result_index]["result"]["failure_kind"] =
+        serde_json::json!("approval");
+    let visible_approval_with_count_result = resumed_agent_loop.resume_pending_tool_call(
+        &resumed_input,
+        &pending,
+        &visible_approval_with_count,
+    );
+    assert_eq!(
+        visible_approval_with_count_result.status,
+        AgentStatus::Failed
+    );
+    assert!(
+        visible_approval_with_count_result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("hidden tool result binding"))
+    );
+
+    let mut visible_approval_missing_count = checkpoint.clone();
+    visible_approval_missing_count["tool_results"][command_result_index]["result"]["failure_kind"] =
+        serde_json::json!("approval");
+    visible_approval_missing_count["tool_results"][command_result_index]
+        .as_object_mut()
+        .expect("checkpoint command object")
+        .remove("context_token_count");
+    let visible_approval = resumed_agent_loop.resume_pending_tool_call(
+        &resumed_input,
+        &pending,
+        &visible_approval_missing_count,
+    );
+    assert_eq!(visible_approval.status, AgentStatus::Failed);
+    assert!(
+        visible_approval
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("hidden tool result binding"))
+    );
+
     let resumed =
         resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
 
@@ -3414,6 +3593,49 @@ impl SandboxBackend for LargeOutputBackend {
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
         CommandResult::completed(&request.command_id, "large-safe-output\n".repeat(2_000))
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
+
+#[derive(Default)]
+struct SequencedOutputBackend {
+    calls: AtomicUsize,
+}
+
+impl SequencedOutputBackend {
+    fn output(&self) -> String {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            "small-safe-output".to_string()
+        } else {
+            "large-safe-output\n".repeat(2_000)
+        }
+    }
+}
+
+impl SandboxBackend for SequencedOutputBackend {
+    fn name(&self) -> &'static str {
+        "sequenced_output_strict_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, self.output())
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, self.output())
             .with_workspace_mutation(WorkspaceMutation::Unchanged)
             .with_sandbox_execution(
                 self.name(),

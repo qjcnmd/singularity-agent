@@ -12,8 +12,9 @@ use singularity_tools::{
     ToolCallRequest, ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolExposure,
     ToolFailureKind, ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult, ToolSpec,
     WorkspaceMutation, WorkspacePatch, WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError,
-    WorkspaceToolExecutor, WorkspaceTools, command_scope_digest, command_script_scope_digest,
-    command_script_scope_digest_with_policy, workspace_tool_entries, workspace_tool_specs,
+    WorkspaceToolExecutor, WorkspaceTools, approximate_token_count, command_scope_digest,
+    command_script_scope_digest, command_script_scope_digest_with_policy, workspace_tool_entries,
+    workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -577,6 +578,37 @@ fn broker_tool_result_keeps_bounded_preview_without_unregistered_artifact_ref() 
     assert!(payload.get("preview").is_some());
     assert!(payload.get("artifact_refs").is_none());
     assert!(!serialized.contains("artifact://result/readme"));
+}
+
+#[test]
+fn large_safe_tool_result_keeps_compaction_accounting_outside_public_payload() {
+    let envelope = ToolCallRequest::new("call_1", "command", r#"{"command":"cargo test"}"#);
+    let result = ToolOutput::success(serde_json::json!({
+        "stdout_preview": "large-safe-output\n".repeat(2_000),
+        "artifact_ref": "artifact://result/output",
+    }));
+
+    let tool_result = ToolResult::from_result(&envelope, &result);
+    let payload = tool_result.to_message_payload();
+    let serialized = serde_json::to_string(&payload).expect("serialize payload");
+
+    assert!(
+        tool_result
+            .context_token_count()
+            .is_some_and(|tokens| tokens > 1_000)
+    );
+    assert!(payload.get("content").is_some() || payload.get("preview").is_some());
+    assert!(!serialized.contains("large-safe-output"));
+    assert!(!serialized.contains("artifact://result/output"));
+    assert!(!serialized.contains("context_token_count"));
+}
+
+#[test]
+fn approximate_token_count_is_the_shared_ascii_and_unicode_estimator() {
+    assert_eq!(approximate_token_count(""), 1);
+    assert_eq!(approximate_token_count("abcd"), 1);
+    assert_eq!(approximate_token_count("abcde"), 2);
+    assert_eq!(approximate_token_count("中a文"), 3);
 }
 
 #[test]
