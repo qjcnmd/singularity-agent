@@ -57,7 +57,6 @@ pub struct SpawnRequest {
     pub permission_profile: PermissionProfile,
     pub workspace_roots: Vec<AbsolutePathBuf>,
     pub sandbox_home: PathBuf,
-    pub real_sandbox_home: PathBuf,
     pub deny_read_runner_lease_name: String,
     pub cap_sids: Vec<String>,
     pub timeout_ms: Option<u64>,
@@ -202,7 +201,6 @@ mod tests {
                     permission_profile: PermissionProfile::read_only(),
                     workspace_roots: workspace_roots.clone(),
                     sandbox_home: PathBuf::from(r"C:\singularity"),
-                    real_sandbox_home: PathBuf::from(r"C:\Users\singularity"),
                     deny_read_runner_lease_name:
                         r"Global\SingularityDenyReadRunner_0123456789abcdef0123456789abcdef"
                             .to_string(),

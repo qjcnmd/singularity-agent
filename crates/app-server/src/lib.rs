@@ -3318,11 +3318,11 @@ fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Value>> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use singularity_agent::PendingToolCall;
+    use singularity_agent::{AgentRecoveryMetrics, PendingToolCall};
     use singularity_model::{
         ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall,
-        ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, Provider,
-        ProviderError, ProviderProtocolContract,
+        ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
+        Provider, ProviderAttemptMetadata, ProviderError, ProviderProtocolContract,
     };
     use singularity_policy::{ToolId, WorkspaceRelativePath};
     use singularity_protocol::ItemKind;
@@ -3359,7 +3359,8 @@ mod tests {
             "tool_name": &request.action,
             "raw_arguments": &raw_arguments,
             "resources": &request.resources,
-            "checkpoint_version": 1,
+            "checkpoint_version": 2,
+            "project_instructions_digest": null,
             "messages": [{
                 "role": "assistant",
                 "content": "",
@@ -3372,7 +3373,7 @@ mod tests {
                     "validation_errors": []
                 }]
             }],
-            "tool_results": [],
+            "tool_result_occurrences": [],
             "used_approval_grants": [],
             "approval_count": 1,
             "model_turns": 1,
@@ -3385,7 +3386,15 @@ mod tests {
                 "terminal_command_revisions": [],
                 "unresolved_failures": []
             },
-            "last_completion_error": null
+            "last_completion_error": null,
+            "plan": null,
+            "plan_update_count": 0,
+            "recovery_metrics": AgentRecoveryMetrics::default(),
+            "model_usage": ModelUsage::default(),
+            "provider_attempts": ProviderAttemptMetadata::default(),
+            "context_trace": null,
+            "seen_tool_call_fingerprints": [],
+            "last_repair_failure": null
         });
         decode_pending_approval(request, Some(&payload))
             .expect("pending approval")
@@ -3393,7 +3402,7 @@ mod tests {
     }
 
     #[test]
-    fn app_server_checkpoint_codec_migrates_legacy_string_resources() {
+    fn app_server_checkpoint_codec_rejects_legacy_resources() {
         let request = ApprovalRequest::new(
             "approval_legacy_resource",
             "thread_legacy_resource",
@@ -3413,10 +3422,12 @@ mod tests {
             .remove("tool_result_occurrences");
         legacy["tool_result_context_bindings"] = json!([]);
 
-        let migrated = decode_pending_approval(&request, Some(&legacy))
-            .expect("decode legacy checkpoint")
-            .expect("pending approval");
-        assert_eq!(migrated.pending_tool_call().resources, request.resources);
+        assert_eq!(
+            decode_pending_approval(&request, Some(&legacy))
+                .expect_err("legacy checkpoint must fail closed")
+                .to_string(),
+            "store error: invalid store state: approval request requires an internal AgentLoop checkpoint: unsupported approval checkpoint version"
+        );
     }
 
     #[test]
@@ -5044,47 +5055,9 @@ mod tests {
             "expected": "before",
             "replacement": "after"
         });
-        let pending = PendingToolCall {
-            request_id: request.request_id.clone(),
-            tool_call_id: "call_1".to_string(),
-            tool_name: tool_id(TOOL_EDIT),
-            raw_arguments: arguments.to_string(),
-            resources: request.resources.clone(),
-        };
-        let pending_payload = json!({
-            "request_id": pending.request_id,
-            "thread_id": thread.thread_id,
-            "turn_id": turn.turn_id,
-            "tool_call_id": pending.tool_call_id,
-            "tool_name": pending.tool_name,
-            "raw_arguments": pending.raw_arguments,
-            "resources": pending.resources,
-            "checkpoint_version": 1,
-            "messages": [{
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{
-                    "tool_call_id": "call_1",
-                    "tool_name": TOOL_EDIT,
-                    "arguments": arguments.clone(),
-                    "raw_arguments": arguments.to_string(),
-                    "parse_status": "valid",
-                    "validation_errors": []
-                }]
-            }],
-            "tool_results": [],
-            "used_approval_grants": [],
-            "approval_count": 1,
-            "model_turns": 1,
-            "completion": {
-                "workspace_mutated": false,
-                "successful_command_count": 0,
-                "required_command_counts": {},
-                "terminal_command_scope_digests": [],
-                "unresolved_failures": []
-            },
-            "last_completion_error": null
-        });
+        let pending_payload = pending_approval_for_test(&request, arguments.clone())
+            .encode_checkpoint()
+            .expect("current checkpoint");
         let decision = ApprovalDecision::new(
             request.request_id.clone(),
             ApprovalOutcome::Allow,

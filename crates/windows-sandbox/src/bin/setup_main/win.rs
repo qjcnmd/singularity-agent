@@ -74,6 +74,32 @@ const DENY_ACCESS: i32 = 3;
 const WRITE_ROOT_ALLOW_MASK: u32 =
     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
 
+fn acl_error_priority(error: &anyhow::Error) -> u8 {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WindowsAclError>())
+        .map_or(0, |error| {
+            if error.code == 5
+                && matches!(
+                    error.operation,
+                    AclOperation::OpenTarget
+                        | AclOperation::GetSecurityInfo
+                        | AclOperation::SetSecurityInfo
+                )
+            {
+                2
+            } else {
+                1
+            }
+        })
+}
+
+fn retain_preferred_acl_error(retained: &mut Option<anyhow::Error>, candidate: anyhow::Error) {
+    if acl_error_priority(&candidate) > retained.as_ref().map_or(0, acl_error_priority) {
+        *retained = Some(candidate);
+    }
+}
+
 mod sandbox_users;
 mod setup_runtime_bin;
 use sandbox_users::commit_setup_marker;
@@ -803,6 +829,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         string_from_sid_bytes(&sandbox_group_sid).map_err(anyhow::Error::msg)?;
 
     let mut refresh_errors: Vec<String> = Vec::new();
+    let mut preferred_refresh_error = None;
     if !refresh_only {
         configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
     }
@@ -933,11 +960,11 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             let needs_refresh = match write_root_needs_refresh(root, psid) {
                 Ok(needs_refresh) => needs_refresh,
                 Err(e) => {
-                    refresh_errors.push(format!(
+                    let message = format!(
                         "write ACE check failed on {} for {label}: {}",
                         root.display(),
                         e
-                    ));
+                    );
                     log_line(
                         log,
                         &format!(
@@ -946,6 +973,11 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                             e
                         ),
                     )?;
+                    retain_preferred_acl_error(
+                        &mut preferred_refresh_error,
+                        e.context(format!("check write ACE on {} for {label}", root.display())),
+                    );
+                    refresh_errors.push(message);
                     true
                 }
             };
@@ -1000,7 +1032,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    refresh_errors.push(format!("write ACE failed on {}: {}", root.display(), e));
+                    let message = format!("write ACE failed on {}: {}", root.display(), e);
                     if log_line(
                         log,
                         &format!("write ACE grant failed on {}: {}", root.display(), e),
@@ -1009,6 +1041,11 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                     {
                         // ignore log errors inside scoped thread
                     }
+                    retain_preferred_acl_error(
+                        &mut preferred_refresh_error,
+                        e.context(format!("grant write ACE on {}", root.display())),
+                    );
+                    refresh_errors.push(message);
                 }
             }
         }
@@ -1053,7 +1090,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 }
                 Ok(false) => {}
                 Err(err) => {
-                    refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
+                    let message = format!("deny ACE failed on {}: {err}", path.display());
                     if let Some(materialized) = materialized.take()
                         && let Err(cleanup) = materialized.cleanup_if_empty()
                     {
@@ -1066,6 +1103,11 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                         log,
                         &format!("deny ACE failed on {}: {err}", path.display()),
                     )?;
+                    retain_preferred_acl_error(
+                        &mut preferred_refresh_error,
+                        err.context(format!("apply deny-write ACE to {}", path.display())),
+                    );
+                    refresh_errors.push(message);
                 }
             }
             unsafe {
@@ -1095,6 +1137,19 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             log,
             &format!("setup refresh completed with errors: {refresh_errors:?}"),
         )?;
+        if let Some(error) = preferred_refresh_error {
+            if let Some(acl_error) = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<WindowsAclError>())
+                .copied()
+            {
+                return Err(anyhow::Error::new(
+                    SetupFailure::new(SetupErrorCode::HelperAclRefreshFailed, "ACL refresh failed")
+                        .with_acl_error(acl_error),
+                ));
+            }
+            return Err(error.context("setup refresh failed"));
+        }
         anyhow::bail!("setup refresh had errors");
     }
     log_note("setup binary completed", Some(sbx_dir));

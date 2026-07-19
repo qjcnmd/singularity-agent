@@ -1,7 +1,8 @@
 //! AppServer protocol、approval continuation、recovery 和 sandbox 边界测试。
 
+use singularity_agent::AgentRecoveryMetrics;
 use singularity_app_server::{AppServer, AppServerError};
-use singularity_model::ProviderConfigSnapshot;
+use singularity_model::{ModelUsage, ProviderAttemptMetadata, ProviderConfigSnapshot};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
     WorkspaceRelativePath,
@@ -114,21 +115,31 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
         "tool_name": &request.action,
         "raw_arguments": "{}",
         "resources": &request.resources,
-        "checkpoint_version": 1,
+        "checkpoint_version": 2,
+        "project_instructions_digest": null,
         "messages": [{"role":"assistant","content":"","tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{},"raw_arguments":"{}","parse_status":"valid","validation_errors":[]}]}],
-        "tool_results": [],
+        "tool_result_occurrences": [],
         "used_approval_grants": [],
         "approval_count": 1,
         "model_turns": 1,
         "completion": {
             "workspace_mutated": false,
-            "verified_after_last_mutation": false,
+            "workspace_revision": null,
             "successful_command_count": 0,
             "required_command_counts": {},
-            "satisfied_command_counts": {},
+            "terminal_command_scope_digests": [],
+            "terminal_command_revisions": [],
             "unresolved_failures": []
         },
-        "last_completion_error": null
+        "last_completion_error": null,
+        "plan": null,
+        "plan_update_count": 0,
+        "recovery_metrics": AgentRecoveryMetrics::default(),
+        "model_usage": ModelUsage::default(),
+        "provider_attempts": ProviderAttemptMetadata::default(),
+        "context_trace": null,
+        "seen_tool_call_fingerprints": [],
+        "last_repair_failure": null
     })
 }
 #[test]
@@ -1294,22 +1305,7 @@ fn pending_approval_prevents_thread_archive_and_delete() {
     store
         .create_approval_with_pending_tool_call_and_trace(
             &request,
-            Some(serde_json::json!({
-                "request_id": &request.request_id,
-                "thread_id": &thread.thread_id,
-                "turn_id": &turn.turn_id,
-                "tool_call_id": "call_1",
-                "tool_name": "edit",
-                "raw_arguments": "{}",
-                "resources": &request.resources,
-                "checkpoint_version": 1,
-                "messages": [],
-                "tool_results": [],
-                "used_approval_grants": [],
-                "approval_count": 1,
-                "model_turns": 1,
-                "completion": {}
-            })),
+            Some(approval_checkpoint(&request, "call_1")),
             "approval",
             "approval requested",
         )

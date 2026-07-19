@@ -75,6 +75,8 @@ pub enum SetupErrorCode {
     HelperReadAclMutexProbeFailed,
     /// Helper failed to reconcile deny-read ACLs.
     HelperDenyReadAclFailed,
+    /// Helper failed to refresh another runtime ACL boundary.
+    HelperAclRefreshFailed,
     /// Helper failed to lock down sandbox directories via ACLs.
     HelperSandboxLockFailed,
     /// Helper failed for an unmapped or unexpected reason.
@@ -114,6 +116,7 @@ impl SetupErrorCode {
             Self::HelperReadAclHelperSpawnFailed => "helper_read_acl_helper_spawn_failed",
             Self::HelperReadAclMutexProbeFailed => "helper_read_acl_mutex_probe_failed",
             Self::HelperDenyReadAclFailed => "helper_deny_read_acl_failed",
+            Self::HelperAclRefreshFailed => "helper_acl_refresh_failed",
             Self::HelperSandboxLockFailed => "helper_sandbox_lock_failed",
             Self::HelperUnknownError => "helper_unknown_error",
         }

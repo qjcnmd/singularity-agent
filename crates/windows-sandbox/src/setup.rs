@@ -888,8 +888,10 @@ pub(crate) fn is_acl_authority_failure(error: &anyhow::Error) -> bool {
     let Some(failure) = extract_failure(error) else {
         return false;
     };
-    failure.code == SetupErrorCode::HelperDenyReadAclFailed
-        && failure.windows_error_code == Some(ERROR_ACCESS_DENIED)
+    matches!(
+        failure.code,
+        SetupErrorCode::HelperDenyReadAclFailed | SetupErrorCode::HelperAclRefreshFailed
+    ) && failure.windows_error_code == Some(ERROR_ACCESS_DENIED)
         && failure.acl_operation.is_some_and(|operation| {
             matches!(
                 operation,
@@ -2242,6 +2244,18 @@ mod tests {
             }),
         );
         assert!(super::is_acl_authority_failure(&access_denied));
+
+        let refresh_access_denied = anyhow::Error::new(
+            super::SetupFailure::new(
+                super::SetupErrorCode::HelperAclRefreshFailed,
+                "safe ACL refresh failure",
+            )
+            .with_acl_error(crate::WindowsAclError {
+                operation: crate::AclOperation::SetSecurityInfo,
+                code: 5,
+            }),
+        );
+        assert!(super::is_acl_authority_failure(&refresh_access_denied));
 
         let unknown_code = anyhow::Error::new(
             super::SetupFailure::new(

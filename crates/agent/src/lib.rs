@@ -23,10 +23,9 @@ use singularity_model::{
     validate_model_turn_response,
 };
 use singularity_policy::{
-    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest, NetworkAccess,
-    PermissionDecision, PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation,
-    PermissionProfile, PermissionProfileName, PermissionRequest, PermissionResource, PolicyEngine,
-    ToolId, WorkspaceRelativePath,
+    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
+    PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
+    PermissionProfileName, PermissionRequest, PermissionResource, PolicyEngine, ToolId,
 };
 use singularity_tools::{
     AgentControlToolExecutor, BoundToolCall, COMMAND_TOOL as TOOL_COMMAND, CommandToolInput,
@@ -43,7 +42,6 @@ use thiserror::Error;
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
 const APPROVAL_CHECKPOINT_VERSION: u32 = 2;
-const LEGACY_APPROVAL_CHECKPOINT_VERSION: u32 = 1;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -561,7 +559,7 @@ impl ApprovalGrant {
 }
 
 /// 一次运行的完整结果，包括按 occurrence 顺序保留的待处理 approval 和 tool 结果。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct AgentLoopResult {
     pub status: AgentStatus,
     pub completed: bool,
@@ -571,8 +569,7 @@ pub struct AgentLoopResult {
     pub approval_count: u32,
     #[serde(
         rename = "approval_requests",
-        serialize_with = "serialize_pending_approval_requests",
-        deserialize_with = "deserialize_pending_approval_requests"
+        serialize_with = "serialize_pending_approval_requests"
     )]
     #[schemars(skip)]
     /// Each entry owns its request and the typed checkpoint for the executable call.
@@ -618,22 +615,6 @@ where
         .map(PendingApprovalOccurrence::request)
         .collect::<Vec<_>>()
         .serialize(serializer)
-}
-
-fn deserialize_pending_approval_requests<'de, D>(
-    deserializer: D,
-) -> Result<Vec<PendingApprovalOccurrence>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let requests = Vec::<ApprovalRequest>::deserialize(deserializer)?;
-    if requests.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Err(serde::de::Error::custom(
-            "approval requests require their typed checkpoint occurrence",
-        ))
-    }
 }
 
 impl AgentLoopResult {
@@ -1342,60 +1323,6 @@ struct ApprovalCheckpointWire {
     last_repair_failure: Option<RepairFailureState>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyPendingToolCall {
-    request_id: String,
-    tool_call_id: String,
-    tool_name: ToolId,
-    raw_arguments: String,
-    resources: Vec<LegacyPendingResource>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum LegacyPendingResource {
-    String(String),
-    Typed(PermissionResource),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyApprovalCheckpoint {
-    #[serde(flatten)]
-    pending_tool_call: LegacyPendingToolCall,
-    checkpoint_version: u32,
-    thread_id: String,
-    turn_id: String,
-    #[serde(default)]
-    project_instructions_digest: Option<String>,
-    messages: Vec<ModelMessage>,
-    tool_results: Vec<ToolResultOccurrenceWire>,
-    used_approval_grants: Vec<String>,
-    approval_count: u32,
-    model_turns: u32,
-    completion: CompletionTracker,
-    last_completion_error: Option<String>,
-    #[serde(default)]
-    plan: Option<AgentPlan>,
-    #[serde(default)]
-    plan_update_count: u32,
-    #[serde(default)]
-    recovery_metrics: AgentRecoveryMetrics,
-    #[serde(default)]
-    model_usage: ModelUsage,
-    #[serde(default)]
-    provider_attempts: ProviderAttemptMetadata,
-    #[serde(default)]
-    context_trace: Option<AgentContextTrace>,
-    #[serde(default)]
-    tool_result_context_bindings: Option<Vec<ToolResultVisibility>>,
-    #[serde(default)]
-    seen_tool_call_fingerprints: Vec<String>,
-    #[serde(default)]
-    last_repair_failure: Option<RepairFailureState>,
-}
-
 #[derive(Debug, Deserialize)]
 struct CheckpointVersion {
     checkpoint_version: u32,
@@ -1428,99 +1355,6 @@ impl From<&ApprovalCheckpoint> for ApprovalCheckpointWire {
     }
 }
 
-fn migrate_legacy_pending_tool_call(
-    legacy: LegacyPendingToolCall,
-) -> Result<PendingToolCall, String> {
-    let action = legacy.tool_name;
-    let resources = migrate_legacy_pending_resources(&action, legacy.resources)?;
-    Ok(PendingToolCall {
-        request_id: legacy.request_id,
-        tool_call_id: legacy.tool_call_id,
-        tool_name: action,
-        raw_arguments: legacy.raw_arguments,
-        resources,
-    })
-}
-
-fn migrate_legacy_pending_resources(
-    action: &ToolId,
-    resources: Vec<LegacyPendingResource>,
-) -> Result<Vec<PermissionResource>, String> {
-    if !matches!(
-        action.as_str(),
-        "read" | "list" | "grep" | "edit" | "patch" | "command" | UPDATE_PLAN_TOOL
-    ) {
-        return Err("approval checkpoint legacy tool cannot be uniquely recovered".to_string());
-    }
-    let mut saw_strings = false;
-    let mut saw_typed = false;
-    let migrated = resources
-        .into_iter()
-        .map(|resource| match resource {
-            LegacyPendingResource::String(value) => {
-                saw_strings = true;
-                migrate_legacy_pending_string_resource(action, value)
-            }
-            LegacyPendingResource::Typed(resource) => {
-                saw_typed = true;
-                validate_legacy_pending_typed_resource(action, resource)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if saw_strings && saw_typed {
-        return Err("approval checkpoint legacy resources mix incompatible encodings".to_string());
-    }
-    Ok(migrated)
-}
-
-fn migrate_legacy_pending_string_resource(
-    action: &ToolId,
-    resource: String,
-) -> Result<PermissionResource, String> {
-    match action.as_str() {
-        "read" | "list" | "grep" | "edit" | "patch" => {
-            WorkspaceRelativePath::from_canonical(resource)
-                .map(PermissionResource::WorkspacePath)
-                .map_err(|error| {
-                    format!("approval checkpoint legacy workspace resource is invalid: {error}")
-                })
-        }
-        "command" => resource
-            .strip_prefix("command_script;scope_digest:")
-            .ok_or_else(|| {
-                "approval checkpoint legacy command resource is not an exact scope".to_string()
-            })
-            .and_then(|digest| {
-                CommandScopeDigest::new(digest.to_string())
-                    .map(PermissionResource::CommandScope)
-                    .map_err(|error| {
-                        format!("approval checkpoint legacy command resource is invalid: {error}")
-                    })
-            }),
-        UPDATE_PLAN_TOOL if resource == action.as_str() => {
-            Ok(PermissionResource::Tool(action.clone()))
-        }
-        _ => Err("approval checkpoint legacy resource cannot be uniquely recovered".to_string()),
-    }
-}
-
-fn validate_legacy_pending_typed_resource(
-    action: &ToolId,
-    resource: PermissionResource,
-) -> Result<PermissionResource, String> {
-    let valid = match (action.as_str(), &resource) {
-        ("read" | "list" | "grep" | "edit" | "patch", PermissionResource::WorkspacePath(_)) => true,
-        ("command", PermissionResource::CommandScope(_)) => true,
-        (UPDATE_PLAN_TOOL, PermissionResource::Tool(tool)) if tool == action => true,
-        _ => false,
-    };
-    if valid {
-        Ok(resource)
-    } else {
-        Err("approval checkpoint typed resource does not match its tool".to_string())
-    }
-}
-
 impl ApprovalCheckpoint {
     /// Encode a validated checkpoint at the persistence boundary.
     pub fn encode(&self) -> Result<Value, String> {
@@ -1529,7 +1363,7 @@ impl ApprovalCheckpoint {
             .map_err(|error| format!("approval checkpoint serialization failed: {error}"))
     }
 
-    /// Decode and migrate a persisted checkpoint into the current typed representation.
+    /// Decode a persisted checkpoint and reject every non-current version.
     pub fn decode(payload: &Value) -> Result<Self, String> {
         let version: CheckpointVersion = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid approval checkpoint version: {error}"))?;
@@ -1539,7 +1373,6 @@ impl ApprovalCheckpoint {
                     .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
                 Self::from_wire(wire)
             }
-            LEGACY_APPROVAL_CHECKPOINT_VERSION => Self::migrate_legacy(payload)?,
             _ => return Err("unsupported approval checkpoint version".to_string()),
         };
         checkpoint.validate_serialized()?;
@@ -1574,56 +1407,6 @@ impl ApprovalCheckpoint {
             seen_tool_call_fingerprints: wire.seen_tool_call_fingerprints,
             last_repair_failure: wire.last_repair_failure,
         }
-    }
-
-    fn migrate_legacy(payload: &Value) -> Result<Self, String> {
-        let legacy: LegacyApprovalCheckpoint = serde_json::from_value(payload.clone())
-            .map_err(|error| format!("invalid legacy approval checkpoint: {error}"))?;
-        if legacy.checkpoint_version != LEGACY_APPROVAL_CHECKPOINT_VERSION {
-            return Err("unsupported approval checkpoint version".to_string());
-        }
-        let bindings_present = legacy.tool_result_context_bindings.is_some();
-        let bindings = legacy.tool_result_context_bindings.unwrap_or_default();
-        if !legacy.tool_results.is_empty() && !bindings_present {
-            return Err(
-                "approval checkpoint tool result occurrence bindings are missing for non-empty results"
-                    .to_string(),
-            );
-        }
-        if bindings.len() != legacy.tool_results.len() {
-            return Err(
-                "approval checkpoint tool result occurrence bindings are invalid".to_string(),
-            );
-        }
-        let tool_result_occurrences = legacy
-            .tool_results
-            .into_iter()
-            .zip(bindings)
-            .map(|(wire, visibility)| ToolResultOccurrence::from_wire(wire, visibility))
-            .collect::<Result<Vec<_>, _>>()?;
-        let pending_tool_call = migrate_legacy_pending_tool_call(legacy.pending_tool_call)?;
-        Ok(Self {
-            pending_tool_call,
-            checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
-            thread_id: legacy.thread_id,
-            turn_id: legacy.turn_id,
-            project_instructions_digest: legacy.project_instructions_digest,
-            messages: legacy.messages,
-            tool_result_occurrences,
-            used_approval_grants: legacy.used_approval_grants,
-            approval_count: legacy.approval_count,
-            model_turns: legacy.model_turns,
-            completion: legacy.completion,
-            last_completion_error: legacy.last_completion_error,
-            plan: legacy.plan,
-            plan_update_count: legacy.plan_update_count,
-            recovery_metrics: legacy.recovery_metrics,
-            model_usage: legacy.model_usage,
-            provider_attempts: legacy.provider_attempts,
-            context_trace: legacy.context_trace,
-            seen_tool_call_fingerprints: legacy.seen_tool_call_fingerprints,
-            last_repair_failure: legacy.last_repair_failure,
-        })
     }
 }
 
@@ -4580,69 +4363,53 @@ pub fn terminal_command_scope_digests(
         return Vec::new();
     }
     let mut observations = Vec::new();
-    let mut workspace_revision = None;
+    let mut workspace_revision: Option<WorkspaceRevision> = None;
     for tool_result in tool_results {
-        if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH) {
-            observations.clear();
-            workspace_revision = tool_result.workspace_observation().and_then(|observation| {
-                let revision = observation.revision()?;
-                (observation.mutation() == WorkspaceMutation::Changed
-                    && workspace_revision
-                        .unwrap_or_else(WorkspaceRevision::initial)
-                        .next()
-                        == Some(revision))
-                .then_some(revision)
-            });
-            continue;
-        }
-        if tool_result.tool_name != TOOL_COMMAND {
-            continue;
-        }
-        let Some(observation) = tool_result.workspace_observation() else {
+        let observed_mutation = tool_result.workspace_observation().and_then(|observation| {
+            let revision = observation.revision()?;
+            let valid = match (workspace_revision, observation.mutation()) {
+                (None, WorkspaceMutation::Unchanged) => revision == WorkspaceRevision::initial(),
+                (None, WorkspaceMutation::Changed) => {
+                    WorkspaceRevision::initial().next() == Some(revision)
+                }
+                (Some(current), WorkspaceMutation::Unchanged) => current == revision,
+                (Some(current), WorkspaceMutation::Changed) => current.next() == Some(revision),
+                (_, WorkspaceMutation::Unknown) => false,
+            };
+            if !valid {
+                return None;
+            }
+            workspace_revision = Some(revision);
+            if observation.mutation() == WorkspaceMutation::Changed {
+                observations.clear();
+            }
+            Some(observation.mutation())
+        });
+
+        if tool_result.workspace_observation().is_some() && observed_mutation.is_none() {
             observations.clear();
             workspace_revision = None;
-            continue;
-        };
-        let Some(revision) = observation.revision() else {
-            observations.clear();
-            workspace_revision = None;
-            continue;
-        };
-        match observation.mutation() {
-            WorkspaceMutation::Changed => {
-                if workspace_revision
-                    .unwrap_or_else(WorkspaceRevision::initial)
-                    .next()
-                    != Some(revision)
-                {
+        }
+        match tool_result.tool_name.as_str() {
+            TOOL_EDIT | TOOL_PATCH if tool_result.ok => {
+                if observed_mutation != Some(WorkspaceMutation::Changed) {
                     observations.clear();
                     workspace_revision = None;
-                    continue;
                 }
-                observations.clear();
-                workspace_revision = Some(revision);
             }
-            WorkspaceMutation::Unknown => {
-                observations.clear();
-                workspace_revision = None;
-            }
-            WorkspaceMutation::Unchanged => {
-                let expected_revision =
-                    workspace_revision.unwrap_or_else(WorkspaceRevision::initial);
-                if expected_revision != revision {
-                    observations.clear();
-                    workspace_revision = None;
-                    continue;
-                }
-                workspace_revision = Some(revision);
-                if tool_result.ok {
+            TOOL_COMMAND if tool_result.ok => {
+                if observed_mutation == Some(WorkspaceMutation::Unchanged) {
                     record_terminal_command_observation(
                         &mut observations,
                         successful_command_scope_digest(tool_result),
                         max_count,
                     );
+                } else if tool_result.workspace_observation().is_none() {
+                    observations.clear();
+                    workspace_revision = None;
                 }
             }
+            _ => {}
         }
     }
     observations
@@ -5524,6 +5291,23 @@ mod audit_projection_tests {
 
         assert_eq!(
             terminal_command_scope_digests(&[failed, before_mutation, mutation, after_mutation], 1),
+            vec![digest.to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_command_observations_preserve_revision_across_unexecuted_failures() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let revision = WorkspaceRevision::initial().next().expect("revision");
+        let mutation = ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            .with_workspace_observation(WorkspaceObservation::changed(revision));
+        let rejected = ToolResult::summary("invalid", TOOL_COMMAND, false, "invalid arguments");
+        let mut verified = ToolResult::summary("verified", TOOL_COMMAND, true, "ok");
+        verified.result_id = Some(digest.to_string());
+        verified = verified.with_workspace_observation(WorkspaceObservation::unchanged(revision));
+
+        assert_eq!(
+            terminal_command_scope_digests(&[mutation, rejected, verified], 1),
             vec![digest.to_string()]
         );
     }

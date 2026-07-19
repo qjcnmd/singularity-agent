@@ -290,9 +290,9 @@ fn prepare_v10_pending_checkpoint(
     request
 }
 
-// 验证 v10 pending checkpoint 的 legacy string resources 在 Store 迁移中保持 opaque。
+// 旧数据库含未完成 AgentLoop checkpoint 时，在任何 schema 写入前拒绝迁移。
 #[test]
-fn v10_pending_checkpoint_resources_remain_opaque_during_migration() {
+fn v10_pending_checkpoint_rejects_migration_without_mutation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     let mut checkpoint = serde_json::json!({
@@ -332,69 +332,13 @@ fn v10_pending_checkpoint_resources_remain_opaque_during_migration() {
         "last_completion_error": null
     });
     let request = prepare_v10_pending_checkpoint(&db_path, &mut checkpoint);
-    let checkpoint_text = serde_json::to_string(&checkpoint).expect("checkpoint text");
-
-    let migrated = SessionStore::open(&db_path).expect("migrate v10 store");
-    let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
-    let stored_payload: String = connection
-        .query_row(
-            "select payload from pending_tool_calls where request_id = ?1",
-            rusqlite::params![request.request_id],
-            |row| row.get(0),
-        )
-        .expect("stored checkpoint payload");
-    assert_eq!(stored_payload, checkpoint_text);
-    assert_eq!(
-        migrated
-            .get_pending_tool_call(&request.request_id)
-            .expect("opaque checkpoint")
-            .expect("pending checkpoint")["resources"],
-        serde_json::json!(["README.md"])
-    );
-    assert_eq!(
-        migrated
-            .get_pending_approval(&request.request_id)
-            .expect("migrated approval")
-            .resources,
-        vec![workspace_resource("README.md")]
-    );
-}
-
-// 验证 v10 pending payload 的 JSON 损坏在迁移事务内 fail closed 且不改旧库。
-#[test]
-fn v10_pending_checkpoint_invalid_json_rolls_back_without_mutation() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db_path = dir.path().join("sessions.sqlite3");
-    let mut checkpoint = serde_json::json!({
-        "request_id": "approval_pending_v10",
-        "thread_id": "thread_v10",
-        "turn_id": "turn_v10",
-        "tool_call_id": "call_1",
-        "tool_name": "edit",
-        "raw_arguments": "{}",
-        "resources": ["README.md"],
-        "checkpoint_version": 1,
-        "messages": [],
-        "tool_results": [],
-        "used_approval_grants": [],
-        "approval_count": 1,
-        "model_turns": 1,
-        "completion": {}
-    });
-    let request = prepare_v10_pending_checkpoint(&db_path, &mut checkpoint);
-    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute(
-            "update pending_tool_calls set payload = '{' where request_id = ?1",
-            rusqlite::params![request.request_id],
-        )
-        .expect("corrupt checkpoint payload");
-    drop(connection);
     let before = sqlite_snapshot(&db_path);
 
     assert!(matches!(
         SessionStore::open(&db_path),
-        Err(StoreError::InvalidState(message)) if message.contains("payload is invalid JSON")
+        Err(StoreError::InvalidState(message))
+            if message.contains("v10 pending AgentLoop checkpoint")
+                && message.contains(&request.request_id)
     ));
     assert_eq!(sqlite_snapshot(&db_path), before);
     assert!(!has_v11_temporary_tables(&db_path));
@@ -440,6 +384,7 @@ fn v8_threads_migrate_to_policy_snapshot_defaults() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     create_legacy_enum_database(&db_path, 8);
+    remove_legacy_pending_approval(&db_path, 8);
 
     let migrated = SessionStore::open(&db_path).expect("migrate v8 store");
     assert_eq!(migrated.descriptor().schema_version, 11);
@@ -462,13 +407,14 @@ fn v8_threads_migrate_to_policy_snapshot_defaults() {
     );
 }
 
-// 验证每个受支持的 v1-v9 历史 schema 都在同一 v11 事务中完成转换。
+// 验证不含未完成 checkpoint 的 v1-v9 历史 schema 在同一 v11 事务中完成转换。
 #[test]
 fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
     for schema_version in 1..=9 {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("sessions.sqlite3");
         create_legacy_enum_database(&db_path, schema_version);
+        remove_legacy_pending_approval(&db_path, schema_version);
 
         let store = SessionStore::open(&db_path).expect("migrate legacy schema");
         assert_eq!(store.descriptor().schema_version, 11);
@@ -511,7 +457,7 @@ fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
                 .iter()
                 .map(|request| request.request_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["approval_pending"]
+            Vec::<&str>::new()
         );
         assert_eq!(
             store
@@ -536,8 +482,7 @@ fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
     }
 }
 
-// v4-v6 only persisted the selected tool call, not the model/history checkpoint
-// required by the current AgentLoop. Migration must not invent resumable state.
+// 任何旧 schema 的 pending checkpoint 都不属于当前 AgentLoop codec；迁移不能伪造状态。
 #[test]
 fn pre_checkpoint_pending_tool_calls_are_rejected_without_mutation() {
     for schema_version in 4..=6 {
@@ -578,7 +523,7 @@ fn pre_checkpoint_pending_tool_calls_are_rejected_without_mutation() {
         assert!(matches!(
             SessionStore::open(&db_path),
             Err(StoreError::InvalidState(message))
-                if message.contains("cannot be migrated without fabricating an AgentLoop checkpoint")
+                if message.contains("pending AgentLoop checkpoint")
         ));
         assert_eq!(sqlite_snapshot(&db_path), before);
         assert!(!has_v11_temporary_tables(&db_path));
@@ -592,6 +537,7 @@ fn released_legacy_schema_variants_migrate() {
     let dir = tempfile::tempdir().expect("temp dir");
     let v2_path = dir.path().join("v2-appended-trace.sqlite3");
     create_legacy_enum_database(&v2_path, 2);
+    remove_legacy_pending_approval(&v2_path, 2);
     let connection = rusqlite::Connection::open(&v2_path).expect("open v2 db");
     connection
         .execute_batch(
@@ -619,6 +565,7 @@ fn released_legacy_schema_variants_migrate() {
 
     let v5_path = dir.path().join("v5-retired-sidecar.sqlite3");
     create_legacy_enum_database(&v5_path, 5);
+    remove_legacy_pending_approval(&v5_path, 5);
     let connection = rusqlite::Connection::open(&v5_path).expect("open v5 db");
     connection
         .execute_batch(
@@ -647,6 +594,7 @@ fn released_legacy_schema_variants_migrate() {
 
     let v6_path = dir.path().join("v6-initial-indexes.sqlite3");
     create_legacy_enum_database(&v6_path, 6);
+    remove_legacy_pending_approval(&v6_path, 6);
     let connection = rusqlite::Connection::open(&v6_path).expect("open v6 db");
     connection
         .execute_batch(
@@ -665,6 +613,7 @@ fn released_legacy_schema_variants_migrate() {
 
     let v7_path = dir.path().join("v7-appended-state.sqlite3");
     create_legacy_enum_database(&v7_path, 7);
+    remove_legacy_pending_approval(&v7_path, 7);
     let connection = rusqlite::Connection::open(&v7_path).expect("open v7 db");
     connection
         .execute_batch(
@@ -697,10 +646,9 @@ fn released_legacy_schema_variants_migrate() {
     );
 }
 
-// v8 historically collapsed every non-pending v7 handoff state to executing,
-// which prevents an unknown external side effect from being replayed.
+// 旧 execution state 不能绕过 current-only checkpoint codec。
 #[test]
-fn v7_non_pending_execution_states_migrate_fail_closed_as_executing() {
+fn v7_non_pending_execution_states_reject_migration_without_mutation() {
     for legacy_state in ["approved", "executing", "outcome_recorded"] {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join(format!("v7-{legacy_state}.sqlite3"));
@@ -744,19 +692,15 @@ fn v7_non_pending_execution_states_migrate_fail_closed_as_executing() {
             )
             .expect("set legacy state");
         drop(connection);
+        let before = sqlite_snapshot(&db_path);
 
-        let store = SessionStore::open(&db_path).expect("migrate v7 state");
-        drop(store);
-        let connection = rusqlite::Connection::open(&db_path).expect("reopen migrated db");
-        let state: String = connection
-            .query_row(
-                "select execution_state from pending_tool_calls
-                 where request_id = 'approval_pending'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("migrated execution state");
-        assert_eq!(state, "executing");
+        assert!(matches!(
+            SessionStore::open(&db_path),
+            Err(StoreError::InvalidState(message))
+                if message.contains("v7 pending AgentLoop checkpoint")
+        ));
+        assert_eq!(sqlite_snapshot(&db_path), before);
+        assert!(!has_v11_temporary_tables(&db_path));
     }
 }
 
@@ -1146,6 +1090,7 @@ fn ambiguous_legacy_turn_trace_is_rejected_without_mutation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
     create_legacy_enum_database(&db_path, 9);
+    remove_legacy_pending_approval(&db_path, 9);
     let connection = rusqlite::Connection::open(&db_path).expect("open legacy db");
     let payload = legacy_trace_payload(
         "trace_legacy_turn_repair",
@@ -4721,6 +4666,24 @@ fn create_v5_history_database(path: &std::path::Path) {
             "#,
         )
         .expect("create v5 schema");
+}
+
+fn remove_legacy_pending_approval(path: &std::path::Path, schema_version: u32) {
+    let connection = rusqlite::Connection::open(path).expect("open legacy database");
+    if schema_version >= 4 {
+        connection
+            .execute(
+                "delete from pending_tool_calls where request_id = 'approval_pending'",
+                [],
+            )
+            .expect("remove legacy pending checkpoint");
+    }
+    connection
+        .execute(
+            "delete from approvals where request_id = 'approval_pending'",
+            [],
+        )
+        .expect("remove legacy pending approval");
 }
 
 // 创建真实历史版本的最小数据库：v1/v2 仍没有 schema_meta，v3/v4

@@ -44,8 +44,11 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH;
 use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::Win32::System::Threading::MUTEX_MODIFY_STATE;
+use windows_sys::Win32::System::Threading::OpenMutexW;
 use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -171,6 +174,32 @@ fn wait_raw_named_mutex(name: &str, timeout_ms: u32) -> Result<Option<StateMutex
                 CloseHandle(handle);
             }
             anyhow::bail!("WaitForSingleObject failed for deny-read state: {wait}");
+        }
+    }
+}
+
+fn wait_existing_runner_mutex(name: &str) -> Result<StateMutex> {
+    let name = to_wide(name);
+    // SAFETY: `name` is a live, NUL-terminated UTF-16 buffer for the duration of the call. The
+    // returned HANDLE is owned here and is either transferred to `StateMutex` or closed below.
+    let handle = unsafe { OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, 0, name.as_ptr()) };
+    if handle == 0 {
+        // SAFETY: this immediately reads the calling thread's last-error value after OpenMutexW.
+        anyhow::bail!(
+            "open registered deny-read runner lease failed: {}",
+            unsafe { GetLastError() }
+        );
+    }
+    // SAFETY: `handle` is a valid mutex HANDLE opened above and remains owned by this function.
+    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    match wait {
+        WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(StateMutex { handle }),
+        _ => {
+            // SAFETY: this branch has not transferred the owned HANDLE into `StateMutex`.
+            unsafe {
+                CloseHandle(handle);
+            }
+            anyhow::bail!("wait for registered deny-read runner lease failed: {wait}");
         }
     }
 }
@@ -317,20 +346,14 @@ pub(crate) fn register_runner_lease(
     Ok(RegisteredRunnerLease { lease_name, handle })
 }
 
-/// Acquires a lease registered by the parent and verifies it still exists before child spawn.
-pub fn acquire_registered_runner_lease(
-    sandbox_home: &Path,
-    lease_name: &str,
-) -> Result<RunnerLeaseGuard> {
+/// Acquires the unpredictable, DACL-protected lease created by the parent before child spawn.
+///
+/// Persistent lease bookkeeping belongs to the parent. The runner executes as a distinct sandbox
+/// identity and must not read the real user's state directory to validate the kernel object it was
+/// handed over the parent-authenticated pipe.
+pub fn acquire_registered_runner_lease(lease_name: &str) -> Result<RunnerLeaseGuard> {
     validate_runner_lease_name(lease_name)?;
-    let mutex = wait_raw_named_mutex(lease_name, INFINITE)?
-        .ok_or_else(|| anyhow::anyhow!("infinite deny-read runner lease wait timed out"))?;
-    let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
-    let lock = lock_state(&state_path)?;
-    let state = load_state_for_runner(lock.path())?;
-    if !state.active_runner_leases.contains(lease_name) {
-        anyhow::bail!("deny-read runner lease is no longer registered");
-    }
+    let mutex = wait_existing_runner_mutex(lease_name)?;
     Ok(RunnerLeaseGuard { mutex: Some(mutex) })
 }
 
@@ -616,7 +639,8 @@ pub unsafe fn sync_persistent_deny_read_acls(
         }
     }
     let mut retained_stale = Vec::new();
-    let mut revoke_errors = Vec::new();
+    let mut revoke_error_count = 0usize;
+    let mut preferred_revoke_error = None;
     for (_, managed) in previous_by_key {
         if desired_keys.contains(&lexical_path_key(&managed.path)) {
             continue;
@@ -625,7 +649,14 @@ pub unsafe fn sync_persistent_deny_read_acls(
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                revoke_errors.push(format!("{}: {error}", managed.path.display()));
+                revoke_error_count = revoke_error_count.saturating_add(1);
+                retain_preferred_reconciliation_error(
+                    &mut preferred_revoke_error,
+                    anyhow::Error::new(error).context(format!(
+                        "inspect stale deny-read target {}",
+                        managed.path.display()
+                    )),
+                );
                 retained_stale.push(managed);
                 continue;
             }
@@ -633,7 +664,14 @@ pub unsafe fn sync_persistent_deny_read_acls(
         let current_fingerprint = match unsafe { deny_read_acl_fingerprint(&managed.path, psid) } {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
-                revoke_errors.push(format!("{}: {error}", managed.path.display()));
+                revoke_error_count = revoke_error_count.saturating_add(1);
+                retain_preferred_reconciliation_error(
+                    &mut preferred_revoke_error,
+                    error.context(format!(
+                        "inspect stale deny-read ACL {}",
+                        managed.path.display()
+                    )),
+                );
                 retained_stale.push(managed);
                 continue;
             }
@@ -642,18 +680,32 @@ pub unsafe fn sync_persistent_deny_read_acls(
             continue;
         }
         if current_fingerprint != managed.fingerprint {
-            revoke_errors.push(format!(
-                "{}: ownership fingerprint changed (current={current_fingerprint:?}, expected={:?})",
-                managed.path.display(),
-                managed.fingerprint
-            ));
+            revoke_error_count = revoke_error_count.saturating_add(1);
+            retain_preferred_reconciliation_error(
+                &mut preferred_revoke_error,
+                anyhow::anyhow!(
+                    "ownership fingerprint changed (current={current_fingerprint:?}, expected={:?})",
+                    managed.fingerprint
+                )
+                .context(format!(
+                    "refuse stale deny-read ACL revocation for {}",
+                    managed.path.display()
+                )),
+            );
             retained_stale.push(managed);
             continue;
         }
         if let Err(error) = unsafe {
             revoke_deny_read_ace_with_fingerprint(&managed.path, psid, &managed.fingerprint)
         } {
-            revoke_errors.push(format!("{}: {error}", managed.path.display()));
+            revoke_error_count = revoke_error_count.saturating_add(1);
+            retain_preferred_reconciliation_error(
+                &mut preferred_revoke_error,
+                error.context(format!(
+                    "revoke stale deny-read ACL {}",
+                    managed.path.display()
+                )),
+            );
             retained_stale.push(managed);
         }
     }
@@ -696,13 +748,30 @@ pub unsafe fn sync_persistent_deny_read_acls(
             .insert(principal_sid.to_string(), retained_legacy);
     }
     store_state(state_path, &state)?;
-    if !revoke_errors.is_empty() {
-        anyhow::bail!(
-            "failed to revoke stale deny-read ACLs: {}",
-            revoke_errors.join("; ")
-        );
+    if let Some(error) = preferred_revoke_error {
+        let detail = format!("{error:#}");
+        return Err(error.context(format!(
+            "failed to revoke stale deny-read ACLs: {detail} ({revoke_error_count} failure(s))"
+        )));
     }
     Ok(application.enforced_paths)
+}
+
+fn retain_preferred_reconciliation_error(
+    retained: &mut Option<anyhow::Error>,
+    candidate: anyhow::Error,
+) {
+    let candidate_is_typed_acl = candidate
+        .chain()
+        .any(|cause| cause.is::<crate::acl::WindowsAclError>());
+    let retained_is_typed_acl = retained.as_ref().is_some_and(|error| {
+        error
+            .chain()
+            .any(|cause| cause.is::<crate::acl::WindowsAclError>())
+    });
+    if retained.is_none() || (candidate_is_typed_acl && !retained_is_typed_acl) {
+        *retained = Some(candidate);
+    }
 }
 
 fn merge_tracked_paths(
@@ -721,18 +790,6 @@ fn merge_tracked_paths(
 }
 
 fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
-    load_state_inner(path, true)
-}
-
-/// Loads state for the sandbox runner without probing protected paths as the restricted user.
-/// The elevated parent validates path identities before writing the state and protects the state
-/// file from the runner; repeating those probes in the runner would necessarily hit its own
-/// deny-read ACLs.
-fn load_state_for_runner(path: &Path) -> Result<PersistentDenyReadAclState> {
-    load_state_inner(path, false)
-}
-
-fn load_state_inner(path: &Path, validate_paths: bool) -> Result<PersistentDenyReadAclState> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -741,11 +798,9 @@ fn load_state_inner(path: &Path, validate_paths: bool) -> Result<PersistentDenyR
                 Some(version) if version == u64::from(DENY_READ_ACL_STATE_VERSION) => {
                     let state: PersistentDenyReadAclState = serde_json::from_value(value)
                         .with_context(|| format!("parse deny-read ACL state {}", path.display()))?;
-                    if validate_paths {
-                        validate_state_paths(&state).with_context(|| {
-                            format!("validate deny-read ACL state paths {}", path.display())
-                        })?;
-                    }
+                    validate_state_paths(&state).with_context(|| {
+                        format!("validate deny-read ACL state paths {}", path.display())
+                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate deny-read ACL state {}", path.display())
                     })?;
@@ -768,14 +823,12 @@ fn load_state_inner(path: &Path, validate_paths: bool) -> Result<PersistentDenyR
                         active_runner_leases: previous.active_runner_leases,
                         ..PersistentDenyReadAclState::default()
                     };
-                    if validate_paths {
-                        validate_state_paths(&state).with_context(|| {
-                            format!(
-                                "validate version 3 deny-read ACL state paths {}",
-                                path.display()
-                            )
-                        })?;
-                    }
+                    validate_state_paths(&state).with_context(|| {
+                        format!(
+                            "validate version 3 deny-read ACL state paths {}",
+                            path.display()
+                        )
+                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate version 3 deny-read ACL state {}", path.display())
                     })?;
@@ -799,14 +852,12 @@ fn load_state_inner(path: &Path, validate_paths: bool) -> Result<PersistentDenyR
                         ),
                         ..PersistentDenyReadAclState::default()
                     };
-                    if validate_paths {
-                        validate_state_paths(&state).with_context(|| {
-                            format!(
-                                "validate version 2 deny-read ACL state paths {}",
-                                path.display()
-                            )
-                        })?;
-                    }
+                    validate_state_paths(&state).with_context(|| {
+                        format!(
+                            "validate version 2 deny-read ACL state paths {}",
+                            path.display()
+                        )
+                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate version 2 deny-read ACL state {}", path.display())
                     })?;
@@ -825,14 +876,12 @@ fn load_state_inner(path: &Path, validate_paths: bool) -> Result<PersistentDenyR
                         legacy_unmanaged_principals: legacy.principals,
                         ..PersistentDenyReadAclState::default()
                     };
-                    if validate_paths {
-                        validate_state_paths(&state).with_context(|| {
-                            format!(
-                                "validate legacy deny-read ACL state paths {}",
-                                path.display()
-                            )
-                        })?;
-                    }
+                    validate_state_paths(&state).with_context(|| {
+                        format!(
+                            "validate legacy deny-read ACL state paths {}",
+                            path.display()
+                        )
+                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate legacy deny-read ACL state {}", path.display())
                     })?;
@@ -928,16 +977,18 @@ mod tests {
     use super::ManagedDenyReadAcl;
     use super::PersistentDenyReadAclState;
     use super::load_state;
-    use super::load_state_for_runner;
     use super::lock_state;
     use super::merge_tracked_paths;
     use super::reconcile_runner_leases;
     use super::register_runner_lease;
+    use super::retain_preferred_reconciliation_error;
     use super::sandbox_dir;
     use super::state_mutex_name;
     use super::store_state;
     use super::sync_persistent_deny_read_acls;
     use super::try_lock_deny_read_execution;
+    use crate::acl::AclOperation;
+    use crate::acl::WindowsAclError;
     use crate::acl::add_deny_read_ace;
     use crate::acl::add_deny_write_ace;
     use crate::acl::dacl_has_read_deny_for_sid;
@@ -967,6 +1018,26 @@ mod tests {
     const CHILD_ENV: &str = "SINGULARITY_DENY_READ_STATE_CHILD";
     const EXECUTION_CHILD_ENV: &str = "SINGULARITY_DENY_READ_EXECUTION_CHILD";
     const EXECUTION_ACQUIRED_ENV: &str = "SINGULARITY_DENY_READ_EXECUTION_ACQUIRED";
+
+    #[test]
+    fn reconciliation_preserves_typed_acl_failure_over_generic_errors() {
+        let mut retained = None;
+        retain_preferred_reconciliation_error(
+            &mut retained,
+            anyhow::anyhow!("generic stale-state mismatch"),
+        );
+        retain_preferred_reconciliation_error(
+            &mut retained,
+            anyhow::Error::new(WindowsAclError {
+                operation: AclOperation::OpenTarget,
+                code: 5,
+            })
+            .context("reopen stale target"),
+        );
+
+        let retained = retained.expect("preferred reconciliation failure");
+        assert!(retained.chain().any(|cause| cause.is::<WindowsAclError>()));
+    }
     const HOME_ENV: &str = "SINGULARITY_DENY_READ_STATE_HOME";
     const PATH_ENV: &str = "SINGULARITY_DENY_READ_STATE_PATH";
 
@@ -1027,34 +1098,6 @@ mod tests {
                 PathBuf::from(r"C:\workspace\.git")
             ]
         );
-    }
-
-    #[test]
-    fn runner_state_loader_does_not_probe_protected_paths() {
-        let temp = tempfile::tempdir().expect("state directory");
-        let state_path = temp.path().join(DENY_READ_ACL_STATE_FILE);
-        let lease_name = format!(
-            r"Global\SingularityDenyReadRunner_{}",
-            "a".repeat(super::RUNNER_LEASE_NONCE_HEX_LEN)
-        );
-        let state = serde_json::json!({
-            "version": 4,
-            "principals": {
-                "S-1-5-21-test": [{
-                    "path": r"C:\Windows\System32\config\SAM",
-                    "fingerprint": {"entries": [{"flags": 0, "mask": 1}]}
-                }]
-            },
-            "active_runner_leases": [lease_name]
-        });
-        std::fs::write(
-            &state_path,
-            serde_json::to_vec(&state).expect("serialize runner state fixture"),
-        )
-        .expect("write runner state fixture");
-
-        let loaded = load_state_for_runner(&state_path).expect("load runner state");
-        assert_eq!(loaded.active_runner_leases.len(), 1);
     }
 
     #[test]
@@ -1166,12 +1209,28 @@ mod tests {
 
         assert!(reconcile_runner_leases(&sandbox_home, 1_000).expect("reconcile abandoned lease"));
         assert!(
-            super::acquire_registered_runner_lease(&sandbox_home, &lease_name).is_err(),
+            super::acquire_registered_runner_lease(&lease_name).is_err(),
             "a late runner must not spawn after its registration was reconciled"
         );
         let state = load_state(&sandbox_dir(&sandbox_home).join(DENY_READ_ACL_STATE_FILE))
             .expect("load reconciled lease state");
         assert!(state.active_runner_leases.is_empty());
+    }
+
+    #[test]
+    fn active_runner_lease_does_not_depend_on_parent_state_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_home = temp.path().join("singularity-home");
+        let username = std::env::var("USERNAME").expect("current Windows username");
+        let registration =
+            register_runner_lease(&sandbox_home, &username).expect("register runner lease");
+        let lease_name = registration.name().to_string();
+
+        std::fs::remove_dir_all(&sandbox_home).expect("remove parent-only state directory");
+
+        let lease = super::acquire_registered_runner_lease(&lease_name)
+            .expect("runner acquires the parent-created lease without reading parent state");
+        lease.release();
     }
 
     #[test]

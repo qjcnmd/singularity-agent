@@ -1454,61 +1454,26 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
     let blocked = agent_loop.run(&input);
     let pending = pending_approval(&blocked);
     let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
-    let mut legacy_checkpoint = checkpoint.clone();
-    legacy_checkpoint["checkpoint_version"] = serde_json::json!(1);
-    legacy_checkpoint["resources"] = serde_json::json!(["README.md"]);
-    legacy_checkpoint["tool_results"] = legacy_checkpoint["tool_result_occurrences"].clone();
-    legacy_checkpoint
-        .as_object_mut()
-        .expect("checkpoint object")
-        .remove("tool_result_occurrences");
-    legacy_checkpoint["tool_result_context_bindings"] = serde_json::json!([]);
     let resume_input = input.clone().with_approval_grant(ApprovalGrant::allow(
         pending.pending_tool_call().request_id.clone(),
         pending.pending_tool_call().tool_name.clone(),
         pending.pending_tool_call().resources.clone(),
     ));
 
-    let migrated = PendingApprovalOccurrence::from_checkpoint_payload(
-        pending.request().clone(),
-        &legacy_checkpoint,
-    )
-    .expect("migrate legacy checkpoint");
-
-    let mut invalid_resource = legacy_checkpoint.clone();
-    invalid_resource["resources"] = serde_json::json!(["../escape"]);
-    assert!(
+    let restored =
+        PendingApprovalOccurrence::from_checkpoint_payload(pending.request().clone(), &checkpoint)
+            .expect("decode current checkpoint");
+    let mut legacy_checkpoint = checkpoint.clone();
+    legacy_checkpoint["checkpoint_version"] = serde_json::json!(1);
+    assert_eq!(
         PendingApprovalOccurrence::from_checkpoint_payload(
             pending.request().clone(),
-            &invalid_resource,
+            &legacy_checkpoint,
         )
-        .expect_err("invalid legacy resource must fail closed")
-        .contains("workspace resource is invalid")
+        .expect_err("legacy checkpoint must fail closed"),
+        "unsupported approval checkpoint version"
     );
-    let mut mixed_resources = legacy_checkpoint.clone();
-    mixed_resources["resources"] = serde_json::json!([
-        "README.md",
-        {"kind": "workspace_path", "value": "README.md"}
-    ]);
-    assert!(
-        PendingApprovalOccurrence::from_checkpoint_payload(
-            pending.request().clone(),
-            &mixed_resources,
-        )
-        .expect_err("mixed legacy resource encodings must fail closed")
-        .contains("mix incompatible encodings")
-    );
-    let mut unknown_tool = legacy_checkpoint.clone();
-    unknown_tool["tool_name"] = serde_json::json!("unknown_tool");
-    assert!(
-        PendingApprovalOccurrence::from_checkpoint_payload(
-            pending.request().clone(),
-            &unknown_tool
-        )
-        .expect_err("unknown legacy tool must fail closed")
-        .contains("tool cannot be uniquely recovered")
-    );
-    let resumed = agent_loop.resume_pending_approval(&resume_input, &migrated);
+    let resumed = agent_loop.resume_pending_approval(&resume_input, &restored);
 
     assert_eq!(resumed.status, AgentStatus::Failed);
     assert_eq!(resumed.model_turns, 1);
@@ -2649,57 +2614,19 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     );
 
     let mut legacy_checkpoint = checkpoint.clone();
-    let mut legacy_results = legacy_checkpoint["tool_result_occurrences"]
-        .as_array()
-        .expect("checkpoint occurrences")
-        .clone();
-    let legacy_bindings = legacy_results
-        .iter()
-        .map(|occurrence| occurrence["visibility"].clone())
-        .collect::<Vec<_>>();
-    for occurrence in &mut legacy_results {
-        occurrence
-            .as_object_mut()
-            .expect("checkpoint occurrence object")
-            .remove("visibility");
-    }
     legacy_checkpoint["checkpoint_version"] = serde_json::json!(1);
-    legacy_checkpoint["tool_results"] = serde_json::Value::Array(legacy_results);
-    legacy_checkpoint["tool_result_context_bindings"] = serde_json::Value::Array(legacy_bindings);
-    legacy_checkpoint
-        .as_object_mut()
-        .expect("checkpoint object")
-        .remove("tool_result_occurrences");
-    let mut missing_legacy_bindings = legacy_checkpoint.clone();
-    missing_legacy_bindings
-        .as_object_mut()
-        .expect("checkpoint object")
-        .remove("tool_result_context_bindings");
-    let missing_legacy = PendingApprovalOccurrence::from_checkpoint_payload(
-        pending.request().clone(),
-        &missing_legacy_bindings,
-    );
-    assert!(
-        missing_legacy
-            .expect_err("missing legacy bindings must fail")
-            .contains("bindings are missing")
-    );
-    let migrated = PendingApprovalOccurrence::from_checkpoint_payload(
+    let legacy = PendingApprovalOccurrence::from_checkpoint_payload(
         pending.request().clone(),
         &legacy_checkpoint,
-    )
-    .expect("migrate non-empty legacy checkpoint");
-    let migrated_v2 = migrated
-        .encode_checkpoint()
-        .expect("encode migrated checkpoint");
-    assert_eq!(migrated_v2["checkpoint_version"], 2);
-    assert!(migrated_v2.get("tool_result_context_bindings").is_none());
-    assert!(
-        migrated_v2["tool_result_occurrences"][0]
-            .get("visibility")
-            .is_some()
     );
-    let resumed = resumed_agent_loop.resume_pending_approval(&resumed_input, &migrated);
+    assert_eq!(
+        legacy.expect_err("legacy checkpoint must fail closed"),
+        "unsupported approval checkpoint version"
+    );
+    let restored =
+        PendingApprovalOccurrence::from_checkpoint_payload(pending.request().clone(), &checkpoint)
+            .expect("decode current checkpoint");
+    let resumed = resumed_agent_loop.resume_pending_approval(&resumed_input, &restored);
 
     assert_eq!(
         resumed.status,

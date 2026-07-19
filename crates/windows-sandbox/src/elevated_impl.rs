@@ -22,6 +22,8 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
     pub deny_write_paths_override: &'a [AbsolutePathBuf],
     pub protect_workspace_metadata: bool,
+    #[cfg(target_os = "windows")]
+    pub workspace_change_monitor: Option<&'a mut Option<crate::WorkspaceChangeMonitor>>,
 }
 
 impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
@@ -51,6 +53,8 @@ impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
             deny_read_paths_override: &[],
             deny_write_paths_override: &[],
             protect_workspace_metadata: true,
+            #[cfg(target_os = "windows")]
+            workspace_change_monitor: None,
         }
     }
 }
@@ -191,6 +195,7 @@ mod windows_impl {
             deny_read_paths_override,
             deny_write_paths_override,
             protect_workspace_metadata,
+            workspace_change_monitor,
         } = request;
         // Resolve safe aliases once so the execution mutex, setup payload, runner registration,
         // cleanup, and every state-file operation share one long-lived sandbox-home identity.
@@ -319,6 +324,13 @@ mod windows_impl {
             return Ok(cancelled_capture_result());
         }
 
+        if let Some(slot) = workspace_change_monitor {
+            let workspace = workspace_roots
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("workspace change monitoring requires a root"))?;
+            *slot = Some(crate::WorkspaceChangeMonitor::start(workspace.as_path())?);
+        }
+
         let capture_result = (|| -> Result<CaptureResult> {
             let spawn_request = SpawnRequest {
                 command: command.clone(),
@@ -327,7 +339,6 @@ mod windows_impl {
                 permission_profile: permission_profile.clone(),
                 workspace_roots: workspace_roots.to_vec(),
                 sandbox_home: sandbox_base.clone(),
-                real_sandbox_home: sandbox_home.to_path_buf(),
                 deny_read_runner_lease_name: String::new(),
                 cap_sids,
                 timeout_ms,

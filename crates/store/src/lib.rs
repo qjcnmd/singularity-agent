@@ -391,16 +391,6 @@ mod migration {
         execution_state: String,
     }
 
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct LegacyPendingToolCallV4 {
-        request_id: String,
-        tool_call_id: String,
-        tool_name: String,
-        raw_arguments: String,
-        resources: Vec<String>,
-    }
-
     #[derive(Debug, Clone)]
     struct LegacyArtifactRow {
         artifact: ArtifactRef,
@@ -1766,46 +1756,13 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                     "pending tool call {request_id} has no approval request"
                 ))
             })?;
-            if version <= 6 {
-                let legacy: LegacyPendingToolCallV4 = serde_json::from_str(&payload).map_err(
-                    |error| {
-                        StoreError::InvalidState(format!(
-                            "pending tool call {request_id} payload is invalid for v{version}: {error}"
-                        ))
-                    },
-                )?;
-                let legacy_action = legacy_tool_id(
-                    legacy.tool_name.clone(),
-                    &format!("pending tool call {request_id}"),
-                )?;
-                let legacy_resources = legacy_permission_resources(
-                    &legacy_action,
-                    legacy.resources,
-                    &format!("pending tool call {request_id}"),
-                )?;
-                if legacy.request_id != request_id
-                    || legacy.tool_call_id.trim().is_empty()
-                    || legacy_action != approval.request.action
-                    || legacy_resources != approval.request.resources
-                    || serde_json::from_str::<Value>(&legacy.raw_arguments).is_err()
-                    || thread_id
-                        .as_deref()
-                        .is_some_and(|value| value != approval.request.thread_id)
-                    || turn_id != approval.request.turn_id
-                    || tool_call_id
-                        .as_deref()
-                        .is_some_and(|value| value != legacy.tool_call_id)
-                {
-                    return Err(StoreError::InvalidState(format!(
-                        "pending tool call {request_id} legacy binding is invalid"
-                    )));
-                }
+            if version < SCHEMA_VERSION {
                 return Err(StoreError::InvalidState(format!(
-                    "v{version} pending tool call {request_id} cannot be migrated without fabricating an AgentLoop checkpoint"
+                    "v{version} pending AgentLoop checkpoint {request_id} cannot be migrated into the current checkpoint contract"
                 )));
             }
-            // v7+ checkpoint payloads stay opaque here: syntax validation is the
-            // only payload check; Agent owns version and resource migration.
+            // Current checkpoint payloads stay opaque here: syntax validation is the only payload
+            // check; Agent owns the versioned codec and all business-field validation.
             if payload.trim().is_empty() {
                 return Err(StoreError::InvalidState(format!(
                     "pending tool call {request_id} payload is empty"
@@ -1826,11 +1783,9 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                         "pending tool call {request_id} has no tool_call_id"
                     ))
                 })?;
-            let execution_state = match (version, state.as_deref().unwrap_or("pending")) {
-                (7, "pending") => "pending".to_string(),
-                (7, "approved" | "executing" | "outcome_recorded") => "executing".to_string(),
-                (8..=SCHEMA_VERSION, "pending") => "pending".to_string(),
-                (8..=SCHEMA_VERSION, "executing") => "executing".to_string(),
+            let execution_state = match state.as_deref().unwrap_or("pending") {
+                "pending" => "pending".to_string(),
+                "executing" => "executing".to_string(),
                 _ => {
                     return Err(StoreError::InvalidState(format!(
                         "pending tool call {request_id} has unknown execution state"

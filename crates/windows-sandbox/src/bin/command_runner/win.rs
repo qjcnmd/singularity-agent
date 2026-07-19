@@ -432,10 +432,7 @@ pub fn main() -> Result<()> {
         }
     };
 
-    let runner_lease = match acquire_registered_runner_lease(
-        &req.real_sandbox_home,
-        &req.deny_read_runner_lease_name,
-    ) {
+    let runner_lease = match acquire_registered_runner_lease(&req.deny_read_runner_lease_name) {
         Ok(lease) => lease,
         Err(err) => {
             let _ = send_error(

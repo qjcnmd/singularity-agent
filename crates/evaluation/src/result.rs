@@ -3,12 +3,11 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::{
     CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS, EvaluationCapability, EvaluationError,
-    PREVIOUS_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION, Result, RunId, TaskId,
-    ToolCapabilityRequirement, validation_error,
+    RESULT_SCHEMA_VERSION, Result, RunId, TaskId, ToolCapabilityRequirement,
+    require_schema_version, validation_error,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,40 +642,8 @@ impl EvaluationResult {
     }
 
     pub fn from_json_str(json: &str) -> Result<Self> {
-        let mut value: Value = serde_json::from_str(json)?;
-        let actual = value
-            .get("schema_version")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let migrated = actual == PREVIOUS_RESULT_SCHEMA_VERSION;
-        match actual {
-            RESULT_SCHEMA_VERSION => {}
-            PREVIOUS_RESULT_SCHEMA_VERSION => migrate_result_v6(&mut value)?,
-            _ => {
-                return Err(EvaluationError::UnsupportedSchemaVersion {
-                    expected: RESULT_SCHEMA_VERSION,
-                    actual: actual.to_string(),
-                });
-            }
-        }
-        let result: Self = serde_json::from_value(value)?;
-        let result = if migrated {
-            let tasks = result
-                .tasks
-                .into_iter()
-                .map(|task| {
-                    EvaluationTaskResult::from_trials(
-                        task.task_id,
-                        task.capabilities,
-                        task.required_tool_capabilities,
-                        task.trials,
-                    )
-                })
-                .collect::<Vec<_>>();
-            EvaluationResult::from_tasks(result.run_id, result.summary.trials_per_task, tasks)
-        } else {
-            result
-        };
+        require_schema_version(json, RESULT_SCHEMA_VERSION)?;
+        let result: Self = serde_json::from_str(json)?;
         result.validate()?;
         Ok(result)
     }
@@ -741,34 +708,6 @@ fn count_trials(
     predicate: impl Fn(&EvaluationTrialResult) -> bool,
 ) -> u32 {
     u32::try_from(trials.iter().filter(|trial| predicate(trial)).count()).unwrap_or(u32::MAX)
-}
-
-fn migrate_result_v6(value: &mut Value) -> Result<()> {
-    let tasks = value
-        .get_mut("tasks")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| validation_error("evaluation.result/v6 tasks must be an array"))?;
-    for task in tasks {
-        let task_summary = task
-            .get_mut("summary")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                validation_error("evaluation.result/v6 task summary must be an object")
-            })?;
-        task_summary.remove("evaluation_passed_count");
-        task_summary.insert("trial_success_count".to_string(), json!(0));
-    }
-
-    let summary = value
-        .get_mut("summary")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| validation_error("evaluation.result/v6 summary must be an object"))?;
-    summary.remove("evaluation_passed_count");
-    summary.insert("task_success_count".to_string(), json!(0));
-    summary.insert("trial_success_count".to_string(), json!(0));
-    summary.insert("trial_success_rate_basis_points".to_string(), json!(0));
-    value["schema_version"] = Value::String(RESULT_SCHEMA_VERSION.to_string());
-    Ok(())
 }
 
 fn validate_nonempty_unique<T: Ord + Clone>(values: &[T], context: &str) -> Result<()> {

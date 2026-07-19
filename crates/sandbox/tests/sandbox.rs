@@ -4,6 +4,8 @@ use schemars::schema_for;
 use singularity_core::CancellationToken;
 #[cfg(windows)]
 use singularity_sandbox::SandboxNetworkMode;
+#[cfg(windows)]
+use singularity_sandbox::WorkspaceMutation;
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
     CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
@@ -280,6 +282,7 @@ fn windows_backend_reports_strict_maximum_capabilities() {
     );
     assert!(backend.capabilities().filesystem_isolation);
     assert!(backend.capabilities().network_isolation);
+    assert!(backend.capabilities().change_detection);
 }
 
 #[cfg(windows)]
@@ -406,7 +409,29 @@ fn windows_elevated_backend_executes_network_denied_command() {
         result.sandbox.enforcement,
         SandboxBackendEnforcement::Strict
     );
+    assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
     assert!(!result.sandbox.local_process_fallback);
+
+    let changed_request = CommandRequest::project_verification(
+        "command_elevated_changed",
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo changed>changed.txt".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    let changed_result = WindowsSandboxBackend::new().execute(&changed_request);
+    assert_eq!(
+        changed_result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{changed_result:#?}"
+    );
+    assert_eq!(
+        changed_result.workspace_mutation,
+        WorkspaceMutation::Changed
+    );
 }
 
 #[cfg(windows)]
@@ -443,6 +468,7 @@ fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
         CommandExecutionStatus::Completed,
         "{create_result:#?}"
     );
+    assert_eq!(create_result.workspace_mutation, WorkspaceMutation::Changed);
     assert!(
         generated.exists(),
         "sandbox command must create the protected file"

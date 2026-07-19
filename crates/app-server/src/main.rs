@@ -582,41 +582,53 @@ fn send_output(
         .map_err(|_| "output ordering state poisoned".to_string())?;
     flush_pending_event_gap_locked(outputs, cancellation)?;
     let order = reserve_output_order(outputs)?;
-    drop(_send_guard);
     match kind {
-        OutputKind::Control => outputs
-            .control
-            .send(QueuedOutput { order, message })
-            .map(|()| {
-                complete_output_order(outputs, order);
-                OutputSendStatus::Enqueued
-            })
-            .map_err(|_| {
-                complete_output_order(outputs, order);
-                cancellation.request_execution_stop();
-                "stdout transport unavailable".to_string()
-            }),
-        OutputKind::ReliableEvent => outputs
-            .event
-            .send(QueuedOutput { order, message })
-            .map(|()| {
-                complete_output_order(outputs, order);
-                OutputSendStatus::Enqueued
-            })
-            .map_err(|_| {
-                complete_output_order(outputs, order);
-                cancellation.request_execution_stop();
-                "stdout transport unavailable".to_string()
-            }),
+        OutputKind::Control => {
+            drop(_send_guard);
+            outputs
+                .control
+                .send(QueuedOutput { order, message })
+                .map(|()| {
+                    complete_output_order(outputs, order);
+                    OutputSendStatus::Enqueued
+                })
+                .map_err(|_| {
+                    complete_output_order(outputs, order);
+                    cancellation.request_execution_stop();
+                    "stdout transport unavailable".to_string()
+                })
+        }
+        OutputKind::ReliableEvent => {
+            drop(_send_guard);
+            outputs
+                .event
+                .send(QueuedOutput { order, message })
+                .map(|()| {
+                    complete_output_order(outputs, order);
+                    OutputSendStatus::Enqueued
+                })
+                .map_err(|_| {
+                    complete_output_order(outputs, order);
+                    cancellation.request_execution_stop();
+                    "stdout transport unavailable".to_string()
+                })
+        }
+        // `try_send` cannot block, so keep the ordering guard until a dropped progress event and
+        // its reserved order are committed to the same gap. Reliable sends release the guard
+        // before backpressure so one slow queue does not serialize unrelated Turn workers.
         OutputKind::Event => match outputs.event.try_send(QueuedOutput { order, message }) {
             Ok(()) => {
                 complete_output_order(outputs, order);
                 Ok(OutputSendStatus::Enqueued)
             }
-            Err(TrySendError::Full(output)) => {
-                record_event_gap(outputs, &output.message, order)?;
-                Ok(OutputSendStatus::EventDropped)
-            }
+            Err(TrySendError::Full(output)) => record_event_gap(outputs, &output.message, order)
+                .map_or_else(
+                    |error| {
+                        complete_output_order(outputs, order);
+                        Err(error)
+                    },
+                    |()| Ok(OutputSendStatus::EventDropped),
+                ),
             Err(TrySendError::Disconnected(_)) => {
                 complete_output_order(outputs, order);
                 cancellation.request_execution_stop();

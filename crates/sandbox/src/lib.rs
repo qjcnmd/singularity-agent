@@ -1170,7 +1170,8 @@ mod windows_backend {
         AbsolutePathBuf, ElevatedSandboxProfileCaptureRequest, FileSystemAccessMode,
         FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
         ManagedFileSystemPermissions, NetworkSandboxPolicy, PermissionProfile,
-        WindowsSandboxCancellationToken, resolve_windows_deny_read_paths,
+        WindowsSandboxCancellationToken, WorkspaceChangeMonitor, WorkspaceChangeObservation,
+        resolve_windows_deny_read_paths,
         run_windows_sandbox_capture_for_permission_profile_elevated,
         run_windows_sandbox_capture_with_filesystem_overrides, safe_windows_error_summary,
     };
@@ -1236,7 +1237,7 @@ mod windows_backend {
         }
 
         fn capabilities(&self) -> SandboxCapabilities {
-            SandboxCapabilities::strict()
+            SandboxCapabilities::strict().with_change_detection()
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -1282,12 +1283,15 @@ mod windows_backend {
                         );
                 }
             };
-            match execute_windows_sandbox(&request.command_id, cancellation, prepared) {
-                Ok(result) => result,
-                Err(error) => CommandResult::backend_error(&request.command_id, error)
-                    .with_workspace_mutation(WorkspaceMutation::Unknown)
-                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
-            }
+            execute_prepared_command(
+                &request.command_id,
+                cancellation,
+                prepared,
+                matches!(
+                    request.filesystem.mode,
+                    SandboxFilesystemMode::WorkspaceWrite
+                ),
+            )
         }
 
         fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
@@ -1333,13 +1337,47 @@ mod windows_backend {
                         );
                 }
             };
-            match execute_windows_sandbox(&request.command_id, cancellation, prepared) {
-                Ok(result) => result,
-                Err(error) => CommandResult::backend_error(&request.command_id, error)
-                    .with_workspace_mutation(WorkspaceMutation::Unknown)
-                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
-            }
+            execute_prepared_command(
+                &request.command_id,
+                cancellation,
+                prepared,
+                matches!(
+                    request.filesystem.mode,
+                    SandboxFilesystemMode::WorkspaceWrite
+                ),
+            )
         }
+    }
+
+    fn execute_prepared_command(
+        command_id: &str,
+        cancellation: &CancellationToken,
+        prepared: PreparedCommand,
+        observe_workspace_change: bool,
+    ) -> CommandResult {
+        let mut monitor = None;
+        let result = match execute_windows_sandbox(
+            command_id,
+            cancellation,
+            prepared,
+            observe_workspace_change.then_some(&mut monitor),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return CommandResult::backend_error(command_id, error)
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
+                    .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable);
+            }
+        };
+        let mutation = match monitor {
+            Some(monitor) => match monitor.finish() {
+                Ok(WorkspaceChangeObservation::Unchanged) => WorkspaceMutation::Unchanged,
+                Ok(WorkspaceChangeObservation::Changed) => WorkspaceMutation::Changed,
+                Ok(WorkspaceChangeObservation::Unknown) | Err(_) => WorkspaceMutation::Unknown,
+            },
+            None => WorkspaceMutation::Unknown,
+        };
+        result.with_workspace_mutation(mutation)
     }
 
     /// 将 core 的 protected path 规则投影为 resolver 可展开的 workspace glob。
@@ -1569,6 +1607,7 @@ mod windows_backend {
     fn elevated_capture_request<'a>(
         prepared: &'a PreparedCommand,
         windows_cancellation: WindowsSandboxCancellationToken,
+        workspace_change_monitor: Option<&'a mut Option<WorkspaceChangeMonitor>>,
     ) -> ElevatedSandboxProfileCaptureRequest<'a> {
         let mut elevated = ElevatedSandboxProfileCaptureRequest::new(
             &prepared.permission_profile,
@@ -1584,6 +1623,7 @@ mod windows_backend {
         elevated.deny_read_paths_override = &prepared.protected_deny_read_paths;
         elevated.deny_write_paths_override = &prepared.protected_deny_write_paths;
         elevated.protect_workspace_metadata = prepared.protect_workspace_metadata;
+        elevated.workspace_change_monitor = workspace_change_monitor;
         elevated
     }
 
@@ -1591,15 +1631,19 @@ mod windows_backend {
         command_id: &str,
         cancellation: &CancellationToken,
         prepared: PreparedCommand,
+        workspace_change_monitor: Option<&mut Option<WorkspaceChangeMonitor>>,
     ) -> Result<CommandResult, String> {
         let started = Instant::now();
         let windows_cancellation = WindowsSandboxCancellationToken::new({
             let cancellation = cancellation.clone();
             move || cancellation.is_cancelled()
         });
-        let elevated = run_windows_sandbox_capture_for_permission_profile_elevated(
-            elevated_capture_request(&prepared, windows_cancellation.clone()),
-        );
+        let elevated =
+            run_windows_sandbox_capture_for_permission_profile_elevated(elevated_capture_request(
+                &prepared,
+                windows_cancellation.clone(),
+                workspace_change_monitor,
+            ));
         match elevated {
             Ok(capture) => Ok(command_result_from_capture(command_id, capture, started)
                 .with_sandbox_execution(ELEVATED_BACKEND_NAME, SandboxBackendEnforcement::Strict)),
@@ -2346,8 +2390,11 @@ mod windows_backend {
                 protected_paths
             );
 
-            let elevated =
-                elevated_capture_request(&prepared, WindowsSandboxCancellationToken::new(|| false));
+            let elevated = elevated_capture_request(
+                &prepared,
+                WindowsSandboxCancellationToken::new(|| false),
+                None,
+            );
             assert_eq!(
                 elevated.deny_read_paths_override,
                 prepared.protected_deny_read_paths.as_slice()
@@ -2472,8 +2519,11 @@ mod windows_backend {
                 .map(|path| dunce::canonicalize(path).expect("canonical protected path"))
                 .collect()
             );
-            let elevated =
-                elevated_capture_request(&prepared, WindowsSandboxCancellationToken::new(|| false));
+            let elevated = elevated_capture_request(
+                &prepared,
+                WindowsSandboxCancellationToken::new(|| false),
+                None,
+            );
             assert_eq!(
                 elevated.deny_read_paths_override,
                 prepared.protected_deny_read_paths.as_slice()

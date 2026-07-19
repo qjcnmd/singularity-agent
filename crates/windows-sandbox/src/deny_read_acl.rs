@@ -2,6 +2,7 @@ use crate::acl::DenyReadAclFingerprint;
 use crate::acl::add_deny_read_ace_with_ownership_before_set;
 use crate::acl::add_deny_read_ace_with_ownership_to_handle_before_set;
 use crate::acl::add_deny_write_ace_to_handle;
+use crate::acl::open_acl_target_file;
 use crate::acl::revoke_deny_read_ace_with_fingerprint;
 use crate::path_normalization::lexical_path_key;
 use crate::path_safety::FILE_ATTRIBUTE_REPARSE_POINT;
@@ -14,12 +15,15 @@ use crate::path_safety::open_filesystem_root;
 use crate::path_safety::validate_plain_directory;
 use anyhow::Context;
 use anyhow::Result;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cap_std::fs::Dir;
 use serde::Deserialize;
 use serde::Serialize;
 use singularity_core::PROTECTED_GIT_DIR_NAME;
 use std::collections::HashSet;
 use std::ffi::{OsStr, c_void};
+use std::io::Read;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use windows_sys::Wdk::Storage::FileSystem::{FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF};
@@ -32,6 +36,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_FLAG_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO_EX;
+use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY;
 use windows_sys::Win32::Storage::FileSystem::FileDispositionInfoEx;
 use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
@@ -39,6 +44,8 @@ use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::WindowsProgramming::FILE_CREATED;
+
+const MAX_PEM_CLASSIFICATION_BYTES: u64 = 1024 * 1024;
 
 /// Build the exact ACL paths that should receive a deny-read ACE.
 ///
@@ -58,6 +65,93 @@ fn push_planned_path(planned: &mut Vec<PathBuf>, seen: &mut HashSet<String>, pat
     if seen.insert(lexical_path_key(&path)) {
         planned.push(path);
     }
+}
+
+fn is_pem_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pem"))
+}
+
+fn public_certificate_label<'a>(line: &'a str, boundary: &str) -> Option<&'a str> {
+    line.strip_prefix(boundary)
+        .and_then(|line| line.strip_suffix("-----"))
+        .filter(|label| matches!(*label, "CERTIFICATE" | "TRUSTED CERTIFICATE"))
+}
+
+fn is_public_certificate_metadata_comment(line: &str) -> bool {
+    [
+        "# Issuer:",
+        "# Subject:",
+        "# Label:",
+        "# Serial:",
+        "# MD5 Fingerprint:",
+        "# SHA1 Fingerprint:",
+        "# SHA256 Fingerprint:",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+/// Returns whether a pinned `.pem` file contains only public certificate blocks.
+///
+/// Unknown, unreadable, oversized, or mixed PEM payloads remain protected. The caller retains the
+/// same no-follow handle for a subsequent deny-ACL mutation when this returns `false`.
+fn is_public_certificate_only_pem(file: &mut std::fs::File) -> Result<bool> {
+    if !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PEM_CLASSIFICATION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read pinned PEM classification input")?;
+    if bytes.len() as u64 > MAX_PEM_CLASSIFICATION_BYTES {
+        return Ok(false);
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(false);
+    };
+    let mut open_label = None;
+    let mut encoded_block = String::new();
+    let mut certificate_count = 0usize;
+    for line in text.lines().map(str::trim) {
+        match open_label {
+            None => {
+                if line.is_empty() || is_public_certificate_metadata_comment(line) {
+                    continue;
+                }
+                let Some(label) = public_certificate_label(line, "-----BEGIN ") else {
+                    return Ok(false);
+                };
+                open_label = Some(label);
+                encoded_block.clear();
+            }
+            Some(expected_label) => {
+                if let Some(label) = public_certificate_label(line, "-----END ") {
+                    if label != expected_label
+                        || encoded_block.is_empty()
+                        || BASE64_STANDARD.decode(encoded_block.as_bytes()).is_err()
+                    {
+                        return Ok(false);
+                    }
+                    certificate_count = certificate_count.saturating_add(1);
+                    open_label = None;
+                    continue;
+                }
+                if line.is_empty()
+                    || line.starts_with("-----")
+                    || !line.is_ascii()
+                    || !line.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+                    })
+                {
+                    return Ok(false);
+                }
+                encoded_block.push_str(line);
+            }
+        }
+    }
+    Ok(open_label.is_none() && certificate_count > 0)
 }
 
 fn is_reparse_point_attributes(attributes: u32) -> bool {
@@ -339,6 +433,33 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership_before_set(
     let mut added_in_this_call: Vec<ManagedDenyReadAcl> = Vec::new();
     let mut pinned_materialized = Vec::new();
     for path in planned {
+        let pem_exists = if is_pem_path(&path) {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect PEM deny-read target {}", path.display())
+                    });
+                }
+            }
+        } else {
+            false
+        };
+        let pinned_pem_target = if pem_exists {
+            let mut classification_target = open_acl_target_file(&path, FILE_GENERIC_READ)?;
+            if is_public_certificate_only_pem(&mut classification_target)? {
+                continue;
+            }
+            let mut enforcement_target =
+                open_acl_target_file(&path, FILE_GENERIC_READ | READ_CONTROL | WRITE_DAC)?;
+            if is_public_certificate_only_pem(&mut enforcement_target)? {
+                continue;
+            }
+            Some(enforcement_target)
+        } else {
+            None
+        };
         let result = (|| -> Result<(Option<ManagedDenyReadAcl>, Option<MaterializedDirectory>)> {
             let materialized = match std::fs::symlink_metadata(&path) {
                 Ok(_) => None,
@@ -357,11 +478,18 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership_before_set(
                     fingerprint: fingerprint.clone(),
                 })
             };
-            let mutation = match &materialized {
-                Some(materialized) => unsafe {
+            let mutation = match (materialized.as_ref(), pinned_pem_target.as_ref()) {
+                (Some(materialized), _) => unsafe {
                     materialized.add_deny_read_ace_with_ownership_before_set(psid, &mut journal)
                 },
-                None => unsafe {
+                (None, Some(file)) => unsafe {
+                    add_deny_read_ace_with_ownership_to_handle_before_set(
+                        file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+                        psid,
+                        &mut journal,
+                    )
+                },
+                (None, None) => unsafe {
                     add_deny_read_ace_with_ownership_before_set(&path, psid, &mut journal)
                 },
             }
@@ -739,6 +867,78 @@ mod tests {
         unsafe {
             LocalFree(p_sd as HLOCAL);
             revoke_deny_read_ace(&missing_marker, sid.as_ptr()).expect("restore marker ACL");
+        }
+    }
+
+    #[test]
+    fn pem_classification_allows_public_certificates_and_protects_private_keys() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certificate = tmp.path().join("certificate.pem");
+        let private_key = tmp.path().join("private.pem");
+        let combined = tmp.path().join("combined.pem");
+        let malformed = tmp.path().join("malformed.pem");
+        std::fs::write(
+            &certificate,
+            "# Issuer: CN=Public Root\n# Subject: CN=Public Root\n-----BEGIN CERTIFICATE-----\nY2VydA==\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write certificate");
+        std::fs::write(
+            &private_key,
+            "-----BEGIN PRIVATE KEY-----\na2V5\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write private key");
+        std::fs::write(
+            &combined,
+            "-----BEGIN CERTIFICATE-----\nY2VydA==\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\na2V5\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("write combined PEM");
+        std::fs::write(
+            &malformed,
+            "-----BEGIN CERTIFICATE-----\nY2VydA==\n-----END TRUSTED CERTIFICATE-----\n",
+        )
+        .expect("write malformed PEM");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+
+        let applied = unsafe {
+            apply_deny_read_acls(
+                &[
+                    certificate.clone(),
+                    private_key.clone(),
+                    combined.clone(),
+                    malformed.clone(),
+                ],
+                sid.as_ptr(),
+            )
+        }
+        .expect("classify and protect PEM paths");
+
+        assert_eq!(
+            applied,
+            vec![private_key.clone(), combined.clone(), malformed.clone()]
+        );
+        for (path, denied) in [
+            (&certificate, false),
+            (&private_key, true),
+            (&combined, true),
+            (&malformed, true),
+        ] {
+            let (dacl, security_descriptor) =
+                unsafe { fetch_dacl_handle(path) }.expect("fetch PEM ACL");
+            assert_eq!(
+                unsafe { dacl_has_read_deny_for_sid(dacl, sid.as_ptr()) },
+                denied,
+                "{}",
+                path.display()
+            );
+            unsafe {
+                LocalFree(security_descriptor as HLOCAL);
+            }
+        }
+        unsafe {
+            revoke_deny_read_ace(&private_key, sid.as_ptr()).expect("restore private-key ACL");
+            revoke_deny_read_ace(&combined, sid.as_ptr()).expect("restore combined PEM ACL");
+            revoke_deny_read_ace(&malformed, sid.as_ptr()).expect("restore malformed PEM ACL");
         }
     }
 

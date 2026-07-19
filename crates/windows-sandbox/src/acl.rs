@@ -172,25 +172,7 @@ unsafe fn open_acl_target(path: &Path, desired_access: u32, object_type: i32) ->
             ERROR_INVALID_DATA,
         )));
     }
-    let file = match open_existing_acl_target(path, desired_access) {
-        Ok(file) => file,
-        Err(error) => {
-            let native_code = error.chain().find_map(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .and_then(std::io::Error::raw_os_error)
-                    .map(|code| code as u32)
-            });
-            if let Some(code) = native_code {
-                return Err(anyhow::Error::new(WindowsAclError::new(
-                    AclOperation::OpenTarget,
-                    code,
-                ))
-                .context(error));
-            }
-            return Err(error);
-        }
-    };
+    let file = open_acl_target_file(path, desired_access)?;
     let handle = file.as_raw_handle() as HANDLE;
     // SAFETY: `handle` is owned by `file` and remains valid until it is transferred below;
     // Windows initializes the plain output structure through the valid mutable pointer.
@@ -256,12 +238,35 @@ unsafe fn open_acl_target(path: &Path, desired_access: u32, object_type: i32) ->
     })
 }
 
-/// Borrows an already pinned directory handle for one ACL operation.
+/// Opens a no-follow ACL target while preserving native access failures as typed ACL errors.
+pub(crate) fn open_acl_target_file(path: &Path, desired_access: u32) -> Result<std::fs::File> {
+    match open_existing_acl_target(path, desired_access) {
+        Ok(file) => Ok(file),
+        Err(error) => {
+            let native_code = error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    .map(|code| code as u32)
+            });
+            if let Some(code) = native_code {
+                return Err(anyhow::Error::new(WindowsAclError::new(
+                    AclOperation::OpenTarget,
+                    code,
+                ))
+                .context(error));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Borrows an already pinned file or directory handle for one ACL operation.
 ///
 /// The caller retains handle ownership and must have opened it with the access required by the
 /// requested operation.
-unsafe fn borrow_acl_directory(handle: HANDLE) -> Result<AclTarget> {
-    // SAFETY: `handle` is a caller-owned directory handle, and the Win32 output structure is
+unsafe fn borrow_acl_target(handle: HANDLE) -> Result<AclTarget> {
+    // SAFETY: `handle` is a caller-owned filesystem handle, and the Win32 output structure is
     // initialized through a valid mutable pointer.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe {
@@ -273,14 +278,13 @@ unsafe fn borrow_acl_directory(handle: HANDLE) -> Result<AclTarget> {
             unsafe { GetLastError() },
         )));
     }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        || info.dwFileAttributes & 0x0000_0400 != 0
-    {
+    if info.dwFileAttributes & 0x0000_0400 != 0 {
         return Err(anyhow::Error::new(WindowsAclError::new(
             AclOperation::ReparseTargetUnsupported,
             50, // ERROR_NOT_SUPPORTED
         )));
     }
+    let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
     let identity = AclTargetIdentity {
         volume_serial_number: info.dwVolumeSerialNumber,
         file_index_high: info.nFileIndexHigh,
@@ -310,10 +314,22 @@ unsafe fn borrow_acl_directory(handle: HANDLE) -> Result<AclTarget> {
         handle,
         p_dacl,
         p_sd,
-        is_directory: true,
+        is_directory,
         identity,
         owns_handle: false,
     })
+}
+
+/// Borrows an already pinned directory handle for directory-only ACL operations.
+unsafe fn borrow_acl_directory(handle: HANDLE) -> Result<AclTarget> {
+    let target = unsafe { borrow_acl_target(handle) }?;
+    if !target.is_directory {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::ReparseTargetUnsupported,
+            50, // ERROR_NOT_SUPPORTED
+        )));
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -1064,14 +1080,14 @@ pub(crate) unsafe fn add_deny_read_ace_with_ownership_before_set(
 /// Adds a deny-read ACE through a pinned handle after persisting its expected fingerprint.
 ///
 /// # Safety
-/// Caller must ensure `handle` is a valid directory handle with `READ_CONTROL | WRITE_DAC` and
-/// `psid` points to a valid SID.
+/// Caller must ensure `handle` is a valid file or directory handle with
+/// `READ_CONTROL | WRITE_DAC` and `psid` points to a valid SID.
 pub(crate) unsafe fn add_deny_read_ace_with_ownership_to_handle_before_set(
     handle: HANDLE,
     psid: *mut c_void,
     before_set: &mut dyn FnMut(&DenyReadAclFingerprint) -> Result<()>,
 ) -> Result<DenyAceAddResult> {
-    let target = unsafe { borrow_acl_directory(handle) }?;
+    let target = unsafe { borrow_acl_target(handle) }?;
     unsafe { add_deny_ace_to_target(target, psid, DenyAceKind::Read, Some(before_set)) }
 }
 

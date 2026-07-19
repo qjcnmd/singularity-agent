@@ -491,44 +491,24 @@ fn unsupported_result_v5_and_evidence_v1_fail_closed() {
 }
 
 #[test]
-fn previous_result_migrates_and_current_v2_evidence_binds_to_v7_result() {
+fn previous_result_is_rejected_and_current_v2_evidence_binds_to_v7_result() {
     let result = result_for(task_result(vec![passed_trial(1), failed_trial(2)]), 2);
     let mut legacy_result = serde_json::to_value(&result).expect("result JSON");
     legacy_result["schema_version"] = json!("evaluation.result/v6");
-    for task in legacy_result["tasks"].as_array_mut().expect("tasks") {
-        let summary = task["summary"].as_object_mut().expect("task summary");
-        let trial_success_count = summary
-            .remove("trial_success_count")
-            .expect("trial success count");
-        summary.insert("evaluation_passed_count".to_string(), trial_success_count);
-    }
-    let summary = legacy_result["summary"].as_object_mut().expect("summary");
-    summary.remove("task_success_count");
-    summary.remove("trial_success_count");
-    summary.remove("trial_success_rate_basis_points");
-    summary.insert("evaluation_passed_count".to_string(), json!(1));
-    summary.insert("task_success_rate_basis_points".to_string(), json!(10_000));
+    assert!(matches!(
+        EvaluationResult::from_json_str(
+            &serde_json::to_string(&legacy_result).expect("legacy result JSON"),
+        ),
+        Err(EvaluationError::UnsupportedSchemaVersion { .. })
+    ));
 
-    let migrated = EvaluationResult::from_json_str(
-        &serde_json::to_string(&legacy_result).expect("legacy result JSON"),
-    )
-    .expect("supported v6 result migrates");
-    assert_eq!(migrated.summary.task_success_count, 0);
-    assert_eq!(migrated.summary.trial_success_count, 1);
-    assert_eq!(migrated.summary.task_success_rate_basis_points, 0);
-    assert_eq!(migrated.summary.trial_success_rate_basis_points, 5_000);
-    assert_eq!(
-        serde_json::to_value(&migrated).expect("migrated JSON")["schema_version"],
-        json!("evaluation.result/v7")
-    );
-
-    let evidence = evidence_for(&migrated, true);
+    let evidence = evidence_for(&result, true);
     let parsed_evidence = EvaluationEvidence::from_json_str(
         &serde_json::to_string(&evidence).expect("current evidence JSON"),
     )
     .expect("current v2 evidence parses directly");
     parsed_evidence
-        .validate_against_result(&migrated)
+        .validate_against_result(&result)
         .expect("current v2 evidence binds to v7 result");
     assert_eq!(
         serde_json::to_value(parsed_evidence).expect("current evidence JSON")["schema_version"],

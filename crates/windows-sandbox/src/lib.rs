@@ -159,6 +159,8 @@ mod wfp_setup;
 mod winutil;
 #[cfg(target_os = "windows")]
 mod workspace_acl;
+#[cfg(target_os = "windows")]
+mod workspace_change;
 
 #[cfg(target_os = "windows")]
 mod deny_read_resolver;
@@ -421,6 +423,8 @@ pub use winutil::string_from_sid_bytes;
 pub use winutil::to_wide;
 #[cfg(target_os = "windows")]
 pub use workspace_acl::is_command_cwd_root;
+#[cfg(target_os = "windows")]
+pub use workspace_change::{WorkspaceChangeMonitor, WorkspaceChangeObservation};
 
 #[cfg(not(target_os = "windows"))]
 pub use stub::CaptureResult;
