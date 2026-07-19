@@ -1,0 +1,72 @@
+name: Rust gates
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  supply-chain:
+    name: Supply-chain policy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Install pinned supply-chain tools
+        run: |
+          $toolRoot = Join-Path $env:RUNNER_TEMP "cargo-tools"
+          $auditRoot = Join-Path $toolRoot "cargo-audit"
+          $denyRoot = Join-Path $toolRoot "cargo-deny"
+          cargo install cargo-audit --version 0.22.2 --locked --root $auditRoot
+          cargo install cargo-deny --version 0.20.2 --locked --root $denyRoot
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $auditRoot "bin")
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $denyRoot "bin")
+
+      - name: Audit locked dependencies
+        run: |
+          cargo metadata --all-features --locked --format-version 1 --no-deps | Out-Null
+          cargo audit --file Cargo.lock --deny warnings
+
+      - name: Check locked dependency policy
+        run: cargo deny --workspace --all-features --locked check advisories bans licenses sources
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.96.0
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked --no-fail-fast

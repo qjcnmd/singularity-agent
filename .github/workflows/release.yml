@@ -14,69 +14,14 @@ defaults:
     shell: pwsh
 
 jobs:
-  supply-chain:
-    name: Supply-chain policy
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
-
-      - name: Install pinned supply-chain tools
-        run: |
-          $toolRoot = Join-Path $env:RUNNER_TEMP "cargo-tools"
-          $auditRoot = Join-Path $toolRoot "cargo-audit"
-          $denyRoot = Join-Path $toolRoot "cargo-deny"
-          cargo install cargo-audit --version 0.22.2 --locked --root $auditRoot
-          cargo install cargo-deny --version 0.20.2 --locked --root $denyRoot
-          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $auditRoot "bin")
-          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $denyRoot "bin")
-
-      - name: Audit locked dependencies
-        run: |
-          cargo metadata --all-features --locked --format-version 1 --no-deps | Out-Null
-          cargo audit --file Cargo.lock --deny warnings
-
-      - name: Check locked dependency policy
-        run: cargo deny --workspace --all-features --locked check advisories bans licenses sources
-
-  verify:
-    name: Verify (${{ matrix.os }})
-    needs: supply-chain
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
-          rustup default 1.96.0
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check workspace
-        run: cargo check --workspace --all-targets --all-features --locked
-
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
-
-      - name: Test workspace
-        run: cargo test --workspace --all-targets --locked --no-fail-fast
+  gates:
+    name: Rust gates
+    uses: ./.github/workflows/rust-gates.yml
+    permissions:
+      contents: read
 
   windows-x86_64:
-    needs: verify
+    needs: gates
     runs-on: windows-latest
     permissions:
       contents: read
@@ -124,422 +69,51 @@ jobs:
           WINDOWS_CODESIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGNING_PFX_PASSWORD }}
           WINDOWS_CODESIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGNING_TIMESTAMP_URL }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $isFormalRelease = "${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag"
-          $binaryNames = @(
-            "sg"
-            "singularity_app_server"
-            "singularity-command-runner"
-            "singularity-windows-sandbox-setup"
+          $isFormalRelease = ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag")
+          $arguments = @(
+            "-NoProfile"
+            "-File"
+            ".github/scripts/sign-release-binaries.v1.ps1"
+            "-WorkspaceRoot"
+            $PWD.Path
           )
-          $binaryPaths = @($binaryNames | ForEach-Object {
-            Join-Path $PWD ("target/release/{0}.exe" -f $_)
-          })
-          $pfxBase64 = $env:WINDOWS_CODESIGNING_PFX_BASE64
-          $pfxPassword = $env:WINDOWS_CODESIGNING_PFX_PASSWORD
-          $timestampUrl = $env:WINDOWS_CODESIGNING_TIMESTAMP_URL
-          $configuredValues = @($pfxBase64, $pfxPassword, $timestampUrl)
-          $configuredCount = @($configuredValues | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
-
-          if (-not $isFormalRelease -and $configuredCount -eq 0) {
-            Write-Host "::warning::No Windows code-signing configuration was provided; this workflow_dispatch artifact is unsigned and is not a release-signed build."
-            "status=unsigned-dev" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
-            exit 0
+          if ($isFormalRelease) {
+            $arguments += "-IsFormalRelease"
           }
-          if ($configuredCount -ne 3) {
-            throw "Windows code-signing configuration must provide the PFX, PFX password, and RFC3161 timestamp URL."
-          }
-
-          [Uri]$timestampUri = $null
-          if (-not [Uri]::TryCreate($timestampUrl.Trim(), [UriKind]::Absolute, [ref]$timestampUri)) {
-            throw "Windows code-signing timestamp URL must be an absolute HTTP(S) RFC3161 endpoint."
-          }
-          if (@("http", "https") -notcontains $timestampUri.Scheme.ToLowerInvariant()) {
-            throw "Windows code-signing timestamp URL must be an absolute HTTP(S) RFC3161 endpoint."
-          }
-
-          foreach ($binaryPath in $binaryPaths) {
-            if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
-              throw "missing release binary: $binaryPath"
-            }
-          }
-
-          $signtoolPath = $null
-          $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
-          if (Test-Path -LiteralPath $sdkRoot -PathType Container) {
-            $signtoolCandidate = Get-ChildItem -LiteralPath $sdkRoot -Filter "signtool.exe" -File -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1
-            if ($null -ne $signtoolCandidate) {
-              $signtoolPath = $signtoolCandidate.FullName
-            }
-          }
-          if ([string]::IsNullOrWhiteSpace($signtoolPath)) {
-            $signtoolCommand = Get-Command signtool.exe -CommandType Application -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-            if ($null -ne $signtoolCommand) {
-              $signtoolPath = $signtoolCommand.Source
-            }
-          }
-          if ([string]::IsNullOrWhiteSpace($signtoolPath)) {
-            throw "signtool.exe was not found on the Windows runner."
-          }
-
-          $pfxPath = Join-Path $env:RUNNER_TEMP ("singularity-codesign-{0}.pfx" -f [Guid]::NewGuid().ToString("N"))
-          $toolLogPath = Join-Path $env:RUNNER_TEMP ("singularity-codesign-{0}.log" -f [Guid]::NewGuid().ToString("N"))
-          $store = $null
-          $securePassword = $null
-          $certificates = $null
-          $importedThumbprints = @()
-          $cleanupFailed = $false
-
-          try {
-            try {
-              $pfxBytes = [Convert]::FromBase64String($pfxBase64)
-            } catch {
-              throw "Windows code-signing PFX is not valid base64."
-            }
-            if ($pfxBytes.Length -eq 0) {
-              throw "Windows code-signing PFX is empty."
-            }
-            [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
-
-            $certificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
-            $certificates.Import(
-              $pfxPath,
-              $pfxPassword,
-              [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
-            )
-            $leafCandidates = @($certificates | Where-Object { $_.HasPrivateKey })
-            if ($leafCandidates.Count -ne 1) {
-              throw "Windows code-signing PFX must contain exactly one private-key leaf certificate."
-            }
-            $leaf = $leafCandidates[0]
-            $now = [DateTime]::UtcNow
-            if ($leaf.NotBefore.ToUniversalTime() -gt $now -or $leaf.NotAfter.ToUniversalTime() -le $now) {
-              throw "Windows code-signing leaf certificate is not currently valid."
-            }
-            $hasCodeSigningEku = $false
-            foreach ($extension in $leaf.Extensions) {
-              if ($extension.Oid.Value -ne "2.5.29.37") {
-                continue
-              }
-              $ekuExtension = [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]$extension
-              if (@($ekuExtension.EnhancedKeyUsages | Where-Object { $_.Value -eq "1.3.6.1.5.5.7.3.3" }).Count -gt 0) {
-                $hasCodeSigningEku = $true
-              }
-            }
-            if (-not $hasCodeSigningEku) {
-              throw "Windows code-signing leaf certificate lacks the Code Signing EKU."
-            }
-            $thumbprint = ($leaf.Thumbprint -replace '\s', '').ToUpperInvariant()
-            if ($thumbprint -notmatch '^[0-9A-F]{40}$') {
-              throw "Windows code-signing leaf certificate has an invalid thumbprint."
-            }
-
-            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-              [System.Security.Cryptography.X509Certificates.StoreName]::My,
-              [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-            )
-            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
-            $preexistingThumbprints = @(
-              $store.Certificates |
-                ForEach-Object { $_.Thumbprint } |
-                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-                Sort-Object -Unique
-            )
-            $preexistingLeaf = @($store.Certificates | Where-Object { $_.Thumbprint -eq $thumbprint })
-            $store.Close()
-
-            if ($preexistingLeaf.Count -gt 1) {
-              throw "Windows code-signing certificate selection is ambiguous."
-            }
-            if ($preexistingLeaf.Count -eq 1) {
-              if (-not $preexistingLeaf[0].HasPrivateKey) {
-                throw "The existing Windows code-signing certificate has no private key."
-              }
-            } else {
-              $importedThumbprints = @(
-                $certificates |
-                  ForEach-Object { $_.Thumbprint } |
-                  Where-Object {
-                    -not [string]::IsNullOrWhiteSpace($_) -and $preexistingThumbprints -notcontains $_
-                  } |
-                  Sort-Object -Unique
-              )
-              $securePassword = ConvertTo-SecureString -String $pfxPassword -AsPlainText -Force
-              Import-PfxCertificate `
-                -FilePath $pfxPath `
-                -CertStoreLocation "Cert:\CurrentUser\My" `
-                -Password $securePassword | Out-Null
-            }
-
-            $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly)
-            $storedLeaf = @($store.Certificates | Where-Object { $_.Thumbprint -eq $thumbprint })
-            $store.Close()
-            if ($storedLeaf.Count -ne 1 -or -not $storedLeaf[0].HasPrivateKey) {
-              throw "Windows code-signing leaf certificate was not available with a private key."
-            }
-
-            foreach ($binaryPath in $binaryPaths) {
-              $signArguments = @(
-                "sign"
-                "/fd"
-                "SHA256"
-                "/td"
-                "SHA256"
-                "/tr"
-                $timestampUrl.Trim()
-                "/s"
-                "My"
-                "/sha1"
-                $thumbprint
-                $binaryPath
-              )
-              & $signtoolPath @signArguments *> $toolLogPath
-              if ($LASTEXITCODE -ne 0) {
-                throw "Authenticode signing failed."
-              }
-            }
-
-            foreach ($binaryPath in $binaryPaths) {
-              $verifyArguments = @(
-                "verify"
-                "/pa"
-                "/all"
-                "/tw"
-                $binaryPath
-              )
-              & $signtoolPath @verifyArguments *> $toolLogPath
-              if ($LASTEXITCODE -ne 0) {
-                throw "Authenticode policy verification failed."
-              }
-            }
-            "status=signed" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
-          } finally {
-            try {
-              if ($null -ne $store) {
-                $store.Close()
-              }
-            } catch {
-              $cleanupFailed = $true
-            }
-
-            if (@($importedThumbprints).Count -gt 0) {
-              $cleanupStore = $null
-              try {
-                $cleanupStore = [System.Security.Cryptography.X509Certificates.X509Store]::new(
-                  [System.Security.Cryptography.X509Certificates.StoreName]::My,
-                  [System.Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-                )
-                $cleanupStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-                foreach ($importedThumbprint in $importedThumbprints) {
-                  $certificatesToRemove = @(
-                    $cleanupStore.Certificates | Where-Object { $_.Thumbprint -eq $importedThumbprint }
-                  )
-                  foreach ($certificateToRemove in $certificatesToRemove) {
-                    $cleanupStore.Remove($certificateToRemove)
-                  }
-                }
-              } catch {
-                $cleanupFailed = $true
-              } finally {
-                try {
-                  if ($null -ne $cleanupStore) {
-                    $cleanupStore.Close()
-                  }
-                } catch {
-                  $cleanupFailed = $true
-                }
-              }
-            }
-
-            try {
-              if ($null -ne $pfxPath -and (Test-Path -LiteralPath $pfxPath -PathType Leaf)) {
-                Remove-Item -LiteralPath $pfxPath -Force
-              }
-            } catch {
-              $cleanupFailed = $true
-            }
-            try {
-              if ($null -ne $toolLogPath -and (Test-Path -LiteralPath $toolLogPath -PathType Leaf)) {
-                Remove-Item -LiteralPath $toolLogPath -Force
-              }
-            } catch {
-              $cleanupFailed = $true
-            }
-            if ($null -ne $securePassword) {
-              $securePassword.Dispose()
-            }
-            if ($null -ne $certificates) {
-              foreach ($certificate in $certificates) {
-                $certificate.Dispose()
-              }
-            }
-            $pfxBase64 = $null
-            $pfxPassword = $null
-            $pfxBytes = $null
-            foreach ($variableName in @(
-              "WINDOWS_CODESIGNING_PFX_BASE64"
-              "WINDOWS_CODESIGNING_PFX_PASSWORD"
-              "WINDOWS_CODESIGNING_TIMESTAMP_URL"
-            )) {
-              Remove-Item -LiteralPath "Env:$variableName" -ErrorAction SilentlyContinue
-            }
-            if ($cleanupFailed) {
-              throw "Windows code-signing cleanup failed."
-            }
+          & pwsh @arguments
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
           }
 
       - name: Assemble archive
         id: package
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $isFormalRelease = "${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag"
-          $signingStatus = "${{ steps.sign.outputs.status }}"
-          if ($signingStatus -notin @("signed", "unsigned-dev")) {
-            throw "release signing status was not produced"
-          }
-          $version = if ($isFormalRelease) {
+          $isFormalRelease = ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag")
+          $arguments = @(
+            "-NoProfile"
+            "-File"
+            ".github/scripts/package-release.v1.ps1"
+            "-WorkspaceRoot"
+            $PWD.Path
+            "-OutputDirectory"
+            (Join-Path $PWD "dist")
+            "-RefName"
             "${{ github.ref_name }}"
-          } else {
-            "dev-${{ github.run_number }}"
-          }
-          $name = "singularity-$version-windows-x86_64"
-          if ($signingStatus -eq "unsigned-dev") {
-            $name = "$name-unsigned"
-          }
-          $directory = Join-Path $PWD "dist/$name"
-          New-Item -ItemType Directory -Force -Path $directory | Out-Null
-
-          @(
-            "sg.exe",
-            "singularity_app_server.exe",
-            "singularity-command-runner.exe",
-            "singularity-windows-sandbox-setup.exe"
-          ) | ForEach-Object {
-            $source = Join-Path $PWD "target/release/$_"
-            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-              throw "missing release binary: $source"
-            }
-            Copy-Item -LiteralPath $source -Destination $directory
-          }
-
-          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md -Destination $directory
-          Copy-Item docs/INSTALL.md -Destination (Join-Path $directory "INSTALL.md")
-
-          $archive = Join-Path $PWD "dist/$name.zip"
-          Compress-Archive -LiteralPath $directory -DestinationPath $archive
-          $checksumPath = Join-Path $PWD "dist/SHA256SUMS.txt"
-          $checksum = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$checksum  $name.zip" | Set-Content -Encoding ascii $checksumPath
-
-          $sbomRequests = @(
-            [ordered]@{
-              Manifest = Join-Path $PWD "crates/cli/Cargo.toml"
-              Directory = Join-Path $PWD "crates/cli"
-              ExpectedNames = @("sg")
-            }
-            [ordered]@{
-              Manifest = Join-Path $PWD "crates/app-server/Cargo.toml"
-              Directory = Join-Path $PWD "crates/app-server"
-              ExpectedNames = @("singularity_app_server")
-            }
-            [ordered]@{
-              Manifest = Join-Path $PWD "crates/windows-sandbox/Cargo.toml"
-              Directory = Join-Path $PWD "crates/windows-sandbox"
-              ExpectedNames = @("singularity-command-runner", "singularity-windows-sandbox-setup")
-            }
+            "-RunNumber"
+            [int]"${{ github.run_number }}"
+            "-SigningStatus"
+            "${{ steps.sign.outputs.status }}"
+            "-SbomToolPath"
+            "${{ steps.sbom-tool.outputs.path }}"
           )
-          $expectedBinaryNames = @(
-            "sg"
-            "singularity_app_server"
-            "singularity-command-runner"
-            "singularity-windows-sandbox-setup"
-          )
-          $stableNames = @{
-            "sg" = "sbom-sg.cdx.json"
-            "singularity_app_server" = "sbom-singularity-app-server.cdx.json"
-            "singularity-command-runner" = "sbom-singularity-command-runner.cdx.json"
-            "singularity-windows-sandbox-setup" = "sbom-singularity-windows-sandbox-setup.cdx.json"
+          if ($isFormalRelease) {
+            $arguments += "-IsFormalRelease"
           }
-          $generatedBomFiles = @()
-          foreach ($request in $sbomRequests) {
-            $existing = @(Get-ChildItem -LiteralPath $request.Directory -Filter "*.cdx.json" -File)
-            if ($existing.Count -ne 0) {
-              throw "unexpected pre-existing CycloneDX files in $($request.Directory)"
-            }
-            & "${{ steps.sbom-tool.outputs.path }}" cyclonedx `
-              --manifest-path $request.Manifest --format json --describe binaries --all-features `
-              --target x86_64-pc-windows-msvc --spec-version 1.5 --quiet
-            if ($LASTEXITCODE -ne 0) {
-              throw "cargo-cyclonedx failed for $($request.Manifest)"
-            }
-            $outputs = @(Get-ChildItem -LiteralPath $request.Directory -Filter "*.cdx.json" -File)
-            if ($outputs.Count -ne $request.ExpectedNames.Count) {
-              throw "expected $($request.ExpectedNames.Count) binary BOMs in $($request.Directory), found $($outputs.Count)"
-            }
-            $generatedBomFiles += $outputs
+          & pwsh @arguments
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
           }
-          if ($generatedBomFiles.Count -ne $expectedBinaryNames.Count) {
-            throw "expected four generated binary BOMs, found $($generatedBomFiles.Count)"
-          }
-
-          $validatedBoms = @()
-          foreach ($bomFile in @($generatedBomFiles | Sort-Object FullName)) {
-            try {
-              $bom = Get-Content -Raw -LiteralPath $bomFile.FullName | ConvertFrom-Json
-            } catch {
-              throw "invalid CycloneDX JSON: $($bomFile.FullName): $($_.Exception.Message)"
-            }
-            if ([string]$bom.bomFormat -ne "CycloneDX" -or [string]$bom.specVersion -ne "1.5") {
-              throw "unexpected CycloneDX format or spec version: $($bomFile.FullName)"
-            }
-            if ($null -eq $bom.metadata -or $null -eq $bom.metadata.component) {
-              throw "missing CycloneDX metadata component: $($bomFile.FullName)"
-            }
-            $binaryName = [string]$bom.metadata.component.name
-            if ([string]$bom.metadata.component.type -ne "application" -or $stableNames.Keys -notcontains $binaryName) {
-              throw "metadata component does not identify a release binary: $($bomFile.FullName)"
-            }
-            $request = @($sbomRequests | Where-Object { $_.Directory -eq $bomFile.DirectoryName })
-            if ($request.Count -ne 1 -or $request[0].ExpectedNames -notcontains $binaryName) {
-              throw "metadata binary does not match its manifest: $($bomFile.FullName)"
-            }
-            if (@($validatedBoms | Where-Object { $_.BinaryName -eq $binaryName }).Count -ne 0) {
-              throw "duplicate binary BOM metadata: $binaryName"
-            }
-            $validatedBoms += [PSCustomObject]@{
-              BinaryName = $binaryName
-              File = $bomFile
-              StableName = $stableNames[$binaryName]
-            }
-          }
-          if ($validatedBoms.Count -ne $expectedBinaryNames.Count) {
-            throw "expected four validated binary BOMs, found $($validatedBoms.Count)"
-          }
-          foreach ($binaryName in $expectedBinaryNames) {
-            $validated = @($validatedBoms | Where-Object { $_.BinaryName -eq $binaryName })
-            if ($validated.Count -ne 1) {
-              throw "missing expected binary BOM: $binaryName"
-            }
-            $stablePath = Join-Path $PWD "dist/$($validated[0].StableName)"
-            if (Test-Path -LiteralPath $stablePath) {
-              throw "stable SBOM path already exists: $stablePath"
-            }
-            Copy-Item -LiteralPath $validated[0].File.FullName -Destination $stablePath
-          }
-          $generatedBomFiles | Remove-Item -Force
-
-          "name=$name" >> $env:GITHUB_OUTPUT
-          "archive=$archive" >> $env:GITHUB_OUTPUT
-          "checksum=$checksumPath" >> $env:GITHUB_OUTPUT
-          "sbom_sg=$(Join-Path $PWD 'dist/sbom-sg.cdx.json')" >> $env:GITHUB_OUTPUT
-          "sbom_app_server=$(Join-Path $PWD 'dist/sbom-singularity-app-server.cdx.json')" >> $env:GITHUB_OUTPUT
-          "sbom_command_runner=$(Join-Path $PWD 'dist/sbom-singularity-command-runner.cdx.json')" >> $env:GITHUB_OUTPUT
-          "sbom_windows_sandbox_setup=$(Join-Path $PWD 'dist/sbom-singularity-windows-sandbox-setup.cdx.json')" >> $env:GITHUB_OUTPUT
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -567,7 +141,7 @@ jobs:
 
   publish:
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [verify, windows-x86_64]
+    needs: [gates, windows-x86_64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
