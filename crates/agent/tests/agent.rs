@@ -1,10 +1,10 @@
 //! AgentLoop 的 Direct tool、completion、approval 和恢复回归测试。
 
 use singularity_agent::{
-    AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopInput, AgentPlan,
-    AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentStatus,
-    AgentVerificationRequirement, ApprovalGrant, agent_control_tool_entries,
-    assemble_context_items,
+    AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopInput, AgentLoopResult,
+    AgentPlan, AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics,
+    AgentStatus, AgentVerificationRequirement, ApprovalGrant, PendingApprovalOccurrence,
+    agent_control_tool_entries, assemble_context_items,
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
@@ -44,6 +44,14 @@ fn workspace_resource(value: &str) -> PermissionResource {
 
 fn typed_command_resource(digest: String) -> PermissionResource {
     PermissionResource::CommandScope(CommandScopeDigest::new(digest).expect("valid command digest"))
+}
+
+fn pending_approval(result: &AgentLoopResult) -> PendingApprovalOccurrence {
+    result
+        .pending_approvals
+        .first()
+        .expect("pending approval")
+        .clone()
 }
 
 struct StaticProvider {
@@ -513,17 +521,14 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
 
     assert_eq!(blocked.status, AgentStatus::Blocked);
     assert_eq!(negotiation_calls.load(Ordering::SeqCst), 1);
-    let pending = blocked.pending_tool_calls[0].clone();
-    let checkpoint = blocked
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
+    let pending = pending_approval(&blocked);
 
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
-        pending.request_id.clone(),
-        pending.tool_name.clone(),
-        pending.resources.clone(),
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
     ));
-    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
+    let resumed = agent_loop.resume_pending_approval(&resumed_input, &pending);
 
     assert_eq!(resumed.status, AgentStatus::Completed);
     assert_eq!(negotiation_calls.load(Ordering::SeqCst), 2);
@@ -858,8 +863,7 @@ fn direct_tool_mode_rejects_hidden_router_before_policy_or_execution() {
         result.tool_results[0].error_code.as_deref(),
         Some("tool_not_visible")
     );
-    assert!(result.approval_requests.is_empty());
-    assert!(result.pending_tool_calls.is_empty());
+    assert!(result.pending_approvals.is_empty());
     let audit = result.to_run_status().audit_events[0].clone();
     assert_eq!(audit["policy_evaluated"], false);
     assert_eq!(audit["executor_started"], false);
@@ -1032,8 +1036,7 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
     .run(&AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3));
 
     assert_eq!(result.status, AgentStatus::Completed);
-    assert!(result.approval_requests.is_empty());
-    assert!(result.pending_tool_calls.is_empty());
+    assert!(result.pending_approvals.is_empty());
     assert_eq!(result.tool_results.len(), 3);
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
@@ -1163,9 +1166,7 @@ fn agent_loop_does_not_create_partial_approval_for_a_batch() {
     .run(&AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3));
 
     assert_eq!(result.status, AgentStatus::Completed);
-    assert!(result.approval_requests.is_empty());
-    assert!(result.pending_tool_calls.is_empty());
-    assert!(result.approval_checkpoints.is_empty());
+    assert!(result.pending_approvals.is_empty());
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
         Some("approval_required")
@@ -1256,11 +1257,12 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     let result = agent_loop.run(&input);
 
     assert_eq!(result.status, AgentStatus::Blocked);
-    let pending = &result.pending_tool_calls[0];
-    assert_eq!(pending.request_id, "approval_turn_1_call_1");
-    let checkpoint = result
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
+    let pending = pending_approval(&result);
+    assert_eq!(
+        pending.pending_tool_call().request_id,
+        "approval_turn_1_call_1"
+    );
+    let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
     assert_eq!(checkpoint["checkpoint_version"], 2);
     assert_eq!(checkpoint["thread_id"], "thread_1");
     assert_eq!(checkpoint["turn_id"], "turn_1");
@@ -1284,43 +1286,35 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     assert!(!public_result.contains("raw_arguments"));
     assert!(!public_result.contains("before approval"));
 
+    let typed_roundtrip =
+        PendingApprovalOccurrence::from_checkpoint_payload(pending.request().clone(), &checkpoint)
+            .expect("typed checkpoint roundtrip");
+    assert_eq!(typed_roundtrip, pending);
     assert_eq!(
         checkpoint,
-        result
-            .approval_checkpoint(&pending.request_id)
-            .expect("checkpoint roundtrip")
-    );
-    let grant = ApprovalGrant::allow(
-        pending.request_id.clone(),
-        pending.tool_name.clone(),
-        pending.resources.clone(),
+        pending.encode_checkpoint().expect("checkpoint roundtrip")
     );
     let mut future_checkpoint = checkpoint.clone();
     future_checkpoint["checkpoint_version"] = serde_json::json!(999);
-    let future = agent_loop.resume_pending_tool_call(
-        &input.clone().with_approval_grant(grant.clone()),
-        pending,
+    let future = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
         &future_checkpoint,
     );
-    assert_eq!(future.status, AgentStatus::Failed);
     assert_eq!(
-        future.error.as_deref(),
-        Some("unsupported approval checkpoint version")
+        future.expect_err("future checkpoint must fail"),
+        "unsupported approval checkpoint version"
     );
 
     let mut unknown_field_checkpoint = checkpoint.clone();
     unknown_field_checkpoint["unexpected"] = serde_json::json!("must reject");
-    let unknown_field = agent_loop.resume_pending_tool_call(
-        &input.clone().with_approval_grant(grant.clone()),
-        pending,
+    let unknown_field = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
         &unknown_field_checkpoint,
     );
-    assert_eq!(unknown_field.status, AgentStatus::Failed);
     assert!(
         unknown_field
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("unknown field"))
+            .expect_err("unknown checkpoint field must fail")
+            .contains("unknown field")
     );
 
     let mut incomplete_checkpoint = checkpoint.clone();
@@ -1328,17 +1322,111 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         .as_object_mut()
         .expect("checkpoint object")
         .remove("tool_result_occurrences");
-    let incomplete = agent_loop.resume_pending_tool_call(
-        &input.with_approval_grant(grant),
-        pending,
+    let incomplete = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
         &incomplete_checkpoint,
     );
-    assert_eq!(incomplete.status, AgentStatus::Failed);
     assert!(
         incomplete
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("invalid approval checkpoint"))
+            .expect_err("incomplete checkpoint must fail")
+            .contains("invalid approval checkpoint")
+    );
+}
+
+#[test]
+fn pending_approval_occurrences_keep_request_tool_checkpoint_order() {
+    let response = |call_id: &str, path: &str| {
+        let mut response = ModelTurnResponse::completed(
+            "model_request_turn_1_0",
+            format!("response_{call_id}"),
+            "before approval",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "edit",
+            serde_json::json!({
+                "path": path,
+                "expected": "before",
+                "replacement": "after"
+            }),
+        ));
+        response
+    };
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit files");
+    let first = agent_loop_with_response(
+        response("call_1", "first.txt"),
+        allow_read_policy().with_rule(
+            PermissionRule::new(
+                "ask_first",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Ask,
+            )
+            .for_operation(PermissionOperation::Write)
+            .for_resource(workspace_resource("first.txt")),
+        ),
+    )
+    .run(&input);
+    assert_eq!(first.status, AgentStatus::Blocked);
+    let second = agent_loop_with_response(
+        response("call_2", "second.txt"),
+        allow_read_policy().with_rule(
+            PermissionRule::new(
+                "ask_second",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Ask,
+            )
+            .for_operation(PermissionOperation::Write)
+            .for_resource(workspace_resource("second.txt")),
+        ),
+    )
+    .run(&input);
+    assert_eq!(second.status, AgentStatus::Blocked);
+    let first_occurrence = pending_approval(&first);
+    let second_occurrence = pending_approval(&second);
+
+    let mut ordered = first.clone();
+    ordered.pending_approvals = vec![first_occurrence.clone(), second_occurrence.clone()];
+    assert_eq!(
+        ordered
+            .pending_approvals
+            .iter()
+            .map(|occurrence| occurrence.request().request_id.as_str())
+            .collect::<Vec<_>>(),
+        ["approval_turn_1_call_1", "approval_turn_1_call_2"]
+    );
+    assert_eq!(
+        ordered.pending_approvals[0]
+            .pending_tool_call()
+            .tool_call_id,
+        "call_1"
+    );
+    assert_eq!(
+        ordered.pending_approvals[1]
+            .pending_tool_call()
+            .tool_call_id,
+        "call_2"
+    );
+    let public = serde_json::to_value(&ordered).expect("serialize ordered approvals");
+    assert_eq!(
+        public["approval_requests"]
+            .as_array()
+            .expect("approval request projection")
+            .iter()
+            .map(|request| request["request_id"].as_str().expect("request id"))
+            .collect::<Vec<_>>(),
+        ["approval_turn_1_call_1", "approval_turn_1_call_2"]
+    );
+
+    let mismatched = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_occurrence.request().clone(),
+        &second_occurrence
+            .encode_checkpoint()
+            .expect("second checkpoint"),
+    );
+    assert!(
+        mismatched
+            .expect_err("mismatched occurrence must fail closed")
+            .contains("request mismatch")
     );
 }
 
@@ -1364,10 +1452,8 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"));
     let blocked = agent_loop.run(&input);
-    let pending = blocked.pending_tool_calls[0].clone();
-    let checkpoint = blocked
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
+    let pending = pending_approval(&blocked);
+    let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
     let mut legacy_checkpoint = checkpoint.clone();
     legacy_checkpoint["checkpoint_version"] = serde_json::json!(1);
     legacy_checkpoint["tool_results"] = legacy_checkpoint["tool_result_occurrences"].clone();
@@ -1377,12 +1463,17 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
         .remove("tool_result_occurrences");
     legacy_checkpoint["tool_result_context_bindings"] = serde_json::json!([]);
     let resume_input = input.clone().with_approval_grant(ApprovalGrant::allow(
-        pending.request_id.clone(),
-        pending.tool_name.clone(),
-        pending.resources.clone(),
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
     ));
 
-    let resumed = agent_loop.resume_pending_tool_call(&resume_input, &pending, &legacy_checkpoint);
+    let migrated = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
+        &legacy_checkpoint,
+    )
+    .expect("migrate legacy checkpoint");
+    let resumed = agent_loop.resume_pending_approval(&resume_input, &migrated);
 
     assert_eq!(resumed.status, AgentStatus::Failed);
     assert_eq!(resumed.model_turns, 1);
@@ -1457,14 +1548,11 @@ fn approval_pause_resume_matches_uninterrupted_history_and_result_order() {
     .with_workspace_tools(WorkspaceTools::new(workspace.path()).expect("bind workspace tools"));
     let blocked = paused.run(&input);
     assert_eq!(blocked.status, AgentStatus::Blocked);
-    let pending = blocked.pending_tool_calls[0].clone();
-    let checkpoint = blocked
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
+    let pending = pending_approval(&blocked);
     let resumed_grant = ApprovalGrant::allow(
-        pending.request_id.clone(),
-        pending.tool_name.clone(),
-        pending.resources.clone(),
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
     );
 
     let resumed_requests = Arc::new(Mutex::new(Vec::new()));
@@ -1478,11 +1566,8 @@ fn approval_pause_resume_matches_uninterrupted_history_and_result_order() {
         policy,
     )
     .with_workspace_tools(WorkspaceTools::new(workspace.path()).expect("bind workspace tools"));
-    let resumed = resumed_loop.resume_pending_tool_call(
-        &input.with_approval_grant(resumed_grant),
-        &pending,
-        &checkpoint,
-    );
+    let resumed =
+        resumed_loop.resume_pending_approval(&input.with_approval_grant(resumed_grant), &pending);
 
     assert_eq!(resumed.status, uninterrupted_result.status);
     assert_eq!(resumed.model_turns, uninterrupted_result.model_turns);
@@ -1570,10 +1655,8 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
 
     let blocked = agent_loop.run(&input);
     assert_eq!(blocked.status, AgentStatus::Blocked);
-    let pending = blocked.pending_tool_calls[0].clone();
-    let checkpoint = blocked
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
+    let pending = pending_approval(&blocked);
+    let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
     assert_eq!(
         checkpoint["used_approval_grants"],
         serde_json::json!(["approval_turn_1_call_1"])
@@ -1582,12 +1665,12 @@ fn agent_loop_resume_rejects_reused_tool_call_id_after_consuming_grant() {
         .with_approval_grant(second_grant)
         .with_approval_grant(first_grant);
 
-    let resumed = agent_loop.resume_pending_tool_call(&resume_input, &pending, &checkpoint);
+    let resumed = agent_loop.resume_pending_approval(&resume_input, &pending);
 
     assert_eq!(resumed.status, AgentStatus::Failed);
     assert_eq!(resumed.model_turns, 3);
     assert_eq!(resumed.approval_count, 1);
-    assert!(resumed.approval_requests.is_empty());
+    assert!(resumed.pending_approvals.is_empty());
     assert_eq!(
         resumed.error.as_deref(),
         Some("tool execution failed: tool_denied")
@@ -1616,25 +1699,16 @@ fn agent_loop_resume_rejects_tampered_completion_checkpoint() {
         PolicyEngine::new(PermissionProfile::workspace_write()),
     );
     let blocked = agent_loop.run(&input);
-    let pending = blocked.pending_tool_calls[0].clone();
-    let mut checkpoint = blocked
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
+    let pending = pending_approval(&blocked);
+    let mut checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
     checkpoint["completion"]["workspace_mutated"] = serde_json::json!(true);
-    let resume_input = input.with_approval_grant(ApprovalGrant::allow(
-        pending.request_id.clone(),
-        pending.tool_name.clone(),
-        pending.resources.clone(),
-    ));
+    let resumed =
+        PendingApprovalOccurrence::from_checkpoint_payload(pending.request().clone(), &checkpoint);
 
-    let resumed = agent_loop.resume_pending_tool_call(&resume_input, &pending, &checkpoint);
-
-    assert_eq!(resumed.status, AgentStatus::Failed);
     assert_eq!(
-        resumed.error.as_deref(),
-        Some("approval checkpoint workspace revision state is invalid")
+        resumed.expect_err("tampered completion checkpoint must fail"),
+        "approval checkpoint workspace revision state is invalid"
     );
-    assert!(resumed.tool_results.is_empty());
 }
 
 #[test]
@@ -2404,10 +2478,8 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     assert_eq!(blocked.status, AgentStatus::Blocked);
     assert_eq!(blocked.verification.required_command_count, 2);
     assert_eq!(blocked.verification.satisfied_command_count, 1);
-    let pending = blocked.pending_tool_calls[0].clone();
-    let checkpoint = blocked
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
+    let pending = pending_approval(&blocked);
+    let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
     assert_eq!(checkpoint["context_trace"]["compaction_count"], 1);
     assert_eq!(
         checkpoint["completion"]["terminal_command_scope_digests"]
@@ -2433,9 +2505,9 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     );
 
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
-        pending.request_id.clone(),
-        pending.tool_name.clone(),
-        pending.resources.clone(),
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
     ));
     let resumed_agent_loop = AgentLoop::new(
         StaticProvider {
@@ -2462,17 +2534,14 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         .as_object_mut()
         .expect("checkpoint command object")
         .remove("context_token_count");
-    let missing = resumed_agent_loop.resume_pending_tool_call(
-        &resumed_input,
-        &pending,
+    let missing = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
         &missing_context_count,
     );
-    assert_eq!(missing.status, AgentStatus::Failed);
     assert!(
         missing
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("context token"))
+            .expect_err("missing accounting must fail")
+            .contains("context token")
     );
 
     let mut low_context_count = checkpoint.clone();
@@ -2482,13 +2551,13 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         .iter_mut()
         .find(|result| result["result"]["tool_name"] == "command")
         .expect("checkpoint command result")["context_token_count"] = serde_json::json!(1);
-    let low =
-        resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &low_context_count);
-    assert_eq!(low.status, AgentStatus::Failed);
+    let low = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
+        &low_context_count,
+    );
     assert!(
-        low.error
-            .as_deref()
-            .is_some_and(|error| error.contains("context token"))
+        low.expect_err("inconsistent accounting must fail")
+            .contains("context token")
     );
 
     let command_result_index = checkpoint["tool_result_occurrences"]
@@ -2500,9 +2569,13 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let mut compacted_binding = checkpoint.clone();
     compacted_binding["tool_result_occurrences"][command_result_index]["visibility"] =
         serde_json::json!("visible");
+    let compacted_binding_result = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
+        &compacted_binding,
+    )
+    .expect("decode visibility binding");
     let compacted_binding_result =
-        resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &compacted_binding);
-    assert_eq!(compacted_binding_result.status, AgentStatus::Failed);
+        resumed_agent_loop.resume_pending_approval(&resumed_input, &compacted_binding_result);
     assert!(
         compacted_binding_result
             .error
@@ -2513,20 +2586,14 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let mut visible_approval_with_count = checkpoint.clone();
     visible_approval_with_count["tool_result_occurrences"][command_result_index]["result"]["failure_kind"] =
         serde_json::json!("approval");
-    let visible_approval_with_count_result = resumed_agent_loop.resume_pending_tool_call(
-        &resumed_input,
-        &pending,
+    let visible_approval_with_count_result = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
         &visible_approval_with_count,
-    );
-    assert_eq!(
-        visible_approval_with_count_result.status,
-        AgentStatus::Failed
     );
     assert!(
         visible_approval_with_count_result
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("hidden tool result binding"))
+            .expect_err("visible approval binding must fail")
+            .contains("hidden tool result binding")
     );
 
     let mut visible_approval_missing_count = checkpoint.clone();
@@ -2536,17 +2603,14 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         .as_object_mut()
         .expect("checkpoint command object")
         .remove("context_token_count");
-    let visible_approval = resumed_agent_loop.resume_pending_tool_call(
-        &resumed_input,
-        &pending,
+    let visible_approval = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
         &visible_approval_missing_count,
     );
-    assert_eq!(visible_approval.status, AgentStatus::Failed);
     assert!(
         visible_approval
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("hidden tool result binding"))
+            .expect_err("hidden approval accounting must fail")
+            .contains("hidden tool result binding")
     );
 
     let mut legacy_checkpoint = checkpoint.clone();
@@ -2576,20 +2640,31 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         .as_object_mut()
         .expect("checkpoint object")
         .remove("tool_result_context_bindings");
-    let missing_legacy = resumed_agent_loop.resume_pending_tool_call(
-        &resumed_input,
-        &pending,
+    let missing_legacy = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
         &missing_legacy_bindings,
     );
-    assert_eq!(missing_legacy.status, AgentStatus::Failed);
     assert!(
         missing_legacy
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("bindings are missing"))
+            .expect_err("missing legacy bindings must fail")
+            .contains("bindings are missing")
     );
-    let resumed =
-        resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &legacy_checkpoint);
+    let migrated = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
+        &legacy_checkpoint,
+    )
+    .expect("migrate non-empty legacy checkpoint");
+    let migrated_v2 = migrated
+        .encode_checkpoint()
+        .expect("encode migrated checkpoint");
+    assert_eq!(migrated_v2["checkpoint_version"], 2);
+    assert!(migrated_v2.get("tool_result_context_bindings").is_none());
+    assert!(
+        migrated_v2["tool_result_occurrences"][0]
+            .get("visibility")
+            .is_some()
+    );
+    let resumed = resumed_agent_loop.resume_pending_approval(&resumed_input, &migrated);
 
     assert_eq!(
         resumed.status,
@@ -2672,7 +2747,7 @@ fn agent_loop_approval_grant_allows_workspace_mutation_without_policy_reask() {
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.approval_count, 0);
     assert_eq!(result.model_turns, 3);
-    assert!(result.approval_requests.is_empty());
+    assert!(result.pending_approvals.is_empty());
     assert!(result.tool_results[0].ok);
     assert!(result.tool_results[1].ok);
     assert!(result.verification.required);
@@ -3483,38 +3558,34 @@ fn agent_loop_command_approval_binds_exact_resource_and_rejects_tampered_resume(
     assert_eq!(result.status, AgentStatus::Blocked);
     assert_eq!(result.approval_count, 1);
     assert_eq!(
-        result.approval_requests[0].resources,
+        result.pending_approvals[0].request().resources,
         vec![command_resource]
     );
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
         Some("approval_required")
     );
-    let pending = result
-        .pending_tool_calls
-        .first()
-        .expect("pending command")
-        .clone();
+    let pending = pending_approval(&result);
     let pending_arguments: serde_json::Value =
-        serde_json::from_str(&pending.raw_arguments).expect("pending arguments");
+        serde_json::from_str(&pending.pending_tool_call().raw_arguments)
+            .expect("pending arguments");
     assert_eq!(pending_arguments["cwd"], ".");
     assert_eq!(pending_arguments["timeout_seconds"], 5);
     assert_eq!(pending_arguments["command"], command_script);
 
-    let mut tampered = pending.clone();
     let mut tampered_arguments = pending_arguments;
     tampered_arguments["command"] = serde_json::json!("different command");
-    tampered.raw_arguments = tampered_arguments.to_string();
-    let mut checkpoint = result
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
-    checkpoint["raw_arguments"] = serde_json::json!(tampered.raw_arguments.clone());
+    let mut checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
+    checkpoint["raw_arguments"] = serde_json::json!(tampered_arguments.to_string());
+    let tampered =
+        PendingApprovalOccurrence::from_checkpoint_payload(pending.request().clone(), &checkpoint)
+            .expect("tampered typed occurrence");
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
-        pending.request_id,
-        pending.tool_name,
-        pending.resources,
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
     ));
-    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &tampered, &checkpoint);
+    let resumed = agent_loop.resume_pending_approval(&resumed_input, &tampered);
 
     assert_eq!(resumed.status, AgentStatus::Failed);
     assert_eq!(
@@ -4047,7 +4118,7 @@ fn agent_loop_approval_grant_matches_request_id_and_is_single_use() {
     assert_eq!(result.status, AgentStatus::Blocked);
     assert_eq!(result.approval_count, 1);
     assert_eq!(
-        result.approval_requests[0].request_id,
+        result.pending_approvals[0].request().request_id,
         "approval_turn_1_call_2"
     );
     assert_eq!(
@@ -4272,13 +4343,16 @@ fn agent_loop_patch_approval_request_covers_unapproved_change_path() {
         Some("approval_required")
     );
     assert_eq!(
-        result.approval_requests[0].request_id,
+        result.pending_approvals[0].request().request_id,
         "approval_turn_1_call_1"
     );
-    assert_eq!(result.approval_requests[0].thread_id, "thread_1");
-    assert_eq!(result.approval_requests[0].turn_id, "turn_1");
+    assert_eq!(result.pending_approvals[0].request().thread_id, "thread_1");
+    assert_eq!(result.pending_approvals[0].request().turn_id, "turn_1");
     assert_eq!(
-        result.approval_requests[0].tool_call_id.as_deref(),
+        result.pending_approvals[0]
+            .request()
+            .tool_call_id
+            .as_deref(),
         Some("call_1")
     );
     assert_eq!(
@@ -5540,10 +5614,8 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     assert_eq!(blocked.status, AgentStatus::Blocked);
     assert_eq!(blocked.plan_update_count, 1);
     assert_eq!(blocked.recovery_metrics, AgentRecoveryMetrics::default());
-    let pending = blocked.pending_tool_calls[0].clone();
-    let checkpoint = blocked
-        .approval_checkpoint(&pending.request_id)
-        .expect("approval checkpoint");
+    let pending = pending_approval(&blocked);
+    let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
     assert_eq!(checkpoint["plan"]["steps"][0]["status"], "completed");
     assert_eq!(checkpoint["plan_update_count"], 1);
     assert_eq!(checkpoint["recovery_metrics"]["repair_attempt_count"], 0);
@@ -5554,11 +5626,11 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     assert!(checkpoint["last_repair_failure"].is_null());
 
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
-        pending.request_id.clone(),
-        pending.tool_name.clone(),
-        pending.resources.clone(),
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
     ));
-    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
+    let resumed = agent_loop.resume_pending_approval(&resumed_input, &pending);
 
     assert_eq!(resumed.status, AgentStatus::Completed);
     assert_eq!(resumed.model_turns, 4);

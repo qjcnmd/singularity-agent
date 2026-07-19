@@ -559,7 +559,7 @@ impl ApprovalGrant {
     }
 }
 
-/// 一次运行的完整结果，包括待处理 approval 检查点和 tool 结果。
+/// 一次运行的完整结果，包括按 occurrence 顺序保留的待处理 approval 和 tool 结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentLoopResult {
     pub status: AgentStatus,
@@ -568,14 +568,14 @@ pub struct AgentLoopResult {
     pub model_turns: u32,
     pub tool_calls: u32,
     pub approval_count: u32,
-    pub approval_requests: Vec<ApprovalRequest>,
-    #[serde(skip)]
+    #[serde(
+        rename = "approval_requests",
+        serialize_with = "serialize_pending_approval_requests",
+        deserialize_with = "deserialize_pending_approval_requests"
+    )]
     #[schemars(skip)]
-    pub pending_tool_calls: Vec<PendingToolCall>,
-    #[serde(skip)]
-    #[schemars(skip)]
-    /// Typed checkpoints are encoded here only at the public persistence boundary.
-    pub approval_checkpoints: Vec<Value>,
+    /// Each entry owns its request and the typed checkpoint for the executable call.
+    pub pending_approvals: Vec<PendingApprovalOccurrence>,
     /// Public projection of the ordered internal tool-result occurrences.
     pub tool_results: Vec<ToolResult>,
     pub verification: AgentVerification,
@@ -605,18 +605,42 @@ pub struct AgentLoopResult {
     pub provider_capability_metadata: Option<ProviderCapabilityMetadata>,
 }
 
+fn serialize_pending_approval_requests<S>(
+    pending_approvals: &[PendingApprovalOccurrence],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    pending_approvals
+        .iter()
+        .map(PendingApprovalOccurrence::request)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn deserialize_pending_approval_requests<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PendingApprovalOccurrence>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let requests = Vec::<ApprovalRequest>::deserialize(deserializer)?;
+    if requests.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Err(serde::de::Error::custom(
+            "approval requests require their typed checkpoint occurrence",
+        ))
+    }
+}
+
 impl AgentLoopResult {
-    /// 读取指定 approval request 的 checkpoint。
-    pub fn approval_checkpoint(&self, request_id: &str) -> Option<Value> {
-        let checkpoint_index = self
-            .approval_requests
+    /// 按 request id 查找一个完整的 typed approval occurrence。
+    pub fn pending_approval(&self, request_id: &str) -> Option<&PendingApprovalOccurrence> {
+        self.pending_approvals
             .iter()
-            .position(|request| request.request_id == request_id)?;
-        let checkpoint = self.approval_checkpoints.get(checkpoint_index)?;
-        let checkpoint = ApprovalCheckpointCodec::decode(checkpoint).ok()?;
-        (checkpoint.pending_tool_call.request_id == request_id)
-            .then(|| ApprovalCheckpointCodec::encode(&checkpoint).ok())
-            .flatten()
+            .find(|occurrence| occurrence.request().request_id == request_id)
     }
 
     /// 将内部结果投影为持久化运行状态。
@@ -648,6 +672,7 @@ impl AgentLoopResult {
 
 /// approval 暂停运行期间保留的规范化可执行 tool call 数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PendingToolCall {
     pub request_id: String,
     pub tool_call_id: String,
@@ -678,6 +703,88 @@ impl PendingToolCall {
             parse_status: ModelToolParseStatus::Valid,
             validation_errors: Vec::new(),
         })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.request_id.trim().is_empty() || self.tool_call_id.trim().is_empty() {
+            return Err("approval checkpoint pending tool call identity is missing".to_string());
+        }
+        if self.tool_name.as_str().trim().is_empty() {
+            return Err("approval checkpoint pending tool name is missing".to_string());
+        }
+        serde_json::from_str::<Value>(&self.raw_arguments).map_err(|error| {
+            format!("approval checkpoint pending tool arguments are invalid: {error}")
+        })?;
+        Ok(())
+    }
+}
+
+/// 一个待处理 approval occurrence 的唯一 typed 所有者。
+///
+/// request 与 checkpoint 不再通过多个同下标数组关联；checkpoint 内部持有同一份规范化
+/// executable tool call，构造和恢复时会集中校验三者绑定关系。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingApprovalOccurrence {
+    request: ApprovalRequest,
+    checkpoint: ApprovalCheckpoint,
+}
+
+impl PendingApprovalOccurrence {
+    fn new(request: ApprovalRequest, checkpoint: ApprovalCheckpoint) -> Result<Self, String> {
+        checkpoint.validate_serialized()?;
+        let occurrence = Self {
+            request,
+            checkpoint,
+        };
+        occurrence.validate_binding()?;
+        Ok(occurrence)
+    }
+
+    /// 从持久化 checkpoint 解码一个完整的 typed approval occurrence。
+    pub fn from_checkpoint_payload(
+        request: ApprovalRequest,
+        payload: &Value,
+    ) -> Result<Self, String> {
+        Self::new(request, ApprovalCheckpoint::decode(payload)?)
+    }
+
+    /// 返回绑定的 approval request。
+    pub fn request(&self) -> &ApprovalRequest {
+        &self.request
+    }
+
+    /// 返回 checkpoint 唯一持有的规范化可执行 tool call。
+    pub fn pending_tool_call(&self) -> &PendingToolCall {
+        self.checkpoint.pending_tool_call()
+    }
+
+    /// 返回版本化 typed checkpoint。
+    pub fn checkpoint(&self) -> &ApprovalCheckpoint {
+        &self.checkpoint
+    }
+
+    /// Encode only when crossing the persistence boundary.
+    pub fn encode_checkpoint(&self) -> Result<Value, String> {
+        self.checkpoint.encode()
+    }
+
+    fn validate_binding(&self) -> Result<(), String> {
+        let pending = self.checkpoint.pending_tool_call();
+        if self.request.request_id != pending.request_id {
+            return Err("approval occurrence request mismatch".to_string());
+        }
+        if self.request.thread_id != self.checkpoint.thread_id
+            || self.request.turn_id != self.checkpoint.turn_id
+        {
+            return Err("approval occurrence thread or turn mismatch".to_string());
+        }
+        if self.request.tool_call_id.as_deref() != Some(pending.tool_call_id.as_str()) {
+            return Err("approval occurrence tool call id mismatch".to_string());
+        }
+        if self.request.action != pending.tool_name || self.request.resources != pending.resources {
+            return Err("approval occurrence tool binding mismatch".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -1180,9 +1287,37 @@ impl ToolResultOccurrence {
     }
 }
 
-/// 版本化 approval checkpoint 的持久化投影。
+/// 版本化 approval checkpoint 的 opaque typed 状态。
+///
+/// JSON 只通过 [`Self::encode`] 与 [`Self::decode`] 进入持久化边界；业务代码不能直接读取
+/// JSON 字段，也不能绕过集中校验构造 checkpoint。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalCheckpoint {
+    pending_tool_call: PendingToolCall,
+    checkpoint_version: u32,
+    thread_id: String,
+    turn_id: String,
+    project_instructions_digest: Option<String>,
+    messages: Vec<ModelMessage>,
+    tool_result_occurrences: Vec<ToolResultOccurrence>,
+    used_approval_grants: Vec<String>,
+    approval_count: u32,
+    model_turns: u32,
+    completion: CompletionTracker,
+    last_completion_error: Option<String>,
+    plan: Option<AgentPlan>,
+    plan_update_count: u32,
+    recovery_metrics: AgentRecoveryMetrics,
+    model_usage: ModelUsage,
+    provider_attempts: ProviderAttemptMetadata,
+    context_trace: Option<AgentContextTrace>,
+    seen_tool_call_fingerprints: Vec<String>,
+    last_repair_failure: Option<RepairFailureState>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ApprovalCheckpoint {
+#[serde(deny_unknown_fields)]
+struct ApprovalCheckpointWire {
     #[serde(flatten)]
     pending_tool_call: PendingToolCall,
     checkpoint_version: u32,
@@ -1207,6 +1342,7 @@ struct ApprovalCheckpoint {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyApprovalCheckpoint {
     #[serde(flatten)]
     pending_tool_call: PendingToolCall,
@@ -1247,101 +1383,89 @@ struct CheckpointVersion {
     checkpoint_version: u32,
 }
 
-struct ApprovalCheckpointCodec;
+impl From<&ApprovalCheckpoint> for ApprovalCheckpointWire {
+    fn from(checkpoint: &ApprovalCheckpoint) -> Self {
+        Self {
+            pending_tool_call: checkpoint.pending_tool_call.clone(),
+            checkpoint_version: checkpoint.checkpoint_version,
+            thread_id: checkpoint.thread_id.clone(),
+            turn_id: checkpoint.turn_id.clone(),
+            project_instructions_digest: checkpoint.project_instructions_digest.clone(),
+            messages: checkpoint.messages.clone(),
+            tool_result_occurrences: checkpoint.tool_result_occurrences.clone(),
+            used_approval_grants: checkpoint.used_approval_grants.clone(),
+            approval_count: checkpoint.approval_count,
+            model_turns: checkpoint.model_turns,
+            completion: checkpoint.completion.clone(),
+            last_completion_error: checkpoint.last_completion_error.clone(),
+            plan: checkpoint.plan.clone(),
+            plan_update_count: checkpoint.plan_update_count,
+            recovery_metrics: checkpoint.recovery_metrics.clone(),
+            model_usage: checkpoint.model_usage.clone(),
+            provider_attempts: checkpoint.provider_attempts.clone(),
+            context_trace: checkpoint.context_trace.clone(),
+            seen_tool_call_fingerprints: checkpoint.seen_tool_call_fingerprints.clone(),
+            last_repair_failure: checkpoint.last_repair_failure.clone(),
+        }
+    }
+}
 
-impl ApprovalCheckpointCodec {
-    fn encode(checkpoint: &ApprovalCheckpoint) -> Result<Value, String> {
-        serde_json::to_value(checkpoint)
+impl ApprovalCheckpoint {
+    /// Encode a validated checkpoint at the persistence boundary.
+    pub fn encode(&self) -> Result<Value, String> {
+        self.validate_serialized()?;
+        serde_json::to_value(ApprovalCheckpointWire::from(self))
             .map_err(|error| format!("approval checkpoint serialization failed: {error}"))
     }
 
-    fn decode(payload: &Value) -> Result<ApprovalCheckpoint, String> {
+    /// Decode and migrate a persisted checkpoint into the current typed representation.
+    pub fn decode(payload: &Value) -> Result<Self, String> {
         let version: CheckpointVersion = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid approval checkpoint version: {error}"))?;
         let checkpoint = match version.checkpoint_version {
             APPROVAL_CHECKPOINT_VERSION => {
-                Self::validate_keys(
-                    payload,
-                    &[
-                        "request_id",
-                        "tool_call_id",
-                        "tool_name",
-                        "raw_arguments",
-                        "resources",
-                        "checkpoint_version",
-                        "thread_id",
-                        "turn_id",
-                        "project_instructions_digest",
-                        "messages",
-                        "tool_result_occurrences",
-                        "used_approval_grants",
-                        "approval_count",
-                        "model_turns",
-                        "completion",
-                        "last_completion_error",
-                        "plan",
-                        "plan_update_count",
-                        "recovery_metrics",
-                        "model_usage",
-                        "provider_attempts",
-                        "context_trace",
-                        "seen_tool_call_fingerprints",
-                        "last_repair_failure",
-                    ],
-                )?;
-                serde_json::from_value(payload.clone())
-                    .map_err(|error| format!("invalid approval checkpoint: {error}"))?
+                let wire: ApprovalCheckpointWire = serde_json::from_value(payload.clone())
+                    .map_err(|error| format!("invalid approval checkpoint: {error}"))?;
+                Self::from_wire(wire)
             }
-            LEGACY_APPROVAL_CHECKPOINT_VERSION => {
-                Self::validate_keys(
-                    payload,
-                    &[
-                        "request_id",
-                        "tool_call_id",
-                        "tool_name",
-                        "raw_arguments",
-                        "resources",
-                        "checkpoint_version",
-                        "thread_id",
-                        "turn_id",
-                        "project_instructions_digest",
-                        "messages",
-                        "tool_results",
-                        "used_approval_grants",
-                        "approval_count",
-                        "model_turns",
-                        "completion",
-                        "last_completion_error",
-                        "plan",
-                        "plan_update_count",
-                        "recovery_metrics",
-                        "model_usage",
-                        "provider_attempts",
-                        "context_trace",
-                        "tool_result_context_bindings",
-                        "seen_tool_call_fingerprints",
-                        "last_repair_failure",
-                    ],
-                )?;
-                Self::migrate_legacy(payload)?
-            }
+            LEGACY_APPROVAL_CHECKPOINT_VERSION => Self::migrate_legacy(payload)?,
             _ => return Err("unsupported approval checkpoint version".to_string()),
         };
         checkpoint.validate_serialized()?;
         Ok(checkpoint)
     }
 
-    fn validate_keys(payload: &Value, allowed: &[&str]) -> Result<(), String> {
-        let object = payload
-            .as_object()
-            .ok_or_else(|| "approval checkpoint must be a JSON object".to_string())?;
-        if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-            return Err(format!("approval checkpoint contains unknown field: {key}"));
-        }
-        Ok(())
+    /// 返回 checkpoint 唯一持有的规范化可执行 tool call。
+    pub fn pending_tool_call(&self) -> &PendingToolCall {
+        &self.pending_tool_call
     }
 
-    fn migrate_legacy(payload: &Value) -> Result<ApprovalCheckpoint, String> {
+    fn from_wire(wire: ApprovalCheckpointWire) -> Self {
+        Self {
+            pending_tool_call: wire.pending_tool_call,
+            checkpoint_version: wire.checkpoint_version,
+            thread_id: wire.thread_id,
+            turn_id: wire.turn_id,
+            project_instructions_digest: wire.project_instructions_digest,
+            messages: wire.messages,
+            tool_result_occurrences: wire.tool_result_occurrences,
+            used_approval_grants: wire.used_approval_grants,
+            approval_count: wire.approval_count,
+            model_turns: wire.model_turns,
+            completion: wire.completion,
+            last_completion_error: wire.last_completion_error,
+            plan: wire.plan,
+            plan_update_count: wire.plan_update_count,
+            recovery_metrics: wire.recovery_metrics,
+            model_usage: wire.model_usage,
+            provider_attempts: wire.provider_attempts,
+            context_trace: wire.context_trace,
+            seen_tool_call_fingerprints: wire.seen_tool_call_fingerprints,
+            last_repair_failure: wire.last_repair_failure,
+        }
+    }
+
+    fn migrate_legacy(payload: &Value) -> Result<Self, String> {
         let legacy: LegacyApprovalCheckpoint = serde_json::from_value(payload.clone())
             .map_err(|error| format!("invalid legacy approval checkpoint: {error}"))?;
         if legacy.checkpoint_version != LEGACY_APPROVAL_CHECKPOINT_VERSION {
@@ -1366,7 +1490,7 @@ impl ApprovalCheckpointCodec {
             .zip(bindings)
             .map(|(wire, visibility)| ToolResultOccurrence::from_wire(wire, visibility))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ApprovalCheckpoint {
+        Ok(Self {
             pending_tool_call: legacy.pending_tool_call,
             checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
             thread_id: legacy.thread_id,
@@ -1396,6 +1520,10 @@ impl ApprovalCheckpoint {
         if self.checkpoint_version != APPROVAL_CHECKPOINT_VERSION {
             return Err("unsupported approval checkpoint version".to_string());
         }
+        if self.thread_id.trim().is_empty() || self.turn_id.trim().is_empty() {
+            return Err("approval checkpoint thread or turn is missing".to_string());
+        }
+        self.pending_tool_call.validate()?;
         if self.model_turns == 0 {
             return Err("approval checkpoint model-turn offset is invalid".to_string());
         }
@@ -1478,9 +1606,7 @@ impl ApprovalCheckpoint {
 struct AgentLoopState {
     messages: Vec<ModelMessage>,
     tool_result_occurrences: Vec<ToolResultOccurrence>,
-    approval_requests: Vec<ApprovalRequest>,
-    pending_tool_calls: Vec<PendingToolCall>,
-    approval_checkpoints: Vec<ApprovalCheckpoint>,
+    pending_approvals: Vec<PendingApprovalOccurrence>,
     used_approval_grants: BTreeSet<String>,
     prior_approval_count: u32,
     completion: CompletionTracker,
@@ -1507,9 +1633,7 @@ impl AgentLoopState {
         Self {
             messages,
             tool_result_occurrences: Vec::new(),
-            approval_requests: Vec::new(),
-            pending_tool_calls: Vec::new(),
-            approval_checkpoints: Vec::new(),
+            pending_approvals: Vec::new(),
             used_approval_grants: BTreeSet::new(),
             prior_approval_count: 0,
             completion: CompletionTracker::default(),
@@ -1550,14 +1674,8 @@ impl AgentLoopState {
     ) -> AgentLoopResult {
         let approval_count = self
             .prior_approval_count
-            .saturating_add(self.approval_requests.len() as u32);
+            .saturating_add(self.pending_approvals.len() as u32);
         let public_plan = self.plan.as_ref().map(safe_agent_plan);
-        let approval_checkpoints = self
-            .approval_checkpoints
-            .iter()
-            .map(ApprovalCheckpointCodec::encode)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("AgentLoop approval checkpoints serialize");
         let tool_results = self
             .tool_result_occurrences
             .into_iter()
@@ -1570,9 +1688,7 @@ impl AgentLoopState {
             model_turns,
             tool_calls: tool_results.len() as u32,
             approval_count,
-            approval_requests: self.approval_requests,
-            pending_tool_calls: self.pending_tool_calls,
-            approval_checkpoints,
+            pending_approvals: self.pending_approvals,
             tool_results,
             verification: self.completion.summary(),
             plan: public_plan,
@@ -1606,7 +1722,7 @@ impl AgentLoopState {
 
     fn approval_count(&self) -> u32 {
         self.prior_approval_count
-            .saturating_add(self.approval_requests.len() as u32)
+            .saturating_add(self.pending_approvals.len() as u32)
     }
 
     fn observe_model_response(&mut self, response: &ModelTurnResponse) {
@@ -1665,7 +1781,7 @@ impl AgentLoopState {
             messages: self.messages.clone(),
             tool_result_occurrences: self.tool_result_occurrences.clone(),
             used_approval_grants: self.used_approval_grants.iter().cloned().collect(),
-            approval_count: self.approval_count(),
+            approval_count: self.approval_count().saturating_add(1),
             model_turns,
             completion: self.completion.clone(),
             last_completion_error: self.last_completion_error.clone(),
@@ -2183,12 +2299,11 @@ where
         )
     }
 
-    /// 恢复已校验的 approval 检查点，执行已批准调用，并继续运行。
-    pub fn resume_pending_tool_call(
+    /// 恢复一个已校验的 typed approval occurrence，执行已批准调用并继续运行。
+    pub fn resume_pending_approval(
         &self,
         input: &AgentLoopInput,
-        pending: &PendingToolCall,
-        checkpoint_payload: &Value,
+        pending: &PendingApprovalOccurrence,
     ) -> AgentLoopResult {
         if self.is_cancelled(input) {
             return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
@@ -2203,6 +2318,7 @@ where
             return failed_result(error);
         }
         let call = match pending
+            .pending_tool_call()
             .to_model_tool_call()
             .map_err(|error| format!("invalid pending tool call arguments: {error}"))
             .and_then(|call| {
@@ -2222,19 +2338,19 @@ where
                 );
             }
         };
-        let (state, model_turn_offset) =
-            match restore_checkpoint(input, pending, checkpoint_payload, &self.tool_broker) {
-                Ok(restored) => restored,
-                Err(error) => {
-                    return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        0,
-                        Some(error),
-                    );
-                }
-            };
+        let (state, model_turn_offset) = match restore_checkpoint(input, pending, &self.tool_broker)
+        {
+            Ok(restored) => restored,
+            Err(error) => {
+                return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    0,
+                    Some(error),
+                );
+            }
+        };
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
         }
@@ -2580,12 +2696,7 @@ where
             reason,
         } = &decision
         {
-            state.approval_requests.push(approval_request(
-                input,
-                approval_request_id,
-                &prepared,
-                reason,
-            ));
+            let request = approval_request(input, approval_request_id, &prepared, reason);
             let pending = PendingToolCall::new(
                 input,
                 &prepared.call,
@@ -2594,12 +2705,15 @@ where
                     .as_ref()
                     .expect("admitted tool call is bound"),
             );
-            state.pending_tool_calls.push(pending.clone());
             let checkpoint = match state.checkpoint(input, &pending, next_model_turn) {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => return ToolBatchControl::Failed(error),
             };
-            state.approval_checkpoints.push(checkpoint);
+            let occurrence = match PendingApprovalOccurrence::new(request, checkpoint) {
+                Ok(occurrence) => occurrence,
+                Err(error) => return ToolBatchControl::Failed(error),
+            };
+            state.pending_approvals.push(occurrence);
             let result = self.execute_tool(&prepared, decision, state);
             state.append_hidden_tool_result(result);
             return ToolBatchControl::Blocked;
@@ -3836,11 +3950,12 @@ fn current_turn_excluded(input: &AgentLoopInput, context: &ContextBundle) -> boo
 /// 在已批准调用执行前恢复并重新规范化检查点。
 fn restore_checkpoint(
     input: &AgentLoopInput,
-    pending: &PendingToolCall,
-    payload: &Value,
+    pending: &PendingApprovalOccurrence,
     tool_broker: &ToolBroker,
 ) -> Result<(AgentLoopState, u32), String> {
-    let checkpoint = ApprovalCheckpointCodec::decode(payload)?;
+    pending.validate_binding()?;
+    let checkpoint = pending.checkpoint.clone();
+    let pending_tool_call = pending.pending_tool_call();
     if checkpoint.thread_id != input.thread_id {
         return Err("approval checkpoint thread mismatch".to_string());
     }
@@ -3850,12 +3965,12 @@ fn restore_checkpoint(
     if checkpoint.project_instructions_digest != input.project_instructions_digest {
         return Err("approval checkpoint project instructions digest mismatch".to_string());
     }
-    if checkpoint.pending_tool_call != *pending {
+    if checkpoint.pending_tool_call != *pending_tool_call {
         return Err("approval checkpoint tool call mismatch".to_string());
     }
     let expected_request_id =
-        approval_request_id_from_tool_call_id(&input.turn_id, &pending.tool_call_id);
-    if pending.request_id != expected_request_id
+        approval_request_id_from_tool_call_id(&input.turn_id, &pending_tool_call.tool_call_id);
+    if pending_tool_call.request_id != expected_request_id
         || checkpoint.pending_tool_call.request_id != expected_request_id
     {
         return Err("approval checkpoint request mismatch".to_string());
@@ -3866,7 +3981,7 @@ fn restore_checkpoint(
         .ok_or_else(|| "approval checkpoint messages are missing".to_string())?;
     if last_message.role != ModelRole::Assistant
         || last_message.tool_calls.len() != 1
-        || last_message.tool_calls[0].tool_call_id != pending.tool_call_id
+        || last_message.tool_calls[0].tool_call_id != pending_tool_call.tool_call_id
     {
         return Err("approval checkpoint assistant tool-call ordering is invalid".to_string());
     }
@@ -3874,10 +3989,10 @@ fn restore_checkpoint(
     if model_visible_call.parse_status != ModelToolParseStatus::Valid {
         return Err("approval checkpoint assistant tool-call name is invalid".to_string());
     }
-    let pending_call = pending
+    let pending_call = pending_tool_call
         .to_model_tool_call()
         .map_err(|error| format!("invalid pending checkpoint tool call arguments: {error}"))?;
-    if model_visible_call.tool_name != pending.tool_name.as_str() {
+    if model_visible_call.tool_name != pending_tool_call.tool_name.as_str() {
         return Err("approval checkpoint assistant tool-call name is invalid".to_string());
     }
     let canonical_model_call = model_visible_call.clone();
@@ -3897,7 +4012,7 @@ fn restore_checkpoint(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    if used_approval_grants.contains(&pending.request_id) {
+    if used_approval_grants.contains(&pending_tool_call.request_id) {
         return Err("approval checkpoint consumed the pending grant".to_string());
     }
     let tool_result_occurrences = checkpoint.tool_result_occurrences;
@@ -3980,9 +4095,7 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         model_turns: 0,
         tool_calls: 0,
         approval_count: 0,
-        approval_requests: Vec::new(),
-        pending_tool_calls: Vec::new(),
-        approval_checkpoints: Vec::new(),
+        pending_approvals: Vec::new(),
         tool_results: Vec::new(),
         verification: AgentVerification::default(),
         plan: None,
