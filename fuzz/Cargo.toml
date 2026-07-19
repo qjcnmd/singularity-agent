@@ -1,0 +1,39 @@
+[package]
+name = "singularity_fuzz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+singularity_agent = { path = "../crates/agent" }
+singularity_policy = { path = "../crates/policy" }
+singularity_protocol = { path = "../crates/protocol" }
+
+[[bin]]
+name = "json_rpc_batch"
+path = "fuzz_targets/json_rpc_batch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_decode"
+path = "fuzz_targets/event_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "typed_checkpoint_decode"
+path = "fuzz_targets/typed_checkpoint_decode.rs"
+test = false
+doc = false
+bench = false

@@ -23,9 +23,10 @@ use singularity_model::{
     validate_model_turn_response,
 };
 use singularity_policy::{
-    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
-    PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
-    PermissionProfileName, PermissionRequest, PermissionResource, PolicyEngine, ToolId,
+    ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest, NetworkAccess,
+    PermissionDecision, PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation,
+    PermissionProfile, PermissionProfileName, PermissionRequest, PermissionResource, PolicyEngine,
+    ToolId, WorkspaceRelativePath,
 };
 use singularity_tools::{
     AgentControlToolExecutor, BoundToolCall, COMMAND_TOOL as TOOL_COMMAND, CommandToolInput,
@@ -1343,9 +1344,26 @@ struct ApprovalCheckpointWire {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LegacyPendingToolCall {
+    request_id: String,
+    tool_call_id: String,
+    tool_name: ToolId,
+    raw_arguments: String,
+    resources: Vec<LegacyPendingResource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum LegacyPendingResource {
+    String(String),
+    Typed(PermissionResource),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyApprovalCheckpoint {
     #[serde(flatten)]
-    pending_tool_call: PendingToolCall,
+    pending_tool_call: LegacyPendingToolCall,
     checkpoint_version: u32,
     thread_id: String,
     turn_id: String,
@@ -1407,6 +1425,99 @@ impl From<&ApprovalCheckpoint> for ApprovalCheckpointWire {
             seen_tool_call_fingerprints: checkpoint.seen_tool_call_fingerprints.clone(),
             last_repair_failure: checkpoint.last_repair_failure.clone(),
         }
+    }
+}
+
+fn migrate_legacy_pending_tool_call(
+    legacy: LegacyPendingToolCall,
+) -> Result<PendingToolCall, String> {
+    let action = legacy.tool_name;
+    let resources = migrate_legacy_pending_resources(&action, legacy.resources)?;
+    Ok(PendingToolCall {
+        request_id: legacy.request_id,
+        tool_call_id: legacy.tool_call_id,
+        tool_name: action,
+        raw_arguments: legacy.raw_arguments,
+        resources,
+    })
+}
+
+fn migrate_legacy_pending_resources(
+    action: &ToolId,
+    resources: Vec<LegacyPendingResource>,
+) -> Result<Vec<PermissionResource>, String> {
+    if !matches!(
+        action.as_str(),
+        "read" | "list" | "grep" | "edit" | "patch" | "command" | UPDATE_PLAN_TOOL
+    ) {
+        return Err("approval checkpoint legacy tool cannot be uniquely recovered".to_string());
+    }
+    let mut saw_strings = false;
+    let mut saw_typed = false;
+    let migrated = resources
+        .into_iter()
+        .map(|resource| match resource {
+            LegacyPendingResource::String(value) => {
+                saw_strings = true;
+                migrate_legacy_pending_string_resource(action, value)
+            }
+            LegacyPendingResource::Typed(resource) => {
+                saw_typed = true;
+                validate_legacy_pending_typed_resource(action, resource)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if saw_strings && saw_typed {
+        return Err("approval checkpoint legacy resources mix incompatible encodings".to_string());
+    }
+    Ok(migrated)
+}
+
+fn migrate_legacy_pending_string_resource(
+    action: &ToolId,
+    resource: String,
+) -> Result<PermissionResource, String> {
+    match action.as_str() {
+        "read" | "list" | "grep" | "edit" | "patch" => {
+            WorkspaceRelativePath::from_canonical(resource)
+                .map(PermissionResource::WorkspacePath)
+                .map_err(|error| {
+                    format!("approval checkpoint legacy workspace resource is invalid: {error}")
+                })
+        }
+        "command" => resource
+            .strip_prefix("command_script;scope_digest:")
+            .ok_or_else(|| {
+                "approval checkpoint legacy command resource is not an exact scope".to_string()
+            })
+            .and_then(|digest| {
+                CommandScopeDigest::new(digest.to_string())
+                    .map(PermissionResource::CommandScope)
+                    .map_err(|error| {
+                        format!("approval checkpoint legacy command resource is invalid: {error}")
+                    })
+            }),
+        UPDATE_PLAN_TOOL if resource == action.as_str() => {
+            Ok(PermissionResource::Tool(action.clone()))
+        }
+        _ => Err("approval checkpoint legacy resource cannot be uniquely recovered".to_string()),
+    }
+}
+
+fn validate_legacy_pending_typed_resource(
+    action: &ToolId,
+    resource: PermissionResource,
+) -> Result<PermissionResource, String> {
+    let valid = match (action.as_str(), &resource) {
+        ("read" | "list" | "grep" | "edit" | "patch", PermissionResource::WorkspacePath(_)) => true,
+        ("command", PermissionResource::CommandScope(_)) => true,
+        (UPDATE_PLAN_TOOL, PermissionResource::Tool(tool)) if tool == action => true,
+        _ => false,
+    };
+    if valid {
+        Ok(resource)
+    } else {
+        Err("approval checkpoint typed resource does not match its tool".to_string())
     }
 }
 
@@ -1490,8 +1601,9 @@ impl ApprovalCheckpoint {
             .zip(bindings)
             .map(|(wire, visibility)| ToolResultOccurrence::from_wire(wire, visibility))
             .collect::<Result<Vec<_>, _>>()?;
+        let pending_tool_call = migrate_legacy_pending_tool_call(legacy.pending_tool_call)?;
         Ok(Self {
-            pending_tool_call: legacy.pending_tool_call,
+            pending_tool_call,
             checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
             thread_id: legacy.thread_id,
             turn_id: legacy.turn_id,

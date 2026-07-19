@@ -197,7 +197,11 @@ fn app_server_enforces_initialize_and_emits_item_events() {
         subscription[0]["params"]["event"]["gap"]["reason"],
         "cursor_not_replayed"
     );
-    assert!(subscription[0]["params"]["event"]["cursor"] > 0);
+    assert!(
+        subscription[0]["params"]["event"]["cursor"]
+            .as_u64()
+            .is_some_and(|cursor| cursor > 0)
+    );
     let subscription_result = result_message(&subscription);
     assert_eq!(
         subscription_result["eventTypes"],
@@ -782,7 +786,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
-    assert_eq!(payload["schema_version"], "evaluation.result/v6");
+    assert_eq!(payload["schema_version"], "evaluation.result/v7");
     assert_eq!(payload["status"], "blocked");
     assert_eq!(
         payload["tasks"][0]["blocker"]["kind"],
@@ -1357,6 +1361,7 @@ fn allow_resume_precondition_failure_is_terminalized_without_replay() {
     server
         .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
+    subscribe_events(&mut server);
 
     let store = SessionStore::open(&db_path).expect("reopen store");
     let thread = store
@@ -1592,6 +1597,7 @@ fn interrupting_a_pending_approval_atomically_invalidates_the_request() {
     server
         .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
         .expect("initialized");
+    subscribe_events(&mut server);
     let store = SessionStore::open(&db_path).expect("reopen store");
     let thread = store
         .create_thread(Some("test-model"), Some(&workspace.to_string_lossy()))
@@ -2457,6 +2463,32 @@ fn initialize_process(input: &mut ChildStdin, output: &mut JsonOutput) {
     send_json(
         input,
         serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+    send_json(
+        input,
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "event/subscribe", "id": 99,
+            "params": {"eventTypes": [
+                "thread/started", "turn/started", "turn/completed",
+                "turn/plan/updated", "item/started", "item/completed",
+                "item/agentMessage/delta", "approval/requested"
+            ]}
+        }),
+    );
+    let subscription = output.recv_id(99, Duration::from_secs(2));
+    assert!(subscription.get("result").is_some());
+}
+
+fn subscribe_events(server: &mut AppServer) {
+    let response = server
+        .handle_json(
+            r#"{"jsonrpc":"2.0","method":"event/subscribe","id":99,"params":{"eventTypes":["thread/started","turn/started","turn/completed","turn/plan/updated","item/started","item/completed","item/agentMessage/delta","approval/requested"]}}"#,
+        )
+        .expect("event subscription");
+    assert!(
+        response
+            .iter()
+            .any(|message| message.get("result").is_some())
     );
 }
 

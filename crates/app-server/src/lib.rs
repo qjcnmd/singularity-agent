@@ -18,12 +18,12 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult,
-    AgentRunStatus, AgentStatus, ApprovalGrant, PendingToolCall, agent_control_tool_entries,
-    project_audit_event,
+    AgentRunStatus, AgentStatus, ApprovalGrant, PendingApprovalOccurrence,
+    agent_control_tool_entries, project_audit_event,
 };
 use singularity_core::{
-    CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
-    load_project_instructions,
+    CancellationToken, ErrorCode, JSON_RPC_INTERNAL_ERROR, ProjectInstructionError,
+    contains_sensitive_text, load_project_instructions,
 };
 use singularity_model::{Provider, ProviderConfigSnapshot};
 use singularity_policy::{
@@ -114,7 +114,6 @@ pub enum AppServerError {
 
 /// `AppServer` 请求处理和生命周期操作使用的结果类型。
 pub type AppServerResult<T> = Result<T, AppServerError>;
-type ApprovalCheckpoint = (ApprovalRequest, Value);
 
 /// 已持久化 Running Turn 的失败阶段；仅暴露稳定分类，不携带底层错误文本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,7 +264,7 @@ struct ApprovalResumeInput<'a> {
     decision: &'a ApprovalDecision,
     turn: &'a Turn,
     thread: &'a Thread,
-    pending_tool_call: Option<Value>,
+    pending_approval: Option<PendingApprovalOccurrence>,
 }
 
 struct ApprovalTerminalizationContext<'a> {
@@ -1312,10 +1311,17 @@ impl AppServer {
             &self.provider_snapshot,
         ) {
             Ok(result) => json_response(message.required_id(), result),
-            Err(_) => json_error(
-                Some(message.required_id()),
-                ErrorCode::invalid_params("Invalid params"),
-            ),
+            Err(error) => match error.kind() {
+                evaluation::EvaluationRunErrorKind::Input => json_error(
+                    Some(message.required_id()),
+                    ErrorCode::invalid_params("Invalid params"),
+                ),
+                evaluation::EvaluationRunErrorKind::Publication
+                | evaluation::EvaluationRunErrorKind::Infrastructure => json_error(
+                    Some(message.required_id()),
+                    ErrorCode::new(JSON_RPC_INTERNAL_ERROR, "Internal error"),
+                ),
+            },
         }
     }
 
@@ -1352,13 +1358,13 @@ impl AppServer {
         &self,
         input: ApprovalResumeInput<'_>,
         context: ApprovalResumeContext<'_>,
-    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<ApprovalCheckpoint>)>> {
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>> {
         let ApprovalResumeInput {
             request,
             decision,
             turn,
             thread,
-            pending_tool_call,
+            pending_approval,
         } = input;
         if monitor_infrastructure_failure(context.monitor_control) {
             return Err(AppServerError::TurnExecution {
@@ -1372,7 +1378,7 @@ impl AppServer {
         if !matches!(decision.outcome, ApprovalOutcome::Allow) {
             return Ok(None);
         }
-        if pending_tool_call.is_none() {
+        if pending_approval.is_none() {
             return Ok(None);
         }
         let provider = match self.provider_snapshot.provider() {
@@ -1382,7 +1388,7 @@ impl AppServer {
                 let mut run_status = approval_terminal_status(
                     thread,
                     decision,
-                    pending_tool_call.as_ref(),
+                    pending_approval.as_ref(),
                     AgentStatus::Failed,
                     "unavailable",
                     SAFE_PROVIDER_FAILURE,
@@ -1397,7 +1403,7 @@ impl AppServer {
                 decision,
                 turn,
                 thread,
-                pending_tool_call,
+                pending_approval,
             },
             provider,
             context,
@@ -1414,19 +1420,23 @@ impl AppServer {
         provider: P,
         cancellation: &CancellationToken,
         prepared_workspace_tools: Option<WorkspaceTools>,
-    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<ApprovalCheckpoint>)>>
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
     where
         P: Provider,
     {
         let turn = self.store.get_turn(&request.turn_id)?;
         let thread = self.store.get_thread(&turn.thread_id)?;
+        let pending_approval = match pending_tool_call.as_ref() {
+            Some(payload) => decode_pending_approval(request, Some(payload))?,
+            None => None,
+        };
         self.resume_agent_loop_after_gate_with_monitor(
             ApprovalResumeInput {
                 request,
                 decision,
                 turn: &turn,
                 thread: &thread,
-                pending_tool_call,
+                pending_approval,
             },
             provider,
             ApprovalResumeContext {
@@ -1442,7 +1452,7 @@ impl AppServer {
         input: ApprovalResumeInput<'_>,
         provider: P,
         context: ApprovalResumeContext<'_>,
-    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<ApprovalCheckpoint>)>>
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
     where
         P: Provider,
     {
@@ -1451,7 +1461,7 @@ impl AppServer {
             decision,
             turn,
             thread,
-            pending_tool_call,
+            pending_approval,
         } = input;
         if monitor_infrastructure_failure(context.monitor_control) {
             return Err(AppServerError::TurnExecution {
@@ -1467,31 +1477,17 @@ impl AppServer {
         {
             return Ok(None);
         }
-        let Some(pending_tool_call) = pending_tool_call else {
+        let Some(pending_approval) = pending_approval else {
             return Ok(None);
         };
-        let pending = match serde_json::from_value::<PendingToolCall>(pending_tool_call.clone()) {
-            Ok(pending) => pending,
-            Err(_error) => {
-                let run_status = approval_terminal_status(
-                    thread,
-                    decision,
-                    Some(&pending_tool_call),
-                    AgentStatus::Failed,
-                    "unavailable",
-                    "pending tool call could not be restored",
-                );
-                return Ok(Some((turn.clone(), run_status, Vec::new())));
-            }
-        };
-        if pending.request_id != request.request_id {
+        if pending_approval.request().request_id != request.request_id {
             let run_status = approval_terminal_status(
                 thread,
                 decision,
-                Some(&pending_tool_call),
+                Some(&pending_approval),
                 AgentStatus::Failed,
                 "unavailable",
-                "pending tool call request mismatch",
+                "pending approval request mismatch",
             );
             return Ok(Some((turn.clone(), run_status, Vec::new())));
         }
@@ -1504,7 +1500,7 @@ impl AppServer {
                 let run_status = approval_terminal_status(
                     thread,
                     decision,
-                    Some(&pending_tool_call),
+                    Some(&pending_approval),
                     AgentStatus::Failed,
                     "unavailable",
                     "workspace capability was not prepared",
@@ -1547,7 +1543,7 @@ impl AppServer {
                 let run_status = approval_terminal_status(
                     thread,
                     decision,
-                    Some(&pending_tool_call),
+                    Some(&pending_approval),
                     AgentStatus::Failed,
                     "unavailable",
                     SAFE_PROJECT_INSTRUCTIONS_FAILURE,
@@ -1558,7 +1554,7 @@ impl AppServer {
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
             .with_workspace_tools(workspace_tools)
             .with_cancellation_token(context.cancellation.clone())
-            .resume_pending_tool_call(&loop_input, &pending, &pending_tool_call);
+            .resume_pending_approval(&loop_input, &pending_approval);
         if monitor_infrastructure_failure(context.monitor_control) {
             return Err(AppServerError::TurnExecution {
                 stage: TurnFailureStage::CancellationMonitor,
@@ -1567,21 +1563,14 @@ impl AppServer {
         }
         let mut run_status = result.to_run_status();
         sanitize_agent_run_status_error(&mut run_status);
-        let next_approvals = match approval_checkpoints(&result) {
-            Ok(next_approvals) => next_approvals,
-            Err(_) => {
-                run_status = failed_turn_status(TurnFailure {
-                    stage: TurnFailureStage::ApprovalCheckpoint,
-                    cause: TurnFailureCause::Store,
-                });
-                Vec::new()
-            }
-        };
-        if run_status.audit_events.is_empty() && pending.tool_name.as_str() == TOOL_COMMAND {
+        let next_approvals = result.pending_approvals.clone();
+        if run_status.audit_events.is_empty()
+            && pending_approval.pending_tool_call().tool_name.as_str() == TOOL_COMMAND
+        {
             let audit_status = approval_terminal_status(
                 thread,
                 decision,
-                Some(&pending_tool_call),
+                Some(&pending_approval),
                 run_status.status.clone(),
                 "unavailable",
                 run_status
@@ -1710,7 +1699,7 @@ impl AppServer {
                 cause: TurnFailureCause::CancellationMonitor,
             });
         }
-        let checkpoints = approval_checkpoints(result)?;
+        let encoded_checkpoints = encode_pending_approvals(&result.pending_approvals)?;
         if monitor_infrastructure_failure(monitor_control) {
             return Err(AppServerError::TurnExecution {
                 stage: TurnFailureStage::CancellationMonitor,
@@ -1719,7 +1708,7 @@ impl AppServer {
         }
         self.store
             .create_approval_batch_with_pending_tool_calls_and_trace(
-                &checkpoints,
+                &encoded_checkpoints,
                 "approval",
                 "approval requested",
             )?;
@@ -1813,7 +1802,7 @@ impl AppServer {
         request_id: &str,
         turn: &Turn,
         run_status: &AgentRunStatus,
-        next_approvals: &[ApprovalCheckpoint],
+        next_approvals: &[PendingApprovalOccurrence],
         monitor_outcome: Option<CancellationMonitorOutcome>,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         let mut effective_status = run_status.clone();
@@ -1822,9 +1811,9 @@ impl AppServer {
             let plan = status.plan.as_ref().map(serde_json::to_value).transpose()?;
             let event = agent_loop_trace(turn, status);
             let effective_next_approvals = if status.status == AgentStatus::Blocked {
-                next_approvals
+                encode_pending_approvals(next_approvals)?
             } else {
-                &[]
+                Vec::new()
             };
             let authority =
                 if monitor_outcome == Some(CancellationMonitorOutcome::InfrastructureFailure) {
@@ -1842,7 +1831,7 @@ impl AppServer {
                         plan: plan.as_ref(),
                         trace: &event,
                     },
-                    effective_next_approvals,
+                    &effective_next_approvals,
                     authority,
                 )
         };
@@ -2048,6 +2037,18 @@ impl AppServer {
                 cause: TurnFailureCause::CancellationMonitor,
             });
         }
+        let pending_payload = if is_tool_continuation {
+            self.store
+                .get_pending_tool_call(&pending_request.request_id)?
+        } else {
+            None
+        };
+        if decode_pending_approval(&pending_request, pending_payload.as_ref()).is_err() {
+            return invalid_state_response(
+                message.required_id(),
+                "Approval checkpoint unavailable",
+            );
+        }
         let recorded = match self.store.record_approval_decision(
             &decision,
             "approval",
@@ -2071,7 +2072,16 @@ impl AppServer {
                 };
             }
         };
-        let pending_tool_call = recorded.pending_tool_call.clone();
+        let pending_approval =
+            match decode_pending_approval(&recorded.request, recorded.pending_tool_call.as_ref()) {
+                Ok(pending_approval) => pending_approval,
+                Err(_) => {
+                    return invalid_state_response(
+                        message.required_id(),
+                        "Approval checkpoint unavailable",
+                    );
+                }
+            };
         if matches!(decision.outcome, ApprovalOutcome::Defer) {
             return Ok(vec![approval_decision_response(
                 message.required_id(),
@@ -2080,7 +2090,7 @@ impl AppServer {
         }
         if matches!(decision.outcome, ApprovalOutcome::Deny) {
             let mut messages = Vec::new();
-            if pending_tool_call.is_some()
+            if pending_approval.is_some()
                 && let Some(event) =
                     self.event_notification(AppEvent::turn_completed(&recorded.turn))?
             {
@@ -2108,7 +2118,7 @@ impl AppServer {
                         decision: &decision,
                         turn: &recorded.turn,
                         thread: &pending_thread,
-                        pending_tool_call: pending_tool_call.clone(),
+                        pending_approval: pending_approval.clone(),
                     },
                     ApprovalResumeContext {
                         cancellation: &cancellation,
@@ -2124,7 +2134,7 @@ impl AppServer {
                         &decision,
                         &recorded.turn,
                         &pending_thread,
-                        pending_tool_call.as_ref(),
+                        pending_approval.as_ref(),
                     )?
                     .map(|(turn, run_status)| (turn, run_status, Vec::new()))
                 };
@@ -2143,7 +2153,7 @@ impl AppServer {
                 .terminalize_claimed_approval_error(
                     &recorded.request,
                     &decision,
-                    pending_tool_call.as_ref(),
+                    pending_approval.as_ref(),
                     ApprovalTerminalizationContext {
                         turn: &recorded.turn,
                         thread: &pending_thread,
@@ -2177,7 +2187,7 @@ impl AppServer {
                 let terminal = self.terminalize_claimed_approval_error(
                     &recorded.request,
                     &decision,
-                    pending_tool_call.as_ref(),
+                    pending_approval.as_ref(),
                     ApprovalTerminalizationContext {
                         turn: &recorded.turn,
                         thread: &pending_thread,
@@ -2230,7 +2240,7 @@ impl AppServer {
                         .terminalize_claimed_approval_error(
                             &recorded.request,
                             &decision,
-                            pending_tool_call.as_ref(),
+                            pending_approval.as_ref(),
                             ApprovalTerminalizationContext {
                                 turn: &turn,
                                 thread: &pending_thread,
@@ -2265,7 +2275,7 @@ impl AppServer {
         &self,
         _request: &ApprovalRequest,
         decision: &ApprovalDecision,
-        pending_tool_call: Option<&Value>,
+        pending_approval: Option<&PendingApprovalOccurrence>,
         context: ApprovalTerminalizationContext<'_>,
     ) -> Result<TurnTerminalizationResult, TurnTerminalizationFailure> {
         let ApprovalTerminalizationContext {
@@ -2291,7 +2301,7 @@ impl AppServer {
         let fallback_status = approval_terminal_status(
             thread,
             decision,
-            pending_tool_call,
+            pending_approval,
             AgentStatus::Failed,
             "unavailable",
             failure_message.clone(),
@@ -2371,9 +2381,9 @@ impl AppServer {
         decision: &ApprovalDecision,
         turn: &Turn,
         thread: &Thread,
-        pending_tool_call: Option<&Value>,
+        pending_approval: Option<&PendingApprovalOccurrence>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus)>> {
-        if pending_tool_call.is_none() {
+        if pending_approval.is_none() {
             return Ok(None);
         }
         let (status, audit_decision, message) = if turn.agent_loop_status
@@ -2400,7 +2410,7 @@ impl AppServer {
             )
         } else {
             match decision.outcome {
-                ApprovalOutcome::Allow if pending_tool_call.is_some() => (
+                ApprovalOutcome::Allow if pending_approval.is_some() => (
                     AgentStatus::Failed,
                     "unavailable",
                     "approval allowed but agent loop turn could not resume",
@@ -2417,7 +2427,7 @@ impl AppServer {
         let run_status = approval_terminal_status(
             thread,
             decision,
-            pending_tool_call,
+            pending_approval,
             status,
             audit_decision,
             message,
@@ -2786,7 +2796,7 @@ fn cancellation_monitor(
 fn approval_terminal_status(
     thread: &Thread,
     decision: &ApprovalDecision,
-    pending_tool_call: Option<&Value>,
+    pending_approval: Option<&PendingApprovalOccurrence>,
     status: AgentStatus,
     audit_decision: &str,
     message: impl Into<String>,
@@ -2800,7 +2810,7 @@ fn approval_terminal_status(
         "approval_decision_id": decision.decision_id,
         "command_provenance": "agent_requested",
     });
-    if let Some(command_audit) = pending_command_audit_metadata(pending_tool_call, thread) {
+    if let Some(command_audit) = pending_command_audit_metadata(pending_approval, thread) {
         merge_json_object(&mut audit_event, command_audit);
     }
     run_status
@@ -2809,22 +2819,43 @@ fn approval_terminal_status(
     run_status
 }
 
+/// 在 approval 请求进入执行状态前，唯一解码 opaque checkpoint 的 typed 边界。
+fn decode_pending_approval(
+    request: &ApprovalRequest,
+    payload: Option<&Value>,
+) -> AppServerResult<Option<PendingApprovalOccurrence>> {
+    match (request.tool_call_id.is_some(), payload) {
+        (false, None) => Ok(None),
+        (true, Some(payload)) => {
+            PendingApprovalOccurrence::from_checkpoint_payload(request.clone(), payload)
+                .map(Some)
+                .map_err(|error| {
+                    AppServerError::Store(StoreError::InvalidState(format!(
+                        "{APPROVAL_CHECKPOINT_REQUIRED}: {error}"
+                    )))
+                })
+        }
+        (true, None) | (false, Some(_)) => Err(AppServerError::Store(StoreError::InvalidState(
+            APPROVAL_CHECKPOINT_REQUIRED.to_string(),
+        ))),
+    }
+}
+
 fn pending_command_audit_metadata(
-    pending_tool_call: Option<&Value>,
+    pending_approval: Option<&PendingApprovalOccurrence>,
     thread: &Thread,
 ) -> Option<Value> {
-    let pending_value = pending_tool_call?;
-    let tool_name = pending_value.get("tool_name").and_then(Value::as_str)?;
-    if tool_name != TOOL_COMMAND {
+    let pending = pending_approval?.pending_tool_call();
+    if pending.tool_name.as_str() != TOOL_COMMAND {
         return None;
     }
-    let resources = serde_json::from_value::<PendingToolCall>(pending_value.clone())
-        .map(|pending| pending.resources)
-        .unwrap_or_default();
-    let scope_digest = resources.iter().find_map(|resource| match resource {
-        PermissionResource::CommandScope(digest) => Some(digest.as_str()),
-        _ => None,
-    });
+    let scope_digest = pending
+        .resources
+        .iter()
+        .find_map(|resource| match resource {
+            PermissionResource::CommandScope(digest) => Some(digest.as_str()),
+            _ => None,
+        });
     let audit = json!({
         "sandbox_backend": "not_executed",
         "sandbox_enforcement": "not_executed",
@@ -2848,19 +2879,17 @@ fn merge_json_object(target: &mut Value, source: Value) {
     }
 }
 
-fn approval_checkpoints(result: &AgentLoopResult) -> AppServerResult<Vec<ApprovalCheckpoint>> {
-    result
-        .approval_requests
+/// 在 AppServer 与 Store 的持久化边界一次性编码 typed checkpoint。
+fn encode_pending_approvals(
+    checkpoints: &[PendingApprovalOccurrence],
+) -> Result<Vec<(ApprovalRequest, Value)>, StoreError> {
+    checkpoints
         .iter()
-        .map(|request| {
-            let checkpoint = result
-                .approval_checkpoint(&request.request_id)
-                .ok_or_else(|| {
-                    AppServerError::Store(StoreError::InvalidState(
-                        APPROVAL_CHECKPOINT_REQUIRED.to_string(),
-                    ))
-                })?;
-            Ok((request.clone(), checkpoint))
+        .map(|occurrence| {
+            let payload = occurrence
+                .encode_checkpoint()
+                .map_err(StoreError::InvalidState)?;
+            Ok((occurrence.request().clone(), payload))
         })
         .collect()
 }
@@ -3295,13 +3324,10 @@ mod tests {
         ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, Provider,
         ProviderError, ProviderProtocolContract,
     };
-    use singularity_policy::{CommandScopeDigest, ToolId, WorkspaceRelativePath};
+    use singularity_policy::{ToolId, WorkspaceRelativePath};
     use singularity_protocol::ItemKind;
     use singularity_sandbox::{CommandScriptRequest, WorkspaceMutation};
-    use singularity_tools::{
-        CommandRequest, CommandResult, SandboxFilesystemMode, SandboxNetworkMode,
-        command_script_scope_digest_with_policy,
-    };
+    use singularity_tools::{CommandRequest, CommandResult};
 
     use super::*;
 
@@ -3315,14 +3341,82 @@ mod tests {
         )
     }
 
-    fn command_resource(value: String) -> PermissionResource {
-        PermissionResource::CommandScope(
-            CommandScopeDigest::new(value).expect("valid command scope"),
-        )
-    }
-
     fn app_server(store: SessionStore) -> AppServer {
         AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+    }
+
+    fn pending_approval_for_test(
+        request: &ApprovalRequest,
+        arguments: Value,
+    ) -> PendingApprovalOccurrence {
+        let tool_call_id = request.tool_call_id.clone().expect("tool call id");
+        let raw_arguments = arguments.to_string();
+        let payload = json!({
+            "request_id": &request.request_id,
+            "thread_id": &request.thread_id,
+            "turn_id": &request.turn_id,
+            "tool_call_id": &tool_call_id,
+            "tool_name": &request.action,
+            "raw_arguments": &raw_arguments,
+            "resources": &request.resources,
+            "checkpoint_version": 1,
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "tool_call_id": &tool_call_id,
+                    "tool_name": &request.action,
+                    "arguments": arguments,
+                    "raw_arguments": &raw_arguments,
+                    "parse_status": "valid",
+                    "validation_errors": []
+                }]
+            }],
+            "tool_results": [],
+            "used_approval_grants": [],
+            "approval_count": 1,
+            "model_turns": 1,
+            "completion": {
+                "workspace_mutated": false,
+                "workspace_revision": null,
+                "successful_command_count": 0,
+                "required_command_counts": {},
+                "terminal_command_scope_digests": [],
+                "terminal_command_revisions": [],
+                "unresolved_failures": []
+            },
+            "last_completion_error": null
+        });
+        decode_pending_approval(request, Some(&payload))
+            .expect("pending approval")
+            .expect("pending occurrence")
+    }
+
+    #[test]
+    fn app_server_checkpoint_codec_migrates_legacy_string_resources() {
+        let request = ApprovalRequest::new(
+            "approval_legacy_resource",
+            "thread_legacy_resource",
+            "turn_legacy_resource",
+            tool_id(TOOL_EDIT),
+        )
+        .with_tool_call_id("call_1")
+        .with_resources([workspace_resource("README.md")]);
+        let pending = pending_approval_for_test(&request, json!({}));
+        let mut legacy = pending.encode_checkpoint().expect("checkpoint");
+        legacy["checkpoint_version"] = json!(1);
+        legacy["resources"] = json!(["README.md"]);
+        legacy["tool_results"] = legacy["tool_result_occurrences"].clone();
+        legacy
+            .as_object_mut()
+            .expect("checkpoint object")
+            .remove("tool_result_occurrences");
+        legacy["tool_result_context_bindings"] = json!([]);
+
+        let migrated = decode_pending_approval(&request, Some(&legacy))
+            .expect("decode legacy checkpoint")
+            .expect("pending approval");
+        assert_eq!(migrated.pending_tool_call().resources, request.resources);
     }
 
     #[test]
@@ -4057,7 +4151,7 @@ mod tests {
             .terminalize_claimed_approval_error(
                 &request,
                 &decision,
-                Some(&checkpoint),
+                None,
                 ApprovalTerminalizationContext {
                     turn: &turn,
                     thread: &thread,
@@ -4792,6 +4886,17 @@ mod tests {
             .expect("agent loop");
         assert_eq!(status.status, AgentStatus::Completed);
         assert!(status.plan.is_some());
+        server
+            .event_filter
+            .lock()
+            .expect("event filter")
+            .event_types = Some(vec![
+            "item/started".to_string(),
+            "item/completed".to_string(),
+            "turn/plan/updated".to_string(),
+            "item/agentMessage/delta".to_string(),
+            "turn/completed".to_string(),
+        ]);
 
         let committed = server
             .commit_turn_run_status(turn, &status, &CancellationToken::new(), None)
@@ -5052,18 +5157,13 @@ mod tests {
             tool_id(TOOL_COMMAND),
         )
         .with_tool_call_id("call_1");
-        let pending = PendingToolCall {
-            request_id: request.request_id.clone(),
-            tool_call_id: "call_1".to_string(),
-            tool_name: tool_id(TOOL_COMMAND),
-            raw_arguments: json!({
+        let pending_approval = pending_approval_for_test(
+            &request,
+            json!({
                 "command": "test-program success",
                 "timeout_seconds": 5
-            })
-            .to_string(),
-            resources: Vec::new(),
-        };
-        let pending_payload = serde_json::to_value(&pending).expect("pending payload");
+            }),
+        );
         let decision = ApprovalDecision::new(
             request.request_id.clone(),
             ApprovalOutcome::Allow,
@@ -5072,7 +5172,7 @@ mod tests {
         let server = app_server(store);
 
         let (_turn, run_status) = server
-            .approval_no_resume_status(&request, &decision, &turn, &thread, Some(&pending_payload))
+            .approval_no_resume_status(&request, &decision, &turn, &thread, Some(&pending_approval))
             .expect("status")
             .expect("terminal status");
 
@@ -5188,6 +5288,7 @@ mod tests {
         store
             .request_turn_cancellation(&turn.turn_id, &cancellation_trace)
             .expect("request cancellation");
+        let pending_approval = pending_approval_for_test(&request, json!({}));
         let server = app_server(store);
         let current_turn = server
             .store
@@ -5199,7 +5300,7 @@ mod tests {
                 &decision,
                 &current_turn,
                 &thread,
-                Some(&pending_payload),
+                Some(&pending_approval),
             )
             .expect("no-resume status")
             .expect("terminal status");
@@ -5218,7 +5319,7 @@ mod tests {
                 &request.request_id,
                 &turn,
                 &stale_status,
-                &[(next.clone(), checkpoint(&next, "call_2"))],
+                &[],
                 None,
             )
             .expect("cancellation wins approval resolution");
@@ -5323,7 +5424,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_loop_approval_resume_failures_record_command_audit() {
+    fn agent_loop_approval_resume_rejects_untyped_checkpoint_payloads() {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
@@ -5359,24 +5460,16 @@ mod tests {
             ApprovalOutcome::Allow,
             "approved",
         );
-        let valid_command = json!({
-            "command": "test-program success",
-            "timeout_seconds": 5
-        })
-        .to_string();
-        let bound_resource = command_resource(command_script_scope_digest_with_policy(
-            "test-program success",
-            ".",
-            5,
-            SandboxFilesystemMode::WorkspaceWrite,
-            SandboxNetworkMode::Allowed,
-        ));
         let mismatched_pending = PendingToolCall {
             request_id: "approval_other_call_1".to_string(),
             tool_call_id: "call_1".to_string(),
             tool_name: tool_id(TOOL_COMMAND),
-            raw_arguments: valid_command.clone(),
-            resources: vec![bound_resource.clone()],
+            raw_arguments: json!({
+                "command": "test-program success",
+                "timeout_seconds": 5
+            })
+            .to_string(),
+            resources: Vec::new(),
         };
         let invalid_args_pending = PendingToolCall {
             request_id: request.request_id.clone(),
@@ -5385,76 +5478,43 @@ mod tests {
             raw_arguments: "{not-json".to_string(),
             resources: Vec::new(),
         };
-        let seen_requests = Arc::new(Mutex::new(Vec::new()));
         let server = app_server(store);
 
-        let (_turn, mismatch_status, _next_approvals) = server
+        let mismatch_error = server
             .resume_agent_loop_after_gate(
                 &request,
                 &decision,
                 Some(serde_json::to_value(&mismatched_pending).expect("pending payload")),
                 StaticProvider {
-                    responses: vec![ModelTurnResponse::completed(
-                        "model_request_turn_1_0",
-                        "response_1",
-                        "done",
-                    )],
-                    seen_requests: Arc::clone(&seen_requests),
+                    responses: Vec::new(),
+                    seen_requests: Arc::new(Mutex::new(Vec::new())),
                 },
                 &CancellationToken::new(),
                 None,
             )
-            .expect("resume")
-            .expect("terminal status");
-        assert_eq!(mismatch_status.status, AgentStatus::Failed);
-        assert_eq!(
-            mismatch_status.audit_events[0]["sandbox_backend"],
-            "not_executed"
-        );
-        assert_eq!(
-            mismatch_status.audit_events[0]["command_scope_digest"],
-            match &bound_resource {
-                PermissionResource::CommandScope(digest) => digest.as_str(),
-                _ => panic!("bound command resource must be typed"),
-            }
-        );
-        assert_eq!(
-            mismatch_status.audit_events[0]["policy_scope_binding"],
-            "bound"
-        );
+            .expect_err("mismatched checkpoint must fail closed");
+        assert!(matches!(
+            mismatch_error,
+            AppServerError::Store(StoreError::InvalidState(_))
+        ));
 
-        let (_turn, invalid_args_status, _next_approvals) = server
+        let invalid_args_error = server
             .resume_agent_loop_after_gate(
                 &request,
                 &decision,
                 Some(serde_json::to_value(&invalid_args_pending).expect("pending payload")),
                 StaticProvider {
-                    responses: vec![ModelTurnResponse::completed(
-                        "model_request_turn_1_0",
-                        "response_1",
-                        "done",
-                    )],
-                    seen_requests: Arc::clone(&seen_requests),
+                    responses: Vec::new(),
+                    seen_requests: Arc::new(Mutex::new(Vec::new())),
                 },
                 &CancellationToken::new(),
                 None,
             )
-            .expect("resume")
-            .expect("terminal status");
-        assert_eq!(invalid_args_status.status, AgentStatus::Failed);
-        assert_eq!(
-            invalid_args_status.audit_events[0]["approval_decision"],
-            "unavailable"
-        );
-        assert_eq!(
-            invalid_args_status.audit_events[0]["sandbox_enforcement"],
-            "not_executed"
-        );
-        assert_eq!(
-            invalid_args_status.audit_events[0]["command_scope_digest"],
-            "unavailable"
-        );
-        assert!(seen_requests.lock().expect("seen requests").is_empty());
+            .expect_err("invalid checkpoint arguments must fail closed");
+        assert!(matches!(
+            invalid_args_error,
+            AppServerError::Store(StoreError::InvalidState(_))
+        ));
     }
 
     #[test]
@@ -5618,14 +5678,14 @@ mod tests {
             .record_approval_decision(&decision, "approval", "approval decision recorded")
             .expect("record approval");
         let pending_payload = recorded.pending_tool_call.expect("checkpoint payload");
-        assert_eq!(pending_payload["checkpoint_version"], 1);
+        assert_eq!(pending_payload["checkpoint_version"], 2);
         assert!(
             pending_payload["project_instructions_digest"]
                 .as_str()
                 .is_some_and(|digest| digest.starts_with("sha256:"))
         );
         assert!(pending_payload["messages"].is_array());
-        assert!(pending_payload["tool_results"].is_array());
+        assert!(pending_payload["tool_result_occurrences"].is_array());
 
         let resumed = server
             .resume_agent_loop_after_gate(

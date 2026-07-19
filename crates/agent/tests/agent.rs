@@ -1456,6 +1456,7 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
     let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
     let mut legacy_checkpoint = checkpoint.clone();
     legacy_checkpoint["checkpoint_version"] = serde_json::json!(1);
+    legacy_checkpoint["resources"] = serde_json::json!(["README.md"]);
     legacy_checkpoint["tool_results"] = legacy_checkpoint["tool_result_occurrences"].clone();
     legacy_checkpoint
         .as_object_mut()
@@ -1473,6 +1474,40 @@ fn agent_loop_resume_preserves_max_turn_accounting_after_pending_tool_execution(
         &legacy_checkpoint,
     )
     .expect("migrate legacy checkpoint");
+
+    let mut invalid_resource = legacy_checkpoint.clone();
+    invalid_resource["resources"] = serde_json::json!(["../escape"]);
+    assert!(
+        PendingApprovalOccurrence::from_checkpoint_payload(
+            pending.request().clone(),
+            &invalid_resource,
+        )
+        .expect_err("invalid legacy resource must fail closed")
+        .contains("workspace resource is invalid")
+    );
+    let mut mixed_resources = legacy_checkpoint.clone();
+    mixed_resources["resources"] = serde_json::json!([
+        "README.md",
+        {"kind": "workspace_path", "value": "README.md"}
+    ]);
+    assert!(
+        PendingApprovalOccurrence::from_checkpoint_payload(
+            pending.request().clone(),
+            &mixed_resources,
+        )
+        .expect_err("mixed legacy resource encodings must fail closed")
+        .contains("mix incompatible encodings")
+    );
+    let mut unknown_tool = legacy_checkpoint.clone();
+    unknown_tool["tool_name"] = serde_json::json!("unknown_tool");
+    assert!(
+        PendingApprovalOccurrence::from_checkpoint_payload(
+            pending.request().clone(),
+            &unknown_tool
+        )
+        .expect_err("unknown legacy tool must fail closed")
+        .contains("tool cannot be uniquely recovered")
+    );
     let resumed = agent_loop.resume_pending_approval(&resume_input, &migrated);
 
     assert_eq!(resumed.status, AgentStatus::Failed);

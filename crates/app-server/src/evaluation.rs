@@ -20,10 +20,9 @@ use singularity_core::{contains_sensitive_text, load_project_instructions};
 use singularity_evaluation::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
     EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationPromptStructure,
-    EvaluationProviderEvidence, EvaluationResult, EvaluationResultSchemaVersion,
-    EvaluationRunSummary, EvaluationStageResults, EvaluationStatus, EvaluationTaskResult,
-    EvaluationTrialResult, PatchFormat, PlannedWorkspaceSource, RunId, StageResult, StageStatus,
-    TaskId, VerificationStagePlan, WorkspacePlan,
+    EvaluationProviderEvidence, EvaluationResult, EvaluationStageResults, EvaluationStatus,
+    EvaluationTaskResult, EvaluationTrialResult, PatchFormat, PlannedWorkspaceSource, RunId,
+    StageResult, StageStatus, TaskId, VerificationStagePlan, WorkspacePlan,
 };
 use singularity_model::{
     ModelErrorCategory, ModelUsage, OpenAiProvider, ProviderAttemptMetadata,
@@ -300,29 +299,77 @@ struct PublishedEvaluationArtifacts {
     evidence_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvaluationRunErrorKind {
+    Input,
+    Publication,
+    Infrastructure,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EvaluationRunError {
+    kind: EvaluationRunErrorKind,
+    message: String,
+}
+
+impl EvaluationRunError {
+    fn input(message: impl Into<String>) -> Self {
+        Self {
+            kind: EvaluationRunErrorKind::Input,
+            message: message.into(),
+        }
+    }
+
+    fn publication(message: impl Into<String>) -> Self {
+        Self {
+            kind: EvaluationRunErrorKind::Publication,
+            message: message.into(),
+        }
+    }
+
+    fn infrastructure(message: impl Into<String>) -> Self {
+        Self {
+            kind: EvaluationRunErrorKind::Infrastructure,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> EvaluationRunErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for EvaluationRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EvaluationRunError {}
+
 pub(crate) fn run_evaluation(
     params: &EvalRunParams,
     sandbox_backend: SharedSandboxBackend,
     provider_snapshot: &ProviderConfigSnapshot,
-) -> Result<EvalRunResult, String> {
+) -> Result<EvalRunResult, EvaluationRunError> {
     let manifest_path = Path::new(&params.manifest);
     let manifest_json = fs::read_to_string(manifest_path).map_err(|error| {
-        format!(
+        EvaluationRunError::input(format!(
             "invalid eval manifest: failed to read {}: {error}",
             manifest_path.display()
-        )
+        ))
     })?;
     let manifest_digest = content_digest(manifest_json.as_bytes());
     let manifest_dir = manifest_path.parent().ok_or_else(|| {
-        format!(
+        EvaluationRunError::input(format!(
             "invalid eval manifest: manifest path has no parent: {}",
             manifest_path.display()
-        )
+        ))
     })?;
     let manifest = EvaluationManifest::from_json_str(&manifest_json, manifest_dir)
-        .map_err(|error| format!("invalid eval manifest: {error}"))?;
+        .map_err(|error| EvaluationRunError::input(format!("invalid eval manifest: {error}")))?;
     let run_id = RunId::new(params.run_id.clone())
-        .map_err(|error| format!("invalid eval run id: {error}"))?;
+        .map_err(|error| EvaluationRunError::input(format!("invalid eval run id: {error}")))?;
     let output_root = evaluation_output_root(params.output_root.as_deref());
     let plans = manifest
         .task_set()
@@ -333,25 +380,27 @@ pub(crate) fn run_evaluation(
                 .workspace_plan(&task.task_id)
                 .map_err(|error| error.to_string())
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(EvaluationRunError::input)?;
     let task_ids = plans
         .iter()
         .map(|plan| plan.task_id.clone())
         .collect::<Vec<_>>();
     let trials_per_task = manifest.task_set().trial_count;
-    preflight_evaluation_path_budget(&output_root, &run_id, &task_ids, trials_per_task)?;
+    preflight_evaluation_path_budget(&output_root, &run_id, &task_ids, trials_per_task)
+        .map_err(EvaluationRunError::input)?;
     fs::create_dir_all(&output_root).map_err(|error| {
-        format!(
+        EvaluationRunError::infrastructure(format!(
             "failed to create evaluation output root {}: {error}",
             output_root.display()
-        )
+        ))
     })?;
     let run_dir = output_root.join(run_id.as_str());
     fs::create_dir(&run_dir).map_err(|error| {
-        format!(
+        EvaluationRunError::infrastructure(format!(
             "failed to create new evaluation run directory {}: {error}",
             run_dir.display()
-        )
+        ))
     })?;
 
     let mut task_executions = Vec::new();
@@ -371,36 +420,11 @@ pub(crate) fn run_evaluation(
         .iter()
         .map(|execution| execution.result.clone())
         .collect::<Vec<_>>();
-    let evaluation_passed = tasks.iter().all(|task| task.evaluation_passed);
-    let status = if tasks
-        .iter()
-        .all(|task| task.status == EvaluationStatus::Completed)
-    {
-        EvaluationStatus::Completed
-    } else if tasks
-        .iter()
-        .any(|task| task.status == EvaluationStatus::Failed)
-    {
-        EvaluationStatus::Failed
-    } else {
-        EvaluationStatus::Blocked
-    };
-    let blocker = (status == EvaluationStatus::Blocked)
-        .then(|| tasks.iter().find_map(|task| task.blocker.clone()))
-        .flatten();
-    let result = EvaluationResult {
-        schema_version: EvaluationResultSchemaVersion::V6,
-        run_id: run_id.clone(),
-        status,
-        blocker,
-        evaluation_passed,
-        summary: EvaluationRunSummary::from_tasks(&tasks, trials_per_task),
-        tasks,
-    };
+    let result = EvaluationResult::from_tasks(run_id.clone(), trials_per_task, tasks);
     if let Err(error) = result.validate() {
         return Err(cleanup_incomplete_run(
             &run_dir,
-            format!("invalid evaluation result: {error}"),
+            EvaluationRunError::infrastructure(format!("invalid evaluation result: {error}")),
         ));
     }
 
@@ -416,23 +440,43 @@ pub(crate) fn run_evaluation(
         &run_dir,
     ) {
         Ok(evidence) => evidence,
-        Err(error) => return Err(cleanup_incomplete_run(&run_dir, error)),
+        Err(error) => {
+            return Err(cleanup_incomplete_run(
+                &run_dir,
+                EvaluationRunError::infrastructure(error),
+            ));
+        }
     };
     if let Err(error) = evidence.validate_against_result(&result) {
         return Err(cleanup_incomplete_run(
             &run_dir,
-            format!("evaluation evidence/result mismatch: {error}"),
+            EvaluationRunError::infrastructure(format!(
+                "evaluation evidence/result mismatch: {error}"
+            )),
         ));
     }
     let status_string = match enum_string(result.status) {
         Ok(status) => status,
-        Err(error) => return Err(cleanup_incomplete_run(&run_dir, error)),
+        Err(error) => {
+            return Err(cleanup_incomplete_run(
+                &run_dir,
+                EvaluationRunError::infrastructure(error),
+            ));
+        }
+    };
+    let blocker = match result.blocker.as_ref().map(blocker_code).transpose() {
+        Ok(blocker) => blocker,
+        Err(error) => {
+            return Err(cleanup_incomplete_run(
+                &run_dir,
+                EvaluationRunError::infrastructure(error),
+            ));
+        }
     };
     let task_reports = task_executions.iter().map(task_report).collect::<Vec<_>>();
     let report = json!({
         "manifest": params.manifest,
         "runner": RUNNER_NAME,
-        "result": result,
         "tasks": task_reports,
         "result_path": result_path.to_string_lossy(),
         "report_path": report_path.to_string_lossy(),
@@ -441,7 +485,12 @@ pub(crate) fn run_evaluation(
     let published =
         match publish_evaluation_artifacts(&run_dir, &run_id, &result, &report, &evidence) {
             Ok(published) => published,
-            Err(error) => return Err(cleanup_incomplete_run(&run_dir, error)),
+            Err(error) => {
+                return Err(cleanup_incomplete_run(
+                    &run_dir,
+                    EvaluationRunError::publication(error),
+                ));
+            }
         };
 
     Ok(EvalRunResult {
@@ -449,8 +498,8 @@ pub(crate) fn run_evaluation(
         manifest: params.manifest.clone(),
         runner: RUNNER_NAME.to_string(),
         status: status_string,
-        blocker: result.blocker.as_ref().map(blocker_code),
-        tasks: report["tasks"].as_array().cloned().unwrap_or_default(),
+        blocker,
+        tasks: task_reports,
         result_path: Some(published.result_path.to_string_lossy().into_owned()),
         report_path: Some(published.report_path.to_string_lossy().into_owned()),
         evidence_path: Some(published.evidence_path.to_string_lossy().into_owned()),
@@ -458,13 +507,17 @@ pub(crate) fn run_evaluation(
     })
 }
 
-fn cleanup_incomplete_run(run_dir: &Path, error: String) -> String {
+fn cleanup_incomplete_run(run_dir: &Path, mut error: EvaluationRunError) -> EvaluationRunError {
     match fs::remove_dir_all(run_dir) {
         Ok(()) => error,
-        Err(cleanup_error) => format!(
-            "{error}; failed to clean incomplete evaluation run {}: {cleanup_error}",
-            run_dir.display()
-        ),
+        Err(cleanup_error) => {
+            error.message = format!(
+                "{}; failed to clean incomplete evaluation run {}: {cleanup_error}",
+                error.message,
+                run_dir.display()
+            );
+            error
+        }
     }
 }
 
@@ -2654,8 +2707,8 @@ fn enum_string(value: impl Serialize) -> Result<String, String> {
         .ok_or_else(|| "enum did not serialize as a string".to_string())
 }
 
-fn blocker_code(blocker: &EvaluationBlocker) -> String {
-    enum_string(blocker.kind).unwrap_or_else(|_| "environment".to_string())
+fn blocker_code(blocker: &EvaluationBlocker) -> Result<String, String> {
+    enum_string(blocker.kind)
 }
 
 fn safe_text(text: impl AsRef<str>) -> String {
@@ -2769,10 +2822,8 @@ mod tests {
             model_turns: 1,
             tool_calls: tool_results.len() as u32,
             approval_count: 0,
-            approval_requests: Vec::new(),
-            pending_tool_calls: Vec::new(),
+            pending_approvals: Vec::new(),
             tool_results,
-            approval_checkpoints: Vec::new(),
             verification: singularity_agent::AgentVerification::default(),
             plan: None,
             plan_update_count: 0,
@@ -3130,7 +3181,11 @@ mod tests {
         };
 
         let error = evaluation_registry(&projection).expect_err("missing command capability");
-        assert!(error.contains("registry-resolved command execution tool"));
+        assert!(
+            error
+                .to_string()
+                .contains("registry-resolved command execution tool")
+        );
     }
 
     #[test]
@@ -3162,7 +3217,7 @@ mod tests {
 
         let error = copy_tree_checked(&source, &destination).expect_err("overlap");
 
-        assert!(error.contains("source and destination overlap"));
+        assert!(error.to_string().contains("source and destination overlap"));
         assert!(!destination.exists());
     }
 
@@ -3183,7 +3238,11 @@ mod tests {
         )
         .expect_err("full-SHA evaluation paths must exceed the conservative budget");
 
-        assert!(error.contains("evaluation path budget exceeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("evaluation path budget exceeded")
+        );
         assert!(!run_dir.exists());
     }
 
@@ -3255,7 +3314,11 @@ mod tests {
         )
         .expect_err("long evaluation paths must fail before execution");
 
-        assert!(error.contains("evaluation path budget exceeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("evaluation path budget exceeded")
+        );
         assert!(!run_dir.exists());
     }
 
@@ -3651,7 +3714,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_blocked_run_publishes_v6_result_and_v2_evidence_as_one_artifact_set() {
+    fn v5_blocked_run_publishes_v7_result_and_v2_evidence_as_one_artifact_set() {
         let temp = tempfile::tempdir().expect("temp");
         let fixture = temp.path().join("fixture");
         let output_root = temp.path().join("output");
@@ -3704,7 +3767,7 @@ mod tests {
         let result = EvaluationResult::from_json_str(
             &fs::read_to_string(&result_path).expect("result artifact"),
         )
-        .expect("result v6");
+        .expect("result v7");
         let evidence = singularity_evaluation::EvaluationEvidence::from_json_str(
             &fs::read_to_string(&evidence_path).expect("evidence artifact"),
         )
@@ -3810,7 +3873,11 @@ mod tests {
         )
         .expect_err("publish must fail");
 
-        assert!(error.contains("failed to publish evaluation artifact set"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to publish evaluation artifact set")
+        );
         assert!(temp.path().join(PUBLICATION_DIR).is_dir());
         assert!(temp.path().join(PUBLICATION_DIR).join("sentinel").is_file());
         assert!(
@@ -3837,7 +3904,7 @@ mod tests {
         let published = publish_evaluation_artifacts(
             temp.path(),
             &run_id,
-            &json!({"schema_version": "evaluation.result/v6"}),
+            &json!({"schema_version": "evaluation.result/v7"}),
             &json!({"runner": RUNNER_NAME}),
             &json!({"schema_version": "evaluation.evidence/v2"}),
         )
@@ -3878,7 +3945,11 @@ mod tests {
 
         let error = write_json_atomic(&path, &SerializationFailure).expect_err("write failure");
 
-        assert!(error.contains("intentional serialization failure"));
+        assert!(
+            error
+                .to_string()
+                .contains("intentional serialization failure")
+        );
         assert!(!path.exists());
         assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 0);
     }

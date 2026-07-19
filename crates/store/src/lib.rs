@@ -141,25 +141,10 @@ const APPROVAL_BINDING_REQUIRED: &str =
 const APPROVAL_TURN_THREAD_MISMATCH: &str = "approval request thread_id must match bound turn";
 const PENDING_TOOL_CALL_ID_MISMATCH: &str =
     "pending tool call tool_call_id must match approval request";
-const PENDING_TOOL_CALL_NAME_MISMATCH: &str =
-    "pending tool call tool_name must match approval request";
-const PENDING_TOOL_CALL_RESOURCES_MISMATCH: &str =
-    "pending tool call resources must match approval request";
 const PENDING_TOOL_CALL_TURN_MISMATCH: &str =
     "pending tool call turn_id must match approval request";
 const PENDING_TOOL_CALL_THREAD_MISMATCH: &str =
     "pending tool call thread_id must match approval request";
-const APPROVAL_CHECKPOINT_REQUIRED: &str =
-    "pending approval must include an internal AgentLoop checkpoint";
-const APPROVAL_CHECKPOINT_VERSION: u64 = 1;
-const APPROVAL_CHECKPOINT_THREAD_MISMATCH: &str =
-    "approval checkpoint thread_id must match approval request";
-const APPROVAL_CHECKPOINT_TURN_MISMATCH: &str =
-    "approval checkpoint turn_id must match approval request";
-const APPROVAL_CHECKPOINT_REQUEST_MISMATCH: &str =
-    "approval checkpoint request_id must match approval request";
-const APPROVAL_CHECKPOINT_TOOL_CALL_MISMATCH: &str =
-    "approval checkpoint tool_call_id must match pending tool call";
 const PENDING_APPROVAL_ALLOW_REQUIRES_ACTIVE_THREAD: &str =
     "pending approval allow requires an active thread";
 
@@ -402,7 +387,7 @@ mod migration {
         thread_id: String,
         turn_id: String,
         tool_call_id: String,
-        payload: Value,
+        payload: String,
         execution_state: String,
     }
 
@@ -1819,29 +1804,28 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                     "v{version} pending tool call {request_id} cannot be migrated without fabricating an AgentLoop checkpoint"
                 )));
             }
-            let mut payload: Value = serde_json::from_str(&payload)?;
-            if version <= 10 {
-                convert_legacy_pending_resources(
-                    &mut payload,
-                    &approval.request.action,
-                    &format!("pending tool call {request_id}"),
-                )?;
+            // v7+ checkpoint payloads stay opaque here: syntax validation is the
+            // only payload check; Agent owns version and resource migration.
+            if payload.trim().is_empty() {
+                return Err(StoreError::InvalidState(format!(
+                    "pending tool call {request_id} payload is empty"
+                )));
             }
-            let derived_tool_call_id = payload
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "pending tool call {request_id} has no tool_call_id"
-                    ))
-                })?;
+            serde_json::from_str::<Value>(&payload).map_err(|error| {
+                StoreError::InvalidState(format!(
+                    "pending tool call {request_id} payload is invalid JSON: {error}"
+                ))
+            })?;
             let thread_id = thread_id
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| approval.request.thread_id.clone());
             let tool_call_id = tool_call_id
                 .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| derived_tool_call_id.to_string());
+                .ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "pending tool call {request_id} has no tool_call_id"
+                    ))
+                })?;
             let execution_state = match (version, state.as_deref().unwrap_or("pending")) {
                 (7, "pending") => "pending".to_string(),
                 (7, "approved" | "executing" | "outcome_recorded") => "executing".to_string(),
@@ -1868,7 +1852,6 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                     "pending tool call {request_id} tool_call_id does not match approval request"
                 )));
             }
-            pending_tool_call_id(connection, &approval.request, &payload)?;
             pending.push(LegacyPendingRow {
                 request_id,
                 thread_id,
@@ -1879,49 +1862,6 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
             });
         }
         Ok(pending)
-    }
-
-    fn convert_legacy_pending_resources(
-        payload: &mut Value,
-        action: &ToolId,
-        context: &str,
-    ) -> StoreResult<()> {
-        let object = payload.as_object_mut().ok_or_else(|| {
-            StoreError::InvalidState(format!("{context} checkpoint is not an object"))
-        })?;
-        let tool_name = object
-            .get("tool_name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                StoreError::InvalidState(format!("{context} checkpoint has no tool_name"))
-            })?;
-        if tool_name != action.as_str() {
-            return Err(StoreError::InvalidState(format!(
-                "{context} checkpoint tool does not match approval"
-            )));
-        }
-        let resources = object
-            .get_mut("resources")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| {
-                StoreError::InvalidState(format!("{context} checkpoint has no resources"))
-            })?;
-        let legacy = resources
-            .iter()
-            .map(|resource| resource.as_str().map(str::to_string))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "{context} checkpoint resources are not legacy strings"
-                ))
-            })?;
-        *resources = serde_json::to_value(legacy_permission_resources(action, legacy, context)?)?
-            .as_array()
-            .cloned()
-            .ok_or_else(|| {
-                StoreError::InvalidState(format!("{context} converted resources are not an array"))
-            })?;
-        Ok(())
     }
 
     fn read_legacy_artifacts(connection: &Connection) -> StoreResult<Vec<LegacyArtifactRow>> {
@@ -2236,8 +2176,9 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
 
     fn migrate_legacy_schema(connection: &Connection, version: u32) -> StoreResult<()> {
         let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-        // This is deliberately the first schema/data write boundary. All enum,
-        // approval, checkpoint, trace, and schema inputs are decoded first.
+        // This is deliberately the first schema/data write boundary. Enum,
+        // approval, opaque-checkpoint syntax, trace, and schema inputs are
+        // validated first.
         // Foreign keys remain enabled: replacement rows are inserted parent-first
         // and legacy tables are removed child-first within this transaction.
         let data = read_legacy_data(&transaction, version, true)?;
@@ -2350,7 +2291,7 @@ create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execut
                     pending.thread_id,
                     pending.turn_id,
                     pending.tool_call_id,
-                    serde_json::to_string(&pending.payload)?,
+                    &pending.payload,
                     pending.execution_state,
                 ],
             )?;
@@ -4352,7 +4293,11 @@ impl SessionStore {
                     "approval batch request ids must be non-empty and unique".to_string(),
                 ));
             }
-            let tool_call_id = pending_tool_call_id(&transaction, request, checkpoint)?;
+            let tool_call_id = request.tool_call_id.clone().ok_or_else(|| {
+                StoreError::InvalidState(
+                    "pending approval checkpoint requires an explicit tool_call_id".to_string(),
+                )
+            })?;
             if !tool_call_keys.insert((request.turn_id.clone(), tool_call_id.clone())) {
                 return Err(StoreError::InvalidState(
                     "approval batch tool call bindings must be unique".to_string(),
@@ -4455,15 +4400,11 @@ impl SessionStore {
                         "existing approval batch request is missing its checkpoint".to_string(),
                     ));
                 };
-                let stored_checkpoint = serde_json::from_str::<Value>(&stored_checkpoint)?;
-                let stored_checkpoint_tool_call_id =
-                    pending_tool_call_id(&transaction, request, &stored_checkpoint)?;
                 if execution_state != "pending"
                     || stored_pending_thread_id != request.thread_id
                     || stored_pending_turn_id != request.turn_id
                     || stored_tool_call_id != tool_call_id
-                    || stored_checkpoint_tool_call_id != tool_call_id
-                    || stored_checkpoint != *checkpoint
+                    || stored_checkpoint != serde_json::to_string(checkpoint)?
                 {
                     return Err(StoreError::InvalidState(
                         "existing approval batch checkpoint does not match the request".to_string(),
@@ -4494,7 +4435,11 @@ impl SessionStore {
                 continue;
             }
             insert_approval(&transaction, request)?;
-            let tool_call_id = pending_tool_call_id(&transaction, request, checkpoint)?;
+            let tool_call_id = request.tool_call_id.as_deref().ok_or_else(|| {
+                StoreError::InvalidState(
+                    "pending approval checkpoint requires an explicit tool_call_id".to_string(),
+                )
+            })?;
             transaction.execute(
                 "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload, execution_state) values(?1, ?2, ?3, ?4, ?5, 'pending')",
                 params![
@@ -4721,6 +4666,22 @@ impl SessionStore {
         )
     }
 
+    /// 读取 pending execution 的 opaque checkpoint payload；字段语义由 AppServer/AgentLoop
+    /// 在 typed persistence seam 解码，Store 只返回持久化字节和值关系。
+    pub fn get_pending_tool_call(&self, request_id: &str) -> StoreResult<Option<Value>> {
+        let payload = self
+            .connection
+            .query_row(
+                "select payload from pending_tool_calls where request_id = ?1",
+                params![request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        payload
+            .map(|payload| serde_json::from_str::<Value>(&payload).map_err(StoreError::from))
+            .transpose()
+    }
+
     /// 按持久化顺序列出已记录的 approval decisions。
     pub fn list_approval_decisions(&self) -> StoreResult<Vec<ApprovalDecision>> {
         type RawDecisionRow = (
@@ -4930,9 +4891,7 @@ impl SessionStore {
                         PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
                     ));
                 }
-                let payload = serde_json::from_str::<Value>(&payload)?;
-                let _ = pending_tool_call_id(&transaction, &request, &payload)?;
-                Some(payload)
+                Some(serde_json::from_str::<Value>(&payload)?)
             }
             None => {
                 if request.tool_call_id.is_some() {
@@ -5182,7 +5141,11 @@ impl SessionStore {
                 ));
             }
             insert_approval(&transaction, request)?;
-            let tool_call_id = pending_tool_call_id(&transaction, request, checkpoint)?;
+            let tool_call_id = request.tool_call_id.as_deref().ok_or_else(|| {
+                StoreError::InvalidState(
+                    "pending approval checkpoint requires an explicit tool_call_id".to_string(),
+                )
+            })?;
             ensure_request_turn_binding(&transaction, request)?;
             transaction.execute(
                 "insert into pending_tool_calls(request_id, thread_id, turn_id, tool_call_id, payload, execution_state) values(?1, ?2, ?3, ?4, ?5, 'pending')",
@@ -5402,8 +5365,11 @@ impl SessionStore {
                             PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
                         ));
                     }
-                    let payload = serde_json::from_str::<Value>(payload)?;
-                    let _ = pending_tool_call_id(transaction, &request, &payload)?;
+                    if payload.trim().is_empty() {
+                        return Err(StoreError::InvalidState(format!(
+                            "approval {request_id} has an empty pending checkpoint payload"
+                        )));
+                    }
                 }
                 _ => {
                     return Err(StoreError::InvalidState(format!(
@@ -6830,121 +6796,6 @@ fn fail_closed_on_foreign_key_violations(connection: &Connection, phase: &str) -
         )));
     }
     Ok(())
-}
-
-// 校验 checkpoint 并提取唯一的 pending tool call id。
-fn pending_tool_call_id(
-    connection: &Connection,
-    request: &ApprovalRequest,
-    payload: &Value,
-) -> StoreResult<String> {
-    ensure_request_turn_binding(connection, request)?;
-    let payload_request_id = payload
-        .get("request_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            StoreError::InvalidState("pending tool call request_id is required".to_string())
-        })?;
-    if payload_request_id != request.request_id {
-        return Err(StoreError::InvalidState(
-            "pending tool call request_id must match approval request".to_string(),
-        ));
-    }
-    let tool_call_id = payload
-        .get("tool_call_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            StoreError::InvalidState("pending tool call tool_call_id is required".to_string())
-        })?;
-    if request.tool_call_id.as_deref() != Some(tool_call_id) {
-        return Err(StoreError::InvalidState(
-            PENDING_TOOL_CALL_ID_MISMATCH.to_string(),
-        ));
-    }
-    let tool_name = payload
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
-    if tool_name != request.action.as_str() {
-        return Err(StoreError::InvalidState(
-            PENDING_TOOL_CALL_NAME_MISMATCH.to_string(),
-        ));
-    }
-    let resources = serde_json::from_value::<Vec<PermissionResource>>(
-        payload
-            .get("resources")
-            .cloned()
-            .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?,
-    )
-    .map_err(|_| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
-    if resources != request.resources {
-        return Err(StoreError::InvalidState(
-            PENDING_TOOL_CALL_RESOURCES_MISMATCH.to_string(),
-        ));
-    }
-    let checkpoint_version = payload
-        .get("checkpoint_version")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
-    if checkpoint_version != APPROVAL_CHECKPOINT_VERSION {
-        return Err(StoreError::InvalidState(
-            "unsupported approval checkpoint version".to_string(),
-        ));
-    }
-    let checkpoint_request_id = payload
-        .get("request_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
-    if checkpoint_request_id != request.request_id {
-        return Err(StoreError::InvalidState(
-            APPROVAL_CHECKPOINT_REQUEST_MISMATCH.to_string(),
-        ));
-    }
-    let checkpoint_thread_id = payload
-        .get("thread_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
-    if checkpoint_thread_id != request.thread_id {
-        return Err(StoreError::InvalidState(
-            APPROVAL_CHECKPOINT_THREAD_MISMATCH.to_string(),
-        ));
-    }
-    let checkpoint_turn_id = payload
-        .get("turn_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
-    if checkpoint_turn_id != request.turn_id {
-        return Err(StoreError::InvalidState(
-            APPROVAL_CHECKPOINT_TURN_MISMATCH.to_string(),
-        ));
-    }
-    let checkpoint_tool_call_id = payload
-        .get("tool_call_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| StoreError::InvalidState(APPROVAL_CHECKPOINT_REQUIRED.to_string()))?;
-    if checkpoint_tool_call_id != tool_call_id {
-        return Err(StoreError::InvalidState(
-            APPROVAL_CHECKPOINT_TOOL_CALL_MISMATCH.to_string(),
-        ));
-    }
-    for field in [
-        "messages",
-        "tool_results",
-        "used_approval_grants",
-        "approval_count",
-        "model_turns",
-        "completion",
-    ] {
-        if payload.get(field).is_none() {
-            return Err(StoreError::InvalidState(
-                APPROVAL_CHECKPOINT_REQUIRED.to_string(),
-            ));
-        }
-    }
-    Ok(tool_call_id.to_string())
 }
 
 // 校验 approval request 的显式 thread/turn 绑定。

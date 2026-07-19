@@ -665,7 +665,7 @@ fn flush_pending_event_gap_locked(
     };
     let message = JsonRpcMessage::notification(
         "event/gap",
-        &serde_json::json!({
+        serde_json::json!({
             "gap": gap,
             "event": metadata,
         }),
@@ -1122,7 +1122,7 @@ mod tests {
     fn progress_event(cursor: u64) -> Value {
         JsonRpcMessage::notification(
             "item/agentMessage/delta",
-            &serde_json::json!({
+            serde_json::json!({
                 "item": {"item_id": "item_progress"},
                 "delta": "progress",
                 "event": EventMetadata {
@@ -1142,7 +1142,7 @@ mod tests {
     fn reliable_state_event(cursor: u64) -> Value {
         JsonRpcMessage::notification(
             "turn/diff/updated",
-            &serde_json::json!({
+            serde_json::json!({
                 "turnId": "turn_state",
                 "diff": {"files": []},
                 "event": EventMetadata {

@@ -1,6 +1,7 @@
 //! 验证 SessionStore 的 schema、绑定、恢复、历史、trace 与事务不变量。
 
 use schemars::schema_for;
+use serde_json::Value;
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
     PermissionResource, ToolId, WorkspaceRelativePath,
@@ -220,6 +221,183 @@ fn v10_approval_resources_migrate_to_typed_v11_payloads() {
             .resources,
         vec![workspace_resource("README.md")]
     );
+}
+
+fn prepare_v10_pending_checkpoint(
+    db_path: &std::path::Path,
+    checkpoint: &mut Value,
+) -> ApprovalRequest {
+    let store = SessionStore::open(db_path).expect("create v11 store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_pending_v10",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_1")
+    .with_resources([workspace_resource("README.md")]);
+    checkpoint["request_id"] = serde_json::json!(&request.request_id);
+    checkpoint["thread_id"] = serde_json::json!(&request.thread_id);
+    checkpoint["turn_id"] = serde_json::json!(&request.turn_id);
+    checkpoint["tool_call_id"] = serde_json::json!("call_1");
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(checkpoint.clone()),
+            "approval",
+            "approval requested",
+        )
+        .expect("pending checkpoint");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(db_path).expect("open sqlite");
+    connection
+        .execute_batch(
+            "pragma foreign_keys = off;
+             create table schema_meta_v10(
+                 schema_version integer not null check(schema_version = 10)
+             );
+             insert into schema_meta_v10(schema_version) values(10);
+             drop table schema_meta;
+             alter table schema_meta_v10 rename to schema_meta;
+             delete from schema_migrations
+              where migration_id = '0011_typed_permission_resources';",
+        )
+        .expect("restore v10 schema metadata");
+    let legacy_approval = serde_json::json!({
+        "request_id": &request.request_id,
+        "thread_id": &request.thread_id,
+        "turn_id": &request.turn_id,
+        "tool_call_id": &request.tool_call_id,
+        "action": "edit",
+        "resources": ["README.md"],
+        "reason": ""
+    });
+    connection
+        .execute(
+            "update approvals set payload = ?1 where request_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&legacy_approval).expect("legacy approval"),
+                request.request_id,
+            ],
+        )
+        .expect("write legacy approval");
+    drop(connection);
+    request
+}
+
+// 验证 v10 pending checkpoint 的 legacy string resources 在 Store 迁移中保持 opaque。
+#[test]
+fn v10_pending_checkpoint_resources_remain_opaque_during_migration() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let mut checkpoint = serde_json::json!({
+        "request_id": "approval_pending_v10",
+        "thread_id": "thread_v10",
+        "turn_id": "turn_v10",
+        "tool_call_id": "call_1",
+        "tool_name": "edit",
+        "raw_arguments": "{}",
+        "resources": ["README.md"],
+        "checkpoint_version": 1,
+        "messages": [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "tool_call_id": "call_1",
+                "tool_name": "edit",
+                "arguments": {},
+                "raw_arguments": "{}",
+                "parse_status": "valid",
+                "validation_errors": []
+            }]
+        }],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {
+            "workspace_mutated": false,
+            "workspace_revision": null,
+            "successful_command_count": 0,
+            "required_command_counts": {},
+            "terminal_command_scope_digests": [],
+            "terminal_command_revisions": [],
+            "unresolved_failures": []
+        },
+        "last_completion_error": null
+    });
+    let request = prepare_v10_pending_checkpoint(&db_path, &mut checkpoint);
+    let checkpoint_text = serde_json::to_string(&checkpoint).expect("checkpoint text");
+
+    let migrated = SessionStore::open(&db_path).expect("migrate v10 store");
+    let connection = rusqlite::Connection::open(&db_path).expect("reopen sqlite");
+    let stored_payload: String = connection
+        .query_row(
+            "select payload from pending_tool_calls where request_id = ?1",
+            rusqlite::params![request.request_id],
+            |row| row.get(0),
+        )
+        .expect("stored checkpoint payload");
+    assert_eq!(stored_payload, checkpoint_text);
+    assert_eq!(
+        migrated
+            .get_pending_tool_call(&request.request_id)
+            .expect("opaque checkpoint")
+            .expect("pending checkpoint")["resources"],
+        serde_json::json!(["README.md"])
+    );
+    assert_eq!(
+        migrated
+            .get_pending_approval(&request.request_id)
+            .expect("migrated approval")
+            .resources,
+        vec![workspace_resource("README.md")]
+    );
+}
+
+// 验证 v10 pending payload 的 JSON 损坏在迁移事务内 fail closed 且不改旧库。
+#[test]
+fn v10_pending_checkpoint_invalid_json_rolls_back_without_mutation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let mut checkpoint = serde_json::json!({
+        "request_id": "approval_pending_v10",
+        "thread_id": "thread_v10",
+        "turn_id": "turn_v10",
+        "tool_call_id": "call_1",
+        "tool_name": "edit",
+        "raw_arguments": "{}",
+        "resources": ["README.md"],
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+    let request = prepare_v10_pending_checkpoint(&db_path, &mut checkpoint);
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "update pending_tool_calls set payload = '{' where request_id = ?1",
+            rusqlite::params![request.request_id],
+        )
+        .expect("corrupt checkpoint payload");
+    drop(connection);
+    let before = sqlite_snapshot(&db_path);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::InvalidState(message)) if message.contains("payload is invalid JSON")
+    ));
+    assert_eq!(sqlite_snapshot(&db_path), before);
+    assert!(!has_v11_temporary_tables(&db_path));
 }
 
 // 验证 thread policy 快照在 create/get/list 和 reopen 路径保持一致。
@@ -951,18 +1129,12 @@ fn trusted_reopen_defers_approval_and_checkpoint_validation_until_use() {
                 trusted.get_approval_decision(&decision_id.expect("decision id")),
                 Err(StoreError::InvalidState(_))
             )),
-            "checkpoint" => assert!(matches!(
-                trusted.record_approval_decision(
-                    &ApprovalDecision::new(
-                        request.request_id.clone(),
-                        ApprovalOutcome::Allow,
-                        "allowed",
-                    ),
-                    "approval",
-                    "approval decision recorded",
-                ),
-                Err(StoreError::InvalidState(_))
-            )),
+            "checkpoint" => assert_eq!(
+                trusted
+                    .get_pending_tool_call(&request.request_id)
+                    .expect("opaque checkpoint payload"),
+                Some(serde_json::json!({}))
+            ),
             _ => unreachable!("table-driven corruption case"),
         }
     }
@@ -1253,16 +1425,15 @@ fn pending_tool_call_binding_rejects_request_mismatch() {
         "resources": []
     });
 
-    assert!(matches!(
-        store.create_approval_with_pending_tool_call_and_trace(
+    store
+        .create_approval_with_pending_tool_call_and_trace(
             &request,
             Some(pending_tool_call),
             "approval",
             "approval requested",
-        ),
-        Err(StoreError::InvalidState(message)) if message == "pending tool call request_id must match approval request"
-    ));
-    assert!(store.list_pending_approvals().expect("pending").is_empty());
+        )
+        .expect("Store persists opaque checkpoint payload");
+    assert_eq!(store.list_pending_approvals().expect("pending").len(), 1);
 }
 
 // 验证 approval 必须显式绑定已有 thread 与 turn。
@@ -1351,7 +1522,7 @@ fn pending_tool_call_binding_requires_request_tool_call_id() {
             "approval requested",
         ),
         Err(StoreError::InvalidState(message))
-            if message == "pending tool call tool_call_id must match approval request"
+            if message == "pending approval checkpoint requires an explicit tool_call_id"
     ));
 }
 
@@ -1381,22 +1552,72 @@ fn pending_tool_call_requires_checkpoint_and_rolls_back_atomically() {
         "resources": []
     });
 
-    assert!(matches!(
-        store.create_approval_with_pending_tool_call_and_trace(
+    store
+        .create_approval_with_pending_tool_call_and_trace(
             &request,
-            Some(pending_tool_call),
+            Some(pending_tool_call.clone()),
             "approval",
             "approval requested",
-        ),
-        Err(StoreError::InvalidState(message))
-            if message == "pending approval must include an internal AgentLoop checkpoint"
-    ));
-    assert!(store.list_pending_approvals().expect("pending").is_empty());
-    assert!(matches!(
-        store.list_trace(&thread.thread_id),
-        Err(StoreError::NotFound(message))
-            if message == format!("trace run {}", thread.thread_id)
-    ));
+        )
+        .expect("Store persists opaque checkpoint payload");
+    assert_eq!(
+        store
+            .get_pending_tool_call(&request.request_id)
+            .expect("opaque checkpoint payload"),
+        Some(pending_tool_call)
+    );
+}
+
+// 验证相同对象型 checkpoint 的 approval batch 重试按持久化序列化保持幂等。
+#[test]
+fn approval_batch_retry_accepts_same_opaque_object_checkpoint() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_batch_idempotent",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_1");
+    let checkpoint = serde_json::json!({
+        "request_id": &request.request_id,
+        "thread_id": &request.thread_id,
+        "turn_id": &request.turn_id,
+        "tool_call_id": "call_1",
+        "tool_name": "edit",
+        "raw_arguments": "{}",
+        "resources": [],
+        "checkpoint_version": 1,
+        "messages": [],
+        "tool_results": [],
+        "used_approval_grants": [],
+        "approval_count": 1,
+        "model_turns": 1,
+        "completion": {}
+    });
+
+    store
+        .create_approval_batch_with_pending_tool_calls_and_trace(
+            &[(request.clone(), checkpoint.clone())],
+            "approval",
+            "approval requested",
+        )
+        .expect("initial approval batch");
+    let retry = store
+        .create_approval_batch_with_pending_tool_calls_and_trace(
+            &[(request, checkpoint)],
+            "approval",
+            "approval requested",
+        )
+        .expect("idempotent approval batch retry");
+
+    assert!(retry.is_empty());
+    assert_eq!(store.list_pending_approvals().expect("pending").len(), 1);
 }
 
 // 验证批次第二条 trace 写入失败时，approval、checkpoint、turn 和首条 trace 全部回滚。
