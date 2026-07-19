@@ -411,6 +411,76 @@ fn windows_elevated_backend_executes_network_denied_command() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "requires first-run Windows UAC sandbox setup and an additional ACL-authority elevation"]
+fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
+    let workspace = if let Some(root) =
+        std::env::var_os("SINGULARITY_WINDOWS_SANDBOX_TEST_ROOT").map(std::path::PathBuf::from)
+    {
+        std::fs::create_dir_all(&root).expect("create live sandbox test root");
+        tempfile::Builder::new()
+            .prefix("singularity-live-acl-")
+            .tempdir_in(root)
+            .expect("workspace")
+    } else {
+        tempfile::tempdir().expect("workspace")
+    };
+    let backend = WindowsSandboxBackend::new();
+    let generated = workspace.path().join("generated.pem");
+    let mut create_request = CommandRequest::project_verification(
+        "sandbox_owned_protected_create",
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo generated>generated.pem".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    create_request.network.mode = SandboxNetworkMode::Denied;
+    let create_result = backend.execute(&create_request);
+    assert_eq!(
+        create_result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{create_result:#?}"
+    );
+    assert!(
+        generated.exists(),
+        "sandbox command must create the protected file"
+    );
+
+    let mut read_request = CommandRequest::project_verification(
+        "sandbox_owned_protected_read",
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "$ErrorActionPreference='Stop'; try { Get-Content -LiteralPath 'generated.pem' -Raw | Out-File -LiteralPath 'readback.txt'; exit 9 } catch { exit 0 }".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    read_request.network.mode = SandboxNetworkMode::Denied;
+    let read_result = backend.execute(&read_request);
+    assert_eq!(
+        read_result.execution_status,
+        CommandExecutionStatus::Completed,
+        "ACL refresh must not collapse into a backend-unavailable result: {read_result:#?}"
+    );
+    assert_eq!(read_result.sandbox.backend, "windows_elevated");
+    assert_eq!(
+        read_result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!read_result.sandbox.local_process_fallback);
+    assert!(
+        !workspace.path().join("readback.txt").exists(),
+        "the sandbox identity must remain denied after elevated ACL reconciliation"
+    );
+}
+
+#[cfg(windows)]
+#[test]
 #[ignore = "requires first-run Windows UAC sandbox setup"]
 fn windows_elevated_deny_read_is_held_for_overlapping_child_lifetimes() {
     let root = std::env::var_os("SINGULARITY_WINDOWS_SANDBOX_TEST_ROOT")

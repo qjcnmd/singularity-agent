@@ -1172,7 +1172,7 @@ mod windows_backend {
         ManagedFileSystemPermissions, NetworkSandboxPolicy, PermissionProfile,
         WindowsSandboxCancellationToken, resolve_windows_deny_read_paths,
         run_windows_sandbox_capture_for_permission_profile_elevated,
-        run_windows_sandbox_capture_with_filesystem_overrides,
+        run_windows_sandbox_capture_with_filesystem_overrides, safe_windows_error_summary,
     };
 
     const BACKEND_NAME: &str = "windows";
@@ -1637,7 +1637,10 @@ mod windows_backend {
                 if !prepared.protected_deny_read_paths.is_empty()
                     || !prepared.protected_deny_write_paths.is_empty()
                 {
-                    Err(PROTECTED_PATH_ENFORCEMENT_FAILED.to_string())
+                    Err(format!(
+                        "{PROTECTED_PATH_ENFORCEMENT_FAILED}: {}",
+                        safe_windows_error_summary(&error)
+                    ))
                 } else {
                     Err(format!(
                         "{ELEVATED_FAILURE_PREFIX}: {}",

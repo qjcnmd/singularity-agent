@@ -176,6 +176,9 @@ mod proc_thread_attr;
 mod sandbox_utils;
 
 #[cfg(target_os = "windows")]
+mod read_acl_mutex;
+
+#[cfg(target_os = "windows")]
 mod setup;
 
 #[cfg(target_os = "windows")]
@@ -322,6 +325,24 @@ pub use process::create_process_as_user;
 pub use process::read_handle_loop;
 #[cfg(target_os = "windows")]
 pub use process::spawn_process_with_pipes;
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub use read_acl_mutex::ReadAclMutexError;
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub use read_acl_mutex::ReadAclMutexGuard;
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub use read_acl_mutex::ReadAclMutexOperation;
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub use read_acl_mutex::ReadAclMutexState;
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub use read_acl_mutex::acquire_read_acl_mutex;
+#[cfg(target_os = "windows")]
+#[doc(hidden)]
+pub use read_acl_mutex::probe_read_acl_mutex;
 pub use resolved_permissions::ResolvedWindowsSandboxPermissions;
 pub use resolved_permissions::WindowsSandboxTokenMode;
 pub use resolved_permissions::token_mode_for_permission_profile;
@@ -353,6 +374,8 @@ pub use setup_error::SetupErrorReport;
 pub use setup_error::SetupFailure;
 #[cfg(target_os = "windows")]
 pub use setup_error::extract_failure as extract_setup_failure;
+#[cfg(target_os = "windows")]
+pub use setup_error::safe_windows_error_summary;
 #[cfg(target_os = "windows")]
 pub use setup_error::sanitize_setup_metric_tag_value;
 #[cfg(target_os = "windows")]

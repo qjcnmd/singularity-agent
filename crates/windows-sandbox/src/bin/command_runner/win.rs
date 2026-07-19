@@ -23,6 +23,8 @@ use singularity_windows_sandbox::Message;
 use singularity_windows_sandbox::OutputPayload;
 use singularity_windows_sandbox::OutputStream;
 use singularity_windows_sandbox::PipeSpawnHandles;
+use singularity_windows_sandbox::ReadAclMutexError;
+use singularity_windows_sandbox::ReadAclMutexState;
 use singularity_windows_sandbox::SpawnReady;
 use singularity_windows_sandbox::SpawnRequest;
 use singularity_windows_sandbox::StderrMode;
@@ -36,14 +38,13 @@ use singularity_windows_sandbox::encode_bytes;
 use singularity_windows_sandbox::get_current_token_for_restriction;
 use singularity_windows_sandbox::hide_current_user_profile_dir;
 use singularity_windows_sandbox::log_note;
-use singularity_windows_sandbox::product_identity::READ_ACL_MUTEX_NAME;
+use singularity_windows_sandbox::probe_read_acl_mutex;
 use singularity_windows_sandbox::read_frame;
 use singularity_windows_sandbox::read_handle_loop;
 use singularity_windows_sandbox::spawn_process_with_pipes;
 use singularity_windows_sandbox::to_wide;
 use singularity_windows_sandbox::token_mode_for_permission_profile;
 use singularity_windows_sandbox::write_frame;
-use std::ffi::OsStr;
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
@@ -52,7 +53,6 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -63,8 +63,6 @@ use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::GetProcessId;
 use windows_sys::Win32::System::Threading::INFINITE;
-use windows_sys::Win32::System::Threading::MUTEX_ALL_ACCESS;
-use windows_sys::Win32::System::Threading::OpenMutexW;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -194,9 +192,14 @@ fn send_error(
 fn windows_error_code(err: &anyhow::Error) -> Option<u32> {
     err.chain().find_map(|cause| {
         cause
-            .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error)
-            .and_then(|code| u32::try_from(code).ok())
+            .downcast_ref::<ReadAclMutexError>()
+            .map(|error| error.code)
+            .or_else(|| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    .and_then(|code| u32::try_from(code).ok())
+            })
     })
 }
 
@@ -214,40 +217,14 @@ fn read_spawn_request(reader: &mut File) -> Result<SpawnRequest> {
     }
 }
 
-fn read_acl_mutex_exists() -> Result<bool> {
-    let name = to_wide(OsStr::new(READ_ACL_MUTEX_NAME));
-    let handle = unsafe { OpenMutexW(MUTEX_ALL_ACCESS, 0, name.as_ptr()) };
-    if handle == 0 {
-        let err = unsafe { GetLastError() };
-        if err == ERROR_FILE_NOT_FOUND {
-            return Ok(false);
-        }
-        return Err(anyhow::anyhow!("OpenMutexW failed: {err}"));
-    }
-    unsafe {
-        CloseHandle(handle);
-    }
-    Ok(true)
-}
-
 /// Pick an effective CWD, using a junction if the ACL helper is active.
-fn effective_cwd(req_cwd: &Path, log_dir: Option<&Path>) -> PathBuf {
-    let use_junction = match read_acl_mutex_exists() {
-        Ok(exists) => exists,
-        Err(err) => {
-            log_note(
-                &format!(
-                    "junction: failed to probe ACL mutex state: {err}; defaulting to junction cwd"
-                ),
-                log_dir,
-            );
-            true
-        }
-    };
-    if use_junction {
-        cwd_junction::create_cwd_junction(req_cwd, log_dir).unwrap_or_else(|| req_cwd.to_path_buf())
-    } else {
-        req_cwd.to_path_buf()
+fn effective_cwd(req_cwd: &Path, log_dir: Option<&Path>) -> Result<PathBuf> {
+    match probe_read_acl_mutex()? {
+        ReadAclMutexState::Absent => Ok(req_cwd.to_path_buf()),
+        ReadAclMutexState::Present => cwd_junction::create_cwd_junction(req_cwd, log_dir)
+            .ok_or_else(|| {
+                anyhow::anyhow!("read ACL mutex is active but cwd junction creation failed")
+            }),
     }
 }
 
@@ -296,7 +273,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         }
     }
 
-    let effective_cwd = effective_cwd(&req.cwd, Some(log_dir.as_path()));
+    let effective_cwd = effective_cwd(&req.cwd, Some(log_dir.as_path()))?;
 
     let spawned_pipes: PipeSpawnHandles = spawn_process_with_pipes(
         h_token.raw(),

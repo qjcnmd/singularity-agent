@@ -96,7 +96,8 @@ struct DenyAceFingerprintEntry {
 }
 
 /// The Win32 operation that failed while reading or writing a DACL.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AclOperation {
     OpenTarget,
     ReparseTargetUnsupported,
@@ -140,7 +141,15 @@ struct AclTarget {
     p_dacl: *mut ACL,
     p_sd: *mut c_void,
     is_directory: bool,
+    identity: AclTargetIdentity,
     owns_handle: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AclTargetIdentity {
+    volume_serial_number: u32,
+    file_index_high: u32,
+    file_index_low: u32,
 }
 
 impl Drop for AclTarget {
@@ -203,6 +212,11 @@ unsafe fn open_acl_target(path: &Path, desired_access: u32, object_type: i32) ->
         )));
     }
     let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let identity = AclTargetIdentity {
+        volume_serial_number: info.dwVolumeSerialNumber,
+        file_index_high: info.nFileIndexHigh,
+        file_index_low: info.nFileIndexLow,
+    };
     if is_directory {
         ensure_case_insensitive_directory(&file, path)?;
     }
@@ -237,6 +251,7 @@ unsafe fn open_acl_target(path: &Path, desired_access: u32, object_type: i32) ->
         p_dacl,
         p_sd,
         is_directory,
+        identity,
         owns_handle: true,
     })
 }
@@ -266,6 +281,11 @@ unsafe fn borrow_acl_directory(handle: HANDLE) -> Result<AclTarget> {
             50, // ERROR_NOT_SUPPORTED
         )));
     }
+    let identity = AclTargetIdentity {
+        volume_serial_number: info.dwVolumeSerialNumber,
+        file_index_high: info.nFileIndexHigh,
+        file_index_low: info.nFileIndexLow,
+    };
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = unsafe {
@@ -291,6 +311,7 @@ unsafe fn borrow_acl_directory(handle: HANDLE) -> Result<AclTarget> {
         p_dacl,
         p_sd,
         is_directory: true,
+        identity,
         owns_handle: false,
     })
 }
@@ -899,9 +920,35 @@ unsafe fn add_deny_ace(
     psid: *mut c_void,
     kind: DenyAceKind,
 ) -> Result<DenyAceAddResult> {
-    // SAFETY: the caller supplies a valid SID pointer and an existing non-reparse path.
+    unsafe { add_deny_ace_with_before_set(path, psid, kind, None) }
+}
+
+unsafe fn add_deny_ace_with_before_set(
+    path: &Path,
+    psid: *mut c_void,
+    kind: DenyAceKind,
+    before_set: BeforeDenyReadSet<'_>,
+) -> Result<DenyAceAddResult> {
+    // Probe with READ_CONTROL first so an already-complete deny does not require mutation rights.
+    // If mutation is needed, reopen with WRITE_DAC and verify the object identity did not change
+    // between the two handle acquisitions.
+    let read_target = unsafe { open_acl_target(path, READ_CONTROL, 1) }?;
+    let existing_entries = unsafe { deny_aces_for_sid(read_target.p_dacl, psid) }?;
+    if kind.already_present(&existing_entries, read_target.is_directory) {
+        return Ok(DenyAceAddResult {
+            added: false,
+            runtime_owned: false,
+            fingerprint: None,
+        });
+    }
     let target = unsafe { open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) }?;
-    unsafe { add_deny_ace_to_target(target, psid, kind, None) }
+    if target.identity != read_target.identity {
+        return Err(anyhow::Error::new(WindowsAclError::new(
+            AclOperation::QueryTargetIdentity,
+            ERROR_INVALID_DATA,
+        )));
+    }
+    unsafe { add_deny_ace_to_target(target, psid, kind, before_set) }
 }
 
 unsafe fn add_deny_ace_to_handle(
@@ -1011,8 +1058,7 @@ pub(crate) unsafe fn add_deny_read_ace_with_ownership_before_set(
     psid: *mut c_void,
     before_set: &mut dyn FnMut(&DenyReadAclFingerprint) -> Result<()>,
 ) -> Result<DenyAceAddResult> {
-    let target = unsafe { open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) }?;
-    unsafe { add_deny_ace_to_target(target, psid, DenyAceKind::Read, Some(before_set)) }
+    unsafe { add_deny_ace_with_before_set(path, psid, DenyAceKind::Read, Some(before_set)) }
 }
 
 /// Adds a deny-read ACE through a pinned handle after persisting its expected fingerprint.
@@ -1470,6 +1516,11 @@ mod tests {
         assert!(!unsafe { fetch_has_deny(&path, sid.as_ptr(), false) });
         assert!(unsafe { add_deny_read_ace(&path, sid.as_ptr()) }.expect("complete read deny"));
         assert!(unsafe { fetch_has_deny(&path, sid.as_ptr(), false) });
+        assert!(
+            !unsafe { add_deny_read_ace(&path, sid.as_ptr()) }
+                .expect("existing read deny needs no mutation"),
+            "an already complete deny must not reopen with WRITE_DAC"
+        );
         assert!(
             unsafe { add_deny_read_ace(&path, world_sid.as_ptr()) }
                 .expect("install observable read deny")

@@ -45,6 +45,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Security::AllocateAndInitializeSid;
 use windows_sys::Win32::Security::CheckTokenMembership;
@@ -83,6 +84,8 @@ const WINDOWS_PLATFORM_DEFAULT_READ_ROOTS: &[&str] = &[
 struct SharedSetupError {
     code: Option<SetupErrorCode>,
     message: String,
+    acl_operation: Option<crate::AclOperation>,
+    windows_error_code: Option<u32>,
 }
 
 impl SharedSetupError {
@@ -91,17 +94,26 @@ impl SharedSetupError {
             Some(failure) => Self {
                 code: Some(failure.code),
                 message: failure.message.clone(),
+                acl_operation: failure.acl_operation,
+                windows_error_code: failure.windows_error_code,
             },
             None => Self {
                 code: None,
                 message: format!("{error:#}"),
+                acl_operation: None,
+                windows_error_code: None,
             },
         }
     }
 
     fn into_error(self) -> anyhow::Error {
         match self.code {
-            Some(code) => failure(code, self.message),
+            Some(code) => {
+                let mut failure = SetupFailure::new(code, self.message);
+                failure.acl_operation = self.acl_operation;
+                failure.windows_error_code = self.windows_error_code;
+                anyhow::Error::new(failure)
+            }
             None => anyhow!(self.message),
         }
     }
@@ -249,6 +261,7 @@ pub fn run_setup_refresh(
         },
         SetupRootOverrides::default(),
         /*offline_proxy_settings_override*/ None,
+        /*elevated_authority*/ false,
     )
 }
 
@@ -257,7 +270,25 @@ pub(crate) fn run_setup_refresh_with_overrides_and_proxy_settings(
     overrides: SetupRootOverrides,
     offline_proxy_settings: &OfflineProxySettings,
 ) -> Result<()> {
-    run_setup_refresh_inner(request, overrides, Some(offline_proxy_settings))
+    run_setup_refresh_inner(
+        request,
+        overrides,
+        Some(offline_proxy_settings),
+        /*elevated_authority*/ false,
+    )
+}
+
+pub(crate) fn run_setup_refresh_with_elevated_acl_authority(
+    request: SandboxSetupRequest<'_>,
+    overrides: SetupRootOverrides,
+    offline_proxy_settings: &OfflineProxySettings,
+) -> Result<()> {
+    run_setup_refresh_inner(
+        request,
+        overrides,
+        Some(offline_proxy_settings),
+        /*elevated_authority*/ true,
+    )
 }
 
 pub fn run_setup_refresh_with_extra_read_roots(
@@ -295,6 +326,7 @@ pub fn run_setup_refresh_with_extra_read_roots(
             deny_write_paths: None,
         },
         /*offline_proxy_settings_override*/ None,
+        /*elevated_authority*/ false,
     )
 }
 
@@ -302,6 +334,7 @@ fn run_setup_refresh_inner(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
+    elevated_authority: bool,
 ) -> Result<()> {
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
@@ -329,9 +362,19 @@ fn run_setup_refresh_inner(
     };
     let json = serde_json::to_vec(&payload)?;
     let b64 = BASE64_STANDARD.encode(json);
-    run_setup_singleflight(b64.clone(), || {
-        run_setup_refresh_payload(&b64, request.sandbox_home)
-    })
+    if elevated_authority {
+        let needs_elevation = !is_elevated().map_err(|err| {
+            failure(
+                SetupErrorCode::OrchestratorElevationCheckFailed,
+                format!("failed to determine elevation state: {err}"),
+            )
+        })?;
+        run_setup_exe(&payload, needs_elevation, request.sandbox_home)
+    } else {
+        run_setup_singleflight(b64.clone(), || {
+            run_setup_refresh_payload(&b64, request.sandbox_home)
+        })
+    }
 }
 
 fn run_setup_refresh_payload(b64: &str, sandbox_home: &Path) -> Result<()> {
@@ -837,6 +880,24 @@ fn report_helper_failure(
             format!("{exit_detail}; failed to read setup_error.json: {err}"),
         ),
     }
+}
+
+/// Returns true only for a typed ACL access failure that the elevated setup helper can repair.
+/// Other setup failures remain terminal and are never retried by changing authority.
+pub(crate) fn is_acl_authority_failure(error: &anyhow::Error) -> bool {
+    let Some(failure) = extract_failure(error) else {
+        return false;
+    };
+    failure.code == SetupErrorCode::HelperDenyReadAclFailed
+        && failure.windows_error_code == Some(ERROR_ACCESS_DENIED)
+        && failure.acl_operation.is_some_and(|operation| {
+            matches!(
+                operation,
+                crate::AclOperation::OpenTarget
+                    | crate::AclOperation::GetSecurityInfo
+                    | crate::AclOperation::SetSecurityInfo
+            )
+        })
 }
 
 fn verify_setup_completed(sandbox_home: &Path) -> Result<()> {
@@ -1454,6 +1515,8 @@ mod tests {
             &SetupErrorReport {
                 code: super::SetupErrorCode::HelperFirewallPolicyAccessFailed,
                 message: "firewall policy unavailable".to_string(),
+                acl_operation: None,
+                windows_error_code: None,
             },
         )
         .expect("write setup error report");
@@ -1483,6 +1546,8 @@ mod tests {
             &SetupErrorReport {
                 code: super::SetupErrorCode::HelperFirewallPolicyAccessFailed,
                 message: "stale report".to_string(),
+                acl_operation: None,
+                windows_error_code: None,
             },
         )
         .expect("write setup error report");
@@ -2162,5 +2227,44 @@ mod tests {
             super::build_payload_deny_read_paths(Some(vec![existing.clone(), missing.clone()])),
             vec![existing, missing]
         );
+    }
+
+    #[test]
+    fn acl_authority_retry_requires_typed_access_denied() {
+        let access_denied = anyhow::Error::new(
+            super::SetupFailure::new(
+                super::SetupErrorCode::HelperDenyReadAclFailed,
+                "safe ACL failure",
+            )
+            .with_acl_error(crate::WindowsAclError {
+                operation: crate::AclOperation::OpenTarget,
+                code: 5,
+            }),
+        );
+        assert!(super::is_acl_authority_failure(&access_denied));
+
+        let unknown_code = anyhow::Error::new(
+            super::SetupFailure::new(
+                super::SetupErrorCode::HelperDenyReadAclFailed,
+                "safe ACL failure",
+            )
+            .with_acl_error(crate::WindowsAclError {
+                operation: crate::AclOperation::OpenTarget,
+                code: 87,
+            }),
+        );
+        assert!(!super::is_acl_authority_failure(&unknown_code));
+
+        let wrong_operation = anyhow::Error::new(
+            super::SetupFailure::new(
+                super::SetupErrorCode::HelperDenyReadAclFailed,
+                "safe ACL failure",
+            )
+            .with_acl_error(crate::WindowsAclError {
+                operation: crate::AclOperation::SetEntriesInAcl,
+                code: 5,
+            }),
+        );
+        assert!(!super::is_acl_authority_failure(&wrong_operation));
     }
 }

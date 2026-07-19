@@ -7,8 +7,10 @@ use crate::setup::SandboxUsersFile;
 use crate::setup::SetupMarker;
 use crate::setup::gather_read_roots;
 use crate::setup::gather_write_roots_for_permissions;
+use crate::setup::is_acl_authority_failure;
 use crate::setup::offline_proxy_settings_from_env;
 use crate::setup::run_elevated_setup_with_proxy_settings;
+use crate::setup::run_setup_refresh_with_elevated_acl_authority;
 use crate::setup::run_setup_refresh_with_overrides_and_proxy_settings;
 use crate::setup::sandbox_users_path;
 use crate::setup::setup_marker_path;
@@ -228,24 +230,45 @@ pub fn require_logon_sandbox_creds(
         )?;
         identity = select_identity(network_identity, sandbox_home)?;
     }
-    // Always refresh ACLs (non-elevated) for current roots via the setup binary.
-    run_setup_refresh_with_overrides_and_proxy_settings(
-        crate::setup::SandboxSetupRequest {
-            permissions,
-            command_cwd,
-            env_map,
-            sandbox_home,
-            proxy_enforced,
-        },
-        crate::setup::SetupRootOverrides {
-            read_roots: Some(needed_read),
-            read_roots_include_platform_defaults,
-            write_roots: Some(needed_write),
-            deny_read_paths: Some(deny_read_paths_override.to_vec()),
-            deny_write_paths: Some(deny_write_paths_override.to_vec()),
-        },
+    // Refresh ordinary roots without UAC. If the refresh reaches a typed access-denied ACL
+    // mutation on a sandbox-owned target, retry the same refresh-only payload through the existing
+    // elevated helper. This preserves the no-prompt hot path while keeping ACL authority at the
+    // setup boundary; cancellation of the required elevation remains a fail-closed error.
+    let setup_request = || crate::setup::SandboxSetupRequest {
+        permissions,
+        command_cwd,
+        env_map,
+        sandbox_home,
+        proxy_enforced,
+    };
+    let setup_overrides = || crate::setup::SetupRootOverrides {
+        read_roots: Some(needed_read.clone()),
+        read_roots_include_platform_defaults,
+        write_roots: Some(needed_write.clone()),
+        deny_read_paths: Some(deny_read_paths_override.to_vec()),
+        deny_write_paths: Some(deny_write_paths_override.to_vec()),
+    };
+    if let Err(error) = run_setup_refresh_with_overrides_and_proxy_settings(
+        setup_request(),
+        setup_overrides(),
         &desired_offline_proxy_settings,
-    )?;
+    ) {
+        if !is_acl_authority_failure(&error) {
+            return Err(error);
+        }
+        crate::logging::log_note(
+            "sandbox-owned ACL target requires elevated setup authority",
+            Some(&sandbox_dir),
+        );
+        run_setup_refresh_with_elevated_acl_authority(
+            setup_request(),
+            setup_overrides(),
+            &desired_offline_proxy_settings,
+        )
+        .map_err(|elevated_error| {
+            elevated_error.context("elevated ACL authority was required after access denial")
+        })?;
+    }
     let identity = identity.ok_or_else(|| {
         anyhow!(
             "Windows sandbox setup is missing or out of date; rerun the sandbox setup with elevation"
