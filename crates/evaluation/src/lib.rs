@@ -34,9 +34,11 @@ pub use value::{
 /// 当前 task set schema 版本。
 pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v5";
 /// 当前稳定 result schema 版本。
-pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v6";
+pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v7";
 /// 当前 evidence schema 版本。
-pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v2";
+pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v3";
+pub(crate) const PREVIOUS_RESULT_SCHEMA_VERSION: &str = "evaluation.result/v6";
+pub(crate) const PREVIOUS_EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v2";
 /// 核心任务成功率门禁的 basis points 阈值。
 pub const CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
 

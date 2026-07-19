@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-//! Evaluation v5/v6/v2 schema、trial 分母和证据绑定合同测试。
+//! Evaluation v5/v7/v3 schema、task/trial 指标和证据绑定合同测试。
 
 use serde_json::{Value, json};
 use singularity_evaluation::{
@@ -190,29 +190,25 @@ fn blocked_trial(trial: u32) -> EvaluationTrialResult {
     }
 }
 
-fn task_result(trials: Vec<EvaluationTrialResult>) -> EvaluationTaskResult {
+fn task_result_for(task_id: &str, trials: Vec<EvaluationTrialResult>) -> EvaluationTaskResult {
     EvaluationTaskResult::from_trials(
-        TaskId::new("representative-task").expect("task id"),
+        TaskId::new(task_id).expect("task id"),
         vec![EvaluationCapability::RequiredVerification],
         vec![requirement("workspace_read")],
         trials,
     )
 }
 
+fn task_result(trials: Vec<EvaluationTrialResult>) -> EvaluationTaskResult {
+    task_result_for("representative-task", trials)
+}
+
 fn result_for(task: EvaluationTaskResult, trials_per_task: u32) -> EvaluationResult {
-    let status = task.status;
-    let blocker = task.blocker.clone();
-    let evaluation_passed = task.evaluation_passed;
-    let tasks = vec![task];
-    EvaluationResult {
-        schema_version: EvaluationResultSchemaVersion::V6,
-        run_id: RunId::new("run-1").expect("run id"),
-        status,
-        blocker,
-        evaluation_passed,
-        summary: EvaluationRunSummary::from_tasks(&tasks, trials_per_task),
-        tasks,
-    }
+    result_for_tasks(vec![task], trials_per_task)
+}
+
+fn result_for_tasks(tasks: Vec<EvaluationTaskResult>, trials_per_task: u32) -> EvaluationResult {
+    EvaluationResult::from_tasks(RunId::new("run-1").expect("run id"), trials_per_task, tasks)
 }
 
 fn empty_scope() -> EvaluationScopeEvidence {
@@ -266,7 +262,7 @@ fn trial_evidence(trial: &EvaluationTrialResult, complete: bool) -> EvaluationTr
 fn evidence_for(result: &EvaluationResult, complete: bool) -> EvaluationEvidence {
     let task = &result.tasks[0];
     EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V2,
+        schema_version: EvaluationEvidenceSchemaVersion::V3,
         run_id: result.run_id.clone(),
         manifest_digest: DIGEST.to_string(),
         task_selection_digest: task_selection_digest(std::slice::from_ref(&task.task_id)),
@@ -367,7 +363,7 @@ fn command_and_path_trust_boundaries_remain_fail_closed() {
 }
 
 #[test]
-fn result_v6_derives_blocked_excluding_agent_denominators() {
+fn result_v7_keeps_blocked_trials_out_of_trial_diagnostics() {
     let task = task_result(vec![passed_trial(1), blocked_trial(2)]);
     assert_eq!(task.summary.completed_trial_count, 1);
     assert_eq!(task.summary.failed_trial_count, 0);
@@ -380,6 +376,56 @@ fn result_v6_derives_blocked_excluding_agent_denominators() {
     result.validate().expect("valid blocked-denominator result");
     assert_eq!(result.summary.blocked_trial_count, 1);
     assert_eq!(result.summary.agent_scored_trial_count, 1);
+    assert_eq!(result.summary.trial_success_count, 1);
+    assert_eq!(result.summary.trial_success_rate_basis_points, 10_000);
+    assert_eq!(result.summary.task_success_count, 0);
+    assert_eq!(result.summary.task_success_rate_basis_points, 0);
+    assert!(!result.summary.meets_core_task_success_threshold);
+}
+
+#[test]
+fn task_success_gate_differs_from_trial_success_rate() {
+    let task_a = task_result_for(
+        "task-a",
+        vec![passed_trial(1), passed_trial(2), passed_trial(3)],
+    );
+    let task_b = task_result_for(
+        "task-b",
+        vec![passed_trial(1), passed_trial(2), failed_trial(3)],
+    );
+    let result = EvaluationResult {
+        schema_version: EvaluationResultSchemaVersion::V7,
+        run_id: RunId::new("run-1").expect("run id"),
+        status: EvaluationStatus::Failed,
+        blocker: None,
+        evaluation_passed: false,
+        summary: EvaluationRunSummary {
+            task_count: 2,
+            trials_per_task: 3,
+            trial_count: 6,
+            completed_trial_count: 5,
+            failed_trial_count: 1,
+            blocked_trial_count: 0,
+            agent_scored_trial_count: 6,
+            agent_completed_count: 6,
+            agent_failed_count: 0,
+            task_success_count: 1,
+            trial_success_count: 5,
+            trial_success_rate_basis_points: 5 * 10_000 / 6,
+            task_success_rate_basis_points: 10_000 / 2,
+            meets_core_task_success_threshold: false,
+        },
+        tasks: vec![task_a, task_b],
+    };
+
+    result.validate().expect("task/trial metrics are valid");
+    assert_eq!(result.summary.task_success_count, 1);
+    assert_eq!(result.summary.trial_success_count, 5);
+    assert_eq!(result.summary.task_success_rate_basis_points, 5_000);
+    assert_eq!(result.summary.trial_success_rate_basis_points, 8_333);
+    assert!(result.summary.trial_success_rate_basis_points >= 8_000);
+    assert!(!result.summary.meets_core_task_success_threshold);
+    assert!(!result.evaluation_passed);
 }
 
 #[test]
@@ -410,7 +456,7 @@ fn single_trial_is_unstable_and_multi_trial_statistics_are_finite() {
 }
 
 #[test]
-fn result_v5_and_evidence_v1_are_typed_rejections() {
+fn unsupported_result_v5_and_evidence_v1_fail_closed() {
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut value = serde_json::to_value(result).expect("result JSON");
     value["schema_version"] = json!("evaluation.result/v5");
@@ -426,10 +472,74 @@ fn result_v5_and_evidence_v1_are_typed_rejections() {
         EvaluationEvidence::from_json_str(&serde_json::to_string(&value).expect("JSON")),
         Err(EvaluationError::UnsupportedSchemaVersion { .. })
     ));
+
+    let result = result_for(task_result(vec![failed_trial(1)]), 1);
+    let mut future = serde_json::to_value(result).expect("result JSON");
+    future["schema_version"] = json!("evaluation.result/v8");
+    assert!(matches!(
+        EvaluationResult::from_json_str(&serde_json::to_string(&future).expect("JSON")),
+        Err(EvaluationError::UnsupportedSchemaVersion { .. })
+    ));
+
+    let result = result_for(task_result(vec![failed_trial(1)]), 1);
+    let mut future = serde_json::to_value(evidence_for(&result, false)).expect("evidence JSON");
+    future["schema_version"] = json!("evaluation.evidence/v4");
+    assert!(matches!(
+        EvaluationEvidence::from_json_str(&serde_json::to_string(&future).expect("JSON")),
+        Err(EvaluationError::UnsupportedSchemaVersion { .. })
+    ));
 }
 
 #[test]
-fn evidence_v2_binds_every_trial_and_safe_reproducibility_identity() {
+fn previous_result_and_evidence_schemas_migrate_into_one_current_path() {
+    let result = result_for(task_result(vec![passed_trial(1), failed_trial(2)]), 2);
+    let mut legacy_result = serde_json::to_value(&result).expect("result JSON");
+    legacy_result["schema_version"] = json!("evaluation.result/v6");
+    for task in legacy_result["tasks"].as_array_mut().expect("tasks") {
+        let summary = task["summary"].as_object_mut().expect("task summary");
+        let trial_success_count = summary
+            .remove("trial_success_count")
+            .expect("trial success count");
+        summary.insert("evaluation_passed_count".to_string(), trial_success_count);
+    }
+    let summary = legacy_result["summary"].as_object_mut().expect("summary");
+    summary.remove("task_success_count");
+    summary.remove("trial_success_count");
+    summary.remove("trial_success_rate_basis_points");
+    summary.insert("evaluation_passed_count".to_string(), json!(1));
+    summary.insert("task_success_rate_basis_points".to_string(), json!(10_000));
+
+    let migrated = EvaluationResult::from_json_str(
+        &serde_json::to_string(&legacy_result).expect("legacy result JSON"),
+    )
+    .expect("supported v6 result migrates");
+    assert_eq!(migrated.summary.task_success_count, 0);
+    assert_eq!(migrated.summary.trial_success_count, 1);
+    assert_eq!(migrated.summary.task_success_rate_basis_points, 0);
+    assert_eq!(migrated.summary.trial_success_rate_basis_points, 5_000);
+    assert_eq!(
+        serde_json::to_value(&migrated).expect("migrated JSON")["schema_version"],
+        json!("evaluation.result/v7")
+    );
+
+    let mut legacy_evidence =
+        serde_json::to_value(evidence_for(&result, true)).expect("evidence JSON");
+    legacy_evidence["schema_version"] = json!("evaluation.evidence/v2");
+    let migrated_evidence = EvaluationEvidence::from_json_str(
+        &serde_json::to_string(&legacy_evidence).expect("legacy evidence JSON"),
+    )
+    .expect("supported v2 evidence migrates");
+    migrated_evidence
+        .validate_against_result(&migrated)
+        .expect("migrated evidence binds to migrated result");
+    assert_eq!(
+        serde_json::to_value(migrated_evidence).expect("migrated evidence JSON")["schema_version"],
+        json!("evaluation.evidence/v3")
+    );
+}
+
+#[test]
+fn evidence_v3_binds_every_trial_and_safe_reproducibility_identity() {
     let result = result_for(task_result(vec![passed_trial(1), passed_trial(2)]), 2);
     let evidence = evidence_for(&result, true);
     evidence

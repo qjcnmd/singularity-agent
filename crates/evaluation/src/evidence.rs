@@ -3,17 +3,18 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    EVIDENCE_SCHEMA_VERSION, EvaluationError, EvaluationResult, GitCommit, Result, RunId, TaskId,
-    require_schema_version, validation_error,
+    EVIDENCE_SCHEMA_VERSION, EvaluationError, EvaluationResult, GitCommit,
+    PREVIOUS_EVIDENCE_SCHEMA_VERSION, Result, RunId, TaskId, validation_error,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation evidence 的 schema 版本。
 pub enum EvaluationEvidenceSchemaVersion {
-    #[serde(rename = "evaluation.evidence/v2")]
-    V2,
+    #[serde(rename = "evaluation.evidence/v3")]
+    V3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,7 +271,7 @@ impl EvaluationTaskEvidence {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 与 EvaluationResult/v6 逐 trial 绑定的脱敏 evidence。
+/// 与 EvaluationResult/v7 逐 trial 绑定的脱敏 evidence。
 pub struct EvaluationEvidence {
     pub schema_version: EvaluationEvidenceSchemaVersion,
     pub run_id: RunId,
@@ -284,8 +285,22 @@ pub struct EvaluationEvidence {
 
 impl EvaluationEvidence {
     pub fn from_json_str(json: &str) -> Result<Self> {
-        require_schema_version(json, EVIDENCE_SCHEMA_VERSION)?;
-        let evidence: Self = serde_json::from_str(json)?;
+        let mut value: Value = serde_json::from_str(json)?;
+        let actual = value
+            .get("schema_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match actual {
+            EVIDENCE_SCHEMA_VERSION => {}
+            PREVIOUS_EVIDENCE_SCHEMA_VERSION => migrate_evidence_v2(&mut value)?,
+            _ => {
+                return Err(EvaluationError::UnsupportedSchemaVersion {
+                    expected: EVIDENCE_SCHEMA_VERSION,
+                    actual: actual.to_string(),
+                });
+            }
+        }
+        let evidence: Self = serde_json::from_value(value)?;
         evidence.validate()?;
         Ok(evidence)
     }
@@ -392,6 +407,16 @@ impl EvaluationEvidence {
         }
         Ok(())
     }
+}
+
+fn migrate_evidence_v2(value: &mut Value) -> Result<()> {
+    if !value.is_object() {
+        return Err(validation_error(
+            "evaluation.evidence/v2 must be a JSON object",
+        ));
+    }
+    value["schema_version"] = Value::String(EVIDENCE_SCHEMA_VERSION.to_string());
+    Ok(())
 }
 
 /// 计算固定顺序的任务选择摘要。

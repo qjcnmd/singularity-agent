@@ -3,18 +3,19 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::{
     CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS, EvaluationCapability, EvaluationError,
-    RESULT_SCHEMA_VERSION, Result, RunId, TaskId, ToolCapabilityRequirement,
-    require_schema_version, validation_error,
+    PREVIOUS_RESULT_SCHEMA_VERSION, RESULT_SCHEMA_VERSION, Result, RunId, TaskId,
+    ToolCapabilityRequirement, validation_error,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation result 的 schema 版本。
 pub enum EvaluationResultSchemaVersion {
-    #[serde(rename = "evaluation.result/v6")]
-    V6,
+    #[serde(rename = "evaluation.result/v7")]
+    V7,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,7 +199,7 @@ impl EvaluationStageResults {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 单个独立 trial 的最终结果和门禁字段。
+/// 单个独立 trial 的最终结果和任务定义完成条件字段。
 pub struct EvaluationTrialResult {
     pub trial: u32,
     pub status: EvaluationStatus,
@@ -207,6 +208,7 @@ pub struct EvaluationTrialResult {
     pub stages: EvaluationStageResults,
     pub agent_completed: bool,
     pub tests_passed: bool,
+    /// 该 trial 是否满足 manifest evaluator 定义的完成条件。
     pub evaluation_passed: bool,
     pub evidence: EvaluationEvidenceSummary,
 }
@@ -266,7 +268,7 @@ impl EvaluationTrialResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 同一任务的 trial 分母和状态计数。
+/// 同一任务的 trial 分母、状态计数和 trial 成功数。
 pub struct EvaluationTaskSummary {
     pub trial_count: u32,
     pub completed_trial_count: u32,
@@ -275,7 +277,8 @@ pub struct EvaluationTaskSummary {
     pub agent_scored_trial_count: u32,
     pub agent_completed_count: u32,
     pub agent_failed_count: u32,
-    pub evaluation_passed_count: u32,
+    /// 满足任务定义完成条件的 trial 数；仅对非 blocked trial 作为 trial rate 的分子。
+    pub trial_success_count: u32,
 }
 
 impl EvaluationTaskSummary {
@@ -299,7 +302,7 @@ impl EvaluationTaskSummary {
             agent_scored_trial_count,
             agent_completed_count,
             agent_failed_count: agent_scored_trial_count.saturating_sub(agent_completed_count),
-            evaluation_passed_count: count_trials(trials, |trial| trial.evaluation_passed),
+            trial_success_count: count_trials(trials, |trial| trial.evaluation_passed),
         }
     }
 }
@@ -412,6 +415,7 @@ pub struct EvaluationTaskResult {
     pub status: EvaluationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<EvaluationBlocker>,
+    /// 任务成功：该任务的每个 trial 都满足任务定义的完成条件。
     pub evaluation_passed: bool,
     pub summary: EvaluationTaskSummary,
     pub stability: EvaluationStabilitySummary,
@@ -503,7 +507,7 @@ impl EvaluationTaskResult {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 整个 Evaluation run 的 trial 分母和门禁结果。
+/// 整个 Evaluation run 的任务/ trial 指标和门禁结果。
 pub struct EvaluationRunSummary {
     pub task_count: u32,
     pub trials_per_task: u32,
@@ -514,8 +518,15 @@ pub struct EvaluationRunSummary {
     pub agent_scored_trial_count: u32,
     pub agent_completed_count: u32,
     pub agent_failed_count: u32,
-    pub evaluation_passed_count: u32,
+    /// 满足任务定义完成条件的 task 数；task rate 的分母是所有选定 task。
+    pub task_success_count: u32,
+    /// 所有 task 的 trial success 数，仅用于稳定性/模型波动观测。
+    pub trial_success_count: u32,
+    /// 非 blocked trial 中满足完成条件的比例，仅用于稳定性/模型波动观测。
+    pub trial_success_rate_basis_points: u32,
+    /// 满足全部 trial 完成条件的 task 比例，唯一用于核心能力门禁。
     pub task_success_rate_basis_points: u32,
+    /// 是否达到核心 task success rate 门槛。
     pub meets_core_task_success_threshold: bool,
 }
 
@@ -547,18 +558,14 @@ impl EvaluationRunSummary {
             .iter()
             .map(|task| task.summary.agent_failed_count)
             .sum();
-        let evaluation_passed_count: u32 = tasks
+        let task_success_count = count_tasks(tasks, |task| task.evaluation_passed);
+        let trial_success_count: u32 = tasks
             .iter()
-            .map(|task| task.summary.evaluation_passed_count)
-            .sum();
-        let task_success_rate_basis_points = if agent_scored_trial_count == 0 {
-            0
-        } else {
-            evaluation_passed_count
-                .saturating_mul(10_000)
-                .checked_div(agent_scored_trial_count)
-                .unwrap_or(0)
-        };
+            .map(|task| task.summary.trial_success_count)
+            .fold(0, u32::saturating_add);
+        let trial_success_rate_basis_points =
+            rate_basis_points(trial_success_count, agent_scored_trial_count);
+        let task_success_rate_basis_points = rate_basis_points(task_success_count, task_count);
         Self {
             task_count,
             trials_per_task,
@@ -569,11 +576,31 @@ impl EvaluationRunSummary {
             agent_scored_trial_count,
             agent_completed_count,
             agent_failed_count,
-            evaluation_passed_count,
+            task_success_count,
+            trial_success_count,
+            trial_success_rate_basis_points,
             task_success_rate_basis_points,
             meets_core_task_success_threshold: task_success_rate_basis_points
                 >= CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS,
         }
+    }
+}
+
+fn count_tasks(
+    tasks: &[EvaluationTaskResult],
+    predicate: impl Fn(&EvaluationTaskResult) -> bool,
+) -> u32 {
+    u32::try_from(tasks.iter().filter(|task| predicate(task)).count()).unwrap_or(u32::MAX)
+}
+
+fn rate_basis_points(success_count: u32, denominator: u32) -> u32 {
+    if denominator == 0 {
+        0
+    } else {
+        success_count
+            .saturating_mul(10_000)
+            .checked_div(denominator)
+            .unwrap_or(0)
     }
 }
 
@@ -592,9 +619,64 @@ pub struct EvaluationResult {
 }
 
 impl EvaluationResult {
+    /// 从已完成的 task 结果构造唯一的 run-level 状态和指标投影。
+    pub fn from_tasks(
+        run_id: RunId,
+        trials_per_task: u32,
+        tasks: Vec<EvaluationTaskResult>,
+    ) -> Self {
+        let status = aggregate_status(&tasks.iter().map(|task| task.status).collect::<Vec<_>>());
+        let blocker = (status == EvaluationStatus::Blocked)
+            .then(|| tasks.iter().find_map(|task| task.blocker.clone()))
+            .flatten();
+        let evaluation_passed =
+            !tasks.is_empty() && tasks.iter().all(|task| task.evaluation_passed);
+        Self {
+            schema_version: EvaluationResultSchemaVersion::V7,
+            run_id,
+            status,
+            blocker,
+            evaluation_passed,
+            summary: EvaluationRunSummary::from_tasks(&tasks, trials_per_task),
+            tasks,
+        }
+    }
+
     pub fn from_json_str(json: &str) -> Result<Self> {
-        require_schema_version(json, RESULT_SCHEMA_VERSION)?;
-        let result: Self = serde_json::from_str(json)?;
+        let mut value: Value = serde_json::from_str(json)?;
+        let actual = value
+            .get("schema_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let migrated = actual == PREVIOUS_RESULT_SCHEMA_VERSION;
+        match actual {
+            RESULT_SCHEMA_VERSION => {}
+            PREVIOUS_RESULT_SCHEMA_VERSION => migrate_result_v6(&mut value)?,
+            _ => {
+                return Err(EvaluationError::UnsupportedSchemaVersion {
+                    expected: RESULT_SCHEMA_VERSION,
+                    actual: actual.to_string(),
+                });
+            }
+        }
+        let result: Self = serde_json::from_value(value)?;
+        let result = if migrated {
+            let tasks = result
+                .tasks
+                .into_iter()
+                .map(|task| {
+                    EvaluationTaskResult::from_trials(
+                        task.task_id,
+                        task.capabilities,
+                        task.required_tool_capabilities,
+                        task.trials,
+                    )
+                })
+                .collect::<Vec<_>>();
+            EvaluationResult::from_tasks(result.run_id, result.summary.trials_per_task, tasks)
+        } else {
+            result
+        };
         result.validate()?;
         Ok(result)
     }
@@ -659,6 +741,34 @@ fn count_trials(
     predicate: impl Fn(&EvaluationTrialResult) -> bool,
 ) -> u32 {
     u32::try_from(trials.iter().filter(|trial| predicate(trial)).count()).unwrap_or(u32::MAX)
+}
+
+fn migrate_result_v6(value: &mut Value) -> Result<()> {
+    let tasks = value
+        .get_mut("tasks")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| validation_error("evaluation.result/v6 tasks must be an array"))?;
+    for task in tasks {
+        let task_summary = task
+            .get_mut("summary")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                validation_error("evaluation.result/v6 task summary must be an object")
+            })?;
+        task_summary.remove("evaluation_passed_count");
+        task_summary.insert("trial_success_count".to_string(), json!(0));
+    }
+
+    let summary = value
+        .get_mut("summary")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| validation_error("evaluation.result/v6 summary must be an object"))?;
+    summary.remove("evaluation_passed_count");
+    summary.insert("task_success_count".to_string(), json!(0));
+    summary.insert("trial_success_count".to_string(), json!(0));
+    summary.insert("trial_success_rate_basis_points".to_string(), json!(0));
+    value["schema_version"] = Value::String(RESULT_SCHEMA_VERSION.to_string());
+    Ok(())
 }
 
 fn validate_nonempty_unique<T: Ord + Clone>(values: &[T], context: &str) -> Result<()> {
