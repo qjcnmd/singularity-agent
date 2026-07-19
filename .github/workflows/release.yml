@@ -68,8 +68,10 @@ jobs:
           WINDOWS_CODESIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGNING_PFX_BASE64 }}
           WINDOWS_CODESIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGNING_PFX_PASSWORD }}
           WINDOWS_CODESIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGNING_TIMESTAMP_URL }}
+          SINGULARITY_RELEASE_EVENT_NAME: ${{ github.event_name }}
+          SINGULARITY_RELEASE_REF_TYPE: ${{ github.ref_type }}
         run: |
-          $isFormalRelease = ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag")
+          $isFormalRelease = ($env:SINGULARITY_RELEASE_EVENT_NAME -eq "push" -and $env:SINGULARITY_RELEASE_REF_TYPE -eq "tag")
           $arguments = @(
             "-NoProfile"
             "-File"
@@ -88,8 +90,15 @@ jobs:
       - name: Assemble archive
         id: package
         shell: pwsh
+        env:
+          SINGULARITY_RELEASE_EVENT_NAME: ${{ github.event_name }}
+          SINGULARITY_RELEASE_REF_TYPE: ${{ github.ref_type }}
+          SINGULARITY_RELEASE_REF_NAME: ${{ github.ref_name }}
+          SINGULARITY_RELEASE_RUN_NUMBER: ${{ github.run_number }}
+          SINGULARITY_RELEASE_SIGNING_STATUS: ${{ steps.sign.outputs.status }}
+          SINGULARITY_RELEASE_SBOM_TOOL_PATH: ${{ steps.sbom-tool.outputs.path }}
         run: |
-          $isFormalRelease = ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag")
+          $isFormalRelease = ($env:SINGULARITY_RELEASE_EVENT_NAME -eq "push" -and $env:SINGULARITY_RELEASE_REF_TYPE -eq "tag")
           $arguments = @(
             "-NoProfile"
             "-File"
@@ -99,13 +108,13 @@ jobs:
             "-OutputDirectory"
             (Join-Path $PWD "dist")
             "-RefName"
-            "${{ github.ref_name }}"
+            $env:SINGULARITY_RELEASE_REF_NAME
             "-RunNumber"
-            [int]"${{ github.run_number }}"
+            [int]$env:SINGULARITY_RELEASE_RUN_NUMBER
             "-SigningStatus"
-            "${{ steps.sign.outputs.status }}"
+            $env:SINGULARITY_RELEASE_SIGNING_STATUS
             "-SbomToolPath"
-            "${{ steps.sbom-tool.outputs.path }}"
+            $env:SINGULARITY_RELEASE_SBOM_TOOL_PATH
           )
           if ($isFormalRelease) {
             $arguments += "-IsFormalRelease"
