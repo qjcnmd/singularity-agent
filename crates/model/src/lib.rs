@@ -1,4 +1,4 @@
-#![allow(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! 面向模型的消息、模型提供方能力契约和兼容 OpenAI 的传输。
 //!
@@ -1602,7 +1602,7 @@ fn remove_owned_path(path: &Path, expected: CacheFileIdentity) -> bool {
 fn replace_existing_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        replace_existing_windows(from, to)
+        windows_file_replace::replace(from, to)
     }
     #[cfg(not(windows))]
     {
@@ -1611,35 +1611,51 @@ fn replace_existing_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn replace_existing_windows(from: &Path, to: &Path) -> std::io::Result<()> {
+#[allow(unsafe_code)]
+mod windows_file_replace {
+    use std::io;
     use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    let source = from
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = to
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // The source and destination are NUL-terminated UTF-16 paths owned by this function;
-    // MoveFileExW does not retain either pointer after returning.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    /// Replaces the destination using the Windows operation required for an existing target.
+    pub(super) fn replace(from: &Path, to: &Path) -> io::Result<()> {
+        let source = encoded_path(from)?;
+        let destination = encoded_path(to)?;
+
+        // SAFETY: both vectors are owned by this function, contain no interior NULs, and remain
+        // alive for the synchronous call. MoveFileExW does not retain either pointer after it
+        // returns; it receives no Rust-owned handle or mutable alias that could escape.
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn encoded_path(path: &Path) -> io::Result<Vec<u16>> {
+        let mut encoded = Vec::new();
+        for unit in path.as_os_str().encode_wide() {
+            if unit == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Windows path contains an embedded NUL",
+                ));
+            }
+            encoded.push(unit);
+        }
+        encoded.push(0);
+        Ok(encoded)
     }
 }
 
@@ -6020,6 +6036,44 @@ mod transport_tests {
         assert_eq!(
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_replacement_covers_success_and_failure_paths() {
+        let directory = tempfile::tempdir().expect("Windows replacement directory");
+        let source = directory.path().join("source-测试.tmp");
+        let destination = directory.path().join("destination-缓存.json");
+        std::fs::write(&source, b"replacement").expect("source file");
+        std::fs::write(&destination, b"old").expect("destination file");
+
+        replace_existing_atomic(&source, &destination).expect("replace existing file");
+        assert!(
+            !source.exists(),
+            "successful replacement consumes the source"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("replacement destination"),
+            b"replacement"
+        );
+
+        let missing = directory.path().join("missing.tmp");
+        let error = replace_existing_atomic(&missing, &destination)
+            .expect_err("missing source must report the Windows error");
+        assert!(error.raw_os_error().is_some());
+        assert_eq!(
+            std::fs::read(&destination).expect("destination after failed replacement"),
+            b"replacement"
+        );
+
+        let embedded_nul = std::path::PathBuf::from("invalid\0source.tmp");
+        let error = replace_existing_atomic(&embedded_nul, &destination)
+            .expect_err("embedded NUL must be rejected before the FFI call");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read(&destination).expect("destination after invalid path"),
+            b"replacement"
         );
     }
 
