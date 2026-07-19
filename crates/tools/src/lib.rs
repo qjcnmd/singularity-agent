@@ -38,6 +38,7 @@ pub use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, CommandSemanticStatus, DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
+    WorkspaceMutation,
 };
 
 const REDACTED_TOOL_OUTPUT: &str = "[redacted sensitive tool output]";
@@ -48,6 +49,7 @@ const TOOL_APPROVAL_REQUIRED_ERROR: &str = "approval_required";
 const TOOL_SANDBOX_UNAVAILABLE_ERROR: &str = "sandbox_unavailable";
 const TOOL_CONTRACT_INVALID_ERROR: &str = "tool_contract_invalid";
 const WORKSPACE_MUTATION_NOT_APPROVED: &str = "workspace mutation requires allowed tool decision";
+const WORKSPACE_OBSERVATION_METADATA: &str = "workspace_observation";
 const DUPLICATE_PATCH_TARGET: &str = "patch contains duplicate canonical target";
 const MUTATION_TEMP_FILE_ATTEMPTS: usize = 64;
 const DEFAULT_READ_MAX_CHARS: usize = 8_192;
@@ -1231,6 +1233,9 @@ pub struct ToolResult {
     pub truncated: bool,
     #[serde(skip)]
     audit_metadata: Option<Value>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    workspace_observation: Option<WorkspaceObservation>,
 }
 
 impl ToolResult {
@@ -1253,6 +1258,7 @@ impl ToolResult {
             result_id: None,
             truncated: false,
             audit_metadata: None,
+            workspace_observation: None,
         }
     }
 
@@ -1265,6 +1271,17 @@ impl ToolResult {
     /// 返回内部审计 metadata。
     pub fn audit_metadata(&self) -> Option<&Value> {
         self.audit_metadata.as_ref()
+    }
+
+    /// 返回只供 completion/checkpoint 使用的 workspace observation。
+    pub fn workspace_observation(&self) -> Option<&WorkspaceObservation> {
+        self.workspace_observation.as_ref()
+    }
+
+    /// 绑定内部 workspace observation；该字段不会序列化到模型 payload。
+    pub fn with_workspace_observation(mut self, observation: WorkspaceObservation) -> Self {
+        self.workspace_observation = Some(observation);
+        self
     }
 
     /// 将执行器输出投影为模型和 trace 可用结果。
@@ -1310,6 +1327,10 @@ impl ToolResult {
             tool_result.preview = None;
         }
         tool_result.audit_metadata = result.metadata.get("audit").cloned();
+        tool_result.workspace_observation = result
+            .metadata
+            .get(WORKSPACE_OBSERVATION_METADATA)
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
         tool_result
     }
 
@@ -1628,6 +1649,67 @@ pub struct WorkspacePatchChange {
     pub replacement: String,
 }
 
+/// 绑定到一个工作区执行生命周期的单调 revision；只在内部 verification/checkpoint 中使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct WorkspaceRevision(u64);
+
+impl WorkspaceRevision {
+    /// 返回新绑定工作区的初始 revision。
+    pub fn initial() -> Self {
+        Self(0)
+    }
+
+    /// 返回下一个 revision；溢出时返回 `None`，调用方必须 fail closed。
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+/// 一次 tool 结果实际观察到的工作区 revision 与变化事实。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceObservation {
+    revision: Option<WorkspaceRevision>,
+    mutation: WorkspaceMutation,
+}
+
+impl WorkspaceObservation {
+    /// 构造一次未改变工作区的观察。
+    pub fn unchanged(revision: WorkspaceRevision) -> Self {
+        Self {
+            revision: Some(revision),
+            mutation: WorkspaceMutation::Unchanged,
+        }
+    }
+
+    /// 构造一次已改变工作区的观察。
+    pub fn changed(revision: WorkspaceRevision) -> Self {
+        Self {
+            revision: Some(revision),
+            mutation: WorkspaceMutation::Changed,
+        }
+    }
+
+    /// 构造无法可靠判断工作区变化的观察。
+    pub fn unknown() -> Self {
+        Self {
+            revision: None,
+            mutation: WorkspaceMutation::Unknown,
+        }
+    }
+
+    /// 返回该观察绑定的 revision；未知观察没有可用 revision。
+    pub fn revision(&self) -> Option<WorkspaceRevision> {
+        self.revision
+    }
+
+    /// 返回 backend/WorkspaceTools 报告的变化事实。
+    pub fn mutation(&self) -> WorkspaceMutation {
+        self.mutation
+    }
+}
+
 /// 绑定到根目录的工作区文件 tool，以及为命令配置的严格沙箱 backend。
 #[derive(Clone)]
 pub struct WorkspaceTools {
@@ -1637,6 +1719,7 @@ pub struct WorkspaceTools {
     workspace_namespace_guards: Arc<Vec<std::fs::File>>,
     sandbox_backend: Option<Arc<dyn SandboxBackend + Send + Sync>>,
     command_environment: CommandEnvironmentPolicy,
+    workspace_revision: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for WorkspaceTools {
@@ -1699,6 +1782,7 @@ impl WorkspaceTools {
             workspace_namespace_guards: Arc::new(workspace_namespace_guards),
             sandbox_backend: None,
             command_environment: CommandEnvironmentPolicy::default(),
+            workspace_revision: Arc::new(AtomicU64::new(WorkspaceRevision::initial().0)),
         })
     }
 
@@ -1728,6 +1812,64 @@ impl WorkspaceTools {
     pub fn with_command_environment(mut self, environment: CommandEnvironmentPolicy) -> Self {
         self.command_environment = environment;
         self
+    }
+
+    /// 将新的 `WorkspaceTools` 实例绑定到 approval checkpoint 的内部 revision。
+    ///
+    /// 恢复只允许填充尚未执行命令的初始计数，或确认已经相同的计数；不会覆盖一个
+    /// 已经观察到不同 revision 的执行器状态。该绑定不进入模型 payload。
+    pub fn bind_checkpoint_workspace_revision(
+        &self,
+        revision: Option<WorkspaceRevision>,
+    ) -> Result<(), WorkspaceToolError> {
+        let expected = revision.unwrap_or_else(WorkspaceRevision::initial).0;
+        let current = self.workspace_revision.load(Ordering::SeqCst);
+        if current == expected {
+            return Ok(());
+        }
+        if current != WorkspaceRevision::initial().0 {
+            return Err(WorkspaceToolError::InvalidInput(
+                "workspace revision differs from approval checkpoint".to_string(),
+            ));
+        }
+        self.workspace_revision
+            .compare_exchange(current, expected, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(|_| {
+                WorkspaceToolError::InvalidInput(
+                    "workspace revision changed while restoring approval checkpoint".to_string(),
+                )
+            })
+    }
+
+    fn current_workspace_revision(&self) -> WorkspaceRevision {
+        WorkspaceRevision(self.workspace_revision.load(Ordering::SeqCst))
+    }
+
+    fn advance_workspace_revision(&self) -> Result<WorkspaceRevision, WorkspaceToolError> {
+        let previous = self
+            .workspace_revision
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |revision| {
+                revision.checked_add(1)
+            })
+            .map_err(|_| {
+                WorkspaceToolError::InvalidInput("workspace revision exhausted".to_string())
+            })?;
+        previous
+            .checked_add(1)
+            .map(WorkspaceRevision)
+            .ok_or_else(|| {
+                WorkspaceToolError::InvalidInput("workspace revision exhausted".to_string())
+            })
+    }
+
+    fn attach_workspace_observation(
+        output: &mut ToolOutput,
+        observation: &WorkspaceObservation,
+    ) -> Result<(), WorkspaceToolError> {
+        output.metadata[WORKSPACE_OBSERVATION_METADATA] =
+            serde_json::to_value(observation).map_err(serialization_error)?;
+        Ok(())
     }
 
     /// 规范化执行输入，并从同一次工作区解析结果投影类型化授权资源。
@@ -2288,11 +2430,14 @@ impl WorkspaceTools {
             .iter()
             .map(|mutation| mutation.relative.clone())
             .collect::<Vec<_>>();
-        Ok(ToolOutput::success(json!({
+        let revision = self.advance_workspace_revision()?;
+        let mut output = ToolOutput::success(json!({
             "changed_files": changed_files,
             "diff_ref": artifact_ref(DIFF_ARTIFACT_PREFIX, &changed_files.join(",")),
             "rolled_back": false,
-        })))
+        }));
+        Self::attach_workspace_observation(&mut output, &WorkspaceObservation::changed(revision))?;
+        Ok(output)
     }
 
     /// 在严格 sandbox backend 中执行命令字符串。
@@ -2344,6 +2489,11 @@ impl WorkspaceTools {
         if !capabilities.supports_command_execution() {
             return Err(WorkspaceToolError::SandboxUnavailable);
         }
+        if matches!(&filesystem, SandboxFilesystemMode::WorkspaceWrite)
+            && !capabilities.change_detection
+        {
+            return Err(WorkspaceToolError::SandboxUnavailable);
+        }
         let command_cwd = self.resolve_optional_workspace_path(input.cwd.as_deref(), false)?;
         self.validate_existing_path(&command_cwd, true)?;
         let actual_scope = command_script_scope_digest_with_policy(
@@ -2358,6 +2508,7 @@ impl WorkspaceTools {
                 "command authorization scope does not match execution input".to_string(),
             ));
         }
+        let requested_filesystem = filesystem.clone();
         let bound_command_cwd = self.bind_command_cwd(&command_cwd)?;
         let mut request = CommandScriptRequest::agent_requested_with_policy(
             next_command_id(),
@@ -2373,8 +2524,34 @@ impl WorkspaceTools {
         }
         let result = backend.execute_script_cancellable(&request, cancellation);
         drop(bound_command_cwd);
+        let mutation = result.workspace_mutation;
         let execution = result.sandbox.clone();
         let mut output = command_tool_output(result);
+        let observation = match (&requested_filesystem, mutation) {
+            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unchanged) => {
+                WorkspaceObservation::unchanged(self.current_workspace_revision())
+            }
+            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Changed) => {
+                WorkspaceObservation::changed(self.advance_workspace_revision()?)
+            }
+            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unknown) => {
+                output.ok = false;
+                output.failure_kind = Some(ToolFailureKind::Backend);
+                output.error_code = Some("workspace_change_unknown".to_string());
+                WorkspaceObservation::unknown()
+            }
+            (SandboxFilesystemMode::ReadOnly, WorkspaceMutation::Changed) => {
+                output.ok = false;
+                output.failure_kind = Some(ToolFailureKind::Backend);
+                output.error_code = Some("workspace_changed_in_read_only_command".to_string());
+                WorkspaceObservation::changed(self.advance_workspace_revision()?)
+            }
+            (
+                SandboxFilesystemMode::ReadOnly,
+                WorkspaceMutation::Unchanged | WorkspaceMutation::Unknown,
+            ) => WorkspaceObservation::unchanged(self.current_workspace_revision()),
+        };
+        Self::attach_workspace_observation(&mut output, &observation)?;
         output.metadata["result_id"] = json!(expected_scope.as_str());
         output.metadata["audit"] = json!({
             "cwd": request.cwd,

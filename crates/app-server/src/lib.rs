@@ -3151,7 +3151,7 @@ mod tests {
     };
     use singularity_policy::{CommandScopeDigest, ToolId, WorkspaceRelativePath};
     use singularity_protocol::ItemKind;
-    use singularity_sandbox::CommandScriptRequest;
+    use singularity_sandbox::{CommandScriptRequest, WorkspaceMutation};
     use singularity_tools::{
         CommandRequest, CommandResult, SandboxFilesystemMode, SandboxNetworkMode,
         command_script_scope_digest_with_policy,
@@ -5748,11 +5748,12 @@ mod tests {
         }
 
         fn capabilities(&self) -> singularity_tools::SandboxCapabilities {
-            singularity_tools::SandboxCapabilities::strict()
+            singularity_tools::SandboxCapabilities::strict().with_change_detection()
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             CommandResult::completed(&request.command_id, "app-server-sandbox-ok")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution(
                     self.name(),
                     singularity_tools::SandboxBackendEnforcement::Strict,
@@ -5761,6 +5762,7 @@ mod tests {
 
         fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
             CommandResult::completed(&request.command_id, "app-server-sandbox-ok")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution(
                     self.name(),
                     singularity_tools::SandboxBackendEnforcement::Strict,
@@ -5781,10 +5783,12 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             CommandResult::sandbox_backend_unavailable(&request.command_id)
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
         }
 
         fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
             CommandResult::sandbox_backend_unavailable(&request.command_id)
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
         }
     }
 

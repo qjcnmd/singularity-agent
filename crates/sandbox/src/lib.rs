@@ -84,6 +84,20 @@ pub enum SandboxNetworkMode {
     Allowed,
 }
 
+/// 沙箱命令对受保护工作区是否产生了实际文件系统变化的执行事实。
+///
+/// `WorkspaceWrite` 命令只有在 backend 明确返回 `Unchanged` 或 `Changed` 时才可进入
+/// completion verification；`Unknown` 会在 `WorkspaceTools` 边界 fail closed。该事实不
+/// 通过模型 payload 或普通 trace 暴露。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMutation {
+    Unchanged,
+    Changed,
+    #[default]
+    Unknown,
+}
+
 /// 与命令请求使用的工作区根目录配对的文件系统策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxFilesystemPolicy {
@@ -332,6 +346,9 @@ pub struct CommandResult {
     pub output_truncated: bool,
     pub redacted: bool,
     pub sandbox: SandboxExecutionMetadata,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub workspace_mutation: WorkspaceMutation,
 }
 
 /// 输出限制辅助函数返回的有界文本预览。
@@ -364,6 +381,7 @@ impl CommandResult {
             output_truncated: stdout.truncated,
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
+            workspace_mutation: WorkspaceMutation::Unknown,
         }
     }
 
@@ -468,6 +486,7 @@ impl CommandResult {
             output_truncated: captured_truncated || stdout.truncated || stderr.truncated,
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
+            workspace_mutation: WorkspaceMutation::Unknown,
         }
     }
 
@@ -478,6 +497,12 @@ impl CommandResult {
         enforcement: SandboxBackendEnforcement,
     ) -> Self {
         self.sandbox = SandboxExecutionMetadata::sandboxed(backend, enforcement);
+        self
+    }
+
+    /// 绑定 backend 对受保护工作区变化的明确执行观察。
+    pub fn with_workspace_mutation(mut self, mutation: WorkspaceMutation) -> Self {
+        self.workspace_mutation = mutation;
         self
     }
 
@@ -500,6 +525,7 @@ impl CommandResult {
             output_truncated: stderr.truncated,
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
+            workspace_mutation: WorkspaceMutation::Unknown,
         }
     }
 }
@@ -623,6 +649,12 @@ impl SandboxCapabilities {
             change_detection: false,
         }
     }
+
+    /// 声明 backend 同时能够返回受保护工作区变化事实。
+    pub fn with_change_detection(mut self) -> Self {
+        self.change_detection = true;
+        self
+    }
 }
 
 /// 严格命令执行和取消传播的 backend 边界。
@@ -635,8 +667,13 @@ pub trait SandboxBackend {
     fn execute(&self, request: &CommandRequest) -> CommandResult;
 
     /// 执行模型提交的 shell script；不支持的平台必须返回 typed unsupported。
+    ///
+    /// 对 `WorkspaceWrite` 请求，支持变化检测的 backend 必须在返回的
+    /// [`CommandResult`] 中绑定 [`WorkspaceMutation::Unchanged`] 或
+    /// [`WorkspaceMutation::Changed`]；无法证明时保留 `Unknown`，由上层拒绝验证。
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
         CommandResult::unsupported(&request.command_id, COMMAND_SCRIPT_UNSUPPORTED)
+            .with_workspace_mutation(WorkspaceMutation::Unknown)
     }
 
     /// 执行并支持取消，默认先进行执行前取消检查。
@@ -646,7 +683,8 @@ pub trait SandboxBackend {
         cancellation: &CancellationToken,
     ) -> CommandResult {
         if cancellation.is_cancelled() {
-            return CommandResult::cancelled(&request.command_id, 0);
+            return CommandResult::cancelled(&request.command_id, 0)
+                .with_workspace_mutation(WorkspaceMutation::Unknown);
         }
         self.execute(request)
     }
@@ -658,7 +696,8 @@ pub trait SandboxBackend {
         cancellation: &CancellationToken,
     ) -> CommandResult {
         if cancellation.is_cancelled() {
-            return CommandResult::cancelled(&request.command_id, 0);
+            return CommandResult::cancelled(&request.command_id, 0)
+                .with_workspace_mutation(WorkspaceMutation::Unknown);
         }
         self.execute_script(request)
     }
@@ -692,6 +731,7 @@ impl SandboxBackend for WindowsSandboxBackend {
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
         CommandResult::sandbox_backend_unavailable(&request.command_id)
+            .with_workspace_mutation(WorkspaceMutation::Unknown)
             .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable)
     }
 }
@@ -1119,7 +1159,7 @@ mod windows_backend {
         COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
         CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
         CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
-        SandboxFilesystemMode, SandboxNetworkMode, command_request_denial,
+        SandboxFilesystemMode, SandboxNetworkMode, WorkspaceMutation, command_request_denial,
         command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
     };
     use singularity_core::{
@@ -1168,13 +1208,14 @@ mod windows_backend {
 
     impl ExecutableResolutionError {
         fn into_command_result(self, command_id: &str) -> CommandResult {
-            match self {
+            let result = match self {
                 Self::Unavailable(message) => {
                     CommandResult::executable_unavailable(command_id, message)
                 }
                 Self::Unsupported(message) => CommandResult::unsupported(command_id, message),
                 Self::NotPermitted(message) => CommandResult::policy_denied(command_id, message),
-            }
+            };
+            result.with_workspace_mutation(WorkspaceMutation::Unknown)
         }
     }
 
@@ -1209,10 +1250,12 @@ mod windows_backend {
         ) -> CommandResult {
             if cancellation.is_cancelled() {
                 return CommandResult::cancelled(&request.command_id, 0)
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
             if let Some(denied) = command_request_denial(request) {
                 return denied
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
             let prepared = match PreparedCommand::from_request(request) {
@@ -1224,6 +1267,7 @@ mod windows_backend {
                 }
                 Err(PrepareCommandError::Backend(error)) => {
                     return CommandResult::backend_error(&request.command_id, error)
+                        .with_workspace_mutation(WorkspaceMutation::Unknown)
                         .with_sandbox_execution(
                             self.name(),
                             SandboxBackendEnforcement::Unavailable,
@@ -1231,6 +1275,7 @@ mod windows_backend {
                 }
                 Err(PrepareCommandError::ProtectedPaths(error)) => {
                     return CommandResult::backend_error(&request.command_id, error)
+                        .with_workspace_mutation(WorkspaceMutation::Unknown)
                         .with_sandbox_execution(
                             self.name(),
                             SandboxBackendEnforcement::Unavailable,
@@ -1240,6 +1285,7 @@ mod windows_backend {
             match execute_windows_sandbox(&request.command_id, cancellation, prepared) {
                 Ok(result) => result,
                 Err(error) => CommandResult::backend_error(&request.command_id, error)
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
             }
         }
@@ -1255,10 +1301,12 @@ mod windows_backend {
         ) -> CommandResult {
             if cancellation.is_cancelled() {
                 return CommandResult::cancelled(&request.command_id, 0)
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
             if let Some(denied) = command_script_request_denial(request) {
                 return denied
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
             let prepared = match PreparedCommand::from_script_request(request) {
@@ -1270,6 +1318,7 @@ mod windows_backend {
                 }
                 Err(PrepareCommandError::Backend(error)) => {
                     return CommandResult::backend_error(&request.command_id, error)
+                        .with_workspace_mutation(WorkspaceMutation::Unknown)
                         .with_sandbox_execution(
                             self.name(),
                             SandboxBackendEnforcement::Unavailable,
@@ -1277,6 +1326,7 @@ mod windows_backend {
                 }
                 Err(PrepareCommandError::ProtectedPaths(error)) => {
                     return CommandResult::backend_error(&request.command_id, error)
+                        .with_workspace_mutation(WorkspaceMutation::Unknown)
                         .with_sandbox_execution(
                             self.name(),
                             SandboxBackendEnforcement::Unavailable,
@@ -1286,6 +1336,7 @@ mod windows_backend {
             match execute_windows_sandbox(&request.command_id, cancellation, prepared) {
                 Ok(result) => result,
                 Err(error) => CommandResult::backend_error(&request.command_id, error)
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable),
             }
         }
@@ -1638,6 +1689,7 @@ mod windows_backend {
             String::from_utf8_lossy(&capture.stderr),
             capture.output_truncated,
         )
+        .with_workspace_mutation(WorkspaceMutation::Unknown)
     }
 
     fn interrupted_command_result(
@@ -1663,7 +1715,7 @@ mod windows_backend {
         if result.stderr_preview.is_empty() {
             result.stderr_preview = fallback_message.to_string();
         }
-        result
+        result.with_workspace_mutation(WorkspaceMutation::Unknown)
     }
 
     fn canonical_directory(path: &Path) -> Result<PathBuf, String> {

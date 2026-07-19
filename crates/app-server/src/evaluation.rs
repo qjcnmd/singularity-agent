@@ -2678,6 +2678,7 @@ mod tests {
     };
     use singularity_tools::{
         CommandRequest, CommandResult, SandboxBackendEnforcement, SandboxCapabilities,
+        WorkspaceMutation, WorkspaceObservation, WorkspaceRevision,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2720,6 +2721,20 @@ mod tests {
         command: &CommandSpec,
         workspace: &Path,
     ) -> singularity_tools::ToolResult {
+        successful_command_result_at_revision(
+            tool_call_id,
+            command,
+            workspace,
+            WorkspaceRevision::initial(),
+        )
+    }
+
+    fn successful_command_result_at_revision(
+        tool_call_id: &str,
+        command: &CommandSpec,
+        workspace: &Path,
+        revision: WorkspaceRevision,
+    ) -> singularity_tools::ToolResult {
         let mut result =
             singularity_tools::ToolResult::summary(tool_call_id, TOOL_COMMAND, true, "ok");
         result.result_id = Some(command_script_scope_digest_with_policy(
@@ -2730,6 +2745,18 @@ mod tests {
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
             SandboxFilesystemMode::WorkspaceWrite,
             sandbox_network_mode(command.network_access),
+        ));
+        result.with_workspace_observation(WorkspaceObservation::unchanged(revision))
+    }
+
+    fn changed_command_result(
+        tool_call_id: &str,
+        command: &CommandSpec,
+        workspace: &Path,
+    ) -> singularity_tools::ToolResult {
+        let mut result = successful_command_result(tool_call_id, command, workspace);
+        result = result.with_workspace_observation(WorkspaceObservation::changed(
+            WorkspaceRevision::initial().next().expect("revision"),
         ));
         result
     }
@@ -2894,7 +2921,7 @@ mod tests {
         ));
 
         let other = command(&["touch", "result.txt"]);
-        let other_result = successful_command_result("call-other", &other, workspace.path());
+        let other_result = changed_command_result("call-other", &other, workspace.path());
         let result = completed_agent_result(vec![
             successful_command_result("call-smoke-1", &smoke, workspace.path()),
             successful_command_result("call-smoke-2", &smoke, workspace.path()),
@@ -2922,9 +2949,12 @@ mod tests {
             ],
             smoke_commands: vec![smoke.clone()],
         };
+        let revision = WorkspaceRevision::initial().next().expect("revision");
         let mutation =
-            singularity_tools::ToolResult::summary("call-edit", TOOL_EDIT, true, "changed");
-        let smoke_result = successful_command_result("call-smoke", &smoke, workspace.path());
+            singularity_tools::ToolResult::summary("call-edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision));
+        let smoke_result =
+            successful_command_result_at_revision("call-smoke", &smoke, workspace.path(), revision);
 
         let stale = completed_agent_result(vec![smoke_result.clone(), mutation.clone()]);
         assert!(!smoke_commands_satisfied(
@@ -2954,8 +2984,9 @@ mod tests {
             required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
             smoke_commands: vec![smoke.clone()],
         };
+        let revision = WorkspaceRevision::initial().next().expect("revision");
         let smoke_result = successful_command_result("call-smoke", &smoke, workspace.path());
-        let write_result = successful_command_result("call-write", &write, workspace.path());
+        let write_result = changed_command_result("call-write", &write, workspace.path());
 
         let stale = completed_agent_result(vec![smoke_result.clone(), write_result.clone()]);
         assert!(!smoke_commands_satisfied(
@@ -2964,7 +2995,9 @@ mod tests {
             &stale
         ));
 
-        let current = completed_agent_result(vec![write_result, smoke_result]);
+        let current_smoke =
+            successful_command_result_at_revision("call-smoke", &smoke, workspace.path(), revision);
+        let current = completed_agent_result(vec![write_result, current_smoke]);
         assert!(smoke_commands_satisfied(
             workspace.path(),
             &projection,
@@ -2990,10 +3023,22 @@ mod tests {
     fn smoke_observation_preserves_post_mutation_order_and_duplicates() {
         let workspace = tempfile::tempdir().expect("workspace");
         let smoke = command(&["cargo", "test"]);
+        let revision = WorkspaceRevision::initial().next().expect("revision");
         let mutation =
-            singularity_tools::ToolResult::summary("call-edit", TOOL_EDIT, true, "changed");
-        let first = successful_command_result("call-smoke-1", &smoke, workspace.path());
-        let second = successful_command_result("call-smoke-2", &smoke, workspace.path());
+            singularity_tools::ToolResult::summary("call-edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision));
+        let first = successful_command_result_at_revision(
+            "call-smoke-1",
+            &smoke,
+            workspace.path(),
+            revision,
+        );
+        let second = successful_command_result_at_revision(
+            "call-smoke-2",
+            &smoke,
+            workspace.path(),
+            revision,
+        );
         let expected = first.result_id.clone().expect("scope digest");
 
         let result = completed_agent_result(vec![mutation, first, second]);
@@ -3349,6 +3394,7 @@ mod tests {
                     &request.command_id,
                     "source test backend does not execute evaluator commands",
                 )
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
             if request.argv.get(1).map(String::as_str) == Some("clone") {
@@ -3363,6 +3409,7 @@ mod tests {
                 );
             }
             CommandResult::completed(&request.command_id, "ok")
+                .with_workspace_mutation(WorkspaceMutation::Changed)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
@@ -3405,6 +3452,7 @@ mod tests {
                 );
             }
             CommandResult::completed(&request.command_id, "ok")
+                .with_workspace_mutation(WorkspaceMutation::Changed)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
@@ -3487,6 +3535,7 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             CommandResult::executed(&request.command_id, 101, 0, "", "Filename too long", false)
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }

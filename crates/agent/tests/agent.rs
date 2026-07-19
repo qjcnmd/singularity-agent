@@ -22,8 +22,10 @@ use singularity_policy::{
 use singularity_tools::{
     CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend, SandboxCapabilities,
     SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolFailureKind, ToolRegistry,
-    WorkspaceTools, command_script_scope_digest_with_policy, workspace_tool_entries,
+    WorkspaceMutation, WorkspaceTools, command_script_scope_digest_with_policy,
+    workspace_tool_entries,
 };
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -1438,7 +1440,7 @@ fn agent_loop_resume_rejects_tampered_completion_checkpoint() {
     assert_eq!(resumed.status, AgentStatus::Failed);
     assert_eq!(
         resumed.error.as_deref(),
-        Some("approval checkpoint completion state mismatch")
+        Some("approval checkpoint workspace revision state is invalid")
     );
     assert!(resumed.tool_results.is_empty());
 }
@@ -2102,8 +2104,8 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
     };
     let first_verification = command_response(1, "verify_1", &first_argv);
     let pending_verification = command_response(2, "verify_2", &second_argv);
-    let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_3", "response_3", "done");
+    let continuation_final_response =
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
     let first_command_resource =
         typed_command_resource(singularity_tools::command_script_scope_digest_with_policy(
             &first_argv.join(" "),
@@ -2135,13 +2137,10 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
         max_output_tokens: 128,
         ..ProviderProtocolContract::default()
     };
+    let continuation_capabilities = capabilities.clone();
+    let continuation_policy = policy.clone();
     let agent_loop = agent_loop_with_capabilities(
-        vec![
-            edit,
-            first_verification,
-            pending_verification,
-            final_response,
-        ],
+        vec![edit, first_verification, pending_verification],
         policy,
         Arc::new(Mutex::new(Vec::new())),
         capabilities,
@@ -2168,15 +2167,52 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
             .len(),
         1
     );
+    assert_eq!(checkpoint["completion"]["workspace_revision"], 1);
+    assert_eq!(
+        checkpoint["completion"]["terminal_command_revisions"],
+        serde_json::json!([1])
+    );
+    let checkpoint_command = checkpoint["tool_results"]
+        .as_array()
+        .expect("checkpoint tool results")
+        .iter()
+        .find(|result| result["result"]["tool_name"] == "command")
+        .expect("checkpoint command result");
+    assert_eq!(
+        checkpoint_command["workspace_observation"],
+        serde_json::json!({"revision": 1, "mutation": "unchanged"})
+    );
 
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
         pending.request_id.clone(),
         pending.tool_name.clone(),
         pending.resources.clone(),
     ));
-    let resumed = agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
+    let resumed_agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![continuation_final_response],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: continuation_capabilities,
+        },
+        agent_tool_broker_for_test(false),
+        continuation_policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind resumed workspace tools")
+            .with_sandbox_backend(LargeOutputBackend),
+    );
+    let resumed =
+        resumed_agent_loop.resume_pending_tool_call(&resumed_input, &pending, &checkpoint);
 
-    assert_eq!(resumed.status, AgentStatus::Completed);
+    assert_eq!(
+        resumed.status,
+        AgentStatus::Completed,
+        "error={:?} tool_results={:?} verification={:?}",
+        resumed.error,
+        resumed.tool_results,
+        resumed.verification
+    );
     assert_eq!(resumed.model_turns, 4);
     assert_eq!(resumed.model_turn_limit, 3);
     assert!(resumed.verification.passed);
@@ -2188,6 +2224,9 @@ fn approval_resume_preserves_exact_verification_and_compaction_state() {
             .as_ref()
             .is_some_and(|trace| trace.compaction_count >= 1)
     );
+    let public = serde_json::to_string(&resumed).expect("serialize public result");
+    assert!(!public.contains("workspace_revision"));
+    assert!(!public.contains("workspace_observation"));
 }
 
 #[test]
@@ -3184,7 +3223,146 @@ fn agent_loop_command_audit_records_sandbox_approval_and_provenance() {
     );
 }
 
+#[test]
+fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file_path = dir.path().join("README.md");
+    std::fs::write(&file_path, "before").expect("write file");
+    let mut edit_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    edit_response.tool_calls.push(tool_call(
+        "edit_call",
+        "edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut verification_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    verification_response.tool_calls.push(tool_call(
+        "verification_call",
+        "command",
+        serde_json::json!({"command": "test-program verify", "timeout_seconds": 5}),
+    ));
+    let premature_final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+    let mut post_mutation_verification_response =
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "");
+    post_mutation_verification_response
+        .tool_calls
+        .push(tool_call(
+            "post_mutation_verification_call",
+            "command",
+            serde_json::json!({"command": "test-program verify", "timeout_seconds": 5}),
+        ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_4", "response_5", "done");
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit_response,
+                verification_response,
+                premature_final_response,
+                post_mutation_verification_response,
+                final_response,
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(CommandMutatingBackend {
+                workspace: dir.path().to_path_buf(),
+                calls: AtomicUsize::new(0),
+            }),
+    )
+    .run(
+        &AgentLoopInput::new("thread_1", "turn_1", "edit and verify")
+            .with_max_turns(5)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                command_script_scope_digest_with_policy(
+                    "test-program verify",
+                    ".",
+                    5,
+                    SandboxFilesystemMode::WorkspaceWrite,
+                    SandboxNetworkMode::Denied,
+                ),
+                1,
+            )]),
+    );
+
+    assert_eq!(
+        result.status,
+        AgentStatus::Completed,
+        "error={:?} tool_results={:?}",
+        result.error,
+        result.tool_results
+    );
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(result.tool_results.len(), 3);
+    assert_eq!(result.verification.required_command_count, 1);
+    assert_eq!(result.verification.satisfied_command_count, 1);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
+    assert_eq!(
+        std::fs::read_to_string(file_path).expect("read file"),
+        "command mutation"
+    );
+}
+
 struct AgentStrictBackend;
+
+struct CommandMutatingBackend {
+    workspace: PathBuf,
+    calls: AtomicUsize,
+}
+
+impl SandboxBackend for CommandMutatingBackend {
+    fn name(&self) -> &'static str {
+        "command_mutating_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, "direct command")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        let changed = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        if changed {
+            std::fs::write(self.workspace.join("README.md"), "command mutation")
+                .expect("command mutation");
+        }
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(if changed {
+                WorkspaceMutation::Changed
+            } else {
+                WorkspaceMutation::Unchanged
+            })
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
 
 impl SandboxBackend for AgentStrictBackend {
     fn name(&self) -> &'static str {
@@ -3192,21 +3370,25 @@ impl SandboxBackend for AgentStrictBackend {
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
+        SandboxCapabilities::strict().with_change_detection()
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
-        CommandResult::completed(&request.command_id, "agent command ok").with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::completed(&request.command_id, "agent command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
-        CommandResult::completed(&request.command_id, "agent command ok").with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::completed(&request.command_id, "agent command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 }
 
@@ -3218,11 +3400,12 @@ impl SandboxBackend for LargeOutputBackend {
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
+        SandboxCapabilities::strict().with_change_detection()
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
         CommandResult::completed(&request.command_id, "large-safe-output\n".repeat(2_000))
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
             .with_sandbox_execution(
                 self.name(),
                 singularity_tools::SandboxBackendEnforcement::Strict,
@@ -3231,6 +3414,7 @@ impl SandboxBackend for LargeOutputBackend {
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
         CommandResult::completed(&request.command_id, "large-safe-output\n".repeat(2_000))
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
             .with_sandbox_execution(
                 self.name(),
                 singularity_tools::SandboxBackendEnforcement::Strict,
@@ -3248,7 +3432,7 @@ impl SandboxBackend for BlockingCommandBackend {
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
+        SandboxCapabilities::strict().with_change_detection()
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -3266,10 +3450,12 @@ impl SandboxBackend for BlockingCommandBackend {
         while !cancellation.is_cancelled() {
             thread::sleep(Duration::from_millis(5));
         }
-        CommandResult::cancelled(&request.command_id, 1).with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::cancelled(&request.command_id, 1)
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 
     fn execute_script_cancellable(
@@ -3283,10 +3469,12 @@ impl SandboxBackend for BlockingCommandBackend {
         while !cancellation.is_cancelled() {
             thread::sleep(Duration::from_millis(5));
         }
-        CommandResult::cancelled(&request.command_id, 1).with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::cancelled(&request.command_id, 1)
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 }
 
@@ -3300,29 +3488,34 @@ impl SandboxBackend for AgentFailThenSucceedBackend {
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
+        SandboxCapabilities::strict().with_change_detection()
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             CommandResult::executed(&request.command_id, 1, 1, "", "failed", false)
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution(
                     self.name(),
                     singularity_tools::SandboxBackendEnforcement::Strict,
                 )
         } else {
-            CommandResult::completed(&request.command_id, "repaired").with_sandbox_execution(
-                self.name(),
-                singularity_tools::SandboxBackendEnforcement::Strict,
-            )
+            CommandResult::completed(&request.command_id, "repaired")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(
+                    self.name(),
+                    singularity_tools::SandboxBackendEnforcement::Strict,
+                )
         }
     }
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
         let result = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             CommandResult::executed(&request.command_id, 1, 1, "", "failed", false)
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
         } else {
             CommandResult::completed(&request.command_id, "repaired")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
         };
         result.with_sandbox_execution(
             self.name(),
@@ -3341,7 +3534,7 @@ impl SandboxBackend for AgentExecutableUnavailableBackend {
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
+        SandboxCapabilities::strict().with_change_detection()
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -3350,8 +3543,10 @@ impl SandboxBackend for AgentExecutableUnavailableBackend {
                 &request.command_id,
                 "required executable 'missing-host-tool' was not found on host PATH",
             )
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
         } else {
             CommandResult::completed(&request.command_id, "repaired")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
         };
         result.with_sandbox_execution(
             self.name(),
@@ -3365,8 +3560,10 @@ impl SandboxBackend for AgentExecutableUnavailableBackend {
                 &request.command_id,
                 "required executable 'missing-host-tool' was not found on host PATH",
             )
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
         } else {
             CommandResult::completed(&request.command_id, "repaired")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
         };
         result.with_sandbox_execution(
             self.name(),

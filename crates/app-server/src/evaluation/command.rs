@@ -267,7 +267,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use singularity_tools::{SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities};
+    use singularity_tools::{
+        SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities, WorkspaceMutation,
+    };
 
     struct EnvironmentCaptureBackend;
 
@@ -277,7 +279,7 @@ mod tests {
         }
 
         fn capabilities(&self) -> SandboxCapabilities {
-            SandboxCapabilities::strict()
+            SandboxCapabilities::strict().with_change_detection()
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -287,6 +289,7 @@ mod tests {
                 CommandEnvironmentPolicy::EvaluationIsolated
             );
             CommandResult::completed(&request.command_id, "ok")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
@@ -314,7 +317,7 @@ mod tests {
         }
 
         fn capabilities(&self) -> SandboxCapabilities {
-            SandboxCapabilities::strict()
+            SandboxCapabilities::strict().with_change_detection()
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -324,6 +327,7 @@ mod tests {
                 CommandEnvironmentPolicy::EvaluationIsolated
             );
             CommandResult::completed(&request.command_id, "ok")
+                .with_workspace_mutation(WorkspaceMutation::Changed)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }

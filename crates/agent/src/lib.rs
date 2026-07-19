@@ -33,8 +33,8 @@ use singularity_tools::{
     ReadToolInput, SandboxFilesystemMode, SandboxNetworkMode, ToolAuthorization, ToolBroker,
     ToolBrokerDecision, ToolCallRequest, ToolCapability, ToolEntry, ToolExecutionMode,
     ToolExecutor, ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec,
-    WorkspacePatch, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
-    command_script_scope_digest_with_policy,
+    WorkspaceMutation, WorkspaceObservation, WorkspacePatch, WorkspaceRevision, WorkspaceToolError,
+    WorkspaceToolExecutor, WorkspaceTools, command_script_scope_digest_with_policy,
 };
 use thiserror::Error;
 
@@ -681,11 +681,15 @@ impl PendingToolCall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct CompletionTracker {
     workspace_mutated: bool,
+    #[serde(default)]
+    workspace_revision: Option<WorkspaceRevision>,
     successful_command_count: u32,
     #[serde(default)]
     required_command_counts: BTreeMap<String, u32>,
     #[serde(default)]
     terminal_command_scope_digests: Vec<String>,
+    #[serde(default)]
+    terminal_command_revisions: Vec<WorkspaceRevision>,
     unresolved_failures: BTreeSet<String>,
 }
 
@@ -730,6 +734,21 @@ impl CompletionTracker {
                 tool_name => tool_name,
             },
         };
+
+        let observed_mutation = tool_result
+            .workspace_observation()
+            .map(|observation| self.observe_workspace_observation(observation));
+        if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH)
+            && tool_result.ok
+            && !matches!(
+                observed_mutation,
+                Some(Some((WorkspaceMutation::Changed, _)))
+            )
+        {
+            self.mark_workspace_revision_invalid("mutation_observation_missing");
+            self.workspace_mutated = true;
+            self.clear_terminal_command_observations();
+        }
         if tool_result.ok {
             self.unresolved_failures.retain(|failure| {
                 !failure.starts_with(failure_group)
@@ -737,15 +756,19 @@ impl CompletionTracker {
             });
             if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH) {
                 self.workspace_mutated = true;
-                self.terminal_command_scope_digests.clear();
+                self.clear_terminal_command_observations();
             } else if tool_result.tool_name == TOOL_COMMAND {
                 self.successful_command_count = self.successful_command_count.saturating_add(1);
-                let window_len = self.terminal_command_window_len();
-                record_terminal_command_observation(
-                    &mut self.terminal_command_scope_digests,
-                    successful_command_scope_digest(tool_result),
-                    window_len,
-                );
+                if let Some(Some((WorkspaceMutation::Unchanged, revision))) = observed_mutation {
+                    let window_len = self.terminal_command_window_len();
+                    self.record_terminal_command_observation(
+                        successful_command_scope_digest(tool_result),
+                        revision,
+                        window_len,
+                    );
+                } else if observed_mutation.is_none() {
+                    self.mark_workspace_revision_invalid("verification_observation_missing");
+                }
             }
         } else if is_repairable_tool_result(tool_result) {
             let error_code = tool_result
@@ -754,6 +777,75 @@ impl CompletionTracker {
                 .unwrap_or("tool_execution_failed");
             self.unresolved_failures
                 .insert(format!("{failure_group}:{error_code}"));
+        }
+    }
+
+    fn observe_workspace_observation(
+        &mut self,
+        observation: &WorkspaceObservation,
+    ) -> Option<(WorkspaceMutation, WorkspaceRevision)> {
+        let Some(revision) = observation.revision() else {
+            self.mark_workspace_revision_invalid("revision_missing");
+            return None;
+        };
+        let mutation = observation.mutation();
+        if mutation == WorkspaceMutation::Unknown {
+            self.mark_workspace_revision_invalid("change_unknown");
+            return None;
+        }
+        let valid_revision = match (self.workspace_revision, mutation) {
+            (None, WorkspaceMutation::Unchanged) => revision == WorkspaceRevision::initial(),
+            (None, WorkspaceMutation::Changed) => {
+                WorkspaceRevision::initial().next() == Some(revision)
+            }
+            (None, WorkspaceMutation::Unknown) => false,
+            (Some(current), WorkspaceMutation::Unchanged) => current == revision,
+            (Some(current), WorkspaceMutation::Changed) => current.next() == Some(revision),
+            (Some(_), WorkspaceMutation::Unknown) => false,
+        };
+        if !valid_revision {
+            self.mark_workspace_revision_invalid("revision_mismatch");
+            return None;
+        }
+        self.workspace_revision = Some(revision);
+        if mutation == WorkspaceMutation::Changed {
+            self.workspace_mutated = true;
+            self.clear_terminal_command_observations();
+        }
+        Some((mutation, revision))
+    }
+
+    fn mark_workspace_revision_invalid(&mut self, reason: &str) {
+        self.clear_terminal_command_observations();
+        self.unresolved_failures
+            .insert(format!("workspace_revision:{reason}"));
+    }
+
+    fn clear_terminal_command_observations(&mut self) {
+        self.terminal_command_scope_digests.clear();
+        self.terminal_command_revisions.clear();
+    }
+
+    fn record_terminal_command_observation(
+        &mut self,
+        scope_digest: Option<&str>,
+        revision: WorkspaceRevision,
+        max_count: usize,
+    ) {
+        let Some(scope_digest) = scope_digest else {
+            self.clear_terminal_command_observations();
+            return;
+        };
+        self.terminal_command_scope_digests
+            .push(scope_digest.to_string());
+        self.terminal_command_revisions.push(revision);
+        let excess = self
+            .terminal_command_scope_digests
+            .len()
+            .saturating_sub(max_count);
+        if excess > 0 {
+            self.terminal_command_scope_digests.drain(..excess);
+            self.terminal_command_revisions.drain(..excess);
         }
     }
 
@@ -824,10 +916,22 @@ impl CompletionTracker {
 
     fn verification_satisfied(&self) -> bool {
         if self.required_command_counts.is_empty() {
-            return !self.workspace_mutated || !self.terminal_command_scope_digests.is_empty();
+            return !self.workspace_mutated
+                || (!self.terminal_command_scope_digests.is_empty()
+                    && self.terminal_command_scope_digests.len()
+                        == self.terminal_command_revisions.len()
+                    && self
+                        .terminal_command_revisions
+                        .iter()
+                        .all(|revision| Some(*revision) == self.workspace_revision));
         }
         usize::try_from(self.required_command_count()).is_ok_and(|required_count| {
             self.terminal_command_scope_digests.len() == required_count
+                && self.terminal_command_revisions.len() == required_count
+                && self
+                    .terminal_command_revisions
+                    .iter()
+                    .all(|revision| Some(*revision) == self.workspace_revision)
                 && self.terminal_command_counts() == self.required_command_counts
         })
     }
@@ -865,6 +969,25 @@ impl CompletionTracker {
         }
         counts
     }
+
+    fn is_consistent(&self) -> bool {
+        if self.workspace_mutated && self.workspace_revision.is_none() {
+            return false;
+        }
+        if self.terminal_command_scope_digests.len() != self.terminal_command_revisions.len() {
+            return false;
+        }
+        if self
+            .terminal_command_scope_digests
+            .iter()
+            .any(|digest| !is_sha256_fingerprint(digest))
+        {
+            return false;
+        }
+        self.terminal_command_revisions
+            .iter()
+            .all(|revision| Some(*revision) == self.workspace_revision)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -879,6 +1002,8 @@ struct CheckpointToolResult {
     #[serde(default)]
     result_id: Option<String>,
     audit_metadata: Option<Value>,
+    #[serde(default)]
+    workspace_observation: Option<WorkspaceObservation>,
 }
 
 impl CheckpointToolResult {
@@ -887,16 +1012,20 @@ impl CheckpointToolResult {
             result: result.clone(),
             result_id: result.result_id.clone(),
             audit_metadata: result.audit_metadata().cloned(),
+            workspace_observation: result.workspace_observation().cloned(),
         }
     }
 
     fn into_tool_result(self) -> ToolResult {
         let mut result = self.result;
         result.result_id = self.result_id;
-        match self.audit_metadata {
-            Some(audit_metadata) => result.with_audit(audit_metadata),
-            None => result,
+        if let Some(audit_metadata) = self.audit_metadata {
+            result = result.with_audit(audit_metadata);
         }
+        if let Some(observation) = self.workspace_observation {
+            result = result.with_workspace_observation(observation);
+        }
+        result
     }
 }
 
@@ -1652,6 +1781,20 @@ where
             };
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
+        }
+        if let Some(workspace_tools) = &self.workspace_tools
+            && let Err(error) = workspace_tools
+                .bind_checkpoint_workspace_revision(state.completion.workspace_revision)
+        {
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some(format!(
+                    "approval checkpoint workspace revision binding failed: {error}"
+                )),
+            );
         }
         let (capabilities, mut state) =
             match self.negotiate_tool_capabilities(input, state, model_turn_offset) {
@@ -3188,6 +3331,9 @@ fn restore_checkpoint(
     }) {
         return Err("approval checkpoint context compaction state is invalid".to_string());
     }
+    if !checkpoint.completion.is_consistent() {
+        return Err("approval checkpoint workspace revision state is invalid".to_string());
+    }
     let tool_results = checkpoint
         .tool_results
         .into_iter()
@@ -3197,6 +3343,9 @@ fn restore_checkpoint(
         CompletionTracker::from_requirements(&input.verification_requirements)?;
     for tool_result in &tool_results {
         derived_completion.observe(tool_result);
+    }
+    if !derived_completion.is_consistent() {
+        return Err("approval checkpoint derived workspace revision state is invalid".to_string());
     }
     if derived_completion != checkpoint.completion {
         return Err("approval checkpoint completion state mismatch".to_string());
@@ -3599,10 +3748,17 @@ fn audit_events_from_tool_results(tool_results: &[ToolResult]) -> Vec<Value> {
 
 /// 将内部 command 结果归约为可用于 verification/evaluation 的精确成功观察。
 pub fn successful_command_scope_digest(tool_result: &ToolResult) -> Option<&str> {
-    (tool_result.tool_name == TOOL_COMMAND && tool_result.ok)
-        .then_some(tool_result.result_id.as_deref())
-        .flatten()
-        .filter(|digest| is_sha256_fingerprint(digest))
+    (tool_result.tool_name == TOOL_COMMAND
+        && tool_result.ok
+        && tool_result
+            .workspace_observation()
+            .is_some_and(|observation| {
+                observation.mutation() == WorkspaceMutation::Unchanged
+                    && observation.revision().is_some()
+            }))
+    .then_some(tool_result.result_id.as_deref())
+    .flatten()
+    .filter(|digest| is_sha256_fingerprint(digest))
 }
 
 /// 返回最后一次 workspace mutation 之后最后 `max_count` 个成功 command 的精确观察。
@@ -3616,18 +3772,70 @@ pub fn terminal_command_scope_digests(
     if max_count == 0 {
         return Vec::new();
     }
-    let first_eligible_result = tool_results
-        .iter()
-        .rposition(|tool_result| matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH))
-        .map_or(0, |index| index + 1);
     let mut observations = Vec::new();
-    for tool_result in &tool_results[first_eligible_result..] {
-        if tool_result.tool_name == TOOL_COMMAND && tool_result.ok {
-            record_terminal_command_observation(
-                &mut observations,
-                successful_command_scope_digest(tool_result),
-                max_count,
-            );
+    let mut workspace_revision = None;
+    for tool_result in tool_results {
+        if matches!(tool_result.tool_name.as_str(), TOOL_EDIT | TOOL_PATCH) {
+            observations.clear();
+            workspace_revision = tool_result.workspace_observation().and_then(|observation| {
+                let revision = observation.revision()?;
+                (observation.mutation() == WorkspaceMutation::Changed
+                    && workspace_revision
+                        .unwrap_or_else(WorkspaceRevision::initial)
+                        .next()
+                        == Some(revision))
+                .then_some(revision)
+            });
+            continue;
+        }
+        if tool_result.tool_name != TOOL_COMMAND {
+            continue;
+        }
+        let Some(observation) = tool_result.workspace_observation() else {
+            observations.clear();
+            workspace_revision = None;
+            continue;
+        };
+        let Some(revision) = observation.revision() else {
+            observations.clear();
+            workspace_revision = None;
+            continue;
+        };
+        match observation.mutation() {
+            WorkspaceMutation::Changed => {
+                if workspace_revision
+                    .unwrap_or_else(WorkspaceRevision::initial)
+                    .next()
+                    != Some(revision)
+                {
+                    observations.clear();
+                    workspace_revision = None;
+                    continue;
+                }
+                observations.clear();
+                workspace_revision = Some(revision);
+            }
+            WorkspaceMutation::Unknown => {
+                observations.clear();
+                workspace_revision = None;
+            }
+            WorkspaceMutation::Unchanged => {
+                let expected_revision =
+                    workspace_revision.unwrap_or_else(WorkspaceRevision::initial);
+                if expected_revision != revision {
+                    observations.clear();
+                    workspace_revision = None;
+                    continue;
+                }
+                workspace_revision = Some(revision);
+                if tool_result.ok {
+                    record_terminal_command_observation(
+                        &mut observations,
+                        successful_command_scope_digest(tool_result),
+                        max_count,
+                    );
+                }
+            }
         }
     }
     observations
@@ -4329,11 +4537,23 @@ mod audit_projection_tests {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut failed = ToolResult::summary("failed", TOOL_COMMAND, false, "failed");
         failed.result_id = Some(digest.to_string());
+        failed = failed.with_workspace_observation(WorkspaceObservation::unchanged(
+            WorkspaceRevision::initial(),
+        ));
         let mut before_mutation = ToolResult::summary("before", TOOL_COMMAND, true, "ok");
         before_mutation.result_id = Some(digest.to_string());
-        let mutation = ToolResult::summary("edit", TOOL_EDIT, true, "changed");
+        before_mutation = before_mutation.with_workspace_observation(
+            WorkspaceObservation::unchanged(WorkspaceRevision::initial()),
+        );
+        let mutation = ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+            .with_workspace_observation(WorkspaceObservation::changed(
+                WorkspaceRevision::initial().next().expect("revision"),
+            ));
         let mut after_mutation = ToolResult::summary("after", TOOL_COMMAND, true, "ok");
         after_mutation.result_id = Some(digest.to_string());
+        after_mutation = after_mutation.with_workspace_observation(
+            WorkspaceObservation::unchanged(WorkspaceRevision::initial().next().expect("revision")),
+        );
 
         assert_eq!(
             terminal_command_scope_digests(&[failed, before_mutation, mutation, after_mutation], 1),
@@ -4345,20 +4565,28 @@ mod audit_projection_tests {
     fn completion_gate_requires_exact_successful_command_observation_after_mutation() {
         let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut tracker = CompletionTracker::default();
-        tracker.observe(&ToolResult::summary("edit", TOOL_EDIT, true, "changed"));
+        let revision = WorkspaceRevision::initial().next().expect("revision");
+        tracker.observe(
+            &ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision)),
+        );
 
         let mut failed = ToolResult::summary("failed", TOOL_COMMAND, false, "failed");
         failed.result_id = Some(digest.to_string());
+        failed = failed.with_workspace_observation(WorkspaceObservation::unchanged(revision));
         tracker.observe(&failed);
         assert!(!tracker.verification_satisfied());
 
         let mut malformed = ToolResult::summary("malformed", TOOL_COMMAND, true, "ok");
         malformed.result_id = Some("sha256:not-a-digest".to_string());
+        malformed = malformed.with_workspace_observation(WorkspaceObservation::unchanged(revision));
         tracker.observe(&malformed);
         assert!(!tracker.verification_satisfied());
 
         let mut successful = ToolResult::summary("successful", TOOL_COMMAND, true, "ok");
         successful.result_id = Some(digest.to_string());
+        successful =
+            successful.with_workspace_observation(WorkspaceObservation::unchanged(revision));
         tracker.observe(&successful);
         assert!(tracker.verification_satisfied());
     }
@@ -4366,25 +4594,29 @@ mod audit_projection_tests {
     #[test]
     fn exact_completion_requires_required_commands_as_the_terminal_multiset() {
         let required = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let other = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let mut tracker =
             CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(required, 2)])
                 .expect("completion tracker");
-        let command = |call_id: &str, digest: &str| {
+        let command = |call_id: &str, digest: &str, revision: WorkspaceRevision| {
             let mut result = ToolResult::summary(call_id, TOOL_COMMAND, true, "ok");
             result.result_id = Some(digest.to_string());
-            result
+            result.with_workspace_observation(WorkspaceObservation::unchanged(revision))
         };
+        let initial = WorkspaceRevision::initial();
+        let changed = initial.next().expect("revision");
 
-        tracker.observe(&command("smoke-1", required));
-        tracker.observe(&command("smoke-2", required));
+        tracker.observe(&command("smoke-1", required, initial));
+        tracker.observe(&command("smoke-2", required, initial));
         assert!(tracker.verification_satisfied());
 
-        tracker.observe(&command("write-after-smoke", other));
+        tracker.observe(
+            &ToolResult::summary("write-after-smoke", TOOL_COMMAND, true, "ok")
+                .with_workspace_observation(WorkspaceObservation::changed(changed)),
+        );
         assert!(!tracker.verification_satisfied());
-        tracker.observe(&command("smoke-3", required));
+        tracker.observe(&command("smoke-3", required, changed));
         assert!(!tracker.verification_satisfied());
-        tracker.observe(&command("smoke-4", required));
+        tracker.observe(&command("smoke-4", required, changed));
         assert!(tracker.verification_satisfied());
     }
 }

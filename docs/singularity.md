@@ -160,6 +160,8 @@ completion gate 保持以下不变量：
 - 没有 manifest 指定的 typed verification 时，edit/patch 之后必须以一个具有合法精确 digest 的成功 command 作为最新 command 观察；后续合法成功 command 会成为新的终态观察。
 - typed verification requirement 使用 canonical command scope 的 SHA-256 digest 和大于零的成功次数；要求的 digest/count 必须精确组成最后的成功 command 后缀多重集合。mutation 会清空后缀；其他成功 command 会占据后缀位置，直到其后重新运行完整 required commands 才能恢复终态。
 - Evaluation smoke 与 completion gate 共用 Agent 的 terminal command observation：只纳入最后一次 workspace mutation 之后、`ok=true` 且 digest 格式精确的 command，并只保留要求数量的最后后缀；失败 command 不占后缀，成功但缺失或非法 digest 的 command 会使此前后缀失效。结果按原顺序保留重复项，不能用旧 smoke 形成 Passed evidence。
+- `WorkspaceTools` 为 edit/patch 和 backend 明确报告的 workspace-write command 变化分配单调的内部 workspace revision；成功 verification 同时保存 `Unchanged` observation 和该 revision。任何 `Changed` observation 会清空旧 evidence，多条 exact requirement 只有在所有 observation 仍绑定同一 revision 时才能共同满足。
+- workspace-write command 必须由 `SandboxBackend` 显式返回 `Unchanged`、`Changed` 或 `Unknown`；未知变化不按命令名称、语言或任务猜测，直接 fail closed。revision、observation 和 audit metadata 只进入内部 completion/checkpoint 校验，不进入模型 tool payload；approval resume 先恢复并核对同一 revision/evidence 关系，损坏或不一致的 checkpoint 拒绝执行。
 - 存在未解决的可修复 tool failure 时不能完成。
 - 若已建立 plan，所有 plan step 必须为 `completed`；否则 final answer 被拒绝并要求再次调用 `update_plan`。
 - 普通工作回合达到 turn 上限时，只有在最后一个允许的工作响应处理后已满足 `finalization_ready()` 才允许一次 terminal finalization；该请求的 provider error、取消、空文本或结构化 tool call 仍 fail closed。没有 readiness 时，达到上限仍返回 failed，不改写为 completed。

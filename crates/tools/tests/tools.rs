@@ -7,15 +7,16 @@ use singularity_sandbox::{
     SandboxNetworkMode,
 };
 use singularity_tools::{
-    AgentControlToolExecutor, CommandToolInput, EditToolInput, GrepToolInput, ListToolInput,
-    ReadToolInput, ToolAuthorization, ToolBroker, ToolBrokerDecision, ToolCallRequest,
-    ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolExposure, ToolFailureKind,
-    ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspacePatch,
-    WorkspacePatchChange, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
-    command_scope_digest, command_script_scope_digest, workspace_tool_entries,
-    workspace_tool_specs,
+    AgentControlToolExecutor, CommandScopeDigest, CommandToolInput, EditToolInput, GrepToolInput,
+    ListToolInput, ReadToolInput, ToolAuthorization, ToolBroker, ToolBrokerDecision,
+    ToolCallRequest, ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolExposure,
+    ToolFailureKind, ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult, ToolSpec,
+    WorkspaceMutation, WorkspacePatch, WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError,
+    WorkspaceToolExecutor, WorkspaceTools, command_scope_digest, command_script_scope_digest,
+    command_script_scope_digest_with_policy, workspace_tool_entries, workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn test_tool_spec(
@@ -2700,7 +2701,208 @@ fn command_script_scope_digest_binds_script_without_exposing_it() {
     assert!(!base.contains(script));
 }
 
+#[test]
+fn workspace_write_command_binds_backend_revision_observation_without_public_leakage() {
+    let workspace = test_workspace("command-revision");
+    let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
+        .with_sandbox_backend(RevisionReportingBackend {
+            calls: AtomicUsize::new(0),
+        });
+    let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+        "verify",
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    ))
+    .expect("command scope digest");
+    let input = || CommandToolInput {
+        command: "verify".to_string(),
+        cwd: None,
+        timeout_seconds: Some(5),
+    };
+
+    let first = tools
+        .command_cancellable_with_policy(
+            input(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+            &scope,
+            &CancellationToken::new(),
+        )
+        .expect("changed command");
+    assert_eq!(
+        first.metadata["workspace_observation"],
+        serde_json::json!({"revision": 1, "mutation": "changed"})
+    );
+
+    let second = tools
+        .command_cancellable_with_policy(
+            input(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+            &scope,
+            &CancellationToken::new(),
+        )
+        .expect("unchanged command");
+    assert_eq!(
+        second.metadata["workspace_observation"],
+        serde_json::json!({"revision": 1, "mutation": "unchanged"})
+    );
+    let envelope = ToolCallRequest::new("call_1", "command", r#"{"command":"verify"}"#);
+    let result = ToolResult::from_result(&envelope, &second);
+    assert_eq!(
+        result
+            .workspace_observation()
+            .and_then(|observation| observation.revision()),
+        Some(WorkspaceRevision::initial().next().expect("revision"))
+    );
+    let public = serde_json::to_string(&result.to_message_payload()).expect("public payload");
+    assert!(!public.contains("workspace_observation"));
+    assert!(!public.contains("revision"));
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_write_command_with_unknown_mutation_fails_closed() {
+    let workspace = test_workspace("command-unknown-revision");
+    let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
+        .with_sandbox_backend(UnknownMutationBackend);
+    let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+        "verify",
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    ))
+    .expect("command scope digest");
+    let output = tools
+        .command_cancellable_with_policy(
+            CommandToolInput {
+                command: "verify".to_string(),
+                cwd: None,
+                timeout_seconds: Some(5),
+            },
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+            &scope,
+            &CancellationToken::new(),
+        )
+        .expect("typed fail-closed output");
+    assert!(!output.ok);
+    assert_eq!(
+        output.error_code.as_deref(),
+        Some("workspace_change_unknown")
+    );
+    assert_eq!(
+        output.metadata["workspace_observation"],
+        serde_json::json!({"revision": null, "mutation": "unknown"})
+    );
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_write_command_rejects_stale_checkpoint_revision() {
+    let workspace = test_workspace("command-stale-checkpoint-revision");
+    let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
+        .with_sandbox_backend(RevisionReportingBackend {
+            calls: AtomicUsize::new(0),
+        });
+    let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+        "verify",
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    ))
+    .expect("command scope digest");
+
+    tools
+        .command_cancellable_with_policy(
+            CommandToolInput {
+                command: "verify".to_string(),
+                cwd: None,
+                timeout_seconds: Some(5),
+            },
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+            &scope,
+            &CancellationToken::new(),
+        )
+        .expect("changed command");
+
+    let error = tools
+        .bind_checkpoint_workspace_revision(Some(WorkspaceRevision::initial()))
+        .expect_err("stale checkpoint revision must be rejected");
+    assert!(matches!(
+        error,
+        WorkspaceToolError::InvalidInput(message)
+            if message == "workspace revision differs from approval checkpoint"
+    ));
+    remove_workspace(&workspace);
+}
+
 struct RecordingSandboxBackend;
+
+struct RevisionReportingBackend {
+    calls: AtomicUsize,
+}
+
+impl SandboxBackend for RevisionReportingBackend {
+    fn name(&self) -> &'static str {
+        "revision_reporting"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, _request: &CommandRequest) -> CommandResult {
+        panic!("direct argv command backend must not execute")
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        let mutation = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            WorkspaceMutation::Changed
+        } else {
+            WorkspaceMutation::Unchanged
+        };
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(mutation)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
+
+struct UnknownMutationBackend;
+
+impl SandboxBackend for UnknownMutationBackend {
+    fn name(&self) -> &'static str {
+        "unknown_mutation"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, _request: &CommandRequest) -> CommandResult {
+        panic!("direct argv command backend must not execute")
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unknown)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
 
 impl SandboxBackend for RecordingSandboxBackend {
     fn name(&self) -> &'static str {
@@ -2708,24 +2910,28 @@ impl SandboxBackend for RecordingSandboxBackend {
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
+        SandboxCapabilities::strict().with_change_detection()
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
         assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
-        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
         assert_eq!(request.filesystem.mode, SandboxFilesystemMode::ReadOnly);
         assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
-        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 }
 
@@ -2737,7 +2943,7 @@ impl SandboxBackend for EvaluationEnvironmentBackend {
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
+        SandboxCapabilities::strict().with_change_detection()
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -2745,10 +2951,12 @@ impl SandboxBackend for EvaluationEnvironmentBackend {
             request.environment,
             CommandEnvironmentPolicy::EvaluationIsolated
         );
-        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
@@ -2756,10 +2964,12 @@ impl SandboxBackend for EvaluationEnvironmentBackend {
             request.environment,
             CommandEnvironmentPolicy::EvaluationIsolated
         );
-        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 }
 
@@ -2771,7 +2981,7 @@ impl SandboxBackend for DangerAuditSandboxBackend {
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
-        SandboxCapabilities::strict()
+        SandboxCapabilities::strict().with_change_detection()
     }
 
     fn execute(&self, _request: &CommandRequest) -> CommandResult {
@@ -2781,10 +2991,12 @@ impl SandboxBackend for DangerAuditSandboxBackend {
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
         assert_eq!(request.filesystem.mode, SandboxFilesystemMode::ReadOnly);
         assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
-        CommandResult::completed(&request.command_id, "command ok").with_sandbox_execution(
-            self.name(),
-            singularity_tools::SandboxBackendEnforcement::Strict,
-        )
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
     }
 }
 
