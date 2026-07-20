@@ -51,24 +51,16 @@ impl SessionStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let mut statement = transaction.prepare(
-            "select event_id, run_id, session_id, payload
+            "select event_id, run_id, session_id, payload, span_id, parent_span_id,
+                    span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms
              from trace_events where run_id = ?1 order by rowid limit ?2 offset ?3",
         )?;
-        let rows = statement.query_map(params![run_id, limit, offset], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
+        let rows = statement.query_map(params![run_id, limit, offset], stored_trace_row)?;
         let raw_events = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut events = Vec::new();
         for row in raw_events {
-            let (event_id, stored_run_id, stored_session_id, payload) = row;
-            let event =
-                decode_stored_trace_row(&event_id, &stored_run_id, &stored_session_id, &payload)?;
+            let event = decode_stored_trace_row(row)?;
             events.push(event);
         }
         validate_public_trace_bindings(&transaction, &events)?;
@@ -99,24 +91,16 @@ impl SessionStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let mut statement = transaction.prepare(
-            "select event_id, run_id, session_id, payload
+            "select event_id, run_id, session_id, payload, span_id, parent_span_id,
+                    span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms
              from trace_events where run_id = ?1 order by rowid desc limit ?2 offset ?3",
         )?;
-        let rows = statement.query_map(params![run_id, limit, offset], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
+        let rows = statement.query_map(params![run_id, limit, offset], stored_trace_row)?;
         let raw_events = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut events = Vec::new();
         for row in raw_events {
-            let (event_id, stored_run_id, stored_session_id, payload) = row;
-            let event =
-                decode_stored_trace_row(&event_id, &stored_run_id, &stored_session_id, &payload)?;
+            let event = decode_stored_trace_row(row)?;
             events.push(event);
         }
         validate_public_trace_bindings(&transaction, &events)?;
@@ -138,17 +122,13 @@ impl SessionStore {
     pub fn show_trace(&self, event_id: &str) -> StoreResult<TraceEvent> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let (stored_event_id, stored_run_id, stored_session_id, payload): (
-            String,
-            String,
-            String,
-            String,
-        ) = transaction
+        let row = transaction
             .query_row(
-                "select event_id, run_id, session_id, payload
+                "select event_id, run_id, session_id, payload, span_id, parent_span_id,
+                        span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms
                  from trace_events where event_id = ?1",
                 params![event_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                stored_trace_row,
             )
             .map_err(|error| match error {
                 rusqlite::Error::QueryReturnedNoRows => {
@@ -156,12 +136,7 @@ impl SessionStore {
                 }
                 other => StoreError::Sqlite(other),
             })?;
-        let event = decode_stored_trace_row(
-            &stored_event_id,
-            &stored_run_id,
-            &stored_session_id,
-            &payload,
-        )?;
+        let event = decode_stored_trace_row(row)?;
         validate_public_trace_binding(&transaction, &event)?;
         transaction.commit()?;
         Ok(event)
@@ -274,6 +249,82 @@ pub(crate) fn validate_turn_trace_binding(
 ) -> StoreResult<()> {
     event.validate_turn_binding(thread_id, turn_id)?;
     Ok(())
+}
+
+// Validate all span rows while migrating a legacy database before any source
+// table is replaced. This keeps migration rejection atomic and fail closed.
+pub(crate) fn validate_trace_span_batch(events: &[TraceEvent]) -> StoreResult<()> {
+    let mut spans = BTreeMap::<(String, String), Vec<&TraceEvent>>::new();
+    for event in events {
+        event
+            .validate_span_lifecycle()
+            .map_err(|error| StoreError::InvalidState(format!("trace span is invalid: {error}")))?;
+        if let Some(span_id) = event.span_id.as_deref() {
+            spans
+                .entry((event.run_id.clone(), span_id.to_string()))
+                .or_default()
+                .push(event);
+        }
+    }
+    for ((run_id, span_id), events) in &spans {
+        let starts = events
+            .iter()
+            .filter(|event| event.span_phase == Some(TraceSpanPhase::Start))
+            .count();
+        let ends = events
+            .iter()
+            .filter(|event| event.span_phase == Some(TraceSpanPhase::End))
+            .count();
+        if starts > 1 || ends > 1 {
+            return Err(StoreError::InvalidState(format!(
+                "trace span {span_id} in run {run_id} has duplicate start or end"
+            )));
+        }
+        if ends == 1 && starts != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "trace span {span_id} in run {run_id} ends without a start"
+            )));
+        }
+        if let (Some(start), Some(end)) = (
+            events
+                .iter()
+                .find(|event| event.span_phase == Some(TraceSpanPhase::Start)),
+            events
+                .iter()
+                .find(|event| event.span_phase == Some(TraceSpanPhase::End)),
+        ) && (start.parent_span_id != end.parent_span_id || start.span_kind != end.span_kind)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "trace span {span_id} in run {run_id} has mismatched start and end identity"
+            )));
+        }
+    }
+    for event in events {
+        if let Some(parent_span_id) = event.parent_span_id.as_deref()
+            && !spans.contains_key(&(event.run_id.clone(), parent_span_id.to_string()))
+        {
+            return Err(StoreError::InvalidState(
+                "trace parent_span_id must identify a span in the same run".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Validate every persisted row and its lifecycle before serving a v12 store.
+pub(crate) fn validate_trace_span_rows(connection: &Connection) -> StoreResult<()> {
+    let mut statement = connection.prepare(
+        "select event_id, run_id, session_id, payload, span_id, parent_span_id,
+                span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms
+         from trace_events order by rowid",
+    )?;
+    let rows = statement.query_map([], stored_trace_row)?;
+    let raw_rows = rows.collect::<Result<Vec<_>, _>>()?;
+    let mut events = Vec::with_capacity(raw_rows.len());
+    for row in raw_rows {
+        events.push(decode_stored_trace_row(row)?);
+    }
+    validate_trace_span_batch(&events)
 }
 
 // Public generic trace append may store external runs, but it cannot weaken a

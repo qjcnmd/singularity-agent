@@ -576,15 +576,65 @@ pub(crate) fn artifact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Art
     })
 }
 
-// 解码现行 trace 行，同时验证列与 payload 的身份投影一致。
-pub(crate) fn decode_stored_trace_row(
-    event_id: &str,
-    run_id: &str,
-    session_id: &str,
-    payload: &str,
-) -> StoreResult<TraceEvent> {
-    let event = decode_trace_payload(payload)?;
-    if event.event_id != event_id || event.run_id != run_id || event.session_id != session_id {
+/// SQLite trace row, including every read-only projection column.
+pub(crate) struct StoredTraceRow {
+    pub(crate) event_id: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) payload: String,
+    pub(crate) span_id: Option<String>,
+    pub(crate) parent_span_id: Option<String>,
+    pub(crate) span_kind: Option<String>,
+    pub(crate) span_phase: Option<String>,
+    pub(crate) span_status: Option<String>,
+    pub(crate) duration_ms: Option<i64>,
+    pub(crate) time_to_first_token_ms: Option<i64>,
+}
+
+pub(crate) fn stored_trace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTraceRow> {
+    Ok(StoredTraceRow {
+        event_id: row.get(0)?,
+        run_id: row.get(1)?,
+        session_id: row.get(2)?,
+        payload: row.get(3)?,
+        span_id: row.get(4)?,
+        parent_span_id: row.get(5)?,
+        span_kind: row.get(6)?,
+        span_phase: row.get(7)?,
+        span_status: row.get(8)?,
+        duration_ms: row.get(9)?,
+        time_to_first_token_ms: row.get(10)?,
+    })
+}
+
+// 解码现行 trace 行，同时验证列与 payload 的完整投影一致。
+pub(crate) fn decode_stored_trace_row(row: StoredTraceRow) -> StoreResult<TraceEvent> {
+    let StoredTraceRow {
+        event_id,
+        run_id,
+        session_id,
+        payload,
+        span_id,
+        parent_span_id,
+        span_kind,
+        span_phase,
+        span_status,
+        duration_ms,
+        time_to_first_token_ms,
+    } = row;
+    let event = decode_trace_payload(&payload)?;
+    if event.event_id != event_id
+        || event.run_id != run_id
+        || event.session_id != session_id
+        || event.span_id != span_id
+        || event.parent_span_id != parent_span_id
+        || event.span_kind.map(|kind| kind.as_storage_text()) != span_kind.as_deref()
+        || event.span_phase.map(|phase| phase.as_storage_text()) != span_phase.as_deref()
+        || event.span_status.map(|status| status.as_storage_text()) != span_status.as_deref()
+        || optional_i64_to_u64(duration_ms, "trace duration")? != event.duration_ms
+        || optional_i64_to_u64(time_to_first_token_ms, "trace time to first token")?
+            != event.time_to_first_token_ms
+    {
         return Err(StoreError::InvalidState(format!(
             "trace {event_id} columns do not match payload"
         )));
@@ -600,10 +650,13 @@ pub(crate) fn decode_trace_payload(payload: &str) -> StoreResult<TraceEvent> {
             "stored trace was not sanitized".to_string(),
         ));
     }
-    let expected_hash = trace_payload_hash(&event.payload);
+    event
+        .validate_span_lifecycle()
+        .map_err(|error| StoreError::InvalidState(format!("trace span is invalid: {error}")))?;
+    let expected_hash = trace_envelope_hash(&event);
     if event.payload_hash != expected_hash {
         return Err(StoreError::TraceIntegrity(format!(
-            "payload hash mismatch for {}",
+            "event envelope hash mismatch for {}",
             event.event_id
         )));
     }
@@ -621,15 +674,37 @@ pub(crate) fn sanitize_trace_event(event: &TraceEvent) -> TraceEvent {
         .map(|artifact_ref| redact_secret_like_text(&artifact_ref))
         .collect();
     sanitized.redaction_applied = true;
-    sanitized.payload_hash = trace_payload_hash(&sanitized.payload);
+    sanitized.payload_hash = trace_envelope_hash(&sanitized);
     sanitized
 }
 
-// 对 canonical payload 计算带前缀的 SHA-256 摘要。
+// 对 canonical JSON 计算带前缀的 SHA-256 摘要。
 pub(crate) fn trace_payload_hash(payload: &Value) -> String {
-    let canonical = canonical_json(payload);
+    trace_value_hash(payload)
+}
+
+// 对脱敏后的完整 event envelope 计算摘要，payload_hash 本身不参与输入。
+pub(crate) fn trace_envelope_hash(event: &TraceEvent) -> String {
+    let mut envelope = serde_json::to_value(event).expect("trace event serialization cannot fail");
+    if let Value::Object(fields) = &mut envelope {
+        fields.remove("payload_hash");
+    }
+    trace_value_hash(&envelope)
+}
+
+fn trace_value_hash(value: &Value) -> String {
+    let canonical = canonical_json(value);
     let digest = Sha256::digest(canonical.as_bytes());
     format!("{TRACE_HASH_PREFIX}{digest:x}")
+}
+
+pub(crate) fn optional_i64_to_u64(value: Option<i64>, label: &str) -> StoreResult<Option<u64>> {
+    value
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| StoreError::InvalidState(format!("{label} must be non-negative")))
+        })
+        .transpose()
 }
 
 // 以稳定 key 顺序序列化 JSON，作为哈希输入。

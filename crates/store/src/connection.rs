@@ -118,7 +118,7 @@ impl SessionStore {
         original_guard.verify()?;
         configure_connection(&connection)?;
         validate_connection_pragmas(&connection, false)?;
-        migration::validate_v11_structure(&connection)?;
+        migration::validate_v12_structure(&connection)?;
         identity_guard.verify()?;
         original_guard.verify()?;
         Ok(Self {

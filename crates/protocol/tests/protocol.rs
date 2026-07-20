@@ -8,9 +8,9 @@ use singularity_protocol::{
     EventMetadata, EventRecoveryQuery, EventSubscribeParams, InitializeParams, InitializeResult,
     ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload,
     METHOD_REGISTRY, Method, MethodKind, ProviderConfigurationStatus, ThreadIdParams,
-    ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceListParams,
-    TraceShowParams, TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus,
-    parse_json_rpc_payload,
+    ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceEvent,
+    TraceListParams, TraceShowParams, TraceSpanKind, TraceSpanPhase, TraceSpanStatus,
+    TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus, parse_json_rpc_payload,
 };
 
 #[test]
@@ -551,6 +551,109 @@ fn turn_trace_has_all_three_binding_fields() {
     trace
         .validate_turn_binding("thread_1", "turn_1")
         .expect("turn binding");
+}
+
+#[test]
+fn trace_span_lifecycle_roundtrips_and_legacy_events_remain_valid() {
+    let legacy = TraceEvent::new("trace_legacy", "run", "session", "test", "legacy");
+    let legacy_json = serde_json::to_string(&legacy).expect("legacy trace serialization");
+    let restored_legacy: TraceEvent = serde_json::from_str(&legacy_json).expect("legacy trace");
+    assert_eq!(restored_legacy.span_id, None);
+    assert!(restored_legacy.validate_span_lifecycle().is_ok());
+
+    let mut start = TraceEvent::new("trace_start", "run", "session", "provider", "start");
+    start.span_id = Some("span_1".to_string());
+    start.span_kind = Some(TraceSpanKind::ProviderAttempt);
+    start.span_phase = Some(TraceSpanPhase::Start);
+    let mut end = start.clone();
+    end.event_id = "trace_end".to_string();
+    end.span_phase = Some(TraceSpanPhase::End);
+    end.span_status = Some(TraceSpanStatus::Ok);
+    end.duration_ms = Some(42);
+    end.time_to_first_token_ms = Some(12);
+    let restored: TraceEvent =
+        serde_json::from_value(serde_json::to_value(&end).expect("typed trace serialization"))
+            .expect("typed trace roundtrip");
+    assert_eq!(restored, end);
+    assert!(start.validate_span_lifecycle().is_ok());
+    assert!(end.validate_span_lifecycle().is_ok());
+}
+
+#[test]
+fn trace_span_lifecycle_rejects_invalid_phase_combinations() {
+    let cases = [
+        (
+            "missing span id",
+            None,
+            Some(TraceSpanKind::Agent),
+            Some(TraceSpanPhase::Start),
+            None,
+            None,
+            None,
+        ),
+        (
+            "start status",
+            Some("span"),
+            Some(TraceSpanKind::Agent),
+            Some(TraceSpanPhase::Start),
+            Some(TraceSpanStatus::Ok),
+            None,
+            None,
+        ),
+        (
+            "end status missing",
+            Some("span"),
+            Some(TraceSpanKind::Agent),
+            Some(TraceSpanPhase::End),
+            None,
+            Some(1),
+            None,
+        ),
+        (
+            "end duration missing",
+            Some("span"),
+            Some(TraceSpanKind::Agent),
+            Some(TraceSpanPhase::End),
+            Some(TraceSpanStatus::Ok),
+            None,
+            None,
+        ),
+        (
+            "ttft wrong kind",
+            Some("span"),
+            Some(TraceSpanKind::Tool),
+            Some(TraceSpanPhase::End),
+            Some(TraceSpanStatus::Ok),
+            Some(10),
+            Some(1),
+        ),
+        (
+            "ttft too large",
+            Some("span"),
+            Some(TraceSpanKind::ProviderAttempt),
+            Some(TraceSpanPhase::End),
+            Some(TraceSpanStatus::Ok),
+            Some(10),
+            Some(11),
+        ),
+    ];
+    for (label, span_id, span_kind, span_phase, span_status, duration_ms, ttft) in cases {
+        let mut event = TraceEvent::new(label, "run", "session", "test", label);
+        event.span_id = span_id.map(str::to_string);
+        event.span_kind = span_kind;
+        event.span_phase = span_phase;
+        event.span_status = span_status;
+        event.duration_ms = duration_ms;
+        event.time_to_first_token_ms = ttft;
+        assert!(event.validate_span_lifecycle().is_err(), "accepted {label}");
+    }
+
+    let mut self_parent = TraceEvent::new("self_parent", "run", "session", "test", "self");
+    self_parent.span_id = Some("span".to_string());
+    self_parent.parent_span_id = Some("span".to_string());
+    self_parent.span_kind = Some(TraceSpanKind::Agent);
+    self_parent.span_phase = Some(TraceSpanPhase::Start);
+    assert!(self_parent.validate_span_lifecycle().is_err());
 }
 
 #[test]

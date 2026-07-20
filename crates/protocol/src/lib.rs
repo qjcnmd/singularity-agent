@@ -1053,10 +1053,169 @@ pub struct TraceEvent {
     pub command_id: Option<String>,
     pub transaction_id: Option<String>,
     pub verification_id: Option<String>,
+    /// Stable identity shared by the start and end events of one span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
+    /// Optional parent span in the same run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// Domain span kind; absent means this is a legacy/untyped trace event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_kind: Option<TraceSpanKind>,
+    /// Lifecycle phase represented by this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_phase: Option<TraceSpanPhase>,
+    /// Terminal status, present only on the end event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_status: Option<TraceSpanStatus>,
+    /// Measured elapsed time for the completed span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Measured time until the first provider token was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<u64>,
     pub redaction_applied: bool,
     pub payload_hash: String,
 }
+
+/// Trace span kinds supported by the current runtime contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSpanKind {
+    Internal,
+    Agent,
+    ProviderAttempt,
+    Tool,
+    Sandbox,
+    Approval,
+}
+
+impl TraceSpanKind {
+    /// Return the stable text stored in SQLite and serialized on the wire.
+    pub const fn as_storage_text(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::Agent => "agent",
+            Self::ProviderAttempt => "provider_attempt",
+            Self::Tool => "tool",
+            Self::Sandbox => "sandbox",
+            Self::Approval => "approval",
+        }
+    }
+
+    /// Decode the stable SQLite/wire representation.
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "internal" => Some(Self::Internal),
+            "agent" => Some(Self::Agent),
+            "provider_attempt" => Some(Self::ProviderAttempt),
+            "tool" => Some(Self::Tool),
+            "sandbox" => Some(Self::Sandbox),
+            "approval" => Some(Self::Approval),
+            _ => None,
+        }
+    }
+}
+
+/// The two events that delimit a typed trace span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSpanPhase {
+    Start,
+    End,
+}
+
+impl TraceSpanPhase {
+    /// Return the stable text stored in SQLite and serialized on the wire.
+    pub const fn as_storage_text(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::End => "end",
+        }
+    }
+
+    /// Decode the stable SQLite representation.
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "start" => Some(Self::Start),
+            "end" => Some(Self::End),
+            _ => None,
+        }
+    }
+}
+
+/// Terminal status for a completed typed trace span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceSpanStatus {
+    Unset,
+    Ok,
+    Error,
+}
+
+impl TraceSpanStatus {
+    /// Return the stable text stored in SQLite and serialized on the wire.
+    pub const fn as_storage_text(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+
+    /// Decode the stable SQLite representation.
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "unset" => Some(Self::Unset),
+            "ok" => Some(Self::Ok),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// Validation failures for the optional typed span lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceSpanValidationError {
+    SpanIdRequired,
+    SpanIdEmpty,
+    ParentSpanIdEmpty,
+    ParentSpanIdSelf,
+    SpanKindRequired,
+    SpanPhaseRequired,
+    StartHasTerminalFields,
+    EndStatusRequired,
+    EndDurationRequired,
+    TimeToFirstTokenRequiresProviderAttempt,
+    TimeToFirstTokenExceedsDuration,
+}
+
+impl std::fmt::Display for TraceSpanValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::SpanIdRequired => "typed span requires span_id",
+            Self::SpanIdEmpty => "span_id must not be empty",
+            Self::ParentSpanIdEmpty => "parent_span_id must not be empty",
+            Self::ParentSpanIdSelf => "parent_span_id must not equal span_id",
+            Self::SpanKindRequired => "typed span requires span_kind",
+            Self::SpanPhaseRequired => "typed span requires span_phase",
+            Self::StartHasTerminalFields => {
+                "span start must not include status, duration, or time_to_first_token"
+            }
+            Self::EndStatusRequired => "span end requires span_status",
+            Self::EndDurationRequired => "span end requires duration_ms",
+            Self::TimeToFirstTokenRequiresProviderAttempt => {
+                "time_to_first_token_ms is only valid for provider_attempt spans"
+            }
+            Self::TimeToFirstTokenExceedsDuration => {
+                "time_to_first_token_ms must not exceed duration_ms"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for TraceSpanValidationError {}
 
 /// Trace 与一个 turn 绑定时必须满足的身份不变量。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1125,6 +1284,12 @@ impl TraceEvent {
             transaction_id: None,
             verification_id: None,
             span_id: None,
+            parent_span_id: None,
+            span_kind: None,
+            span_phase: None,
+            span_status: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
             redaction_applied: false,
             payload_hash: String::new(),
         }
@@ -1174,6 +1339,70 @@ impl TraceEvent {
                 expected: turn_id.to_string(),
                 actual: self.task_id.clone(),
             });
+        }
+        Ok(())
+    }
+
+    /// Validate the local contract for an optional typed span event.
+    pub fn validate_span_lifecycle(&self) -> Result<(), TraceSpanValidationError> {
+        let has_span_fields = self.span_id.is_some()
+            || self.parent_span_id.is_some()
+            || self.span_kind.is_some()
+            || self.span_phase.is_some()
+            || self.span_status.is_some()
+            || self.duration_ms.is_some()
+            || self.time_to_first_token_ms.is_some();
+        if !has_span_fields {
+            return Ok(());
+        }
+
+        let span_id = self
+            .span_id
+            .as_deref()
+            .ok_or(TraceSpanValidationError::SpanIdRequired)?;
+        if span_id.trim().is_empty() {
+            return Err(TraceSpanValidationError::SpanIdEmpty);
+        }
+        if let Some(parent_span_id) = self.parent_span_id.as_deref() {
+            if parent_span_id.trim().is_empty() {
+                return Err(TraceSpanValidationError::ParentSpanIdEmpty);
+            }
+            if parent_span_id == span_id {
+                return Err(TraceSpanValidationError::ParentSpanIdSelf);
+            }
+        }
+        let span_kind = self
+            .span_kind
+            .ok_or(TraceSpanValidationError::SpanKindRequired)?;
+        let span_phase = self
+            .span_phase
+            .ok_or(TraceSpanValidationError::SpanPhaseRequired)?;
+        match span_phase {
+            TraceSpanPhase::Start => {
+                if self.span_status.is_some()
+                    || self.duration_ms.is_some()
+                    || self.time_to_first_token_ms.is_some()
+                {
+                    return Err(TraceSpanValidationError::StartHasTerminalFields);
+                }
+            }
+            TraceSpanPhase::End => {
+                if self.span_status.is_none() {
+                    return Err(TraceSpanValidationError::EndStatusRequired);
+                }
+                if self.duration_ms.is_none() {
+                    return Err(TraceSpanValidationError::EndDurationRequired);
+                }
+            }
+        }
+        if self.time_to_first_token_ms.is_some() && span_kind != TraceSpanKind::ProviderAttempt {
+            return Err(TraceSpanValidationError::TimeToFirstTokenRequiresProviderAttempt);
+        }
+        if let (Some(time_to_first_token_ms), Some(duration_ms)) =
+            (self.time_to_first_token_ms, self.duration_ms)
+            && time_to_first_token_ms > duration_ms
+        {
+            return Err(TraceSpanValidationError::TimeToFirstTokenExceedsDuration);
         }
         Ok(())
     }

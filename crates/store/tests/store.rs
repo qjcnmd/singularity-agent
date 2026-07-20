@@ -6,7 +6,10 @@ use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, PermissionProfileName,
     PermissionResource, ToolId, WorkspaceRelativePath,
 };
-use singularity_protocol::{ItemKind, ThreadStatus, TraceBindingError, TraceEvent, TurnStatus};
+use singularity_protocol::{
+    ItemKind, ThreadStatus, TraceBindingError, TraceEvent, TraceSpanKind, TraceSpanPhase,
+    TraceSpanStatus, TurnStatus,
+};
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
     SessionStoreDescriptor, StoreError, TurnOutcomeAuthority,
@@ -31,7 +34,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 11);
+    assert_eq!(descriptor.schema_version, 12);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
@@ -44,7 +47,8 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
             "0008_approval_execution_recovery".to_string(),
             "0009_thread_policy_snapshot".to_string(),
             "0010_stable_enum_text".to_string(),
-            "0011_typed_permission_resources".to_string()
+            "0011_typed_permission_resources".to_string(),
+            "0012_typed_trace_spans".to_string()
         ]
     );
     assert_eq!(
@@ -132,7 +136,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
         .query_row("pragma journal_mode", [], |row| row.get(0))
         .expect("journal mode");
 
-    assert_eq!(schema_version, 11);
+    assert_eq!(schema_version, 12);
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 }
 
@@ -156,7 +160,7 @@ fn sqlite_store_rejects_future_schema_version() {
         SessionStore::open(&db_path),
         Err(StoreError::UnsupportedSchema {
             found: 999,
-            supported: 11
+            supported: 12
         })
     ));
 }
@@ -166,35 +170,10 @@ fn sqlite_store_rejects_future_schema_version() {
 fn v10_approval_resources_migrate_to_typed_v11_payloads() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
-    let store = SessionStore::open(&db_path).expect("create v11 store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
-    let request = ApprovalRequest::new(
-        "approval_v10",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
-        tool_id("edit"),
-    )
-    .with_resources([workspace_resource("README.md")]);
-    store.create_approval(&request).expect("approval");
-    drop(store);
-
+    create_v10_database(&db_path);
+    let request = ApprovalRequest::new("approval_v10", "thread_v10", "turn_v10", tool_id("edit"))
+        .with_resources([workspace_resource("README.md")]);
     let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "pragma foreign_keys = off;
-             create table schema_meta_v10(
-                 schema_version integer not null check(schema_version = 10)
-             );
-             insert into schema_meta_v10(schema_version) values(10);
-             drop table schema_meta;
-             alter table schema_meta_v10 rename to schema_meta;
-             delete from schema_migrations
-              where migration_id = '0011_typed_permission_resources';",
-        )
-        .expect("restore v10 schema metadata");
     let legacy_payload = serde_json::json!({
         "request_id": request.request_id,
         "thread_id": request.thread_id,
@@ -206,14 +185,21 @@ fn v10_approval_resources_migrate_to_typed_v11_payloads() {
     });
     connection
         .execute(
-            "update approvals set payload = ?1 where request_id = 'approval_v10'",
-            [serde_json::to_string(&legacy_payload).expect("legacy approval")],
+            "insert into approvals(
+                 request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
+             ) values(?1, ?2, ?3, ?4, null, null)",
+            rusqlite::params![
+                request.request_id,
+                request.thread_id,
+                request.turn_id,
+                serde_json::to_string(&legacy_payload).expect("legacy approval"),
+            ],
         )
-        .expect("write v10 payload");
+        .expect("insert v10 approval");
     drop(connection);
 
     let migrated = SessionStore::open(&db_path).expect("migrate v10 store");
-    assert_eq!(migrated.descriptor().schema_version, 11);
+    assert_eq!(migrated.descriptor().schema_version, 12);
     assert_eq!(
         migrated
             .get_pending_approval("approval_v10")
@@ -223,19 +209,154 @@ fn v10_approval_resources_migrate_to_typed_v11_payloads() {
     );
 }
 
+// Build the released v10 schema directly so v10 migration tests do not
+// relabel a current v12 database as an older version.
+fn create_v10_database(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).expect("open v10 sqlite");
+    connection
+        .execute_batch(
+            r#"
+create table schema_meta(
+schema_version integer not null check(schema_version = 10)
+);
+create table schema_migrations(
+    migration_id text primary key,
+    applied_at text not null default current_timestamp
+);
+create table threads(
+    thread_id text primary key,
+    model text,
+    cwd text,
+    status text not null default 'active'
+        check(status in ('active', 'archived')),
+    sandbox_mode text not null default 'workspace-write'
+        check(sandbox_mode in ('read-only', 'workspace-write')),
+    approval_policy text not null default 'on-request'
+        check(approval_policy in ('on-request', 'never'))
+);
+create table turns(
+    turn_id text primary key,
+    thread_id text not null,
+    turn_sequence integer not null check(turn_sequence > 0),
+    status text not null
+        check(status in ('running', 'completed', 'blocked', 'failed', 'interrupted')),
+    agent_loop_status text not null,
+    foreign key(thread_id) references threads(thread_id)
+);
+create table items(
+    item_id text primary key,
+    turn_id text not null,
+    item_sequence integer not null check(item_sequence > 0),
+    kind text not null
+        check(kind in ('userMessage', 'agentMessage', 'reasoning', 'plan', 'commandExecution', 'fileChange')),
+    payload text not null,
+    status text not null check(status in ('started', 'completed')),
+    redacted integer not null check(redacted in (0, 1)),
+    foreign key(turn_id) references turns(turn_id)
+);
+create table trace_events(
+    event_id text primary key,
+    run_id text not null,
+    session_id text not null default '',
+    payload text not null
+);
+create table approvals(
+    request_id text primary key,
+    thread_id text not null,
+    turn_id text not null,
+    payload text not null,
+    decision_outcome text check(decision_outcome in ('allow', 'deny') or decision_outcome is null),
+    decision_reason text,
+    foreign key(thread_id) references threads(thread_id),
+    foreign key(turn_id) references turns(turn_id)
+);
+create table approval_decisions(
+    decision_id text primary key,
+    request_id text not null,
+    outcome text not null check(outcome in ('allow', 'deny')),
+    reason text not null,
+    payload text not null,
+    foreign key(request_id) references approvals(request_id)
+);
+create table artifact_refs(
+    artifact_id text primary key,
+    run_id text not null,
+    item_id text,
+    kind text not null,
+    uri text not null,
+    content_digest text not null,
+    summary text not null,
+    metadata text not null,
+    redacted integer not null check(redacted in (0, 1))
+);
+create table pending_tool_calls(
+    request_id text primary key,
+    thread_id text not null,
+    turn_id text not null,
+    tool_call_id text not null,
+    payload text not null,
+    execution_state text not null default 'pending'
+        check(execution_state in ('pending', 'executing')),
+    foreign key(request_id) references approvals(request_id),
+    foreign key(thread_id) references threads(thread_id),
+    foreign key(turn_id) references turns(turn_id)
+);
+create unique index turns_thread_sequence_unique on turns(thread_id, turn_sequence);
+create unique index items_turn_sequence_unique on items(turn_id, item_sequence);
+create index turns_history_lookup on turns(thread_id, status, turn_sequence);
+create index items_history_lookup on items(turn_id, status, kind, item_sequence);
+create unique index approval_decisions_request_unique on approval_decisions(request_id);
+create index trace_run_lookup on trace_events(run_id, event_id);
+create index approvals_pending_lookup on approvals(decision_outcome, request_id);
+create index approvals_thread_lookup on approvals(thread_id, decision_outcome, request_id);
+create index approvals_turn_lookup on approvals(turn_id, decision_outcome, request_id);
+create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execution_state, request_id);
+insert into schema_meta(schema_version) values(10);
+insert into schema_migrations(migration_id) values
+    ('0001_initial_session_store'),
+    ('0002_durable_ledger'),
+    ('0004_pending_tool_calls'),
+    ('0005_store_hardening'),
+    ('0006_conversation_history'),
+    ('0007_pending_execution_state'),
+    ('0008_approval_execution_recovery'),
+    ('0009_thread_policy_snapshot'),
+    ('0010_stable_enum_text');
+insert into threads(thread_id, model, cwd, status, sandbox_mode, approval_policy)
+values('thread_v10', null, null, 'active', 'workspace-write', 'on-request');
+insert into turns(turn_id, thread_id, turn_sequence, status, agent_loop_status)
+values('turn_v10', 'thread_v10', 1, 'running', 'running');
+"#,
+        )
+        .expect("create v10 database");
+}
+
+fn create_v11_database(path: &std::path::Path) {
+    create_v10_database(path);
+    let connection = rusqlite::Connection::open(path).expect("open v11 sqlite");
+    connection
+        .execute_batch(
+            "create table schema_meta_v11(
+                 schema_version integer not null check(schema_version = 11)
+             );
+             insert into schema_meta_v11(schema_version) values(11);
+             drop table schema_meta;
+             alter table schema_meta_v11 rename to schema_meta;
+             insert into schema_migrations(migration_id)
+             values('0011_typed_permission_resources');",
+        )
+        .expect("upgrade v10 schema metadata to v11");
+}
+
 fn prepare_v10_pending_checkpoint(
     db_path: &std::path::Path,
     checkpoint: &mut Value,
 ) -> ApprovalRequest {
-    let store = SessionStore::open(db_path).expect("create v11 store");
-    let thread = store.create_thread(None, None).expect("thread");
-    let turn = store
-        .create_turn(&thread.thread_id, "running")
-        .expect("turn");
+    create_v10_database(db_path);
     let request = ApprovalRequest::new(
         "approval_pending_v10",
-        thread.thread_id.clone(),
-        turn.turn_id.clone(),
+        "thread_v10",
+        "turn_v10",
         tool_id("edit"),
     )
     .with_tool_call_id("call_1")
@@ -244,30 +365,7 @@ fn prepare_v10_pending_checkpoint(
     checkpoint["thread_id"] = serde_json::json!(&request.thread_id);
     checkpoint["turn_id"] = serde_json::json!(&request.turn_id);
     checkpoint["tool_call_id"] = serde_json::json!("call_1");
-    store
-        .create_approval_with_pending_tool_call_and_trace(
-            &request,
-            Some(checkpoint.clone()),
-            "approval",
-            "approval requested",
-        )
-        .expect("pending checkpoint");
-    drop(store);
-
     let connection = rusqlite::Connection::open(db_path).expect("open sqlite");
-    connection
-        .execute_batch(
-            "pragma foreign_keys = off;
-             create table schema_meta_v10(
-                 schema_version integer not null check(schema_version = 10)
-             );
-             insert into schema_meta_v10(schema_version) values(10);
-             drop table schema_meta;
-             alter table schema_meta_v10 rename to schema_meta;
-             delete from schema_migrations
-              where migration_id = '0011_typed_permission_resources';",
-        )
-        .expect("restore v10 schema metadata");
     let legacy_approval = serde_json::json!({
         "request_id": &request.request_id,
         "thread_id": &request.thread_id,
@@ -279,13 +377,37 @@ fn prepare_v10_pending_checkpoint(
     });
     connection
         .execute(
-            "update approvals set payload = ?1 where request_id = ?2",
+            "update turns set status = 'blocked', agent_loop_status = 'blocked' where turn_id = ?1",
+            [&request.turn_id],
+        )
+        .expect("block v10 turn");
+    connection
+        .execute(
+            "insert into approvals(
+                 request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
+             ) values(?1, ?2, ?3, ?4, null, null)",
             rusqlite::params![
-                serde_json::to_string(&legacy_approval).expect("legacy approval"),
                 request.request_id,
+                request.thread_id,
+                request.turn_id,
+                serde_json::to_string(&legacy_approval).expect("legacy approval"),
             ],
         )
-        .expect("write legacy approval");
+        .expect("insert legacy approval");
+    connection
+        .execute(
+            "insert into pending_tool_calls(
+                 request_id, thread_id, turn_id, tool_call_id, payload, execution_state
+             ) values(?1, ?2, ?3, ?4, ?5, 'pending')",
+            rusqlite::params![
+                request.request_id,
+                request.thread_id,
+                request.turn_id,
+                "call_1",
+                serde_json::to_string(checkpoint).expect("checkpoint"),
+            ],
+        )
+        .expect("insert legacy checkpoint");
     drop(connection);
     request
 }
@@ -387,7 +509,7 @@ fn v8_threads_migrate_to_policy_snapshot_defaults() {
     remove_legacy_pending_approval(&db_path, 8);
 
     let migrated = SessionStore::open(&db_path).expect("migrate v8 store");
-    assert_eq!(migrated.descriptor().schema_version, 11);
+    assert_eq!(migrated.descriptor().schema_version, 12);
     let thread_id = migrated
         .list_threads()
         .expect("migrated threads")
@@ -417,7 +539,7 @@ fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
         remove_legacy_pending_approval(&db_path, schema_version);
 
         let store = SessionStore::open(&db_path).expect("migrate legacy schema");
-        assert_eq!(store.descriptor().schema_version, 11);
+        assert_eq!(store.descriptor().schema_version, 12);
         assert_eq!(
             store.applied_migrations().expect("migration markers"),
             vec![
@@ -431,6 +553,7 @@ fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
                 "0009_thread_policy_snapshot".to_string(),
                 "0010_stable_enum_text".to_string(),
                 "0011_typed_permission_resources".to_string(),
+                "0012_typed_trace_spans".to_string(),
             ]
         );
         let connection = rusqlite::Connection::open(&db_path).expect("reopen migrated db");
@@ -560,7 +683,7 @@ fn released_legacy_schema_variants_migrate() {
             .expect("migrate upgraded v2")
             .descriptor()
             .schema_version,
-        11
+        12
     );
 
     let v5_path = dir.path().join("v5-retired-sidecar.sqlite3");
@@ -589,7 +712,7 @@ fn released_legacy_schema_variants_migrate() {
             .expect("migrate upgraded v5")
             .descriptor()
             .schema_version,
-        11
+        12
     );
 
     let v6_path = dir.path().join("v6-initial-indexes.sqlite3");
@@ -608,7 +731,7 @@ fn released_legacy_schema_variants_migrate() {
             .expect("migrate initial v6")
             .descriptor()
             .schema_version,
-        11
+        12
     );
 
     let v7_path = dir.path().join("v7-appended-state.sqlite3");
@@ -642,7 +765,7 @@ fn released_legacy_schema_variants_migrate() {
             .expect("migrate upgraded v7")
             .descriptor()
             .schema_version,
-        11
+        12
     );
 }
 
@@ -1159,7 +1282,7 @@ fn partial_thread_policy_migration_fails_closed() {
     assert!(matches!(
         SessionStore::open(&db_path),
         Err(StoreError::InvalidState(message))
-            if message.contains("v11 schema fingerprint is not canonical")
+            if message.contains("v12 schema fingerprint is not canonical")
     ));
 }
 
@@ -3498,7 +3621,7 @@ fn trace_storage_redacts_recursively_and_hashes_canonical_payload() {
     assert!(first.redaction_applied);
     assert!(first.payload_hash.starts_with("sha256:"));
     assert_eq!(first.payload_hash.len(), "sha256:".len() + 64);
-    assert_eq!(first.payload_hash, second.payload_hash);
+    assert_ne!(first.payload_hash, second.payload_hash);
     let serialized = serde_json::to_string(&first).expect("serialize trace");
     assert!(!serialized.contains("sentinel-secret-value"));
 }
@@ -3540,6 +3663,186 @@ fn tampered_trace_payload_hash_fails_closed() {
         .show_trace("trace_tampered")
         .expect_err("tampered trace must fail closed");
     assert!(error.to_string().contains("trace integrity"));
+}
+
+fn provider_span(event_id: &str, phase: TraceSpanPhase) -> TraceEvent {
+    let mut event = TraceEvent::new(event_id, "run_span", "session_span", "provider", "span");
+    event.span_id = Some("provider_span".to_string());
+    event.span_kind = Some(TraceSpanKind::ProviderAttempt);
+    event.span_phase = Some(phase);
+    if phase == TraceSpanPhase::End {
+        event.span_status = Some(TraceSpanStatus::Ok);
+        event.duration_ms = Some(20);
+        event.time_to_first_token_ms = Some(8);
+    }
+    event
+}
+
+#[test]
+fn typed_trace_span_lifecycle_rejects_duplicates_and_cross_run_parents() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    store
+        .append_trace(&provider_span("span_start", TraceSpanPhase::Start))
+        .expect("span start");
+    assert!(
+        store
+            .append_trace(&provider_span(
+                "span_start_duplicate",
+                TraceSpanPhase::Start
+            ))
+            .is_err()
+    );
+    store
+        .append_trace(&provider_span("span_end", TraceSpanPhase::End))
+        .expect("span end");
+    assert!(
+        store
+            .append_trace(&provider_span("span_end_duplicate", TraceSpanPhase::End))
+            .is_err()
+    );
+
+    let mut cross_run = TraceEvent::new(
+        "cross_run_parent",
+        "another_run",
+        "another_session",
+        "provider",
+        "cross run",
+    );
+    cross_run.span_id = Some("child".to_string());
+    cross_run.parent_span_id = Some("provider_span".to_string());
+    cross_run.span_kind = Some(TraceSpanKind::ProviderAttempt);
+    cross_run.span_phase = Some(TraceSpanPhase::Start);
+    assert!(store.append_trace(&cross_run).is_err());
+}
+
+#[test]
+fn trace_envelope_and_projection_tampering_fail_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let mut event = TraceEvent::new(
+        "trace_envelope_tampered",
+        "run_envelope",
+        "session_envelope",
+        "test",
+        "safe summary",
+    );
+    event.timestamp = Some("2026-07-21T00:00:00Z".to_string());
+    store.append_trace(&event).expect("append envelope trace");
+    let connection = rusqlite::Connection::open(&db_path).expect("open tamper connection");
+    let payload: String = connection
+        .query_row(
+            "select payload from trace_events where event_id = 'trace_envelope_tampered'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read envelope payload");
+    let mut payload: Value = serde_json::from_str(&payload).expect("parse envelope payload");
+    payload["timestamp"] = serde_json::json!("2026-07-21T00:00:01Z");
+    connection
+        .execute(
+            "update trace_events set payload = ?1 where event_id = 'trace_envelope_tampered'",
+            [serde_json::to_string(&payload).expect("serialize envelope payload")],
+        )
+        .expect("tamper envelope");
+    assert!(matches!(
+        store.show_trace("trace_envelope_tampered"),
+        Err(StoreError::TraceIntegrity(_))
+    ));
+    drop(connection);
+
+    let typed = provider_span("projection_tampered", TraceSpanPhase::Start);
+    store.append_trace(&typed).expect("append typed trace");
+    let connection = rusqlite::Connection::open(&db_path).expect("open projection connection");
+    connection
+        .execute(
+            "update trace_events set span_kind = 'tool' where event_id = 'projection_tampered'",
+            [],
+        )
+        .expect("tamper projection");
+    assert!(matches!(
+        store.show_trace("projection_tampered"),
+        Err(StoreError::InvalidState(message)) if message.contains("columns do not match")
+    ));
+}
+
+#[test]
+fn v11_to_v12_migration_rehashes_legacy_trace_without_fabricating_spans() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("v11.sqlite3");
+    create_v11_database(&db_path);
+    let mut legacy = TraceEvent::new(
+        "v11_legacy_trace",
+        "thread_v10",
+        "thread_v10",
+        "legacy",
+        "legacy event",
+    );
+    legacy.payload = serde_json::json!({"safe": true});
+    let connection = rusqlite::Connection::open(&db_path).expect("open v11 connection");
+    connection
+        .execute(
+            "insert into trace_events(event_id, run_id, session_id, payload)
+             values(?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                legacy.event_id,
+                legacy.run_id,
+                legacy.session_id,
+                serde_json::to_string(&legacy).expect("legacy trace")
+            ],
+        )
+        .expect("insert v11 trace");
+    drop(connection);
+
+    let migrated = SessionStore::open(&db_path).expect("migrate v11 store");
+    let stored = migrated
+        .show_trace("v11_legacy_trace")
+        .expect("read migrated trace");
+    assert_eq!(migrated.descriptor().schema_version, 12);
+    assert_eq!(stored.span_id, None);
+    assert_eq!(stored.parent_span_id, None);
+    assert_eq!(stored.span_kind, None);
+    assert_eq!(stored.span_phase, None);
+    assert_eq!(stored.span_status, None);
+    assert_eq!(stored.duration_ms, None);
+    assert_eq!(stored.time_to_first_token_ms, None);
+    let connection = rusqlite::Connection::open(&db_path).expect("inspect migrated trace");
+    let projection: (Option<String>, Option<String>, Option<String>, Option<i64>) = connection
+        .query_row(
+            "select span_id, span_kind, span_phase, duration_ms
+             from trace_events where event_id = 'v11_legacy_trace'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read migrated projection");
+    assert_eq!(projection, (None, None, None, None));
+}
+
+#[test]
+fn invalid_v11_span_data_rolls_back_without_mutation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("invalid-v11.sqlite3");
+    create_v11_database(&db_path);
+    let mut invalid = provider_span("invalid_v11_span", TraceSpanPhase::Start);
+    invalid.span_status = Some(TraceSpanStatus::Ok);
+    let connection = rusqlite::Connection::open(&db_path).expect("open v11 connection");
+    connection
+        .execute(
+            "insert into trace_events(event_id, run_id, session_id, payload)
+             values(?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                invalid.event_id,
+                invalid.run_id,
+                invalid.session_id,
+                serde_json::to_string(&invalid).expect("invalid trace")
+            ],
+        )
+        .expect("insert invalid v11 trace");
+    drop(connection);
+    let before = sqlite_snapshot(&db_path);
+    assert!(SessionStore::open(&db_path).is_err());
+    assert_eq!(sqlite_snapshot(&db_path), before);
 }
 
 // 验证 trace tail 返回有界且按时间正序排列的最新窗口。
@@ -5304,7 +5607,7 @@ fn legacy_approval_payload(schema_version: u32, request: &ApprovalRequest) -> St
             "resources": request.resources,
             "reason": request.reason,
         }),
-        7..=9 => serde_json::json!({
+        7..=10 => serde_json::json!({
             "request_id": request.request_id,
             "thread_id": request.thread_id,
             "turn_id": request.turn_id,

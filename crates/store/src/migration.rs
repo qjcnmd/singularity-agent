@@ -3,7 +3,7 @@
 use super::support::*;
 use super::*;
 
-const EXPECTED_MIGRATIONS: [&str; 10] = [
+const EXPECTED_MIGRATIONS: [&str; 11] = [
     INITIAL_SCHEMA_MIGRATION,
     DURABLE_EVENT_HISTORY_SCHEMA_MIGRATION,
     PENDING_TOOL_CALL_SCHEMA_MIGRATION,
@@ -14,6 +14,7 @@ const EXPECTED_MIGRATIONS: [&str; 10] = [
     THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION,
     STABLE_ENUM_TEXT_SCHEMA_MIGRATION,
     TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION,
+    TYPED_TRACE_SPAN_SCHEMA_MIGRATION,
 ];
 
 impl SessionStore {
@@ -31,7 +32,7 @@ impl SessionStore {
     }
 }
 
-const KNOWN_LEGACY_MIGRATIONS: [&str; 10] = [
+const KNOWN_LEGACY_MIGRATIONS: [&str; 11] = [
     INITIAL_SCHEMA_MIGRATION,
     DURABLE_EVENT_HISTORY_SCHEMA_MIGRATION,
     RETIRED_ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION,
@@ -42,6 +43,7 @@ const KNOWN_LEGACY_MIGRATIONS: [&str; 10] = [
     APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION,
     THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION,
     STABLE_ENUM_TEXT_SCHEMA_MIGRATION,
+    TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION,
 ];
 
 #[derive(Debug, Clone)]
@@ -171,7 +173,7 @@ struct LegacyData {
 pub(crate) fn initialize_or_validate_schema(connection: &Connection) -> StoreResult<()> {
     let tables = user_tables(connection)?;
     if tables.is_empty() {
-        create_v11_schema(connection)?;
+        create_v12_schema(connection)?;
         return Ok(());
     }
 
@@ -183,20 +185,20 @@ pub(crate) fn initialize_or_validate_schema(connection: &Connection) -> StoreRes
         });
     }
     if version == SCHEMA_VERSION {
-        return validate_v11_schema(connection);
+        return validate_v12_schema(connection);
     }
 
     migrate_legacy_schema(connection, version)?;
-    // The migration transaction already performed the complete v11 data
+    // The migration transaction already performed the complete v12 data
     // validation before commit.  Recheck only the committed structure here;
     // callers opening an already-v11 store use the full validator above.
-    validate_v11_structure(connection)
+    validate_v12_structure(connection)
 }
 
-fn create_v11_schema(connection: &Connection) -> StoreResult<()> {
+fn create_v12_schema(connection: &Connection) -> StoreResult<()> {
     let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
-    transaction.execute_batch(V11_SCHEMA_SQL)?;
-    transaction.execute_batch(V11_INDEX_SQL)?;
+    transaction.execute_batch(&canonical_v12_schema_sql(""))?;
+    transaction.execute_batch(&v12_index_sql())?;
     for migration in EXPECTED_MIGRATIONS {
         transaction.execute(
             "insert into schema_migrations(migration_id) values(?1)",
@@ -207,7 +209,7 @@ fn create_v11_schema(connection: &Connection) -> StoreResult<()> {
         "insert into schema_meta(schema_version) values(?1)",
         params![SCHEMA_VERSION],
     )?;
-    validate_v11_schema(&transaction)?;
+    validate_v12_schema(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -314,6 +316,114 @@ create index approvals_turn_lookup on approvals(turn_id, decision_outcome, reque
 create index pending_tool_calls_turn_state on pending_tool_calls(turn_id, execution_state, request_id);
 "#;
 
+const V12_TRACE_INDEX_SQL: &str = r#"
+create unique index trace_span_phase_unique
+    on trace_events(run_id, span_id, span_phase)
+    where span_id is not null;
+create index trace_span_parent_lookup
+    on trace_events(run_id, parent_span_id, span_id)
+    where parent_span_id is not null;
+"#;
+
+const V12_TRACE_TRIGGER_SQL: &str = r#"
+create trigger trace_span_lifecycle_insert
+before insert on trace_events
+when json_extract(new.payload, '$.span_id') is not null
+ and (
+     (json_extract(new.payload, '$.parent_span_id') is not null and not exists(
+         select 1 from trace_events
+         where run_id = new.run_id
+           and span_id = json_extract(new.payload, '$.parent_span_id')
+     ))
+     or (json_extract(new.payload, '$.span_phase') = 'start' and exists(
+         select 1 from trace_events
+         where run_id = new.run_id
+           and span_id = json_extract(new.payload, '$.span_id')
+           and span_phase = 'start'
+     ))
+     or (json_extract(new.payload, '$.span_phase') = 'end' and (
+         not exists(
+             select 1 from trace_events
+             where run_id = new.run_id
+               and span_id = json_extract(new.payload, '$.span_id')
+               and span_phase = 'start'
+         )
+         or exists(
+             select 1 from trace_events
+             where run_id = new.run_id
+               and span_id = json_extract(new.payload, '$.span_id')
+               and span_phase = 'end'
+         )
+         or exists(
+             select 1 from trace_events
+             where run_id = new.run_id
+               and span_id = json_extract(new.payload, '$.span_id')
+               and span_phase = 'start'
+               and (parent_span_id is not json_extract(new.payload, '$.parent_span_id')
+                    or span_kind is not json_extract(new.payload, '$.span_kind'))
+         )
+     ))
+ )
+begin
+    select raise(abort, 'invalid trace span lifecycle');
+end;
+
+create trigger trace_span_projection_insert
+after insert on trace_events
+begin
+    update trace_events
+       set span_id = json_extract(new.payload, '$.span_id'),
+           parent_span_id = json_extract(new.payload, '$.parent_span_id'),
+           span_kind = json_extract(new.payload, '$.span_kind'),
+           span_phase = json_extract(new.payload, '$.span_phase'),
+           span_status = json_extract(new.payload, '$.span_status'),
+           duration_ms = json_extract(new.payload, '$.duration_ms'),
+           time_to_first_token_ms = json_extract(new.payload, '$.time_to_first_token_ms')
+     where event_id = new.event_id;
+end;
+"#;
+
+fn v12_index_sql() -> String {
+    format!("{V11_INDEX_SQL}{V12_TRACE_INDEX_SQL}{V12_TRACE_TRIGGER_SQL}")
+}
+
+fn canonical_v12_schema_sql(suffix: &str) -> String {
+    let mut sql = canonical_v11_schema_sql(suffix);
+    sql = sql.replace("schema_version = 11", "schema_version = 12");
+    let old_trace = format!(
+        "create table trace_events{suffix}(\n\
+event_id text primary key,\n\
+run_id text not null,\n\
+session_id text not null default '',\n\
+payload text not null\n\
+);"
+    );
+    let new_trace = format!(
+        "create table trace_events{suffix}(\n\
+event_id text primary key,\n\
+run_id text not null,\n\
+session_id text not null default '',\n\
+payload text not null,\n\
+span_id text\n    check(span_id is null or length(trim(span_id)) > 0),\n\
+parent_span_id text\n    check(parent_span_id is null or length(trim(parent_span_id)) > 0),\n\
+span_kind text\n    check(span_kind in ('internal', 'agent', 'provider_attempt', 'tool', 'sandbox', 'approval')\n          or span_kind is null),\n\
+span_phase text\n    check(span_phase in ('start', 'end') or span_phase is null),\n\
+span_status text\n    check(span_status in ('unset', 'ok', 'error') or span_status is null),\n\
+duration_ms integer\n    check(duration_ms >= 0 or duration_ms is null),\n\
+time_to_first_token_ms integer\n    check(time_to_first_token_ms >= 0 or time_to_first_token_ms is null),\n\
+check((span_id is null and parent_span_id is null and span_kind is null\n       and span_phase is null and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null)\n      or (span_id is not null and span_kind is not null and span_phase is not null)),\n\
+check((span_phase = 'start' and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null)\n      or (span_phase = 'end' and span_status is not null and duration_ms is not null)\n      or span_phase is null),\n\
+check(time_to_first_token_ms is null or span_kind = 'provider_attempt'),\n\
+check(time_to_first_token_ms is null or duration_ms is null\n      or time_to_first_token_ms <= duration_ms),\n\
+check(parent_span_id is null or parent_span_id <> span_id)\n\
+);"
+    );
+    if !sql.contains(&old_trace) {
+        return sql;
+    }
+    sql.replace(&old_trace, &new_trace)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LegacyTraceLayout {
     SessionBeforePayload,
@@ -346,6 +456,11 @@ fn legacy_reference_schema_sql(
 ) -> String {
     if version == 10 {
         let mut sql = V11_SCHEMA_SQL.replace("schema_version = 11", "schema_version = 10");
+        sql.push_str(V11_INDEX_SQL);
+        return sql;
+    }
+    if version == 11 {
+        let mut sql = V11_SCHEMA_SQL.to_string();
         sql.push_str(V11_INDEX_SQL);
         return sql;
     }
@@ -765,7 +880,7 @@ fn validate_legacy_markers(connection: &Connection, version: u32) -> StoreResult
             .collect::<BTreeSet<_>>();
         if markers != expected {
             return Err(StoreError::InvalidState(
-                "v11 migration markers are incomplete or unknown".to_string(),
+                "v12 migration markers are incomplete or unknown".to_string(),
             ));
         }
         return Ok(());
@@ -818,6 +933,7 @@ fn validate_legacy_markers(connection: &Connection, version: u32) -> StoreResult
             (8, APPROVAL_EXECUTION_RECOVERY_SCHEMA_MIGRATION),
             (9, THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION),
             (10, STABLE_ENUM_TEXT_SCHEMA_MIGRATION),
+            (11, TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION),
         ] {
             if number <= version {
                 expected.insert(marker.to_string());
@@ -1044,6 +1160,7 @@ fn read_legacy_traces(
     threads: &[LegacyThreadRow],
     turns: &[LegacyTurnRow],
     allow_repair: bool,
+    version: u32,
 ) -> StoreResult<Vec<LegacyTraceRow>> {
     if !table_exists(connection, "trace_events")? {
         return Ok(Vec::new());
@@ -1167,11 +1284,22 @@ fn read_legacy_traces(
                     StoreError::InvalidState(format!("trace {event_id} binding invalid: {error}"))
                 })?;
         }
+        event
+            .validate_span_lifecycle()
+            .map_err(|error| StoreError::InvalidState(format!("trace span is invalid: {error}")))?;
         if event.redaction_applied {
-            if event.payload_hash != trace_payload_hash(&event.payload) {
+            let expected_hash = if version < SCHEMA_VERSION {
+                trace_payload_hash(&event.payload)
+            } else {
+                trace_envelope_hash(&event)
+            };
+            if event.payload_hash != expected_hash {
                 return Err(StoreError::TraceIntegrity(format!(
-                    "payload hash mismatch for {event_id}"
+                    "trace envelope hash mismatch for {event_id}"
                 )));
+            }
+            if version < SCHEMA_VERSION {
+                event = sanitize_trace_event(&event);
             }
         } else if allow_repair {
             event = sanitize_trace_event(&event);
@@ -1335,7 +1463,7 @@ fn decode_legacy_approval_request(
                 serde_json::from_str::<LegacyApprovalRequestCurrent>(payload).map_err(invalid)?;
             current_approval_request(value, &context)
         }
-        11 => serde_json::from_str::<ApprovalRequest>(payload).map_err(invalid),
+        11 | 12 => serde_json::from_str::<ApprovalRequest>(payload).map_err(invalid),
         _ => Err(StoreError::InvalidState(format!(
             "approval {request_id} uses unsupported schema version {version}"
         ))),
@@ -1507,7 +1635,7 @@ fn read_legacy_pending_tool_calls(
                 "pending tool call {request_id} has no approval request"
             ))
         })?;
-        if version < SCHEMA_VERSION {
+        if version < 11 {
             return Err(StoreError::InvalidState(format!(
                 "v{version} pending AgentLoop checkpoint {request_id} cannot be migrated into the current checkpoint contract"
             )));
@@ -1862,7 +1990,7 @@ fn read_legacy_data(
     let approvals = read_legacy_approvals(connection, version)?;
     let decisions = read_legacy_decisions(connection)?;
     let pending_tool_calls = read_legacy_pending_tool_calls(connection, version, &approvals)?;
-    let traces = read_legacy_traces(connection, &threads, &turns, allow_trace_repair)?;
+    let traces = read_legacy_traces(connection, &threads, &turns, allow_trace_repair, version)?;
     let artifacts = read_legacy_artifacts(connection)?;
     let data = LegacyData {
         threads,
@@ -1876,6 +2004,13 @@ fn read_legacy_data(
     };
     validate_legacy_sequences(&data, version)?;
     validate_legacy_approvals(&data)?;
+    validate_trace_span_batch(
+        &data
+            .traces
+            .iter()
+            .map(|trace| trace.event.clone())
+            .collect::<Vec<_>>(),
+    )?;
     Ok(data)
 }
 
@@ -1887,20 +2022,20 @@ fn migrate_legacy_schema(connection: &Connection, version: u32) -> StoreResult<(
     // Foreign keys remain enabled: replacement rows are inserted parent-first
     // and legacy tables are removed child-first within this transaction.
     let data = read_legacy_data(&transaction, version, true)?;
-    write_v11_tables(&transaction, &data)?;
+    write_v12_tables(&transaction, &data)?;
     // Validate the fully rebuilt schema while the old database is still
     // recoverable by the transaction. A post-commit validation cannot
     // protect source tables from a malformed final schema or row.
-    validate_v11_schema(&transaction)?;
+    validate_v12_schema(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
 
-fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<()> {
-    connection.execute_batch(&canonical_v11_schema_sql("_v11"))?;
+fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<()> {
+    connection.execute_batch(&canonical_v12_schema_sql("_v12"))?;
     for thread in &data.threads {
         connection.execute(
-            "insert into threads_v11(thread_id, model, cwd, status, sandbox_mode, approval_policy)
+            "insert into threads_v12(thread_id, model, cwd, status, sandbox_mode, approval_policy)
          values(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 thread.thread_id,
@@ -1914,7 +2049,7 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     }
     for turn in &data.turns {
         connection.execute(
-            "insert into turns_v11(turn_id, thread_id, turn_sequence, status, agent_loop_status)
+            "insert into turns_v12(turn_id, thread_id, turn_sequence, status, agent_loop_status)
          values(?1, ?2, ?3, ?4, ?5)",
             params![
                 turn.turn_id,
@@ -1927,7 +2062,7 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     }
     for item in &data.items {
         connection.execute(
-        "insert into items_v11(item_id, turn_id, item_sequence, kind, payload, status, redacted)
+        "insert into items_v12(item_id, turn_id, item_sequence, kind, payload, status, redacted)
          values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             item.item_id,
@@ -1941,15 +2076,15 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     )?;
     }
     for trace in &data.traces {
-        let event = &trace.event;
+        let event = sanitize_trace_event(&trace.event);
         connection.execute(
-            "insert into trace_events_v11(event_id, run_id, session_id, payload)
-         values(?1, ?2, ?3, ?4)",
+            "insert into trace_events_v12(event_id, run_id, session_id, payload)
+             values(?1, ?2, ?3, ?4)",
             params![
                 event.event_id,
                 event.run_id,
                 event.session_id,
-                serde_json::to_string(event)?,
+                serde_json::to_string(&event)?,
             ],
         )?;
     }
@@ -1959,7 +2094,7 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
             .map(final_approval_outcome_to_db_text)
             .transpose()?;
         connection.execute(
-            "insert into approvals_v11(
+            "insert into approvals_v12(
              request_id, thread_id, turn_id, payload, decision_outcome, decision_reason
          ) values(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -1975,7 +2110,7 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     for decision in &data.decisions {
         let outcome = final_approval_outcome_to_db_text(decision.decision.outcome)?;
         connection.execute(
-            "insert into approval_decisions_v11(decision_id, request_id, outcome, reason, payload)
+            "insert into approval_decisions_v12(decision_id, request_id, outcome, reason, payload)
          values(?1, ?2, ?3, ?4, ?5)",
             params![
                 decision.decision.decision_id,
@@ -1988,7 +2123,7 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     }
     for pending in &data.pending_tool_calls {
         connection.execute(
-            "insert into pending_tool_calls_v11(
+            "insert into pending_tool_calls_v12(
              request_id, thread_id, turn_id, tool_call_id, payload, execution_state
          ) values(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -2004,7 +2139,7 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     for artifact in &data.artifacts {
         let artifact = &artifact.artifact;
         connection.execute(
-            "insert into artifact_refs_v11(
+            "insert into artifact_refs_v12(
              artifact_id, run_id, item_id, kind, uri, content_digest,
              summary, metadata, redacted
          ) values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -2023,12 +2158,12 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     }
     for migration in EXPECTED_MIGRATIONS {
         connection.execute(
-            "insert into schema_migrations_v11(migration_id) values(?1)",
+            "insert into schema_migrations_v12(migration_id) values(?1)",
             params![migration],
         )?;
     }
     connection.execute(
-        "insert into schema_meta_v11(schema_version) values(?1)",
+        "insert into schema_meta_v12(schema_version) values(?1)",
         params![SCHEMA_VERSION],
     )?;
 
@@ -2047,40 +2182,41 @@ fn write_v11_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
     drop table if exists artifact_refs;
     drop table if exists schema_migrations;
     drop table if exists schema_meta;
-    alter table schema_meta_v11 rename to schema_meta;
-    alter table schema_migrations_v11 rename to schema_migrations;
-    alter table threads_v11 rename to threads;
-    alter table turns_v11 rename to turns;
-    alter table items_v11 rename to items;
-    alter table trace_events_v11 rename to trace_events;
-    alter table approvals_v11 rename to approvals;
-    alter table approval_decisions_v11 rename to approval_decisions;
-    alter table artifact_refs_v11 rename to artifact_refs;
-    alter table pending_tool_calls_v11 rename to pending_tool_calls;
+    alter table schema_meta_v12 rename to schema_meta;
+    alter table schema_migrations_v12 rename to schema_migrations;
+    alter table threads_v12 rename to threads;
+    alter table turns_v12 rename to turns;
+    alter table items_v12 rename to items;
+    alter table trace_events_v12 rename to trace_events;
+    alter table approvals_v12 rename to approvals;
+    alter table approval_decisions_v12 rename to approval_decisions;
+    alter table artifact_refs_v12 rename to artifact_refs;
+    alter table pending_tool_calls_v12 rename to pending_tool_calls;
     "#,
     )?;
-    connection.execute_batch(V11_INDEX_SQL)?;
+    connection.execute_batch(&v12_index_sql())?;
     Ok(())
 }
 
-fn validate_v11_schema(connection: &Connection) -> StoreResult<()> {
-    validate_v11_structure(connection)?;
+fn validate_v12_schema(connection: &Connection) -> StoreResult<()> {
+    validate_v12_structure(connection)?;
     read_legacy_data(connection, SCHEMA_VERSION, false)?;
-    fail_closed_on_foreign_key_violations(connection, "v11 validation")?;
+    validate_trace_span_rows(connection)?;
+    fail_closed_on_foreign_key_violations(connection, "v12 validation")?;
     Ok(())
 }
 
 // Validate the immutable v11 interface without scanning or decoding every
 // stored row.  Trusted reopen uses this after the owning process initialized
 // the database; row payloads remain validated at each read or transaction.
-pub(crate) fn validate_v11_structure(connection: &Connection) -> StoreResult<()> {
+pub(crate) fn validate_v12_structure(connection: &Connection) -> StoreResult<()> {
     if schema_meta_version(connection)? != Some(SCHEMA_VERSION) {
         return Err(StoreError::InvalidState(
-            "v11 schema_meta version is missing or inconsistent".to_string(),
+            "v12 schema_meta version is missing or inconsistent".to_string(),
         ));
     }
     validate_legacy_markers(connection, SCHEMA_VERSION)?;
-    validate_canonical_v11_fingerprint(connection)
+    validate_canonical_v12_fingerprint(connection)
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2164,7 +2300,24 @@ fn validate_canonical_v11_fingerprint(connection: &Connection) -> StoreResult<()
     Ok(())
 }
 
+fn validate_canonical_v12_fingerprint(connection: &Connection) -> StoreResult<()> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(&canonical_v12_schema_sql(""))?;
+    reference.execute_batch(&v12_index_sql())?;
+    let expected = schema_fingerprint(&reference)?;
+    let actual = schema_fingerprint(connection)?;
+    if actual != expected {
+        return Err(StoreError::InvalidState(
+            "v12 schema fingerprint is not canonical".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_legacy_schema_fingerprint(connection: &Connection, version: u32) -> StoreResult<()> {
+    if version == 11 {
+        return validate_canonical_v11_fingerprint(connection);
+    }
     let actual = schema_fingerprint(connection)?;
     let sidecar_options: &[bool] = match version {
         3 | 4 => &[true],
@@ -2430,7 +2583,9 @@ mod tests {
         for migration in EXPECTED_MIGRATIONS.iter().copied().filter(|migration| {
             !matches!(
                 *migration,
-                STABLE_ENUM_TEXT_SCHEMA_MIGRATION | TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION
+                STABLE_ENUM_TEXT_SCHEMA_MIGRATION
+                    | TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION
+                    | TYPED_TRACE_SPAN_SCHEMA_MIGRATION
             )
         }) {
             connection
