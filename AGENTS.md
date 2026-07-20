@@ -2,10 +2,12 @@
 
 ## 事实入口与范围
 
-1. `.codex/repo-map.json` 存在且与当前 HEAD 一致时，可用其定位最小相关 Rust crate、符号和测试；否则以当前源码为准。
-2. 先读实现、调用方、配置和相邻测试，再修改。不要把报告、旧文档或历史提交当作当前事实。
-3. 默认不读取 `.git/`、`.singularity/`、`target/`、`work/` 或其他运行产物，除非任务明确涉及 Git、缓存、产物或环境诊断。
-4. 不读取、输出或提交 `.env` 中的敏感值；环境检查只报告脱敏的 present/missing 状态。
+1. `.qoder/repowiki` 存在时，先读取其元数据中的 `wiki_repo.last_commit_id`；仅当该提交与当前 HEAD 一致时，才将 Qoder Repo Wiki 用作源码导航入口。
+2. 使用 Qoder Repo Wiki 时，优先定向查询当前任务相关的目录、关键词、源码文件和行号，只提取最小命中集合，不得把大型元数据整体加载进上下文。
+3. Qoder Repo Wiki 只用于定位，不是实现事实；结论必须回到当前源码、调用方、测试及 `docs/singularity.md` 核实。Wiki 缺失、无法解析或落后于当前 HEAD 时，依次回退到与当前 HEAD 一致的 `.codex/repo-map.json` 和当前源码。
+4. 先读实现、调用方、配置和相邻测试，再修改。不要把报告、旧文档或历史提交当作当前事实。
+5. 默认不读取 `.git/`、`.singularity/`、`target/`、`work/` 或其他运行产物，除非任务明确涉及 Git、缓存、产物或环境诊断。
+6. 不读取、输出或提交 `.env` 中的敏感值；环境检查只报告脱敏的 present/missing 状态。
 
 ## 命令与磁盘
 1. Rust 构建和测试优先为单次命令设置 `CARGO_TARGET_DIR` 到空间充足的非系统盘，并复用同一目录；不要修改用户的全局 Cargo 配置。
