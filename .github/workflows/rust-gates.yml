@@ -31,8 +31,6 @@ jobs:
     if: ${{ inputs.run_supply_chain }}
     name: Supply-chain policy
     runs-on: ${{ fromJSON(inputs.supply_chain_runner) }}
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
 
     steps:
       - name: Check out repository
@@ -41,6 +39,9 @@ jobs:
           clean: true
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Configure job-local Cargo target
+        run: Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'cargo-target')"
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
@@ -77,8 +78,6 @@ jobs:
   rust:
     name: Rust (${{ matrix.name }})
     runs-on: ${{ fromJSON(matrix.runs_on) }}
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.rust_runner_matrix) }}
@@ -90,6 +89,9 @@ jobs:
           clean: true
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Configure job-local Cargo target
+        run: Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'cargo-target')"
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
