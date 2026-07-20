@@ -3834,6 +3834,106 @@ fn typed_trace_span_lifecycle_rejects_duplicates_and_cross_run_parents() {
 }
 
 #[test]
+fn prompt_assembly_start_end_contract_is_closed_and_fail_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let make_pair = |span_id: &str,
+                     start_projection: Option<TraceSpanProjection>,
+                     end_projection: TraceSpanProjection| {
+        let mut start = TraceEvent::new(
+            format!("{span_id}_start"),
+            "prompt_run",
+            "prompt_session",
+            "agent",
+            "prompt",
+        );
+        start.span_id = Some(span_id.to_string());
+        start.span_kind = Some(TraceSpanKind::PromptAssembly);
+        start.span_phase = Some(TraceSpanPhase::Start);
+        start.span_projection = start_projection;
+
+        let mut end = TraceEvent::new(
+            format!("{span_id}_end"),
+            "prompt_run",
+            "prompt_session",
+            "agent",
+            "prompt",
+        );
+        end.span_id = Some(span_id.to_string());
+        end.span_kind = Some(TraceSpanKind::PromptAssembly);
+        end.span_phase = Some(TraceSpanPhase::End);
+        end.span_status = Some(TraceSpanStatus::Ok);
+        end.duration_ms = Some(4);
+        end.span_projection = Some(end_projection);
+        (start, end)
+    };
+
+    let terminal_projection = || TraceSpanProjection {
+        message_count: Some(3),
+        tool_count: Some(1),
+        request_token_count: Some(8),
+        request_digest: Some(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ),
+        compacted: Some(true),
+        finalization_only: Some(false),
+        model_turn_ordinal: Some(2),
+        ..TraceSpanProjection::default()
+    };
+
+    let (unknown_start, real_end) = make_pair("unknown", None, terminal_projection());
+    store
+        .append_trace_batch(&[unknown_start, real_end])
+        .expect("unknown start and real end");
+
+    let (terminal_start, terminal_end) = make_pair(
+        "terminal_start",
+        Some(TraceSpanProjection {
+            message_count: Some(3),
+            ..TraceSpanProjection::default()
+        }),
+        terminal_projection(),
+    );
+    assert!(
+        store
+            .append_trace_batch(&[terminal_start, terminal_end])
+            .is_err()
+    );
+
+    let (empty_digest_start, mut empty_digest_end) =
+        make_pair("empty_digest", None, terminal_projection());
+    empty_digest_end
+        .span_projection
+        .as_mut()
+        .expect("end projection")
+        .request_digest = Some(String::new());
+    assert!(
+        store
+            .append_trace_batch(&[empty_digest_start, empty_digest_end])
+            .is_err()
+    );
+
+    let (stable_start, stable_end) = make_pair(
+        "stable_mismatch",
+        Some(TraceSpanProjection {
+            finalization_only: Some(false),
+            model_turn_ordinal: Some(1),
+            ..TraceSpanProjection::default()
+        }),
+        TraceSpanProjection {
+            finalization_only: Some(false),
+            model_turn_ordinal: Some(2),
+            ..TraceSpanProjection::default()
+        },
+    );
+    assert!(
+        store
+            .append_trace_batch(&[stable_start, stable_end])
+            .is_err()
+    );
+}
+
+#[test]
 fn append_trace_batch_validates_every_event_before_any_insert() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
@@ -4028,7 +4128,10 @@ fn trace_metrics_are_derived_from_typed_trace_events_with_deterministic_percenti
         7,
     );
     tool_end.span_projection = Some(TraceSpanProjection {
-        tool: Some(Default::default()),
+        tool: Some(TraceToolProjection {
+            status: Some(TraceToolStatus::Succeeded),
+            ..TraceToolProjection::default()
+        }),
         ..TraceSpanProjection::default()
     });
 
@@ -4075,6 +4178,7 @@ fn trace_metrics_are_derived_from_typed_trace_events_with_deterministic_percenti
         .as_ref()
         .expect("distribution");
     assert_eq!(distribution.count, 2);
+    assert_eq!(distribution.sum, 30);
     assert_eq!(distribution.p50, Some(10));
     assert_eq!(distribution.p95, Some(20));
     assert!(matches!(
@@ -4094,6 +4198,16 @@ fn trace_metrics_are_derived_from_typed_trace_events_with_deterministic_percenti
             .count,
         1
     );
+    assert_eq!(
+        metrics
+            .metric("completion_rejection_count")
+            .expect("rejection")
+            .distribution
+            .as_ref()
+            .expect("rejection distribution")
+            .sum,
+        2
+    );
 }
 
 #[test]
@@ -4101,14 +4215,21 @@ fn trace_metrics_accept_untyped_transport_samples_and_new_observation_projection
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
 
-    let mut prompt_start = metric_span(
+    let prompt_start = metric_span(
         "prompt_start",
         "prompt",
         TraceSpanKind::PromptAssembly,
         TraceSpanPhase::Start,
         0,
     );
-    prompt_start.span_projection = Some(TraceSpanProjection {
+    let mut prompt_end = metric_span(
+        "prompt_end",
+        "prompt",
+        TraceSpanKind::PromptAssembly,
+        TraceSpanPhase::End,
+        4,
+    );
+    prompt_end.span_projection = Some(TraceSpanProjection {
         message_count: Some(3),
         tool_count: Some(1),
         request_token_count: Some(8),
@@ -4120,14 +4241,6 @@ fn trace_metrics_accept_untyped_transport_samples_and_new_observation_projection
         model_turn_ordinal: Some(2),
         ..TraceSpanProjection::default()
     });
-    let mut prompt_end = metric_span(
-        "prompt_end",
-        "prompt",
-        TraceSpanKind::PromptAssembly,
-        TraceSpanPhase::End,
-        4,
-    );
-    prompt_end.span_projection = prompt_start.span_projection.clone();
 
     let mut provider_start = metric_span(
         "provider_start_cached",
@@ -4335,6 +4448,16 @@ fn trace_metrics_accept_untyped_transport_samples_and_new_observation_projection
     );
     assert_eq!(
         metrics
+            .metric("provider_capability_cache_hit_count")
+            .expect("cache hit count")
+            .distribution
+            .as_ref()
+            .expect("cache hit distribution")
+            .sum,
+        2
+    );
+    assert_eq!(
+        metrics
             .metric("provider_capability_cache_hit_rate_bps")
             .expect("cache hit rate")
             .distribution
@@ -4342,6 +4465,16 @@ fn trace_metrics_accept_untyped_transport_samples_and_new_observation_projection
             .expect("cache hit rate distribution")
             .min,
         Some(6666)
+    );
+    assert_eq!(
+        metrics
+            .metric("provider_capability_cache_hit_rate_bps")
+            .expect("cache hit rate")
+            .distribution
+            .as_ref()
+            .expect("cache hit rate distribution")
+            .sum,
+        6666
     );
     assert_eq!(
         metrics
@@ -4355,6 +4488,16 @@ fn trace_metrics_accept_untyped_transport_samples_and_new_observation_projection
     );
     assert_eq!(
         metrics
+            .metric("tool_success_rate_bps")
+            .expect("tool success rate")
+            .distribution
+            .as_ref()
+            .expect("tool success rate distribution")
+            .sum,
+        5000
+    );
+    assert_eq!(
+        metrics
             .metric("event_gap_count")
             .expect("event gap")
             .distribution
@@ -4363,6 +4506,264 @@ fn trace_metrics_accept_untyped_transport_samples_and_new_observation_projection
             .min,
         Some(3)
     );
+    assert_eq!(
+        metrics
+            .metric("event_gap_count")
+            .expect("event gap")
+            .distribution
+            .as_ref()
+            .expect("event gap distribution")
+            .sum,
+        3
+    );
+}
+
+#[test]
+fn trace_metrics_expose_known_zero_counts_and_single_sided_cache_capabilities() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+
+    let provider_start = metric_span(
+        "provider_success_start",
+        "provider_success",
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanPhase::Start,
+        0,
+    );
+    let provider_end = metric_span(
+        "provider_success_end",
+        "provider_success",
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanPhase::End,
+        1,
+    );
+    let mut tool_start = metric_span(
+        "tool_failure_start",
+        "tool_failure",
+        TraceSpanKind::ToolCall,
+        TraceSpanPhase::Start,
+        0,
+    );
+    tool_start.span_projection = Some(TraceSpanProjection {
+        tool: Some(TraceToolProjection::default()),
+        ..TraceSpanProjection::default()
+    });
+    let mut tool_end = metric_span(
+        "tool_failure_end",
+        "tool_failure",
+        TraceSpanKind::ToolCall,
+        TraceSpanPhase::End,
+        1,
+    );
+    tool_end.span_status = Some(TraceSpanStatus::Error);
+    tool_end.span_projection = Some(TraceSpanProjection {
+        tool: Some(TraceToolProjection {
+            status: Some(TraceToolStatus::Failed),
+            ..TraceToolProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    });
+    let mut hit_samples = TraceEvent::new(
+        "cache_hit_samples",
+        "metrics_run",
+        "metrics_session",
+        "transport",
+        "cache hits",
+    );
+    hit_samples.metric_samples = vec![
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::ProviderCapabilityCacheHit,
+            count: 2,
+        },
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::ProviderCapabilityCacheHit,
+            count: 3,
+        },
+    ];
+    store
+        .append_trace_batch(&[
+            provider_start,
+            provider_end,
+            tool_start,
+            tool_end,
+            hit_samples,
+        ])
+        .expect("append known zero metrics");
+
+    let metrics = store.trace_metrics("metrics_run").expect("trace metrics");
+    for name in ["provider_error_count", "tool_success_count"] {
+        let metric = metrics.metric(name).expect("count metric");
+        assert!(matches!(
+            metric.availability,
+            TraceMetricAvailability::Available
+        ));
+        assert_eq!(
+            metric
+                .distribution
+                .as_ref()
+                .expect("count distribution")
+                .sum,
+            0
+        );
+    }
+    assert_eq!(
+        metrics
+            .metric("tool_success_rate_bps")
+            .expect("tool success rate")
+            .distribution
+            .as_ref()
+            .expect("tool success rate distribution")
+            .sum,
+        0
+    );
+    assert_eq!(
+        metrics
+            .metric("provider_capability_cache_hit_count")
+            .expect("cache hit count")
+            .distribution
+            .as_ref()
+            .expect("cache hit distribution")
+            .sum,
+        5
+    );
+    assert_eq!(
+        metrics
+            .metric("provider_capability_cache_miss_count")
+            .expect("cache miss count")
+            .distribution
+            .as_ref()
+            .expect("cache miss distribution")
+            .sum,
+        0
+    );
+    assert_eq!(
+        metrics
+            .metric("provider_capability_cache_hit_rate_bps")
+            .expect("cache hit rate")
+            .distribution
+            .as_ref()
+            .expect("cache hit rate distribution")
+            .sum,
+        10_000
+    );
+
+    let miss_dir = tempfile::tempdir().expect("miss temp dir");
+    let miss_store =
+        SessionStore::open(miss_dir.path().join("sessions.sqlite3")).expect("open miss store");
+    let mut miss_samples = TraceEvent::new(
+        "cache_miss_samples",
+        "metrics_run",
+        "metrics_session",
+        "transport",
+        "cache misses",
+    );
+    miss_samples.metric_samples = vec![TraceMetricSample {
+        kind: TraceMetricSampleKind::ProviderCapabilityCacheMiss,
+        count: 4,
+    }];
+    miss_store
+        .append_trace(&miss_samples)
+        .expect("append cache miss");
+    let miss_metrics = miss_store
+        .trace_metrics("metrics_run")
+        .expect("miss metrics");
+    assert_eq!(
+        miss_metrics
+            .metric("provider_capability_cache_hit_count")
+            .expect("cache hit count")
+            .distribution
+            .as_ref()
+            .expect("cache hit distribution")
+            .sum,
+        0
+    );
+    assert_eq!(
+        miss_metrics
+            .metric("provider_capability_cache_miss_count")
+            .expect("cache miss count")
+            .distribution
+            .as_ref()
+            .expect("cache miss distribution")
+            .sum,
+        4
+    );
+    assert_eq!(
+        miss_metrics
+            .metric("provider_capability_cache_hit_rate_bps")
+            .expect("cache hit rate")
+            .distribution
+            .as_ref()
+            .expect("cache hit rate distribution")
+            .sum,
+        0
+    );
+}
+
+#[test]
+fn trace_metrics_fail_closed_for_missing_or_conflicting_tool_terminal_status() {
+    for (span_status, tool_status) in [
+        (TraceSpanStatus::Ok, None),
+        (TraceSpanStatus::Ok, Some(TraceToolStatus::Failed)),
+        (TraceSpanStatus::Cancelled, Some(TraceToolStatus::Succeeded)),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let mut start = metric_span(
+            "tool_terminal_start",
+            "tool_terminal",
+            TraceSpanKind::ToolCall,
+            TraceSpanPhase::Start,
+            0,
+        );
+        start.span_projection = Some(TraceSpanProjection {
+            tool: Some(TraceToolProjection::default()),
+            ..TraceSpanProjection::default()
+        });
+        let mut end = metric_span(
+            "tool_terminal_end",
+            "tool_terminal",
+            TraceSpanKind::ToolCall,
+            TraceSpanPhase::End,
+            1,
+        );
+        end.span_status = Some(span_status);
+        end.span_projection = Some(TraceSpanProjection {
+            tool: Some(TraceToolProjection {
+                status: tool_status,
+                ..TraceToolProjection::default()
+            }),
+            ..TraceSpanProjection::default()
+        });
+        store
+            .append_trace_batch(&[start, end])
+            .expect("append tool trace");
+        assert!(store.trace_metrics("metrics_run").is_err());
+    }
+}
+
+#[test]
+fn trace_metric_sample_sum_overflow_fails_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let mut event = TraceEvent::new(
+        "overflow_samples",
+        "metrics_run",
+        "metrics_session",
+        "transport",
+        "overflow samples",
+    );
+    event.metric_samples = vec![
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::EventGap,
+            count: i64::MAX as u64,
+        };
+        3
+    ];
+    store.append_trace(&event).expect("append overflow samples");
+    assert!(matches!(
+        store.trace_metrics("metrics_run"),
+        Err(StoreError::InvalidState(message)) if message.contains("trace metric sum overflow")
+    ));
 }
 
 #[test]

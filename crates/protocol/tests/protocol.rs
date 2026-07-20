@@ -589,6 +589,34 @@ fn trace_span_lifecycle_roundtrips_and_legacy_events_remain_valid() {
 }
 
 #[test]
+fn prompt_assembly_start_can_be_unknown_before_end_projection_is_known() {
+    let mut start = TraceEvent::new("prompt_start", "run", "session", "agent", "prompt");
+    start.span_id = Some("prompt_span".to_string());
+    start.span_kind = Some(TraceSpanKind::PromptAssembly);
+    start.span_phase = Some(TraceSpanPhase::Start);
+    assert!(start.validate_span_lifecycle().is_ok());
+
+    let mut end = start.clone();
+    end.event_id = "prompt_end".to_string();
+    end.span_phase = Some(TraceSpanPhase::End);
+    end.span_status = Some(TraceSpanStatus::Ok);
+    end.duration_ms = Some(4);
+    end.span_projection = Some(TraceSpanProjection {
+        message_count: Some(3),
+        tool_count: Some(1),
+        request_token_count: Some(8),
+        request_digest: Some(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ),
+        compacted: Some(true),
+        finalization_only: Some(false),
+        model_turn_ordinal: Some(2),
+        ..TraceSpanProjection::default()
+    });
+    assert!(end.validate_span_lifecycle().is_ok());
+}
+
+#[test]
 fn trace_span_lifecycle_rejects_invalid_phase_combinations() {
     let cases = [
         (
@@ -730,7 +758,20 @@ fn trace_metric_samples_are_typed_and_end_only() {
 
 #[test]
 fn trace_projection_carries_safe_agent_observation_identity_and_sandbox_outcome() {
-    let prompt = TraceSpanProjection {
+    let prompt_start = TraceSpanProjection {
+        finalization_only: Some(false),
+        model_turn_ordinal: Some(2),
+        ..TraceSpanProjection::default()
+    };
+    assert!(
+        prompt_start
+            .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::Start)
+            .is_ok()
+    );
+    let prompt_end = TraceSpanProjection {
+        message_count: Some(3),
+        tool_count: Some(1),
+        request_token_count: Some(8),
         request_digest: Some(
             "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         ),
@@ -740,22 +781,120 @@ fn trace_projection_carries_safe_agent_observation_identity_and_sandbox_outcome(
         ..TraceSpanProjection::default()
     };
     assert!(
-        prompt
-            .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::Start)
+        prompt_end
+            .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::End)
             .is_ok()
     );
-    assert!(prompt.same_identity_attributes(&TraceSpanProjection {
-        request_digest: Some(
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        ),
-        compacted: Some(true),
-        finalization_only: Some(false),
-        model_turn_ordinal: Some(2),
-        ..TraceSpanProjection::default()
-    }));
-    let mut changed_prompt = prompt.clone();
+    assert!(prompt_start.same_identity_attributes(&prompt_end));
+    let mut changed_prompt = prompt_start.clone();
     changed_prompt.model_turn_ordinal = Some(3);
-    assert!(!prompt.same_identity_attributes(&changed_prompt));
+    assert!(!prompt_start.same_identity_attributes(&changed_prompt));
+
+    for projection in [
+        TraceSpanProjection {
+            operation_count: Some(1),
+            ..TraceSpanProjection::default()
+        },
+        TraceSpanProjection {
+            message_count: Some(1),
+            ..TraceSpanProjection::default()
+        },
+        TraceSpanProjection {
+            tool_count: Some(1),
+            ..TraceSpanProjection::default()
+        },
+        TraceSpanProjection {
+            request_token_count: Some(1),
+            ..TraceSpanProjection::default()
+        },
+        TraceSpanProjection {
+            request_digest: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+            ..TraceSpanProjection::default()
+        },
+        TraceSpanProjection {
+            compacted: Some(true),
+            ..TraceSpanProjection::default()
+        },
+    ] {
+        assert!(
+            projection
+                .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::Start)
+                .is_err()
+        );
+    }
+    let prompt_only_fields = [
+        (
+            "operation_count",
+            TraceSpanProjection {
+                operation_count: Some(1),
+                ..TraceSpanProjection::default()
+            },
+        ),
+        (
+            "message_count",
+            TraceSpanProjection {
+                message_count: Some(1),
+                ..TraceSpanProjection::default()
+            },
+        ),
+        (
+            "tool_count",
+            TraceSpanProjection {
+                tool_count: Some(1),
+                ..TraceSpanProjection::default()
+            },
+        ),
+        (
+            "request_token_count",
+            TraceSpanProjection {
+                request_token_count: Some(1),
+                ..TraceSpanProjection::default()
+            },
+        ),
+        (
+            "request_digest",
+            TraceSpanProjection {
+                request_digest: Some(
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                ),
+                ..TraceSpanProjection::default()
+            },
+        ),
+        (
+            "compacted",
+            TraceSpanProjection {
+                compacted: Some(true),
+                ..TraceSpanProjection::default()
+            },
+        ),
+        (
+            "finalization_only",
+            TraceSpanProjection {
+                finalization_only: Some(false),
+                ..TraceSpanProjection::default()
+            },
+        ),
+    ];
+    for (field, projection) in prompt_only_fields {
+        assert!(
+            projection
+                .validate_for(TraceSpanKind::ProviderAttempt, TraceSpanPhase::End)
+                .is_err(),
+            "accepted Prompt-only field {field} on ProviderAttempt"
+        );
+    }
+    assert!(
+        TraceSpanProjection {
+            request_digest: Some(String::new()),
+            ..TraceSpanProjection::default()
+        }
+        .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::End)
+        .is_err()
+    );
 
     let tool = TraceSpanProjection {
         model_turn_ordinal: Some(2),

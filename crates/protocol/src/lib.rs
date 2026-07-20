@@ -1298,9 +1298,16 @@ pub struct TraceSpanProjection {
 
 impl TraceSpanProjection {
     fn has_prompt_fields(&self) -> bool {
-        self.request_digest.is_some()
+        self.has_prompt_terminal_fields() || self.finalization_only.is_some()
+    }
+
+    fn has_prompt_terminal_fields(&self) -> bool {
+        self.operation_count.is_some()
+            || self.message_count.is_some()
+            || self.tool_count.is_some()
+            || self.request_token_count.is_some()
+            || self.request_digest.is_some()
             || self.compacted.is_some()
-            || self.finalization_only.is_some()
     }
 
     fn has_provider_fields(&self) -> bool {
@@ -1449,9 +1456,17 @@ impl TraceSpanProjection {
         if self
             .request_digest
             .as_deref()
-            .is_some_and(|digest| !digest.is_empty() && !is_trace_digest(digest))
+            .is_some_and(|digest| !is_trace_digest(digest))
         {
             return Err("prompt request_digest must be a sha256 digest".to_string());
+        }
+        if kind == TraceSpanKind::PromptAssembly
+            && phase == TraceSpanPhase::Start
+            && self.has_prompt_terminal_fields()
+        {
+            return Err(
+                "prompt assembly start must not include terminal projection fields".to_string(),
+            );
         }
         if phase == TraceSpanPhase::Start && self.has_terminal_fields() {
             return Err("span start must not include terminal projection fields".to_string());
@@ -1461,18 +1476,13 @@ impl TraceSpanProjection {
 
     /// Compare only start/end attributes that must remain stable for one span.
     pub fn same_identity_attributes(&self, other: &Self) -> bool {
-        self.operation_count == other.operation_count
-            && self.message_count == other.message_count
-            && self.tool_count == other.tool_count
-            && self.request_token_count == other.request_token_count
-            && same_digest_identity(
-                self.request_digest.as_deref(),
-                other.request_digest.as_deref(),
-            )
-            && self.compacted == other.compacted
-            && self.finalization_only == other.finalization_only
-            && self.model_turn_ordinal == other.model_turn_ordinal
-            && self.provider_name == other.provider_name
+        same_if_present(
+            self.finalization_only.as_ref(),
+            other.finalization_only.as_ref(),
+        ) && same_if_present(
+            self.model_turn_ordinal.as_ref(),
+            other.model_turn_ordinal.as_ref(),
+        ) && self.provider_name == other.provider_name
             && self.model_name == other.model_name
             && self.protocol == other.protocol
             && self.operation_phase == other.operation_phase
@@ -1516,13 +1526,6 @@ fn same_if_present<T: PartialEq + ?Sized>(left: Option<&T>, right: Option<&T>) -
         (Some(left), Some(right)) => left == right,
         _ => true,
     }
-}
-
-fn same_digest_identity(left: Option<&str>, right: Option<&str>) -> bool {
-    same_if_present(
-        left.filter(|value| !value.is_empty()),
-        right.filter(|value| !value.is_empty()),
-    )
 }
 
 fn is_trace_digest(value: &str) -> bool {
@@ -1651,6 +1654,8 @@ pub enum TraceMetricAvailability {
 /// 使用 nearest-rank 的确定性分布摘要。
 pub struct TraceMetricDistribution {
     pub count: u64,
+    /// Checked integer aggregate of all values represented by this distribution.
+    pub sum: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
