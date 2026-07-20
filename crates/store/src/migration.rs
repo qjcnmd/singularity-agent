@@ -2206,7 +2206,7 @@ fn validate_v12_schema(connection: &Connection) -> StoreResult<()> {
     Ok(())
 }
 
-// Validate the immutable v11 interface without scanning or decoding every
+// Validate the immutable v12 interface without scanning or decoding every
 // stored row.  Trusted reopen uses this after the owning process initialized
 // the database; row payloads remain validated at each read or transaction.
 pub(crate) fn validate_v12_structure(connection: &Connection) -> StoreResult<()> {
