@@ -44,7 +44,7 @@ use singularity_protocol::{
     TraceTailParams, TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult,
     TurnStartParams, TurnStartResult, TurnStatus,
 };
-use singularity_sandbox::{SandboxBackend, SandboxBackendEnforcement, WindowsSandboxBackend};
+use singularity_sandbox::{PlatformSandboxBackend, SandboxBackend, SandboxBackendEnforcement};
 use singularity_store::{
     CommitTurnOutcomeParams, CommittedTurnOutcome, CreateStartedTurnParams, SessionStore,
     StoreError, TurnOutcomeAuthority,
@@ -674,7 +674,7 @@ impl AppServer {
             initialized_acknowledged: false,
             event_filter: Arc::new(Mutex::new(EventSubscriptionState::default())),
             shutdown_requested: false,
-            sandbox_backend: Arc::new(WindowsSandboxBackend::new()),
+            sandbox_backend: Arc::new(PlatformSandboxBackend::new()),
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
