@@ -744,6 +744,18 @@ impl SandboxBackend for WindowsSandboxBackend {
     }
 }
 
+/// Backend selected for the current target without exposing platform selection to callers.
+#[cfg(windows)]
+pub type PlatformSandboxBackend = WindowsSandboxBackend;
+
+/// Backend selected for the current target without exposing platform selection to callers.
+#[cfg(target_os = "linux")]
+pub type PlatformSandboxBackend = LinuxSandboxBackend;
+
+/// Fail-closed placeholder for targets without a strict sandbox implementation.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub type PlatformSandboxBackend = WindowsSandboxBackend;
+
 /// 将 `argv` 转换为策略和审计记录使用的稳定权限资源标识。
 pub fn command_permission_resource(argv: &[String]) -> String {
     if argv.is_empty() {
