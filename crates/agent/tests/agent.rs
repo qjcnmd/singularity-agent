@@ -1,12 +1,11 @@
 //! AgentLoop 的 Direct tool、completion、approval 和恢复回归测试。
 
-// Model 的运行时-only attempt occurrences 字段在并行候选中加入；当前基线尚无该字段。
 #![allow(clippy::needless_update)]
 
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentObservation, AgentPlan, AgentPlanStep,
-    AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentStatus,
+    AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentRunStatus, AgentStatus,
     AgentVerificationRequirement, ApprovalGrant, FinalReviewStatus, OccurrenceLifecycle,
     PendingApprovalOccurrence, PolicyDecisionCause, PolicyDecisionStatus, PromptAssemblyStatus,
     SandboxExecutionStatus, ToolCallStatus, VerificationStatus, agent_control_tool_entries,
@@ -17,7 +16,8 @@ use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage,
     ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderApiProtocol,
-    ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError,
+    ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
+    ProviderAttemptStatus, ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError,
     ProviderProtocolContract, ProviderProtocolNegotiation, ProviderStreamEvent, ToolChoiceMode,
 };
 use singularity_policy::{
@@ -58,6 +58,31 @@ fn pending_approval(result: &AgentLoopResult) -> PendingApprovalOccurrence {
         .first()
         .expect("pending approval")
         .clone()
+}
+
+fn provider_attempt_occurrence(
+    attempt_index: u32,
+    provider_name: &str,
+    terminal_status: ProviderAttemptStatus,
+) -> ProviderAttemptOccurrence {
+    ProviderAttemptOccurrence {
+        operation_phase: ProviderAttemptOperationPhase::Completion,
+        provider_name: provider_name.to_string(),
+        model_name: "gpt-test".to_string(),
+        actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+        attempt_index,
+        terminal_status,
+        attempt_duration_ms: 10,
+        request_send_to_headers_ms: Some(4),
+        queue_duration_ms: None,
+        time_to_first_text_delta_ms: None,
+        retry_scheduled: false,
+        retry_backoff_ms: None,
+        error_category: None,
+        error_stage: None,
+        diagnostic_code: None,
+        usage: Some(ModelUsage::default()),
+    }
 }
 
 struct StaticProvider {
@@ -6102,6 +6127,10 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
         attempt_count: 2,
         retry_count: 1,
         latency_ms: 80,
+        occurrences: vec![
+            provider_attempt_occurrence(99, "provider-plan-first", ProviderAttemptStatus::Ok),
+            provider_attempt_occurrence(99, "provider-plan-retry", ProviderAttemptStatus::Error),
+        ],
         ..Default::default()
     });
     let mut final_response =
@@ -6118,6 +6147,11 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
         attempt_count: 1,
         retry_count: 0,
         latency_ms: 25,
+        occurrences: vec![provider_attempt_occurrence(
+            77,
+            "provider-final",
+            ProviderAttemptStatus::Ok,
+        )],
         ..Default::default()
     });
 
@@ -6138,9 +6172,49 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
     assert_eq!(result.provider_attempts.attempt_count, 3);
     assert_eq!(result.provider_attempts.retry_count, 1);
     assert_eq!(result.provider_attempts.latency_ms, 105);
+    assert_eq!(
+        result
+            .provider_attempts
+            .occurrences
+            .iter()
+            .map(|occurrence| occurrence.attempt_index)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        result
+            .provider_attempts
+            .occurrences
+            .iter()
+            .map(|occurrence| occurrence.provider_name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "provider-plan-first",
+            "provider-plan-retry",
+            "provider-final"
+        ]
+    );
     let status = result.to_run_status();
     assert_eq!(status.model_usage, result.model_usage);
     assert_eq!(status.provider_attempts, result.provider_attempts);
+    let public_result = serde_json::to_string(&result).expect("serialize public result");
+    assert!(!public_result.contains("occurrences"));
+    let public_status = serde_json::to_string(&status).expect("serialize public status");
+    assert!(!public_status.contains("occurrences"));
+    let result_schema = serde_json::to_value(schemars::schema_for!(AgentLoopResult))
+        .expect("serialize result schema");
+    assert!(
+        result_schema["definitions"]["ProviderAttemptMetadata"]["properties"]
+            .get("occurrences")
+            .is_none()
+    );
+    let status_schema = serde_json::to_value(schemars::schema_for!(AgentRunStatus))
+        .expect("serialize status schema");
+    assert!(
+        status_schema["definitions"]["ProviderAttemptMetadata"]["properties"]
+            .get("occurrences")
+            .is_none()
+    );
 }
 
 #[test]
@@ -6412,24 +6486,48 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
                 "timeout_seconds": 5
             }),
         ));
+        verification
+            .provider_attempt_metadata
+            .as_mut()
+            .expect("verification attempt metadata")
+            .occurrences
+            .push(provider_attempt_occurrence(
+                41,
+                "provider-verification",
+                ProviderAttemptStatus::Ok,
+            ));
 
         let final_response = match case {
-            FinalizationCase::ProviderError => Err(ProviderError::from_model_error(
-                ModelError::new(
-                    ModelErrorKind::UnknownProviderError,
-                    "terminal provider failed",
+            FinalizationCase::ProviderError => {
+                let mut first = provider_attempt_occurrence(
+                    88,
+                    "provider-error-first",
+                    ProviderAttemptStatus::Error,
+                );
+                first.error_category = Some(ModelErrorCategory::UnknownProviderError);
+                first.error_stage = Some(singularity_model::ProviderErrorStage::RequestSend);
+                first.diagnostic_code = Some("terminal_provider_failed".to_string());
+                let mut retry = first.clone();
+                retry.attempt_index = 89;
+                retry.provider_name = "provider-error-retry".to_string();
+                let metadata = ProviderAttemptMetadata {
+                    attempt_count: 2,
+                    retry_count: 1,
+                    latency_ms: 40,
+                    occurrences: vec![first, retry],
+                };
+                Err(ProviderError::from_model_error(
+                    ModelError::new(
+                        ModelErrorKind::UnknownProviderError,
+                        "terminal provider failed",
+                    )
+                    .with_provider_diagnostic(
+                        "terminal_provider_failed",
+                        singularity_model::ProviderErrorStage::RequestSend,
+                    ),
                 )
-                .with_provider_diagnostic(
-                    "terminal_provider_failed",
-                    singularity_model::ProviderErrorStage::RequestSend,
-                ),
-            )
-            .with_provider_attempt_metadata(ProviderAttemptMetadata {
-                attempt_count: 2,
-                retry_count: 1,
-                latency_ms: 40,
-                ..Default::default()
-            })),
+                .with_provider_attempt_metadata(metadata))
+            }
             FinalizationCase::EmptyResponse | FinalizationCase::Cancelled => {
                 Ok(response_with_accounting(
                     "model_request_turn_1_1",
@@ -6556,6 +6654,34 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
                 assert_eq!(result.provider_attempts.attempt_count, 3);
                 assert_eq!(result.provider_attempts.retry_count, 1);
                 assert_eq!(result.provider_attempts.latency_ms, 70);
+                assert_eq!(
+                    result
+                        .provider_attempts
+                        .occurrences
+                        .iter()
+                        .map(|occurrence| occurrence.attempt_index)
+                        .collect::<Vec<_>>(),
+                    [1, 2, 3]
+                );
+                assert_eq!(
+                    result
+                        .provider_attempts
+                        .occurrences
+                        .iter()
+                        .map(|occurrence| occurrence.terminal_status)
+                        .collect::<Vec<_>>(),
+                    [
+                        ProviderAttemptStatus::Ok,
+                        ProviderAttemptStatus::Error,
+                        ProviderAttemptStatus::Error
+                    ]
+                );
+                assert_eq!(
+                    result.provider_attempts.occurrences[1]
+                        .diagnostic_code
+                        .as_deref(),
+                    Some("terminal_provider_failed")
+                );
             }
             FinalizationCase::EmptyResponse => {
                 assert_eq!(result.status, AgentStatus::Failed);
@@ -6746,6 +6872,11 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         attempt_count: 1,
         retry_count: 0,
         latency_ms: 10,
+        occurrences: vec![provider_attempt_occurrence(
+            101,
+            "provider-plan",
+            ProviderAttemptStatus::Ok,
+        )],
         ..Default::default()
     });
     let mut edit_response =
@@ -6769,6 +6900,10 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         attempt_count: 2,
         retry_count: 1,
         latency_ms: 20,
+        occurrences: vec![
+            provider_attempt_occurrence(202, "provider-edit-first", ProviderAttemptStatus::Ok),
+            provider_attempt_occurrence(202, "provider-edit-retry", ProviderAttemptStatus::Error),
+        ],
         ..Default::default()
     });
     let mut verify_response =
@@ -6788,6 +6923,11 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         attempt_count: 1,
         retry_count: 0,
         latency_ms: 30,
+        occurrences: vec![provider_attempt_occurrence(
+            303,
+            "provider-verify",
+            ProviderAttemptStatus::Ok,
+        )],
         ..Default::default()
     });
     let mut final_response =
@@ -6802,6 +6942,11 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         attempt_count: 1,
         retry_count: 0,
         latency_ms: 40,
+        occurrences: vec![provider_attempt_occurrence(
+            404,
+            "provider-final",
+            ProviderAttemptStatus::Ok,
+        )],
         ..Default::default()
     });
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
@@ -6827,6 +6972,15 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     assert_eq!(blocked.status, AgentStatus::Blocked);
     assert_eq!(blocked.plan_update_count, 1);
     assert_eq!(blocked.recovery_metrics, AgentRecoveryMetrics::default());
+    assert_eq!(
+        blocked
+            .provider_attempts
+            .occurrences
+            .iter()
+            .map(|occurrence| occurrence.attempt_index)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
     let pending = pending_approval(&blocked);
     let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
     assert_eq!(checkpoint["plan"]["steps"][0]["status"], "completed");
@@ -6835,6 +6989,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     assert_eq!(checkpoint["model_usage"]["total_tokens"], 33);
     assert_eq!(checkpoint["provider_attempts"]["attempt_count"], 3);
     assert_eq!(checkpoint["provider_attempts"]["retry_count"], 1);
+    assert!(checkpoint["provider_attempts"].get("occurrences").is_none());
     assert!(checkpoint["seen_tool_call_fingerprints"].is_array());
     assert!(checkpoint["last_repair_failure"].is_null());
 
@@ -6843,7 +6998,10 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         pending.pending_tool_call().tool_name.clone(),
         pending.pending_tool_call().resources.clone(),
     ));
-    let resumed = agent_loop.resume_pending_approval(&resumed_input, &pending);
+    let restored =
+        PendingApprovalOccurrence::from_checkpoint_payload(pending.request().clone(), &checkpoint)
+            .expect("approval checkpoint decode");
+    let resumed = agent_loop.resume_pending_approval(&resumed_input, &restored);
 
     assert_eq!(resumed.status, AgentStatus::Completed);
     assert_eq!(resumed.model_turns, 4);
@@ -6856,6 +7014,24 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
     assert_eq!(resumed.provider_attempts.attempt_count, 5);
     assert_eq!(resumed.provider_attempts.retry_count, 1);
     assert_eq!(resumed.provider_attempts.latency_ms, 100);
+    assert_eq!(
+        resumed
+            .provider_attempts
+            .occurrences
+            .iter()
+            .map(|occurrence| occurrence.attempt_index)
+            .collect::<Vec<_>>(),
+        [4, 5]
+    );
+    assert_eq!(
+        resumed
+            .provider_attempts
+            .occurrences
+            .iter()
+            .map(|occurrence| occurrence.provider_name.as_str())
+            .collect::<Vec<_>>(),
+        ["provider-verify", "provider-final"]
+    );
     assert!(
         resumed
             .plan

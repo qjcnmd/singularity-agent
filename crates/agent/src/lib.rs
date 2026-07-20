@@ -840,6 +840,7 @@ impl AgentLoopState {
                 Some(self.model_usage.cost_estimate.unwrap_or_default().max(0.0) + cost.max(0.0));
         }
         if let Some(metadata) = &response.provider_attempt_metadata {
+            let first_attempt_index = self.provider_attempts.attempt_count.saturating_add(1);
             self.provider_attempts.attempt_count = self
                 .provider_attempts
                 .attempt_count
@@ -852,6 +853,18 @@ impl AgentLoopState {
                 .provider_attempts
                 .latency_ms
                 .saturating_add(metadata.latency_ms);
+            self.provider_attempts.occurrences.extend(
+                metadata
+                    .occurrences
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(offset, mut occurrence)| {
+                        occurrence.attempt_index = first_attempt_index
+                            .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+                        occurrence
+                    }),
+            );
         }
     }
 
@@ -861,6 +874,10 @@ impl AgentLoopState {
         pending_tool_call: &PendingToolCall,
         model_turns: u32,
     ) -> Result<ApprovalCheckpoint, String> {
+        // Runtime provider occurrences are delivery-scoped; checkpoint only carries the
+        // aggregate counters so a decoded resume emits new observations exactly once.
+        let mut provider_attempts = self.provider_attempts.clone();
+        provider_attempts.occurrences.clear();
         let checkpoint = ApprovalCheckpoint {
             pending_tool_call: pending_tool_call.clone(),
             checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
@@ -878,7 +895,7 @@ impl AgentLoopState {
             plan_update_count: self.plan_update_count,
             recovery_metrics: self.recovery_metrics.clone(),
             model_usage: self.model_usage.clone(),
-            provider_attempts: self.provider_attempts.clone(),
+            provider_attempts,
             context_trace: self.context_trace.clone(),
             seen_tool_call_fingerprints: self.seen_tool_call_fingerprints.iter().cloned().collect(),
             last_repair_failure: self.last_repair_failure.clone(),
