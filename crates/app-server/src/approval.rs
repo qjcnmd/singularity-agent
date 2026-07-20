@@ -40,11 +40,48 @@ impl AppServer {
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
+        let mut messages = Vec::new();
+        self.handle_approval_decision_streaming_values(message, |message| messages.push(message))?;
+        Ok(messages)
+    }
+
+    /// 执行 approval/decision，并在 continuation delta 生成时立即预留输出顺序。
+    pub fn handle_approval_decision_streaming_with_output(
+        &mut self,
+        message: JsonRpcMessage,
+        mut emit: impl FnMut(AppServerOutput),
+    ) -> AppServerResult<()> {
+        let coordinator = self.output_order.clone();
+        let mut sequencing_error = None;
+        let result = self.handle_approval_decision_streaming_values(message, |message| {
+            if sequencing_error.is_some() {
+                return;
+            }
+            match sequence_output(&coordinator, message) {
+                Ok(output) => emit(output),
+                Err(error) => sequencing_error = Some(error),
+            }
+        });
+        if let Some(error) = sequencing_error {
+            return Err(error);
+        }
+        result
+    }
+
+    fn handle_approval_decision_streaming_values(
+        &mut self,
+        message: JsonRpcMessage,
+        mut emit: impl FnMut(Value),
+    ) -> AppServerResult<()> {
         let decision: ApprovalDecision = parse_params(&message)?;
         let pending_request = match self.store.get_pending_approval(&decision.request_id) {
             Ok(request) => request,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND);
+                emit_messages(
+                    &mut emit,
+                    not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND)?,
+                );
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
@@ -54,18 +91,32 @@ impl AppServer {
                 .store
                 .has_pending_tool_call(&pending_request.request_id)?
         {
-            return not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND);
+            emit_messages(
+                &mut emit,
+                not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND)?,
+            );
+            return Ok(());
         }
         let pending_thread = self.store.get_thread(&pending_request.thread_id)?;
         let continues_execution =
             is_tool_continuation && matches!(decision.outcome, ApprovalOutcome::Allow);
         let continuation_workspace = if continues_execution {
             if pending_thread.status != singularity_protocol::ThreadStatus::Active {
-                return invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION);
+                emit_messages(
+                    &mut emit,
+                    invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION)?,
+                );
+                return Ok(());
             }
             match workspace_tools_for_thread(&pending_thread, Arc::clone(&self.sandbox_backend)) {
                 Ok(tools) => Some(tools),
-                Err(error) => return invalid_state_response(message.required_id(), error),
+                Err(error) => {
+                    emit_messages(
+                        &mut emit,
+                        invalid_state_response(message.required_id(), error)?,
+                    );
+                    return Ok(());
+                }
             }
         } else {
             None
@@ -75,7 +126,11 @@ impl AppServer {
                 .store
                 .try_begin_workspace_execution(&pending_request.thread_id)?
             else {
-                return invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE);
+                emit_messages(
+                    &mut emit,
+                    invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE)?,
+                );
+                return Ok(());
             };
             Some(guard)
         } else {
@@ -84,7 +139,11 @@ impl AppServer {
         let mut active_turn = if continues_execution {
             let active_turn = self.activate_turn(&pending_request.turn_id)?;
             if active_turn.0.is_cancelled() {
-                return invalid_state_response(message.required_id(), EXECUTION_STOPPED);
+                emit_messages(
+                    &mut emit,
+                    invalid_state_response(message.required_id(), EXECUTION_STOPPED)?,
+                );
+                return Ok(());
             }
             Some(active_turn)
         } else {
@@ -107,10 +166,11 @@ impl AppServer {
             None
         };
         if decode_pending_approval(&pending_request, pending_payload.as_ref()).is_err() {
-            return invalid_state_response(
-                message.required_id(),
-                "Approval checkpoint unavailable",
+            emit_messages(
+                &mut emit,
+                invalid_state_response(message.required_id(), "Approval checkpoint unavailable")?,
             );
+            return Ok(());
         }
         let recorded = match self.store.record_approval_decision(
             &decision,
@@ -119,53 +179,61 @@ impl AppServer {
         ) {
             Ok(recorded) => recorded,
             Err(error) => {
-                return match error {
+                let response = match error {
                     StoreError::NotFound(_) => {
-                        not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND)
+                        not_found_response(message.required_id(), PENDING_APPROVAL_NOT_FOUND)?
                     }
                     StoreError::InvalidState(state_message)
                         if state_message == "pending approval allow requires an active thread" =>
                     {
-                        invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION)
+                        invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION)?
                     }
                     StoreError::WorkspaceHasNonterminalTurn { .. } => {
-                        invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE)
+                        invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE)?
                     }
-                    other => Err(other.into()),
+                    other => return Err(other.into()),
                 };
+                emit_messages(&mut emit, response);
+                return Ok(());
             }
         };
         let pending_approval =
             match decode_pending_approval(&recorded.request, recorded.pending_tool_call.as_ref()) {
                 Ok(pending_approval) => pending_approval,
                 Err(_) => {
-                    return invalid_state_response(
-                        message.required_id(),
-                        "Approval checkpoint unavailable",
+                    emit_messages(
+                        &mut emit,
+                        invalid_state_response(
+                            message.required_id(),
+                            "Approval checkpoint unavailable",
+                        )?,
                     );
+                    return Ok(());
                 }
             };
         if matches!(decision.outcome, ApprovalOutcome::Defer) {
-            return Ok(vec![approval_decision_response(
+            emit(approval_decision_response(
                 message.required_id(),
                 &decision,
-            )?]);
+            )?);
+            return Ok(());
         }
         if matches!(decision.outcome, ApprovalOutcome::Deny) {
-            let mut messages = Vec::new();
             if pending_approval.is_some()
                 && let Some(event) =
                     self.event_notification(AppEvent::turn_completed(&recorded.turn))?
             {
-                messages.push(event);
+                emit(event);
             }
-            messages.push(approval_decision_response(
+            emit(approval_decision_response(
                 message.required_id(),
                 &decision,
             )?);
-            return Ok(messages);
+            return Ok(());
         }
-        let mut messages = Vec::new();
+        let mut assistant_events = continues_execution
+            .then(|| AssistantItemEventState::new(SessionStore::allocate_assistant_item_id()));
+        let mut delta_error = None;
         let cancellation = active_turn
             .as_ref()
             .map(|(cancellation, _guard)| cancellation.clone())
@@ -188,6 +256,18 @@ impl AppServer {
                         monitor_control,
                         prepared_workspace_tools: continuation_workspace.clone(),
                     },
+                    &mut |delta| {
+                        if delta_error.is_some() {
+                            return;
+                        }
+                        let Some(assistant_events) = assistant_events.as_mut() else {
+                            return;
+                        };
+                        match self.project_assistant_delta(assistant_events, delta) {
+                            Ok(messages) => emit_messages(&mut emit, messages),
+                            Err(error) => delta_error = Some(error),
+                        }
+                    },
                 )?;
                 let terminal = if let Some(resumed) = resumed {
                     Some(resumed)
@@ -204,6 +284,11 @@ impl AppServer {
                 Ok(terminal)
             })()
         };
+        let continuation_event_failed = delta_error.is_some();
+        let continuation = match delta_error {
+            Some(error) => Err(error),
+            None => continuation,
+        };
         let monitor_outcome = active_turn
             .as_mut()
             .and_then(|(_, guard)| guard.stabilize_monitor(&cancellation));
@@ -212,40 +297,57 @@ impl AppServer {
                 stage: TurnFailureStage::CancellationMonitor,
                 cause: TurnFailureCause::CancellationMonitor,
             };
-            let terminal = self
-                .terminalize_claimed_approval_error(
-                    &recorded.request,
-                    &decision,
-                    pending_approval.as_ref(),
-                    ApprovalTerminalizationContext {
-                        turn: &recorded.turn,
-                        thread: &pending_thread,
-                        prior_status: None,
-                        cancellation: &cancellation,
-                        monitor_outcome,
-                        failure,
-                    },
-                )
-                .map_err(|cleanup_failure| AppServerError::TurnTerminalization {
-                    stage: failure.stage,
-                    cause: failure.cause,
-                    failure: cleanup_failure,
-                })?;
-            if let TurnTerminalizationResult::Committed(committed) = terminal {
-                messages.extend(self.committed_turn_events(&committed)?);
+            let terminal = match self.terminalize_claimed_approval_error(
+                &recorded.request,
+                &decision,
+                pending_approval.as_ref(),
+                ApprovalTerminalizationContext {
+                    turn: &recorded.turn,
+                    thread: &pending_thread,
+                    prior_status: None,
+                    cancellation: &cancellation,
+                    monitor_outcome,
+                    failure,
+                },
+            ) {
+                Ok(terminal) => terminal,
+                Err(cleanup_failure) => {
+                    self.emit_realtime_item_failure(&mut emit, assistant_events.as_ref())?;
+                    return Err(AppServerError::TurnTerminalization {
+                        stage: failure.stage,
+                        cause: failure.cause,
+                        failure: cleanup_failure,
+                    });
+                }
+            };
+            match terminal {
+                TurnTerminalizationResult::Committed(committed) => emit_messages(
+                    &mut emit,
+                    self.committed_turn_events(&committed, assistant_events.as_ref())?,
+                ),
+                TurnTerminalizationResult::Preserved => {
+                    self.emit_realtime_item_failure(&mut emit, assistant_events.as_ref())?;
+                }
             }
-            messages.push(approval_decision_response(
+            emit(approval_decision_response(
                 message.required_id(),
                 &decision,
             )?);
-            return Ok(messages);
+            return Ok(());
         }
         let terminal = match continuation {
             Ok(terminal) => terminal,
             Err(error) => {
                 let failure = monitor_failure_or(
                     monitor_outcome,
-                    turn_failure_from_error(&error, TurnFailureStage::ApprovalCheckpoint),
+                    turn_failure_from_error(
+                        &error,
+                        if continuation_event_failed {
+                            TurnFailureStage::EventNotification
+                        } else {
+                            TurnFailureStage::ApprovalCheckpoint
+                        },
+                    ),
                 );
                 let terminal = self.terminalize_claimed_approval_error(
                     &recorded.request,
@@ -262,10 +364,16 @@ impl AppServer {
                 );
                 match terminal {
                     Ok(TurnTerminalizationResult::Committed(committed)) => {
-                        messages.extend(self.committed_turn_events(&committed)?);
+                        emit_messages(
+                            &mut emit,
+                            self.committed_turn_events(&committed, assistant_events.as_ref())?,
+                        );
                     }
-                    Ok(TurnTerminalizationResult::Preserved) => {}
+                    Ok(TurnTerminalizationResult::Preserved) => {
+                        self.emit_realtime_item_failure(&mut emit, assistant_events.as_ref())?;
+                    }
                     Err(cleanup_failure) => {
+                        self.emit_realtime_item_failure(&mut emit, assistant_events.as_ref())?;
                         return Err(AppServerError::TurnTerminalization {
                             stage: failure.stage,
                             cause: failure.cause,
@@ -291,47 +399,64 @@ impl AppServer {
                 &turn,
                 &effective_status,
                 &next_approvals,
+                assistant_events.as_ref().map(|events| &events.item_id),
                 monitor_outcome,
             ) {
-                Ok(committed) => messages.extend(self.committed_turn_events(&committed)?),
+                Ok(committed) => emit_messages(
+                    &mut emit,
+                    self.committed_turn_events(&committed, assistant_events.as_ref())?,
+                ),
                 Err(_) => {
                     let failure = TurnFailure {
                         stage: TurnFailureStage::TerminalOutcome,
                         cause: TurnFailureCause::Store,
                     };
-                    let terminal = self
-                        .terminalize_claimed_approval_error(
-                            &recorded.request,
-                            &decision,
-                            pending_approval.as_ref(),
-                            ApprovalTerminalizationContext {
-                                turn: &turn,
-                                thread: &pending_thread,
-                                prior_status: Some(&effective_status),
-                                cancellation: &cancellation,
-                                monitor_outcome,
-                                failure,
-                            },
-                        )
-                        .map_err(|cleanup_failure| AppServerError::TurnTerminalization {
-                            stage: failure.stage,
-                            cause: failure.cause,
-                            failure: cleanup_failure,
-                        })?;
-                    if let TurnTerminalizationResult::Committed(committed) = terminal {
-                        messages.extend(self.committed_turn_events(&committed)?);
+                    let terminal = match self.terminalize_claimed_approval_error(
+                        &recorded.request,
+                        &decision,
+                        pending_approval.as_ref(),
+                        ApprovalTerminalizationContext {
+                            turn: &turn,
+                            thread: &pending_thread,
+                            prior_status: Some(&effective_status),
+                            cancellation: &cancellation,
+                            monitor_outcome,
+                            failure,
+                        },
+                    ) {
+                        Ok(terminal) => terminal,
+                        Err(cleanup_failure) => {
+                            self.emit_realtime_item_failure(&mut emit, assistant_events.as_ref())?;
+                            return Err(AppServerError::TurnTerminalization {
+                                stage: failure.stage,
+                                cause: failure.cause,
+                                failure: cleanup_failure,
+                            });
+                        }
+                    };
+                    match terminal {
+                        TurnTerminalizationResult::Committed(committed) => emit_messages(
+                            &mut emit,
+                            self.committed_turn_events(&committed, assistant_events.as_ref())?,
+                        ),
+                        TurnTerminalizationResult::Preserved => {
+                            self.emit_realtime_item_failure(&mut emit, assistant_events.as_ref())?;
+                        }
                     }
                 }
             }
         }
         if has_next_approvals {
-            messages.extend(self.pending_approval_events_for_turn(&recorded.turn.turn_id)?);
+            emit_messages(
+                &mut emit,
+                self.pending_approval_events_for_turn(&recorded.turn.turn_id)?,
+            );
         }
-        messages.push(approval_decision_response(
+        emit(approval_decision_response(
             message.required_id(),
             &decision,
         )?);
-        Ok(messages)
+        Ok(())
     }
 
     pub(super) fn terminalize_claimed_approval_error(
@@ -395,6 +520,7 @@ impl AppServer {
             turn,
             &run_status,
             &[],
+            None,
             monitor_outcome,
         ) {
             Ok(committed) => Ok(TurnTerminalizationResult::Committed(Box::new(committed))),
@@ -419,6 +545,7 @@ impl AppServer {
                         &latest,
                         &interrupted,
                         &[],
+                        None,
                         monitor_outcome,
                     ) {
                         return Ok(TurnTerminalizationResult::Committed(Box::new(committed)));

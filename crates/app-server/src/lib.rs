@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult,
-    AgentRunStatus, AgentStatus, ApprovalGrant, PendingApprovalOccurrence,
+    AgentRunStatus, AgentStatus, AgentTextDeltaCallback, ApprovalGrant, PendingApprovalOccurrence,
     agent_control_tool_entries, project_audit_event,
 };
 use singularity_core::{
@@ -49,8 +49,8 @@ use singularity_protocol::{
 };
 use singularity_sandbox::{PlatformSandboxBackend, SandboxBackend, SandboxBackendEnforcement};
 use singularity_store::{
-    CommitTurnOutcomeParams, CommittedTurnOutcome, CreateStartedTurnParams, SessionStore,
-    StoreError, TurnOutcomeAuthority,
+    AllocatedAssistantItemId, CommitTurnOutcomeParams, CommittedTurnOutcome,
+    CreateStartedTurnParams, SessionStore, StoreError, TurnOutcomeAuthority,
 };
 use singularity_tools::{
     COMMAND_TOOL as TOOL_COMMAND, EDIT_TOOL as TOOL_EDIT, GREP_TOOL as TOOL_GREP,
@@ -85,6 +85,7 @@ const SAFE_PROVIDER_FAILURE: &str = "provider request failed";
 const SAFE_PROJECT_INSTRUCTIONS_FAILURE: &str = "project instructions unavailable";
 const SAFE_WORKSPACE_FAILURE: &str = "workspace capability unavailable";
 const SAFE_AGENT_LOOP_FAILURE: &str = "agent loop execution failed";
+const SAFE_ASSISTANT_ITEM_FAILURE: &str = "assistant response failed";
 const APP_ERROR_INVALID_STATE: i64 = -32005;
 const CANCELLATION_MONITOR_FROZEN: u8 = 0x80;
 const CANCELLATION_MONITOR_OUTCOME_MASK: u8 = !CANCELLATION_MONITOR_FROZEN;
@@ -254,6 +255,29 @@ struct AgentLoopInvocation<'a> {
     history: &'a [ConversationMessage],
     cancellation: &'a CancellationToken,
     monitor_control: Option<&'a CancellationMonitorControl>,
+}
+
+/// 一次 AgentLoop 调用预分配的 assistant item 及实际通过订阅过滤器生成的事件状态。
+struct AssistantItemEventState {
+    item_id: AllocatedAssistantItemId,
+    first_delta_observed: bool,
+    started_generated: bool,
+    delta_generated: bool,
+}
+
+impl AssistantItemEventState {
+    fn new(item_id: AllocatedAssistantItemId) -> Self {
+        Self {
+            item_id,
+            first_delta_observed: false,
+            started_generated: false,
+            delta_generated: false,
+        }
+    }
+
+    fn appeared(&self) -> bool {
+        self.started_generated || self.delta_generated
+    }
 }
 
 struct ApprovalResumeContext<'a> {
@@ -1376,6 +1400,7 @@ fn invalid_params_response(id: JsonRpcId) -> AppServerResult<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     use singularity_agent::{AgentRecoveryMetrics, PendingToolCall};
@@ -1383,6 +1408,7 @@ mod tests {
         ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall,
         ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
         Provider, ProviderAttemptMetadata, ProviderError, ProviderProtocolContract,
+        ProviderStreamEvent,
     };
     use singularity_policy::{ToolId, WorkspaceRelativePath};
     use singularity_protocol::ItemKind;
@@ -1860,6 +1886,7 @@ mod tests {
             server.commit_turn_run_status(
                 turn.clone(),
                 &failure_status,
+                None,
                 &token,
                 Some(CancellationMonitorOutcome::InfrastructureFailure),
             ),
@@ -1878,6 +1905,7 @@ mod tests {
             server.finish_turn_failure(
                 &mut emit,
                 &turn,
+                None,
                 &token,
                 Some(CancellationMonitorOutcome::InfrastructureFailure),
                 failure,
@@ -1901,6 +1929,7 @@ mod tests {
             .commit_turn_run_status(
                 cancelled_turn.clone(),
                 &AgentRunStatus::failed("late user result"),
+                None,
                 &cancelled_token,
                 Some(CancellationMonitorOutcome::UserCancellation),
             )
@@ -2073,6 +2102,7 @@ mod tests {
                 .commit_turn_run_status(
                     turn.clone(),
                     &AgentRunStatus::failed("stale run failure"),
+                    None,
                     &CancellationToken::new(),
                     None,
                 )
@@ -2114,6 +2144,7 @@ mod tests {
                         .commit_turn_run_status(
                             turn.clone(),
                             &invalid_commit,
+                            None,
                             &CancellationToken::new(),
                             None,
                         )
@@ -2125,6 +2156,7 @@ mod tests {
             let result = server.finish_turn_failure(
                 &mut emit,
                 &turn,
+                None,
                 &CancellationToken::new(),
                 None,
                 stage,
@@ -2182,6 +2214,7 @@ mod tests {
             let result = server.finish_turn_failure(
                 &mut emit,
                 &turn,
+                None,
                 &CancellationToken::new(),
                 None,
                 TurnFailureStage::AgentLoop,
@@ -2312,6 +2345,7 @@ mod tests {
             .finish_turn_failure(
                 &mut emit,
                 &missing_turn,
+                None,
                 &CancellationToken::new(),
                 None,
                 TurnFailure {
@@ -2576,6 +2610,46 @@ mod tests {
         seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
     }
 
+    struct StreamingProvider {
+        responses: Vec<(Vec<ProviderStreamEvent>, ModelTurnResponse)>,
+        seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    }
+
+    impl Provider for StreamingProvider {
+        fn protocol_contract(&self) -> ProviderProtocolContract {
+            ProviderProtocolContract::default()
+        }
+
+        fn complete_stream(
+            &self,
+            request: &ModelTurnRequest,
+            _cancellation: &CancellationToken,
+            on_event: &mut dyn FnMut(ProviderStreamEvent),
+        ) -> Result<ModelTurnResponse, ProviderError> {
+            let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
+            let response_index = seen_requests.len();
+            seen_requests.push(request.clone());
+            let (events, response) = self
+                .responses
+                .get(response_index)
+                .unwrap_or_else(|| self.responses.last().expect("streaming response"));
+            for event in events {
+                on_event(event.clone());
+            }
+            let mut response = response.clone();
+            response.request_id = request.request_id.clone();
+            Ok(response)
+        }
+
+        fn complete(
+            &self,
+            _request: &ModelTurnRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<ModelTurnResponse, ProviderError> {
+            panic!("streaming provider must use complete_stream")
+        }
+    }
+
     impl Provider for StaticProvider {
         fn protocol_contract(&self) -> ProviderProtocolContract {
             ProviderProtocolContract::default()
@@ -2656,7 +2730,7 @@ mod tests {
         assert!(!status_json.contains(provider_sentinel));
         assert!(!status_json.contains("validation_errors"));
         let committed = server
-            .commit_turn_run_status(turn, &status, &CancellationToken::new(), None)
+            .commit_turn_run_status(turn, &status, None, &CancellationToken::new(), None)
             .expect("commit provider failure");
         let trace_json = serde_json::to_string(&committed.trace).expect("trace json");
         assert!(!trace_json.contains(provider_sentinel));
@@ -3010,13 +3084,21 @@ mod tests {
             "turn/completed".to_string(),
         ]);
 
+        let assistant_events =
+            AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
         let committed = server
-            .commit_turn_run_status(turn, &status, &CancellationToken::new(), None)
+            .commit_turn_run_status(
+                turn,
+                &status,
+                Some(&assistant_events.item_id),
+                &CancellationToken::new(),
+                None,
+            )
             .expect("commit terminal outcome");
         let plan_item = committed.plan_item.as_ref().expect("plan item");
         assert_eq!(plan_item.kind, ItemKind::Plan);
         let events = server
-            .committed_turn_events(&committed)
+            .committed_turn_events(&committed, Some(&assistant_events))
             .expect("terminal events");
         let methods = events
             .iter()
@@ -3039,6 +3121,467 @@ mod tests {
         assert_eq!(events[2]["params"]["plan"], plan_item.payload);
         assert!(events[0]["params"].get("delta").is_none());
         assert!(events[1]["params"].get("delta").is_none());
+    }
+
+    #[test]
+    fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+        let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "say hello"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "say hello".to_string(),
+            }],
+        };
+        let server = app_server(store).with_sandbox_backend(MutatingCommandSandboxBackend {
+            calls: AtomicUsize::new(0),
+        });
+        server
+            .event_filter
+            .lock()
+            .expect("event filter")
+            .event_types = Some(vec![
+            "item/started".to_string(),
+            "item/agentMessage/delta".to_string(),
+            "item/completed".to_string(),
+            "turn/completed".to_string(),
+        ]);
+        let mut assistant_events =
+            AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
+        let mut events = Vec::new();
+        let mut mutation_response =
+            ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "mutating");
+        mutation_response.tool_calls.push(ModelToolCall {
+            tool_call_id: "call_mutate".to_string(),
+            tool_name: "command".to_string(),
+            arguments: json!({
+                "command": "test-program mutate",
+                "timeout_seconds": 5
+            }),
+            raw_arguments: json!({
+                "command": "test-program mutate",
+                "timeout_seconds": 5
+            })
+            .to_string(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+        let mut verification_response =
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "verifying");
+        verification_response.tool_calls.push(ModelToolCall {
+            tool_call_id: "call_verify".to_string(),
+            tool_name: "command".to_string(),
+            arguments: json!({
+                "command": "test-program verify",
+                "timeout_seconds": 5
+            }),
+            raw_arguments: json!({
+                "command": "test-program verify",
+                "timeout_seconds": 5
+            })
+            .to_string(),
+            parse_status: ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+        let status = server
+            .run_agent_loop_with_provider_and_text_deltas(
+                StreamingProvider {
+                    responses: vec![
+                        (
+                            vec![ProviderStreamEvent::OutputTextDelta {
+                                delta: "mutating".to_string(),
+                            }],
+                            mutation_response,
+                        ),
+                        (
+                            vec![ProviderStreamEvent::OutputTextDelta {
+                                delta: "verifying".to_string(),
+                            }],
+                            verification_response,
+                        ),
+                        (
+                            vec![
+                                ProviderStreamEvent::OutputTextDelta {
+                                    delta: "do".to_string(),
+                                },
+                                ProviderStreamEvent::OutputTextDelta {
+                                    delta: "ne".to_string(),
+                                },
+                            ],
+                            ModelTurnResponse::completed(
+                                "model_request_turn_1_2",
+                                "response_3",
+                                "done",
+                            ),
+                        ),
+                    ],
+                    seen_requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                &thread,
+                &params,
+                &turn.turn_id,
+                &[],
+                &CancellationToken::new(),
+                &mut |delta| {
+                    events.extend(
+                        server
+                            .project_assistant_delta(&mut assistant_events, delta)
+                            .expect("project delta"),
+                    );
+                },
+            )
+            .expect("agent loop");
+        assert_eq!(status.status, AgentStatus::Completed);
+        assert_eq!(status.final_answer.as_deref(), Some("done"));
+        assert!(status.verification.required);
+        assert!(status.verification.passed);
+
+        let committed = server
+            .commit_turn_run_status(
+                turn,
+                &status,
+                Some(&assistant_events.item_id),
+                &CancellationToken::new(),
+                None,
+            )
+            .expect("commit terminal outcome");
+        events.extend(
+            server
+                .committed_turn_events(&committed, Some(&assistant_events))
+                .expect("terminal events"),
+        );
+
+        let methods = events
+            .iter()
+            .map(|event| event["method"].as_str().expect("event method"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "item/started",
+                "item/agentMessage/delta",
+                "item/agentMessage/delta",
+                "item/completed",
+                "turn/completed",
+            ]
+        );
+        assert_eq!(events[1]["params"]["delta"], "do");
+        assert_eq!(events[2]["params"]["delta"], "ne");
+        let events_json = serde_json::to_string(&events).expect("events json");
+        assert!(!events_json.contains("mutating"));
+        assert!(!events_json.contains("verifying"));
+        let item_id = assistant_events.item_id.as_str();
+        assert!(
+            events[..4]
+                .iter()
+                .all(|event| event["params"]["item"]["item_id"] == item_id)
+        );
+        assert_eq!(
+            committed
+                .assistant_item
+                .as_ref()
+                .map(|item| item.item_id.as_str()),
+            Some(item_id)
+        );
+        assert_eq!(
+            committed
+                .assistant_item
+                .as_ref()
+                .and_then(|item| item.payload["delta"].as_str()),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn partial_realtime_item_fails_without_persisting_or_completing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+        let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+        let server = app_server(store);
+        server
+            .event_filter
+            .lock()
+            .expect("event filter")
+            .event_types = Some(vec![
+            "item/started".to_string(),
+            "item/agentMessage/delta".to_string(),
+            "item/failed".to_string(),
+            "item/completed".to_string(),
+            "turn/completed".to_string(),
+        ]);
+
+        for (label, cancelled) in [
+            ("raw provider stream failure sentinel", false),
+            ("raw terminal mismatch sentinel", false),
+            ("raw cancellation sentinel", true),
+        ] {
+            let thread = server
+                .store
+                .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+                .expect("thread");
+            let (turn, _, _) = server
+                .store
+                .create_turn_with_input_and_trace(
+                    &thread.thread_id,
+                    AgentStatus::Running.as_str(),
+                    json!([{"type": "text", "text": "run"}]),
+                    "app_server",
+                    "turn started",
+                )
+                .expect("turn");
+            let mut assistant_events =
+                AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
+            let mut events = server
+                .project_assistant_delta(&mut assistant_events, "partial")
+                .expect("project partial");
+            let mut status = AgentRunStatus::failed(label);
+            if cancelled {
+                status.status = AgentStatus::Cancelled;
+            }
+
+            let committed = server
+                .commit_turn_run_status(
+                    turn,
+                    &status,
+                    Some(&assistant_events.item_id),
+                    &CancellationToken::new(),
+                    None,
+                )
+                .expect("commit safe terminal status");
+            events.extend(
+                server
+                    .committed_turn_events(&committed, Some(&assistant_events))
+                    .expect("terminal events"),
+            );
+
+            let methods = events
+                .iter()
+                .map(|event| event["method"].as_str().expect("event method"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                methods,
+                vec![
+                    "item/started",
+                    "item/agentMessage/delta",
+                    "item/failed",
+                    "turn/completed",
+                ]
+            );
+            assert_eq!(events[2]["params"]["error"], SAFE_ASSISTANT_ITEM_FAILURE);
+            assert!(
+                !serde_json::to_string(&events)
+                    .expect("events json")
+                    .contains(label)
+            );
+            assert!(committed.assistant_item.is_none());
+            assert!(
+                server
+                    .store
+                    .read_thread_history(&thread.thread_id, None, 10)
+                    .expect("history")
+                    .messages
+                    .iter()
+                    .all(|message| message.role != ConversationRole::Assistant)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_store_failure_fails_visible_realtime_item_without_completion() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db_path = temp.path().join("sessions.sqlite3");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+        let store = SessionStore::open(&db_path).expect("store");
+        let assistant_item_id = SessionStore::allocate_assistant_item_id();
+        let collision_thread = store.create_thread(None, None).expect("collision thread");
+        let collision_turn = store
+            .create_turn(&collision_thread.thread_id, AgentStatus::Running.as_str())
+            .expect("collision turn");
+        store
+            .commit_turn_outcome(
+                &collision_turn.turn_id,
+                CommitTurnOutcomeParams {
+                    status: TurnStatus::Completed,
+                    agent_loop_status: AgentStatus::Completed.as_str(),
+                    assistant_item_id: Some(&assistant_item_id),
+                    assistant_delta: Some("existing assistant"),
+                    plan: None,
+                    trace: &TraceEvent::for_turn(
+                        "trace_existing_assistant",
+                        &collision_thread.thread_id,
+                        &collision_turn.turn_id,
+                        "test",
+                        "existing assistant",
+                    ),
+                },
+            )
+            .expect("existing assistant");
+        let thread = store
+            .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
+            .expect("thread");
+        let (turn, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                AgentStatus::Running.as_str(),
+                json!([{"type": "text", "text": "complete"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+        let server = app_server(store);
+        server
+            .event_filter
+            .lock()
+            .expect("event filter")
+            .event_types = Some(vec![
+            "item/started".to_string(),
+            "item/agentMessage/delta".to_string(),
+            "item/failed".to_string(),
+            "item/completed".to_string(),
+            "turn/completed".to_string(),
+        ]);
+        let params = TurnStartParams {
+            thread_id: thread.thread_id.clone(),
+            input: vec![singularity_protocol::InputItem::Text {
+                text: "complete".to_string(),
+            }],
+        };
+        let status = server
+            .run_agent_loop_with_provider(
+                StaticProvider {
+                    responses: vec![ModelTurnResponse::completed(
+                        "model_request_turn_1_0",
+                        "response_1",
+                        "complete",
+                    )],
+                    seen_requests: Arc::new(Mutex::new(Vec::new())),
+                },
+                &thread,
+                &params,
+                &turn.turn_id,
+                &[],
+                &CancellationToken::new(),
+            )
+            .expect("agent loop");
+        let mut assistant_events = AssistantItemEventState::new(assistant_item_id);
+        let mut events = server
+            .project_assistant_delta(&mut assistant_events, "partial")
+            .expect("partial delta");
+
+        assert!(
+            server
+                .commit_turn_run_status(
+                    turn.clone(),
+                    &status,
+                    Some(&assistant_events.item_id),
+                    &CancellationToken::new(),
+                    None,
+                )
+                .is_err()
+        );
+        let result = server.finish_turn_failure(
+            &mut |event| events.push(event),
+            &turn,
+            Some(&assistant_events),
+            &CancellationToken::new(),
+            None,
+            TurnFailure {
+                stage: TurnFailureStage::TerminalOutcome,
+                cause: TurnFailureCause::Store,
+            },
+        );
+
+        assert!(matches!(result, Err(AppServerError::TurnExecution { .. })));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["method"].as_str().expect("event method"))
+                .collect::<Vec<_>>(),
+            vec![
+                "item/started",
+                "item/agentMessage/delta",
+                "item/failed",
+                "turn/completed",
+            ]
+        );
+        assert_eq!(
+            server.store.get_turn(&turn.turn_id).expect("turn").status,
+            TurnStatus::Failed
+        );
+        assert!(
+            server
+                .store
+                .read_thread_history(&thread.thread_id, None, 10)
+                .expect("history")
+                .messages
+                .iter()
+                .all(|message| message.role != ConversationRole::Assistant)
+        );
+    }
+
+    #[test]
+    fn realtime_item_tracks_started_and_delta_filtering_independently() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(temp.path().join("sessions.sqlite3")).expect("store");
+        let server = app_server(store);
+
+        for (subscriptions, expected, started_generated, delta_generated) in [
+            (
+                vec!["item/started".to_string()],
+                vec!["item/started"],
+                true,
+                false,
+            ),
+            (
+                vec!["item/agentMessage/delta".to_string()],
+                vec!["item/agentMessage/delta", "item/agentMessage/delta"],
+                false,
+                true,
+            ),
+            (Vec::new(), Vec::new(), false, false),
+        ] {
+            server
+                .event_filter
+                .lock()
+                .expect("event filter")
+                .event_types = Some(subscriptions);
+            let mut assistant_events =
+                AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
+            let mut events = server
+                .project_assistant_delta(&mut assistant_events, "first")
+                .expect("first delta");
+            events.extend(
+                server
+                    .project_assistant_delta(&mut assistant_events, "second")
+                    .expect("second delta"),
+            );
+
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event["method"].as_str().expect("event method"))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(assistant_events.started_generated, started_generated);
+            assert_eq!(assistant_events.delta_generated, delta_generated);
+        }
     }
 
     #[cfg(windows)]
@@ -3395,6 +3938,7 @@ mod tests {
                 &stale_status,
                 &[],
                 None,
+                None,
             )
             .expect("cancellation wins approval resolution");
         assert_eq!(committed.turn.status, TurnStatus::Interrupted);
@@ -3480,7 +4024,7 @@ mod tests {
         let stale_blocked =
             AgentRunStatus::failed("stale blocked result").with_status(AgentStatus::Blocked);
         let committed = server
-            .commit_turn_run_status(turn.clone(), &stale_blocked, &cancellation, None)
+            .commit_turn_run_status(turn.clone(), &stale_blocked, None, &cancellation, None)
             .expect("interrupted handoff is idempotent");
         assert_eq!(committed.turn.status, TurnStatus::Interrupted);
         assert_eq!(committed.turn.agent_loop_status, "cancelled");
@@ -3701,8 +4245,21 @@ mod tests {
             seen_requests: Arc::clone(&initial_seen_requests),
         };
         let resumed_seen_requests = Arc::new(Mutex::new(Vec::new()));
-        let resumed_provider = StaticProvider {
-            responses: vec![verification_response, final_response],
+        let resumed_provider = StreamingProvider {
+            responses: vec![
+                (Vec::new(), verification_response),
+                (
+                    vec![
+                        ProviderStreamEvent::OutputTextDelta {
+                            delta: "do".to_string(),
+                        },
+                        ProviderStreamEvent::OutputTextDelta {
+                            delta: "ne".to_string(),
+                        },
+                    ],
+                    final_response,
+                ),
+            ],
             seen_requests: Arc::clone(&resumed_seen_requests),
         };
         let server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
@@ -3721,7 +4278,7 @@ mod tests {
         assert_eq!(blocked_status.status, AgentStatus::Blocked);
         assert_eq!(blocked_status.approval_count, 1);
         server
-            .commit_turn_run_status(turn.clone(), &blocked_status, &cancellation, None)
+            .commit_turn_run_status(turn.clone(), &blocked_status, None, &cancellation, None)
             .expect("commit blocked turn");
         let blocked_json = serde_json::to_string(&blocked_status).expect("blocked status json");
         assert!(!blocked_json.contains("checkpoint_version"));
@@ -3761,8 +4318,21 @@ mod tests {
         assert!(pending_payload["messages"].is_array());
         assert!(pending_payload["tool_result_occurrences"].is_array());
 
+        server
+            .event_filter
+            .lock()
+            .expect("event filter")
+            .event_types = Some(vec![
+            "item/started".to_string(),
+            "item/agentMessage/delta".to_string(),
+            "item/completed".to_string(),
+            "turn/completed".to_string(),
+        ]);
+        let mut assistant_events =
+            AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
+        let mut realtime_events = Vec::new();
         let resumed = server
-            .resume_agent_loop_after_gate(
+            .resume_agent_loop_after_gate_with_text_deltas(
                 &request,
                 &decision,
                 Some(pending_payload),
@@ -3773,6 +4343,13 @@ mod tests {
                         .expect("bind workspace tools")
                         .with_sandbox_backend(CompletedSandboxBackend),
                 ),
+                &mut |delta| {
+                    realtime_events.extend(
+                        server
+                            .project_assistant_delta(&mut assistant_events, delta)
+                            .expect("project approval delta"),
+                    );
+                },
             )
             .expect("resume")
             .expect("resumed");
@@ -3792,10 +4369,41 @@ mod tests {
                 &resumed.0,
                 &resumed.1,
                 &resumed.2,
+                Some(&assistant_events.item_id),
                 None,
             )
             .expect("commit resumed outcome");
+        realtime_events.extend(
+            server
+                .committed_turn_events(&committed, Some(&assistant_events))
+                .expect("approval terminal events"),
+        );
         assert_eq!(committed.turn.status, TurnStatus::Completed);
+        assert_eq!(
+            realtime_events
+                .iter()
+                .map(|event| event["method"].as_str().expect("event method"))
+                .collect::<Vec<_>>(),
+            vec![
+                "item/started",
+                "item/agentMessage/delta",
+                "item/agentMessage/delta",
+                "item/completed",
+                "turn/completed",
+            ]
+        );
+        assert_eq!(realtime_events[1]["params"]["delta"], "do");
+        assert_eq!(realtime_events[2]["params"]["delta"], "ne");
+        assert!(realtime_events[..4].iter().all(|event| {
+            event["params"]["item"]["item_id"] == assistant_events.item_id.as_str()
+        }));
+        assert_eq!(
+            committed
+                .assistant_item
+                .as_ref()
+                .map(|item| item.item_id.as_str()),
+            Some(assistant_events.item_id.as_str())
+        );
         let terminal_trace = server
             .store
             .list_trace(&thread.thread_id)
@@ -3909,6 +4517,7 @@ mod tests {
             .commit_turn_run_status(
                 turn.clone(),
                 &blocked_status,
+                None,
                 &CancellationToken::new(),
                 None,
             )
@@ -4000,6 +4609,7 @@ mod tests {
                 &resumed.0,
                 &resumed.1,
                 &resumed.2,
+                Some(&SessionStore::allocate_assistant_item_id()),
                 None,
             )
             .expect("commit project instruction failure");
@@ -4021,6 +4631,46 @@ mod tests {
     }
 
     struct CompletedSandboxBackend;
+
+    struct MutatingCommandSandboxBackend {
+        calls: AtomicUsize,
+    }
+
+    impl SandboxBackend for MutatingCommandSandboxBackend {
+        fn name(&self) -> &'static str {
+            "mutating_command_test"
+        }
+
+        fn capabilities(&self) -> singularity_tools::SandboxCapabilities {
+            singularity_tools::SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            CommandResult::completed(&request.command_id, "command ok")
+                .with_workspace_mutation(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    WorkspaceMutation::Changed
+                } else {
+                    WorkspaceMutation::Unchanged
+                })
+                .with_sandbox_execution(
+                    self.name(),
+                    singularity_tools::SandboxBackendEnforcement::Strict,
+                )
+        }
+
+        fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+            CommandResult::completed(&request.command_id, "command ok")
+                .with_workspace_mutation(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    WorkspaceMutation::Changed
+                } else {
+                    WorkspaceMutation::Unchanged
+                })
+                .with_sandbox_execution(
+                    self.name(),
+                    singularity_tools::SandboxBackendEnforcement::Strict,
+                )
+        }
+    }
 
     impl SandboxBackend for CompletedSandboxBackend {
         fn name(&self) -> &'static str {

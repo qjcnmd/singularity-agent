@@ -36,6 +36,17 @@ impl AllocatedTurnId {
     }
 }
 
+/// AppServer 在执行 AgentLoop 前预分配、并由终态事务消费的 assistant item ID。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocatedAssistantItemId(String);
+
+impl AllocatedAssistantItemId {
+    /// 返回预分配 ID 的字符串视图。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// 使用预分配 id 创建 started turn 事务所需的字段。
 pub struct CreateStartedTurnParams<'a> {
     /// 所属 thread。
@@ -80,6 +91,8 @@ pub struct CommitTurnOutcomeParams<'a> {
     pub status: TurnStatus,
     /// AgentLoop 的目标状态。
     pub agent_loop_status: &'a str,
+    /// 与 assistant 增量成对提供的预分配 item ID。
+    pub assistant_item_id: Option<&'a AllocatedAssistantItemId>,
     /// 可选的 assistant 增量。
     pub assistant_delta: Option<&'a str>,
     /// 可选的 plan payload。
@@ -362,6 +375,11 @@ impl SessionStore {
         AllocatedTurnId(format!("turn_{}", short_id()))
     }
 
+    /// 在 AgentLoop 执行前分配终态 assistant item 将使用的稳定 ID。
+    pub fn allocate_assistant_item_id() -> AllocatedAssistantItemId {
+        AllocatedAssistantItemId(format!("item_{}", short_id()))
+    }
+
     /// 使用预分配 id 原子创建 turn、输入、trace 和此前历史。
     pub fn create_allocated_turn_with_input_trace_and_history(
         &self,
@@ -541,6 +559,7 @@ impl SessionStore {
         let CommitTurnOutcomeParams {
             status,
             agent_loop_status,
+            assistant_item_id,
             assistant_delta,
             plan,
             trace,
@@ -559,19 +578,22 @@ impl SessionStore {
             })?;
         validate_turn_status_update(&current, &status, Some(agent_loop_status), authority)?;
         validate_turn_trace_binding(trace, &current.thread_id, &current.turn_id)?;
-        match (&status, assistant_delta) {
-            (TurnStatus::Completed, Some(delta)) if !delta.trim().is_empty() => {}
-            (TurnStatus::Completed, _) => {
+        match (&status, assistant_item_id, assistant_delta) {
+            (TurnStatus::Completed, Some(item_id), Some(delta))
+                if !item_id.as_str().trim().is_empty() && !delta.trim().is_empty() => {}
+            (TurnStatus::Completed, _, _) => {
                 return Err(StoreError::InvalidState(
-                    "completed turn outcome requires a non-empty assistant message".to_string(),
+                    "completed turn outcome requires a preallocated item ID and non-empty assistant message"
+                        .to_string(),
                 ));
             }
-            (_, Some(_)) => {
+            (_, None, None) => {}
+            (_, _, _) => {
                 return Err(StoreError::InvalidState(
-                    "only a completed turn outcome may include an assistant message".to_string(),
+                    "only a completed turn outcome may include a paired assistant item ID and message"
+                        .to_string(),
                 ));
             }
-            (_, None) => {}
         }
         if status == TurnStatus::Interrupted {
             Self::delete_unresolved_pending_approvals(transaction, turn_id)?;
@@ -597,12 +619,18 @@ impl SessionStore {
                 Ok(item)
             })
             .transpose()?;
-        let assistant_item = assistant_delta
-            .map(|delta| -> StoreResult<Item> {
+        let assistant_item = assistant_item_id
+            .zip(assistant_delta)
+            .map(|(item_id, delta)| -> StoreResult<Item> {
                 let kind = ItemKind::AgentMessage;
                 let (payload, redacted) =
                     sanitize_item_payload(&kind, serde_json::json!({"delta": delta}))?;
-                let item = Self::new_item(turn_id, kind, payload);
+                if Self::item_id_exists(transaction, item_id.as_str())? {
+                    return Err(StoreError::InvalidState(
+                        "preallocated assistant item ID is already in use".to_string(),
+                    ));
+                }
+                let item = Self::new_item_with_id(item_id.as_str(), turn_id, kind, payload);
                 let item_sequence = Self::next_item_sequence(transaction, turn_id)?;
                 Self::insert_item(transaction, &item, item_sequence, redacted)?;
                 Ok(item)
@@ -1213,13 +1241,29 @@ impl SessionStore {
 
     // 构造绑定 turn 的 pending Item。
     pub(crate) fn new_item(turn_id: &str, kind: ItemKind, payload: Value) -> Item {
+        Self::new_item_with_id(&format!("item_{}", short_id()), turn_id, kind, payload)
+    }
+
+    // 使用调用方已验证的稳定 ID 构造绑定 turn 的 Item。
+    fn new_item_with_id(item_id: &str, turn_id: &str, kind: ItemKind, payload: Value) -> Item {
         Item {
-            item_id: format!("item_{}", short_id()),
+            item_id: item_id.to_string(),
             turn_id: turn_id.to_string(),
             kind,
             payload,
             status: ItemStatus::Completed,
         }
+    }
+
+    // 在当前终态事务内拒绝复用预分配 assistant item ID。
+    fn item_id_exists(transaction: &Transaction<'_>, item_id: &str) -> StoreResult<bool> {
+        transaction
+            .query_row(
+                "select exists(select 1 from items where item_id = ?1)",
+                params![item_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     // 将 Thread 编码后写入 threads 表。

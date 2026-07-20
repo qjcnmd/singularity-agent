@@ -141,8 +141,9 @@ impl AppServer {
     pub(super) fn committed_turn_events(
         &self,
         committed: &CommittedTurnOutcome,
+        assistant_events: Option<&AssistantItemEventState>,
     ) -> AppServerResult<Vec<Value>> {
-        let mut messages = self.agent_terminal_item_events(committed.plan_item.as_ref())?;
+        let mut messages = self.agent_terminal_item_events(committed.plan_item.as_ref(), None)?;
         if let Some(plan_item) = committed.plan_item.as_ref()
             && let Some(event) = self.event_notification(AppEvent::turn_plan_updated(
                 &committed.turn.turn_id,
@@ -151,7 +152,15 @@ impl AppServer {
         {
             messages.push(event);
         }
-        messages.extend(self.agent_terminal_item_events(committed.assistant_item.as_ref())?);
+        messages.extend(
+            self.agent_terminal_item_events(committed.assistant_item.as_ref(), assistant_events)?,
+        );
+        if committed.assistant_item.is_none()
+            && let Some(assistant_events) = assistant_events
+            && let Some(event) = self.realtime_item_failed_event(assistant_events)?
+        {
+            messages.push(event);
+        }
         if let Some(event) = self.event_notification(AppEvent::turn_completed(&committed.turn))? {
             messages.push(event);
         }
@@ -161,11 +170,23 @@ impl AppServer {
     pub(super) fn agent_terminal_item_events(
         &self,
         item: Option<&Item>,
+        assistant_events: Option<&AssistantItemEventState>,
     ) -> AppServerResult<Vec<Value>> {
         let Some(agent_item) = item else {
             return Ok(Vec::new());
         };
-        let mut events = vec![AppEvent::item_started(agent_item.item_id.clone())];
+        if let Some(assistant_events) = assistant_events
+            && assistant_events.item_id.as_str() != agent_item.item_id
+        {
+            return Err(StoreError::InvalidState(
+                "committed assistant item ID does not match its realtime allocation".to_string(),
+            )
+            .into());
+        }
+        let mut events = Vec::new();
+        if !assistant_events.is_some_and(|events| events.started_generated) {
+            events.push(AppEvent::item_started(agent_item.item_id.clone()));
+        }
         match &agent_item.kind {
             singularity_protocol::ItemKind::Plan => {}
             singularity_protocol::ItemKind::AgentMessage => {
@@ -178,10 +199,12 @@ impl AppServer {
                             "committed assistant item is missing its string delta".to_string(),
                         )
                     })?;
-                events.push(AppEvent::item_agent_message_delta(
-                    agent_item.item_id.clone(),
-                    agent_delta,
-                ));
+                if !assistant_events.is_some_and(|events| events.delta_generated) {
+                    events.push(AppEvent::item_agent_message_delta(
+                        agent_item.item_id.clone(),
+                        agent_delta,
+                    ));
+                }
             }
             _ => {
                 return Err(StoreError::InvalidState(format!(
@@ -197,6 +220,60 @@ impl AppServer {
             if let Some(message) = self.event_notification(event)? {
                 messages.push(message);
             }
+        }
+        Ok(messages)
+    }
+
+    /// 仅在 realtime item 已经通过过滤器出现时构造脱敏失败事件。
+    pub(super) fn realtime_item_failed_event(
+        &self,
+        assistant_events: &AssistantItemEventState,
+    ) -> AppServerResult<Option<Value>> {
+        if !assistant_events.appeared() {
+            return Ok(None);
+        }
+        self.event_notification(AppEvent::item_failed(
+            assistant_events.item_id.as_str(),
+            SAFE_ASSISTANT_ITEM_FAILURE,
+        ))
+    }
+
+    /// 向当前有序输出路径追加可见 realtime item 的可靠失败终态。
+    pub(super) fn emit_realtime_item_failure(
+        &self,
+        emit: &mut impl FnMut(Value),
+        assistant_events: Option<&AssistantItemEventState>,
+    ) -> AppServerResult<()> {
+        if let Some(assistant_events) = assistant_events
+            && let Some(event) = self.realtime_item_failed_event(assistant_events)?
+        {
+            emit(event);
+        }
+        Ok(())
+    }
+
+    /// 把 finalization-only delta 投影到同一预分配 item，并记录过滤器实际生成的部分。
+    pub(super) fn project_assistant_delta(
+        &self,
+        assistant_events: &mut AssistantItemEventState,
+        delta: &str,
+    ) -> AppServerResult<Vec<Value>> {
+        let mut messages = Vec::new();
+        if !assistant_events.first_delta_observed {
+            assistant_events.first_delta_observed = true;
+            if let Some(event) =
+                self.event_notification(AppEvent::item_started(assistant_events.item_id.as_str()))?
+            {
+                assistant_events.started_generated = true;
+                messages.push(event);
+            }
+        }
+        if let Some(event) = self.event_notification(AppEvent::item_agent_message_delta(
+            assistant_events.item_id.as_str(),
+            delta,
+        ))? {
+            assistant_events.delta_generated = true;
+            messages.push(event);
         }
         Ok(messages)
     }

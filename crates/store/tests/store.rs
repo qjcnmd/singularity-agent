@@ -2002,6 +2002,7 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
             CommitTurnOutcomeParams {
                 status: TurnStatus::Completed,
                 agent_loop_status: "completed",
+                assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
                 assistant_delta: Some("too late"),
                 plan: None,
                 trace: &TraceEvent::for_turn(
@@ -2022,6 +2023,7 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
             CommitTurnOutcomeParams {
                 status: TurnStatus::Interrupted,
                 agent_loop_status: "cancelled",
+                assistant_item_id: None,
                 assistant_delta: None,
                 plan: None,
                 trace: &TraceEvent::for_turn(
@@ -2110,6 +2112,7 @@ fn infrastructure_failure_after_approval_claim_terminalizes_and_cleans_checkpoin
             CommitTurnOutcomeParams {
                 status: TurnStatus::Failed,
                 agent_loop_status: "failed",
+                assistant_item_id: None,
                 assistant_delta: None,
                 plan: None,
                 trace: &TraceEvent::for_turn(
@@ -2203,6 +2206,7 @@ fn approval_terminal_store_failure_rolls_back_then_allows_safe_cleanup() {
         CommitTurnOutcomeParams {
             status: TurnStatus::Failed,
             agent_loop_status: "failed",
+            assistant_item_id: None,
             assistant_delta: None,
             plan: None,
             trace: &TraceEvent {
@@ -2240,6 +2244,7 @@ fn approval_terminal_store_failure_rolls_back_then_allows_safe_cleanup() {
             CommitTurnOutcomeParams {
                 status: TurnStatus::Failed,
                 agent_loop_status: "failed",
+                assistant_item_id: None,
                 assistant_delta: None,
                 plan: None,
                 trace: &TraceEvent::for_turn(
@@ -2290,11 +2295,13 @@ fn infrastructure_failure_authority_rejects_non_failed_outcomes() {
             )
             .expect("cancel request");
 
+        let assistant_item_id = SessionStore::allocate_assistant_item_id();
         let result = store.commit_turn_outcome_with_authority(
             &turn.turn_id,
             CommitTurnOutcomeParams {
                 status,
                 agent_loop_status,
+                assistant_item_id: is_completed.then_some(&assistant_item_id),
                 assistant_delta: is_completed.then_some("late result"),
                 plan: None,
                 trace: &TraceEvent::for_turn(
@@ -2901,6 +2908,7 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
             CommitTurnOutcomeParams {
                 status: TurnStatus::Interrupted,
                 agent_loop_status: "interrupted",
+                assistant_item_id: None,
                 assistant_delta: None,
                 plan: None,
                 trace: &trace,
@@ -2926,6 +2934,7 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
             CommitTurnOutcomeParams {
                 status: TurnStatus::Blocked,
                 agent_loop_status: "blocked",
+                assistant_item_id: None,
                 assistant_delta: None,
                 plan: None,
                 trace: &trace,
@@ -3276,6 +3285,7 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
     let plan = serde_json::json!({
         "steps": [{"step": "verify", "status": "completed"}]
     });
+    let assistant_item_id = SessionStore::allocate_assistant_item_id();
 
     let committed = store
         .commit_turn_outcome(
@@ -3283,6 +3293,7 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
             CommitTurnOutcomeParams {
                 status: TurnStatus::Completed,
                 agent_loop_status: "completed",
+                assistant_item_id: Some(&assistant_item_id),
                 assistant_delta: Some("assistant"),
                 plan: Some(&plan),
                 trace: &trace,
@@ -3306,6 +3317,13 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
         committed
             .assistant_item
             .as_ref()
+            .map(|item| item.item_id.as_str()),
+        Some(assistant_item_id.as_str())
+    );
+    assert_eq!(
+        committed
+            .assistant_item
+            .as_ref()
             .and_then(|item| item.payload["delta"].as_str()),
         Some("assistant")
     );
@@ -3320,6 +3338,100 @@ fn terminal_turn_state_assistant_item_and_trace_commit_atomically() {
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>(),
         vec!["user", "assistant"]
+    );
+}
+
+#[test]
+fn terminal_assistant_item_id_and_delta_must_be_paired() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    for (assistant_item_id, assistant_delta) in [
+        (None, Some("assistant")),
+        (Some(SessionStore::allocate_assistant_item_id()), None),
+    ] {
+        let thread = store.create_thread(None, None).expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "running")
+            .expect("turn");
+        let error = store
+            .commit_turn_outcome(
+                &turn.turn_id,
+                CommitTurnOutcomeParams {
+                    status: TurnStatus::Completed,
+                    agent_loop_status: "completed",
+                    assistant_item_id: assistant_item_id.as_ref(),
+                    assistant_delta,
+                    plan: None,
+                    trace: &TraceEvent::for_turn(
+                        format!("trace_pairing_{}", turn.turn_id),
+                        &thread.thread_id,
+                        &turn.turn_id,
+                        "test",
+                        "terminal pairing",
+                    ),
+                },
+            )
+            .expect_err("unpaired assistant item must fail closed");
+        assert!(matches!(
+            error,
+            StoreError::InvalidState(message)
+                if message == "completed turn outcome requires a preallocated item ID and non-empty assistant message"
+        ));
+        assert_eq!(
+            store.get_turn(&turn.turn_id).expect("turn").status,
+            TurnStatus::Running
+        );
+    }
+}
+
+#[test]
+fn preallocated_assistant_item_id_cannot_be_reused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let first_thread = store.create_thread(None, None).expect("first thread");
+    let second_thread = store.create_thread(None, None).expect("second thread");
+    let first_turn = store
+        .create_turn(&first_thread.thread_id, "running")
+        .expect("first turn");
+    let second_turn = store
+        .create_turn(&second_thread.thread_id, "running")
+        .expect("second turn");
+    let item_id = SessionStore::allocate_assistant_item_id();
+    let commit = |turn: &singularity_protocol::Turn, thread_id: &str, trace_id: &str| {
+        store.commit_turn_outcome(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Completed,
+                agent_loop_status: "completed",
+                assistant_item_id: Some(&item_id),
+                assistant_delta: Some("assistant"),
+                plan: None,
+                trace: &TraceEvent::for_turn(
+                    trace_id,
+                    thread_id,
+                    &turn.turn_id,
+                    "test",
+                    "terminal outcome",
+                ),
+            },
+        )
+    };
+
+    commit(&first_turn, &first_thread.thread_id, "trace_first").expect("first commit");
+    let error = commit(&second_turn, &second_thread.thread_id, "trace_second")
+        .expect_err("duplicate item ID must fail closed");
+
+    assert!(matches!(
+        error,
+        StoreError::InvalidState(message)
+            if message == "preallocated assistant item ID is already in use"
+    ));
+    assert_eq!(
+        store
+            .get_turn(&second_turn.turn_id)
+            .expect("second turn")
+            .status,
+        TurnStatus::Running
     );
 }
 
@@ -3366,6 +3478,7 @@ fn terminal_turn_commit_rolls_back_state_and_item_when_trace_insert_fails() {
         CommitTurnOutcomeParams {
             status: TurnStatus::Completed,
             agent_loop_status: "completed",
+            assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
             assistant_delta: Some("assistant"),
             plan: None,
             trace: &trace,
@@ -3421,6 +3534,7 @@ fn turn_trace_binding_error_remains_typed_at_store_boundary() {
             CommitTurnOutcomeParams {
                 status: TurnStatus::Interrupted,
                 agent_loop_status: "interrupted",
+                assistant_item_id: None,
                 assistant_delta: None,
                 plan: None,
                 trace: &trace,
@@ -3465,6 +3579,7 @@ fn missing_turn_trace_task_id_remains_typed_at_store_boundary() {
             CommitTurnOutcomeParams {
                 status: TurnStatus::Interrupted,
                 agent_loop_status: "interrupted",
+                assistant_item_id: None,
                 assistant_delta: None,
                 plan: None,
                 trace: &trace,

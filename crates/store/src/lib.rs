@@ -99,8 +99,8 @@ pub use approval::RecordedApprovalDecision;
 pub use connection::{SessionStore, SessionStoreDescriptor, WorkspaceExecutionGuard};
 pub use error::{StoreError, StoreResult};
 pub use thread_turn::{
-    AllocatedTurnId, CommitTurnOutcomeParams, CommittedTurnOutcome, CreateStartedTurnParams,
-    StartedTurn, ThreadHistoryPage, TurnOutcomeAuthority,
+    AllocatedAssistantItemId, AllocatedTurnId, CommitTurnOutcomeParams, CommittedTurnOutcome,
+    CreateStartedTurnParams, StartedTurn, ThreadHistoryPage, TurnOutcomeAuthority,
 };
 pub use trace_artifact::RegisterArtifactRefParams;
 

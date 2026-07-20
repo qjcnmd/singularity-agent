@@ -286,6 +286,8 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let turn = started.turn;
+        let mut assistant_events =
+            AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
         active_turn.start_monitor();
         match self.event_notification(AppEvent::turn_started(&turn)) {
             Ok(Some(event)) => emit(event),
@@ -295,6 +297,7 @@ impl AppServer {
                 return self.finish_turn_failure(
                     &mut emit,
                     &turn,
+                    Some(&assistant_events),
                     &cancellation,
                     monitor_outcome,
                     monitor_failure_or(
@@ -304,6 +307,7 @@ impl AppServer {
                 );
             }
         }
+        let mut delta_error = None;
         let status = match self.run_agent_loop(
             AgentLoopInvocation {
                 thread: &thread,
@@ -314,6 +318,15 @@ impl AppServer {
                 monitor_control: active_turn.monitor_control(),
             },
             workspace_tools,
+            &mut |delta| {
+                if delta_error.is_some() {
+                    return;
+                }
+                match self.project_assistant_delta(&mut assistant_events, delta) {
+                    Ok(messages) => emit_messages(&mut emit, messages),
+                    Err(error) => delta_error = Some(error),
+                }
+            },
         ) {
             Ok(status) => status,
             Err(error) => {
@@ -321,6 +334,7 @@ impl AppServer {
                 return self.finish_turn_failure(
                     &mut emit,
                     &turn,
+                    Some(&assistant_events),
                     &cancellation,
                     monitor_outcome,
                     monitor_failure_or(
@@ -330,6 +344,20 @@ impl AppServer {
                 );
             }
         };
+        if let Some(error) = delta_error {
+            let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
+            return self.finish_turn_failure(
+                &mut emit,
+                &turn,
+                Some(&assistant_events),
+                &cancellation,
+                monitor_outcome,
+                monitor_failure_or(
+                    monitor_outcome,
+                    turn_failure_from_error(&error, TurnFailureStage::EventNotification),
+                ),
+            );
+        }
         let approval_events = match self.pending_approval_events_for_turn(&turn.turn_id) {
             Ok(events) => events,
             Err(error) => {
@@ -337,6 +365,7 @@ impl AppServer {
                 return self.finish_turn_failure(
                     &mut emit,
                     &turn,
+                    Some(&assistant_events),
                     &cancellation,
                     monitor_outcome,
                     monitor_failure_or(
@@ -352,6 +381,7 @@ impl AppServer {
             return self.finish_turn_failure(
                 &mut emit,
                 &turn,
+                Some(&assistant_events),
                 &cancellation,
                 monitor_outcome,
                 TurnFailure {
@@ -363,6 +393,7 @@ impl AppServer {
         let committed = match self.commit_turn_run_status(
             turn.clone(),
             &status,
+            Some(&assistant_events.item_id),
             &cancellation,
             monitor_outcome,
         ) {
@@ -371,6 +402,7 @@ impl AppServer {
                 return self.finish_turn_failure(
                     &mut emit,
                     &turn,
+                    Some(&assistant_events),
                     &cancellation,
                     monitor_outcome,
                     monitor_failure_or(
@@ -383,7 +415,7 @@ impl AppServer {
                 );
             }
         };
-        let terminal_events = self.committed_turn_events(&committed)?;
+        let terminal_events = self.committed_turn_events(&committed, Some(&assistant_events))?;
         let turn = committed.turn;
         emit_messages(&mut emit, terminal_events);
         emit(
@@ -400,6 +432,7 @@ impl AppServer {
         &self,
         emit: &mut impl FnMut(Value),
         turn: &Turn,
+        assistant_events: Option<&AssistantItemEventState>,
         cancellation: &CancellationToken,
         monitor_outcome: Option<CancellationMonitorOutcome>,
         failure: impl Into<TurnFailure>,
@@ -407,7 +440,7 @@ impl AppServer {
         let failure = failure.into();
         match self.terminalize_turn_failure(turn, cancellation, monitor_outcome, failure) {
             Ok(TurnTerminalizationResult::Committed(committed)) => {
-                match self.committed_turn_events(&committed) {
+                match self.committed_turn_events(&committed, assistant_events) {
                     Ok(events) => emit_messages(emit, events),
                     Err(_) => {
                         return Err(AppServerError::TurnTerminalization {
@@ -422,15 +455,21 @@ impl AppServer {
                     cause: failure.cause,
                 })
             }
-            Ok(TurnTerminalizationResult::Preserved) => Err(AppServerError::TurnExecution {
-                stage: failure.stage,
-                cause: failure.cause,
-            }),
-            Err(cleanup_failure) => Err(AppServerError::TurnTerminalization {
-                stage: failure.stage,
-                cause: failure.cause,
-                failure: cleanup_failure,
-            }),
+            Ok(TurnTerminalizationResult::Preserved) => {
+                self.emit_realtime_item_failure(emit, assistant_events)?;
+                Err(AppServerError::TurnExecution {
+                    stage: failure.stage,
+                    cause: failure.cause,
+                })
+            }
+            Err(cleanup_failure) => {
+                self.emit_realtime_item_failure(emit, assistant_events)?;
+                Err(AppServerError::TurnTerminalization {
+                    stage: failure.stage,
+                    cause: failure.cause,
+                    failure: cleanup_failure,
+                })
+            }
         }
     }
 
@@ -468,7 +507,7 @@ impl AppServer {
             } else {
                 TurnOutcomeAuthority::AgentLoop
             };
-        match self.commit_effective_turn_status_with_authority(&current, &status, authority) {
+        match self.commit_effective_turn_status_with_authority(&current, &status, None, authority) {
             Ok(committed) => Ok(TurnTerminalizationResult::Committed(Box::new(committed))),
             Err(_) => {
                 let latest = self
@@ -483,7 +522,7 @@ impl AppServer {
                     let mut interrupted =
                         AgentRunStatus::failed("turn interrupted by user request");
                     mark_run_cancelled(&mut interrupted);
-                    match self.commit_effective_turn_status(&latest, &interrupted) {
+                    match self.commit_effective_turn_status(&latest, &interrupted, None) {
                         Ok(committed) => {
                             Ok(TurnTerminalizationResult::Committed(Box::new(committed)))
                         }
@@ -567,6 +606,7 @@ impl AppServer {
         &self,
         invocation: AgentLoopInvocation<'_>,
         workspace_tools: WorkspaceTools,
+        on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AppServerResult<AgentRunStatus> {
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
@@ -577,7 +617,12 @@ impl AppServer {
                 return Ok(status);
             }
         };
-        match self.run_agent_loop_with_provider_and_tools(provider, invocation, workspace_tools) {
+        match self.run_agent_loop_with_provider_and_tools(
+            provider,
+            invocation,
+            workspace_tools,
+            on_text_delta,
+        ) {
             Err(AppServerError::ProjectInstructions(_)) => Ok(safe_failed_agent_status(
                 SAFE_PROJECT_INSTRUCTIONS_FAILURE,
                 "project_instructions",
@@ -595,6 +640,7 @@ impl AppServer {
         &self,
         input: ApprovalResumeInput<'_>,
         context: ApprovalResumeContext<'_>,
+        on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>> {
         let ApprovalResumeInput {
             request,
@@ -644,6 +690,7 @@ impl AppServer {
             },
             provider,
             context,
+            on_text_delta,
         )
     }
 
@@ -657,6 +704,32 @@ impl AppServer {
         provider: P,
         cancellation: &CancellationToken,
         prepared_workspace_tools: Option<WorkspaceTools>,
+    ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
+    where
+        P: Provider,
+    {
+        self.resume_agent_loop_after_gate_with_text_deltas(
+            request,
+            decision,
+            pending_tool_call,
+            provider,
+            cancellation,
+            prepared_workspace_tools,
+            &mut |_| {},
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resume_agent_loop_after_gate_with_text_deltas<P>(
+        &self,
+        request: &ApprovalRequest,
+        decision: &ApprovalDecision,
+        pending_tool_call: Option<Value>,
+        provider: P,
+        cancellation: &CancellationToken,
+        prepared_workspace_tools: Option<WorkspaceTools>,
+        on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
     where
         P: Provider,
@@ -681,6 +754,7 @@ impl AppServer {
                 monitor_control: None,
                 prepared_workspace_tools,
             },
+            on_text_delta,
         )
     }
 
@@ -689,6 +763,7 @@ impl AppServer {
         input: ApprovalResumeInput<'_>,
         provider: P,
         context: ApprovalResumeContext<'_>,
+        on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
     where
         P: Provider,
@@ -791,7 +866,11 @@ impl AppServer {
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
             .with_workspace_tools(workspace_tools)
             .with_cancellation_token(context.cancellation.clone())
-            .resume_pending_approval(&loop_input, &pending_approval);
+            .resume_pending_approval_with_text_deltas(
+                &loop_input,
+                &pending_approval,
+                on_text_delta,
+            );
         if monitor_infrastructure_failure(context.monitor_control) {
             return Err(AppServerError::TurnExecution {
                 stage: TurnFailureStage::CancellationMonitor,
@@ -839,6 +918,32 @@ impl AppServer {
     where
         P: Provider,
     {
+        self.run_agent_loop_with_provider_and_text_deltas(
+            provider,
+            thread,
+            params,
+            turn_id,
+            history,
+            cancellation,
+            &mut |_| {},
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_agent_loop_with_provider_and_text_deltas<P>(
+        &self,
+        provider: P,
+        thread: &Thread,
+        params: &TurnStartParams,
+        turn_id: &str,
+        history: &[ConversationMessage],
+        cancellation: &CancellationToken,
+        on_text_delta: &mut AgentTextDeltaCallback<'_>,
+    ) -> AppServerResult<AgentRunStatus>
+    where
+        P: Provider,
+    {
         let workspace_tools = workspace_tools_for_thread(thread, Arc::clone(&self.sandbox_backend))
             .map_err(AppServerError::Workspace)?;
         let invocation = AgentLoopInvocation {
@@ -849,7 +954,12 @@ impl AppServer {
             cancellation,
             monitor_control: None,
         };
-        self.run_agent_loop_with_provider_and_tools(provider, invocation, workspace_tools)
+        self.run_agent_loop_with_provider_and_tools(
+            provider,
+            invocation,
+            workspace_tools,
+            on_text_delta,
+        )
     }
 
     pub(super) fn run_agent_loop_with_provider_and_tools<P>(
@@ -857,6 +967,7 @@ impl AppServer {
         provider: P,
         invocation: AgentLoopInvocation<'_>,
         workspace_tools: WorkspaceTools,
+        on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AppServerResult<AgentRunStatus>
     where
         P: Provider,
@@ -877,7 +988,7 @@ impl AppServer {
         let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
             .with_workspace_tools(workspace_tools)
             .with_cancellation_token(invocation.cancellation.clone())
-            .run(&loop_input);
+            .run_with_text_deltas(&loop_input, on_text_delta);
         let mut run_status = result.to_run_status();
         sanitize_agent_run_status_error(&mut run_status);
         if monitor_infrastructure_failure(invocation.monitor_control) {
@@ -963,6 +1074,7 @@ impl AppServer {
         &self,
         turn: Turn,
         run_status: &AgentRunStatus,
+        assistant_item_id: Option<&AllocatedAssistantItemId>,
         cancellation: &CancellationToken,
         monitor_outcome: Option<CancellationMonitorOutcome>,
     ) -> AppServerResult<CommittedTurnOutcome> {
@@ -991,7 +1103,7 @@ impl AppServer {
             )
             .into());
         }
-        self.commit_effective_turn_status(&turn, &effective_status)
+        self.commit_effective_turn_status(&turn, &effective_status, assistant_item_id)
             .map_err(Into::into)
     }
 
@@ -999,10 +1111,12 @@ impl AppServer {
         &self,
         turn: &Turn,
         run_status: &AgentRunStatus,
+        assistant_item_id: Option<&AllocatedAssistantItemId>,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         self.commit_effective_turn_status_with_authority(
             turn,
             run_status,
+            assistant_item_id,
             TurnOutcomeAuthority::AgentLoop,
         )
     }
@@ -1011,6 +1125,7 @@ impl AppServer {
         &self,
         turn: &Turn,
         run_status: &AgentRunStatus,
+        assistant_item_id: Option<&AllocatedAssistantItemId>,
         authority: TurnOutcomeAuthority,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         let assistant_delta = agent_completed_delta(run_status);
@@ -1025,6 +1140,7 @@ impl AppServer {
             CommitTurnOutcomeParams {
                 status: turn_status_for_agent(&run_status.status),
                 agent_loop_status: run_status.status.as_str(),
+                assistant_item_id: assistant_delta.as_ref().and(assistant_item_id),
                 assistant_delta: assistant_delta.as_deref(),
                 plan: plan.as_ref(),
                 trace: &event,
@@ -1040,6 +1156,7 @@ impl AppServer {
         turn: &Turn,
         run_status: &AgentRunStatus,
         next_approvals: &[PendingApprovalOccurrence],
+        assistant_item_id: Option<&AllocatedAssistantItemId>,
         monitor_outcome: Option<CancellationMonitorOutcome>,
     ) -> Result<CommittedTurnOutcome, StoreError> {
         let mut effective_status = run_status.clone();
@@ -1064,6 +1181,7 @@ impl AppServer {
                     CommitTurnOutcomeParams {
                         status: turn_status_for_agent(&status.status),
                         agent_loop_status: status.status.as_str(),
+                        assistant_item_id: assistant_delta.as_ref().and(assistant_item_id),
                         assistant_delta: assistant_delta.as_deref(),
                         plan: plan.as_ref(),
                         trace: &event,

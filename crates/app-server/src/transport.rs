@@ -583,8 +583,14 @@ fn run_request_worker(
 ) -> Result<(), String> {
     let request_id = message.id().cloned();
     let mut output_error = None;
-    let result = if message.method_name() == Some(Method::TurnStart.as_str()) {
-        worker.handle_turn_start_streaming_with_output(message, |output| {
+    let streaming_method = message.method_name();
+    let result = if matches!(
+        streaming_method,
+        Some(method)
+            if method == Method::TurnStart.as_str()
+                || method == Method::ApprovalDecision.as_str()
+    ) {
+        let mut send_streaming_output = |output: AppServerOutput| {
             if output_error.is_none()
                 && let Err(error) = send_reserved_output(
                     &outputs,
@@ -597,7 +603,13 @@ fn run_request_worker(
             } else if output_error.is_some() {
                 outputs.order_state.complete(output.reservation.order);
             }
-        })
+        };
+        if streaming_method == Some(Method::TurnStart.as_str()) {
+            worker.handle_turn_start_streaming_with_output(message, &mut send_streaming_output)
+        } else {
+            worker
+                .handle_approval_decision_streaming_with_output(message, &mut send_streaming_output)
+        }
     } else {
         match worker.handle_with_output(message) {
             Ok(messages) => send_app_server_outputs(&outputs, &cancellation, messages)
@@ -1371,6 +1383,25 @@ mod tests {
         .to_wire_value()
     }
 
+    fn reliable_item_event(method: &str, cursor: u64) -> Value {
+        JsonRpcMessage::notification(
+            method,
+            serde_json::json!({
+                "item": {"item_id": "item_realtime"},
+                "event": EventMetadata {
+                    sequence: cursor,
+                    cursor,
+                    class: EventClass::State,
+                    delivery: EventDelivery::Reliable,
+                    recovery_query: None,
+                    gap: None,
+                },
+            }),
+        )
+        .expect("reliable item event")
+        .to_wire_value()
+    }
+
     #[test]
     fn state_path_rejects_sqlite_uri_before_cache_injection() {
         for path in [
@@ -1602,6 +1633,63 @@ mod tests {
         sender.join().expect("state sender");
         assert_eq!(event_rx.blocking_recv().expect("state output").order, 1);
         assert_eq!(cancellation.request_count(), 0);
+    }
+
+    #[test]
+    fn dropped_realtime_delta_records_gap_without_losing_completed_or_failed() {
+        for terminal_method in ["item/completed", "item/failed"] {
+            let (outputs, mut control_rx, mut event_rx) = test_output_channels(2, 1);
+            let cancellation = CancellationProbe::default();
+            assert_eq!(
+                send_output(
+                    &outputs,
+                    OutputKind::Event,
+                    &cancellation,
+                    progress_event(1),
+                )
+                .expect("first delta"),
+                OutputSendStatus::Enqueued
+            );
+            assert_eq!(
+                send_output(
+                    &outputs,
+                    OutputKind::Event,
+                    &cancellation,
+                    progress_event(2),
+                )
+                .expect("second delta may drop"),
+                OutputSendStatus::EventDropped
+            );
+
+            let sender_outputs = outputs.clone();
+            let sender_cancellation = cancellation.clone();
+            let expected_terminal_method = terminal_method;
+            let terminal_method = terminal_method.to_string();
+            let sender = thread::spawn(move || {
+                send_output(
+                    &sender_outputs,
+                    OutputKind::ReliableEvent,
+                    &sender_cancellation,
+                    reliable_item_event(&terminal_method, 3),
+                )
+            });
+            let first = event_rx.blocking_recv().expect("queued first delta");
+            assert_eq!(first.message["method"], "item/agentMessage/delta");
+            assert_eq!(
+                sender
+                    .join()
+                    .expect("terminal sender")
+                    .expect("terminal event"),
+                OutputSendStatus::Enqueued
+            );
+            let terminal = event_rx.blocking_recv().expect("reliable terminal event");
+            assert_eq!(terminal.message["method"], expected_terminal_method);
+            let gap = control_rx.blocking_recv().expect("typed progress gap");
+            assert_eq!(gap.message["method"], "event/gap");
+            assert_eq!(gap.message["params"]["gap"]["reason"], "progress_dropped");
+            assert_eq!(gap.message["params"]["gap"]["fromCursor"], 2);
+            assert_eq!(gap.message["params"]["gap"]["toCursor"], 2);
+        }
     }
 
     #[test]
