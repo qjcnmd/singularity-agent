@@ -241,6 +241,7 @@ fn validate_projection_storage_values(projection: &TraceSpanProjection) -> Store
         (projection.message_count, "trace message count"),
         (projection.tool_count, "trace tool count"),
         (projection.request_token_count, "trace request token count"),
+        (projection.model_turn_ordinal, "trace model turn ordinal"),
         (projection.attempt_index, "trace attempt index"),
         (projection.retry_count, "trace retry count"),
         (projection.queue_duration_ms, "trace queue duration"),
@@ -324,10 +325,15 @@ const TRACE_METRIC_NAMES: &[TraceMetricName] = &[
     TraceMetricName::ProviderRetryBackoffMs,
     TraceMetricName::ProviderErrorCount,
     TraceMetricName::ProviderInputTokens,
+    TraceMetricName::ProviderCachedInputTokens,
     TraceMetricName::ProviderOutputTokens,
     TraceMetricName::ProviderTotalTokens,
+    TraceMetricName::ProviderCapabilityCacheHitCount,
+    TraceMetricName::ProviderCapabilityCacheMissCount,
+    TraceMetricName::ProviderCapabilityCacheHitRateBps,
     TraceMetricName::ToolFrequency,
     TraceMetricName::ToolSuccessCount,
+    TraceMetricName::ToolSuccessRateBps,
     TraceMetricName::ToolDurationMs,
     TraceMetricName::ApprovalWaitDurationMs,
     TraceMetricName::SandboxExecutionDurationMs,
@@ -415,16 +421,36 @@ fn derive_trace_metric(
         TraceMetricName::ProviderInputTokens => {
             usage_values(events, legacy_only, |usage| usage.input_tokens)
         }
+        TraceMetricName::ProviderCachedInputTokens => {
+            usage_values(events, legacy_only, |usage| usage.cached_input_tokens)
+        }
         TraceMetricName::ProviderOutputTokens => {
             usage_values(events, legacy_only, |usage| usage.output_tokens)
         }
         TraceMetricName::ProviderTotalTokens => {
             usage_values(events, legacy_only, |usage| usage.total_tokens)
         }
+        TraceMetricName::ProviderCapabilityCacheHitCount => sample_values(
+            TraceMetricSampleKind::ProviderCapabilityCacheHit,
+            events,
+            legacy_only,
+        ),
+        TraceMetricName::ProviderCapabilityCacheMissCount => sample_values(
+            TraceMetricSampleKind::ProviderCapabilityCacheMiss,
+            events,
+            legacy_only,
+        ),
+        TraceMetricName::ProviderCapabilityCacheHitRateBps => sample_ratio_values(
+            TraceMetricSampleKind::ProviderCapabilityCacheHit,
+            TraceMetricSampleKind::ProviderCapabilityCacheMiss,
+            events,
+            legacy_only,
+        )?,
         TraceMetricName::ToolFrequency => {
             count_values(TraceSpanKind::ToolCall, events, legacy_only)
         }
         TraceMetricName::ToolSuccessCount => tool_success_values(events, legacy_only),
+        TraceMetricName::ToolSuccessRateBps => tool_success_rate_values(events, legacy_only)?,
         TraceMetricName::ToolDurationMs => duration_values(
             TraceSpanKind::ToolCall,
             events,
@@ -736,6 +762,49 @@ fn tool_success_values(
     (TraceMetricAvailability::Available, values)
 }
 
+fn tool_success_rate_values(
+    events: &[TraceEvent],
+    legacy_only: bool,
+) -> StoreResult<(TraceMetricAvailability, Vec<u64>)> {
+    if legacy_only {
+        return Ok((legacy_only_availability(), Vec::new()));
+    }
+    let ends = span_ends(TraceSpanKind::ToolCall, events);
+    if ends.is_empty() {
+        return Ok((
+            if span_starts(TraceSpanKind::ToolCall, events) > 0 {
+                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
+            } else {
+                unavailable(TraceMetricUnavailableReason::NoProducer)
+            },
+            Vec::new(),
+        ));
+    }
+    let successes = ends
+        .iter()
+        .filter(|event| {
+            event.span_status == Some(TraceSpanStatus::Ok)
+                || event
+                    .span_projection
+                    .as_ref()
+                    .and_then(|projection| projection.tool.as_ref())
+                    .and_then(|tool| tool.status)
+                    == Some(TraceToolStatus::Succeeded)
+        })
+        .count();
+    let successes = u128::try_from(successes)
+        .map_err(|_| StoreError::InvalidState("trace tool success count overflow".to_string()))?;
+    let total = u128::try_from(ends.len())
+        .map_err(|_| StoreError::InvalidState("trace tool span count overflow".to_string()))?;
+    let rate = successes
+        .checked_mul(10_000)
+        .ok_or_else(|| StoreError::InvalidState("trace metric rate overflow".to_string()))?
+        / total;
+    let rate = u64::try_from(rate)
+        .map_err(|_| StoreError::InvalidState("trace metric rate overflow".to_string()))?;
+    Ok((TraceMetricAvailability::Available, vec![rate]))
+}
+
 fn sample_values(
     kind: TraceMetricSampleKind,
     events: &[TraceEvent],
@@ -758,6 +827,50 @@ fn sample_values(
     } else {
         (TraceMetricAvailability::Available, values)
     }
+}
+
+fn sample_ratio_values(
+    numerator_kind: TraceMetricSampleKind,
+    denominator_kind: TraceMetricSampleKind,
+    events: &[TraceEvent],
+    legacy_only: bool,
+) -> StoreResult<(TraceMetricAvailability, Vec<u64>)> {
+    if legacy_only {
+        return Ok((legacy_only_availability(), Vec::new()));
+    }
+    let mut numerator = 0_u128;
+    let mut denominator = 0_u128;
+    let mut found = false;
+    for sample in events.iter().flat_map(|event| event.metric_samples.iter()) {
+        if sample.kind == numerator_kind || sample.kind == denominator_kind {
+            found = true;
+            denominator = denominator
+                .checked_add(u128::from(sample.count))
+                .ok_or_else(|| {
+                    StoreError::InvalidState("trace metric sample sum overflow".to_string())
+                })?;
+            if sample.kind == numerator_kind {
+                numerator = numerator
+                    .checked_add(u128::from(sample.count))
+                    .ok_or_else(|| {
+                        StoreError::InvalidState("trace metric sample sum overflow".to_string())
+                    })?;
+            }
+        }
+    }
+    if !found || denominator == 0 {
+        return Ok((
+            unavailable(TraceMetricUnavailableReason::NoProducer),
+            Vec::new(),
+        ));
+    }
+    let rate = numerator
+        .checked_mul(10_000)
+        .ok_or_else(|| StoreError::InvalidState("trace metric rate overflow".to_string()))?
+        / denominator;
+    let rate = u64::try_from(rate)
+        .map_err(|_| StoreError::InvalidState("trace metric rate overflow".to_string()))?;
+    Ok((TraceMetricAvailability::Available, vec![rate]))
 }
 
 fn unavailable(reason: TraceMetricUnavailableReason) -> TraceMetricAvailability {

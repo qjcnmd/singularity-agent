@@ -1160,6 +1160,24 @@ pub enum TraceSandboxStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// sandbox execution 的工作区变化事实。
+pub enum TraceWorkspaceMutation {
+    Unchanged,
+    Changed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// sandbox backend 的实际强制执行强度。
+pub enum TraceSandboxEnforcement {
+    Strict,
+    RestrictedToken,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// sandbox execution 的安全投影；不含 command、cwd、path 或 environment。
@@ -1170,6 +1188,10 @@ pub struct TraceSandboxProjection {
     pub command_id_binding_valid: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TraceSandboxStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation: Option<TraceWorkspaceMutation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforcement: Option<TraceSandboxEnforcement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1231,6 +1253,14 @@ pub struct TraceSpanProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_token_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_turn_ordinal: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
@@ -1267,6 +1297,12 @@ pub struct TraceSpanProjection {
 }
 
 impl TraceSpanProjection {
+    fn has_prompt_fields(&self) -> bool {
+        self.request_digest.is_some()
+            || self.compacted.is_some()
+            || self.finalization_only.is_some()
+    }
+
     fn has_provider_fields(&self) -> bool {
         self.provider_name.is_some()
             || self.model_name.is_some()
@@ -1299,10 +1335,11 @@ impl TraceSpanProjection {
                 .approval
                 .as_ref()
                 .is_some_and(|value| value.outcome.is_some())
-            || self
-                .sandbox
-                .as_ref()
-                .is_some_and(|value| value.status.is_some())
+            || self.sandbox.as_ref().is_some_and(|value| {
+                value.status.is_some()
+                    || value.workspace_mutation.is_some()
+                    || value.enforcement.is_some()
+            })
             || self
                 .verification
                 .as_ref()
@@ -1318,6 +1355,8 @@ impl TraceSpanProjection {
         let allowed = match kind {
             TraceSpanKind::Task | TraceSpanKind::Turn => {
                 !self.has_provider_fields()
+                    && !self.has_prompt_fields()
+                    && self.model_turn_ordinal.is_none()
                     && self.tool.is_none()
                     && self.policy.is_none()
                     && self.approval.is_none()
@@ -1335,7 +1374,9 @@ impl TraceSpanProjection {
                     && self.final_review.is_none()
             }
             TraceSpanKind::ProviderAttempt => {
-                self.tool.is_none()
+                !self.has_prompt_fields()
+                    && self.model_turn_ordinal.is_none()
+                    && self.tool.is_none()
                     && self.policy.is_none()
                     && self.approval.is_none()
                     && self.sandbox.is_none()
@@ -1344,6 +1385,7 @@ impl TraceSpanProjection {
             }
             TraceSpanKind::ToolCall => {
                 !self.has_provider_fields()
+                    && !self.has_prompt_fields()
                     && self.policy.is_none()
                     && self.approval.is_none()
                     && self.sandbox.is_none()
@@ -1352,6 +1394,8 @@ impl TraceSpanProjection {
             }
             TraceSpanKind::PolicyDecision => {
                 !self.has_provider_fields()
+                    && !self.has_prompt_fields()
+                    && self.model_turn_ordinal.is_none()
                     && self.tool.is_none()
                     && self.approval.is_none()
                     && self.sandbox.is_none()
@@ -1360,6 +1404,8 @@ impl TraceSpanProjection {
             }
             TraceSpanKind::ApprovalWait => {
                 !self.has_provider_fields()
+                    && !self.has_prompt_fields()
+                    && self.model_turn_ordinal.is_none()
                     && self.tool.is_none()
                     && self.policy.is_none()
                     && self.sandbox.is_none()
@@ -1368,6 +1414,8 @@ impl TraceSpanProjection {
             }
             TraceSpanKind::SandboxExecution => {
                 !self.has_provider_fields()
+                    && !self.has_prompt_fields()
+                    && self.model_turn_ordinal.is_none()
                     && self.tool.is_none()
                     && self.policy.is_none()
                     && self.approval.is_none()
@@ -1376,6 +1424,8 @@ impl TraceSpanProjection {
             }
             TraceSpanKind::Verification => {
                 !self.has_provider_fields()
+                    && !self.has_prompt_fields()
+                    && self.model_turn_ordinal.is_none()
                     && self.tool.is_none()
                     && self.policy.is_none()
                     && self.approval.is_none()
@@ -1384,6 +1434,8 @@ impl TraceSpanProjection {
             }
             TraceSpanKind::FinalReview => {
                 !self.has_provider_fields()
+                    && !self.has_prompt_fields()
+                    && self.model_turn_ordinal.is_none()
                     && self.tool.is_none()
                     && self.policy.is_none()
                     && self.approval.is_none()
@@ -1393,6 +1445,13 @@ impl TraceSpanProjection {
         };
         if !allowed {
             return Err("typed span projection fields do not match span kind".to_string());
+        }
+        if self
+            .request_digest
+            .as_deref()
+            .is_some_and(|digest| !digest.is_empty() && !is_trace_digest(digest))
+        {
+            return Err("prompt request_digest must be a sha256 digest".to_string());
         }
         if phase == TraceSpanPhase::Start && self.has_terminal_fields() {
             return Err("span start must not include terminal projection fields".to_string());
@@ -1406,6 +1465,13 @@ impl TraceSpanProjection {
             && self.message_count == other.message_count
             && self.tool_count == other.tool_count
             && self.request_token_count == other.request_token_count
+            && same_digest_identity(
+                self.request_digest.as_deref(),
+                other.request_digest.as_deref(),
+            )
+            && self.compacted == other.compacted
+            && self.finalization_only == other.finalization_only
+            && self.model_turn_ordinal == other.model_turn_ordinal
             && self.provider_name == other.provider_name
             && self.model_name == other.model_name
             && self.protocol == other.protocol
@@ -1424,7 +1490,46 @@ impl TraceSpanProjection {
                     value.tool_call_ordinal,
                 )
             })
+            && same_if_present(
+                self.sandbox
+                    .as_ref()
+                    .and_then(|value| value.workspace_mutation.as_ref()),
+                other
+                    .sandbox
+                    .as_ref()
+                    .and_then(|value| value.workspace_mutation.as_ref()),
+            )
+            && same_if_present(
+                self.sandbox
+                    .as_ref()
+                    .and_then(|value| value.enforcement.as_ref()),
+                other
+                    .sandbox
+                    .as_ref()
+                    .and_then(|value| value.enforcement.as_ref()),
+            )
     }
+}
+
+fn same_if_present<T: PartialEq + ?Sized>(left: Option<&T>, right: Option<&T>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
+}
+
+fn same_digest_identity(left: Option<&str>, right: Option<&str>) -> bool {
+    same_if_present(
+        left.filter(|value| !value.is_empty()),
+        right.filter(|value| !value.is_empty()),
+    )
+}
+
+fn is_trace_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.chars().all(|character| character.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1436,6 +1541,8 @@ pub enum TraceMetricSampleKind {
     EventQueueDrop,
     EventGap,
     WriterVisible,
+    ProviderCapabilityCacheHit,
+    ProviderCapabilityCacheMiss,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1460,10 +1567,15 @@ pub enum TraceMetricName {
     ProviderRetryBackoffMs,
     ProviderErrorCount,
     ProviderInputTokens,
+    ProviderCachedInputTokens,
     ProviderOutputTokens,
     ProviderTotalTokens,
+    ProviderCapabilityCacheHitCount,
+    ProviderCapabilityCacheMissCount,
+    ProviderCapabilityCacheHitRateBps,
     ToolFrequency,
     ToolSuccessCount,
+    ToolSuccessRateBps,
     ToolDurationMs,
     ApprovalWaitDurationMs,
     SandboxExecutionDurationMs,
@@ -1489,10 +1601,15 @@ impl TraceMetricName {
             Self::ProviderRetryBackoffMs => "provider_retry_backoff_ms",
             Self::ProviderErrorCount => "provider_error_count",
             Self::ProviderInputTokens => "provider_input_tokens",
+            Self::ProviderCachedInputTokens => "provider_cached_input_tokens",
             Self::ProviderOutputTokens => "provider_output_tokens",
             Self::ProviderTotalTokens => "provider_total_tokens",
+            Self::ProviderCapabilityCacheHitCount => "provider_capability_cache_hit_count",
+            Self::ProviderCapabilityCacheMissCount => "provider_capability_cache_miss_count",
+            Self::ProviderCapabilityCacheHitRateBps => "provider_capability_cache_hit_rate_bps",
             Self::ToolFrequency => "tool_frequency",
             Self::ToolSuccessCount => "tool_success_count",
+            Self::ToolSuccessRateBps => "tool_success_rate_bps",
             Self::ToolDurationMs => "tool_duration_ms",
             Self::ApprovalWaitDurationMs => "approval_wait_duration_ms",
             Self::SandboxExecutionDurationMs => "sandbox_execution_duration_ms",

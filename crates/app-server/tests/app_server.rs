@@ -368,7 +368,14 @@ fn app_server_enforces_initialize_and_emits_item_events() {
             .as_array()
             .unwrap()
             .len(),
-        24
+        29
+    );
+    assert!(
+        trace_metrics[0]["result"]["metrics"]["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|metric| metric["name"] == "tool_success_rate_bps")
     );
 
     let archived = server

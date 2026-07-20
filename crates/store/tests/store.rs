@@ -8,8 +8,9 @@ use singularity_policy::{
 };
 use singularity_protocol::{
     ItemKind, ThreadStatus, TraceBindingError, TraceEvent, TraceMetricAvailability,
-    TraceMetricSample, TraceMetricSampleKind, TraceProviderProtocol, TraceSpanKind, TraceSpanPhase,
-    TraceSpanProjection, TraceSpanStatus, TraceUsage, TurnStatus,
+    TraceMetricSample, TraceMetricSampleKind, TraceProviderProtocol, TraceSandboxEnforcement,
+    TraceSandboxProjection, TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
+    TraceToolProjection, TraceToolStatus, TraceUsage, TraceWorkspaceMutation, TurnStatus,
 };
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
@@ -3864,6 +3865,23 @@ fn append_trace_batch_rejects_overflow_before_persisting_any_event() {
         store.list_trace("run_span"),
         Err(StoreError::NotFound(message)) if message == "trace run run_span"
     ));
+
+    let mut prompt = metric_span(
+        "overflow_prompt",
+        "overflow_prompt_span",
+        TraceSpanKind::PromptAssembly,
+        TraceSpanPhase::Start,
+        0,
+    );
+    prompt.span_projection = Some(TraceSpanProjection {
+        model_turn_ordinal: Some(u64::MAX),
+        ..TraceSpanProjection::default()
+    });
+    assert!(store.append_trace(&prompt).is_err());
+    assert!(matches!(
+        store.list_trace("metrics_run"),
+        Err(StoreError::NotFound(message)) if message == "trace run metrics_run"
+    ));
 }
 
 #[test]
@@ -4079,6 +4097,275 @@ fn trace_metrics_are_derived_from_typed_trace_events_with_deterministic_percenti
 }
 
 #[test]
+fn trace_metrics_accept_untyped_transport_samples_and_new_observation_projections() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+
+    let mut prompt_start = metric_span(
+        "prompt_start",
+        "prompt",
+        TraceSpanKind::PromptAssembly,
+        TraceSpanPhase::Start,
+        0,
+    );
+    prompt_start.span_projection = Some(TraceSpanProjection {
+        message_count: Some(3),
+        tool_count: Some(1),
+        request_token_count: Some(8),
+        request_digest: Some(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ),
+        compacted: Some(true),
+        finalization_only: Some(false),
+        model_turn_ordinal: Some(2),
+        ..TraceSpanProjection::default()
+    });
+    let mut prompt_end = metric_span(
+        "prompt_end",
+        "prompt",
+        TraceSpanKind::PromptAssembly,
+        TraceSpanPhase::End,
+        4,
+    );
+    prompt_end.span_projection = prompt_start.span_projection.clone();
+
+    let mut provider_start = metric_span(
+        "provider_start_cached",
+        "provider_cached",
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanPhase::Start,
+        0,
+    );
+    provider_start.span_projection = Some(TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        attempt_index: Some(1),
+        ..TraceSpanProjection::default()
+    });
+    let mut provider_end = metric_span(
+        "provider_end_cached",
+        "provider_cached",
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanPhase::End,
+        12,
+    );
+    provider_end.span_projection = Some(TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        attempt_index: Some(1),
+        usage: Some(TraceUsage {
+            input_tokens: 10,
+            output_tokens: 4,
+            total_tokens: 14,
+            cached_input_tokens: 7,
+            reasoning_tokens: 0,
+        }),
+        ..TraceSpanProjection::default()
+    });
+
+    let mut tool_start = metric_span(
+        "tool_start_success",
+        "tool_success",
+        TraceSpanKind::ToolCall,
+        TraceSpanPhase::Start,
+        0,
+    );
+    tool_start.span_projection = Some(TraceSpanProjection {
+        model_turn_ordinal: Some(2),
+        tool: Some(TraceToolProjection::default()),
+        ..TraceSpanProjection::default()
+    });
+    let mut tool_end = metric_span(
+        "tool_end_success",
+        "tool_success",
+        TraceSpanKind::ToolCall,
+        TraceSpanPhase::End,
+        5,
+    );
+    tool_end.span_projection = Some(TraceSpanProjection {
+        model_turn_ordinal: Some(2),
+        tool: Some(TraceToolProjection {
+            status: Some(TraceToolStatus::Succeeded),
+            ..TraceToolProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    });
+
+    let mut tool_failed_start = metric_span(
+        "tool_start_failed",
+        "tool_failed",
+        TraceSpanKind::ToolCall,
+        TraceSpanPhase::Start,
+        0,
+    );
+    tool_failed_start.span_projection = Some(TraceSpanProjection {
+        model_turn_ordinal: Some(2),
+        tool: Some(TraceToolProjection::default()),
+        ..TraceSpanProjection::default()
+    });
+    let mut tool_failed_end = metric_span(
+        "tool_end_failed",
+        "tool_failed",
+        TraceSpanKind::ToolCall,
+        TraceSpanPhase::End,
+        6,
+    );
+    tool_failed_end.span_status = Some(TraceSpanStatus::Error);
+    tool_failed_end.span_projection = Some(TraceSpanProjection {
+        model_turn_ordinal: Some(2),
+        tool: Some(TraceToolProjection {
+            status: Some(TraceToolStatus::Failed),
+            ..TraceToolProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    });
+
+    let mut sandbox_start = metric_span(
+        "sandbox_start",
+        "sandbox",
+        TraceSpanKind::SandboxExecution,
+        TraceSpanPhase::Start,
+        0,
+    );
+    sandbox_start.span_projection = Some(TraceSpanProjection {
+        sandbox: Some(TraceSandboxProjection::default()),
+        ..TraceSpanProjection::default()
+    });
+    let mut sandbox_end = metric_span(
+        "sandbox_end",
+        "sandbox",
+        TraceSpanKind::SandboxExecution,
+        TraceSpanPhase::End,
+        9,
+    );
+    sandbox_end.span_projection = Some(TraceSpanProjection {
+        sandbox: Some(TraceSandboxProjection {
+            workspace_mutation: Some(TraceWorkspaceMutation::Changed),
+            enforcement: Some(TraceSandboxEnforcement::Strict),
+            ..TraceSandboxProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    });
+
+    let mut transport_sample = TraceEvent::new(
+        "transport_samples",
+        "metrics_run",
+        "metrics_session",
+        "transport",
+        "closed samples",
+    );
+    transport_sample.metric_samples = vec![
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::ProviderCapabilityCacheHit,
+            count: 2,
+        },
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::ProviderCapabilityCacheMiss,
+            count: 1,
+        },
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::EventGap,
+            count: 3,
+        },
+    ];
+
+    store
+        .append_trace_batch(&[
+            prompt_start,
+            prompt_end,
+            provider_start,
+            provider_end,
+            tool_start,
+            tool_end,
+            tool_failed_start,
+            tool_failed_end,
+            sandbox_start,
+            sandbox_end,
+            transport_sample,
+        ])
+        .expect("append observation projections");
+
+    let stored = store.list_trace("metrics_run").expect("list trace");
+    let stored_prompt = stored
+        .iter()
+        .find(|event| event.event_id == "prompt_end")
+        .expect("prompt end");
+    assert_eq!(
+        stored_prompt
+            .span_projection
+            .as_ref()
+            .and_then(|projection| projection.request_digest.as_deref()),
+        Some("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+    );
+    let stored_sandbox = stored
+        .iter()
+        .find(|event| event.event_id == "sandbox_end")
+        .expect("sandbox end");
+    assert_eq!(
+        stored_sandbox
+            .span_projection
+            .as_ref()
+            .and_then(|projection| projection.sandbox.as_ref())
+            .and_then(|sandbox| sandbox.workspace_mutation),
+        Some(TraceWorkspaceMutation::Changed)
+    );
+
+    let metrics = store.trace_metrics("metrics_run").expect("trace metrics");
+    assert_eq!(
+        metrics
+            .metric("provider_cached_input_tokens")
+            .expect("cached input metric")
+            .distribution
+            .as_ref()
+            .expect("cached input distribution")
+            .min,
+        Some(7)
+    );
+    assert_eq!(
+        metrics
+            .metric("provider_capability_cache_hit_count")
+            .expect("cache hit count")
+            .distribution
+            .as_ref()
+            .expect("cache hit distribution")
+            .min,
+        Some(2)
+    );
+    assert_eq!(
+        metrics
+            .metric("provider_capability_cache_hit_rate_bps")
+            .expect("cache hit rate")
+            .distribution
+            .as_ref()
+            .expect("cache hit rate distribution")
+            .min,
+        Some(6666)
+    );
+    assert_eq!(
+        metrics
+            .metric("tool_success_rate_bps")
+            .expect("tool success rate")
+            .distribution
+            .as_ref()
+            .expect("tool success rate distribution")
+            .min,
+        Some(5000)
+    );
+    assert_eq!(
+        metrics
+            .metric("event_gap_count")
+            .expect("event gap")
+            .distribution
+            .as_ref()
+            .expect("event gap distribution")
+            .min,
+        Some(3)
+    );
+}
+
+#[test]
 fn trace_metrics_expose_unavailable_reasons_instead_of_zero_placeholders() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
@@ -4108,6 +4395,24 @@ fn trace_metrics_expose_unavailable_reasons_instead_of_zero_placeholders() {
             .distribution
             .is_none()
     );
+    assert!(matches!(
+        metrics
+            .metric("provider_capability_cache_hit_rate_bps")
+            .expect("cache hit rate")
+            .availability,
+        TraceMetricAvailability::Unavailable {
+            reason: singularity_protocol::TraceMetricUnavailableReason::LegacyOnly
+        }
+    ));
+    assert!(matches!(
+        metrics
+            .metric("tool_success_rate_bps")
+            .expect("tool success rate")
+            .availability,
+        TraceMetricAvailability::Unavailable {
+            reason: singularity_protocol::TraceMetricUnavailableReason::LegacyOnly
+        }
+    ));
 }
 
 #[test]

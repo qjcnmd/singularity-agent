@@ -10,9 +10,9 @@ use singularity_protocol::{
     METHOD_REGISTRY, Method, MethodKind, ProviderConfigurationStatus, ThreadIdParams,
     ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceEvent,
     TraceListParams, TraceMetricSample, TraceMetricSampleKind, TraceMetrics, TraceMetricsParams,
-    TraceMetricsResult, TraceProviderProtocol, TraceShowParams, TraceSpanKind, TraceSpanPhase,
-    TraceSpanProjection, TraceSpanStatus, TraceTailParams, TurnIdParams, TurnStartParams,
-    TurnStatus, parse_json_rpc_payload,
+    TraceMetricsResult, TraceProviderProtocol, TraceSandboxEnforcement, TraceShowParams,
+    TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus, TraceTailParams,
+    TraceWorkspaceMutation, TurnIdParams, TurnStartParams, TurnStatus, parse_json_rpc_payload,
 };
 
 #[test]
@@ -726,6 +726,79 @@ fn trace_metric_samples_are_typed_and_end_only() {
     invalid.span_kind = Some(TraceSpanKind::Turn);
     invalid.span_phase = Some(TraceSpanPhase::Start);
     assert!(invalid.validate_span_lifecycle().is_err());
+}
+
+#[test]
+fn trace_projection_carries_safe_agent_observation_identity_and_sandbox_outcome() {
+    let prompt = TraceSpanProjection {
+        request_digest: Some(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ),
+        compacted: Some(true),
+        finalization_only: Some(false),
+        model_turn_ordinal: Some(2),
+        ..TraceSpanProjection::default()
+    };
+    assert!(
+        prompt
+            .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::Start)
+            .is_ok()
+    );
+    assert!(prompt.same_identity_attributes(&TraceSpanProjection {
+        request_digest: Some(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ),
+        compacted: Some(true),
+        finalization_only: Some(false),
+        model_turn_ordinal: Some(2),
+        ..TraceSpanProjection::default()
+    }));
+    let mut changed_prompt = prompt.clone();
+    changed_prompt.model_turn_ordinal = Some(3);
+    assert!(!prompt.same_identity_attributes(&changed_prompt));
+
+    let tool = TraceSpanProjection {
+        model_turn_ordinal: Some(2),
+        ..TraceSpanProjection::default()
+    };
+    assert!(
+        tool.validate_for(TraceSpanKind::ToolCall, TraceSpanPhase::Start)
+            .is_ok()
+    );
+
+    let sandbox = TraceSpanProjection {
+        sandbox: Some(singularity_protocol::TraceSandboxProjection {
+            workspace_mutation: Some(TraceWorkspaceMutation::Changed),
+            enforcement: Some(TraceSandboxEnforcement::Strict),
+            ..Default::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    assert!(
+        sandbox
+            .validate_for(TraceSpanKind::SandboxExecution, TraceSpanPhase::End)
+            .is_ok()
+    );
+    assert!(
+        sandbox
+            .validate_for(TraceSpanKind::SandboxExecution, TraceSpanPhase::Start)
+            .is_err()
+    );
+    let mut changed_sandbox = sandbox.clone();
+    changed_sandbox.sandbox = Some(singularity_protocol::TraceSandboxProjection {
+        workspace_mutation: Some(TraceWorkspaceMutation::Unchanged),
+        enforcement: Some(TraceSandboxEnforcement::Strict),
+        ..Default::default()
+    });
+    assert!(!sandbox.same_identity_attributes(&changed_sandbox));
+    assert!(
+        TraceSpanProjection {
+            request_digest: Some("raw prompt".to_string()),
+            ..TraceSpanProjection::default()
+        }
+        .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::Start)
+        .is_err()
+    );
 }
 
 #[test]
