@@ -635,6 +635,9 @@ fn classify_output(value: &Value) -> OutputKind {
 }
 
 /// 按事件交付合同入队；控制与 state/gap 阻塞 backpressure，progress 可丢弃但记录 gap。
+///
+/// channel send 只承诺 frame 已进入有界队列；`ready` 由唯一 writer 在接收 frame 时提交，
+/// 从而避免 sender 唤醒 writer 后才提交 ready 的竞态。
 fn send_output(
     outputs: &OutputChannels,
     _kind: OutputKind,
@@ -720,10 +723,7 @@ fn send_reserved_output(
                 to_order: order,
                 message,
             })
-            .map(|()| {
-                outputs.order_state.enqueue(order);
-                OutputSendStatus::Enqueued
-            })
+            .map(|()| OutputSendStatus::Enqueued)
             .map_err(|_| {
                 outputs.order_state.complete(order);
                 cancellation.request_execution_stop();
@@ -736,10 +736,7 @@ fn send_reserved_output(
                 to_order: order,
                 message,
             })
-            .map(|()| {
-                outputs.order_state.enqueue(order);
-                OutputSendStatus::Enqueued
-            })
+            .map(|()| OutputSendStatus::Enqueued)
             .map_err(|_| {
                 outputs.order_state.complete(order);
                 cancellation.request_execution_stop();
@@ -761,10 +758,7 @@ fn try_send_event(
         to_order: order,
         message,
     }) {
-        Ok(()) => {
-            outputs.order_state.enqueue(order);
-            Ok(OutputSendStatus::Enqueued)
-        }
+        Ok(()) => Ok(OutputSendStatus::Enqueued),
         Err(mpsc::error::TrySendError::Full(output)) => {
             record_event_gap(outputs, &output.message, order).map_or_else(
                 |error| {
@@ -841,9 +835,7 @@ fn enqueue_pending_event_gap(
         to_order: pending.to_order,
         message,
     }) {
-        Ok(()) => outputs
-            .order_state
-            .enqueue_range(pending.from_order, pending.to_order),
+        Ok(()) => {}
         Err(_) => {
             outputs
                 .order_state
@@ -916,7 +908,26 @@ fn record_event_gap(outputs: &OutputChannels, message: &Value, order: u64) -> Re
     Ok(())
 }
 
+/// 将 writer 接收的 frame 与唯一顺序状态提交到同一个 owner 内的短临界步骤。
+fn accept_output(
+    order_state: &OutputOrderCoordinator,
+    pending: &mut BTreeMap<u64, QueuedOutput>,
+    message: QueuedOutput,
+) {
+    let order = message.order;
+    let to_order = message.to_order;
+    pending.insert(order, message);
+    if order == to_order {
+        order_state.enqueue(order);
+    } else {
+        order_state.enqueue_range(order, to_order);
+    }
+}
+
 /// 按发送顺序从两个 Tokio 有界队列取出一条 frame，避免 progress 被后续 control 越过。
+///
+/// 接收和 ready 提交之间不发生 await；writer 随后才检查 readiness，因此唯一 frame 不会
+/// 因 sender 尚未完成旧式的 post-send enqueue 而永久滞留。
 async fn next_output(
     control_rx: &mut mpsc::Receiver<QueuedOutput>,
     event_rx: &mut mpsc::Receiver<QueuedOutput>,
@@ -930,7 +941,7 @@ async fn next_output(
             loop {
                 match control_rx.try_recv() {
                     Ok(message) => {
-                        pending.insert(message.order, message);
+                        accept_output(order_state, pending, message);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -944,7 +955,7 @@ async fn next_output(
             loop {
                 match event_rx.try_recv() {
                     Ok(message) => {
-                        pending.insert(message.order, message);
+                        accept_output(order_state, pending, message);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -967,11 +978,11 @@ async fn next_output(
         tokio::select! {
             biased;
             message = control_rx.recv(), if *control_open => match message {
-                Some(message) => { pending.insert(message.order, message); }
+                Some(message) => accept_output(order_state, pending, message),
                 None => *control_open = false,
             },
             message = event_rx.recv(), if *event_open => match message {
-                Some(message) => { pending.insert(message.order, message); }
+                Some(message) => accept_output(order_state, pending, message),
                 None => *event_open = false,
             },
         }
@@ -1813,6 +1824,49 @@ mod tests {
 
         assert!(error.starts_with("failed to write response:"));
         assert_eq!(cancellation.request_count(), 1);
+    }
+
+    #[test]
+    fn writer_accepts_a_sole_frame_before_the_readiness_check() {
+        let (outputs, mut control_rx, mut event_rx) = test_output_channels(1, 1);
+        let reservation = outputs
+            .order_state
+            .reserve(false)
+            .expect("single frame reservation");
+        outputs
+            .control
+            .blocking_send(QueuedOutput {
+                order: reservation.order,
+                to_order: reservation.order,
+                message: serde_json::json!({"only": true}),
+            })
+            .expect("single frame enters bounded queue");
+        // Deliberately leave the reservation in-flight: this is the state observed when a
+        // sender wakes the writer before its old post-send ready update.
+        let order_state = outputs.order_state.clone();
+        drop(outputs);
+
+        let mut stdout = VecWriter::default();
+        let cancellation = CancellationProbe::default();
+        block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                write_output_queue(
+                    &mut control_rx,
+                    &mut event_rx,
+                    &mut stdout,
+                    &cancellation,
+                    order_state,
+                ),
+            )
+            .await
+        })
+        .expect("sole frame must not wait for a second message")
+        .expect("writer drains the sole frame");
+        assert_eq!(
+            String::from_utf8(stdout.0).expect("writer output is UTF-8"),
+            "{\"only\":true}\n"
+        );
     }
 
     #[test]
