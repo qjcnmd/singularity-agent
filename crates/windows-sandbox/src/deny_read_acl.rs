@@ -31,6 +31,9 @@ use windows_sys::Win32::Foundation::ERROR_DIR_NOT_EMPTY;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
+use windows_sys::Win32::Security::Cryptography::{
+    CertCreateCertificateContext, CertFreeCertificateContext, X509_ASN_ENCODING,
+};
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_FLAG_DELETE;
@@ -93,6 +96,22 @@ fn is_public_certificate_metadata_comment(line: &str) -> bool {
     .any(|prefix| line.starts_with(prefix))
 }
 
+fn is_x509_certificate_der(bytes: &[u8]) -> bool {
+    let Ok(length) = u32::try_from(bytes.len()) else {
+        return false;
+    };
+    // SAFETY: `bytes` remains live and immutable for the synchronous call. A non-null context is
+    // owned by this function and released exactly once with CertFreeCertificateContext.
+    let context =
+        unsafe { CertCreateCertificateContext(X509_ASN_ENCODING, bytes.as_ptr(), length) };
+    if context.is_null() {
+        return false;
+    }
+    // SAFETY: `context` is the live context returned above and has not been freed or transferred.
+    unsafe { CertFreeCertificateContext(context) };
+    true
+}
+
 /// Returns whether a pinned `.pem` file contains only public certificate blocks.
 ///
 /// Unknown, unreadable, oversized, or mixed PEM payloads remain protected. The caller retains the
@@ -128,9 +147,10 @@ fn is_public_certificate_only_pem(file: &mut std::fs::File) -> Result<bool> {
             }
             Some(expected_label) => {
                 if let Some(label) = public_certificate_label(line, "-----END ") {
+                    let decoded = BASE64_STANDARD.decode(encoded_block.as_bytes());
                     if label != expected_label
                         || encoded_block.is_empty()
-                        || BASE64_STANDARD.decode(encoded_block.as_bytes()).is_err()
+                        || !decoded.as_deref().is_ok_and(is_x509_certificate_der)
                     {
                         return Ok(false);
                     }
@@ -872,16 +892,42 @@ mod tests {
 
     #[test]
     fn pem_classification_allows_public_certificates_and_protects_private_keys() {
+        const TEST_CERTIFICATE_DER_BASE64: &str = concat!(
+            "MIICzzCCAbegAwIBAgIJAPhKKnPDrEh9MA0GCSqGSIb3DQEBCwUAMCcxJTAjBgNV",
+            "BAMTHFNpbmd1bGFyaXR5IFRlc3QgQ2VydGlmaWNhdGUwHhcNMjYwNzE5MDMxNjI1",
+            "WhcNMjYwODE5MDMxNjI1WjAnMSUwIwYDVQQDExxTaW5ndWxhcml0eSBUZXN0IENl",
+            "cnRpZmljYXRlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzFHDKy/6",
+            "/bHJAeSQbXVimzISJ5bdtWseYdfQef4vW64r07zAnC23gdczH0I/hwiPCjHxAjfp",
+            "e4T0hVSnpHKRx/b+F5DWKceAPTw2E0gQ88DCtWP+FeLpP0JbOLalWId1HATZzCqO",
+            "as97UqHEfo3T8oP/4BmLJbi3WPZWbeBqrsfw+i4LgQ18+mdHbL3HfOQW3+p8Ar1",
+            "/Kj7RwgZJbsXXLuz7owisix8SMtkafQN4ZUh2HAnMtZIWki2Kc74/V7yVqQkFVAv",
+            "EZkpazll0hAmru3gWuYeGArConKHhxykEBl+bzcJgj6Q3UOcmrkImlG8H6jaQ7vw",
+            "Z4n1eEYWX1YXayQIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQB/w63efqTRm9qhf2xz",
+            "G3K2tJ6UEKUuj9o444nN0wE4ljiVquXFPo5QYl0j/cdv9cupkJ4PeAnAgbTr+0Or",
+            "FxEiqrhFEsTcPhEV3I62+huLV5EE7AoAb1JSKL/W7pcDF9zJMlkDc36VD21dlpDv",
+            "0BeAZR2/+wNvUvZNY3BwmMWWZSa3O88Aqe3JnJhEGt1YpQfFXaQDuoepBskyWtfw",
+            "QKd5d/pVL2mindlSqiCctJlly6W5BsKNpczWhQKkjc2eEDSDctgi5rshsTNvsjsc",
+            "HGhYnmwaX/HqJoKiaAXgojVbHh6SRcLj1ez+JfP3jM+kqsXVvhbGc7KYcG+Twae",
+            "7oD1o"
+        );
         let tmp = TempDir::new().expect("tempdir");
         let certificate = tmp.path().join("certificate.pem");
+        let disguised_secret = tmp.path().join("disguised-secret.pem");
         let private_key = tmp.path().join("private.pem");
         let combined = tmp.path().join("combined.pem");
         let malformed = tmp.path().join("malformed.pem");
         std::fs::write(
             &certificate,
-            "# Issuer: CN=Public Root\n# Subject: CN=Public Root\n-----BEGIN CERTIFICATE-----\nY2VydA==\n-----END CERTIFICATE-----\n",
+            format!(
+                "# Issuer: CN=Public Root\n# Subject: CN=Public Root\n-----BEGIN CERTIFICATE-----\n{TEST_CERTIFICATE_DER_BASE64}\n-----END CERTIFICATE-----\n"
+            ),
         )
         .expect("write certificate");
+        std::fs::write(
+            &disguised_secret,
+            "-----BEGIN CERTIFICATE-----\nc2VjcmV0\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write disguised secret");
         std::fs::write(
             &private_key,
             "-----BEGIN PRIVATE KEY-----\na2V5\n-----END PRIVATE KEY-----\n",
@@ -904,6 +950,7 @@ mod tests {
             apply_deny_read_acls(
                 &[
                     certificate.clone(),
+                    disguised_secret.clone(),
                     private_key.clone(),
                     combined.clone(),
                     malformed.clone(),
@@ -915,10 +962,16 @@ mod tests {
 
         assert_eq!(
             applied,
-            vec![private_key.clone(), combined.clone(), malformed.clone()]
+            vec![
+                disguised_secret.clone(),
+                private_key.clone(),
+                combined.clone(),
+                malformed.clone()
+            ]
         );
         for (path, denied) in [
             (&certificate, false),
+            (&disguised_secret, true),
             (&private_key, true),
             (&combined, true),
             (&malformed, true),
@@ -936,6 +989,8 @@ mod tests {
             }
         }
         unsafe {
+            revoke_deny_read_ace(&disguised_secret, sid.as_ptr())
+                .expect("restore disguised-secret ACL");
             revoke_deny_read_ace(&private_key, sid.as_ptr()).expect("restore private-key ACL");
             revoke_deny_read_ace(&combined, sid.as_ptr()).expect("restore combined PEM ACL");
             revoke_deny_read_ace(&malformed, sid.as_ptr()).expect("restore malformed PEM ACL");
