@@ -49,10 +49,24 @@ mod registry;
 mod tests;
 mod workspace;
 
-pub use broker::*;
-pub use command::*;
-pub use registry::*;
-pub use workspace::*;
+pub use broker::{
+    ToolBroker, ToolBrokerDecision, ToolCallRequest, ToolFailureKind, ToolOutput, ToolResult,
+    approximate_token_count,
+};
+pub use command::{
+    CommandToolInput, command_scope_digest, command_script_scope_digest,
+    command_script_scope_digest_with_policy,
+};
+pub use registry::{
+    AgentControlToolExecutor, BoundToolCall, COMMAND_TOOL, EDIT_TOOL, GREP_TOOL, LIST_TOOL,
+    PATCH_TOOL, READ_TOOL, ToolAuthorization, ToolCapability, ToolEntry, ToolExecutionMode,
+    ToolExecutor, ToolExposure, ToolInputValidationError, ToolInputValidator, ToolRegistry,
+    ToolSpec, WorkspaceToolExecutor, workspace_tool_entries, workspace_tool_specs,
+};
+pub use workspace::{
+    EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, WorkspaceObservation,
+    WorkspacePatch, WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError, WorkspaceTools,
+};
 
 pub(crate) use broker::contains_artifact_reference;
 pub(crate) use command::{
