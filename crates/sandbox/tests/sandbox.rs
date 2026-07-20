@@ -789,7 +789,7 @@ mod linux_tests {
         LinuxSandboxBackend, LinuxSandboxProbe, SandboxFilesystemMode, SandboxNetworkMode,
         WorkspaceMutation, probe_linux_capabilities,
     };
-    use std::fs;
+    use std::fs::{self, hard_link};
     use std::os::unix::fs::symlink;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -858,6 +858,80 @@ mod linux_tests {
         assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
         assert_eq!(
             fs::read_to_string(workspace.path().join("output.txt")).unwrap(),
+            "changed"
+        );
+    }
+
+    #[test]
+    fn linux_external_hardlink_is_rejected_before_execution() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("outside.txt"), "outside").expect("outside file");
+        hard_link(
+            outside.path().join("outside.txt"),
+            workspace.path().join("linked.txt"),
+        )
+        .expect("external hardlink");
+        let backend = strict_backend();
+        let request = request(
+            "linux_external_hardlink",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf changed > linked.txt; printf ran > executed.txt",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        );
+
+        let result = backend.execute(&request);
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::PolicyDenied
+        );
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Unknown);
+        assert!(
+            result
+                .stderr_preview
+                .contains("workspace hardlink safety check failed")
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("outside.txt")).unwrap(),
+            "outside"
+        );
+        assert!(!workspace.path().join("executed.txt").exists());
+    }
+
+    #[test]
+    fn linux_internal_hardlinks_are_allowed() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("first.txt"), "original").expect("first file");
+        hard_link(
+            workspace.path().join("first.txt"),
+            workspace.path().join("second.txt"),
+        )
+        .expect("internal hardlink");
+        let backend = strict_backend();
+        let request = request(
+            "linux_internal_hardlink",
+            &["/bin/sh", "-c", "printf changed > second.txt"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        );
+
+        let result = backend.execute(&request);
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("first.txt")).unwrap(),
+            "changed"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("second.txt")).unwrap(),
             "changed"
         );
     }

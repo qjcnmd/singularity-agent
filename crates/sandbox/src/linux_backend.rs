@@ -36,6 +36,7 @@ const SANDBOX_POLICY_DENIED: &str = "linux sandbox policy denied";
 const SANDBOX_PROTECTED_PATH_DENIED: &str = "linux sandbox protected path denied";
 const SANDBOX_CWD_DENIED: &str = "linux sandbox cwd is outside workspace";
 const SANDBOX_EXECUTABLE_UNAVAILABLE: &str = "linux sandbox executable unavailable";
+const SANDBOX_HARDLINK_DENIED: &str = "linux sandbox workspace hardlink safety check failed";
 const SANDBOX_CHILD_CANCELLED: &str = "linux sandbox command cancelled";
 const SANDBOX_CHILD_TIMED_OUT: &str = "linux sandbox command timed out";
 const SANDBOX_HOME: &str = "/run/singularity-home";
@@ -514,6 +515,8 @@ impl PreparedCommand {
         argv[0] = executable.to_string_lossy().into_owned();
         let protected_paths = collect_protected_paths(&workspace)
             .map_err(|_| LinuxSandboxError::PolicyDenied(SANDBOX_PROTECTED_PATH_DENIED))?;
+        validate_workspace_hardlinks(&workspace)
+            .map_err(|_| LinuxSandboxError::PolicyDenied(SANDBOX_HARDLINK_DENIED))?;
         let before = snapshot_workspace(&workspace);
         Ok(Self {
             workspace,
@@ -717,6 +720,43 @@ fn collect_protected_paths(workspace: &Path) -> Result<Vec<ProtectedPath>, std::
         top_level.push(item);
     }
     Ok(top_level)
+}
+
+/// Reject regular files whose filesystem link count is not fully visible in the workspace.
+fn validate_workspace_hardlinks(workspace: &Path) -> Result<(), ()> {
+    fn visit(current: &Path, identities: &mut BTreeMap<(u64, u64), (u64, u64)>) -> Result<(), ()> {
+        let mut entries = fs::read_dir(current)
+            .map_err(|_| ())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                visit(&path, identities)?;
+            } else if metadata.is_file() {
+                let identity = (metadata.dev(), metadata.ino());
+                let links = identities.entry(identity).or_insert((0, metadata.nlink()));
+                if links.1 != metadata.nlink() {
+                    return Err(());
+                }
+                links.0 = links.0.checked_add(1).ok_or(())?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut identities = BTreeMap::new();
+    visit(workspace, &mut identities)?;
+    identities
+        .values()
+        .all(|(visible_links, filesystem_links)| visible_links == filesystem_links)
+        .then_some(())
+        .ok_or(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
