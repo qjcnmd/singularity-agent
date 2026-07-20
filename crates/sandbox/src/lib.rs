@@ -703,6 +703,14 @@ pub trait SandboxBackend {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod linux_backend;
+
+#[cfg(target_os = "linux")]
+pub use linux_backend::{
+    LinuxCapability, LinuxSandboxBackend, LinuxSandboxProbe, probe_linux_capabilities,
+};
+
 #[cfg(windows)]
 pub use windows_backend::WindowsSandboxBackend;
 

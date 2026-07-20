@@ -19,5 +19,8 @@ singularity_core = { path = "../core" }
 dunce = "1.0"
 singularity_windows_sandbox = { path = "../windows-sandbox" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true

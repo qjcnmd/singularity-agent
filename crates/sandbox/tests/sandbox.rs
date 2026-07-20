@@ -780,3 +780,257 @@ impl SandboxBackend for DirectArgvOnlyBackend {
         CommandResult::completed(&request.command_id, "direct argv")
     }
 }
+
+#[cfg(target_os = "linux")]
+mod linux_tests {
+    use super::*;
+    use singularity_core::CancellationToken;
+    use singularity_sandbox::{
+        LinuxSandboxBackend, LinuxSandboxProbe, SandboxFilesystemMode, SandboxNetworkMode,
+        WorkspaceMutation, probe_linux_capabilities,
+    };
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn path_str(path: &Path) -> &str {
+        path.to_str().expect("utf8 path")
+    }
+
+    fn strict_backend() -> LinuxSandboxBackend {
+        let backend = LinuxSandboxBackend::new();
+        assert!(
+            backend.probe().strict_ready(),
+            "strict Linux capability probe failed: {:?}",
+            backend.probe()
+        );
+        backend
+    }
+
+    fn request(
+        id: &str,
+        argv: &[&str],
+        workspace: &Path,
+        filesystem: SandboxFilesystemMode,
+        network: SandboxNetworkMode,
+    ) -> CommandRequest {
+        let mut request = CommandRequest::project_verification(
+            id,
+            argv.iter().map(|value| (*value).to_string()).collect(),
+            path_str(workspace),
+            path_str(workspace),
+        );
+        request.filesystem.mode = filesystem;
+        request.network.mode = network;
+        request
+    }
+
+    #[test]
+    fn linux_probe_reports_kernel_controls_without_os_handles() {
+        let probe: LinuxSandboxProbe = probe_linux_capabilities();
+        assert!(probe.user_namespace);
+        assert!(probe.mount_namespace);
+        assert!(probe.network_namespace);
+        assert!(probe.no_new_privs);
+        assert!(probe.seccomp);
+        assert!(probe.landlock_abi.is_some_and(|abi| abi >= 3));
+        assert!(probe.process_tree_cleanup);
+        assert!(probe.cgroup_v2);
+        assert!(!probe.cgroup_delegated);
+    }
+
+    #[test]
+    fn linux_workspace_write_is_enforced_and_observed() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = strict_backend();
+        let request = request(
+            "linux_workspace_write",
+            &["/bin/sh", "-c", "printf changed > output.txt"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        );
+
+        let result = backend.execute(&request);
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("output.txt")).unwrap(),
+            "changed"
+        );
+    }
+
+    #[test]
+    fn linux_read_only_and_protected_mounts_reject_writes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("existing.txt"), "original").expect("existing file");
+        fs::write(workspace.path().join(".env"), "opaque").expect("protected file");
+        let backend = strict_backend();
+
+        let readonly = request(
+            "linux_read_only",
+            &["/bin/sh", "-c", "printf changed > existing.txt"],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        );
+        let readonly_result = backend.execute(&readonly);
+        assert_eq!(
+            readonly_result.execution_status,
+            CommandExecutionStatus::Completed
+        );
+        assert_ne!(readonly_result.exit_code, Some(0));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("existing.txt")).unwrap(),
+            "original"
+        );
+
+        let protected_read = request(
+            "linux_protected_read",
+            &["/bin/cat", ".env"],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        );
+        let protected_read_result = backend.execute(&protected_read);
+        assert_eq!(
+            protected_read_result.execution_status,
+            CommandExecutionStatus::Completed
+        );
+        assert_ne!(protected_read_result.exit_code, Some(0));
+
+        let protected = request(
+            "linux_protected_rename",
+            &["/bin/sh", "-c", "mv .env renamed.env"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        );
+        let protected_result = backend.execute(&protected);
+        assert_eq!(
+            protected_result.execution_status,
+            CommandExecutionStatus::Completed
+        );
+        assert_ne!(protected_result.exit_code, Some(0));
+        assert!(workspace.path().join(".env").exists());
+        assert!(!workspace.path().join("renamed.env").exists());
+    }
+
+    #[test]
+    fn linux_path_traversal_and_symlink_escape_are_denied_by_landlock() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("outside.txt"), "outside").expect("outside file");
+        symlink(outside.path(), workspace.path().join("outside-link")).expect("symlink");
+        let backend = strict_backend();
+
+        for (id, path) in [
+            (
+                "linux_path_traversal",
+                format!("{}/../outside.txt", path_str(workspace.path())),
+            ),
+            (
+                "linux_symlink_escape",
+                format!("{}/outside-link/outside.txt", path_str(workspace.path())),
+            ),
+        ] {
+            let request = request(
+                id,
+                &["/bin/cat", &path],
+                workspace.path(),
+                SandboxFilesystemMode::ReadOnly,
+                SandboxNetworkMode::Denied,
+            );
+            let result = backend.execute(&request);
+            assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+            assert_ne!(
+                result.exit_code,
+                Some(0),
+                "escape unexpectedly succeeded: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_network_seccomp_denies_and_allows_socket_creation() {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = strict_backend();
+        let script = "import socket; socket.socket().close()";
+
+        let denied = request(
+            "linux_network_denied",
+            &[path_str(python), "-c", script],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        );
+        let denied_result = backend.execute(&denied);
+        assert_eq!(
+            denied_result.execution_status,
+            CommandExecutionStatus::Completed
+        );
+        assert_ne!(denied_result.exit_code, Some(0));
+
+        let allowed = request(
+            "linux_network_allowed",
+            &[path_str(python), "-c", script],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Allowed,
+        );
+        let allowed_result = backend.execute(&allowed);
+        assert_eq!(
+            allowed_result.execution_status,
+            CommandExecutionStatus::Completed
+        );
+        assert_eq!(allowed_result.exit_code, Some(0));
+    }
+
+    #[test]
+    fn linux_timeout_and_cancellation_kill_the_process_group() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = strict_backend();
+        let mut timeout_request = request(
+            "linux_timeout",
+            &["/bin/sh", "-c", "sleep 30 & wait"],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        );
+        timeout_request.timeout_seconds = 1;
+        let started = Instant::now();
+        let timeout_result = backend.execute(&timeout_request);
+        assert_eq!(
+            timeout_result.execution_status,
+            CommandExecutionStatus::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let cancellation = CancellationToken::new();
+        let cancel_request = request(
+            "linux_cancel",
+            &["/bin/sh", "-c", "sleep 30 & wait"],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        );
+        let worker_backend = backend.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            worker_backend.execute_cancellable(&cancel_request, &worker_cancellation)
+        });
+        thread::sleep(Duration::from_millis(100));
+        cancellation.cancel();
+        let cancelled = worker.join().expect("cancelled command worker");
+        assert_eq!(
+            cancelled.execution_status,
+            CommandExecutionStatus::Cancelled
+        );
+    }
+}

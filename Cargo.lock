@@ -1597,6 +1597,7 @@ name = "singularity_sandbox"
 version = "0.1.0"
 dependencies = [
  "dunce",
+ "libc",
  "schemars",
  "serde",
  "serde_json",
