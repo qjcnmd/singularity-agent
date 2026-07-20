@@ -1009,6 +1009,9 @@ enum ToolBatchControl {
     Cancelled,
 }
 
+/// 调用方消费最终化 assistant 文本 delta 的窄 callback 类型。
+pub type AgentTextDeltaCallback<'a> = dyn FnMut(&str) + 'a;
+
 /// 编排模型提供方 turn、策略决策、沙箱 tool、approval 和最终答复阶段。
 pub struct AgentLoop<P> {
     provider: P,
@@ -1047,6 +1050,23 @@ where
 
     /// 运行一个新 turn，直到完成、因 approval 阻塞、被取消或拒绝继续执行。
     pub fn run(&self, input: &AgentLoopInput) -> AgentLoopResult {
+        self.run_internal(input, None)
+    }
+
+    /// 运行一个新 turn，并只向调用方投影最终化 assistant 回合的有序文本 delta。
+    pub fn run_with_text_deltas(
+        &self,
+        input: &AgentLoopInput,
+        on_text_delta: &mut AgentTextDeltaCallback<'_>,
+    ) -> AgentLoopResult {
+        self.run_internal(input, Some(on_text_delta))
+    }
+
+    fn run_internal(
+        &self,
+        input: &AgentLoopInput,
+        on_text_delta: Option<&mut AgentTextDeltaCallback<'_>>,
+    ) -> AgentLoopResult {
         let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
             return state.finish(AgentStatus::Cancelled, false, None, 0, None);
@@ -1082,10 +1102,19 @@ where
         }
         state.messages = model_messages_from_input(input, &context, max_tool_calls);
         state.context_trace = Some(AgentContextTrace::from(&context));
-        self.continue_run(input, &budget, &capabilities, max_tool_calls, state, 0)
+        self.continue_run(
+            input,
+            &budget,
+            &capabilities,
+            max_tool_calls,
+            state,
+            0,
+            on_text_delta,
+        )
     }
 
     /// 在每次模型提供方响应或 tool 结果后推进状态机。
+    #[allow(clippy::too_many_arguments)]
     fn continue_run(
         &self,
         input: &AgentLoopInput,
@@ -1094,6 +1123,7 @@ where
         max_tool_calls: u32,
         mut state: AgentLoopState,
         model_turn_offset: u32,
+        on_text_delta: Option<&mut AgentTextDeltaCallback<'_>>,
     ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
         if model_turn_offset > max_turns
@@ -1109,6 +1139,7 @@ where
             );
         }
         let mut finalization_attempted = false;
+        let mut on_text_delta = on_text_delta;
         let mut actual_model_turns = model_turn_offset;
         // 包含端点只保留给终态；没有 readiness 时仍维持普通工作回合上限及其失败语义。
         for turn_index in model_turn_offset..=max_turns {
@@ -1193,7 +1224,10 @@ where
                 &self.cancellation,
                 &mut |event| match event {
                     ProviderStreamEvent::OutputTextDelta { delta } => {
-                        streamed_text.push_str(&delta)
+                        streamed_text.push_str(&delta);
+                        if finalization_only && let Some(callback) = on_text_delta.as_deref_mut() {
+                            callback(&delta);
+                        }
                     }
                 },
             );
@@ -1407,6 +1441,25 @@ where
         input: &AgentLoopInput,
         pending: &PendingApprovalOccurrence,
     ) -> AgentLoopResult {
+        self.resume_pending_approval_internal(input, pending, None)
+    }
+
+    /// 恢复 approval，并只向调用方投影恢复后最终化 assistant 回合的有序文本 delta。
+    pub fn resume_pending_approval_with_text_deltas(
+        &self,
+        input: &AgentLoopInput,
+        pending: &PendingApprovalOccurrence,
+        on_text_delta: &mut AgentTextDeltaCallback<'_>,
+    ) -> AgentLoopResult {
+        self.resume_pending_approval_internal(input, pending, Some(on_text_delta))
+    }
+
+    fn resume_pending_approval_internal(
+        &self,
+        input: &AgentLoopInput,
+        pending: &PendingApprovalOccurrence,
+        on_text_delta: Option<&mut AgentTextDeltaCallback<'_>>,
+    ) -> AgentLoopResult {
         if self.is_cancelled(input) {
             return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
                 AgentStatus::Cancelled,
@@ -1564,6 +1617,7 @@ where
             max_tool_calls,
             state,
             model_turn_offset,
+            on_text_delta,
         )
     }
 

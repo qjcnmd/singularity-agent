@@ -672,6 +672,29 @@ pub enum ProviderStreamEvent {
     OutputTextDelta { delta: String },
 }
 
+/// Typed normalized text-stream capability for one selected provider protocol.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderStreamingCapability {
+    /// The selected protocol has no normalized text stream at this boundary.
+    #[default]
+    Unsupported,
+    /// The selected protocol emits ordered visible text deltas.
+    OutputTextDelta,
+}
+
+impl ProviderStreamingCapability {
+    /// Resolve the normalized stream capability from the actual selected protocol.
+    pub const fn for_protocol(protocol: ProviderApiProtocol) -> Self {
+        match protocol {
+            ProviderApiProtocol::OpenAiResponses => Self::OutputTextDelta,
+            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                Self::Unsupported
+            }
+        }
+    }
+}
+
 /// 一次模型提供方操作记录的尝试次数和重试次数。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderAttemptMetadata {
@@ -727,6 +750,17 @@ pub trait Provider {
         Ok(ProviderProtocolNegotiation::declared(
             self.protocol_contract(),
         ))
+    }
+
+    /// Report the typed stream capability for the protocol selected by this provider.
+    ///
+    /// Legacy providers default to unsupported, even if their unrelated protocol metadata uses
+    /// the same enum values as the OpenAI-compatible adapter.
+    fn streaming_capability(
+        &self,
+        _selected_protocol: ProviderApiProtocol,
+    ) -> ProviderStreamingCapability {
+        ProviderStreamingCapability::Unsupported
     }
 
     /// Stream normalized visible text when the selected protocol supports it.

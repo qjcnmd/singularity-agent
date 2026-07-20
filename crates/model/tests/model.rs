@@ -8,10 +8,11 @@ use singularity_model::{
     ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityProfile,
     ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
-    ProviderProtocolContract, ProviderStreamEvent, ProviderToolReasoningMode, ToolChoiceMode,
-    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, resolve_provider_config,
-    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
-    validate_model_response, validate_model_turn_response, validate_provider_config,
+    ProviderProtocolContract, ProviderStreamEvent, ProviderStreamingCapability,
+    ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
+    classify_model_error, resolve_provider_config, responses_endpoint, validate_model_request,
+    validate_model_request_with_capabilities, validate_model_response,
+    validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -2015,6 +2016,40 @@ fn openai_chat_streaming_is_explicitly_unsupported() {
     assert_eq!(
         error.error.code.as_deref(),
         Some("provider_streaming_unsupported")
+    );
+}
+
+#[test]
+fn streaming_capability_is_bound_to_the_selected_protocol() {
+    assert_eq!(
+        ProviderStreamingCapability::for_protocol(ProviderApiProtocol::OpenAiResponses),
+        ProviderStreamingCapability::OutputTextDelta
+    );
+    for protocol in [
+        ProviderApiProtocol::Declared,
+        ProviderApiProtocol::OpenAiChatCompletions,
+    ] {
+        assert_eq!(
+            ProviderStreamingCapability::for_protocol(protocol),
+            ProviderStreamingCapability::Unsupported
+        );
+    }
+
+    let provider = OpenAiProvider::new(provider_config_with_base_url(
+        "http://127.0.0.1:1/v1/responses".to_string(),
+    ))
+    .expect("provider");
+    assert_eq!(
+        provider.streaming_capability(ProviderApiProtocol::OpenAiResponses),
+        ProviderStreamingCapability::OutputTextDelta
+    );
+    assert_eq!(
+        provider.streaming_capability(ProviderApiProtocol::OpenAiChatCompletions),
+        ProviderStreamingCapability::Unsupported
+    );
+    assert_eq!(
+        provider.streaming_capability(ProviderApiProtocol::Declared),
+        ProviderStreamingCapability::Unsupported
     );
 }
 

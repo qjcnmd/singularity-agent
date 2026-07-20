@@ -587,6 +587,13 @@ impl Provider for OpenAiProvider {
         self.config.protocol_contract()
     }
 
+    fn streaming_capability(
+        &self,
+        selected_protocol: ProviderApiProtocol,
+    ) -> ProviderStreamingCapability {
+        ProviderStreamingCapability::for_protocol(selected_protocol)
+    }
+
     fn negotiate_tool_capabilities(
         &self,
         model_preferences: &ModelPreferences,
@@ -612,7 +619,9 @@ impl Provider for OpenAiProvider {
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
         let context = self.prepare_completion_context(request, cancellation)?;
-        if context.api_protocol != ProviderApiProtocol::OpenAiResponses {
+        if self.streaming_capability(context.api_protocol)
+            != ProviderStreamingCapability::OutputTextDelta
+        {
             return Err(attach_capability_metadata(
                 provider_streaming_unsupported_error(),
                 &context.capability_metadata,

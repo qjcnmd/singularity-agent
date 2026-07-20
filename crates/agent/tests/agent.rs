@@ -715,6 +715,26 @@ fn agent_loop_aggregates_stream_deltas_and_requires_matching_terminal_text() {
 }
 
 #[test]
+fn agent_loop_nonstream_fallback_keeps_text_callback_empty() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut deltas = Vec::new();
+    let result = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "done"),
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .run_with_text_deltas(
+        &AgentLoopInput::new("thread_1", "turn_1", "hello"),
+        &mut |delta| deltas.push(delta.to_string()),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert!(deltas.is_empty());
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 1);
+}
+
+#[test]
 fn agent_loop_fails_closed_when_streamed_text_differs_from_terminal_text() {
     let agent_loop = AgentLoop::new(
         StreamingProvider {
@@ -740,6 +760,258 @@ fn agent_loop_fails_closed_when_streamed_text_differs_from_terminal_text() {
             .and_then(|diagnostic| diagnostic.code),
         Some("provider_stream_text_mismatch".to_string())
     );
+}
+
+#[test]
+fn agent_loop_projects_only_finalization_text_deltas_in_order() {
+    let verification_argv = test_command("verify");
+    let verification_digest = command_script_scope_digest_with_policy(
+        &verification_argv.join(" "),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let mut tool_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "intermediate");
+    let call = tool_call(
+        "verify_call",
+        "command",
+        serde_json::json!({
+            "command": verification_argv.join(" "),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    );
+    tool_response.tool_calls = vec![call.clone()];
+    tool_response.assistant_message = Some(ModelMessage {
+        role: ModelRole::Assistant,
+        content: "intermediate".to_string(),
+        tool_call_id: None,
+        tool_calls: vec![call],
+    });
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_final", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut deltas = Vec::new();
+    let result = AgentLoop::new(
+        StreamingProvider {
+            responses: vec![
+                (
+                    vec![ProviderStreamEvent::OutputTextDelta {
+                        delta: "intermediate".to_string(),
+                    }],
+                    tool_response,
+                ),
+                (
+                    vec![
+                        ProviderStreamEvent::OutputTextDelta {
+                            delta: "do".to_string(),
+                        },
+                        ProviderStreamEvent::OutputTextDelta {
+                            delta: "ne".to_string(),
+                        },
+                    ],
+                    final_response,
+                ),
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(env!("CARGO_MANIFEST_DIR"))
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run_with_text_deltas(
+        &AgentLoopInput::new("thread_1", "turn_1", "verify")
+            .with_max_turns(2)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                verification_digest,
+                1,
+            )]),
+        &mut |delta| deltas.push(delta.to_string()),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(deltas, ["do", "ne"]);
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::None);
+    assert!(requests[1].tools.is_empty());
+}
+
+#[test]
+fn agent_loop_keeps_partial_callback_text_when_terminal_validation_fails() {
+    let verification_argv = test_command("verify");
+    let verification_digest = command_script_scope_digest_with_policy(
+        &verification_argv.join(" "),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let mut tool_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "intermediate");
+    let call = tool_call(
+        "verify_call",
+        "command",
+        serde_json::json!({
+            "command": verification_argv.join(" "),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    );
+    tool_response.tool_calls = vec![call.clone()];
+    tool_response.assistant_message = Some(ModelMessage {
+        role: ModelRole::Assistant,
+        content: "intermediate".to_string(),
+        tool_call_id: None,
+        tool_calls: vec![call],
+    });
+    let mismatched =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_final", "terminal");
+    let mut deltas = Vec::new();
+    let result = AgentLoop::new(
+        StreamingProvider {
+            responses: vec![
+                (
+                    vec![ProviderStreamEvent::OutputTextDelta {
+                        delta: "intermediate".to_string(),
+                    }],
+                    tool_response,
+                ),
+                (
+                    vec![ProviderStreamEvent::OutputTextDelta {
+                        delta: "partial".to_string(),
+                    }],
+                    mismatched,
+                ),
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(env!("CARGO_MANIFEST_DIR"))
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run_with_text_deltas(
+        &AgentLoopInput::new("thread_1", "turn_1", "verify")
+            .with_max_turns(2)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                verification_digest,
+                1,
+            )]),
+        &mut |delta| deltas.push(delta.to_string()),
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(deltas, ["partial"]);
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .and_then(|diagnostic| diagnostic.code),
+        Some("provider_stream_text_mismatch".to_string())
+    );
+    assert!(!result.completed);
+}
+
+#[test]
+fn approval_resume_projects_finalization_text_deltas() {
+    let verification_argv = test_command("verify");
+    let verification_digest = command_script_scope_digest_with_policy(
+        &verification_argv.join(" "),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let mut tool_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "approval needed");
+    let call = tool_call(
+        "verify_call",
+        "command",
+        serde_json::json!({
+            "command": verification_argv.join(" "),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    );
+    tool_response.tool_calls = vec![call.clone()];
+    tool_response.assistant_message = Some(ModelMessage {
+        role: ModelRole::Assistant,
+        content: "approval needed".to_string(),
+        tool_call_id: None,
+        tool_calls: vec![call],
+    });
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_final", "resumed");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = AgentLoop::new(
+        StreamingProvider {
+            responses: vec![
+                (
+                    vec![ProviderStreamEvent::OutputTextDelta {
+                        delta: "approval needed".to_string(),
+                    }],
+                    tool_response,
+                ),
+                (
+                    vec![
+                        ProviderStreamEvent::OutputTextDelta {
+                            delta: "re".to_string(),
+                        },
+                        ProviderStreamEvent::OutputTextDelta {
+                            delta: "sumed".to_string(),
+                        },
+                    ],
+                    final_response,
+                ),
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(env!("CARGO_MANIFEST_DIR"))
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "verify")
+        .with_max_turns(2)
+        .with_verification_requirements([AgentVerificationRequirement::new(
+            verification_digest,
+            1,
+        )]);
+    let blocked = agent_loop.run(&input);
+    assert_eq!(blocked.status, AgentStatus::Blocked);
+    let pending = pending_approval(&blocked);
+    let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
+    ));
+    let mut deltas = Vec::new();
+    let resumed = agent_loop.resume_pending_approval_with_text_deltas(
+        &resumed_input,
+        &pending,
+        &mut |delta| deltas.push(delta.to_string()),
+    );
+
+    assert_eq!(resumed.status, AgentStatus::Completed);
+    assert_eq!(resumed.final_answer.as_deref(), Some("resumed"));
+    assert_eq!(deltas, ["re", "sumed"]);
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 2);
 }
 
 #[test]
