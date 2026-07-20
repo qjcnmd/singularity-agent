@@ -619,6 +619,63 @@ fn app_server_binary_reports_only_redacted_provider_configuration() {
 }
 
 #[test]
+fn app_server_batch_shutdown_stays_with_stdin_owner_when_eval_is_present() {
+    let dir = tempfile::tempdir().expect("temp directory");
+    let mut child = Command::new(app_server_bin())
+        .current_dir(dir.path())
+        .env(
+            "SINGULARITY_APP_SERVER_DB",
+            dir.path().join("sessions.sqlite3"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app-server");
+    let mut stdin = child.stdin.take().expect("app-server stdin");
+    for line in [
+        r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        r#"[{"jsonrpc":"2.0","method":"eval/run","id":2,"params":{"manifest":"missing-evaluation-manifest.json","runId":"batch-eval"}},{"jsonrpc":"2.0","method":"server/shutdown","id":3,"params":{}}]"#,
+    ] {
+        writeln!(stdin, "{line}").expect("write app-server request");
+        stdin.flush().expect("flush app-server request");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let exited = loop {
+        if child.try_wait().expect("poll app-server").is_some() {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if !exited {
+        child.kill().expect("kill stuck app-server");
+        drop(stdin);
+        child.wait().expect("reap stuck app-server");
+        panic!("batch server/shutdown was not owned by the stdin server");
+    }
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait for app-server");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 app-server output");
+    let shutdown = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|message| {
+            message
+                .as_array()
+                .and_then(|responses| responses.iter().find(|response| response["id"] == 3))
+                .cloned()
+        })
+        .expect("batch shutdown response");
+    assert_eq!(shutdown["result"]["shutdown"], true);
+}
+
+#[test]
 fn app_server_reuses_one_provider_snapshot_for_capability_reads() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");

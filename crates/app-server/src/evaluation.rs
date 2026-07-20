@@ -36,10 +36,10 @@ use singularity_policy::{
 };
 use singularity_protocol::{EvalRunParams, EvalRunResult};
 use singularity_tools::{
-    CommandEnvironmentPolicy, SandboxBackend, SandboxFilesystemMode, SandboxNetworkMode,
-    ToolAuthorization, ToolBroker, ToolCapability, ToolExecutor, ToolRegistry,
-    WorkspaceToolExecutor, WorkspaceTools, command_script_scope_digest_with_policy,
-    workspace_tool_entries,
+    CommandEnvironmentPolicy, CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend,
+    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, ToolAuthorization, ToolBroker,
+    ToolCapability, ToolExecutor, ToolRegistry, WorkspaceToolExecutor, WorkspaceTools,
+    command_script_scope_digest_with_policy, workspace_tool_entries,
 };
 
 #[allow(unused_imports)]
@@ -93,6 +93,63 @@ const CARGO_DEP_HEX: &str = "012345678901234567890123456789012345678901234567890
 static ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type SharedSandboxBackend = Arc<dyn SandboxBackend + Send + Sync>;
+
+/// 将 Evaluation 自身的停止令牌绑定到既有 sandbox 执行边界。
+///
+/// 固定 evaluator command 仍复用 `command` 模块的请求构造和策略校验；这里只把其
+/// `execute` 入口投影为 cancellable backend，避免 shutdown 只能取消 AgentLoop 而留下
+/// baseline、setup 或 verification 命令继续运行。
+struct CancellationAwareSandboxBackend {
+    backend: SharedSandboxBackend,
+    cancellation: CancellationToken,
+}
+
+impl SandboxBackend for CancellationAwareSandboxBackend {
+    fn name(&self) -> &'static str {
+        self.backend.name()
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        self.backend.capabilities()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        self.backend
+            .execute_cancellable(request, &self.cancellation)
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        self.backend
+            .execute_script_cancellable(request, &self.cancellation)
+    }
+
+    fn execute_cancellable(
+        &self,
+        request: &CommandRequest,
+        cancellation: &CancellationToken,
+    ) -> CommandResult {
+        self.backend.execute_cancellable(request, cancellation)
+    }
+
+    fn execute_script_cancellable(
+        &self,
+        request: &CommandScriptRequest,
+        cancellation: &CancellationToken,
+    ) -> CommandResult {
+        self.backend
+            .execute_script_cancellable(request, cancellation)
+    }
+}
+
+fn cancellation_aware_sandbox_backend(
+    backend: &SharedSandboxBackend,
+    cancellation: &CancellationToken,
+) -> SharedSandboxBackend {
+    Arc::new(CancellationAwareSandboxBackend {
+        backend: Arc::clone(backend),
+        cancellation: cancellation.clone(),
+    })
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct StageDiagnostics {
@@ -441,11 +498,13 @@ pub(crate) fn run_evaluation(
         ))
     })?;
 
+    let cancellable_sandbox_backend =
+        cancellation_aware_sandbox_backend(&sandbox_backend, cancellation);
     let run_context = EvaluationRunContext {
         run_id: &run_id,
         run_dir: &run_dir,
         manifest_dir: manifest.manifest_dir(),
-        sandbox_backend: &sandbox_backend,
+        sandbox_backend: &cancellable_sandbox_backend,
         provider_snapshot,
         cancellation,
     };
@@ -582,11 +641,16 @@ fn partial_evaluation_result(
     };
     EvalRunResult {
         run_id: run_id.as_str().to_string(),
-        manifest: params.manifest.clone(),
+        manifest: safe_text(&params.manifest),
         runner: RUNNER_NAME.to_string(),
         status: status.to_string(),
         blocker: Some("evaluation_cancelled".to_string()),
-        tasks: task_executions.iter().map(task_report).collect(),
+        tasks: task_executions
+            .iter()
+            .map(|execution| {
+                serde_json::to_value(&execution.result).expect("evaluation result serializes")
+            })
+            .collect(),
         result_path: None,
         report_path: None,
         evidence_path: None,
@@ -2834,8 +2898,8 @@ mod tests {
         ToolCapabilityRequirement,
     };
     use singularity_tools::{
-        CommandRequest, CommandResult, SandboxBackendEnforcement, SandboxCapabilities,
-        WorkspaceMutation, WorkspaceObservation, WorkspaceRevision,
+        CommandExecutionStatus, CommandRequest, CommandResult, SandboxBackendEnforcement,
+        SandboxCapabilities, WorkspaceMutation, WorkspaceObservation, WorkspaceRevision,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3388,6 +3452,105 @@ mod tests {
         assert_eq!(partial.status, "blocked");
         assert_eq!(partial.blocker.as_deref(), Some("evaluation_cancelled"));
         assert!(partial.tasks.is_empty());
+    }
+
+    #[derive(Default)]
+    struct CancellableProbeBackend {
+        execute_calls: AtomicUsize,
+        cancellable_calls: AtomicUsize,
+    }
+
+    impl SandboxBackend for CancellableProbeBackend {
+        fn name(&self) -> &'static str {
+            "cancellable_probe"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            CommandResult::backend_error(&request.command_id, "non-cancellable path used")
+        }
+
+        fn execute_cancellable(
+            &self,
+            request: &CommandRequest,
+            _cancellation: &CancellationToken,
+        ) -> CommandResult {
+            self.cancellable_calls.fetch_add(1, Ordering::SeqCst);
+            CommandResult::cancelled(&request.command_id, 0)
+        }
+    }
+
+    #[test]
+    fn evaluation_commands_use_the_run_cancellation_token() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let backend = Arc::new(CancellableProbeBackend::default());
+        let shared: SharedSandboxBackend = backend.clone();
+        let wrapped = cancellation_aware_sandbox_backend(&shared, &CancellationToken::new());
+
+        let result = run_command_spec(
+            temp.path(),
+            &command(&["git", "status"]),
+            DEFAULT_COMMAND_TIMEOUT_SECONDS,
+            wrapped,
+        )
+        .expect("cancellable command result");
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Cancelled);
+        assert_eq!(backend.cancellable_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelled_partial_result_uses_bounded_safe_task_projection() {
+        let task_id = TaskId::new("partial-task").expect("task id");
+        let diagnostics = TaskDiagnostics {
+            trace_path: Some("C:\\secret-workspace\\agent-trace.json".to_string()),
+            patch_evidence_path: Some("C:\\secret-workspace\\patch-evidence.json".to_string()),
+            ..TaskDiagnostics::default()
+        };
+        let task = finish_task(
+            &task_id,
+            1,
+            StageExecution::blocked(
+                evaluation_blocker(BlockerKind::AgentRuntime, "evaluation cancelled"),
+                Vec::new(),
+            ),
+            StageExecution::skipped("agent stage skipped"),
+            StageExecution::skipped("public stage skipped"),
+            StageExecution::skipped("hidden stage skipped"),
+            diagnostics,
+        );
+        let task_result = EvaluationTaskResult::from_trials(
+            task_id,
+            Vec::new(),
+            Vec::new(),
+            vec![task.result.clone()],
+        );
+        let execution = TaskEvaluation {
+            result: task_result,
+            trials: vec![task],
+        };
+        let run_id = RunId::new("partial-safe").expect("run id");
+        let partial = partial_evaluation_result(
+            &EvalRunParams {
+                manifest: "C:\\secret-workspace\\manifest.json".to_string(),
+                run_id: run_id.as_str().to_string(),
+                output_root: None,
+            },
+            &run_id,
+            std::slice::from_ref(&execution),
+        );
+        let serialized = serde_json::to_string(&partial).expect("partial result serializes");
+
+        assert_eq!(partial.manifest, "[redacted]");
+        assert_eq!(partial.tasks.len(), 1);
+        assert!(!serialized.contains("secret-workspace"));
+        assert!(!serialized.contains("agent-trace.json"));
+        assert!(!serialized.contains("patch-evidence.json"));
     }
 
     #[cfg(windows)]

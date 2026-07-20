@@ -205,64 +205,7 @@ fn run() -> Result<(), String> {
             }
         };
         if !matches!(payload, JsonRpcPayload::Single(_)) {
-            if is_request_worker_batch(&payload) && server.ready_for_turn_worker() {
-                if request_workers.len() >= MAX_REQUEST_WORKERS {
-                    if let Err(error) = send_output(
-                        &outputs,
-                        OutputKind::Control,
-                        &cancellation,
-                        internal_error_value(None, REQUEST_CAPACITY_EXCEEDED),
-                    ) {
-                        terminal_error = Some(error);
-                        break;
-                    }
-                } else {
-                    match server.turn_worker() {
-                        Ok(mut worker) => {
-                            let worker_outputs = outputs.clone();
-                            let worker_cancellation = cancellation.clone();
-                            match thread::Builder::new()
-                                .name("singularity-request".to_string())
-                                .spawn(move || {
-                                    dispatch_batch(
-                                        &mut worker,
-                                        payload,
-                                        &worker_outputs,
-                                        &worker_cancellation,
-                                    )
-                                }) {
-                                Ok(worker) => request_workers.push(worker),
-                                Err(error) => {
-                                    if let Err(error) = send_output(
-                                        &outputs,
-                                        OutputKind::Control,
-                                        &cancellation,
-                                        internal_error_value(
-                                            None,
-                                            format!("failed to start request worker: {error}"),
-                                        ),
-                                    ) {
-                                        terminal_error = Some(error);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            if let Err(error) = send_output(
-                                &outputs,
-                                OutputKind::Control,
-                                &cancellation,
-                                transport_error_value(None, &error),
-                            ) {
-                                terminal_error = Some(error);
-                                break;
-                            }
-                        }
-                    }
-                }
-            } else if let Err(error) = dispatch_batch(&mut server, payload, &outputs, &cancellation)
-            {
+            if let Err(error) = dispatch_batch(&mut server, payload, &outputs, &cancellation) {
                 terminal_error = Some(error);
                 break;
             }
@@ -403,16 +346,6 @@ fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
                 || method == Method::ApprovalDecision.as_str()
                 || method == Method::EvalRun.as_str()
     )
-}
-
-fn is_request_worker_batch(payload: &JsonRpcPayload) -> bool {
-    let JsonRpcPayload::Batch(items) = payload else {
-        return false;
-    };
-    items.iter().any(|item| match item {
-        JsonRpcBatchItem::Message(message) => is_request_worker_method(message),
-        JsonRpcBatchItem::Invalid { .. } => false,
-    })
 }
 
 /// 按输入顺序串行分发 batch；副作用项不并行，notification 项不产生控制响应。
@@ -682,109 +615,122 @@ fn send_reserved_output(
     order: u64,
     message: Value,
 ) -> Result<OutputSendStatus, String> {
-    let _send_guard = match outputs.send_lock.lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            outputs.order_state.complete(order);
-            return Err("output ordering state poisoned".to_string());
+    let kind = classify_output(&message);
+    if kind == OutputKind::Event {
+        loop {
+            let pending_gap = {
+                let _send_guard = match outputs.send_lock.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        outputs.order_state.complete(order);
+                        return Err("output ordering state poisoned".to_string());
+                    }
+                };
+                let pending_gap = match prepare_pending_event_gap(outputs, cancellation) {
+                    Ok(pending_gap) => pending_gap,
+                    Err(error) => {
+                        outputs.order_state.complete(order);
+                        return Err(error);
+                    }
+                };
+                if pending_gap.is_none() {
+                    return try_send_event(outputs, cancellation, order, message);
+                }
+                pending_gap
+            };
+            if let Some((pending, gap_message)) = pending_gap
+                && let Err(error) =
+                    enqueue_pending_event_gap(outputs, cancellation, pending, gap_message)
+            {
+                outputs.order_state.complete(order);
+                return Err(error);
+            }
         }
-    };
-    if let Err(error) = flush_pending_event_gap_locked(outputs, cancellation) {
+    }
+    if let Err(error) = flush_pending_event_gap(outputs, cancellation) {
         outputs.order_state.complete(order);
         return Err(error);
     }
-    let kind = classify_output(&message);
     match kind {
-        OutputKind::Control => {
-            drop(_send_guard);
-            outputs
-                .control
-                .send(QueuedOutput {
-                    order,
-                    to_order: order,
-                    message,
-                })
-                .map(|()| {
-                    outputs.order_state.enqueue(order);
-                    OutputSendStatus::Enqueued
-                })
-                .map_err(|_| {
-                    outputs.order_state.complete(order);
-                    cancellation.request_execution_stop();
-                    "stdout transport unavailable".to_string()
-                })
-        }
-        OutputKind::ReliableEvent => {
-            drop(_send_guard);
-            outputs
-                .event
-                .send(QueuedOutput {
-                    order,
-                    to_order: order,
-                    message,
-                })
-                .map(|()| {
-                    outputs.order_state.enqueue(order);
-                    OutputSendStatus::Enqueued
-                })
-                .map_err(|_| {
-                    outputs.order_state.complete(order);
-                    cancellation.request_execution_stop();
-                    "stdout transport unavailable".to_string()
-                })
-        }
-        // `try_send` cannot block, so keep the ordering guard until a dropped progress event and
-        // its reserved order are committed to the same gap. Reliable sends release the guard
-        // before backpressure so one slow queue does not serialize unrelated Turn workers.
-        OutputKind::Event => match outputs.event.try_send(QueuedOutput {
-            order,
-            to_order: order,
-            message,
-        }) {
-            Ok(()) => {
+        OutputKind::Control => outputs
+            .control
+            .send(QueuedOutput {
+                order,
+                to_order: order,
+                message,
+            })
+            .map(|()| {
                 outputs.order_state.enqueue(order);
-                Ok(OutputSendStatus::Enqueued)
-            }
-            Err(TrySendError::Full(output)) => record_event_gap(outputs, &output.message, order)
-                .map_or_else(
-                    |error| {
-                        outputs.order_state.complete(order);
-                        Err(error)
-                    },
-                    |()| Ok(OutputSendStatus::EventDropped),
-                ),
-            Err(TrySendError::Disconnected(_)) => {
+                OutputSendStatus::Enqueued
+            })
+            .map_err(|_| {
                 outputs.order_state.complete(order);
                 cancellation.request_execution_stop();
-                Err("stdout transport unavailable".to_string())
-            }
-        },
+                "stdout transport unavailable".to_string()
+            }),
+        OutputKind::ReliableEvent => outputs
+            .event
+            .send(QueuedOutput {
+                order,
+                to_order: order,
+                message,
+            })
+            .map(|()| {
+                outputs.order_state.enqueue(order);
+                OutputSendStatus::Enqueued
+            })
+            .map_err(|_| {
+                outputs.order_state.complete(order);
+                cancellation.request_execution_stop();
+                "stdout transport unavailable".to_string()
+            }),
+        OutputKind::Event => unreachable!("progress events are sent under the ordering lock"),
     }
 }
 
-/// 将待发送 gap 放入控制队列，保证它先于同一请求的匹配响应写出。
-fn flush_pending_event_gap(
+/// `try_send` 与 dropped-progress gap 的提交共享短排序临界区，但不执行阻塞 I/O。
+fn try_send_event(
     outputs: &OutputChannels,
     cancellation: &dyn ExecutionStop,
-) -> Result<(), String> {
-    let _send_guard = outputs
-        .send_lock
-        .lock()
-        .map_err(|_| "output ordering state poisoned".to_string())?;
-    flush_pending_event_gap_locked(outputs, cancellation)
+    order: u64,
+    message: Value,
+) -> Result<OutputSendStatus, String> {
+    match outputs.event.try_send(QueuedOutput {
+        order,
+        to_order: order,
+        message,
+    }) {
+        Ok(()) => {
+            outputs.order_state.enqueue(order);
+            Ok(OutputSendStatus::Enqueued)
+        }
+        Err(TrySendError::Full(output)) => record_event_gap(outputs, &output.message, order)
+            .map_or_else(
+                |error| {
+                    outputs.order_state.complete(order);
+                    Err(error)
+                },
+                |()| Ok(OutputSendStatus::EventDropped),
+            ),
+        Err(TrySendError::Disconnected(_)) => {
+            outputs.order_state.complete(order);
+            cancellation.request_execution_stop();
+            Err("stdout transport unavailable".to_string())
+        }
+    }
 }
 
-fn flush_pending_event_gap_locked(
+/// 仅在发送锁内取得 pending gap；实际 channel send 在锁外完成。
+fn prepare_pending_event_gap(
     outputs: &OutputChannels,
     cancellation: &dyn ExecutionStop,
-) -> Result<(), String> {
-    let pending = outputs
+) -> Result<Option<(PendingEventGap, Value)>, String> {
+    let mut pending_guard = outputs
         .pending_event_gap
         .lock()
-        .map_err(|_| "event gap state poisoned".to_string())?
-        .take();
-    let Some(pending) = pending else {
-        return Ok(());
+        .map_err(|_| "event gap state poisoned".to_string())?;
+    let Some(pending) = pending_guard.as_ref().copied() else {
+        return Ok(None);
     };
     let gap = EventGap {
         reason: EventGapReason::ProgressDropped,
@@ -799,15 +745,35 @@ fn flush_pending_event_gap_locked(
         recovery_query: None,
         gap: Some(gap.clone()),
     };
-    let message = JsonRpcMessage::notification(
+    let message = match JsonRpcMessage::notification(
         "event/gap",
         serde_json::json!({
             "gap": gap,
             "event": metadata,
         }),
-    )
-    .map_err(|_| "failed to serialize event gap".to_string())?
-    .to_wire_value();
+    ) {
+        Ok(message) => message.to_wire_value(),
+        Err(_) => {
+            pending_guard.take();
+            drop(pending_guard);
+            outputs
+                .order_state
+                .complete_range(pending.from_order, pending.to_order);
+            cancellation.request_execution_stop();
+            return Err("failed to serialize event gap".to_string());
+        }
+    };
+    pending_guard.take();
+    Ok(Some((pending, message)))
+}
+
+/// 将已取得的 gap 放入控制队列，并在 transport 失败时完成其 reservation 范围。
+fn enqueue_pending_event_gap(
+    outputs: &OutputChannels,
+    cancellation: &dyn ExecutionStop,
+    pending: PendingEventGap,
+    message: Value,
+) -> Result<(), String> {
     match outputs.control.send(QueuedOutput {
         order: pending.from_order,
         to_order: pending.to_order,
@@ -823,6 +789,24 @@ fn flush_pending_event_gap_locked(
             cancellation.request_execution_stop();
             return Err("stdout transport unavailable".to_string());
         }
+    }
+    Ok(())
+}
+
+/// 将待发送 gap 放入控制队列，保证它先于同一请求的匹配响应写出。
+fn flush_pending_event_gap(
+    outputs: &OutputChannels,
+    cancellation: &dyn ExecutionStop,
+) -> Result<(), String> {
+    let pending_gap = {
+        let _send_guard = outputs
+            .send_lock
+            .lock()
+            .map_err(|_| "output ordering state poisoned".to_string())?;
+        prepare_pending_event_gap(outputs, cancellation)?
+    };
+    if let Some((pending, message)) = pending_gap {
+        enqueue_pending_event_gap(outputs, cancellation, pending, message)?;
     }
     Ok(())
 }
@@ -1609,6 +1593,66 @@ mod tests {
         assert_eq!(values[1]["params"]["event"]["gap"]["toCursor"], 2);
         assert_eq!(values[2]["kind"], "control");
         assert_eq!(cancellation.request_count(), 0);
+    }
+
+    #[test]
+    fn pending_gap_flush_does_not_hold_send_lock_across_control_backpressure() {
+        let (outputs, control_rx, _event_rx) = test_output_channels(1, 1);
+        let cancellation = CancellationProbe::default();
+        send_output(
+            &outputs,
+            OutputKind::Control,
+            &cancellation,
+            serde_json::json!({"kind": "occupied"}),
+        )
+        .expect("control queue is filled");
+        send_output(
+            &outputs,
+            OutputKind::Event,
+            &cancellation,
+            progress_event(1),
+        )
+        .expect("first progress event fits");
+        assert_eq!(
+            send_output(
+                &outputs,
+                OutputKind::Event,
+                &cancellation,
+                progress_event(2),
+            )
+            .expect("second progress event is droppable"),
+            OutputSendStatus::EventDropped
+        );
+
+        let (attempted_sender, attempted_receiver) = mpsc::channel();
+        let sender_outputs = outputs.clone();
+        let sender_cancellation = cancellation.clone();
+        let sender = thread::spawn(move || {
+            attempted_sender.send(()).expect("gap flush attempted");
+            flush_pending_event_gap(&sender_outputs, &sender_cancellation)
+        });
+        attempted_receiver.recv().expect("gap flush started");
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut lock_available = false;
+        while Instant::now() < deadline {
+            if let Ok(guard) = outputs.send_lock.try_lock() {
+                drop(guard);
+                lock_available = true;
+                break;
+            }
+            thread::yield_now();
+        }
+
+        control_rx.recv().expect("release occupied control output");
+        sender
+            .join()
+            .expect("gap sender")
+            .expect("gap flush succeeds after backpressure is released");
+        assert!(
+            lock_available,
+            "gap flush must release send_lock before blocking on control queue"
+        );
     }
 
     struct DisconnectedWriter;
