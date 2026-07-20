@@ -740,6 +740,23 @@ pub struct OpenAiProviderConfig {
     pub max_output_tokens: u32,
 }
 
+/// Provider transport runtime ownership: an app-server borrows its existing handle, while
+/// independent consumers own a dedicated runtime shared by provider clones.
+#[derive(Clone)]
+enum ProviderRuntime {
+    External(tokio::runtime::Handle),
+    Owned(Arc<tokio::runtime::Runtime>),
+}
+
+impl ProviderRuntime {
+    fn block_on<F: Future>(&self, future: F) -> F::Output {
+        match self {
+            Self::External(handle) => handle.block_on(future),
+            Self::Owned(runtime) => runtime.block_on(future),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 struct ProviderCapabilityCacheKey {
@@ -769,8 +786,8 @@ struct ProviderCapabilityProbeKey {
 pub struct OpenAiProvider {
     config: OpenAiProviderConfig,
     client: reqwest::Client,
-    /// 所有 provider clone 共享的受控多线程 runtime；最后一个持有者释放时由 Tokio 关闭它。
-    runtime: Arc<tokio::runtime::Runtime>,
+    /// 所有 provider clone 共享同一 runtime ownership 绑定。
+    runtime: Arc<ProviderRuntime>,
     request_timeout_seconds: u64,
     capability_probe_deadline: Duration,
     tool_capability_cache: Arc<Mutex<capability::InMemoryProviderCapabilityCacheState>>,

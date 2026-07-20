@@ -3829,6 +3829,58 @@ fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
 }
 
 #[test]
+fn openai_provider_uses_external_runtime_handle_for_http_body_and_backoff() {
+    let success_body = r#"{
+        "id": "resp_external_runtime",
+        "choices": [{
+            "message": {"role": "assistant", "content": "done"},
+            "finish_reason": "stop"
+        }]
+    }"#;
+    let (base_url, attempts) = sequence_response_server(vec![
+        ("HTTP/1.1 429 Too Many Requests", "{}"),
+        ("HTTP/1.1 200 OK", success_body),
+    ]);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("external Tokio runtime");
+    let provider = OpenAiProvider::new_with_runtime_handle(
+        provider_test_config(base_url),
+        runtime.handle().clone(),
+    )
+    .expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_external_runtime",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let mut request = request;
+    request.tools.push(ModelToolSchema {
+        name: "read".to_string(),
+        description: "Read a file".to_string(),
+        parameters_schema: serde_json::json!({"type": "object"}),
+    });
+
+    let result = thread::spawn(move || {
+        provider.complete(&request, &singularity_core::CancellationToken::new())
+    })
+    .join()
+    .expect("join external runtime provider");
+    let response = result.expect("provider response");
+
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(
+        response
+            .provider_attempt_metadata
+            .expect("attempt metadata")
+            .attempt_count,
+        2
+    );
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2]);
+    runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
 fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated provider");
     let address = listener.local_addr().expect("truncated provider address");

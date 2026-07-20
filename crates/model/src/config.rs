@@ -28,12 +28,52 @@ impl ProviderConfigSnapshot {
     where
         F: FnMut(&str) -> Option<String>,
     {
+        Self::capture_with_provider(get_env, move |config| {
+            OpenAiProvider::new_with_cache_path(config, cache_path)
+        })
+    }
+
+    /// 从环境读取 provider 配置，并把传输绑定到调用方已有的 Tokio runtime handle。
+    pub fn capture_with_runtime_handle<F>(
+        get_env: F,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        Self::capture_with_runtime_handle_and_cache_path(get_env, None, runtime_handle)
+    }
+
+    /// 从环境读取 provider 配置，绑定调用方 runtime，并显式设置 capability cache 路径。
+    pub fn capture_with_runtime_handle_and_cache_path<F>(
+        get_env: F,
+        cache_path: Option<PathBuf>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        Self::capture_with_provider(get_env, move |config| {
+            OpenAiProvider::new_with_runtime_handle_and_cache_path(
+                config,
+                PROVIDER_TIMEOUT_SECONDS,
+                cache_path,
+                runtime_handle,
+            )
+        })
+    }
+
+    fn capture_with_provider<F, P>(get_env: F, provider_factory: P) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+        P: FnOnce(OpenAiProviderConfig) -> Result<OpenAiProvider, ProviderError>,
+    {
         let project_dir = std::env::current_dir().ok();
         let values = resolve_provider_values(get_env, project_dir.as_deref());
         let source = values.source;
         let redacted_config = provider_config_resolution(&values).config;
-        let provider = OpenAiProviderConfig::from_resolved_values(values)
-            .and_then(|config| OpenAiProvider::new_with_cache_path(config, cache_path));
+        let provider =
+            OpenAiProviderConfig::from_resolved_values(values).and_then(provider_factory);
         let mut configuration = ProviderConfigurationStatus::from_config(&redacted_config);
         if configuration.configured
             && let Err(error) = &provider

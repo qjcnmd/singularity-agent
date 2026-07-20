@@ -90,6 +90,36 @@ fn configured_app_server(store: SessionStore) -> AppServer {
     )
 }
 
+#[test]
+fn configured_provider_drops_cleanly_inside_app_server_runtime() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime");
+        let runtime_handle = runtime.handle().clone();
+        runtime.block_on(async move {
+            let provider_snapshot = ProviderConfigSnapshot::capture_with_runtime_handle(
+                |name| match name {
+                    "SINGULARITY_MODEL" => Some("drop-test-model".to_string()),
+                    "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+                    "SINGULARITY_API_KEY" => Some("drop-test-key".to_string()),
+                    _ => None,
+                },
+                runtime_handle,
+            );
+            assert!(provider_snapshot.configuration().configured);
+            let store = SessionStore::open(":memory:").expect("open store");
+            drop(AppServer::new(store, provider_snapshot));
+        });
+    }));
+
+    assert!(
+        result.is_ok(),
+        "configured provider drop panicked: {result:?}"
+    );
+}
+
 fn expected_eval_blocker_kind() -> &'static str {
     if cfg!(windows) {
         "workspace_preparation"

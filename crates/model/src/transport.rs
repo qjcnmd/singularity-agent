@@ -20,6 +20,19 @@ impl OpenAiProvider {
         Self::new_with_request_timeout(config, PROVIDER_TIMEOUT_SECONDS)
     }
 
+    /// 创建 provider，并绑定调用方已经拥有的 Tokio runtime handle。
+    pub fn new_with_runtime_handle(
+        config: OpenAiProviderConfig,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_runtime_handle_and_cache_path(
+            config,
+            PROVIDER_TIMEOUT_SECONDS,
+            None,
+            runtime_handle,
+        )
+    }
+
     /// 创建 provider，并显式绑定可选的持久 capability cache 文件。
     pub fn new_with_cache_path(
         config: OpenAiProviderConfig,
@@ -40,15 +53,43 @@ impl OpenAiProvider {
         request_timeout_seconds: u64,
         cache_path: Option<PathBuf>,
     ) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(request_timeout_seconds))
-            .build()
-            .map_err(provider_client_initialization_error)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(PROVIDER_RUNTIME_WORKER_THREADS)
             .enable_all()
             .build()
             .map_err(provider_runtime_error)?;
+        Self::new_with_runtime(
+            config,
+            request_timeout_seconds,
+            cache_path,
+            ProviderRuntime::Owned(Arc::new(runtime)),
+        )
+    }
+
+    pub(super) fn new_with_runtime_handle_and_cache_path(
+        config: OpenAiProviderConfig,
+        request_timeout_seconds: u64,
+        cache_path: Option<PathBuf>,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_runtime(
+            config,
+            request_timeout_seconds,
+            cache_path,
+            ProviderRuntime::External(runtime_handle),
+        )
+    }
+
+    fn new_with_runtime(
+        config: OpenAiProviderConfig,
+        request_timeout_seconds: u64,
+        cache_path: Option<PathBuf>,
+        runtime: ProviderRuntime,
+    ) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(request_timeout_seconds))
+            .build()
+            .map_err(provider_client_initialization_error)?;
         Ok(Self {
             config,
             client,
@@ -559,7 +600,7 @@ pub(super) fn provider_retry_backoff(retry_count: u32) -> Duration {
 }
 
 pub(super) fn wait_provider_backoff(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     duration: Duration,
     probe_deadline: Option<Instant>,
@@ -591,7 +632,7 @@ pub(super) fn wait_provider_backoff(
 }
 
 pub(super) fn block_on_provider_future<C, F, T>(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     error_code: &'static str,
     error_stage: ProviderErrorStage,
@@ -603,9 +644,15 @@ where
     C: FnOnce() -> F,
     F: Future<Output = Result<T, reqwest::Error>>,
 {
-    let mut future = {
-        let _runtime_context = runtime.enter();
-        Box::pin(create_future())
+    let mut future = match runtime {
+        ProviderRuntime::External(handle) => {
+            let _runtime_context = handle.enter();
+            Box::pin(create_future())
+        }
+        ProviderRuntime::Owned(runtime) => {
+            let _runtime_context = runtime.enter();
+            Box::pin(create_future())
+        }
     };
     loop {
         if cancellation.is_cancelled() {
@@ -638,7 +685,7 @@ where
 }
 
 pub(super) fn read_bounded_provider_response_body(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &ProviderRuntime,
     cancellation: &CancellationToken,
     request_timeout_seconds: u64,
     probe_deadline: Option<Instant>,

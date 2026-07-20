@@ -85,12 +85,14 @@ impl ExecutionStop for AppServerCancellationHandle {
 }
 
 /// 在单一 Tokio runtime 内运行 stdio 控制面；所有同步 AppServer 工作都跨 blocking 边界。
-pub(super) async fn run() -> Result<(), String> {
+pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), String> {
     let configured_db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
-    let server = tokio::task::spawn_blocking(move || initialize_app_server(&configured_db_path))
-        .await
-        .map_err(|error| format!("app-server startup task failed: {error}"))??;
+    let server = tokio::task::spawn_blocking(move || {
+        initialize_app_server(&configured_db_path, runtime_handle)
+    })
+    .await
+    .map_err(|error| format!("app-server startup task failed: {error}"))??;
     let cancellation = server.cancellation_handle();
     let (control_tx, mut control_rx) = mpsc::channel::<QueuedOutput>(CONTROL_QUEUE_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel::<QueuedOutput>(EVENT_QUEUE_CAPACITY);
@@ -440,7 +442,10 @@ pub(super) async fn run() -> Result<(), String> {
     }
 }
 
-fn initialize_app_server(configured_db_path: &str) -> Result<AppServer, String> {
+fn initialize_app_server(
+    configured_db_path: &str,
+    runtime_handle: tokio::runtime::Handle,
+) -> Result<AppServer, String> {
     let (db_path, capability_cache_path) = prepare_app_server_state_paths(configured_db_path)?;
     let store = SessionStore::open(&db_path)
         .map_err(|error| format!("failed to open app-server store {db_path}: {error}"))?;
@@ -448,9 +453,10 @@ fn initialize_app_server(configured_db_path: &str) -> Result<AppServer, String> 
     store
         .recover_unowned_workspace_executions()
         .map_err(|error| format!("failed to recover app-server thread executions: {error}"))?;
-    let provider_snapshot = ProviderConfigSnapshot::capture_with_cache_path(
+    let provider_snapshot = ProviderConfigSnapshot::capture_with_runtime_handle_and_cache_path(
         |name| std::env::var(name).ok(),
         Some(capability_cache_path),
+        runtime_handle,
     );
     Ok(AppServer::new(store, provider_snapshot))
 }

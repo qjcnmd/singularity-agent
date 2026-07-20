@@ -19,7 +19,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let result = runtime.block_on(transport::run());
+    let result = runtime.block_on(transport::run(runtime.handle().clone()));
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     if let Err(error) = result {
         eprintln!("app-server error: {error}");
