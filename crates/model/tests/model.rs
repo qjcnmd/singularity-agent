@@ -6,7 +6,8 @@ use singularity_model::{
     ModelErrorCategory, ModelErrorKind, ModelMessage, ModelPreferences, ModelProviderConfig,
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
-    ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityProfile,
+    ProviderApiProtocol, ProviderAttemptMetadata, ProviderAttemptOccurrence,
+    ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderCapabilityProfile,
     ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
     ProviderProtocolContract, ProviderStreamEvent, ProviderStreamingCapability,
     ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
@@ -1519,6 +1520,23 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
         .expect("decode attempt metadata");
     assert_eq!(decode_metadata.attempt_count, 1);
     assert_eq!(decode_metadata.retry_count, 0);
+    let [decode_occurrence] = decode_metadata.occurrences.as_slice() else {
+        panic!("one decode failure occurrence expected");
+    };
+    assert_eq!(
+        decode_occurrence.terminal_status,
+        ProviderAttemptStatus::Error
+    );
+    assert_eq!(
+        decode_occurrence.error_stage,
+        Some(ProviderErrorStage::ResponseJsonDecode)
+    );
+    assert_eq!(
+        decode_occurrence.diagnostic_code.as_deref(),
+        Some("provider_response_json_decode_failed")
+    );
+    assert!(decode_occurrence.request_send_to_headers_ms.is_some());
+    assert!(decode_occurrence.time_to_first_text_delta_ms.is_none());
 
     let missing_choices_url = single_response_server("HTTP/1.1 200 OK", r#"{"id":"response_1"}"#);
     let missing_choices = OpenAiProvider::new(provider_test_config(missing_choices_url))
@@ -1537,6 +1555,21 @@ fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics()
     assert_eq!(
         envelope_error.error.validation_errors,
         vec!["response_choices_missing"]
+    );
+    let envelope_metadata = envelope_error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("envelope attempt metadata");
+    let [envelope_occurrence] = envelope_metadata.occurrences.as_slice() else {
+        panic!("one response validation occurrence expected");
+    };
+    assert_eq!(
+        envelope_occurrence.error_stage,
+        Some(ProviderErrorStage::ResponseValidation)
+    );
+    assert_eq!(
+        envelope_occurrence.diagnostic_code.as_deref(),
+        Some("provider_response_invalid")
     );
     let serialized = serde_json::to_string(&envelope_error.error).expect("serialize error");
     assert!(!serialized.contains("hello"));
@@ -1859,6 +1892,39 @@ fn openai_responses_stream_aggregates_deltas_and_requires_completed_envelope() {
     .expect("stream request JSON");
     assert_eq!(payload["stream"], true);
     assert_eq!(payload["store"], false);
+    let metadata = response
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("stream attempt metadata");
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one HTTP attempt occurrence expected");
+    };
+    assert_eq!(
+        occurrence.operation_phase,
+        ProviderAttemptOperationPhase::Completion
+    );
+    assert_eq!(occurrence.provider_name, "openai_compatible");
+    assert_eq!(occurrence.model_name, "gpt-test");
+    assert_eq!(
+        occurrence.actual_api_protocol,
+        ProviderApiProtocol::OpenAiResponses
+    );
+    assert_eq!(occurrence.attempt_index, 1);
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Ok);
+    assert!(occurrence.request_send_to_headers_ms.is_some());
+    assert!(occurrence.queue_duration_ms.is_none());
+    assert!(occurrence.time_to_first_text_delta_ms.is_some());
+    assert!(!occurrence.retry_scheduled);
+    assert!(occurrence.retry_backoff_ms.is_none());
+    assert!(occurrence.error_category.is_none());
+    assert!(occurrence.error_stage.is_none());
+    assert!(occurrence.diagnostic_code.is_none());
+    assert_eq!(
+        occurrence.usage.as_ref().map(|usage| usage.total_tokens),
+        Some(3)
+    );
 }
 
 #[test]
@@ -1912,6 +1978,16 @@ fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
             .expect_err("stream must fail closed");
         assert_eq!(error.error.code.as_deref(), Some(expected_code), "{name}");
         assert!(!error.error.message.contains("secret raw failure"));
+        let metadata = error
+            .provider_attempt_metadata
+            .as_ref()
+            .expect("stream terminal attempt metadata");
+        let [occurrence] = metadata.occurrences.as_slice() else {
+            panic!("one terminal stream occurrence expected for {name}");
+        };
+        assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+        assert_eq!(occurrence.diagnostic_code.as_deref(), Some(expected_code));
+        assert!(!occurrence.retry_scheduled);
         requests
             .recv_timeout(Duration::from_secs(1))
             .expect("stream request was sent");
@@ -1943,6 +2019,19 @@ fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_delt
         error.error.code.as_deref(),
         Some("provider_response_stream_too_large")
     );
+    let metadata = error
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("oversized stream attempt metadata");
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one oversized stream occurrence expected");
+    };
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+    assert_eq!(
+        occurrence.error_stage,
+        Some(ProviderErrorStage::ResponseBodyRead)
+    );
+    assert!(!occurrence.retry_scheduled);
     requests
         .recv_timeout(Duration::from_secs(1))
         .expect("oversized stream request");
@@ -2123,6 +2212,28 @@ fn openai_responses_stream_retries_before_but_not_after_first_text_delta() {
         .expect("stream retry metadata");
     assert_eq!(metadata.attempt_count, 2);
     assert_eq!(metadata.retry_count, 1);
+    assert_eq!(metadata.occurrences.len(), 2);
+    assert_eq!(metadata.occurrences[0].attempt_index, 1);
+    assert_eq!(
+        metadata.occurrences[0].terminal_status,
+        ProviderAttemptStatus::Error
+    );
+    assert!(metadata.occurrences[0].retry_scheduled);
+    assert!(
+        metadata.occurrences[0]
+            .time_to_first_text_delta_ms
+            .is_none()
+    );
+    assert_eq!(metadata.occurrences[1].attempt_index, 2);
+    assert_eq!(
+        metadata.occurrences[1].terminal_status,
+        ProviderAttemptStatus::Ok
+    );
+    assert!(
+        metadata.occurrences[1]
+            .time_to_first_text_delta_ms
+            .is_some()
+    );
     assert_eq!(events.len(), 1);
     server.join().expect("join stream retry server");
 
@@ -2171,6 +2282,12 @@ fn openai_responses_stream_retries_before_but_not_after_first_text_delta() {
     );
     assert_eq!(metadata.attempt_count, 1);
     assert_eq!(metadata.retry_count, 0);
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one post-delta occurrence expected");
+    };
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+    assert!(occurrence.time_to_first_text_delta_ms.is_some());
+    assert!(!occurrence.retry_scheduled);
     assert_eq!(events.len(), 1);
     server.join().expect("join stream no-retry server");
 }
@@ -2224,13 +2341,18 @@ fn openai_responses_stream_cancellation_reaches_inflight_body_read() {
         .expect("stream cancellation was bounded")
         .expect_err("stream cancellation");
     assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+    let metadata = error.provider_attempt_metadata.expect("cancel metadata");
+    assert_eq!(metadata.attempt_count, 1);
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one cancelled stream occurrence expected");
+    };
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Cancelled);
     assert_eq!(
-        error
-            .provider_attempt_metadata
-            .expect("cancel metadata")
-            .attempt_count,
-        1
+        occurrence.error_category,
+        Some(ModelErrorCategory::Cancelled)
     );
+    assert_eq!(occurrence.error_stage, Some(ProviderErrorStage::Cancelled));
+    assert!(!occurrence.retry_scheduled);
     worker.join().expect("join stream cancellation worker");
     server.join().expect("join stream cancellation server");
 }
@@ -2633,6 +2755,31 @@ fn openai_capability_probe_strict_profile_proves_nontrivial_schema_and_arguments
     assert_eq!(continuation["messages"][4].get("name"), None);
     assert_eq!(continuation["messages"][4]["tool_call_id"], "probe_call_b");
     assert_eq!(negotiation.metadata.probe_attempt_metadata.attempt_count, 2);
+    assert_eq!(
+        negotiation
+            .metadata
+            .probe_attempt_metadata
+            .occurrences
+            .iter()
+            .map(|occurrence| (
+                occurrence.operation_phase,
+                occurrence.attempt_index,
+                occurrence.terminal_status,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ProviderAttemptOperationPhase::CapabilityProbe,
+                1,
+                ProviderAttemptStatus::Ok,
+            ),
+            (
+                ProviderAttemptOperationPhase::CapabilityProbe,
+                2,
+                ProviderAttemptStatus::Ok,
+            ),
+        ]
+    );
     let cached = Provider::negotiate_tool_capabilities(
         &provider,
         &ModelPreferences::default(),
@@ -4271,6 +4418,19 @@ fn openai_provider_roundtrips_non_stream_response_without_raw_body_leak() {
     assert_eq!(response.status, ModelTurnStatus::Success);
     assert_eq!(response.response_id, "resp_1");
     assert_eq!(response.usage.total_tokens, 5);
+    let metadata = response
+        .provider_attempt_metadata
+        .as_ref()
+        .expect("non-stream success attempt metadata");
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one non-stream success occurrence expected");
+    };
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Ok);
+    assert!(occurrence.time_to_first_text_delta_ms.is_none());
+    assert_eq!(
+        occurrence.usage.as_ref().map(|usage| usage.total_tokens),
+        Some(5)
+    );
     assert_eq!(
         response.tool_calls[0].arguments,
         serde_json::json!({"path": "README.md"})
@@ -4310,6 +4470,40 @@ fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
     assert_eq!(metadata.attempt_count, 3);
     assert_eq!(metadata.retry_count, 2);
     assert!(metadata.latency_ms >= 100);
+    assert_eq!(metadata.occurrences.len(), 3);
+    for (offset, occurrence) in metadata.occurrences.iter().enumerate() {
+        assert_eq!(occurrence.attempt_index, offset as u32 + 1);
+        assert_eq!(
+            occurrence.operation_phase,
+            ProviderAttemptOperationPhase::Completion
+        );
+        assert_eq!(
+            occurrence.actual_api_protocol,
+            ProviderApiProtocol::OpenAiChatCompletions
+        );
+        assert!(occurrence.request_send_to_headers_ms.is_some());
+        assert!(occurrence.queue_duration_ms.is_none());
+        assert!(occurrence.time_to_first_text_delta_ms.is_none());
+    }
+    for occurrence in &metadata.occurrences[..2] {
+        assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+        assert!(occurrence.retry_scheduled);
+        assert!(occurrence.retry_backoff_ms.is_some());
+        assert_eq!(
+            occurrence.error_stage,
+            Some(ProviderErrorStage::ResponseStatus)
+        );
+        assert_eq!(
+            occurrence.diagnostic_code.as_deref(),
+            Some("provider_http_status")
+        );
+        assert!(occurrence.usage.is_none());
+    }
+    let success = &metadata.occurrences[2];
+    assert_eq!(success.terminal_status, ProviderAttemptStatus::Ok);
+    assert!(!success.retry_scheduled);
+    assert!(success.error_category.is_none());
+    assert!(success.usage.is_none());
     assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
 }
 
@@ -4401,7 +4595,71 @@ fn openai_provider_retries_body_transport_failures_only_to_the_attempt_limit() {
     assert_eq!(metadata.attempt_count, 3);
     assert_eq!(metadata.retry_count, 2);
     assert!(metadata.latency_ms >= 100);
+    assert_eq!(metadata.occurrences.len(), 3);
+    for (index, occurrence) in metadata.occurrences.iter().enumerate() {
+        assert_eq!(occurrence.attempt_index, index as u32 + 1);
+        assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+        assert_eq!(
+            occurrence.error_stage,
+            Some(ProviderErrorStage::ResponseBodyRead)
+        );
+        assert_eq!(
+            occurrence.diagnostic_code.as_deref(),
+            Some("provider_response_body_read_failed")
+        );
+        assert_eq!(occurrence.retry_scheduled, index < 2);
+        assert!(occurrence.time_to_first_text_delta_ms.is_none());
+    }
     server.join().expect("join truncated provider");
+}
+
+#[test]
+fn openai_provider_records_each_send_failure_without_headers_or_sensitive_request_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve unused provider address");
+    let address = listener.local_addr().expect("unused provider address");
+    drop(listener);
+    let provider =
+        OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_send_failure",
+        vec![ModelMessage::text(
+            ModelRole::User,
+            "sensitive prompt marker",
+        )],
+    );
+
+    let error = provider
+        .complete(&request, &singularity_core::CancellationToken::new())
+        .expect_err("closed address must fail during send");
+    let metadata = error
+        .provider_attempt_metadata
+        .expect("send failure attempt metadata");
+
+    assert_eq!(metadata.attempt_count, 3);
+    assert_eq!(metadata.retry_count, 2);
+    assert_eq!(metadata.occurrences.len(), 3);
+    for (index, occurrence) in metadata.occurrences.iter().enumerate() {
+        assert_eq!(occurrence.attempt_index, index as u32 + 1);
+        assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+        assert_eq!(occurrence.error_category, Some(ModelErrorCategory::Network));
+        assert_eq!(
+            occurrence.error_stage,
+            Some(ProviderErrorStage::RequestSend)
+        );
+        assert_eq!(
+            occurrence.diagnostic_code.as_deref(),
+            Some("provider_request_send_failed")
+        );
+        assert!(occurrence.request_send_to_headers_ms.is_none());
+        assert!(occurrence.time_to_first_text_delta_ms.is_none());
+        assert!(occurrence.queue_duration_ms.is_none());
+        assert!(occurrence.usage.is_none());
+        assert_eq!(occurrence.retry_scheduled, index < 2);
+    }
+    let serialized = serde_json::to_string(&metadata).expect("serialize aggregate metadata");
+    assert!(!serialized.contains("occurrences"));
+    assert!(!serialized.contains("sensitive prompt marker"));
+    assert!(!serialized.contains("sk-secret-value"));
 }
 
 #[test]
@@ -4428,9 +4686,20 @@ fn openai_provider_cancels_during_retry_backoff() {
         .recv_timeout(Duration::from_millis(500))
         .expect("provider cancellation during backoff was bounded")
         .expect_err("provider request cancelled");
-    let metadata = error.provider_attempt_metadata.expect("attempt metadata");
-
     assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+    let metadata = error
+        .provider_attempt_metadata
+        .expect("cancelled backoff attempt metadata");
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one failed attempt before cancelled backoff expected");
+    };
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+    assert!(occurrence.request_send_to_headers_ms.is_some());
+    assert!(occurrence.retry_scheduled);
+    assert_eq!(
+        occurrence.error_stage,
+        Some(ProviderErrorStage::ResponseStatus)
+    );
     assert_eq!(metadata.attempt_count, 1);
     assert_eq!(metadata.retry_count, 1);
 }
@@ -4513,6 +4782,19 @@ fn openai_provider_cancels_an_inflight_http_request() {
         .expect_err("provider request cancelled");
 
     assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+    let metadata = error
+        .provider_attempt_metadata
+        .expect("cancelled send attempt metadata");
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one cancelled send occurrence expected");
+    };
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Cancelled);
+    assert!(occurrence.request_send_to_headers_ms.is_none());
+    assert_eq!(
+        occurrence.error_category,
+        Some(ModelErrorCategory::Cancelled)
+    );
+    assert_eq!(occurrence.error_stage, Some(ProviderErrorStage::Cancelled));
 }
 
 #[test]
@@ -4697,6 +4979,23 @@ fn openai_provider_rejects_calls_above_the_agent_request_limit() {
         .expect("contract violation attempt metadata");
     assert_eq!(metadata.attempt_count, 1);
     assert_eq!(metadata.retry_count, 0);
+    let [occurrence] = metadata.occurrences.as_slice() else {
+        panic!("one invalid response attempt occurrence expected");
+    };
+    assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
+    assert_eq!(
+        occurrence.error_category,
+        Some(ModelErrorCategory::JsonSchema)
+    );
+    assert_eq!(
+        occurrence.error_stage,
+        Some(ProviderErrorStage::ResponseValidation)
+    );
+    assert_eq!(
+        occurrence.diagnostic_code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert!(occurrence.usage.is_none());
     let error = response.error.expect("contract violation error");
     assert_eq!(error.kind, ModelErrorKind::JsonSchemaViolation);
     assert_eq!(
@@ -4734,8 +5033,13 @@ fn openai_provider_classifies_http_auth_errors_without_body_or_secret_leak() {
         .expect("auth attempt metadata");
     assert_eq!(metadata.attempt_count, 1);
     assert_eq!(metadata.retry_count, 0);
+    assert_eq!(metadata.occurrences.len(), 1);
     assert!(!serialized.contains("bad key"));
     assert!(!serialized.contains("sk-secret-value"));
+    let serialized_metadata = serde_json::to_string(metadata).expect("serialize attempt aggregate");
+    assert!(!serialized_metadata.contains("occurrences"));
+    assert!(!serialized_metadata.contains("openai_compatible"));
+    assert!(!serialized_metadata.contains("gpt-test"));
 }
 
 #[test]
@@ -5114,7 +5418,57 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
         attempt_count: 3,
         retry_count: 2,
         latency_ms: 150,
+        occurrences: Vec::new(),
     };
+    let mut runtime_attempt_metadata = attempt_metadata.clone();
+    runtime_attempt_metadata
+        .occurrences
+        .push(ProviderAttemptOccurrence {
+            operation_phase: ProviderAttemptOperationPhase::Completion,
+            provider_name: "runtime-provider-marker".to_string(),
+            model_name: "runtime-model-marker".to_string(),
+            actual_api_protocol: ProviderApiProtocol::OpenAiResponses,
+            attempt_index: 1,
+            terminal_status: ProviderAttemptStatus::Ok,
+            attempt_duration_ms: 25,
+            request_send_to_headers_ms: Some(10),
+            queue_duration_ms: None,
+            time_to_first_text_delta_ms: Some(15),
+            retry_scheduled: false,
+            retry_backoff_ms: None,
+            error_category: None,
+            error_stage: None,
+            diagnostic_code: None,
+            usage: Some(ModelUsage::default()),
+        });
+    let runtime_wire = serde_json::to_value(&runtime_attempt_metadata)
+        .expect("serialize runtime attempt metadata");
+    assert_eq!(
+        runtime_wire,
+        serde_json::json!({
+            "attempt_count": 3,
+            "retry_count": 2,
+            "latency_ms": 150
+        })
+    );
+    let restored_runtime: ProviderAttemptMetadata =
+        serde_json::from_value(runtime_wire).expect("deserialize aggregate attempt metadata");
+    assert_eq!(restored_runtime, attempt_metadata);
+    let attempt_schema = schema_for!(ProviderAttemptMetadata);
+    assert!(
+        !attempt_schema
+            .schema
+            .object
+            .as_ref()
+            .expect("attempt metadata object schema")
+            .properties
+            .contains_key("occurrences")
+    );
+    assert!(
+        !attempt_schema
+            .definitions
+            .contains_key("ProviderAttemptOccurrence")
+    );
     let restored_schema: ModelToolSchema =
         serde_json::from_value(serde_json::to_value(&tool_schema).unwrap()).unwrap();
     let restored_config: ModelProviderConfig =
