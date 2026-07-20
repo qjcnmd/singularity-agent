@@ -1,0 +1,701 @@
+//! provider HTTP transport、retry、bounded body read 和取消传播。
+
+use super::capability::{
+    BoundProviderProtocolNegotiation, InMemoryProviderCapabilityCacheState,
+    ProviderCapabilityCache, capability_probe_deadline_error, is_stable_capability_rejection,
+};
+use super::contract::{
+    attach_capability_metadata, provider_request_validation_error, request_uses_tool_protocol,
+};
+use super::openai::{
+    OpenAiCompletion, openai_reasoning_content_present, openai_request_payload,
+    openai_responses_reasoning_content_present, openai_responses_request_payload,
+    parse_openai_response, parse_openai_responses_response,
+};
+use super::*;
+
+impl OpenAiProvider {
+    /// 创建并校验 OpenAI-compatible provider。
+    pub fn new(config: OpenAiProviderConfig) -> Result<Self, ProviderError> {
+        Self::new_with_request_timeout(config, PROVIDER_TIMEOUT_SECONDS)
+    }
+
+    /// 创建 provider，并显式绑定可选的持久 capability cache 文件。
+    pub fn new_with_cache_path(
+        config: OpenAiProviderConfig,
+        cache_path: Option<PathBuf>,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_request_timeout_and_cache_path(config, PROVIDER_TIMEOUT_SECONDS, cache_path)
+    }
+
+    pub(super) fn new_with_request_timeout(
+        config: OpenAiProviderConfig,
+        request_timeout_seconds: u64,
+    ) -> Result<Self, ProviderError> {
+        Self::new_with_request_timeout_and_cache_path(config, request_timeout_seconds, None)
+    }
+
+    pub(super) fn new_with_request_timeout_and_cache_path(
+        config: OpenAiProviderConfig,
+        request_timeout_seconds: u64,
+        cache_path: Option<PathBuf>,
+    ) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(request_timeout_seconds))
+            .build()
+            .map_err(provider_client_initialization_error)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(PROVIDER_RUNTIME_WORKER_THREADS)
+            .enable_all()
+            .build()
+            .map_err(provider_runtime_error)?;
+        Ok(Self {
+            config,
+            client,
+            runtime: Arc::new(runtime),
+            request_timeout_seconds,
+            capability_probe_deadline: Duration::from_secs(CAPABILITY_PROBE_DEADLINE_SECONDS),
+            tool_capability_cache: Arc::new(
+                Mutex::new(InMemoryProviderCapabilityCacheState::new()),
+            ),
+            tool_capability_probe_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            persistent_capability_cache: cache_path
+                .and_then(ProviderCapabilityCache::new)
+                .map(Arc::new),
+            capability_cache_diagnostic: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// 从环境加载 OpenAI-compatible provider。
+    pub fn from_env<F>(get_env: F) -> Result<Self, ProviderError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        Self::new(OpenAiProviderConfig::from_env(get_env)?)
+    }
+}
+
+impl OpenAiProvider {
+    pub(super) fn complete_with_contract(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        capabilities: &ProviderProtocolContract,
+        api_protocol: ProviderApiProtocol,
+        model_name: &str,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        let completion = self.complete_with_contract_details(
+            request,
+            cancellation,
+            capabilities,
+            api_protocol,
+            model_name,
+        )?;
+        if request_uses_tool_protocol(request) && completion.reasoning_content_present {
+            return Err(provider_tool_reasoning_history_error(
+                &completion.response,
+                capabilities.tool_reasoning_mode,
+            ));
+        }
+        Ok(completion.response)
+    }
+
+    pub(super) fn complete_with_contract_details(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        capabilities: &ProviderProtocolContract,
+        api_protocol: ProviderApiProtocol,
+        model_name: &str,
+    ) -> Result<OpenAiCompletion, ProviderError> {
+        self.complete_with_contract_details_until(
+            request,
+            cancellation,
+            capabilities,
+            api_protocol,
+            model_name,
+            None,
+        )
+    }
+
+    pub(super) fn complete_with_contract_details_until(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        capabilities: &ProviderProtocolContract,
+        api_protocol: ProviderApiProtocol,
+        model_name: &str,
+        probe_deadline: Option<Instant>,
+    ) -> Result<OpenAiCompletion, ProviderError> {
+        let runtime = self.runtime.as_ref();
+        let started_at = Instant::now();
+        let mut metadata = ProviderAttemptMetadata::zero();
+        let endpoint = match api_protocol {
+            ProviderApiProtocol::OpenAiResponses => responses_endpoint(&self.config.base_url),
+            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                self.config.endpoint()
+            }
+        };
+        let request_payload = match api_protocol {
+            ProviderApiProtocol::OpenAiResponses => {
+                openai_responses_request_payload(request, model_name, capabilities)
+            }
+            ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                openai_request_payload(request, model_name, capabilities)
+            }
+        };
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(provider_cancelled_error().with_provider_attempt_metadata(
+                    provider_attempt_metadata(&metadata, started_at),
+                ));
+            }
+            metadata.attempt_count += 1;
+            let response =
+                match block_on_provider_future(
+                    runtime,
+                    cancellation,
+                    "provider_request_send_failed",
+                    ProviderErrorStage::RequestSend,
+                    self.request_timeout_seconds,
+                    probe_deadline,
+                    || {
+                        self.client
+                            .post(&endpoint)
+                            .bearer_auth(&self.config.api_key)
+                            .json(&request_payload)
+                            .send()
+                    },
+                ) {
+                    Ok(response) => response,
+                    Err(error)
+                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                            && provider_error_is_retryable(&error) =>
+                    {
+                        metadata.retry_count += 1;
+                        wait_provider_backoff(
+                            runtime,
+                            cancellation,
+                            provider_retry_backoff(metadata.retry_count),
+                            probe_deadline,
+                        )
+                        .map_err(|cancelled| {
+                            cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
+                                &metadata, started_at,
+                            ))
+                        })?;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error.with_provider_attempt_metadata(
+                            provider_attempt_metadata(&metadata, started_at),
+                        ));
+                    }
+                };
+            let status = response.status();
+            if !status.is_success() {
+                let error = ProviderError::from_model_error(model_error_from_http_status(
+                    status.as_u16(),
+                    &self.config.provider_name,
+                    model_name,
+                ));
+                if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                    && http_status_is_retryable(status.as_u16())
+                {
+                    metadata.retry_count += 1;
+                    wait_provider_backoff(
+                        runtime,
+                        cancellation,
+                        provider_retry_backoff(metadata.retry_count),
+                        probe_deadline,
+                    )
+                    .map_err(|cancelled| {
+                        cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
+                            &metadata, started_at,
+                        ))
+                    })?;
+                    continue;
+                }
+                return Err(
+                    error.with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    )),
+                );
+            }
+            let body =
+                match read_bounded_provider_response_body(
+                    runtime,
+                    cancellation,
+                    self.request_timeout_seconds,
+                    probe_deadline,
+                    response,
+                ) {
+                    Ok(body) => body,
+                    Err(error)
+                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                            && provider_error_is_retryable(&error) =>
+                    {
+                        metadata.retry_count += 1;
+                        wait_provider_backoff(
+                            runtime,
+                            cancellation,
+                            provider_retry_backoff(metadata.retry_count),
+                            probe_deadline,
+                        )
+                        .map_err(|cancelled| {
+                            cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
+                                &metadata, started_at,
+                            ))
+                        })?;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error.with_provider_attempt_metadata(
+                            provider_attempt_metadata(&metadata, started_at),
+                        ));
+                    }
+                };
+            let payload = serde_json::from_slice::<Value>(&body).map_err(|_| {
+                ProviderError::from_model_error(provider_response_json_error())
+                    .with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    ))
+            })?;
+            let reasoning_content_present = match api_protocol {
+                ProviderApiProtocol::OpenAiResponses => {
+                    openai_responses_reasoning_content_present(&payload)
+                }
+                ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                    openai_reasoning_content_present(&payload)
+                }
+            };
+            let parsed = match api_protocol {
+                ProviderApiProtocol::OpenAiResponses => parse_openai_responses_response(
+                    request,
+                    &self.config,
+                    payload,
+                    capabilities,
+                    model_name,
+                ),
+                ProviderApiProtocol::Declared | ProviderApiProtocol::OpenAiChatCompletions => {
+                    parse_openai_response(request, &self.config, payload, capabilities, model_name)
+                }
+            };
+            return parsed
+                .map(|mut response| {
+                    response.provider_attempt_metadata =
+                        Some(provider_attempt_metadata(&metadata, started_at));
+                    OpenAiCompletion {
+                        response,
+                        reasoning_content_present,
+                    }
+                })
+                .map_err(|error| {
+                    error.with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    ))
+                });
+        }
+    }
+}
+
+impl Provider for OpenAiProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.config.protocol_contract()
+    }
+
+    fn negotiate_tool_capabilities(
+        &self,
+        model_preferences: &ModelPreferences,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        self.negotiate_openai_tool_capabilities(
+            model_preferences
+                .model_name
+                .as_deref()
+                .unwrap_or(&self.config.model_name),
+            cancellation,
+        )
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error()
+                .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
+        }
+        let local_validation = validate_model_request(request);
+        if !local_validation.valid {
+            return Err(provider_request_validation_error(
+                local_validation,
+                &self.config,
+            ));
+        }
+        let mut capability_binding: Option<BoundProviderProtocolNegotiation> = None;
+        let (capabilities, capability_metadata, api_protocol) =
+            if !request_uses_tool_protocol(request) {
+                (
+                    self.protocol_contract(),
+                    None,
+                    self.config.completion_protocol_without_tools(),
+                )
+            } else {
+                let effective_model_name = request
+                    .model_preferences
+                    .model_name
+                    .as_deref()
+                    .unwrap_or(&self.config.model_name);
+                let binding = self
+                    .negotiate_openai_tool_capabilities_bound(effective_model_name, cancellation)?;
+                let api_protocol = binding.negotiation.metadata.api_protocol;
+                capability_binding = Some(binding.clone());
+                (
+                    binding.negotiation.contract,
+                    Some(binding.negotiation.metadata),
+                    api_protocol,
+                )
+            };
+        let request_validation =
+            validate_model_request_with_capabilities(request, Some(&capabilities));
+        if !request_validation.valid {
+            let provider_error =
+                provider_request_validation_error(request_validation, &self.config);
+            return Err(attach_capability_metadata(
+                provider_error,
+                &capability_metadata,
+            ));
+        }
+        let effective_model_name = request
+            .model_preferences
+            .model_name
+            .as_deref()
+            .unwrap_or(&self.config.model_name);
+        let cache_invalidation_deadline =
+            Instant::now() + Duration::from_secs(self.request_timeout_seconds);
+        let result = self.complete_with_contract(
+            request,
+            cancellation,
+            &capabilities,
+            api_protocol,
+            effective_model_name,
+        );
+        let result = if let (Some(binding), Err(error)) = (&capability_binding, &result)
+            && is_stable_capability_rejection(error)
+        {
+            match self.invalidate_tool_capability_negotiation(
+                &binding.key,
+                cancellation,
+                cache_invalidation_deadline,
+            ) {
+                Ok(()) => result,
+                Err(invalidation_error) => result.map_err(|mut original| {
+                    original.error.validation_errors.push(
+                        invalidation_error.error.code.unwrap_or_else(|| {
+                            "provider_capability_cache_invalidation_failed".to_string()
+                        }),
+                    );
+                    original
+                }),
+            }
+        } else {
+            result
+        };
+        result.map_err(|error| attach_capability_metadata(error, &capability_metadata))
+    }
+}
+
+pub(super) fn add_provider_attempt_metadata(
+    total: &mut ProviderAttemptMetadata,
+    metadata: &ProviderAttemptMetadata,
+) {
+    total.attempt_count = total.attempt_count.saturating_add(metadata.attempt_count);
+    total.retry_count = total.retry_count.saturating_add(metadata.retry_count);
+    total.latency_ms = total.latency_ms.saturating_add(metadata.latency_ms);
+}
+
+pub(super) fn model_error_from_http_status(
+    status: u16,
+    provider_name: &str,
+    model_name: &str,
+) -> ModelError {
+    let kind = match status {
+        HTTP_STATUS_UNAUTHORIZED | HTTP_STATUS_FORBIDDEN => ModelErrorKind::AuthError,
+        HTTP_STATUS_REQUEST_TIMEOUT => ModelErrorKind::Timeout,
+        HTTP_STATUS_NOT_FOUND => ModelErrorKind::InvalidRequest,
+        HTTP_STATUS_RATE_LIMITED => ModelErrorKind::RateLimited,
+        status if status >= HTTP_STATUS_INTERNAL_SERVER_ERROR => ModelErrorKind::ProviderOverloaded,
+        _ => ModelErrorKind::UnknownProviderError,
+    };
+    let message = format!("Provider returned HTTP {status}.");
+    let mut error = ModelError::new(kind, message)
+        .with_provider(provider_name.to_string())
+        .with_model(model_name.to_string())
+        .with_provider_diagnostic("provider_http_status", ProviderErrorStage::ResponseStatus);
+    error.http_status = Some(status);
+    error
+}
+
+pub(super) fn provider_transport_error(
+    error: reqwest::Error,
+    code: &'static str,
+    stage: ProviderErrorStage,
+    request_timeout_seconds: Option<u64>,
+) -> ProviderError {
+    let kind = if error.is_timeout() {
+        ModelErrorKind::Timeout
+    } else {
+        ModelErrorKind::NetworkError
+    };
+    let category = if error.is_timeout() {
+        ProviderTransportCategory::Timeout
+    } else if error.is_connect() {
+        ProviderTransportCategory::Connect
+    } else if error.is_request() {
+        ProviderTransportCategory::Request
+    } else if error.is_body() {
+        ProviderTransportCategory::BodyRead
+    } else {
+        ProviderTransportCategory::Unknown
+    };
+    let mut model_error =
+        ModelError::new(kind, "provider transport failed").with_provider_diagnostic(code, stage);
+    model_error.transport_category = Some(category);
+    if error.is_timeout() {
+        model_error.timeout_seconds = request_timeout_seconds;
+    }
+    ProviderError::from_model_error(model_error)
+}
+
+pub(super) fn provider_runtime_error(_error: std::io::Error) -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnknownProviderError,
+            "provider runtime initialization failed",
+        )
+        .with_provider_diagnostic(
+            PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
+            ProviderErrorStage::ClientInitialization,
+        ),
+    )
+}
+
+pub(super) fn provider_client_initialization_error(error: reqwest::Error) -> ProviderError {
+    provider_transport_error(
+        error,
+        "provider_client_initialization_failed",
+        ProviderErrorStage::ClientInitialization,
+        None,
+    )
+}
+
+pub(super) fn provider_cancelled_error() -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(ModelErrorKind::Cancelled, "provider request cancelled")
+            .with_provider_diagnostic("provider_request_cancelled", ProviderErrorStage::Cancelled),
+    )
+}
+
+pub(super) fn provider_tool_reasoning_history_error(
+    response: &ModelTurnResponse,
+    mode: ProviderToolReasoningMode,
+) -> ProviderError {
+    let (code, evidence) = if mode == ProviderToolReasoningMode::DisabledForToolCalls {
+        (
+            "provider_tool_reasoning_mode_not_honored",
+            "tool_reasoning_disable_not_honored",
+        )
+    } else {
+        (
+            "provider_tool_reasoning_history_unsupported",
+            "tool_reasoning_content_requires_adapter_history_support",
+        )
+    };
+    let mut error = ModelError::new(
+        ModelErrorKind::UnsupportedCapability,
+        "provider returned tool reasoning that cannot be safely replayed",
+    )
+    .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
+    error.validation_errors.push(evidence.to_string());
+    let provider_error = ProviderError::from_model_error(error);
+    if let Some(metadata) = &response.provider_attempt_metadata {
+        provider_error.with_provider_attempt_metadata(metadata.clone())
+    } else {
+        provider_error
+    }
+}
+
+pub(super) fn provider_attempt_metadata(
+    metadata: &ProviderAttemptMetadata,
+    started_at: Instant,
+) -> ProviderAttemptMetadata {
+    ProviderAttemptMetadata {
+        attempt_count: metadata.attempt_count,
+        retry_count: metadata.retry_count,
+        latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+pub(super) fn provider_error_is_retryable(error: &ProviderError) -> bool {
+    matches!(
+        error.error.kind,
+        ModelErrorKind::NetworkError | ModelErrorKind::Timeout
+    ) && !matches!(
+        error.error.transport_category,
+        Some(ProviderTransportCategory::Request)
+    )
+}
+
+pub(super) fn http_status_is_retryable(status: u16) -> bool {
+    status == HTTP_STATUS_RATE_LIMITED || status >= HTTP_STATUS_INTERNAL_SERVER_ERROR
+}
+
+pub(super) fn provider_retry_backoff(retry_count: u32) -> Duration {
+    let shift = retry_count.saturating_sub(1).min(10);
+    let multiplier = 1_u64 << shift;
+    Duration::from_millis(PROVIDER_RETRY_BASE_BACKOFF_MS.saturating_mul(multiplier))
+}
+
+pub(super) fn wait_provider_backoff(
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &CancellationToken,
+    duration: Duration,
+    probe_deadline: Option<Instant>,
+) -> Result<(), ProviderError> {
+    let deadline = Instant::now() + duration;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error());
+        }
+        if probe_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(capability_probe_deadline_error());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let poll = probe_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(remaining)
+            .min(remaining)
+            .min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
+        if poll.is_zero() {
+            return Err(capability_probe_deadline_error());
+        }
+        runtime.block_on(async {
+            tokio::time::sleep(poll).await;
+        });
+    }
+}
+
+pub(super) fn block_on_provider_future<C, F, T>(
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &CancellationToken,
+    error_code: &'static str,
+    error_stage: ProviderErrorStage,
+    request_timeout_seconds: u64,
+    probe_deadline: Option<Instant>,
+    create_future: C,
+) -> Result<T, ProviderError>
+where
+    C: FnOnce() -> F,
+    F: Future<Output = Result<T, reqwest::Error>>,
+{
+    let mut future = {
+        let _runtime_context = runtime.enter();
+        Box::pin(create_future())
+    };
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error());
+        }
+        if probe_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(capability_probe_deadline_error());
+        }
+        let poll = probe_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|| Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS))
+            .min(Duration::from_millis(PROVIDER_CANCELLATION_POLL_MS));
+        if poll.is_zero() {
+            return Err(capability_probe_deadline_error());
+        }
+        match runtime.block_on(async { tokio::time::timeout(poll, future.as_mut()).await }) {
+            Ok(result) => {
+                return result.map_err(|error| {
+                    provider_transport_error(
+                        error,
+                        error_code,
+                        error_stage.clone(),
+                        Some(request_timeout_seconds),
+                    )
+                });
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
+pub(super) fn read_bounded_provider_response_body(
+    runtime: &tokio::runtime::Runtime,
+    cancellation: &CancellationToken,
+    request_timeout_seconds: u64,
+    probe_deadline: Option<Instant>,
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, ProviderError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(provider_response_body_too_large_error());
+    }
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(MAX_PROVIDER_RESPONSE_BODY_BYTES);
+    let mut body = Vec::with_capacity(initial_capacity);
+    loop {
+        let chunk = block_on_provider_future(
+            runtime,
+            cancellation,
+            "provider_response_body_read_failed",
+            ProviderErrorStage::ResponseBodyRead,
+            request_timeout_seconds,
+            probe_deadline,
+            || response.chunk(),
+        )?;
+        let Some(chunk) = chunk else {
+            return Ok(body);
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BODY_BYTES {
+            return Err(provider_response_body_too_large_error());
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
+pub(super) fn provider_response_body_too_large_error() -> ProviderError {
+    let mut error = ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider response body exceeded the fixed safety limit",
+    )
+    .with_provider_diagnostic(
+        "provider_response_body_too_large",
+        ProviderErrorStage::ResponseBodyRead,
+    );
+    error.validation_errors = vec!["provider_response_body_too_large".to_string()];
+    ProviderError::from_model_error(error)
+}
+
+pub(super) fn provider_response_json_error() -> ModelError {
+    ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider response was not valid JSON",
+    )
+    .with_provider_diagnostic(
+        "provider_response_json_decode_failed",
+        ProviderErrorStage::ResponseJsonDecode,
+    )
+}
