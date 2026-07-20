@@ -166,7 +166,7 @@ method_registry! {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
-/// JSON-RPC request id；公共合同允许字符串、合法整数或 null。
+/// JSON-RPC id；请求仅允许字符串或合法整数，无法关联的错误响应使用 null。
 pub enum JsonRpcId {
     String(String),
     Number(i64),
