@@ -1273,9 +1273,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.18",
  "time",
- "uuid",
 ]
 
 [[package]]
@@ -1331,6 +1329,7 @@ name = "singularity_sandbox"
 version = "0.1.0"
 dependencies = [
  "dunce",
+ "libc",
  "schemars",
  "serde",
  "serde_json",
