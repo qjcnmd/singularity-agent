@@ -8,10 +8,10 @@ use singularity_model::{
     ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityProfile,
     ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
-    ProviderProtocolContract, ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy,
-    chat_completions_endpoint, classify_model_error, resolve_provider_config, responses_endpoint,
-    validate_model_request, validate_model_request_with_capabilities, validate_model_response,
-    validate_model_turn_response, validate_provider_config,
+    ProviderProtocolContract, ProviderStreamEvent, ProviderToolReasoningMode, ToolChoiceMode,
+    ToolChoicePolicy, chat_completions_endpoint, classify_model_error, resolve_provider_config,
+    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
+    validate_model_response, validate_model_turn_response, validate_provider_config,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -196,6 +196,43 @@ fn responses_provider_server(
         }
     });
     (format!("http://{addr}"), rx)
+}
+
+fn responses_stream_server(
+    chunks: Vec<Vec<u8>>,
+    declared_length: Option<usize>,
+) -> (String, Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Responses stream provider");
+    let addr = listener
+        .local_addr()
+        .expect("Responses stream provider address");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept Responses stream request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let (first_line, headers, request_body) = read_provider_request(&mut reader);
+        assert!(first_line.contains("/v1/responses"));
+        assert!(headers.contains("authorization: Bearer sk-secret-value"));
+        tx.send(request_body)
+            .expect("send Responses stream request");
+        let length = declared_length
+            .map(|length| format!("content-length: {length}\r\n"))
+            .unwrap_or_default();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n{length}\r\n"
+        )
+        .expect("write Responses stream headers");
+        stream.flush().expect("flush Responses stream headers");
+        for chunk in chunks {
+            stream
+                .write_all(&chunk)
+                .expect("write Responses stream chunk");
+            stream.flush().expect("flush Responses stream chunk");
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    (format!("http://{addr}/v1/responses"), rx)
 }
 
 fn finalization_protocol_server() -> (String, Receiver<Vec<(String, String)>>) {
@@ -1748,6 +1785,419 @@ fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
     assert_eq!(actual["tools"][0]["strict"], false);
     assert_eq!(actual["tool_choice"], "auto");
     assert_eq!(actual["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn openai_responses_stream_aggregates_deltas_and_requires_completed_envelope() {
+    let delta_one = serde_json::json!({
+        "type": "response.output_text.delta",
+        "delta": "hel"
+    });
+    let delta_two = serde_json::json!({
+        "type": "response.output_text.delta",
+        "delta": "lo"
+    });
+    let completed = serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response_stream_1",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}]
+            }],
+            "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+        }
+    });
+    let body = format!(
+        "event: response.output_text.delta\r\ndata: {delta_one}\r\n\r\nevent: response.output_text.delta\r\ndata: {delta_two}\r\n\r\nevent: response.completed\r\ndata: {completed}\r\n\r\n"
+    );
+    let chunks = body
+        .as_bytes()
+        .chunks(3)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let (base_url, requests) = responses_stream_server(chunks, None);
+    let provider = OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_stream_1",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let cancellation = singularity_core::CancellationToken::new();
+    let mut events = Vec::new();
+    let response = provider
+        .complete_stream(&request, &cancellation, &mut |event| events.push(event))
+        .expect("Responses stream completion");
+
+    assert_eq!(
+        events,
+        vec![
+            ProviderStreamEvent::OutputTextDelta {
+                delta: "hel".to_string()
+            },
+            ProviderStreamEvent::OutputTextDelta {
+                delta: "lo".to_string()
+            }
+        ]
+    );
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(
+        response
+            .assistant_message
+            .as_ref()
+            .map(|message| message.content.as_str()),
+        Some("hello")
+    );
+    let payload: serde_json::Value = serde_json::from_str(
+        &requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stream request"),
+    )
+    .expect("stream request JSON");
+    assert_eq!(payload["stream"], true);
+    assert_eq!(payload["store"], false);
+}
+
+#[test]
+fn openai_responses_stream_maps_terminal_failures_and_protocol_failures() {
+    let cases = [
+        (
+            "error",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"secret raw failure\"}}\n\n",
+            "responses_stream_error",
+        ),
+        (
+            "failed",
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+            "responses_stream_failed",
+        ),
+        (
+            "incomplete",
+            "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
+            "responses_stream_incomplete",
+        ),
+        (
+            "missing_terminal",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "responses_stream_terminal_missing",
+        ),
+        (
+            "malformed",
+            "event: response.output_text.delta\ndata: {not-json}\n\n",
+            "responses_stream_malformed",
+        ),
+    ];
+    for (name, body, expected_code) in cases {
+        let chunks = body
+            .as_bytes()
+            .chunks(2)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let (base_url, requests) = responses_stream_server(chunks, None);
+        let provider =
+            OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+        let request = ModelTurnRequest::new(
+            format!("request_stream_{name}"),
+            vec![ModelMessage::text(ModelRole::User, "hello")],
+        );
+        let error = provider
+            .complete_stream(
+                &request,
+                &singularity_core::CancellationToken::new(),
+                &mut |_| {},
+            )
+            .expect_err("stream must fail closed");
+        assert_eq!(error.error.code.as_deref(), Some(expected_code), "{name}");
+        assert!(!error.error.message.contains("secret raw failure"));
+        requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stream request was sent");
+    }
+}
+
+#[test]
+fn openai_responses_stream_rejects_oversized_body_and_ignores_tool_argument_deltas() {
+    let body = format!("data: {}\n\n", "x".repeat(8 * 1024 * 1024 + 1));
+    let chunks = body
+        .as_bytes()
+        .chunks(64 * 1024)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let (base_url, requests) = responses_stream_server(chunks, None);
+    let provider = OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_stream_oversized",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let error = provider
+        .complete_stream(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
+        .expect_err("oversized stream must fail closed");
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_response_stream_too_large")
+    );
+    requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("oversized stream request");
+
+    let completed = serde_json::json!({
+        "type": "response.completed",
+        "response": {
+            "id": "response_tool_stream",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_read",
+                "name": "read",
+                "arguments": "{\"path\":\"README.md\"}"
+            }]
+        }
+    });
+    let tool_body = format!(
+        "event: response.function_call_arguments.delta\ndata: {{\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{{\\\"path\\\":\\\"README.md\\\"}}\"}}\n\nevent: response.completed\ndata: {completed}\n\n"
+    );
+    let chunks = tool_body
+        .as_bytes()
+        .chunks(5)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let (base_url, requests) = responses_stream_server(chunks, None);
+    let provider = OpenAiProvider::new(provider_config_with_base_url(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_tool_stream",
+        vec![ModelMessage::text(ModelRole::User, "call read")],
+    );
+    let mut events = Vec::new();
+    let response = provider
+        .complete_stream(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .expect("final function call envelope");
+    assert!(events.is_empty());
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].tool_name, "read");
+    assert_eq!(
+        response.tool_calls[0].raw_arguments,
+        r#"{"path":"README.md"}"#
+    );
+    requests
+        .recv_timeout(Duration::from_secs(1))
+        .expect("tool stream request");
+}
+
+#[test]
+fn openai_chat_streaming_is_explicitly_unsupported() {
+    let provider = OpenAiProvider::new(provider_config_with_base_url(
+        "http://127.0.0.1:1/v1/chat/completions".to_string(),
+    ))
+    .expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_chat_stream",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let error = provider
+        .complete_stream(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |_| {},
+        )
+        .expect_err("Chat streaming must be unsupported");
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_streaming_unsupported")
+    );
+}
+
+#[test]
+fn openai_responses_stream_retries_before_but_not_after_first_text_delta() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stream retry provider");
+    let address = listener
+        .local_addr()
+        .expect("stream retry provider address");
+    let server = thread::spawn(move || {
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept stream retry request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            read_provider_request(&mut reader);
+            if attempt == 0 {
+                let body = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len() + 16,
+                    body
+                )
+                .expect("write truncated stream retry body");
+            } else {
+                let delta = serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "done"
+                });
+                let completed = serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response_retry",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "done"}]
+                        }]
+                    }
+                });
+                let body = format!(
+                    "event: response.output_text.delta\ndata: {delta}\n\nevent: response.completed\ndata: {completed}\n\n"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{body}"
+                )
+                .expect("write successful stream retry body");
+            }
+        }
+    });
+    let provider = OpenAiProvider::new(provider_config_with_base_url(format!(
+        "http://{address}/v1/responses"
+    )))
+    .expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_stream_retry_before_delta",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let mut events = Vec::new();
+    let response = provider
+        .complete_stream(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .expect("retry before delta");
+    let metadata = response
+        .provider_attempt_metadata
+        .expect("stream retry metadata");
+    assert_eq!(metadata.attempt_count, 2);
+    assert_eq!(metadata.retry_count, 1);
+    assert_eq!(events.len(), 1);
+    server.join().expect("join stream retry server");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stream no-retry provider");
+    let address = listener
+        .local_addr()
+        .expect("stream no-retry provider address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept stream no-retry request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        read_provider_request(&mut reader);
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "partial"
+        });
+        let body = format!("event: response.output_text.delta\ndata: {delta}\n\n");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len() + 16
+        )
+        .expect("write truncated post-delta body");
+    });
+    let provider = OpenAiProvider::new(provider_config_with_base_url(format!(
+        "http://{address}/v1/responses"
+    )))
+    .expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_stream_no_retry_after_delta",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let mut events = Vec::new();
+    let error = provider
+        .complete_stream(
+            &request,
+            &singularity_core::CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .expect_err("post-delta body failure");
+    let metadata = error
+        .provider_attempt_metadata
+        .expect("post-delta metadata");
+    assert_eq!(
+        error.error.stage,
+        Some(ProviderErrorStage::ResponseBodyRead)
+    );
+    assert_eq!(metadata.attempt_count, 1);
+    assert_eq!(metadata.retry_count, 0);
+    assert_eq!(events.len(), 1);
+    server.join().expect("join stream no-retry server");
+}
+
+#[test]
+fn openai_responses_stream_cancellation_reaches_inflight_body_read() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stream cancellation provider");
+    let address = listener
+        .local_addr()
+        .expect("stream cancellation provider address");
+    let (started_tx, started_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept stream cancellation request");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        read_provider_request(&mut reader);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+        )
+        .expect("write stream cancellation headers");
+        stream.flush().expect("flush stream cancellation headers");
+        started_tx
+            .send(())
+            .expect("signal stream cancellation start");
+        thread::sleep(Duration::from_millis(500));
+    });
+    let provider = OpenAiProvider::new(provider_config_with_base_url(format!(
+        "http://{address}/v1/responses"
+    )))
+    .expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_stream_cancel",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let cancellation = singularity_core::CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        result_tx
+            .send(provider.complete_stream(&request, &worker_cancellation, &mut |_| {}))
+            .expect("send cancellation result");
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("stream request started");
+    cancellation.cancel();
+    let error = result_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("stream cancellation was bounded")
+        .expect_err("stream cancellation");
+    assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+    assert_eq!(
+        error
+            .provider_attempt_metadata
+            .expect("cancel metadata")
+            .attempt_count,
+        1
+    );
+    worker.join().expect("join stream cancellation worker");
+    server.join().expect("join stream cancellation server");
 }
 
 #[test]

@@ -10,9 +10,24 @@ use super::contract::{
 use super::openai::{
     OpenAiCompletion, openai_reasoning_content_present, openai_request_payload,
     openai_responses_reasoning_content_present, openai_responses_request_payload,
-    parse_openai_response, parse_openai_responses_response,
+    openai_responses_stream_request_payload, parse_openai_response,
+    parse_openai_responses_response,
 };
 use super::*;
+
+/// The single validated protocol choice shared by one provider completion.
+struct CompletionContext {
+    capabilities: ProviderProtocolContract,
+    capability_metadata: Option<ProviderCapabilityMetadata>,
+    api_protocol: ProviderApiProtocol,
+    capability_binding: Option<BoundProviderProtocolNegotiation>,
+}
+
+/// A stream attempt error plus whether retrying could duplicate visible text.
+struct StreamAttemptFailure {
+    error: ProviderError,
+    emitted_text_delta: bool,
+}
 
 impl OpenAiProvider {
     /// 创建并校验 OpenAI-compatible provider。
@@ -117,6 +132,94 @@ impl OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    /// Validate the request and resolve the already-negotiated OpenAI protocol.
+    fn prepare_completion_context(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<CompletionContext, ProviderError> {
+        let local_validation = validate_model_request(request);
+        if !local_validation.valid {
+            return Err(provider_request_validation_error(
+                local_validation,
+                &self.config,
+            ));
+        }
+        let mut capability_binding = None;
+        let (capabilities, capability_metadata, api_protocol) =
+            if !request_uses_tool_protocol(request) {
+                (
+                    self.protocol_contract(),
+                    None,
+                    self.config.completion_protocol_without_tools(),
+                )
+            } else {
+                let effective_model_name = request
+                    .model_preferences
+                    .model_name
+                    .as_deref()
+                    .unwrap_or(&self.config.model_name);
+                let binding = self
+                    .negotiate_openai_tool_capabilities_bound(effective_model_name, cancellation)?;
+                let api_protocol = binding.negotiation.metadata.api_protocol;
+                capability_binding = Some(binding.clone());
+                (
+                    binding.negotiation.contract,
+                    Some(binding.negotiation.metadata),
+                    api_protocol,
+                )
+            };
+        let request_validation =
+            validate_model_request_with_capabilities(request, Some(&capabilities));
+        if !request_validation.valid {
+            let provider_error =
+                provider_request_validation_error(request_validation, &self.config);
+            return Err(attach_capability_metadata(
+                provider_error,
+                &capability_metadata,
+            ));
+        }
+        Ok(CompletionContext {
+            capabilities,
+            capability_metadata,
+            api_protocol,
+            capability_binding,
+        })
+    }
+
+    /// Apply capability-cache invalidation and attach safe negotiation metadata once.
+    fn finish_completion_result<T>(
+        &self,
+        result: Result<T, ProviderError>,
+        cancellation: &CancellationToken,
+        context: &CompletionContext,
+    ) -> Result<T, ProviderError> {
+        let cache_invalidation_deadline =
+            Instant::now() + Duration::from_secs(self.request_timeout_seconds);
+        let result = if let (Some(binding), Err(error)) = (&context.capability_binding, &result)
+            && is_stable_capability_rejection(error)
+        {
+            match self.invalidate_tool_capability_negotiation(
+                &binding.key,
+                cancellation,
+                cache_invalidation_deadline,
+            ) {
+                Ok(()) => result,
+                Err(invalidation_error) => result.map_err(|mut original| {
+                    original.error.validation_errors.push(
+                        invalidation_error.error.code.unwrap_or_else(|| {
+                            "provider_capability_cache_invalidation_failed".to_string()
+                        }),
+                    );
+                    original
+                }),
+            }
+        } else {
+            result
+        };
+        result.map_err(|error| attach_capability_metadata(error, &context.capability_metadata))
+    }
+
     pub(super) fn complete_with_contract(
         &self,
         request: &ModelTurnRequest,
@@ -139,6 +242,145 @@ impl OpenAiProvider {
             ));
         }
         Ok(completion.response)
+    }
+
+    /// Execute a bounded Responses SSE attempt sequence without exposing raw events.
+    fn complete_responses_stream(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        capabilities: &ProviderProtocolContract,
+        model_name: &str,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<OpenAiCompletion, ProviderError> {
+        let runtime = self.runtime.as_ref();
+        let started_at = Instant::now();
+        let mut metadata = ProviderAttemptMetadata::zero();
+        let endpoint = responses_endpoint(&self.config.base_url);
+        let request_payload =
+            openai_responses_stream_request_payload(request, model_name, capabilities);
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(provider_cancelled_error().with_provider_attempt_metadata(
+                    provider_attempt_metadata(&metadata, started_at),
+                ));
+            }
+            metadata.attempt_count += 1;
+            let response =
+                match block_on_provider_future(
+                    runtime,
+                    cancellation,
+                    "provider_request_send_failed",
+                    ProviderErrorStage::RequestSend,
+                    self.request_timeout_seconds,
+                    None,
+                    || {
+                        self.client
+                            .post(&endpoint)
+                            .bearer_auth(&self.config.api_key)
+                            .json(&request_payload)
+                            .send()
+                    },
+                ) {
+                    Ok(response) => response,
+                    Err(error)
+                        if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                            && provider_error_is_retryable(&error) =>
+                    {
+                        metadata.retry_count += 1;
+                        wait_stream_retry_backoff(
+                            runtime,
+                            cancellation,
+                            provider_retry_backoff(metadata.retry_count),
+                            &metadata,
+                            started_at,
+                        )?;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error.with_provider_attempt_metadata(
+                            provider_attempt_metadata(&metadata, started_at),
+                        ));
+                    }
+                };
+            let status = response.status();
+            if !status.is_success() {
+                let error = ProviderError::from_model_error(model_error_from_http_status(
+                    status.as_u16(),
+                    &self.config.provider_name,
+                    model_name,
+                ));
+                if metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                    && http_status_is_retryable(status.as_u16())
+                {
+                    metadata.retry_count += 1;
+                    wait_stream_retry_backoff(
+                        runtime,
+                        cancellation,
+                        provider_retry_backoff(metadata.retry_count),
+                        &metadata,
+                        started_at,
+                    )?;
+                    continue;
+                }
+                return Err(
+                    error.with_provider_attempt_metadata(provider_attempt_metadata(
+                        &metadata, started_at,
+                    )),
+                );
+            }
+            let attempt = read_openai_responses_sse(
+                runtime,
+                cancellation,
+                self.request_timeout_seconds,
+                response,
+                on_event,
+            );
+            let payload = match attempt {
+                Ok(payload) => payload,
+                Err(failure)
+                    if !failure.emitted_text_delta
+                        && metadata.attempt_count < MAX_PROVIDER_ATTEMPTS
+                        && provider_error_is_retryable(&failure.error) =>
+                {
+                    metadata.retry_count += 1;
+                    wait_stream_retry_backoff(
+                        runtime,
+                        cancellation,
+                        provider_retry_backoff(metadata.retry_count),
+                        &metadata,
+                        started_at,
+                    )?;
+                    continue;
+                }
+                Err(failure) => {
+                    return Err(failure.error.with_provider_attempt_metadata(
+                        provider_attempt_metadata(&metadata, started_at),
+                    ));
+                }
+            };
+            let reasoning_content_present = openai_responses_reasoning_content_present(&payload);
+            return parse_openai_responses_response(
+                request,
+                &self.config,
+                payload,
+                capabilities,
+                model_name,
+            )
+            .map(|mut response| {
+                response.provider_attempt_metadata =
+                    Some(provider_attempt_metadata(&metadata, started_at));
+                OpenAiCompletion {
+                    response,
+                    reasoning_content_present,
+                }
+            })
+            .map_err(|error| {
+                error.with_provider_attempt_metadata(provider_attempt_metadata(
+                    &metadata, started_at,
+                ))
+            });
+        }
     }
 
     pub(super) fn complete_with_contract_details(
@@ -359,6 +601,49 @@ impl Provider for OpenAiProvider {
         )
     }
 
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(provider_cancelled_error()
+                .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
+        }
+        let context = self.prepare_completion_context(request, cancellation)?;
+        if context.api_protocol != ProviderApiProtocol::OpenAiResponses {
+            return Err(attach_capability_metadata(
+                provider_streaming_unsupported_error(),
+                &context.capability_metadata,
+            ));
+        }
+        let model_name = request
+            .model_preferences
+            .model_name
+            .as_deref()
+            .unwrap_or(&self.config.model_name);
+        let result = self
+            .complete_responses_stream(
+                request,
+                cancellation,
+                &context.capabilities,
+                model_name,
+                on_event,
+            )
+            .and_then(|completion| {
+                if request_uses_tool_protocol(request) && completion.reasoning_content_present {
+                    Err(provider_tool_reasoning_history_error(
+                        &completion.response,
+                        context.capabilities.tool_reasoning_mode,
+                    ))
+                } else {
+                    Ok(completion.response)
+                }
+            });
+        self.finish_completion_result(result, cancellation, &context)
+    }
+
     fn complete(
         &self,
         request: &ModelTurnRequest,
@@ -368,84 +653,312 @@ impl Provider for OpenAiProvider {
             return Err(provider_cancelled_error()
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
-        let local_validation = validate_model_request(request);
-        if !local_validation.valid {
-            return Err(provider_request_validation_error(
-                local_validation,
-                &self.config,
-            ));
-        }
-        let mut capability_binding: Option<BoundProviderProtocolNegotiation> = None;
-        let (capabilities, capability_metadata, api_protocol) =
-            if !request_uses_tool_protocol(request) {
-                (
-                    self.protocol_contract(),
-                    None,
-                    self.config.completion_protocol_without_tools(),
-                )
-            } else {
-                let effective_model_name = request
-                    .model_preferences
-                    .model_name
-                    .as_deref()
-                    .unwrap_or(&self.config.model_name);
-                let binding = self
-                    .negotiate_openai_tool_capabilities_bound(effective_model_name, cancellation)?;
-                let api_protocol = binding.negotiation.metadata.api_protocol;
-                capability_binding = Some(binding.clone());
-                (
-                    binding.negotiation.contract,
-                    Some(binding.negotiation.metadata),
-                    api_protocol,
-                )
-            };
-        let request_validation =
-            validate_model_request_with_capabilities(request, Some(&capabilities));
-        if !request_validation.valid {
-            let provider_error =
-                provider_request_validation_error(request_validation, &self.config);
-            return Err(attach_capability_metadata(
-                provider_error,
-                &capability_metadata,
-            ));
-        }
+        let context = self.prepare_completion_context(request, cancellation)?;
         let effective_model_name = request
             .model_preferences
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        let cache_invalidation_deadline =
-            Instant::now() + Duration::from_secs(self.request_timeout_seconds);
         let result = self.complete_with_contract(
             request,
             cancellation,
-            &capabilities,
-            api_protocol,
+            &context.capabilities,
+            context.api_protocol,
             effective_model_name,
         );
-        let result = if let (Some(binding), Err(error)) = (&capability_binding, &result)
-            && is_stable_capability_rejection(error)
-        {
-            match self.invalidate_tool_capability_negotiation(
-                &binding.key,
-                cancellation,
-                cache_invalidation_deadline,
-            ) {
-                Ok(()) => result,
-                Err(invalidation_error) => result.map_err(|mut original| {
-                    original.error.validation_errors.push(
-                        invalidation_error.error.code.unwrap_or_else(|| {
-                            "provider_capability_cache_invalidation_failed".to_string()
-                        }),
-                    );
-                    original
-                }),
-            }
-        } else {
-            result
-        };
-        result.map_err(|error| attach_capability_metadata(error, &capability_metadata))
+        self.finish_completion_result(result, cancellation, &context)
     }
+}
+
+fn wait_stream_retry_backoff(
+    runtime: &ProviderRuntime,
+    cancellation: &CancellationToken,
+    duration: Duration,
+    metadata: &ProviderAttemptMetadata,
+    started_at: Instant,
+) -> Result<(), ProviderError> {
+    wait_provider_backoff(runtime, cancellation, duration, None).map_err(|error| {
+        error.with_provider_attempt_metadata(provider_attempt_metadata(metadata, started_at))
+    })
+}
+
+/// Decode one Responses body while preserving arbitrary HTTP chunk and SSE frame boundaries.
+fn read_openai_responses_sse(
+    runtime: &ProviderRuntime,
+    cancellation: &CancellationToken,
+    request_timeout_seconds: u64,
+    mut response: reqwest::Response,
+    on_event: &mut dyn FnMut(ProviderStreamEvent),
+) -> Result<Value, StreamAttemptFailure> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BODY_BYTES as u64)
+    {
+        return Err(StreamAttemptFailure {
+            error: provider_response_stream_too_large_error(),
+            emitted_text_delta: false,
+        });
+    }
+    let mut decoder = ResponsesSseDecoder::new(on_event);
+    loop {
+        let chunk = match block_on_provider_future(
+            runtime,
+            cancellation,
+            "provider_response_body_read_failed",
+            ProviderErrorStage::ResponseBodyRead,
+            request_timeout_seconds,
+            None,
+            || response.chunk(),
+        ) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return Err(StreamAttemptFailure {
+                    error,
+                    emitted_text_delta: decoder.emitted_text_delta,
+                });
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if let Err(error) = decoder.push(&chunk) {
+            return Err(StreamAttemptFailure {
+                error,
+                emitted_text_delta: decoder.emitted_text_delta,
+            });
+        }
+    }
+    decoder.finish().map_err(|error| StreamAttemptFailure {
+        error,
+        emitted_text_delta: decoder.emitted_text_delta,
+    })
+}
+
+/// Incremental, total-size-bounded SSE decoder for the Responses event contract.
+struct ResponsesSseDecoder<'a> {
+    pending: Vec<u8>,
+    event_data: Vec<u8>,
+    event_name: Option<String>,
+    total_bytes: usize,
+    terminal_response: Option<Value>,
+    emitted_text_delta: bool,
+    on_event: &'a mut dyn FnMut(ProviderStreamEvent),
+}
+
+impl<'a> ResponsesSseDecoder<'a> {
+    fn new(on_event: &'a mut dyn FnMut(ProviderStreamEvent)) -> Self {
+        Self {
+            pending: Vec::new(),
+            event_data: Vec::new(),
+            event_name: None,
+            total_bytes: 0,
+            terminal_response: None,
+            emitted_text_delta: false,
+            on_event,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderError> {
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(chunk.len())
+            .ok_or_else(provider_response_stream_too_large_error)?;
+        if self.total_bytes > MAX_PROVIDER_RESPONSE_BODY_BYTES {
+            return Err(provider_response_stream_too_large_error());
+        }
+        self.pending.extend_from_slice(chunk);
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.process_line(&line)?;
+        }
+        Ok(())
+    }
+
+    fn process_line(&mut self, line: &[u8]) -> Result<(), ProviderError> {
+        if line.is_empty() {
+            return self.dispatch_event();
+        }
+        if line.first() == Some(&b':') {
+            return Ok(());
+        }
+        let (field, value) = if let Some(separator) = line.iter().position(|byte| *byte == b':') {
+            let value = line.get(separator + 1..).unwrap_or_default();
+            let value = if value.first() == Some(&b' ') {
+                value.get(1..).unwrap_or_default()
+            } else {
+                value
+            };
+            (line.get(..separator).unwrap_or_default(), value)
+        } else {
+            (line, &[] as &[u8])
+        };
+        match field {
+            b"data" => {
+                let additional = value.len().saturating_add(1);
+                if self.event_data.len().saturating_add(additional)
+                    > MAX_PROVIDER_RESPONSE_BODY_BYTES
+                {
+                    return Err(provider_response_stream_too_large_error());
+                }
+                if !self.event_data.is_empty() {
+                    self.event_data.push(b'\n');
+                }
+                self.event_data.extend_from_slice(value);
+            }
+            b"event" => {
+                let event = std::str::from_utf8(value)
+                    .map_err(|_| provider_responses_stream_malformed_error("event_name_invalid"))?;
+                self.event_name = Some(event.to_string());
+            }
+            b"id" | b"retry" => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn dispatch_event(&mut self) -> Result<(), ProviderError> {
+        if self.event_data.is_empty() {
+            self.event_name = None;
+            return Ok(());
+        }
+        let payload = serde_json::from_slice::<Value>(&self.event_data)
+            .map_err(|_| provider_responses_stream_malformed_error("event_data_invalid_json"))?;
+        self.event_data.clear();
+        let payload_type = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| provider_responses_stream_malformed_error("event_type_missing"))?;
+        if self
+            .event_name
+            .as_deref()
+            .is_some_and(|event_name| event_name != payload_type)
+        {
+            return Err(provider_responses_stream_malformed_error(
+                "event_type_mismatch",
+            ));
+        }
+        self.event_name = None;
+        if self.terminal_response.is_some() {
+            return Err(provider_responses_stream_malformed_error(
+                "event_after_terminal",
+            ));
+        }
+        match payload_type {
+            "response.output_text.delta" => {
+                let delta = payload
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        provider_responses_stream_malformed_error("output_text_delta_missing")
+                    })?;
+                if !delta.is_empty() {
+                    self.emitted_text_delta = true;
+                    (self.on_event)(ProviderStreamEvent::OutputTextDelta {
+                        delta: delta.to_string(),
+                    });
+                }
+            }
+            "response.completed" => {
+                let response = payload.get("response").cloned().ok_or_else(|| {
+                    provider_responses_stream_malformed_error("completed_response_missing")
+                })?;
+                if !response.is_object() {
+                    return Err(provider_responses_stream_malformed_error(
+                        "completed_response_invalid",
+                    ));
+                }
+                self.terminal_response = Some(response);
+            }
+            "error" => {
+                return Err(provider_responses_stream_terminal_error(
+                    "responses_stream_error",
+                    "provider Responses stream returned an error",
+                ));
+            }
+            "response.failed" => {
+                return Err(provider_responses_stream_terminal_error(
+                    "responses_stream_failed",
+                    "provider Responses stream failed",
+                ));
+            }
+            "response.incomplete" => {
+                return Err(provider_responses_stream_terminal_error(
+                    "responses_stream_incomplete",
+                    "provider Responses stream was incomplete",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Value, ProviderError> {
+        if !self.pending.is_empty() || !self.event_data.is_empty() || self.event_name.is_some() {
+            return Err(provider_responses_stream_malformed_error(
+                "event_frame_unterminated",
+            ));
+        }
+        self.terminal_response
+            .clone()
+            .ok_or_else(provider_responses_stream_terminal_missing_error)
+    }
+}
+
+fn provider_responses_stream_malformed_error(reason: &'static str) -> ProviderError {
+    let mut error = ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider Responses stream was malformed",
+    )
+    .with_provider_diagnostic(
+        "responses_stream_malformed",
+        ProviderErrorStage::ResponseValidation,
+    );
+    error.validation_errors.push(reason.to_string());
+    ProviderError::from_model_error(error)
+}
+
+fn provider_responses_stream_terminal_missing_error() -> ProviderError {
+    let mut error = ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider Responses stream did not contain a completed terminal",
+    )
+    .with_provider_diagnostic(
+        "responses_stream_terminal_missing",
+        ProviderErrorStage::ResponseValidation,
+    );
+    error
+        .validation_errors
+        .push("responses_stream_terminal_missing".to_string());
+    ProviderError::from_model_error(error)
+}
+
+fn provider_responses_stream_terminal_error(
+    code: &'static str,
+    message: &'static str,
+) -> ProviderError {
+    let mut error = ModelError::new(ModelErrorKind::UnknownProviderError, message)
+        .with_provider_diagnostic(code, ProviderErrorStage::ResponseValidation);
+    error.validation_errors.push(code.to_string());
+    ProviderError::from_model_error(error)
+}
+
+fn provider_response_stream_too_large_error() -> ProviderError {
+    let mut error = ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider Responses stream exceeded the fixed safety limit",
+    )
+    .with_provider_diagnostic(
+        "provider_response_stream_too_large",
+        ProviderErrorStage::ResponseBodyRead,
+    );
+    error
+        .validation_errors
+        .push("provider_response_stream_too_large".to_string());
+    ProviderError::from_model_error(error)
 }
 
 pub(super) fn add_provider_attempt_metadata(

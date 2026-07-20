@@ -53,6 +53,8 @@ const PROVIDER_CANCELLATION_POLL_MS: u64 = 25;
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROVIDER_ATTEMPTS: u32 = 3;
 const PROVIDER_RETRY_BASE_BACKOFF_MS: u64 = 50;
+/// Provider boundary code used when a protocol has no normalized text stream.
+pub const PROVIDER_STREAMING_UNSUPPORTED_CODE: &str = "provider_streaming_unsupported";
 const PROVIDER_SNAPSHOT_ID_PREFIX: &str = "provider_snapshot_";
 const REQUIRED_TOOL_CHOICE_MISSING_ERROR: &str = "required_tool_call_missing";
 const REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR: &str = "required_tool_choice_requires_tools";
@@ -663,6 +665,13 @@ impl ModelTurnResponse {
     }
 }
 
+/// Normalized provider stream data safe for the `AgentLoop` boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderStreamEvent {
+    /// A visible text delta from the Responses `response.output_text.delta` event.
+    OutputTextDelta { delta: String },
+}
+
 /// 一次模型提供方操作记录的尝试次数和重试次数。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderAttemptMetadata {
@@ -718,6 +727,19 @@ pub trait Provider {
         Ok(ProviderProtocolNegotiation::declared(
             self.protocol_contract(),
         ))
+    }
+
+    /// Stream normalized visible text when the selected protocol supports it.
+    ///
+    /// The callback never receives reasoning, raw provider payloads, or tool argument deltas.
+    /// Providers without this protocol capability keep using `complete` unchanged.
+    fn complete_stream(
+        &self,
+        _request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+        _on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        Err(provider_streaming_unsupported_error())
     }
 
     /// 完成一个已校验请求，同时保留取消和类型化模型提供方错误。
@@ -829,6 +851,20 @@ impl ProviderError {
         self.capability_metadata = Some(Box::new(metadata));
         self
     }
+}
+
+/// Build the stable unsupported result used by Chat, Declared, and legacy providers.
+pub(crate) fn provider_streaming_unsupported_error() -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnsupportedCapability,
+            "provider streaming is unsupported for this protocol",
+        )
+        .with_provider_diagnostic(
+            PROVIDER_STREAMING_UNSUPPORTED_CODE,
+            ProviderErrorStage::ResponseValidation,
+        ),
+    )
 }
 
 #[cfg(test)]

@@ -160,6 +160,16 @@ pub(super) fn openai_responses_request_payload(
     payload
 }
 
+pub(super) fn openai_responses_stream_request_payload(
+    request: &ModelTurnRequest,
+    model_name: &str,
+    capabilities: &ProviderProtocolContract,
+) -> Value {
+    let mut payload = openai_responses_request_payload(request, model_name, capabilities);
+    payload["stream"] = json!(true);
+    payload
+}
+
 pub(super) fn openai_responses_input(messages: &[ModelMessage]) -> (Option<String>, Vec<Value>) {
     let instruction_count = messages
         .iter()

@@ -16,11 +16,12 @@ use singularity_core::{CancellationToken, ProjectInstructions, contains_sensitiv
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
-    ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
-    ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, ToolChoiceMode, is_strict_tool_schema_compatible,
-    provider_error_response, validate_model_request_with_capabilities,
-    validate_model_turn_response,
+    ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
+    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptMetadata,
+    ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError, ProviderErrorStage,
+    ProviderProtocolContract, ProviderStreamEvent, ToolChoiceMode,
+    is_strict_tool_schema_compatible, provider_error_response,
+    validate_model_request_with_capabilities, validate_model_turn_response,
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
@@ -1186,8 +1187,37 @@ where
                     )),
                 );
             }
-            let response = match self.provider.complete(&request, &self.cancellation) {
+            let mut streamed_text = String::new();
+            let stream_result = self.provider.complete_stream(
+                &request,
+                &self.cancellation,
+                &mut |event| match event {
+                    ProviderStreamEvent::OutputTextDelta { delta } => {
+                        streamed_text.push_str(&delta)
+                    }
+                },
+            );
+            let response = match stream_result {
+                Ok(response) if response.status == ModelTurnStatus::Success => {
+                    let terminal_text = assistant_message_text(response.assistant_message.as_ref());
+                    if streamed_text != terminal_text {
+                        provider_error_response(
+                            &request,
+                            ProviderError::from_model_error(provider_stream_text_mismatch_error()),
+                        )
+                    } else {
+                        response
+                    }
+                }
                 Ok(response) => response,
+                Err(error)
+                    if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
+                {
+                    match self.provider.complete(&request, &self.cancellation) {
+                        Ok(response) => response,
+                        Err(error) => provider_error_response(&request, error),
+                    }
+                }
                 Err(error) => provider_error_response(&request, error),
             };
             state.observe_model_response(&response);
@@ -2921,6 +2951,21 @@ fn model_response_validation_error(validation_errors: Vec<String>) -> ModelError
         ProviderErrorStage::ResponseValidation,
     );
     error.validation_errors = validation_errors;
+    error
+}
+
+fn provider_stream_text_mismatch_error() -> ModelError {
+    let mut error = ModelError::new(
+        ModelErrorKind::JsonSchemaViolation,
+        "provider streamed text did not match the completed response",
+    )
+    .with_provider_diagnostic(
+        "provider_stream_text_mismatch",
+        ProviderErrorStage::ResponseValidation,
+    );
+    error
+        .validation_errors
+        .push("provider_stream_text_mismatch".to_string());
     error
 }
 

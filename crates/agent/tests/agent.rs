@@ -8,11 +8,11 @@ use singularity_agent::{
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
-    DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelPreferences,
-    ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse,
-    ModelTurnStatus, ModelUsage, Provider, ProviderApiProtocol, ProviderAttemptMetadata,
-    ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
-    ProviderProtocolNegotiation, ToolChoiceMode,
+    DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage,
+    ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
+    ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderApiProtocol,
+    ProviderAttemptMetadata, ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError,
+    ProviderProtocolContract, ProviderProtocolNegotiation, ProviderStreamEvent, ToolChoiceMode,
 };
 use singularity_policy::{
     CommandScopeDigest, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
@@ -56,6 +56,12 @@ fn pending_approval(result: &AgentLoopResult) -> PendingApprovalOccurrence {
 
 struct StaticProvider {
     responses: Vec<ModelTurnResponse>,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+    capabilities: ProviderProtocolContract,
+}
+
+struct StreamingProvider {
+    responses: Vec<(Vec<ProviderStreamEvent>, ModelTurnResponse)>,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
     capabilities: ProviderProtocolContract,
 }
@@ -122,6 +128,39 @@ impl Provider for StaticProvider {
             .get(response_index)
             .unwrap_or_else(|| self.responses.last().expect("static provider response"))
             .clone())
+    }
+}
+
+impl Provider for StreamingProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        self.capabilities.clone()
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
+        let response_index = seen_requests.len();
+        seen_requests.push(request.clone());
+        let (events, response) = self
+            .responses
+            .get(response_index)
+            .unwrap_or_else(|| self.responses.last().expect("streaming provider response"));
+        for event in events {
+            on_event(event.clone());
+        }
+        Ok(response.clone())
+    }
+
+    fn complete(
+        &self,
+        _request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        panic!("streaming provider must not use non-stream completion")
     }
 }
 
@@ -644,6 +683,113 @@ fn agent_loop_read_only_final_answer_completes_without_verification() {
             .mode,
         ToolChoiceMode::Auto
     );
+}
+
+#[test]
+fn agent_loop_aggregates_stream_deltas_and_requires_matching_terminal_text() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = AgentLoop::new(
+        StreamingProvider {
+            responses: vec![(
+                vec![
+                    ProviderStreamEvent::OutputTextDelta {
+                        delta: "hel".to_string(),
+                    },
+                    ProviderStreamEvent::OutputTextDelta {
+                        delta: "lo".to_string(),
+                    },
+                ],
+                ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "hello"),
+            )],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_policy(),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "hello"));
+
+    assert_eq!(agent_loop.status, AgentStatus::Completed);
+    assert_eq!(agent_loop.final_answer.as_deref(), Some("hello"));
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 1);
+}
+
+#[test]
+fn agent_loop_fails_closed_when_streamed_text_differs_from_terminal_text() {
+    let agent_loop = AgentLoop::new(
+        StreamingProvider {
+            responses: vec![(
+                vec![ProviderStreamEvent::OutputTextDelta {
+                    delta: "hullo".to_string(),
+                }],
+                ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "hello"),
+            )],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_policy(),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "hello"));
+
+    assert_eq!(agent_loop.status, AgentStatus::Failed);
+    assert_eq!(agent_loop.model_turns, 1);
+    assert_eq!(
+        agent_loop
+            .provider_diagnostic
+            .and_then(|diagnostic| diagnostic.code),
+        Some("provider_stream_text_mismatch".to_string())
+    );
+}
+
+#[test]
+fn agent_loop_executes_only_tool_calls_from_stream_terminal_envelope() {
+    let mut tool_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "");
+    let call = tool_call(
+        "call_read",
+        "read",
+        serde_json::json!({"path": "Cargo.toml"}),
+    );
+    tool_response.tool_calls = vec![call.clone()];
+    tool_response.assistant_message = Some(ModelMessage {
+        role: ModelRole::Assistant,
+        content: String::new(),
+        tool_call_id: None,
+        tool_calls: vec![call],
+    });
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = AgentLoop::new(
+        StreamingProvider {
+            responses: vec![
+                (Vec::new(), tool_response),
+                (
+                    vec![ProviderStreamEvent::OutputTextDelta {
+                        delta: "done".to_string(),
+                    }],
+                    ModelTurnResponse::completed("model_request_turn_1_1", "response_done", "done"),
+                ),
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(env!("CARGO_MANIFEST_DIR")).expect("bind workspace tools"),
+    )
+    .run(&AgentLoopInput::new(
+        "thread_1",
+        "turn_1",
+        "read Cargo.toml",
+    ));
+
+    assert_eq!(agent_loop.status, AgentStatus::Completed);
+    assert_eq!(agent_loop.final_answer.as_deref(), Some("done"));
+    assert_eq!(agent_loop.tool_results.len(), 1);
+    assert_eq!(agent_loop.tool_results[0].tool_call_id, "call_read");
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 2);
 }
 
 #[test]
