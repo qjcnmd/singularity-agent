@@ -2,8 +2,15 @@ name: CI
 
 on:
   push:
-  pull_request:
+    branches:
+      - main
   workflow_dispatch:
+    inputs:
+      run_hosted_linux:
+        description: Also run the manually requested GitHub-hosted Linux gates
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -14,11 +21,26 @@ defaults:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
-  gates:
-    name: Rust gates
+  windows:
+    name: Windows self-hosted gates
     uses: ./.github/workflows/rust-gates.yml
     permissions:
       contents: read
+    with:
+      rust_runner_matrix: >-
+        {"include":[{"name":"Windows self-hosted","runs_on":"[\"self-hosted\",\"windows\",\"x64\",\"singularity\"]"}]}
+      supply_chain_runner: '["self-hosted","windows","x64","singularity"]'
+
+  hosted-linux:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_hosted_linux }}
+    name: Manual GitHub-hosted Linux gates
+    uses: ./.github/workflows/rust-gates.yml
+    permissions:
+      contents: read
+    with:
+      rust_runner_matrix: >-
+        {"include":[{"name":"Linux hosted","runs_on":"\"ubuntu-latest\""}]}
+      run_supply_chain: false
