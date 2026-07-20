@@ -222,6 +222,7 @@ enum JsonRpcVersion {
 pub struct JsonRpcRequest {
     jsonrpc: JsonRpcVersion,
     pub method: String,
+    #[serde(deserialize_with = "deserialize_request_id")]
     pub id: JsonRpcId,
     #[serde(default = "empty_params")]
     pub params: Value,
@@ -315,7 +316,24 @@ fn parse_batch_item(value: Value) -> JsonRpcBatchItem {
 
 fn recover_typed_id(value: &Value) -> Option<JsonRpcId> {
     let id = value.as_object()?.get("id")?;
-    serde_json::from_value(id.clone()).ok()
+    match serde_json::from_value(id.clone()).ok()? {
+        JsonRpcId::Null => None,
+        id => Some(id),
+    }
+}
+
+/// 请求 envelope 只接受字符串或合法整数；Null 仅保留给 response/error 关联边界。
+fn deserialize_request_id<'de, D>(deserializer: D) -> Result<JsonRpcId, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let id = JsonRpcId::deserialize(deserializer)?;
+    if matches!(id, JsonRpcId::Null) {
+        return Err(serde::de::Error::custom(
+            "JSON-RPC request id must be a string or integer",
+        ));
+    }
+    Ok(id)
 }
 
 impl JsonRpcMessage {

@@ -1,6 +1,6 @@
 //! JSON-RPC 请求、响应、事件和参数 schema 的协议测试。
 
-use singularity_core::ClientInfo;
+use singularity_core::{ClientInfo, ErrorCode};
 use singularity_policy::{ApprovalPolicy, PermissionProfileName};
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ArtifactFetchParams, ArtifactRef,
@@ -41,10 +41,6 @@ fn json_rpc_rejects_ambiguous_envelopes_and_non_scalar_ids() {
 fn json_rpc_accepts_and_echoes_every_supported_id_shape() {
     for (raw, expected) in [
         (
-            r#"{"jsonrpc":"2.0","method":"thread/list","id":null,"params":{}}"#,
-            JsonRpcId::Null,
-        ),
-        (
             r#"{"jsonrpc":"2.0","method":"thread/list","id":"request-1","params":{}}"#,
             JsonRpcId::String("request-1".to_string()),
         ),
@@ -66,6 +62,26 @@ fn json_rpc_accepts_and_echoes_every_supported_id_shape() {
 }
 
 #[test]
+fn json_rpc_rejects_explicit_null_ids_for_request_and_notification() {
+    for raw in [
+        r#"{"jsonrpc":"2.0","method":"thread/list","id":null,"params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"initialized","id":null,"params":{}}"#,
+    ] {
+        assert!(serde_json::from_str::<JsonRpcMessage>(raw).is_err());
+        assert_eq!(
+            parse_json_rpc_payload(raw).expect("valid JSON frame"),
+            JsonRpcPayload::Single(JsonRpcBatchItem::Invalid { id: None })
+        );
+    }
+
+    let response = JsonRpcMessage::invalid_request(None).to_wire_value();
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], serde_json::Value::Null);
+    assert_eq!(response["error"]["code"], -32600);
+    assert_eq!(response["error"]["message"], "Invalid Request");
+}
+
+#[test]
 fn json_rpc_rejects_fractional_ids_as_invalid_request_with_null_id() {
     let raw = r#"{"jsonrpc":"2.0","method":"thread/list","id":1.5,"params":{}}"#;
 
@@ -80,6 +96,20 @@ fn json_rpc_rejects_fractional_ids_as_invalid_request_with_null_id() {
     assert_eq!(response["id"], serde_json::Value::Null);
     assert_eq!(response["error"]["code"], -32600);
     assert_eq!(response["error"]["message"], "Invalid Request");
+}
+
+#[test]
+fn json_rpc_unassociated_error_responses_round_trip_with_null_id() {
+    for message in [
+        JsonRpcMessage::parse_error(),
+        JsonRpcMessage::invalid_request(None),
+        JsonRpcMessage::error(None, ErrorCode::new(-32603, "Internal error")),
+    ] {
+        let wire = message.to_wire_value();
+        assert_eq!(wire["id"], serde_json::Value::Null);
+        let parsed = serde_json::from_value::<JsonRpcMessage>(wire).expect("error response");
+        assert_eq!(parsed.id(), Some(&JsonRpcId::Null));
+    }
 }
 
 #[test]
