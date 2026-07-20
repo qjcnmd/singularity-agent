@@ -357,6 +357,19 @@ fn app_server_enforces_initialize_and_emits_item_events() {
             .unwrap()
             .is_empty()
     );
+    let trace_metrics = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"trace/metrics","id":83,"params":{{"runId":"{thread_id}"}}}}"#
+        ))
+        .unwrap();
+    assert_eq!(trace_metrics[0]["result"]["metrics"]["runId"], thread_id);
+    assert_eq!(
+        trace_metrics[0]["result"]["metrics"]["metrics"]
+            .as_array()
+            .unwrap()
+            .len(),
+        24
+    );
 
     let archived = server
         .handle_json(&format!(

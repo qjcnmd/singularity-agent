@@ -24,10 +24,49 @@ pub struct RegisterArtifactRefParams<'a> {
 impl SessionStore {
     /// 脱敏并追加一条带完整性校验的 trace event。
     pub fn append_trace(&self, event: &TraceEvent) -> StoreResult<()> {
+        self.append_trace_batch(std::slice::from_ref(event))
+    }
+
+    /// 先整体验证、再在一个 BEGIN IMMEDIATE 中追加 trace batch。
+    pub fn append_trace_batch(&self, events: &[TraceEvent]) -> StoreResult<()> {
+        if events.is_empty() {
+            return Err(StoreError::InvalidState(
+                "trace batch must not be empty".to_string(),
+            ));
+        }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        validate_public_trace_binding(&transaction, event)?;
-        let _ = Self::insert_trace(&transaction, event)?;
+        validate_public_trace_bindings(&transaction, events)?;
+        validate_trace_batch_input(events)?;
+        let sanitized = events.iter().map(sanitize_trace_event).collect::<Vec<_>>();
+        validate_trace_storage_values(&sanitized)?;
+        for event in &sanitized {
+            let existing = transaction
+                .query_row(
+                    "select 1 from trace_events where event_id = ?1",
+                    params![event.event_id],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if existing.is_some() {
+                return Err(StoreError::AlreadyExists(format!(
+                    "trace event {}",
+                    event.event_id
+                )));
+            }
+        }
+
+        let run_ids = sanitized
+            .iter()
+            .map(|event| event.run_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut all_events = load_trace_events(&transaction, &run_ids)?;
+        all_events.extend(sanitized.iter().cloned());
+        validate_trace_span_batch(&all_events)?;
+
+        for event in events {
+            let _ = Self::insert_trace(&transaction, event)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -52,7 +91,8 @@ impl SessionStore {
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let mut statement = transaction.prepare(
             "select event_id, run_id, session_id, payload, span_id, parent_span_id,
-                    span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms
+                    span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
+                    span_projection, metric_samples
              from trace_events where run_id = ?1 order by rowid limit ?2 offset ?3",
         )?;
         let rows = statement.query_map(params![run_id, limit, offset], stored_trace_row)?;
@@ -92,7 +132,8 @@ impl SessionStore {
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let mut statement = transaction.prepare(
             "select event_id, run_id, session_id, payload, span_id, parent_span_id,
-                    span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms
+                    span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
+                    span_projection, metric_samples
              from trace_events where run_id = ?1 order by rowid desc limit ?2 offset ?3",
         )?;
         let rows = statement.query_map(params![run_id, limit, offset], stored_trace_row)?;
@@ -125,7 +166,8 @@ impl SessionStore {
         let row = transaction
             .query_row(
                 "select event_id, run_id, session_id, payload, span_id, parent_span_id,
-                        span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms
+                        span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
+                        span_projection, metric_samples
                  from trace_events where event_id = ?1",
                 params![event_id],
                 stored_trace_row,
@@ -141,6 +183,615 @@ impl SessionStore {
         transaction.commit()?;
         Ok(event)
     }
+
+    /// 从唯一 trace_events 表派生固定 metric 集合。
+    pub fn trace_metrics(&self, run_id: &str) -> StoreResult<TraceMetrics> {
+        let events = self.list_trace(run_id)?;
+        validate_trace_span_batch(&events)?;
+        derive_trace_metrics(run_id, &events)
+    }
+}
+
+fn validate_trace_batch_input(events: &[TraceEvent]) -> StoreResult<()> {
+    let mut event_ids = BTreeSet::new();
+    for event in events {
+        if event.event_id.trim().is_empty() || !event_ids.insert(event.event_id.as_str()) {
+            return Err(StoreError::InvalidState(
+                "trace batch contains an empty or duplicate event_id".to_string(),
+            ));
+        }
+        if event.run_id.trim().is_empty() {
+            return Err(StoreError::InvalidState(
+                "trace run_id must not be empty".to_string(),
+            ));
+        }
+        event
+            .validate_span_lifecycle()
+            .map_err(|error| StoreError::InvalidState(format!("trace span is invalid: {error}")))?;
+    }
+    Ok(())
+}
+
+fn validate_trace_storage_values(events: &[TraceEvent]) -> StoreResult<()> {
+    for event in events {
+        validate_trace_u64(event.duration_ms, "trace duration")?;
+        validate_trace_u64(event.time_to_first_token_ms, "trace time to first token")?;
+        for sample in &event.metric_samples {
+            validate_trace_u64(Some(sample.count), "trace metric sample count")?;
+        }
+        if let Some(projection) = &event.span_projection {
+            validate_projection_storage_values(projection)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_trace_u64(value: Option<u64>, label: &str) -> StoreResult<()> {
+    if let Some(value) = value {
+        i64::try_from(value).map_err(|_| {
+            StoreError::InvalidState(format!("{label} exceeds sqlite integer range"))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_projection_storage_values(projection: &TraceSpanProjection) -> StoreResult<()> {
+    for (value, label) in [
+        (projection.operation_count, "trace operation count"),
+        (projection.message_count, "trace message count"),
+        (projection.tool_count, "trace tool count"),
+        (projection.request_token_count, "trace request token count"),
+        (projection.attempt_index, "trace attempt index"),
+        (projection.retry_count, "trace retry count"),
+        (projection.queue_duration_ms, "trace queue duration"),
+        (
+            projection.request_send_to_headers_ms,
+            "trace send to headers duration",
+        ),
+        (projection.retry_backoff_ms, "trace retry backoff"),
+    ] {
+        validate_trace_u64(value, label)?;
+    }
+    if let Some(usage) = projection.usage {
+        for (value, label) in [
+            (usage.input_tokens, "trace input tokens"),
+            (usage.output_tokens, "trace output tokens"),
+            (usage.total_tokens, "trace total tokens"),
+            (usage.cached_input_tokens, "trace cached input tokens"),
+            (usage.reasoning_tokens, "trace reasoning tokens"),
+        ] {
+            validate_trace_u64(Some(value), label)?;
+        }
+    }
+    if let Some(tool) = &projection.tool {
+        validate_trace_u64(tool.tool_call_ordinal, "trace tool call ordinal")?;
+    }
+    if let Some(policy) = &projection.policy {
+        validate_trace_u64(policy.operation_count, "trace policy operation count")?;
+        validate_trace_u64(policy.resource_count, "trace policy resource count")?;
+    }
+    if let Some(approval) = &projection.approval {
+        validate_trace_u64(approval.request_count, "trace approval request count")?;
+    }
+    if let Some(verification) = &projection.verification {
+        validate_trace_u64(
+            verification.required_command_count,
+            "trace required command count",
+        )?;
+        validate_trace_u64(
+            verification.satisfied_command_count,
+            "trace satisfied command count",
+        )?;
+        validate_trace_u64(verification.occurrence_count, "trace occurrence count")?;
+        validate_trace_u64(verification.command_duration_ms, "trace command duration")?;
+    }
+    if let Some(review) = &projection.final_review {
+        validate_trace_u64(review.model_turn_ordinal, "trace model turn ordinal")?;
+    }
+    Ok(())
+}
+
+fn load_trace_events(
+    connection: &Connection,
+    run_ids: &BTreeSet<String>,
+) -> StoreResult<Vec<TraceEvent>> {
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", run_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "select event_id, run_id, session_id, payload, span_id, parent_span_id, \
+                span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms, \
+                span_projection, metric_samples \
+         from trace_events where run_id in ({placeholders}) order by rowid"
+    );
+    let mut statement = connection.prepare(&query)?;
+    let rows = statement.query_map(params_from_iter(run_ids.iter()), stored_trace_row)?;
+    let raw_rows = rows.collect::<Result<Vec<_>, _>>()?;
+    raw_rows.into_iter().map(decode_stored_trace_row).collect()
+}
+
+const TRACE_METRIC_NAMES: &[TraceMetricName] = &[
+    TraceMetricName::TaskDurationMs,
+    TraceMetricName::TurnDurationMs,
+    TraceMetricName::ProviderAttemptDurationMs,
+    TraceMetricName::ProviderSendToHeadersMs,
+    TraceMetricName::ProviderTimeToFirstTokenMs,
+    TraceMetricName::ProviderQueueDurationMs,
+    TraceMetricName::ProviderRetryCount,
+    TraceMetricName::ProviderRetryBackoffMs,
+    TraceMetricName::ProviderErrorCount,
+    TraceMetricName::ProviderInputTokens,
+    TraceMetricName::ProviderOutputTokens,
+    TraceMetricName::ProviderTotalTokens,
+    TraceMetricName::ToolFrequency,
+    TraceMetricName::ToolSuccessCount,
+    TraceMetricName::ToolDurationMs,
+    TraceMetricName::ApprovalWaitDurationMs,
+    TraceMetricName::SandboxExecutionDurationMs,
+    TraceMetricName::VerificationDurationMs,
+    TraceMetricName::FinalReviewDurationMs,
+    TraceMetricName::CompletionRejectionCount,
+    TraceMetricName::CompletionRepairCount,
+    TraceMetricName::EventQueueDropCount,
+    TraceMetricName::EventGapCount,
+    TraceMetricName::WriterVisibleCount,
+];
+
+fn derive_trace_metrics(run_id: &str, events: &[TraceEvent]) -> StoreResult<TraceMetrics> {
+    let legacy_only = events.iter().all(|event| {
+        event.span_id.is_none()
+            && event.span_phase.is_none()
+            && event.span_projection.is_none()
+            && event.metric_samples.is_empty()
+    });
+    let metrics = TRACE_METRIC_NAMES
+        .iter()
+        .copied()
+        .map(|name| derive_trace_metric(name, events, legacy_only))
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(TraceMetrics {
+        run_id: run_id.to_string(),
+        metrics,
+    })
+}
+
+fn derive_trace_metric(
+    name: TraceMetricName,
+    events: &[TraceEvent],
+    legacy_only: bool,
+) -> StoreResult<TraceMetric> {
+    let (availability, values) = match name {
+        TraceMetricName::TaskDurationMs => duration_values(
+            TraceSpanKind::Task,
+            events,
+            legacy_only,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::TurnDurationMs => duration_values(
+            TraceSpanKind::Turn,
+            events,
+            legacy_only,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::ProviderAttemptDurationMs => duration_values(
+            TraceSpanKind::ProviderAttempt,
+            events,
+            legacy_only,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::ProviderSendToHeadersMs => projection_values(
+            TraceSpanKind::ProviderAttempt,
+            events,
+            legacy_only,
+            |projection| projection.request_send_to_headers_ms,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::ProviderTimeToFirstTokenMs => ttft_values(events, legacy_only),
+        TraceMetricName::ProviderQueueDurationMs => projection_values(
+            TraceSpanKind::ProviderAttempt,
+            events,
+            legacy_only,
+            |projection| projection.queue_duration_ms,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::ProviderRetryCount => projection_values(
+            TraceSpanKind::ProviderAttempt,
+            events,
+            legacy_only,
+            |projection| projection.retry_count,
+            TraceMetricUnavailableReason::MissingMetricValue,
+        ),
+        TraceMetricName::ProviderRetryBackoffMs => projection_values(
+            TraceSpanKind::ProviderAttempt,
+            events,
+            legacy_only,
+            |projection| projection.retry_backoff_ms,
+            TraceMetricUnavailableReason::MissingMetricValue,
+        ),
+        TraceMetricName::ProviderErrorCount => provider_error_values(events, legacy_only),
+        TraceMetricName::ProviderInputTokens => {
+            usage_values(events, legacy_only, |usage| usage.input_tokens)
+        }
+        TraceMetricName::ProviderOutputTokens => {
+            usage_values(events, legacy_only, |usage| usage.output_tokens)
+        }
+        TraceMetricName::ProviderTotalTokens => {
+            usage_values(events, legacy_only, |usage| usage.total_tokens)
+        }
+        TraceMetricName::ToolFrequency => {
+            count_values(TraceSpanKind::ToolCall, events, legacy_only)
+        }
+        TraceMetricName::ToolSuccessCount => tool_success_values(events, legacy_only),
+        TraceMetricName::ToolDurationMs => duration_values(
+            TraceSpanKind::ToolCall,
+            events,
+            legacy_only,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::ApprovalWaitDurationMs => duration_values(
+            TraceSpanKind::ApprovalWait,
+            events,
+            legacy_only,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::SandboxExecutionDurationMs => duration_values(
+            TraceSpanKind::SandboxExecution,
+            events,
+            legacy_only,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::VerificationDurationMs => duration_values(
+            TraceSpanKind::Verification,
+            events,
+            legacy_only,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::FinalReviewDurationMs => duration_values(
+            TraceSpanKind::FinalReview,
+            events,
+            legacy_only,
+            TraceMetricUnavailableReason::MissingTrueTiming,
+        ),
+        TraceMetricName::CompletionRejectionCount => sample_values(
+            TraceMetricSampleKind::CompletionRejection,
+            events,
+            legacy_only,
+        ),
+        TraceMetricName::CompletionRepairCount => {
+            sample_values(TraceMetricSampleKind::CompletionRepair, events, legacy_only)
+        }
+        TraceMetricName::EventQueueDropCount => {
+            sample_values(TraceMetricSampleKind::EventQueueDrop, events, legacy_only)
+        }
+        TraceMetricName::EventGapCount => {
+            sample_values(TraceMetricSampleKind::EventGap, events, legacy_only)
+        }
+        TraceMetricName::WriterVisibleCount => {
+            sample_values(TraceMetricSampleKind::WriterVisible, events, legacy_only)
+        }
+    };
+    Ok(TraceMetric {
+        name,
+        availability,
+        distribution: distribution(values)?,
+    })
+}
+
+fn span_ends(kind: TraceSpanKind, events: &[TraceEvent]) -> Vec<&TraceEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            event.span_kind == Some(kind) && event.span_phase == Some(TraceSpanPhase::End)
+        })
+        .collect()
+}
+
+fn span_starts(kind: TraceSpanKind, events: &[TraceEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            event.span_kind == Some(kind) && event.span_phase == Some(TraceSpanPhase::Start)
+        })
+        .count()
+}
+
+fn duration_values(
+    kind: TraceSpanKind,
+    events: &[TraceEvent],
+    legacy_only: bool,
+    missing_reason: TraceMetricUnavailableReason,
+) -> (TraceMetricAvailability, Vec<u64>) {
+    if legacy_only {
+        return (legacy_only_availability(), Vec::new());
+    }
+    let ends = span_ends(kind, events);
+    if ends.is_empty() {
+        return (
+            if span_starts(kind, events) > 0 {
+                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
+            } else {
+                unavailable(TraceMetricUnavailableReason::NoProducer)
+            },
+            Vec::new(),
+        );
+    }
+    let values = ends
+        .iter()
+        .filter_map(|event| event.duration_ms)
+        .collect::<Vec<_>>();
+    if values.len() != ends.len() {
+        return (unavailable(missing_reason), Vec::new());
+    }
+    (TraceMetricAvailability::Available, values)
+}
+
+fn count_values(
+    kind: TraceSpanKind,
+    events: &[TraceEvent],
+    legacy_only: bool,
+) -> (TraceMetricAvailability, Vec<u64>) {
+    if legacy_only {
+        return (legacy_only_availability(), Vec::new());
+    }
+    let ends = span_ends(kind, events);
+    if ends.is_empty() {
+        return (
+            if span_starts(kind, events) > 0 {
+                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
+            } else {
+                unavailable(TraceMetricUnavailableReason::NoProducer)
+            },
+            Vec::new(),
+        );
+    }
+    (
+        TraceMetricAvailability::Available,
+        std::iter::repeat_n(1, ends.len()).collect(),
+    )
+}
+
+fn projection_values<F>(
+    kind: TraceSpanKind,
+    events: &[TraceEvent],
+    legacy_only: bool,
+    select: F,
+    missing_reason: TraceMetricUnavailableReason,
+) -> (TraceMetricAvailability, Vec<u64>)
+where
+    F: Fn(&TraceSpanProjection) -> Option<u64>,
+{
+    if legacy_only {
+        return (legacy_only_availability(), Vec::new());
+    }
+    let ends = span_ends(kind, events);
+    if ends.is_empty() {
+        return (
+            if span_starts(kind, events) > 0 {
+                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
+            } else {
+                unavailable(TraceMetricUnavailableReason::NoProducer)
+            },
+            Vec::new(),
+        );
+    }
+    let values = ends
+        .iter()
+        .filter_map(|event| event.span_projection.as_ref().and_then(&select))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        (unavailable(missing_reason), values)
+    } else {
+        (TraceMetricAvailability::Available, values)
+    }
+}
+
+fn ttft_values(events: &[TraceEvent], legacy_only: bool) -> (TraceMetricAvailability, Vec<u64>) {
+    if legacy_only {
+        return (legacy_only_availability(), Vec::new());
+    }
+    let ends = span_ends(TraceSpanKind::ProviderAttempt, events);
+    if ends.is_empty() {
+        return (
+            if span_starts(TraceSpanKind::ProviderAttempt, events) > 0 {
+                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
+            } else {
+                unavailable(TraceMetricUnavailableReason::NoProducer)
+            },
+            Vec::new(),
+        );
+    }
+    let values = ends
+        .iter()
+        .filter_map(|event| event.time_to_first_token_ms)
+        .collect::<Vec<_>>();
+    if !values.is_empty() {
+        return (TraceMetricAvailability::Available, values);
+    }
+    let protocols = ends
+        .iter()
+        .filter_map(|event| {
+            event
+                .span_projection
+                .as_ref()
+                .and_then(|value| value.protocol)
+        })
+        .collect::<Vec<_>>();
+    if protocols.len() == ends.len()
+        && protocols
+            .iter()
+            .all(|protocol| *protocol != TraceProviderProtocol::OpenAiResponses)
+    {
+        (
+            unavailable(TraceMetricUnavailableReason::NonStreamingTtft),
+            values,
+        )
+    } else {
+        (
+            unavailable(TraceMetricUnavailableReason::MissingTrueTiming),
+            values,
+        )
+    }
+}
+
+fn usage_values<F>(
+    events: &[TraceEvent],
+    legacy_only: bool,
+    select: F,
+) -> (TraceMetricAvailability, Vec<u64>)
+where
+    F: Fn(&TraceUsage) -> u64,
+{
+    if legacy_only {
+        return (legacy_only_availability(), Vec::new());
+    }
+    let ends = span_ends(TraceSpanKind::ProviderAttempt, events);
+    if ends.is_empty() {
+        return (
+            if span_starts(TraceSpanKind::ProviderAttempt, events) > 0 {
+                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
+            } else {
+                unavailable(TraceMetricUnavailableReason::NoProducer)
+            },
+            Vec::new(),
+        );
+    }
+    let values = ends
+        .iter()
+        .filter_map(|event| {
+            event
+                .span_projection
+                .as_ref()
+                .and_then(|projection| projection.usage.as_ref())
+                .map(&select)
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        (
+            unavailable(TraceMetricUnavailableReason::MissingUsage),
+            values,
+        )
+    } else {
+        (TraceMetricAvailability::Available, values)
+    }
+}
+
+fn provider_error_values(
+    events: &[TraceEvent],
+    legacy_only: bool,
+) -> (TraceMetricAvailability, Vec<u64>) {
+    if legacy_only {
+        return (legacy_only_availability(), Vec::new());
+    }
+    let ends = span_ends(TraceSpanKind::ProviderAttempt, events);
+    if ends.is_empty() {
+        return (
+            if span_starts(TraceSpanKind::ProviderAttempt, events) > 0 {
+                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
+            } else {
+                unavailable(TraceMetricUnavailableReason::NoProducer)
+            },
+            Vec::new(),
+        );
+    }
+    let values = ends
+        .iter()
+        .filter(|event| {
+            event.span_status == Some(TraceSpanStatus::Error)
+                || event
+                    .span_projection
+                    .as_ref()
+                    .is_some_and(|projection| projection.error.is_some())
+        })
+        .map(|_| 1)
+        .collect::<Vec<_>>();
+    (TraceMetricAvailability::Available, values)
+}
+
+fn tool_success_values(
+    events: &[TraceEvent],
+    legacy_only: bool,
+) -> (TraceMetricAvailability, Vec<u64>) {
+    if legacy_only {
+        return (legacy_only_availability(), Vec::new());
+    }
+    let ends = span_ends(TraceSpanKind::ToolCall, events);
+    if ends.is_empty() {
+        return (
+            if span_starts(TraceSpanKind::ToolCall, events) > 0 {
+                unavailable(TraceMetricUnavailableReason::IncompleteStartEnd)
+            } else {
+                unavailable(TraceMetricUnavailableReason::NoProducer)
+            },
+            Vec::new(),
+        );
+    }
+    let values = ends
+        .iter()
+        .filter(|event| event.span_status == Some(TraceSpanStatus::Ok))
+        .map(|_| 1)
+        .collect::<Vec<_>>();
+    (TraceMetricAvailability::Available, values)
+}
+
+fn sample_values(
+    kind: TraceMetricSampleKind,
+    events: &[TraceEvent],
+    legacy_only: bool,
+) -> (TraceMetricAvailability, Vec<u64>) {
+    if legacy_only {
+        return (legacy_only_availability(), Vec::new());
+    }
+    let values = events
+        .iter()
+        .flat_map(|event| event.metric_samples.iter())
+        .filter(|sample| sample.kind == kind)
+        .map(|sample| sample.count)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        (
+            unavailable(TraceMetricUnavailableReason::NoProducer),
+            values,
+        )
+    } else {
+        (TraceMetricAvailability::Available, values)
+    }
+}
+
+fn unavailable(reason: TraceMetricUnavailableReason) -> TraceMetricAvailability {
+    TraceMetricAvailability::Unavailable { reason }
+}
+
+fn legacy_only_availability() -> TraceMetricAvailability {
+    unavailable(TraceMetricUnavailableReason::LegacyOnly)
+}
+
+fn distribution(values: Vec<u64>) -> StoreResult<Option<TraceMetricDistribution>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let mut sorted = values;
+    sorted.sort_unstable();
+    let count = u64::try_from(sorted.len())
+        .map_err(|_| StoreError::InvalidState("trace metric count overflow".to_string()))?;
+    let sum = sorted
+        .iter()
+        .try_fold(0_u128, |sum, value| sum.checked_add(u128::from(*value)))
+        .ok_or_else(|| StoreError::InvalidState("trace metric sum overflow".to_string()))?;
+    let nearest_rank = |percentile: u128| {
+        let rank = (u128::from(count) * percentile).div_ceil(100);
+        sorted[usize::try_from(rank.saturating_sub(1)).unwrap_or(0)]
+    };
+    Ok(Some(TraceMetricDistribution {
+        count,
+        min: sorted.first().copied(),
+        max: sorted.last().copied(),
+        mean: Some(sum as f64 / count as f64),
+        p50: Some(nearest_rank(50)),
+        p95: Some(nearest_rank(95)),
+    }))
 }
 
 impl SessionStore {
@@ -292,7 +943,13 @@ pub(crate) fn validate_trace_span_batch(events: &[TraceEvent]) -> StoreResult<()
             events
                 .iter()
                 .find(|event| event.span_phase == Some(TraceSpanPhase::End)),
-        ) && (start.parent_span_id != end.parent_span_id || start.span_kind != end.span_kind)
+        ) && (start.parent_span_id != end.parent_span_id
+            || start.span_kind != end.span_kind
+            || match (&start.span_projection, &end.span_projection) {
+                (Some(start), Some(end)) => !start.same_identity_attributes(end),
+                (None, None) => false,
+                _ => true,
+            })
         {
             return Err(StoreError::InvalidState(format!(
                 "trace span {span_id} in run {run_id} has mismatched start and end identity"
@@ -315,7 +972,8 @@ pub(crate) fn validate_trace_span_batch(events: &[TraceEvent]) -> StoreResult<()
 pub(crate) fn validate_trace_span_rows(connection: &Connection) -> StoreResult<()> {
     let mut statement = connection.prepare(
         "select event_id, run_id, session_id, payload, span_id, parent_span_id,
-                span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms
+                span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
+                span_projection, metric_samples
          from trace_events order by rowid",
     )?;
     let rows = statement.query_map([], stored_trace_row)?;

@@ -2,7 +2,8 @@
 
 use super::*;
 use singularity_protocol::{
-    TraceListParams, TraceListResult, TraceShowParams, TraceShowResult, TraceTailParams,
+    TraceListParams, TraceListResult, TraceMetricsParams, TraceMetricsResult, TraceShowParams,
+    TraceShowResult, TraceTailParams,
 };
 
 impl AppServer {
@@ -121,6 +122,7 @@ impl AppServer {
             Method::TraceList => self.trace_list(message),
             Method::TraceShow => self.trace_show(message),
             Method::TraceTail => self.trace_tail(message),
+            Method::TraceMetrics => self.trace_metrics(message),
             Method::ServerShutdown => self.server_shutdown(message),
         };
         if notification {
@@ -409,6 +411,17 @@ impl AppServer {
                 )
                 .to_wire_value(),
             ]),
+            Err(StoreError::NotFound(_)) => {
+                not_found_response(message.required_id(), TRACE_RUN_NOT_FOUND)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(super) fn trace_metrics(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TraceMetricsParams = parse_params(&message)?;
+        match self.store.trace_metrics(&params.run_id) {
+            Ok(metrics) => json_response(message.required_id(), TraceMetricsResult { metrics }),
             Err(StoreError::NotFound(_)) => {
                 not_found_response(message.required_id(), TRACE_RUN_NOT_FOUND)
             }

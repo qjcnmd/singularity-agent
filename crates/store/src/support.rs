@@ -589,6 +589,8 @@ pub(crate) struct StoredTraceRow {
     pub(crate) span_status: Option<String>,
     pub(crate) duration_ms: Option<i64>,
     pub(crate) time_to_first_token_ms: Option<i64>,
+    pub(crate) span_projection: Option<String>,
+    pub(crate) metric_samples: String,
 }
 
 pub(crate) fn stored_trace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTraceRow> {
@@ -604,6 +606,8 @@ pub(crate) fn stored_trace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Stor
         span_status: row.get(8)?,
         duration_ms: row.get(9)?,
         time_to_first_token_ms: row.get(10)?,
+        span_projection: row.get(11)?,
+        metric_samples: row.get(12)?,
     })
 }
 
@@ -621,8 +625,21 @@ pub(crate) fn decode_stored_trace_row(row: StoredTraceRow) -> StoreResult<TraceE
         span_status,
         duration_ms,
         time_to_first_token_ms,
+        span_projection,
+        metric_samples,
     } = row;
     let event = decode_trace_payload(&payload)?;
+    let projected_span = span_projection
+        .as_deref()
+        .map(serde_json::from_str::<TraceSpanProjection>)
+        .transpose()
+        .map_err(|error| {
+            StoreError::InvalidState(format!("trace span projection is invalid: {error}"))
+        })?;
+    let projected_samples = serde_json::from_str::<Vec<TraceMetricSample>>(&metric_samples)
+        .map_err(|error| {
+            StoreError::InvalidState(format!("trace metric samples are invalid: {error}"))
+        })?;
     if event.event_id != event_id
         || event.run_id != run_id
         || event.session_id != session_id
@@ -634,6 +651,8 @@ pub(crate) fn decode_stored_trace_row(row: StoredTraceRow) -> StoreResult<TraceE
         || optional_i64_to_u64(duration_ms, "trace duration")? != event.duration_ms
         || optional_i64_to_u64(time_to_first_token_ms, "trace time to first token")?
             != event.time_to_first_token_ms
+        || event.span_projection != projected_span
+        || event.metric_samples != projected_samples
     {
         return Err(StoreError::InvalidState(format!(
             "trace {event_id} columns do not match payload"
@@ -668,6 +687,7 @@ pub(crate) fn sanitize_trace_event(event: &TraceEvent) -> TraceEvent {
     let mut sanitized = event.clone();
     sanitized.summary = redact_secret_like_text(&sanitized.summary);
     sanitized.payload = redact_secret_like_value(sanitized.payload);
+    sanitized.span_projection = sanitized.span_projection.map(sanitize_trace_projection);
     sanitized.artifact_refs = sanitized
         .artifact_refs
         .into_iter()
@@ -676,6 +696,33 @@ pub(crate) fn sanitize_trace_event(event: &TraceEvent) -> TraceEvent {
     sanitized.redaction_applied = true;
     sanitized.payload_hash = trace_envelope_hash(&sanitized);
     sanitized
+}
+
+fn sanitize_trace_projection(mut projection: TraceSpanProjection) -> TraceSpanProjection {
+    projection.provider_name = projection
+        .provider_name
+        .map(|value| redact_secret_like_text(&value));
+    projection.model_name = projection
+        .model_name
+        .map(|value| redact_secret_like_text(&value));
+    projection.error = projection.error.map(|mut error| {
+        error.code = error.code.map(|value| redact_secret_like_text(&value));
+        error
+    });
+    projection.tool = projection.tool.map(|mut tool| {
+        tool.tool_name = tool.tool_name.map(|value| redact_secret_like_text(&value));
+        tool.tool_call_id_digest = tool
+            .tool_call_id_digest
+            .map(|value| redact_secret_like_text(&value));
+        tool
+    });
+    projection.sandbox = projection.sandbox.map(|mut sandbox| {
+        sandbox.command_id_digest = sandbox
+            .command_id_digest
+            .map(|value| redact_secret_like_text(&value));
+        sandbox
+    });
+    projection
 }
 
 // 对 canonical JSON 计算带前缀的 SHA-256 摘要。

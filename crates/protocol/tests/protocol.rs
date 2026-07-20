@@ -9,8 +9,10 @@ use singularity_protocol::{
     ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload,
     METHOD_REGISTRY, Method, MethodKind, ProviderConfigurationStatus, ThreadIdParams,
     ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceEvent,
-    TraceListParams, TraceShowParams, TraceSpanKind, TraceSpanPhase, TraceSpanStatus,
-    TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus, parse_json_rpc_payload,
+    TraceListParams, TraceMetricSample, TraceMetricSampleKind, TraceMetrics, TraceMetricsParams,
+    TraceMetricsResult, TraceProviderProtocol, TraceShowParams, TraceSpanKind, TraceSpanPhase,
+    TraceSpanProjection, TraceSpanStatus, TraceTailParams, TurnIdParams, TurnStartParams,
+    TurnStatus, parse_json_rpc_payload,
 };
 
 #[test]
@@ -381,7 +383,7 @@ fn json_rpc_payload_distinguishes_empty_single_and_mixed_batch() {
 
 #[test]
 fn method_registry_is_the_unique_name_and_contract_source() {
-    assert_eq!(METHOD_REGISTRY.len(), 25);
+    assert_eq!(METHOD_REGISTRY.len(), 26);
     for spec in METHOD_REGISTRY {
         assert_eq!(Method::parse(spec.name), Some(spec.method));
         assert_eq!(spec.method.as_str(), spec.name);
@@ -571,6 +573,13 @@ fn trace_span_lifecycle_roundtrips_and_legacy_events_remain_valid() {
     end.span_status = Some(TraceSpanStatus::Ok);
     end.duration_ms = Some(42);
     end.time_to_first_token_ms = Some(12);
+    end.span_projection = Some(TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        attempt_index: Some(1),
+        ..TraceSpanProjection::default()
+    });
     let restored: TraceEvent =
         serde_json::from_value(serde_json::to_value(&end).expect("typed trace serialization"))
             .expect("typed trace roundtrip");
@@ -585,7 +594,7 @@ fn trace_span_lifecycle_rejects_invalid_phase_combinations() {
         (
             "missing span id",
             None,
-            Some(TraceSpanKind::Agent),
+            Some(TraceSpanKind::Turn),
             Some(TraceSpanPhase::Start),
             None,
             None,
@@ -594,7 +603,7 @@ fn trace_span_lifecycle_rejects_invalid_phase_combinations() {
         (
             "start status",
             Some("span"),
-            Some(TraceSpanKind::Agent),
+            Some(TraceSpanKind::Turn),
             Some(TraceSpanPhase::Start),
             Some(TraceSpanStatus::Ok),
             None,
@@ -603,7 +612,7 @@ fn trace_span_lifecycle_rejects_invalid_phase_combinations() {
         (
             "end status missing",
             Some("span"),
-            Some(TraceSpanKind::Agent),
+            Some(TraceSpanKind::Turn),
             Some(TraceSpanPhase::End),
             None,
             Some(1),
@@ -612,7 +621,7 @@ fn trace_span_lifecycle_rejects_invalid_phase_combinations() {
         (
             "end duration missing",
             Some("span"),
-            Some(TraceSpanKind::Agent),
+            Some(TraceSpanKind::Turn),
             Some(TraceSpanPhase::End),
             Some(TraceSpanStatus::Ok),
             None,
@@ -621,7 +630,7 @@ fn trace_span_lifecycle_rejects_invalid_phase_combinations() {
         (
             "ttft wrong kind",
             Some("span"),
-            Some(TraceSpanKind::Tool),
+            Some(TraceSpanKind::ToolCall),
             Some(TraceSpanPhase::End),
             Some(TraceSpanStatus::Ok),
             Some(10),
@@ -651,9 +660,93 @@ fn trace_span_lifecycle_rejects_invalid_phase_combinations() {
     let mut self_parent = TraceEvent::new("self_parent", "run", "session", "test", "self");
     self_parent.span_id = Some("span".to_string());
     self_parent.parent_span_id = Some("span".to_string());
-    self_parent.span_kind = Some(TraceSpanKind::Agent);
+    self_parent.span_kind = Some(TraceSpanKind::Turn);
     self_parent.span_phase = Some(TraceSpanPhase::Start);
     assert!(self_parent.validate_span_lifecycle().is_err());
+}
+
+#[test]
+fn trace_span_kinds_are_the_closed_runtime_hierarchy_and_cancelled_is_distinct() {
+    let kinds = [
+        TraceSpanKind::Task,
+        TraceSpanKind::Turn,
+        TraceSpanKind::PromptAssembly,
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanKind::ToolCall,
+        TraceSpanKind::PolicyDecision,
+        TraceSpanKind::ApprovalWait,
+        TraceSpanKind::SandboxExecution,
+        TraceSpanKind::Verification,
+        TraceSpanKind::FinalReview,
+    ];
+    assert_eq!(kinds.len(), 10);
+    assert_eq!(TraceSpanStatus::Cancelled.as_storage_text(), "cancelled");
+    assert_eq!(
+        TraceSpanStatus::from_storage_text("cancelled"),
+        Some(TraceSpanStatus::Cancelled)
+    );
+}
+
+#[test]
+fn typed_span_projection_rejects_terminal_fields_on_start_and_wrong_kind_fields() {
+    let mut start = TraceEvent::new("projection_start", "run", "session", "test", "start");
+    start.span_id = Some("span".to_string());
+    start.span_kind = Some(TraceSpanKind::ProviderAttempt);
+    start.span_phase = Some(TraceSpanPhase::Start);
+    start.span_projection = Some(TraceSpanProjection {
+        queue_duration_ms: Some(3),
+        ..TraceSpanProjection::default()
+    });
+    assert!(start.validate_span_lifecycle().is_err());
+
+    let mut wrong_kind = TraceEvent::new("projection_wrong_kind", "run", "session", "test", "end");
+    wrong_kind.span_id = Some("span".to_string());
+    wrong_kind.span_kind = Some(TraceSpanKind::ToolCall);
+    wrong_kind.span_phase = Some(TraceSpanPhase::End);
+    wrong_kind.span_status = Some(TraceSpanStatus::Ok);
+    wrong_kind.duration_ms = Some(1);
+    wrong_kind.span_projection = Some(TraceSpanProjection {
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        ..TraceSpanProjection::default()
+    });
+    assert!(wrong_kind.validate_span_lifecycle().is_err());
+}
+
+#[test]
+fn trace_metric_samples_are_typed_and_end_only() {
+    let mut event = TraceEvent::new("metric", "run", "session", "test", "metric");
+    event.metric_samples.push(TraceMetricSample {
+        kind: TraceMetricSampleKind::EventGap,
+        count: 2,
+    });
+    assert!(event.validate_span_lifecycle().is_ok());
+
+    let mut invalid = event.clone();
+    invalid.span_id = Some("span".to_string());
+    invalid.span_kind = Some(TraceSpanKind::Turn);
+    invalid.span_phase = Some(TraceSpanPhase::Start);
+    assert!(invalid.validate_span_lifecycle().is_err());
+}
+
+#[test]
+fn trace_metrics_has_typed_request_and_result_contracts() {
+    let params = TraceMetricsParams {
+        run_id: "run".to_string(),
+    };
+    let metrics = TraceMetrics {
+        run_id: "run".to_string(),
+        metrics: Vec::new(),
+    };
+    let result = TraceMetricsResult { metrics };
+    assert_eq!(Method::parse("trace/metrics"), Some(Method::TraceMetrics));
+    assert_eq!(
+        serde_json::to_value(params).unwrap(),
+        serde_json::json!({"runId": "run"})
+    );
+    assert_eq!(
+        serde_json::to_value(result).unwrap()["metrics"]["runId"],
+        "run"
+    );
 }
 
 #[test]

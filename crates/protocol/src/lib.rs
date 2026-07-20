@@ -161,6 +161,7 @@ method_registry! {
     TraceList => ("trace/list", Request, TraceListParams, TraceListResult),
     TraceShow => ("trace/show", Request, TraceShowParams, TraceShowResult),
     TraceTail => ("trace/tail", Request, TraceTailParams, TraceListResult),
+    TraceMetrics => ("trace/metrics", Request, TraceMetricsParams, TraceMetricsResult),
     ServerShutdown => ("server/shutdown", Request, EmptyParams, ServerShutdownResult),
 }
 
@@ -993,6 +994,590 @@ pub struct TraceTailParams {
     pub offset: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// 后续 provider observation 可投影的线路协议；不携带 endpoint、凭证或 body。
+pub enum TraceProviderProtocol {
+    Declared,
+    OpenAiResponses,
+    OpenAiChatCompletions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// provider attempt 的业务阶段。
+pub enum TraceProviderOperationPhase {
+    CapabilityProbe,
+    Completion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// provider 错误的稳定分类；不保存原始错误文本。
+pub enum TraceErrorCategory {
+    Cancelled,
+    Authentication,
+    Network,
+    ModelConfiguration,
+    InvalidRequest,
+    ContextLengthExceeded,
+    BudgetExceeded,
+    ToolCallParse,
+    JsonSchema,
+    ContentFilter,
+    UnsupportedCapability,
+    ProviderUnavailable,
+    UnknownProviderError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// provider 错误发生的稳定阶段。
+pub enum TraceErrorStage {
+    ClientInitialization,
+    RequestSend,
+    ResponseStatus,
+    ResponseBodyRead,
+    ResponseJsonDecode,
+    ResponseValidation,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// provider usage 的安全数值投影。
+pub struct TraceUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// provider 错误的脱敏投影；`code` 只能是有界稳定代码。
+pub struct TraceErrorProjection {
+    pub category: TraceErrorCategory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<TraceErrorStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// tool occurrence 的安全终态。
+pub enum TraceToolStatus {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Rejected,
+    PolicyDenied,
+    ApprovalRequired,
+    BatchRejected,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// tool 名称、ordinal 和 digest 的闭集投影；不含 raw arguments。
+pub struct TraceToolProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_ordinal: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TraceToolStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// policy 的稳定决策值。
+pub enum TracePolicyDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// policy 的稳定原因分类。
+pub enum TracePolicyCause {
+    Explicit,
+    Rule,
+    FilesystemProfile,
+    NetworkProfile,
+    ProtectedResource,
+    NoMatchingRule,
+    ApprovalPolicy,
+    ApprovalGrant,
+    ApprovalState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// policy occurrence 的计数与决策投影；不含资源、规则或原始参数。
+pub struct TracePolicyProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<TracePolicyDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<TracePolicyCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// approval wait 的稳定结果。
+pub enum TraceApprovalOutcome {
+    Allow,
+    Deny,
+    Defer,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// approval wait 的安全结果投影；资源仍由 approval 合同单独管理。
+pub struct TraceApprovalProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<TraceApprovalOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// sandbox command 的稳定终态。
+pub enum TraceSandboxStatus {
+    Ok,
+    Error,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// sandbox execution 的安全投影；不含 command、cwd、path 或 environment。
+pub struct TraceSandboxProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id_binding_valid: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TraceSandboxStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// verification occurrence 的稳定结果。
+pub enum TraceVerificationStatus {
+    CommandPassed,
+    CommandFailed,
+    GatePassed,
+    GateRejected,
+    RepairRequested,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// verification 的安全计数投影。
+pub struct TraceVerificationProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TraceVerificationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_command_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub satisfied_command_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// final review 的稳定终态。
+pub enum TraceFinalReviewStatus {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// final review 的安全投影。
+pub struct TraceFinalReviewProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TraceFinalReviewStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_turn_ordinal: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// typed span 的闭集数据面；所有字符串都是安全标识或稳定代码。
+pub struct TraceSpanProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_token_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<TraceProviderProtocol>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_phase: Option<TraceProviderOperationPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_send_to_headers_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_backoff_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TraceUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TraceErrorProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<TraceToolProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<TracePolicyProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<TraceApprovalProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<TraceSandboxProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<TraceVerificationProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_review: Option<TraceFinalReviewProjection>,
+}
+
+impl TraceSpanProjection {
+    fn has_provider_fields(&self) -> bool {
+        self.provider_name.is_some()
+            || self.model_name.is_some()
+            || self.protocol.is_some()
+            || self.operation_phase.is_some()
+            || self.attempt_index.is_some()
+            || self.retry_count.is_some()
+            || self.queue_duration_ms.is_some()
+            || self.request_send_to_headers_ms.is_some()
+            || self.retry_backoff_ms.is_some()
+            || self.usage.is_some()
+            || self.error.is_some()
+    }
+
+    fn has_terminal_fields(&self) -> bool {
+        self.queue_duration_ms.is_some()
+            || self.request_send_to_headers_ms.is_some()
+            || self.retry_backoff_ms.is_some()
+            || self.usage.is_some()
+            || self.error.is_some()
+            || self
+                .tool
+                .as_ref()
+                .is_some_and(|value| value.status.is_some())
+            || self
+                .policy
+                .as_ref()
+                .is_some_and(|value| value.decision.is_some())
+            || self
+                .approval
+                .as_ref()
+                .is_some_and(|value| value.outcome.is_some())
+            || self
+                .sandbox
+                .as_ref()
+                .is_some_and(|value| value.status.is_some())
+            || self
+                .verification
+                .as_ref()
+                .is_some_and(|value| value.status.is_some() || value.command_duration_ms.is_some())
+            || self
+                .final_review
+                .as_ref()
+                .is_some_and(|value| value.status.is_some())
+    }
+
+    /// Validate the closed field set for a span kind and lifecycle phase.
+    pub fn validate_for(&self, kind: TraceSpanKind, phase: TraceSpanPhase) -> Result<(), String> {
+        let allowed = match kind {
+            TraceSpanKind::Task | TraceSpanKind::Turn => {
+                !self.has_provider_fields()
+                    && self.tool.is_none()
+                    && self.policy.is_none()
+                    && self.approval.is_none()
+                    && self.sandbox.is_none()
+                    && self.verification.is_none()
+                    && self.final_review.is_none()
+            }
+            TraceSpanKind::PromptAssembly => {
+                !self.has_provider_fields()
+                    && self.tool.is_none()
+                    && self.policy.is_none()
+                    && self.approval.is_none()
+                    && self.sandbox.is_none()
+                    && self.verification.is_none()
+                    && self.final_review.is_none()
+            }
+            TraceSpanKind::ProviderAttempt => {
+                self.tool.is_none()
+                    && self.policy.is_none()
+                    && self.approval.is_none()
+                    && self.sandbox.is_none()
+                    && self.verification.is_none()
+                    && self.final_review.is_none()
+            }
+            TraceSpanKind::ToolCall => {
+                !self.has_provider_fields()
+                    && self.policy.is_none()
+                    && self.approval.is_none()
+                    && self.sandbox.is_none()
+                    && self.verification.is_none()
+                    && self.final_review.is_none()
+            }
+            TraceSpanKind::PolicyDecision => {
+                !self.has_provider_fields()
+                    && self.tool.is_none()
+                    && self.approval.is_none()
+                    && self.sandbox.is_none()
+                    && self.verification.is_none()
+                    && self.final_review.is_none()
+            }
+            TraceSpanKind::ApprovalWait => {
+                !self.has_provider_fields()
+                    && self.tool.is_none()
+                    && self.policy.is_none()
+                    && self.sandbox.is_none()
+                    && self.verification.is_none()
+                    && self.final_review.is_none()
+            }
+            TraceSpanKind::SandboxExecution => {
+                !self.has_provider_fields()
+                    && self.tool.is_none()
+                    && self.policy.is_none()
+                    && self.approval.is_none()
+                    && self.verification.is_none()
+                    && self.final_review.is_none()
+            }
+            TraceSpanKind::Verification => {
+                !self.has_provider_fields()
+                    && self.tool.is_none()
+                    && self.policy.is_none()
+                    && self.approval.is_none()
+                    && self.sandbox.is_none()
+                    && self.final_review.is_none()
+            }
+            TraceSpanKind::FinalReview => {
+                !self.has_provider_fields()
+                    && self.tool.is_none()
+                    && self.policy.is_none()
+                    && self.approval.is_none()
+                    && self.sandbox.is_none()
+                    && self.verification.is_none()
+            }
+        };
+        if !allowed {
+            return Err("typed span projection fields do not match span kind".to_string());
+        }
+        if phase == TraceSpanPhase::Start && self.has_terminal_fields() {
+            return Err("span start must not include terminal projection fields".to_string());
+        }
+        Ok(())
+    }
+
+    /// Compare only start/end attributes that must remain stable for one span.
+    pub fn same_identity_attributes(&self, other: &Self) -> bool {
+        self.operation_count == other.operation_count
+            && self.message_count == other.message_count
+            && self.tool_count == other.tool_count
+            && self.request_token_count == other.request_token_count
+            && self.provider_name == other.provider_name
+            && self.model_name == other.model_name
+            && self.protocol == other.protocol
+            && self.operation_phase == other.operation_phase
+            && self.attempt_index == other.attempt_index
+            && self.tool.as_ref().map(|value| {
+                (
+                    value.tool_name.clone(),
+                    value.tool_call_id_digest.clone(),
+                    value.tool_call_ordinal,
+                )
+            }) == other.tool.as_ref().map(|value| {
+                (
+                    value.tool_name.clone(),
+                    value.tool_call_id_digest.clone(),
+                    value.tool_call_ordinal,
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// 同一领域事件可产生的有限 metric sample 类型。
+pub enum TraceMetricSampleKind {
+    CompletionRejection,
+    CompletionRepair,
+    EventQueueDrop,
+    EventGap,
+    WriterVisible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// closed metric sample；count 为正整数，不保存原始事件内容。
+pub struct TraceMetricSample {
+    pub kind: TraceMetricSampleKind,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// trace metrics 的稳定名称。
+pub enum TraceMetricName {
+    TaskDurationMs,
+    TurnDurationMs,
+    ProviderAttemptDurationMs,
+    ProviderSendToHeadersMs,
+    ProviderTimeToFirstTokenMs,
+    ProviderQueueDurationMs,
+    ProviderRetryCount,
+    ProviderRetryBackoffMs,
+    ProviderErrorCount,
+    ProviderInputTokens,
+    ProviderOutputTokens,
+    ProviderTotalTokens,
+    ToolFrequency,
+    ToolSuccessCount,
+    ToolDurationMs,
+    ApprovalWaitDurationMs,
+    SandboxExecutionDurationMs,
+    VerificationDurationMs,
+    FinalReviewDurationMs,
+    CompletionRejectionCount,
+    CompletionRepairCount,
+    EventQueueDropCount,
+    EventGapCount,
+    WriterVisibleCount,
+}
+
+impl TraceMetricName {
+    pub const fn as_storage_text(self) -> &'static str {
+        match self {
+            Self::TaskDurationMs => "task_duration_ms",
+            Self::TurnDurationMs => "turn_duration_ms",
+            Self::ProviderAttemptDurationMs => "provider_attempt_duration_ms",
+            Self::ProviderSendToHeadersMs => "provider_send_to_headers_ms",
+            Self::ProviderTimeToFirstTokenMs => "provider_time_to_first_token_ms",
+            Self::ProviderQueueDurationMs => "provider_queue_duration_ms",
+            Self::ProviderRetryCount => "provider_retry_count",
+            Self::ProviderRetryBackoffMs => "provider_retry_backoff_ms",
+            Self::ProviderErrorCount => "provider_error_count",
+            Self::ProviderInputTokens => "provider_input_tokens",
+            Self::ProviderOutputTokens => "provider_output_tokens",
+            Self::ProviderTotalTokens => "provider_total_tokens",
+            Self::ToolFrequency => "tool_frequency",
+            Self::ToolSuccessCount => "tool_success_count",
+            Self::ToolDurationMs => "tool_duration_ms",
+            Self::ApprovalWaitDurationMs => "approval_wait_duration_ms",
+            Self::SandboxExecutionDurationMs => "sandbox_execution_duration_ms",
+            Self::VerificationDurationMs => "verification_duration_ms",
+            Self::FinalReviewDurationMs => "final_review_duration_ms",
+            Self::CompletionRejectionCount => "completion_rejection_count",
+            Self::CompletionRepairCount => "completion_repair_count",
+            Self::EventQueueDropCount => "event_queue_drop_count",
+            Self::EventGapCount => "event_gap_count",
+            Self::WriterVisibleCount => "writer_visible_count",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// metrics 不可用时的稳定原因。
+pub enum TraceMetricUnavailableReason {
+    NoProducer,
+    LegacyOnly,
+    IncompleteStartEnd,
+    NonStreamingTtft,
+    MissingTrueTiming,
+    MissingUsage,
+    MissingMetricValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+/// 每个 metric 都显式表达可用或不可用，未知不使用零值伪装。
+pub enum TraceMetricAvailability {
+    Available,
+    Unavailable {
+        reason: TraceMetricUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// 使用 nearest-rank 的确定性分布摘要。
+pub struct TraceMetricDistribution {
+    pub count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p50: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p95: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// 单个派生 metric 的公共结果。
+pub struct TraceMetric {
+    pub name: TraceMetricName,
+    pub availability: TraceMetricAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<TraceMetricDistribution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// 从唯一 trace_events 权威派生的 run metrics。
+pub struct TraceMetrics {
+    #[serde(rename = "runId")]
+    pub run_id: String,
+    pub metrics: Vec<TraceMetric>,
+}
+
+impl TraceMetrics {
+    pub fn metric(&self, name: &str) -> Option<&TraceMetric> {
+        self.metrics
+            .iter()
+            .find(|metric| metric.name.as_storage_text() == name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// trace/metrics 的参数。
+pub struct TraceMetricsParams {
+    #[serde(rename = "runId")]
+    pub run_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 /// trace/list 的响应。
 pub struct TraceListResult {
@@ -1003,6 +1588,12 @@ pub struct TraceListResult {
 /// trace/show 的类型化响应。
 pub struct TraceShowResult {
     pub event: TraceEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// trace/metrics 的类型化响应。
+pub struct TraceMetricsResult {
+    pub metrics: TraceMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1074,6 +1665,12 @@ pub struct TraceEvent {
     /// Measured time until the first provider token was observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_to_first_token_ms: Option<u64>,
+    /// 后续 Agent observation/provider attempt 的闭集安全投影。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_projection: Option<TraceSpanProjection>,
+    /// 同一领域事件产生的 closed metric samples。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metric_samples: Vec<TraceMetricSample>,
     pub redaction_applied: bool,
     pub payload_hash: String,
 }
@@ -1082,36 +1679,48 @@ pub struct TraceEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceSpanKind {
-    Internal,
-    Agent,
+    Task,
+    Turn,
+    PromptAssembly,
     ProviderAttempt,
-    Tool,
-    Sandbox,
-    Approval,
+    ToolCall,
+    PolicyDecision,
+    ApprovalWait,
+    SandboxExecution,
+    Verification,
+    FinalReview,
 }
 
 impl TraceSpanKind {
     /// Return the stable text stored in SQLite and serialized on the wire.
     pub const fn as_storage_text(self) -> &'static str {
         match self {
-            Self::Internal => "internal",
-            Self::Agent => "agent",
+            Self::Task => "task",
+            Self::Turn => "turn",
+            Self::PromptAssembly => "prompt_assembly",
             Self::ProviderAttempt => "provider_attempt",
-            Self::Tool => "tool",
-            Self::Sandbox => "sandbox",
-            Self::Approval => "approval",
+            Self::ToolCall => "tool_call",
+            Self::PolicyDecision => "policy_decision",
+            Self::ApprovalWait => "approval_wait",
+            Self::SandboxExecution => "sandbox_execution",
+            Self::Verification => "verification",
+            Self::FinalReview => "final_review",
         }
     }
 
     /// Decode the stable SQLite/wire representation.
     pub fn from_storage_text(value: &str) -> Option<Self> {
         match value {
-            "internal" => Some(Self::Internal),
-            "agent" => Some(Self::Agent),
+            "task" => Some(Self::Task),
+            "turn" => Some(Self::Turn),
+            "prompt_assembly" => Some(Self::PromptAssembly),
             "provider_attempt" => Some(Self::ProviderAttempt),
-            "tool" => Some(Self::Tool),
-            "sandbox" => Some(Self::Sandbox),
-            "approval" => Some(Self::Approval),
+            "tool_call" => Some(Self::ToolCall),
+            "policy_decision" => Some(Self::PolicyDecision),
+            "approval_wait" => Some(Self::ApprovalWait),
+            "sandbox_execution" => Some(Self::SandboxExecution),
+            "verification" => Some(Self::Verification),
+            "final_review" => Some(Self::FinalReview),
             _ => None,
         }
     }
@@ -1151,6 +1760,7 @@ pub enum TraceSpanStatus {
     Unset,
     Ok,
     Error,
+    Cancelled,
 }
 
 impl TraceSpanStatus {
@@ -1160,6 +1770,7 @@ impl TraceSpanStatus {
             Self::Unset => "unset",
             Self::Ok => "ok",
             Self::Error => "error",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -1169,6 +1780,7 @@ impl TraceSpanStatus {
             "unset" => Some(Self::Unset),
             "ok" => Some(Self::Ok),
             "error" => Some(Self::Error),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -1188,6 +1800,9 @@ pub enum TraceSpanValidationError {
     EndDurationRequired,
     TimeToFirstTokenRequiresProviderAttempt,
     TimeToFirstTokenExceedsDuration,
+    MetricSampleCountZero,
+    MetricSamplesRequireEnd,
+    InvalidProjection(String),
 }
 
 impl std::fmt::Display for TraceSpanValidationError {
@@ -1210,6 +1825,9 @@ impl std::fmt::Display for TraceSpanValidationError {
             Self::TimeToFirstTokenExceedsDuration => {
                 "time_to_first_token_ms must not exceed duration_ms"
             }
+            Self::MetricSampleCountZero => "trace metric sample count must be positive",
+            Self::MetricSamplesRequireEnd => "trace metric samples require a span end",
+            Self::InvalidProjection(message) => message,
         };
         formatter.write_str(message)
     }
@@ -1290,6 +1908,8 @@ impl TraceEvent {
             span_status: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            span_projection: None,
+            metric_samples: Vec::new(),
             redaction_applied: false,
             payload_hash: String::new(),
         }
@@ -1345,15 +1965,37 @@ impl TraceEvent {
 
     /// Validate the local contract for an optional typed span event.
     pub fn validate_span_lifecycle(&self) -> Result<(), TraceSpanValidationError> {
+        for sample in &self.metric_samples {
+            if sample.count == 0 {
+                return Err(TraceSpanValidationError::MetricSampleCountZero);
+            }
+        }
         let has_span_fields = self.span_id.is_some()
             || self.parent_span_id.is_some()
             || self.span_kind.is_some()
             || self.span_phase.is_some()
             || self.span_status.is_some()
             || self.duration_ms.is_some()
-            || self.time_to_first_token_ms.is_some();
+            || self.time_to_first_token_ms.is_some()
+            || self.span_projection.is_some();
         if !has_span_fields {
             return Ok(());
+        }
+
+        if !self.metric_samples.is_empty() && self.span_phase != Some(TraceSpanPhase::End) {
+            return Err(TraceSpanValidationError::MetricSamplesRequireEnd);
+        }
+
+        let span_kind = self
+            .span_kind
+            .ok_or(TraceSpanValidationError::SpanKindRequired)?;
+        let span_phase = self
+            .span_phase
+            .ok_or(TraceSpanValidationError::SpanPhaseRequired)?;
+        if let Some(projection) = &self.span_projection {
+            projection
+                .validate_for(span_kind, span_phase)
+                .map_err(TraceSpanValidationError::InvalidProjection)?;
         }
 
         let span_id = self
@@ -1371,12 +2013,6 @@ impl TraceEvent {
                 return Err(TraceSpanValidationError::ParentSpanIdSelf);
             }
         }
-        let span_kind = self
-            .span_kind
-            .ok_or(TraceSpanValidationError::SpanKindRequired)?;
-        let span_phase = self
-            .span_phase
-            .ok_or(TraceSpanValidationError::SpanPhaseRequired)?;
         match span_phase {
             TraceSpanPhase::Start => {
                 if self.span_status.is_some()

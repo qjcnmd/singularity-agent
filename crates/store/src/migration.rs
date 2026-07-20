@@ -378,7 +378,9 @@ begin
            span_phase = json_extract(new.payload, '$.span_phase'),
            span_status = json_extract(new.payload, '$.span_status'),
            duration_ms = json_extract(new.payload, '$.duration_ms'),
-           time_to_first_token_ms = json_extract(new.payload, '$.time_to_first_token_ms')
+           time_to_first_token_ms = json_extract(new.payload, '$.time_to_first_token_ms'),
+           span_projection = json_extract(new.payload, '$.span_projection'),
+           metric_samples = coalesce(json_extract(new.payload, '$.metric_samples'), '[]')
      where event_id = new.event_id;
 end;
 "#;
@@ -406,13 +408,15 @@ session_id text not null default '',\n\
 payload text not null,\n\
 span_id text\n    check(span_id is null or length(trim(span_id)) > 0),\n\
 parent_span_id text\n    check(parent_span_id is null or length(trim(parent_span_id)) > 0),\n\
-span_kind text\n    check(span_kind in ('internal', 'agent', 'provider_attempt', 'tool', 'sandbox', 'approval')\n          or span_kind is null),\n\
+  span_kind text\n    check(span_kind in ('task', 'turn', 'prompt_assembly', 'provider_attempt', 'tool_call',\n                        'policy_decision', 'approval_wait', 'sandbox_execution',\n                        'verification', 'final_review')\n          or span_kind is null),\n\
 span_phase text\n    check(span_phase in ('start', 'end') or span_phase is null),\n\
-span_status text\n    check(span_status in ('unset', 'ok', 'error') or span_status is null),\n\
+  span_status text\n    check(span_status in ('unset', 'ok', 'error', 'cancelled') or span_status is null),\n\
 duration_ms integer\n    check(duration_ms >= 0 or duration_ms is null),\n\
-time_to_first_token_ms integer\n    check(time_to_first_token_ms >= 0 or time_to_first_token_ms is null),\n\
-check((span_id is null and parent_span_id is null and span_kind is null\n       and span_phase is null and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null)\n      or (span_id is not null and span_kind is not null and span_phase is not null)),\n\
-check((span_phase = 'start' and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null)\n      or (span_phase = 'end' and span_status is not null and duration_ms is not null)\n      or span_phase is null),\n\
+  time_to_first_token_ms integer\n    check(time_to_first_token_ms >= 0 or time_to_first_token_ms is null),\n\
+  span_projection text\n    check(span_projection is null or json_valid(span_projection)),\n\
+  metric_samples text not null default '[]'\n    check(json_valid(metric_samples) and json_type(metric_samples) = 'array'),\n\
+  check((span_id is null and parent_span_id is null and span_kind is null\n       and span_phase is null and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null and span_projection is null)\n      or (span_id is not null and span_kind is not null and span_phase is not null)),\n\
+  check((span_phase = 'start' and span_status is null and duration_ms is null\n       and time_to_first_token_ms is null and metric_samples = '[]')\n      or (span_phase = 'end' and span_status is not null and duration_ms is not null)\n      or span_phase is null),\n\
 check(time_to_first_token_ms is null or span_kind = 'provider_attempt'),\n\
 check(time_to_first_token_ms is null or duration_ms is null\n      or time_to_first_token_ms <= duration_ms),\n\
 check(parent_span_id is null or parent_span_id <> span_id)\n\

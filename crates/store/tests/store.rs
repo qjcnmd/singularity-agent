@@ -7,8 +7,9 @@ use singularity_policy::{
     PermissionResource, ToolId, WorkspaceRelativePath,
 };
 use singularity_protocol::{
-    ItemKind, ThreadStatus, TraceBindingError, TraceEvent, TraceSpanKind, TraceSpanPhase,
-    TraceSpanStatus, TurnStatus,
+    ItemKind, ThreadStatus, TraceBindingError, TraceEvent, TraceMetricAvailability,
+    TraceMetricSample, TraceMetricSampleKind, TraceProviderProtocol, TraceSpanKind, TraceSpanPhase,
+    TraceSpanProjection, TraceSpanStatus, TraceUsage, TurnStatus,
 };
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
@@ -3832,6 +3833,284 @@ fn typed_trace_span_lifecycle_rejects_duplicates_and_cross_run_parents() {
 }
 
 #[test]
+fn append_trace_batch_validates_every_event_before_any_insert() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let valid_start = provider_span("batch_start", TraceSpanPhase::Start);
+    let valid_end = provider_span("batch_end", TraceSpanPhase::End);
+    let mut invalid = provider_span("batch_invalid", TraceSpanPhase::Start);
+    invalid.span_status = Some(TraceSpanStatus::Error);
+
+    assert!(
+        store
+            .append_trace_batch(&[valid_start, valid_end, invalid])
+            .is_err()
+    );
+    assert!(matches!(
+        store.list_trace("run_span"),
+        Err(StoreError::NotFound(message)) if message == "trace run run_span"
+    ));
+}
+
+#[test]
+fn append_trace_batch_rejects_overflow_before_persisting_any_event() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let start = provider_span("overflow_start", TraceSpanPhase::Start);
+    let mut end = provider_span("overflow_end", TraceSpanPhase::End);
+    end.duration_ms = Some(u64::MAX);
+    assert!(store.append_trace_batch(&[start, end]).is_err());
+    assert!(matches!(
+        store.list_trace("run_span"),
+        Err(StoreError::NotFound(message)) if message == "trace run run_span"
+    ));
+}
+
+#[test]
+fn trace_metrics_report_incomplete_start_end_without_faking_duration_zero() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    store
+        .append_trace(&metric_span(
+            "incomplete_turn_start",
+            "incomplete_turn",
+            TraceSpanKind::Turn,
+            TraceSpanPhase::Start,
+            0,
+        ))
+        .expect("start-only span");
+    let metrics = store.trace_metrics("metrics_run").expect("metrics");
+    let metric = metrics.metric("turn_duration_ms").expect("turn metric");
+    assert!(matches!(
+        metric.availability,
+        TraceMetricAvailability::Unavailable {
+            reason: singularity_protocol::TraceMetricUnavailableReason::IncompleteStartEnd
+        }
+    ));
+    assert!(metric.distribution.is_none());
+}
+
+fn metric_span(
+    event_id: &str,
+    span_id: &str,
+    kind: TraceSpanKind,
+    phase: TraceSpanPhase,
+    duration_ms: u64,
+) -> TraceEvent {
+    let mut event = TraceEvent::new(
+        event_id,
+        "metrics_run",
+        "metrics_session",
+        "metrics",
+        "span",
+    );
+    event.span_id = Some(span_id.to_string());
+    event.span_kind = Some(kind);
+    event.span_phase = Some(phase);
+    if phase == TraceSpanPhase::End {
+        event.span_status = Some(TraceSpanStatus::Ok);
+        event.duration_ms = Some(duration_ms);
+    }
+    event
+}
+
+#[test]
+fn trace_metrics_are_derived_from_typed_trace_events_with_deterministic_percentiles() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+
+    let mut provider_start = metric_span(
+        "provider_start_1",
+        "provider_1",
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanPhase::Start,
+        0,
+    );
+    provider_start.span_projection = Some(TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        attempt_index: Some(1),
+        ..TraceSpanProjection::default()
+    });
+    let mut provider_end = metric_span(
+        "provider_end_1",
+        "provider_1",
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanPhase::End,
+        10,
+    );
+    provider_end.time_to_first_token_ms = Some(4);
+    provider_end.span_projection = Some(TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        attempt_index: Some(1),
+        retry_count: Some(0),
+        request_send_to_headers_ms: Some(3),
+        queue_duration_ms: Some(1),
+        usage: Some(TraceUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
+        }),
+        ..TraceSpanProjection::default()
+    });
+
+    let mut provider_start_2 = metric_span(
+        "provider_start_2",
+        "provider_2",
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanPhase::Start,
+        0,
+    );
+    provider_start_2.span_projection = Some(TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        attempt_index: Some(2),
+        ..TraceSpanProjection::default()
+    });
+    let mut provider_end_2 = metric_span(
+        "provider_end_2",
+        "provider_2",
+        TraceSpanKind::ProviderAttempt,
+        TraceSpanPhase::End,
+        20,
+    );
+    provider_end_2.time_to_first_token_ms = Some(8);
+    provider_end_2.span_projection = Some(TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        attempt_index: Some(2),
+        retry_count: Some(1),
+        retry_backoff_ms: Some(6),
+        ..TraceSpanProjection::default()
+    });
+
+    let mut tool_start = metric_span(
+        "tool_start",
+        "tool_1",
+        TraceSpanKind::ToolCall,
+        TraceSpanPhase::Start,
+        0,
+    );
+    tool_start.span_projection = Some(TraceSpanProjection {
+        tool: Some(Default::default()),
+        ..TraceSpanProjection::default()
+    });
+    let mut tool_end = metric_span(
+        "tool_end",
+        "tool_1",
+        TraceSpanKind::ToolCall,
+        TraceSpanPhase::End,
+        7,
+    );
+    tool_end.span_projection = Some(TraceSpanProjection {
+        tool: Some(Default::default()),
+        ..TraceSpanProjection::default()
+    });
+
+    let mut samples = TraceEvent::new(
+        "metric_samples",
+        "metrics_run",
+        "metrics_session",
+        "metrics",
+        "samples",
+    );
+    samples.metric_samples = vec![
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::CompletionRejection,
+            count: 2,
+        },
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::CompletionRepair,
+            count: 1,
+        },
+        TraceMetricSample {
+            kind: TraceMetricSampleKind::EventGap,
+            count: 3,
+        },
+    ];
+
+    store
+        .append_trace_batch(&[
+            provider_start,
+            provider_end,
+            provider_start_2,
+            provider_end_2,
+            tool_start,
+            tool_end,
+            samples,
+        ])
+        .expect("append metric events");
+
+    let metrics = store.trace_metrics("metrics_run").expect("trace metrics");
+    let provider_duration = metrics
+        .metric("provider_attempt_duration_ms")
+        .expect("provider duration metric");
+    let distribution = provider_duration
+        .distribution
+        .as_ref()
+        .expect("distribution");
+    assert_eq!(distribution.count, 2);
+    assert_eq!(distribution.p50, Some(10));
+    assert_eq!(distribution.p95, Some(20));
+    assert!(matches!(
+        metrics
+            .metric("provider_time_to_first_token_ms")
+            .expect("ttft")
+            .availability,
+        TraceMetricAvailability::Available
+    ));
+    assert_eq!(
+        metrics
+            .metric("completion_rejection_count")
+            .expect("rejection")
+            .distribution
+            .as_ref()
+            .expect("rejection distribution")
+            .count,
+        1
+    );
+}
+
+#[test]
+fn trace_metrics_expose_unavailable_reasons_instead_of_zero_placeholders() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    store
+        .append_trace(&TraceEvent::new(
+            "legacy_metric_event",
+            "legacy_metric_run",
+            "legacy_metric_session",
+            "legacy",
+            "legacy",
+        ))
+        .expect("legacy event");
+    let metrics = store
+        .trace_metrics("legacy_metric_run")
+        .expect("legacy metrics");
+    assert!(matches!(
+        metrics
+            .metric("provider_time_to_first_token_ms")
+            .expect("ttft")
+            .availability,
+        TraceMetricAvailability::Unavailable { .. }
+    ));
+    assert!(
+        metrics
+            .metric("provider_time_to_first_token_ms")
+            .expect("ttft")
+            .distribution
+            .is_none()
+    );
+}
+
+#[test]
 fn trace_envelope_and_projection_tampering_fail_closed() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
@@ -3872,7 +4151,7 @@ fn trace_envelope_and_projection_tampering_fail_closed() {
     let connection = rusqlite::Connection::open(&db_path).expect("open projection connection");
     connection
         .execute(
-            "update trace_events set span_kind = 'tool' where event_id = 'projection_tampered'",
+            "update trace_events set span_kind = 'turn' where event_id = 'projection_tampered'",
             [],
         )
         .expect("tamper projection");

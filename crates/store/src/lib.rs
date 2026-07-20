@@ -30,7 +30,10 @@ use singularity_policy::{
 };
 use singularity_protocol::{
     ArtifactRef, Item, ItemKind, ItemStatus, Thread, ThreadStatus, TraceBindingError, TraceEvent,
-    TraceSpanPhase, Turn, TurnStatus,
+    TraceMetric, TraceMetricAvailability, TraceMetricDistribution, TraceMetricName,
+    TraceMetricSample, TraceMetricSampleKind, TraceMetricUnavailableReason, TraceMetrics,
+    TraceProviderProtocol, TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
+    TraceUsage, Turn, TurnStatus,
 };
 /// 供上层重建 conversation history 的 protocol 类型。
 pub use singularity_protocol::{ConversationMessage, ConversationRole};
