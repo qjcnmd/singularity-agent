@@ -66,6 +66,14 @@ struct StreamingProvider {
     capabilities: ProviderProtocolContract,
 }
 
+struct FinalizationStreamProvider {
+    setup_response: ModelTurnResponse,
+    final_events: Vec<ProviderStreamEvent>,
+    final_response: Result<ModelTurnResponse, ProviderError>,
+    cancel_on_finalization: bool,
+    seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
+}
+
 struct FinalizationAwareProvider {
     setup_responses: Vec<ModelTurnResponse>,
     repeated_tool_response: ModelTurnResponse,
@@ -161,6 +169,42 @@ impl Provider for StreamingProvider {
         _cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError> {
         panic!("streaming provider must not use non-stream completion")
+    }
+}
+
+impl Provider for FinalizationStreamProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
+        seen_requests.push(request.clone());
+        let finalization_only =
+            request.tool_choice.mode == ToolChoiceMode::None && request.tools.is_empty();
+        if !finalization_only {
+            return Ok(self.setup_response.clone());
+        }
+        for event in &self.final_events {
+            on_event(event.clone());
+        }
+        if self.cancel_on_finalization {
+            cancellation.cancel();
+        }
+        self.final_response.clone()
+    }
+
+    fn complete(
+        &self,
+        _request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        panic!("finalization stream provider must not use non-stream completion")
     }
 }
 
@@ -650,6 +694,59 @@ fn test_command_script(argument: &str) -> String {
     format!("test-program {argument}")
 }
 
+fn finalization_stream_fixture() -> (AgentLoopInput, ModelTurnResponse) {
+    let verification_argv = test_command("verify");
+    let verification_digest = command_script_scope_digest_with_policy(
+        &verification_argv.join(" "),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let mut setup_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "");
+    let call = tool_call(
+        "verify_call",
+        "command",
+        serde_json::json!({
+            "command": verification_argv.join(" "),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    );
+    setup_response.tool_calls = vec![call.clone()];
+    setup_response.assistant_message = Some(ModelMessage {
+        role: ModelRole::Assistant,
+        content: String::new(),
+        tool_call_id: None,
+        tool_calls: vec![call],
+    });
+    (
+        AgentLoopInput::new("thread_1", "turn_1", "verify")
+            .with_max_turns(2)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                verification_digest,
+                1,
+            )]),
+        setup_response,
+    )
+}
+
+fn finalization_stream_agent(
+    provider: FinalizationStreamProvider,
+) -> AgentLoop<FinalizationStreamProvider> {
+    AgentLoop::new(
+        provider,
+        agent_tool_broker_for_test(false),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(env!("CARGO_MANIFEST_DIR"))
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+}
+
 fn plan_tool_call(id: &str, steps: serde_json::Value) -> ModelToolCall {
     tool_call(id, "update_plan", serde_json::json!({"steps": steps}))
 }
@@ -922,6 +1019,66 @@ fn agent_loop_keeps_partial_callback_text_when_terminal_validation_fails() {
         Some("provider_stream_text_mismatch".to_string())
     );
     assert!(!result.completed);
+}
+
+#[test]
+fn agent_loop_keeps_partial_callback_text_when_finalization_stream_fails() {
+    let (input, setup_response) = finalization_stream_fixture();
+    let error = ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnknownProviderError,
+            "finalization stream failed",
+        )
+        .with_provider_diagnostic(
+            "finalization_stream_failed",
+            singularity_model::ProviderErrorStage::ResponseValidation,
+        ),
+    );
+    let mut deltas = Vec::new();
+    let result = finalization_stream_agent(FinalizationStreamProvider {
+        setup_response,
+        final_events: vec![ProviderStreamEvent::OutputTextDelta {
+            delta: "partial".to_string(),
+        }],
+        final_response: Err(error),
+        cancel_on_finalization: false,
+        seen_requests: Arc::new(Mutex::new(Vec::new())),
+    })
+    .run_with_text_deltas(&input, &mut |delta| deltas.push(delta.to_string()));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(!result.completed);
+    assert!(result.final_answer.is_none());
+    assert_eq!(deltas, ["partial"]);
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .and_then(|diagnostic| diagnostic.code),
+        Some("finalization_stream_failed".to_string())
+    );
+}
+
+#[test]
+fn agent_loop_keeps_partial_callback_text_when_finalization_is_cancelled() {
+    let (input, setup_response) = finalization_stream_fixture();
+    let late_terminal =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_late", "late terminal");
+    let mut deltas = Vec::new();
+    let result = finalization_stream_agent(FinalizationStreamProvider {
+        setup_response,
+        final_events: vec![ProviderStreamEvent::OutputTextDelta {
+            delta: "partial".to_string(),
+        }],
+        final_response: Ok(late_terminal),
+        cancel_on_finalization: true,
+        seen_requests: Arc::new(Mutex::new(Vec::new())),
+    })
+    .run_with_text_deltas(&input, &mut |delta| deltas.push(delta.to_string()));
+
+    assert_eq!(result.status, AgentStatus::Cancelled);
+    assert!(!result.completed);
+    assert!(result.final_answer.is_none());
+    assert_eq!(deltas, ["partial"]);
 }
 
 #[test]
