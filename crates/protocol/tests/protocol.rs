@@ -38,15 +38,19 @@ fn json_rpc_rejects_ambiguous_envelopes_and_non_scalar_ids() {
 }
 
 #[test]
-fn json_rpc_accepts_and_echoes_every_standard_id_shape() {
+fn json_rpc_accepts_and_echoes_every_supported_id_shape() {
     for (raw, expected) in [
         (
             r#"{"jsonrpc":"2.0","method":"thread/list","id":null,"params":{}}"#,
             JsonRpcId::Null,
         ),
         (
-            r#"{"jsonrpc":"2.0","method":"thread/list","id":1.5,"params":{}}"#,
-            JsonRpcId::Fraction(1.5),
+            r#"{"jsonrpc":"2.0","method":"thread/list","id":"request-1","params":{}}"#,
+            JsonRpcId::String("request-1".to_string()),
+        ),
+        (
+            r#"{"jsonrpc":"2.0","method":"thread/list","id":-7,"params":{}}"#,
+            JsonRpcId::Number(-7),
         ),
         (
             r#"{"jsonrpc":"2.0","method":"thread/list","id":18446744073709551615,"params":{}}"#,
@@ -59,6 +63,23 @@ fn json_rpc_accepts_and_echoes_every_standard_id_shape() {
         let response = JsonRpcMessage::response(expected, serde_json::json!({})).to_wire_value();
         assert_eq!(response["id"], request_value["id"]);
     }
+}
+
+#[test]
+fn json_rpc_rejects_fractional_ids_as_invalid_request_with_null_id() {
+    let raw = r#"{"jsonrpc":"2.0","method":"thread/list","id":1.5,"params":{}}"#;
+
+    assert!(serde_json::from_str::<JsonRpcMessage>(raw).is_err());
+    assert_eq!(
+        parse_json_rpc_payload(raw).expect("valid JSON frame"),
+        JsonRpcPayload::Single(JsonRpcBatchItem::Invalid { id: None })
+    );
+
+    let response = JsonRpcMessage::invalid_request(None).to_wire_value();
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], serde_json::Value::Null);
+    assert_eq!(response["error"]["code"], -32600);
+    assert_eq!(response["error"]["message"], "Invalid Request");
 }
 
 #[test]
