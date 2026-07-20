@@ -1,10 +1,16 @@
 //! AgentLoop 的 Direct tool、completion、approval 和恢复回归测试。
 
+// Model 的运行时-only attempt occurrences 字段在并行候选中加入；当前基线尚无该字段。
+#![allow(clippy::needless_update)]
+
 use singularity_agent::{
-    AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopInput, AgentLoopResult,
-    AgentPlan, AgentPlanStep, AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics,
-    AgentStatus, AgentVerificationRequirement, ApprovalGrant, PendingApprovalOccurrence,
-    agent_control_tool_entries, assemble_context_items,
+    AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
+    AgentLoopInput, AgentLoopResult, AgentObservation, AgentPlan, AgentPlanStep,
+    AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentStatus,
+    AgentVerificationRequirement, ApprovalGrant, FinalReviewStatus, OccurrenceLifecycle,
+    PendingApprovalOccurrence, PolicyDecisionCause, PolicyDecisionStatus, PromptAssemblyStatus,
+    SandboxExecutionStatus, ToolCallStatus, VerificationStatus, agent_control_tool_entries,
+    assemble_context_items,
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
@@ -267,6 +273,7 @@ fn negotiated_capability_metadata() -> ProviderCapabilityMetadata {
             attempt_count: 2,
             retry_count: 1,
             latency_ms: 7,
+            ..Default::default()
         },
     }
 }
@@ -783,6 +790,79 @@ fn agent_loop_read_only_final_answer_completes_without_verification() {
 }
 
 #[test]
+fn event_aware_run_reports_safe_prompt_assembly_at_the_request_boundary() {
+    let secret = "sk-secret-prompt-value";
+    let input = AgentLoopInput::new("thread_1", "turn_1", secret);
+    let mut events = Vec::new();
+    let result = agent_loop_with_response(
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "done"),
+        allow_read_policy(),
+    )
+    .run_with_events(&input, &mut |event| {
+        events.push(event);
+        Ok(())
+    });
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    let prompt_events = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::PromptAssembly(prompt)) => Some(prompt),
+            AgentLoopEvent::FinalTextDelta { .. } | AgentLoopEvent::Observation(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prompt_events.len(), 2);
+    assert_eq!(
+        prompt_events[0].identity.occurrence_id,
+        prompt_events[1].identity.occurrence_id
+    );
+    assert!(matches!(
+        prompt_events[0].lifecycle,
+        OccurrenceLifecycle::Started { .. }
+    ));
+    let OccurrenceLifecycle::Finished {
+        status: PromptAssemblyStatus::Ready,
+        ..
+    } = prompt_events[1].lifecycle
+    else {
+        panic!("prompt assembly must finish ready");
+    };
+    assert_eq!(prompt_events[1].model_turn_ordinal, 0);
+    assert!(!prompt_events[1].finalization_only);
+    assert!(prompt_events[1].message_count > 0);
+    assert!(prompt_events[1].tool_count > 0);
+    assert!(prompt_events[1].request_token_count > 0);
+    assert!(prompt_events[1].request_digest.starts_with("sha256:"));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::FinalReview(_))
+    )));
+    assert!(
+        !serde_json::to_string(&events)
+            .expect("serialize events")
+            .contains(secret)
+    );
+}
+
+#[test]
+fn event_sink_failure_is_sanitized_and_stops_before_the_next_side_effect() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_response_and_requests(
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "unused"),
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .run_with_events(
+        &AgentLoopInput::new("thread_1", "turn_1", "hello"),
+        &mut |_| Err(AgentLoopEventSinkError),
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.error.as_deref(), Some("agent event sink failed"));
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
+}
+
+#[test]
 fn agent_loop_aggregates_stream_deltas_and_requires_matching_terminal_text() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let agent_loop = AgentLoop::new(
@@ -1285,13 +1365,17 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
             .for_operation(PermissionOperation::Execute),
         );
 
+    let mut events = Vec::new();
     let result = agent_loop_with_responses_and_requests(
         vec![edit, final_response],
         policy,
         Arc::new(Mutex::new(Vec::new())),
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
-    .run(&input);
+    .run_with_events(&input, &mut |event| {
+        events.push(event);
+        Ok(())
+    });
 
     assert_eq!(result.status, AgentStatus::Failed);
     assert_eq!(
@@ -1303,6 +1387,24 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
     assert!(result.verification.required);
     assert!(!result.verification.passed);
     assert_eq!(result.verification.successful_command_count, 0);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::Verification(value))
+            if value.occurrence_count == 1
+                && matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                    status: VerificationStatus::GateRejected,
+                    ..
+                })
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::Verification(value))
+            if value.occurrence_count == 1
+                && matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                    status: VerificationStatus::RepairRequested,
+                    ..
+                })
+    )));
 }
 
 #[test]
@@ -1459,11 +1561,15 @@ fn agent_loop_ask_decision_blocks_without_executing_tool() {
         }),
     ));
 
+    let mut events = Vec::new();
     let result = agent_loop_with_response(
         response,
         PolicyEngine::new(PermissionProfile::workspace_write()),
     )
-    .run(&input);
+    .run_with_events(&input, &mut |event| {
+        events.push(event);
+        Ok(())
+    });
 
     assert_eq!(result.status, AgentStatus::Blocked);
     assert_eq!(result.approval_count, 1);
@@ -1471,6 +1577,23 @@ fn agent_loop_ask_decision_blocks_without_executing_tool() {
         result.tool_results[0].error_code.as_deref(),
         Some("approval_required")
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::PolicyDecision(value))
+            if value.cause == Some(PolicyDecisionCause::NoMatchingRule)
+                && matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                    status: PolicyDecisionStatus::Ask,
+                    ..
+                })
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::ToolCall(value))
+            if matches!(value.lifecycle, OccurrenceLifecycle::Suspended {
+                status: ToolCallStatus::ApprovalRequired,
+                ..
+            })
+    )));
 }
 
 #[test]
@@ -1512,6 +1635,7 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
         }),
     ));
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut events = Vec::new();
     let result = agent_loop_with_capabilities(
         vec![
             response,
@@ -1526,7 +1650,10 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
         },
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
-    .run(&input);
+    .run_with_events(&input, &mut |event| {
+        events.push(event);
+        Ok(())
+    });
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.model_turns, 2);
@@ -1561,6 +1688,34 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
             .content
             .contains("independent read-only")
     );
+    let tool_events = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::ToolCall(value))
+                if value.model_turn_ordinal == 0 =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_events.len(), 6);
+    assert!(
+        tool_events[..3]
+            .iter()
+            .all(|value| matches!(value.lifecycle, OccurrenceLifecycle::Started { .. }))
+    );
+    assert_eq!(
+        tool_events[3..]
+            .iter()
+            .map(|value| value.tool_call_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::SandboxExecution(_))
+    )));
 }
 
 #[test]
@@ -1594,6 +1749,7 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
     )
     .for_operation(PermissionOperation::Read)
     .for_resource(workspace_resource("README.md"));
+    let mut events = Vec::new();
     let result = agent_loop_with_capabilities(
         vec![
             response,
@@ -1608,7 +1764,13 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
         },
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3));
+    .run_with_events(
+        &AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert!(result.pending_approvals.is_empty());
@@ -1633,6 +1795,21 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
             .to_string()
             .contains("secret=value")
     }));
+    let batch_rejections = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentLoopEvent::Observation(AgentObservation::ToolCall(value))
+                    if value.model_turn_ordinal == 0
+                        && matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                            status: ToolCallStatus::BatchRejected,
+                            ..
+                        })
+            )
+        })
+        .count();
+    assert_eq!(batch_rejections, 2);
 }
 
 #[test]
@@ -2668,6 +2845,7 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
         max_output_tokens: 128,
         ..ProviderProtocolContract::default()
     };
+    let mut events = Vec::new();
 
     let result = agent_loop_with_capabilities(
         vec![command_response, required_verification, final_response],
@@ -2680,13 +2858,17 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
             .expect("bind workspace tools")
             .with_sandbox_backend(LargeOutputBackend),
     )
-    .run(
+    .run_with_events(
         &AgentLoopInput::new("thread_1", "turn_1", "run the command")
             .with_max_turns(3)
             .with_verification_requirements([AgentVerificationRequirement::new(
                 required_digest,
                 1,
             )]),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
     );
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -2714,6 +2896,108 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
             .iter()
             .any(|message| message.content.contains("large-safe-output"))
     );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentLoopEvent::Observation(AgentObservation::PromptAssembly(value))
+                    if value.compacted
+                        && matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                            status: PromptAssemblyStatus::Ready,
+                            ..
+                        })
+            ))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn approval_resume_finishes_the_same_tool_occurrence_identity() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "approved read").expect("write fixture");
+    let mut tool_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    tool_response.tool_calls.push(tool_call(
+        "approval_call",
+        "read",
+        serde_json::json!({
+            "path": "README.md",
+            "max_chars": null,
+            "line_start": null,
+            "line_end": null
+        }),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = agent_loop_with_responses_and_requests(
+        vec![
+            tool_response,
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done"),
+        ],
+        PolicyEngine::new(PermissionProfile::workspace_write()),
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"));
+    let input = AgentLoopInput::new("thread_1", "turn_1", "read after approval").with_max_turns(2);
+    let mut initial_events = Vec::new();
+
+    let blocked = agent_loop.run_with_events(&input, &mut |event| {
+        initial_events.push(event);
+        Ok(())
+    });
+    assert_eq!(blocked.status, AgentStatus::Blocked);
+    let pending = pending_approval(&blocked);
+    let suspended = initial_events
+        .iter()
+        .find_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::ToolCall(value))
+                if matches!(value.lifecycle, OccurrenceLifecycle::Suspended { .. }) =>
+            {
+                Some(value.identity.occurrence_id.clone())
+            }
+            _ => None,
+        })
+        .expect("suspended tool occurrence");
+    let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
+    ));
+    let mut resumed_events = Vec::new();
+
+    let resumed =
+        agent_loop.resume_pending_approval_with_events(&resumed_input, &pending, &mut |event| {
+            resumed_events.push(event);
+            Ok(())
+        });
+
+    assert_eq!(
+        resumed.status,
+        AgentStatus::Completed,
+        "error={:?} tool_results={:?}",
+        resumed.error,
+        resumed.tool_results
+    );
+    let finished = resumed_events
+        .iter()
+        .find_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::ToolCall(value))
+                if matches!(
+                    value.lifecycle,
+                    OccurrenceLifecycle::Finished {
+                        status: ToolCallStatus::Succeeded,
+                        ..
+                    }
+                ) =>
+            {
+                Some(value.identity.occurrence_id.clone())
+            }
+            _ => None,
+        })
+        .expect("finished resumed tool occurrence");
+    assert_eq!(finished, suspended);
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 2);
 }
 
 #[test]
@@ -2907,6 +3191,7 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
         .for_operation(PermissionOperation::Read)
         .for_resource(workspace_resource("README.md")),
     );
+    let mut events = Vec::new();
 
     let result = agent_loop_with_responses_and_requests(
         vec![denied, allowed, final_response],
@@ -2914,7 +3199,13 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
         Arc::clone(&seen_requests),
     )
     .with_workspace_tools(WorkspaceTools::new(workspace.path()).expect("bind workspace tools"))
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "read if allowed").with_max_turns(3));
+    .run_with_events(
+        &AgentLoopInput::new("thread_1", "turn_1", "read if allowed").with_max_turns(3),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.final_answer.as_deref(), Some("done"));
@@ -2937,6 +3228,27 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
         std::fs::read_to_string(workspace.path().join("README.md")).expect("fixture remains"),
         "unchanged"
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::PolicyDecision(value))
+            if value.cause == Some(PolicyDecisionCause::Rule)
+                && matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                    status: PolicyDecisionStatus::Deny,
+                    ..
+                })
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::ToolCall(value))
+            if matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                status: ToolCallStatus::PolicyDenied,
+                ..
+            })
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::SandboxExecution(_))
+    )));
 }
 
 #[test]
@@ -3679,6 +3991,292 @@ fn agent_loop_command_uses_strict_sandbox_backend_when_injected() {
 }
 
 #[test]
+fn duplicate_tool_call_ids_keep_distinct_occurrence_ordinals_without_execution() {
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls = vec![
+        tool_call(
+            "duplicate",
+            "read",
+            serde_json::json!({"path": "README.md"}),
+        ),
+        tool_call(
+            "duplicate",
+            "read",
+            serde_json::json!({"path": "README.md"}),
+        ),
+    ];
+    let mut events = Vec::new();
+
+    let result = agent_loop_with_response(response, allow_read_policy()).run_with_events(
+        &AgentLoopInput::new("thread_1", "turn_1", "read").with_max_turns(1),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(result.tool_results.is_empty());
+    let finished = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::ToolCall(value))
+                if matches!(value.lifecycle, OccurrenceLifecycle::Finished { .. }) =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(finished.len(), 2);
+    assert_eq!(
+        finished[0].tool_call_id_digest,
+        finished[1].tool_call_id_digest
+    );
+    assert_ne!(
+        finished[0].identity.occurrence_id,
+        finished[1].identity.occurrence_id
+    );
+    assert_eq!(finished[0].tool_call_ordinal, 0);
+    assert_eq!(finished[1].tool_call_ordinal, 1);
+}
+
+#[test]
+fn event_aware_command_run_links_tool_policy_sandbox_verification_and_final_review() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let secret = "token=runtime-observation-secret";
+    let command = format!("test-program {secret}");
+    let verification_digest = command_script_scope_digest_with_policy(
+        &command,
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "run command")
+        .with_max_turns(2)
+        .with_verification_requirements([AgentVerificationRequirement::new(
+            verification_digest,
+            1,
+        )]);
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    command_response.tool_calls.push(tool_call(
+        "call_1",
+        "command",
+        serde_json::json!({"command": command, "timeout_seconds": 5}),
+    ));
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
+        PermissionRule::new(
+            "allow_command",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute),
+    );
+    let mut events = Vec::new();
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![
+            command_response,
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done"),
+        ],
+        policy,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run_with_events(&input, &mut |event| {
+        events.push(event);
+        Ok(())
+    });
+
+    assert_eq!(result.status, AgentStatus::Completed);
+    let tool = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::ToolCall(value)) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool.len(), 2);
+    assert_eq!(
+        tool[0].identity.occurrence_id,
+        tool[1].identity.occurrence_id
+    );
+    assert!(matches!(
+        tool[0].lifecycle,
+        OccurrenceLifecycle::Started { .. }
+    ));
+    assert!(matches!(
+        tool[1].lifecycle,
+        OccurrenceLifecycle::Finished {
+            status: ToolCallStatus::Succeeded,
+            ..
+        }
+    ));
+    let prompt_parent = events
+        .iter()
+        .find_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::PromptAssembly(value))
+                if value.model_turn_ordinal == 0
+                    && matches!(value.lifecycle, OccurrenceLifecycle::Finished { .. }) =>
+            {
+                Some(value.identity.occurrence_id.clone())
+            }
+            _ => None,
+        })
+        .expect("tool request prompt parent");
+    assert_eq!(tool[0].identity.parent_occurrence_id, Some(prompt_parent));
+
+    let policy = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::PolicyDecision(value)) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(policy.len(), 2);
+    assert_eq!(policy[1].cause, Some(PolicyDecisionCause::Rule));
+    assert!(matches!(
+        policy[1].lifecycle,
+        OccurrenceLifecycle::Finished {
+            status: PolicyDecisionStatus::Allow,
+            ..
+        }
+    ));
+
+    let sandbox = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::SandboxExecution(value)) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sandbox.len(), 2);
+    assert_eq!(
+        sandbox[0].identity.parent_occurrence_id,
+        Some(tool[0].identity.occurrence_id.clone())
+    );
+    assert_eq!(sandbox[0].command_id, sandbox[1].command_id);
+    assert_eq!(sandbox[1].command_id_binding_valid, Some(true));
+    assert!(matches!(
+        sandbox[1].lifecycle,
+        OccurrenceLifecycle::Finished {
+            status: SandboxExecutionStatus::Ok,
+            ..
+        }
+    ));
+
+    let verification = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::Verification(value)) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(verification.iter().any(|value| matches!(
+        value.lifecycle,
+        OccurrenceLifecycle::Finished {
+            status: VerificationStatus::CommandPassed,
+            ..
+        }
+    )));
+    assert!(verification.iter().any(|value| matches!(
+        value.lifecycle,
+        OccurrenceLifecycle::Finished {
+            status: VerificationStatus::GatePassed,
+            ..
+        }
+    )));
+
+    let final_review = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::FinalReview(value)) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(final_review.len(), 2);
+    assert!(matches!(
+        final_review[1].lifecycle,
+        OccurrenceLifecycle::Finished {
+            status: FinalReviewStatus::Succeeded,
+            ..
+        }
+    ));
+    assert!(
+        !serde_json::to_string(&events)
+            .expect("serialize runtime observations")
+            .contains(secret)
+    );
+}
+
+#[test]
+fn sandbox_start_sink_failure_stops_before_backend_execution() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    command_response.tool_calls.push(tool_call(
+        "call_1",
+        "command",
+        serde_json::json!({"command": "test-program safe", "timeout_seconds": 5}),
+    ));
+    let policy = PolicyEngine::new(PermissionProfile::workspace_write()).with_rule(
+        PermissionRule::new(
+            "allow_command",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Execute),
+    );
+    let mut events = Vec::new();
+
+    let result = agent_loop_with_response(command_response, policy)
+        .with_workspace_tools(
+            WorkspaceTools::new(dir.path())
+                .expect("bind workspace tools")
+                .with_sandbox_backend(ExecutionCountingBackend {
+                    calls: Arc::clone(&calls),
+                }),
+        )
+        .run_with_events(
+            &AgentLoopInput::new("thread_1", "turn_1", "run command"),
+            &mut |event| {
+                let reject = matches!(
+                    event,
+                    AgentLoopEvent::Observation(AgentObservation::SandboxExecution(ref value))
+                        if matches!(value.lifecycle, OccurrenceLifecycle::Started { .. })
+                );
+                events.push(event);
+                if reject {
+                    Err(AgentLoopEventSinkError)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert_eq!(result.error.as_deref(), Some("agent event sink failed"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentLoopEvent::Observation(AgentObservation::SandboxExecution(_))
+            ))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn agent_loop_returns_command_nonzero_to_model_for_repair() {
     let dir = tempfile::tempdir().expect("temp dir");
     let input = AgentLoopInput::new("thread_1", "turn_1", "run command").with_max_turns(3);
@@ -3852,11 +4450,19 @@ fn agent_loop_cancels_a_running_sandbox_command() {
         .with_sandbox_backend(BlockingCommandBackend {
             started: Mutex::new(Some(started_tx)),
         });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let worker_events = Arc::clone(&events);
     let worker = thread::spawn(move || {
         agent_loop_with_response(command_response, policy)
             .with_workspace_tools(workspace)
             .with_cancellation_token(worker_cancellation)
-            .run(&AgentLoopInput::new("thread_1", "turn_1", "run command"))
+            .run_with_events(
+                &AgentLoopInput::new("thread_1", "turn_1", "run command"),
+                &mut |event| {
+                    worker_events.lock().expect("event lock").push(event);
+                    Ok(())
+                },
+            )
     });
 
     started_rx
@@ -3876,6 +4482,23 @@ fn agent_loop_cancels_a_running_sandbox_command() {
         result.tool_results[0].failure_kind,
         Some(singularity_tools::ToolFailureKind::Cancelled)
     );
+    let events = events.lock().expect("event lock");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::SandboxExecution(value))
+            if matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                status: SandboxExecutionStatus::Cancelled,
+                ..
+            })
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::ToolCall(value))
+            if matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                status: ToolCallStatus::Cancelled,
+                ..
+            })
+    )));
 }
 
 #[test]
@@ -4319,6 +4942,34 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
 }
 
 struct AgentStrictBackend;
+
+struct ExecutionCountingBackend {
+    calls: Arc<AtomicUsize>,
+}
+
+impl SandboxBackend for ExecutionCountingBackend {
+    fn name(&self) -> &'static str {
+        "execution_counting_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, _request: &CommandRequest) -> CommandResult {
+        panic!("direct argv command backend must not execute")
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
 
 struct CommandMutatingBackend {
     workspace: PathBuf,
@@ -5451,6 +6102,7 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
         attempt_count: 2,
         retry_count: 1,
         latency_ms: 80,
+        ..Default::default()
     });
     let mut final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
@@ -5466,6 +6118,7 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
         attempt_count: 1,
         retry_count: 0,
         latency_ms: 25,
+        ..Default::default()
     });
 
     let result = agent_loop_with_plan_capabilities(
@@ -5743,6 +6396,7 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
                 attempt_count: 1,
                 retry_count: 0,
                 latency_ms,
+                ..Default::default()
             });
             response
         };
@@ -5774,6 +6428,7 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
                 attempt_count: 2,
                 retry_count: 1,
                 latency_ms: 40,
+                ..Default::default()
             })),
             FinalizationCase::EmptyResponse | FinalizationCase::Cancelled => {
                 Ok(response_with_accounting(
@@ -5835,13 +6490,18 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
         )
         .with_cancellation_token(cancellation);
 
-        let result = result.run(
+        let mut events = Vec::new();
+        let result = result.run_with_events(
             &AgentLoopInput::new("thread_1", "turn_1", "verify")
                 .with_max_turns(1)
                 .with_verification_requirements([AgentVerificationRequirement::new(
                     verification_digest,
                     1,
                 )]),
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
         );
 
         assert_eq!(result.model_turns, 2);
@@ -5860,6 +6520,18 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
                 .count(),
             1
         );
+        let expected_final_review_status = match case {
+            FinalizationCase::Cancelled => FinalReviewStatus::Cancelled,
+            FinalizationCase::ProviderError
+            | FinalizationCase::EmptyResponse
+            | FinalizationCase::StructuredToolCall => FinalReviewStatus::Failed,
+        };
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentLoopEvent::Observation(AgentObservation::FinalReview(value))
+                if matches!(value.lifecycle, OccurrenceLifecycle::Finished { status, .. }
+                    if status == expected_final_review_status)
+        )));
 
         let requests = seen_requests.lock().expect("seen requests");
         assert_eq!(requests.len(), 2);
@@ -6074,6 +6746,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         attempt_count: 1,
         retry_count: 0,
         latency_ms: 10,
+        ..Default::default()
     });
     let mut edit_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
@@ -6096,6 +6769,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         attempt_count: 2,
         retry_count: 1,
         latency_ms: 20,
+        ..Default::default()
     });
     let mut verify_response =
         ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
@@ -6114,6 +6788,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         attempt_count: 1,
         retry_count: 0,
         latency_ms: 30,
+        ..Default::default()
     });
     let mut final_response =
         ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
@@ -6127,6 +6802,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         attempt_count: 1,
         retry_count: 0,
         latency_ms: 40,
+        ..Default::default()
     });
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let agent_loop = agent_loop_with_plan_capabilities(

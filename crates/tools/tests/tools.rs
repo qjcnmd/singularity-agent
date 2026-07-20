@@ -8,13 +8,13 @@ use singularity_sandbox::{
 };
 use singularity_tools::{
     AgentControlToolExecutor, CommandScopeDigest, CommandToolInput, EditToolInput, GrepToolInput,
-    ListToolInput, ReadToolInput, ToolAuthorization, ToolBroker, ToolBrokerDecision,
-    ToolCallRequest, ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolExposure,
-    ToolFailureKind, ToolInputValidationError, ToolOutput, ToolRegistry, ToolResult, ToolSpec,
-    WorkspaceMutation, WorkspacePatch, WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError,
-    WorkspaceToolExecutor, WorkspaceTools, approximate_token_count, command_scope_digest,
-    command_script_scope_digest, command_script_scope_digest_with_policy, workspace_tool_entries,
-    workspace_tool_specs,
+    ListToolInput, ReadToolInput, SandboxExecutionBoundary, SandboxExecutionStatus,
+    ToolAuthorization, ToolBroker, ToolBrokerDecision, ToolCallRequest, ToolCapability, ToolEntry,
+    ToolExecutionMode, ToolExecutor, ToolExposure, ToolFailureKind, ToolInputValidationError,
+    ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspaceMutation, WorkspacePatch,
+    WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError, WorkspaceToolExecutor,
+    WorkspaceTools, approximate_token_count, command_scope_digest, command_script_scope_digest,
+    command_script_scope_digest_with_policy, workspace_tool_entries, workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2776,6 +2776,178 @@ fn workspace_write_command_binds_backend_revision_observation_without_public_lea
 }
 
 #[test]
+fn command_backend_boundary_returns_a_safe_typed_execution_observation() {
+    let workspace = test_workspace("command-execution-observation");
+    let secret = "token=command-secret";
+    let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
+        .with_sandbox_backend(RevisionReportingBackend {
+            calls: AtomicUsize::new(0),
+        });
+    let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+        secret,
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    ))
+    .expect("command scope digest");
+
+    let mut boundaries = Vec::new();
+    let execution = tools
+        .command_cancellable_with_policy_events(
+            CommandToolInput {
+                command: secret.to_string(),
+                cwd: None,
+                timeout_seconds: Some(5),
+            },
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+            &scope,
+            &CancellationToken::new(),
+            &mut |boundary| {
+                boundaries.push(boundary);
+                Ok(())
+            },
+        )
+        .expect("observed command");
+
+    assert!(execution.output.ok);
+    assert_eq!(
+        execution.sandbox_execution.status,
+        SandboxExecutionStatus::Ok
+    );
+    assert_eq!(
+        execution.sandbox_execution.workspace_mutation,
+        WorkspaceMutation::Changed
+    );
+    assert_eq!(
+        execution.sandbox_execution.enforcement,
+        singularity_tools::SandboxBackendEnforcement::Strict
+    );
+    assert!(
+        execution
+            .sandbox_execution
+            .command_id
+            .starts_with("command_")
+    );
+    assert!(execution.sandbox_execution.command_id_binding_valid);
+    assert_eq!(boundaries.len(), 2);
+    assert!(matches!(
+        boundaries[0],
+        SandboxExecutionBoundary::Started { .. }
+    ));
+    assert!(matches!(
+        boundaries[1],
+        SandboxExecutionBoundary::Finished(_)
+    ));
+    assert!(
+        !serde_json::to_string(&execution.sandbox_execution)
+            .expect("serialize sandbox observation")
+            .contains(secret)
+    );
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn command_backend_observation_preserves_timeout_cancel_and_error_statuses() {
+    for (fixture, expected, expected_duration) in [
+        (
+            BackendFixtureStatus::TimedOut,
+            SandboxExecutionStatus::TimedOut,
+            17,
+        ),
+        (
+            BackendFixtureStatus::Cancelled,
+            SandboxExecutionStatus::Cancelled,
+            19,
+        ),
+        (
+            BackendFixtureStatus::Error,
+            SandboxExecutionStatus::Error,
+            0,
+        ),
+    ] {
+        let workspace = test_workspace("command-status-observation");
+        let command = format!("status-{fixture:?}");
+        let tools = WorkspaceTools::new(&workspace)
+            .expect("bind workspace tools")
+            .with_sandbox_backend(StatusReportingBackend(fixture));
+        let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+            &command,
+            ".",
+            5,
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        ))
+        .expect("command scope digest");
+        let execution = tools
+            .command_cancellable_with_policy_observed(
+                CommandToolInput {
+                    command,
+                    cwd: None,
+                    timeout_seconds: Some(5),
+                },
+                SandboxFilesystemMode::ReadOnly,
+                SandboxNetworkMode::Denied,
+                &scope,
+                &CancellationToken::new(),
+            )
+            .expect("typed command status");
+
+        assert_eq!(execution.sandbox_execution.status, expected);
+        assert!(execution.sandbox_execution.duration_ms >= expected_duration);
+        assert_eq!(
+            execution.sandbox_execution.workspace_mutation,
+            WorkspaceMutation::Unchanged
+        );
+        remove_workspace(&workspace);
+    }
+}
+
+#[test]
+fn command_backend_observation_fails_closed_on_command_id_mismatch() {
+    let workspace = test_workspace("command-id-mismatch");
+    let tools = WorkspaceTools::new(&workspace)
+        .expect("bind workspace tools")
+        .with_sandbox_backend(MismatchedCommandIdBackend);
+    let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+        "verify",
+        ".",
+        5,
+        SandboxFilesystemMode::ReadOnly,
+        SandboxNetworkMode::Denied,
+    ))
+    .expect("command scope digest");
+    let execution = tools
+        .command_cancellable_with_policy_observed(
+            CommandToolInput {
+                command: "verify".to_string(),
+                cwd: None,
+                timeout_seconds: Some(5),
+            },
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+            &scope,
+            &CancellationToken::new(),
+        )
+        .expect("typed mismatch result");
+
+    assert!(!execution.output.ok);
+    assert_eq!(
+        execution.output.error_code.as_deref(),
+        Some("sandbox_command_id_mismatch")
+    );
+    assert!(!execution.sandbox_execution.command_id_binding_valid);
+    assert_eq!(
+        execution.sandbox_execution.status,
+        SandboxExecutionStatus::Error
+    );
+    assert_ne!(execution.sandbox_execution.command_id, "wrong_command");
+    remove_workspace(&workspace);
+}
+
+#[test]
 fn workspace_write_command_with_unknown_mutation_fails_closed() {
     let workspace = test_workspace("command-unknown-revision");
     let tools = WorkspaceTools::new(&workspace)
@@ -2857,6 +3029,70 @@ fn workspace_write_command_rejects_stale_checkpoint_revision() {
 }
 
 struct RecordingSandboxBackend;
+
+#[derive(Debug, Clone, Copy)]
+enum BackendFixtureStatus {
+    TimedOut,
+    Cancelled,
+    Error,
+}
+
+struct StatusReportingBackend(BackendFixtureStatus);
+
+struct MismatchedCommandIdBackend;
+
+impl SandboxBackend for MismatchedCommandIdBackend {
+    fn name(&self) -> &'static str {
+        "mismatched_command_id"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, _request: &CommandRequest) -> CommandResult {
+        panic!("direct argv command backend must not execute")
+    }
+
+    fn execute_script(&self, _request: &CommandScriptRequest) -> CommandResult {
+        CommandResult::completed("wrong_command", "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
+
+impl SandboxBackend for StatusReportingBackend {
+    fn name(&self) -> &'static str {
+        "status_reporting"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, _request: &CommandRequest) -> CommandResult {
+        panic!("direct argv command backend must not execute")
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        let result = match self.0 {
+            BackendFixtureStatus::TimedOut => CommandResult::timed_out(&request.command_id, 17),
+            BackendFixtureStatus::Cancelled => CommandResult::cancelled(&request.command_id, 19),
+            BackendFixtureStatus::Error => {
+                CommandResult::backend_error(&request.command_id, "safe backend error")
+            }
+        };
+        result
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
 
 struct RevisionReportingBackend {
     calls: AtomicUsize,

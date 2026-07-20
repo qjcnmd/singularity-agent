@@ -8,6 +8,7 @@ pub enum WorkspaceToolError {
     OutsideWorkspace(String),
     ProtectedPath(String),
     SandboxUnavailable,
+    ObservationSinkFailed,
     Cancelled,
     BinaryPattern,
     ConcurrentMutation(String),
@@ -27,6 +28,7 @@ impl fmt::Display for WorkspaceToolError {
                 write!(formatter, "protected path requires approval: {path}")
             }
             Self::SandboxUnavailable => write!(formatter, "strict sandbox backend unavailable"),
+            Self::ObservationSinkFailed => write!(formatter, "sandbox observation sink failed"),
             Self::Cancelled => write!(formatter, "workspace tool execution cancelled"),
             Self::BinaryPattern => write!(formatter, "grep pattern must be valid utf-8 text"),
             Self::ConcurrentMutation(path) => {
@@ -214,6 +216,55 @@ impl WorkspaceRevision {
 pub struct WorkspaceObservation {
     revision: Option<WorkspaceRevision>,
     mutation: WorkspaceMutation,
+}
+
+/// 实际进入 `SandboxBackend` 的一次 command 执行的安全终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxExecutionStatus {
+    Ok,
+    Error,
+    TimedOut,
+    Cancelled,
+}
+
+/// `WorkspaceTools` 在 backend 返回点形成的短生命周期 typed observation。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SandboxExecutionObservation {
+    pub command_id: String,
+    pub command_id_binding_valid: bool,
+    pub started_at_unix_ms: u64,
+    pub ended_at_unix_ms: u64,
+    pub duration_ms: u64,
+    pub status: SandboxExecutionStatus,
+    pub workspace_mutation: WorkspaceMutation,
+    pub enforcement: SandboxBackendEnforcement,
+}
+
+/// backend 调用前后的真实短生命周期边界事件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum SandboxExecutionBoundary {
+    Started {
+        command_id: String,
+        started_at_unix_ms: u64,
+    },
+    Finished(SandboxExecutionObservation),
+}
+
+/// sandbox event sink 的不透明拒绝信号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxExecutionSinkError;
+
+/// 单次 command 调用期间同步消费 sandbox 边界事件的 callback。
+pub type SandboxExecutionCallback<'a> =
+    dyn FnMut(SandboxExecutionBoundary) -> Result<(), SandboxExecutionSinkError> + 'a;
+
+/// command tool 输出与其同一次真实 backend occurrence 的 typed 绑定。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandToolExecution {
+    pub output: ToolOutput,
+    pub sandbox_execution: SandboxExecutionObservation,
 }
 
 impl WorkspaceObservation {
@@ -1011,6 +1062,45 @@ impl WorkspaceTools {
         expected_scope: &CommandScopeDigest,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutput, WorkspaceToolError> {
+        self.command_cancellable_with_policy_observed(
+            input,
+            filesystem,
+            network,
+            expected_scope,
+            cancellation,
+        )
+        .map(|execution| execution.output)
+    }
+
+    /// 按已绑定范围执行 command，并返回与真实 backend 调用同源的 typed observation。
+    pub fn command_cancellable_with_policy_observed(
+        &self,
+        input: CommandToolInput,
+        filesystem: SandboxFilesystemMode,
+        network: SandboxNetworkMode,
+        expected_scope: &CommandScopeDigest,
+        cancellation: &CancellationToken,
+    ) -> Result<CommandToolExecution, WorkspaceToolError> {
+        self.command_cancellable_with_policy_events(
+            input,
+            filesystem,
+            network,
+            expected_scope,
+            cancellation,
+            &mut |_| Ok(()),
+        )
+    }
+
+    /// 执行 command，并在 backend 调用前后同步投影真实边界事件。
+    pub fn command_cancellable_with_policy_events(
+        &self,
+        input: CommandToolInput,
+        filesystem: SandboxFilesystemMode,
+        network: SandboxNetworkMode,
+        expected_scope: &CommandScopeDigest,
+        cancellation: &CancellationToken,
+        on_event: &mut SandboxExecutionCallback<'_>,
+    ) -> Result<CommandToolExecution, WorkspaceToolError> {
         input.validate()?;
         // A failed root binding must not degrade into an ambient command cwd.
         self.workspace_capability()?;
@@ -1054,11 +1144,54 @@ impl WorkspaceTools {
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }
+        let started_at_unix_ms = command_boundary_unix_ms();
+        on_event(SandboxExecutionBoundary::Started {
+            command_id: request.command_id.clone(),
+            started_at_unix_ms,
+        })
+        .map_err(|_| WorkspaceToolError::ObservationSinkFailed)?;
+        let backend_started = std::time::Instant::now();
         let result = backend.execute_script_cancellable(&request, cancellation);
+        let measured_duration_ms =
+            u64::try_from(backend_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         drop(bound_command_cwd);
         let mutation = result.workspace_mutation;
         let execution = result.sandbox.clone();
+        let command_id_binding_valid = result.command_id == request.command_id;
+        let sandbox_execution = SandboxExecutionObservation {
+            command_id: request.command_id.clone(),
+            command_id_binding_valid,
+            started_at_unix_ms,
+            ended_at_unix_ms: command_boundary_unix_ms(),
+            duration_ms: result.duration_ms.max(measured_duration_ms),
+            status: if !command_id_binding_valid {
+                SandboxExecutionStatus::Error
+            } else {
+                match &result.execution_status {
+                    CommandExecutionStatus::Cancelled => SandboxExecutionStatus::Cancelled,
+                    CommandExecutionStatus::TimedOut => SandboxExecutionStatus::TimedOut,
+                    CommandExecutionStatus::Completed
+                        if result.semantic_status == CommandSemanticStatus::Succeeded =>
+                    {
+                        SandboxExecutionStatus::Ok
+                    }
+                    CommandExecutionStatus::Completed
+                    | CommandExecutionStatus::PolicyDenied
+                    | CommandExecutionStatus::ReviewRequired
+                    | CommandExecutionStatus::Unsupported
+                    | CommandExecutionStatus::ExecutableUnavailable
+                    | CommandExecutionStatus::BackendError => SandboxExecutionStatus::Error,
+                }
+            },
+            workspace_mutation: mutation,
+            enforcement: execution.enforcement.clone(),
+        };
         let mut output = command_tool_output(result);
+        if !sandbox_execution.command_id_binding_valid {
+            output.ok = false;
+            output.failure_kind = Some(ToolFailureKind::Infrastructure);
+            output.error_code = Some("sandbox_command_id_mismatch".to_string());
+        }
         let observation = match (&requested_filesystem, mutation) {
             (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unchanged) => {
                 WorkspaceObservation::unchanged(self.current_workspace_revision())
@@ -1096,7 +1229,14 @@ impl WorkspaceTools {
             "command_scope_digest": expected_scope.as_str(),
             "command_provenance": "agent_requested",
         });
-        Ok(output)
+        on_event(SandboxExecutionBoundary::Finished(
+            sandbox_execution.clone(),
+        ))
+        .map_err(|_| WorkspaceToolError::ObservationSinkFailed)?;
+        Ok(CommandToolExecution {
+            output,
+            sandbox_execution,
+        })
     }
 
     fn workspace_capability(&self) -> Result<&CapabilityDir, WorkspaceToolError> {
@@ -2021,6 +2161,14 @@ impl WorkspaceTools {
             None => Ok(CapabilityRelativePath::root()),
         }
     }
+}
+
+fn command_boundary_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn absolute_workspace_root(path: PathBuf) -> Result<PathBuf, WorkspaceToolError> {

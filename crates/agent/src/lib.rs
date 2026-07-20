@@ -25,23 +25,29 @@ use singularity_model::{
 };
 use singularity_policy::{
     ApprovalOutcome, ApprovalPolicy, ApprovalRequest, NetworkAccess, PermissionDecision,
-    PermissionDecisionCause, PermissionDecisionOutcome, PermissionOperation, PermissionProfile,
-    PermissionProfileName, PermissionRequest, PermissionResource, PolicyEngine, ToolId,
+    PermissionDecisionCause as PermissionCause, PermissionDecisionOutcome, PermissionOperation,
+    PermissionProfile, PermissionProfileName, PermissionRequest, PermissionResource, PolicyEngine,
+    ToolId,
 };
 use singularity_tools::{
     AgentControlToolExecutor, BoundToolCall, COMMAND_TOOL as TOOL_COMMAND, CommandToolInput,
     EDIT_TOOL as TOOL_EDIT, EditToolInput, GrepToolInput, ListToolInput, PATCH_TOOL as TOOL_PATCH,
-    ReadToolInput, SandboxFilesystemMode, SandboxNetworkMode, ToolAuthorization, ToolBroker,
-    ToolBrokerDecision, ToolCallRequest, ToolCapability, ToolEntry, ToolExecutionMode,
-    ToolExecutor, ToolFailureKind, ToolInputValidationError, ToolOutput, ToolResult, ToolSpec,
-    WorkspacePatch, WorkspaceToolError, WorkspaceToolExecutor, WorkspaceTools,
-    approximate_token_count, command_script_scope_digest_with_policy,
+    ReadToolInput, SandboxExecutionBoundary as ToolSandboxExecutionBoundary,
+    SandboxExecutionObservation as ToolSandboxExecutionObservation,
+    SandboxExecutionSinkError as ToolSandboxExecutionSinkError,
+    SandboxExecutionStatus as ToolSandboxExecutionStatus, SandboxFilesystemMode,
+    SandboxNetworkMode, ToolAuthorization, ToolBroker, ToolBrokerDecision, ToolCallRequest,
+    ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolFailureKind,
+    ToolInputValidationError, ToolOutput, ToolResult, ToolSpec, WorkspacePatch, WorkspaceToolError,
+    WorkspaceToolExecutor, WorkspaceTools, approximate_token_count,
+    command_script_scope_digest_with_policy,
 };
 use thiserror::Error;
 
 mod checkpoint;
 mod completion;
 mod context;
+mod observation;
 
 pub use checkpoint::{ApprovalCheckpoint, PendingApprovalOccurrence, PendingToolCall};
 use completion::{
@@ -55,6 +61,15 @@ pub use context::{
 use context::{
     ContextBudget, assemble_context_items_with_budget, current_turn_excluded,
     model_messages_from_context,
+};
+use observation::OccurrenceTimer;
+pub use observation::{
+    AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentObservation,
+    FinalReviewObservation, FinalReviewStatus, OccurrenceIdentity, OccurrenceLifecycle,
+    PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
+    PromptAssemblyObservation, PromptAssemblyStatus, SandboxExecutionOccurrence,
+    SandboxExecutionStatus, ToolCallObservation, ToolCallStatus, VerificationObservation,
+    VerificationStatus,
 };
 
 #[cfg(test)]
@@ -101,6 +116,7 @@ const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool f
 const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call update_plan with all steps marked completed before providing the final answer.";
 const EXACT_VERIFICATION_REQUIRED: &str =
     "completion gate rejected final answer: required verification commands are incomplete";
+const EVENT_SINK_FAILURE_ERROR: &str = "agent event sink failed";
 
 /// 一次 `AgentLoop` 运行的外部可观察生命周期状态。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1053,19 +1069,36 @@ where
         self.run_internal(input, None)
     }
 
+    /// 运行一个新 turn，并在真实边界向调用方投影有序 typed 事件。
+    pub fn run_with_events(
+        &self,
+        input: &AgentLoopInput,
+        on_event: &mut AgentLoopEventCallback<'_>,
+    ) -> AgentLoopResult {
+        self.run_internal(input, Some(on_event))
+    }
+
     /// 运行一个新 turn，并只向调用方投影最终化 assistant 回合的有序文本 delta。
     pub fn run_with_text_deltas(
         &self,
         input: &AgentLoopInput,
         on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AgentLoopResult {
-        self.run_internal(input, Some(on_text_delta))
+        self.run_internal(
+            input,
+            Some(&mut |event| {
+                if let AgentLoopEvent::FinalTextDelta { delta } = event {
+                    on_text_delta(&delta);
+                }
+                Ok(())
+            }),
+        )
     }
 
     fn run_internal(
         &self,
         input: &AgentLoopInput,
-        on_text_delta: Option<&mut AgentTextDeltaCallback<'_>>,
+        on_event: Option<&mut AgentLoopEventCallback<'_>>,
     ) -> AgentLoopResult {
         let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
@@ -1109,7 +1142,7 @@ where
             max_tool_calls,
             state,
             0,
-            on_text_delta,
+            on_event,
         )
     }
 
@@ -1123,7 +1156,7 @@ where
         max_tool_calls: u32,
         mut state: AgentLoopState,
         model_turn_offset: u32,
-        on_text_delta: Option<&mut AgentTextDeltaCallback<'_>>,
+        on_event: Option<&mut AgentLoopEventCallback<'_>>,
     ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
         if model_turn_offset > max_turns
@@ -1139,7 +1172,7 @@ where
             );
         }
         let mut finalization_attempted = false;
-        let mut on_text_delta = on_text_delta;
+        let mut on_event = on_event;
         let mut actual_model_turns = model_turn_offset;
         // 包含端点只保留给终态；没有 readiness 时仍维持普通工作回合上限及其失败语义。
         for turn_index in model_turn_offset..=max_turns {
@@ -1155,6 +1188,72 @@ where
                     break;
                 }
                 finalization_attempted = true;
+                let gate_timer = OccurrenceTimer::start();
+                let gate_identity = occurrence_identity(
+                    input,
+                    "verification_gate",
+                    turn_index,
+                    state.recovery_metrics.completion_rejection_count,
+                    None,
+                );
+                let summary = state.completion.summary();
+                for lifecycle in [
+                    gate_timer.started(),
+                    gate_timer.finished(VerificationStatus::GatePassed),
+                ] {
+                    if emit_event(
+                        &mut on_event,
+                        AgentLoopEvent::Observation(AgentObservation::Verification(
+                            VerificationObservation {
+                                identity: gate_identity.clone(),
+                                lifecycle,
+                                required_command_count: summary.required_command_count,
+                                satisfied_command_count: summary.satisfied_command_count,
+                                occurrence_count: state.recovery_metrics.completion_rejection_count,
+                                command_duration_ms: None,
+                            },
+                        )),
+                    )
+                    .is_err()
+                    {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            turn_index,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
+                    }
+                }
+            }
+            let prompt_identity =
+                occurrence_identity(input, "prompt_assembly", turn_index, 0, None);
+            let prompt_timer = OccurrenceTimer::start();
+            if emit_event(
+                &mut on_event,
+                AgentLoopEvent::Observation(AgentObservation::PromptAssembly(
+                    PromptAssemblyObservation {
+                        identity: prompt_identity.clone(),
+                        lifecycle: prompt_timer.started(),
+                        model_turn_ordinal: turn_index,
+                        message_count: 0,
+                        tool_count: 0,
+                        request_token_count: 0,
+                        request_digest: String::new(),
+                        compacted: false,
+                        finalization_only,
+                    },
+                )),
+            )
+            .is_err()
+            {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                );
             }
             let tool_view = if finalization_only {
                 ModelToolView::finalization()
@@ -1162,6 +1261,29 @@ where
                 match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
                     Ok(tool_view) => tool_view,
                     Err(error) => {
+                        if emit_prompt_assembly_finished(
+                            &mut on_event,
+                            prompt_identity,
+                            &prompt_timer,
+                            turn_index,
+                            0,
+                            0,
+                            0,
+                            String::new(),
+                            false,
+                            finalization_only,
+                            PromptAssemblyStatus::ToolViewRejected,
+                        )
+                        .is_err()
+                        {
+                            return state.finish(
+                                AgentStatus::Failed,
+                                false,
+                                None,
+                                turn_index,
+                                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                            );
+                        }
                         return state.finish(
                             AgentStatus::Failed,
                             false,
@@ -1173,6 +1295,7 @@ where
                 }
             };
             let visible_tool_names = tool_view.visible_tool_names.clone();
+            let mut compacted = false;
             if !model_request_fits_context(
                 &tool_view.tools,
                 &state.messages,
@@ -1181,6 +1304,37 @@ where
             ) {
                 let Some(compaction) = compact_model_messages(&tool_view.tools, &state, budget)
                 else {
+                    let message_count = u32::try_from(state.messages.len()).unwrap_or(u32::MAX);
+                    let tool_count = u32::try_from(tool_view.tools.len()).unwrap_or(u32::MAX);
+                    let request_token_count = model_request_token_count(
+                        &tool_view.tools,
+                        &state.messages,
+                        &state.tool_result_occurrences,
+                        budget,
+                    );
+                    if emit_prompt_assembly_finished(
+                        &mut on_event,
+                        prompt_identity,
+                        &prompt_timer,
+                        turn_index,
+                        message_count,
+                        tool_count,
+                        request_token_count,
+                        String::new(),
+                        false,
+                        finalization_only,
+                        PromptAssemblyStatus::ContextOverflow,
+                    )
+                    .is_err()
+                    {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            turn_index,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
+                    }
                     return state.finish(
                         AgentStatus::Failed,
                         false,
@@ -1189,6 +1343,7 @@ where
                         Some(MODEL_REQUEST_CONTEXT_OVERFLOW_ERROR.to_string()),
                     );
                 };
+                compacted = true;
                 if let Some(context_trace) = &mut state.context_trace {
                     context_trace.record_compaction(&compaction);
                 }
@@ -1207,6 +1362,38 @@ where
             let request_validation =
                 validate_model_request_with_capabilities(&request, Some(capabilities));
             if !request_validation.valid {
+                let request_digest = safe_request_digest(&request);
+                let message_count = u32::try_from(request.messages.len()).unwrap_or(u32::MAX);
+                let tool_count = u32::try_from(request.tools.len()).unwrap_or(u32::MAX);
+                let request_token_count = model_request_token_count(
+                    &request.tools,
+                    &request.messages,
+                    &state.tool_result_occurrences,
+                    budget,
+                );
+                if emit_prompt_assembly_finished(
+                    &mut on_event,
+                    prompt_identity,
+                    &prompt_timer,
+                    turn_index,
+                    message_count,
+                    tool_count,
+                    request_token_count,
+                    request_digest,
+                    compacted,
+                    finalization_only,
+                    PromptAssemblyStatus::ValidationFailed,
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        turn_index,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
                 return state.finish(
                     AgentStatus::Failed,
                     false,
@@ -1218,19 +1405,91 @@ where
                     )),
                 );
             }
+            let request_digest = safe_request_digest(&request);
+            let message_count = u32::try_from(request.messages.len()).unwrap_or(u32::MAX);
+            let tool_count = u32::try_from(request.tools.len()).unwrap_or(u32::MAX);
+            let request_token_count = model_request_token_count(
+                &request.tools,
+                &request.messages,
+                &state.tool_result_occurrences,
+                budget,
+            );
+            if emit_prompt_assembly_finished(
+                &mut on_event,
+                prompt_identity.clone(),
+                &prompt_timer,
+                turn_index,
+                message_count,
+                tool_count,
+                request_token_count,
+                request_digest,
+                compacted,
+                finalization_only,
+                PromptAssemblyStatus::Ready,
+            )
+            .is_err()
+            {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                );
+            }
+            let final_review = finalization_only.then(|| {
+                (
+                    child_occurrence_identity(&prompt_identity, "final_review", 0),
+                    OccurrenceTimer::start(),
+                )
+            });
+            if let Some((identity, timer)) = &final_review
+                && emit_event(
+                    &mut on_event,
+                    AgentLoopEvent::Observation(AgentObservation::FinalReview(
+                        FinalReviewObservation {
+                            identity: identity.clone(),
+                            lifecycle: timer.started(),
+                            model_turn_ordinal: turn_index,
+                        },
+                    )),
+                )
+                .is_err()
+            {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                );
+            }
             let mut streamed_text = String::new();
+            let mut event_sink_failed = false;
             let stream_result = self.provider.complete_stream(
                 &request,
                 &self.cancellation,
                 &mut |event| match event {
                     ProviderStreamEvent::OutputTextDelta { delta } => {
                         streamed_text.push_str(&delta);
-                        if finalization_only && let Some(callback) = on_text_delta.as_deref_mut() {
-                            callback(&delta);
+                        if finalization_only
+                            && let Some(callback) = on_event.as_deref_mut()
+                            && callback(AgentLoopEvent::FinalTextDelta { delta }).is_err()
+                        {
+                            event_sink_failed = true;
                         }
                     }
                 },
             );
+            if event_sink_failed {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                );
+            }
             let response = match stream_result {
                 Ok(response) if response.status == ModelTurnStatus::Success => {
                     let terminal_text = assistant_message_text(response.assistant_message.as_ref());
@@ -1257,6 +1516,22 @@ where
             state.observe_model_response(&response);
             actual_model_turns = turn_index.saturating_add(1);
             if self.is_cancelled(input) {
+                if emit_final_review_finished(
+                    &mut on_event,
+                    &final_review,
+                    turn_index,
+                    FinalReviewStatus::Cancelled,
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
                 return state.finish(
                     AgentStatus::Cancelled,
                     false,
@@ -1266,6 +1541,22 @@ where
                 );
             }
             if response.status != ModelTurnStatus::Success {
+                if emit_final_review_finished(
+                    &mut on_event,
+                    &final_review,
+                    turn_index,
+                    FinalReviewStatus::Failed,
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
                 let model_error = response.error.as_ref();
                 return state.finish_with_model_error(
                     AgentStatus::Failed,
@@ -1288,8 +1579,35 @@ where
                 Some(capabilities),
             );
             if !validation.valid {
+                if emit_final_review_finished(
+                    &mut on_event,
+                    &final_review,
+                    turn_index,
+                    FinalReviewStatus::Failed,
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
                 for call in &response.tool_calls {
                     state.observe_model_tool_call(call, &provider_tool_names);
+                }
+                if emit_rejected_tool_calls(&mut on_event, input, &response.tool_calls, turn_index)
+                    .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
                 }
                 let model_error = model_response_validation_error(validation.errors);
                 return state.finish_with_model_error(
@@ -1304,6 +1622,33 @@ where
             if response.assistant_message.as_ref().is_some_and(|message| {
                 !message.tool_calls.is_empty() && message.tool_calls != response.tool_calls
             }) {
+                if emit_final_review_finished(
+                    &mut on_event,
+                    &final_review,
+                    turn_index,
+                    FinalReviewStatus::Failed,
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
+                if emit_rejected_tool_calls(&mut on_event, input, &response.tool_calls, turn_index)
+                    .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
                 let model_error = model_response_validation_error(vec![
                     "assistant_tool_calls_mismatch".to_string(),
                 ]);
@@ -1317,6 +1662,33 @@ where
                 );
             }
             if has_duplicate_tool_call_ids(&response.tool_calls) {
+                if emit_final_review_finished(
+                    &mut on_event,
+                    &final_review,
+                    turn_index,
+                    FinalReviewStatus::Failed,
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
+                if emit_rejected_tool_calls(&mut on_event, input, &response.tool_calls, turn_index)
+                    .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
                 let model_error =
                     model_response_validation_error(vec!["duplicate_tool_call_id".to_string()]);
                 return state.finish_with_model_error(
@@ -1331,10 +1703,46 @@ where
             if response.tool_calls.is_empty() {
                 let final_answer = assistant_message_text(response.assistant_message.as_ref());
                 if final_answer.trim().is_empty() {
+                    if emit_final_review_finished(
+                        &mut on_event,
+                        &final_review,
+                        turn_index,
+                        FinalReviewStatus::Failed,
+                    )
+                    .is_err()
+                    {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            actual_model_turns,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
+                    }
                     state.recovery_metrics.completion_rejection_count = state
                         .recovery_metrics
                         .completion_rejection_count
                         .saturating_add(1);
+                    let rejection_count = state.recovery_metrics.completion_rejection_count;
+                    if emit_verification_occurrence(
+                        &mut on_event,
+                        input,
+                        turn_index,
+                        rejection_count,
+                        "verification_gate_rejected",
+                        VerificationStatus::GateRejected,
+                        &state.completion.summary(),
+                    )
+                    .is_err()
+                    {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            actual_model_turns,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
+                    }
                     return state.finish(
                         AgentStatus::Failed,
                         false,
@@ -1344,6 +1752,22 @@ where
                     );
                 }
                 if state.allows_final() {
+                    if emit_final_review_finished(
+                        &mut on_event,
+                        &final_review,
+                        turn_index,
+                        FinalReviewStatus::Succeeded,
+                    )
+                    .is_err()
+                    {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            actual_model_turns,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
+                    }
                     return state.finish(
                         AgentStatus::Completed,
                         true,
@@ -1356,6 +1780,38 @@ where
                     .recovery_metrics
                     .completion_rejection_count
                     .saturating_add(1);
+                let rejection_count = state.recovery_metrics.completion_rejection_count;
+                let verification = state.completion.summary();
+                for (kind, status) in [
+                    (
+                        "verification_gate_rejected",
+                        VerificationStatus::GateRejected,
+                    ),
+                    (
+                        "verification_repair_requested",
+                        VerificationStatus::RepairRequested,
+                    ),
+                ] {
+                    if emit_verification_occurrence(
+                        &mut on_event,
+                        input,
+                        turn_index,
+                        rejection_count,
+                        kind,
+                        status,
+                        &verification,
+                    )
+                    .is_err()
+                    {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            actual_model_turns,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
+                    }
+                }
                 state.last_completion_error = Some(state.completion_rejection_reason());
                 state.messages.push(
                     response
@@ -1374,10 +1830,43 @@ where
                 .iter()
                 .map(|call| call.tool_name.clone())
                 .collect::<Vec<_>>();
-            let observed_tool_calls = execution_tool_calls
+            let mut tool_occurrences = execution_tool_calls
                 .iter()
-                .map(|call| state.observe_model_tool_call(call, &execution_tool_names))
+                .enumerate()
+                .map(|(ordinal, call)| ModelToolOccurrence {
+                    call: call.clone(),
+                    fingerprint: String::new(),
+                    invalid_was_observed: false,
+                    context: tool_occurrence_context(
+                        input,
+                        call,
+                        turn_index,
+                        u32::try_from(ordinal).unwrap_or(u32::MAX),
+                    ),
+                })
                 .collect::<Vec<_>>();
+            for occurrence in &tool_occurrences {
+                if emit_event(
+                    &mut on_event,
+                    tool_call_event(&occurrence.context, occurrence.context.timer.started()),
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        actual_model_turns,
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
+            }
+            for occurrence in &mut tool_occurrences {
+                let (fingerprint, invalid_was_observed) =
+                    state.observe_model_tool_call(&occurrence.call, &execution_tool_names);
+                occurrence.fingerprint = fingerprint;
+                occurrence.invalid_was_observed = invalid_was_observed;
+            }
             let assistant_tool_message = provider_history_assistant_message(
                 response.assistant_message.as_ref(),
                 &response.tool_calls,
@@ -1386,11 +1875,10 @@ where
             state.messages.push(assistant_tool_message);
             match self.process_tool_calls(
                 input,
-                &execution_tool_calls,
-                &response.tool_calls,
-                &observed_tool_calls,
+                &tool_occurrences,
                 &mut state,
                 actual_model_turns,
+                &mut on_event,
             ) {
                 ToolBatchControl::Continue => {}
                 ToolBatchControl::Blocked => {
@@ -1444,6 +1932,16 @@ where
         self.resume_pending_approval_internal(input, pending, None)
     }
 
+    /// 恢复 approval，并在真实边界向调用方投影有序 typed 事件。
+    pub fn resume_pending_approval_with_events(
+        &self,
+        input: &AgentLoopInput,
+        pending: &PendingApprovalOccurrence,
+        on_event: &mut AgentLoopEventCallback<'_>,
+    ) -> AgentLoopResult {
+        self.resume_pending_approval_internal(input, pending, Some(on_event))
+    }
+
     /// 恢复 approval，并只向调用方投影恢复后最终化 assistant 回合的有序文本 delta。
     pub fn resume_pending_approval_with_text_deltas(
         &self,
@@ -1451,14 +1949,23 @@ where
         pending: &PendingApprovalOccurrence,
         on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AgentLoopResult {
-        self.resume_pending_approval_internal(input, pending, Some(on_text_delta))
+        self.resume_pending_approval_internal(
+            input,
+            pending,
+            Some(&mut |event| {
+                if let AgentLoopEvent::FinalTextDelta { delta } = event {
+                    on_text_delta(&delta);
+                }
+                Ok(())
+            }),
+        )
     }
 
     fn resume_pending_approval_internal(
         &self,
         input: &AgentLoopInput,
         pending: &PendingApprovalOccurrence,
-        on_text_delta: Option<&mut AgentTextDeltaCallback<'_>>,
+        mut on_event: Option<&mut AgentLoopEventCallback<'_>>,
     ) -> AgentLoopResult {
         if self.is_cancelled(input) {
             return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
@@ -1568,8 +2075,82 @@ where
                 Some("pending tool call no longer satisfies its execution boundary".to_string()),
             );
         }
-        let decision = self.tool_decision(input, &prepared, &mut state.used_approval_grants);
-        if !matches!(decision, ToolBrokerDecision::Approved { .. }) {
+        let occurrence = ModelToolOccurrence {
+            call: call.clone(),
+            fingerprint: tool_call_fingerprint,
+            invalid_was_observed: false,
+            context: tool_occurrence_context(input, &call, model_turn_offset.saturating_sub(1), 0),
+        };
+        if emit_event(
+            &mut on_event,
+            tool_call_event(&occurrence.context, occurrence.context.timer.started()),
+        )
+        .is_err()
+        {
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+            );
+        }
+        let policy_timer = OccurrenceTimer::start();
+        let policy_identity =
+            child_occurrence_identity(&occurrence.context.identity, "policy_decision", 1);
+        let bound = prepared.bound.as_ref().expect("pending call remains bound");
+        let operation_count = tool_operation_count(bound, &self.policy.profile);
+        let resource_count = u32::try_from(bound.resources.len()).unwrap_or(u32::MAX);
+        if emit_event(
+            &mut on_event,
+            AgentLoopEvent::Observation(AgentObservation::PolicyDecision(
+                PolicyDecisionObservation {
+                    identity: policy_identity.clone(),
+                    lifecycle: policy_timer.started(),
+                    operation_count,
+                    resource_count,
+                    cause: None,
+                },
+            )),
+        )
+        .is_err()
+        {
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+            );
+        }
+        let observed_decision =
+            self.tool_decision(input, &prepared, &mut state.used_approval_grants);
+        if emit_event(
+            &mut on_event,
+            AgentLoopEvent::Observation(AgentObservation::PolicyDecision(
+                PolicyDecisionObservation {
+                    identity: policy_identity,
+                    lifecycle: policy_timer.finished(policy_status(&observed_decision.decision)),
+                    operation_count,
+                    resource_count,
+                    cause: Some(observed_decision.cause),
+                },
+            )),
+        )
+        .is_err()
+        {
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+            );
+        }
+        if !matches!(
+            observed_decision.decision,
+            ToolBrokerDecision::Approved { .. }
+        ) {
             return state.finish(
                 AgentStatus::Failed,
                 false,
@@ -1578,37 +2159,35 @@ where
                 Some("pending tool call approval did not match".to_string()),
             );
         }
-        let tool_result = self.execute_tool(&prepared, decision, &mut state);
-        let tool_result = if self.is_cancelled(input) && tool_result.ok {
-            cancelled_tool_result(&call)
-        } else {
-            tool_result
-        };
-        let non_repairable_error = (!tool_result.ok && !is_repairable_tool_result(&tool_result))
-            .then(|| {
-                tool_result
-                    .error_code
-                    .clone()
-                    .unwrap_or_else(|| "tool_execution_failed".to_string())
-            });
-        let recovery_feedback = state.observe_tool_result(&tool_result, &tool_call_fingerprint);
-        state.append_visible_tool_result(tool_result, None);
-        if let Some(feedback) = recovery_feedback {
-            state
-                .messages
-                .push(ModelMessage::text(ModelRole::Developer, feedback));
-        }
-        if self.is_cancelled(input) {
-            return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
-        }
-        if let Some(error_code) = non_repairable_error {
-            return state.finish(
-                AgentStatus::Failed,
-                false,
-                None,
-                model_turn_offset,
-                Some(format!("tool execution failed: {error_code}")),
-            );
+        let runtime = self.execute_tool(
+            &prepared,
+            observed_decision.decision,
+            &mut state,
+            &occurrence.context,
+            &mut on_event,
+        );
+        match self.record_tool_results(
+            input,
+            &mut state,
+            vec![(prepared, runtime)],
+            &[occurrence],
+            false,
+            &mut on_event,
+        ) {
+            ToolBatchControl::Continue => {}
+            ToolBatchControl::Cancelled => {
+                return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
+            }
+            ToolBatchControl::Failed(error) => {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    model_turn_offset,
+                    Some(error),
+                );
+            }
+            ToolBatchControl::Blocked => unreachable!("resumed tool cannot block in execution"),
         }
         self.continue_run(
             input,
@@ -1617,7 +2196,7 @@ where
             max_tool_calls,
             state,
             model_turn_offset,
-            on_text_delta,
+            on_event,
         )
     }
 
@@ -1688,27 +2267,36 @@ where
         input: &AgentLoopInput,
         prepared: &PreparedToolCall,
         used_approval_grants: &mut BTreeSet<String>,
-    ) -> ToolBrokerDecision {
+    ) -> ObservedToolDecision {
         let call = &prepared.call;
         if call.parse_status != ModelToolParseStatus::Valid || !call.arguments.is_object() {
-            return ToolBrokerDecision::deny_with_kind(
-                ToolFailureKind::Input,
-                "invalid tool call arguments",
-            );
+            return ObservedToolDecision {
+                decision: ToolBrokerDecision::deny_with_kind(
+                    ToolFailureKind::Input,
+                    "invalid tool call arguments",
+                ),
+                cause: PolicyDecisionCause::Explicit,
+            };
         }
         let Some(bound) = &prepared.bound else {
-            return ToolBrokerDecision::deny_with_kind(
-                ToolFailureKind::Input,
-                "tool call was not bound by the registry",
-            );
+            return ObservedToolDecision {
+                decision: ToolBrokerDecision::deny_with_kind(
+                    ToolFailureKind::Input,
+                    "tool call was not bound by the registry",
+                ),
+                cause: PolicyDecisionCause::Explicit,
+            };
         };
         let request_id = approval_request_id(input, call);
         let permission = self.tool_permission_decision(bound);
         if used_approval_grants.contains(&request_id) {
-            return ToolBrokerDecision::deny_with_kind(
-                ToolFailureKind::Approval,
-                "approval grant already consumed",
-            );
+            return ObservedToolDecision {
+                decision: ToolBrokerDecision::deny_with_kind(
+                    ToolFailureKind::Approval,
+                    "approval grant already consumed",
+                ),
+                cause: PolicyDecisionCause::ApprovalState,
+            };
         }
         if !matches!(permission.outcome, PermissionDecisionOutcome::Deny)
             && let Some(grant) = input.approval_grants.iter().find(|grant| {
@@ -1719,9 +2307,13 @@ where
             })
         {
             used_approval_grants.insert(grant.request_id.clone());
-            return ToolBrokerDecision::approved(grant.request_id.clone());
+            return ObservedToolDecision {
+                decision: ToolBrokerDecision::approved(grant.request_id.clone()),
+                cause: PolicyDecisionCause::ApprovalGrant,
+            };
         }
-        match permission.outcome {
+        let cause = safe_policy_cause(&permission.cause);
+        let decision = match permission.outcome {
             PermissionDecisionOutcome::Allow => ToolBrokerDecision::Allow,
             PermissionDecisionOutcome::Deny => ToolBrokerDecision::deny_with_kind(
                 permission_failure_kind(&permission.cause),
@@ -1730,7 +2322,8 @@ where
             PermissionDecisionOutcome::Ask => {
                 ToolBrokerDecision::ask(request_id, permission.reason)
             }
-        }
+        };
+        ObservedToolDecision { decision, cause }
     }
 
     fn tool_permission_decision(&self, bound: &BoundToolCall) -> PermissionDecision {
@@ -1773,27 +2366,24 @@ where
     fn process_tool_calls(
         &self,
         input: &AgentLoopInput,
-        calls: &[ModelToolCall],
-        model_visible_calls: &[ModelToolCall],
-        observed: &[(String, bool)],
+        occurrences: &[ModelToolOccurrence],
         state: &mut AgentLoopState,
         next_model_turn: u32,
+        on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
     ) -> ToolBatchControl {
         if self.is_cancelled(input) {
             return ToolBatchControl::Cancelled;
         }
-        debug_assert_eq!(calls.len(), model_visible_calls.len());
-        debug_assert_eq!(calls.len(), observed.len());
-        let mut prepared = calls
+        let mut prepared = occurrences
             .iter()
-            .zip(model_visible_calls)
-            .zip(observed)
-            .map(
-                |((call, model_visible_call), (fingerprint, invalid_was_observed))| {
-                    debug_assert_eq!(call.tool_call_id, model_visible_call.tool_call_id);
-                    self.prepare_tool_call(call, fingerprint, *invalid_was_observed, state)
-                },
-            )
+            .map(|occurrence| {
+                self.prepare_tool_call(
+                    &occurrence.call,
+                    &occurrence.fingerprint,
+                    occurrence.invalid_was_observed,
+                    state,
+                )
+            })
             .collect::<Vec<_>>();
         if self.is_cancelled(input) {
             return ToolBatchControl::Cancelled;
@@ -1801,9 +2391,56 @@ where
 
         let mut staged_approval_grants = state.used_approval_grants.clone();
         if !prepared.iter().any(|call| call.rejection.is_some()) {
-            for prepared_call in &mut prepared {
-                let decision =
+            for (prepared_call, occurrence) in prepared.iter_mut().zip(occurrences) {
+                let policy_timer = OccurrenceTimer::start();
+                let identity =
+                    child_occurrence_identity(&occurrence.context.identity, "policy_decision", 0);
+                let operation_count = tool_operation_count(
+                    prepared_call
+                        .bound
+                        .as_ref()
+                        .expect("prepared call is bound"),
+                    &self.policy.profile,
+                );
+                let resource_count = prepared_call.bound.as_ref().map_or(0, |bound| {
+                    u32::try_from(bound.resources.len()).unwrap_or(u32::MAX)
+                });
+                if emit_event(
+                    on_event,
+                    AgentLoopEvent::Observation(AgentObservation::PolicyDecision(
+                        PolicyDecisionObservation {
+                            identity: identity.clone(),
+                            lifecycle: policy_timer.started(),
+                            operation_count,
+                            resource_count,
+                            cause: None,
+                        },
+                    )),
+                )
+                .is_err()
+                {
+                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
+                }
+                let observed_decision =
                     self.tool_decision(input, prepared_call, &mut staged_approval_grants);
+                if emit_event(
+                    on_event,
+                    AgentLoopEvent::Observation(AgentObservation::PolicyDecision(
+                        PolicyDecisionObservation {
+                            identity,
+                            lifecycle: policy_timer
+                                .finished(policy_status(&observed_decision.decision)),
+                            operation_count,
+                            resource_count,
+                            cause: Some(observed_decision.cause),
+                        },
+                    )),
+                )
+                .is_err()
+                {
+                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
+                }
+                let decision = observed_decision.decision;
                 prepared_call.rejection = matches!(decision, ToolBrokerDecision::Deny { .. })
                     .then(|| self.decision_result(&prepared_call.call, &decision));
                 prepared_call.decision = Some(decision);
@@ -1822,10 +2459,17 @@ where
                 .drain(..)
                 .map(|call| {
                     let result = self.batch_rejection_result(&call);
-                    (call, result)
+                    (
+                        call,
+                        RuntimeToolResult {
+                            result,
+                            duration_ms: None,
+                            event_sink_failed: false,
+                        },
+                    )
                 })
                 .collect::<Vec<_>>();
-            return self.record_tool_results(input, state, results, true);
+            return self.record_tool_results(input, state, results, occurrences, true, on_event);
         }
 
         if prepared.len() > 1 {
@@ -1834,14 +2478,28 @@ where
             if self.is_cancelled(input) {
                 return ToolBatchControl::Cancelled;
             }
-            return self.record_tool_results(input, state, results, false);
+            return self.record_tool_results(input, state, results, occurrences, false, on_event);
         }
 
-        let Some(mut prepared) = prepared.pop() else {
+        let Some(prepared) = prepared.pop() else {
             return ToolBatchControl::Continue;
         };
-        if let Some(result) = prepared.rejection.take() {
-            return self.record_tool_results(input, state, vec![(prepared, result)], false);
+        if let Some(result) = prepared.rejection.clone() {
+            return self.record_tool_results(
+                input,
+                state,
+                vec![(
+                    prepared,
+                    RuntimeToolResult {
+                        result,
+                        duration_ms: None,
+                        event_sink_failed: false,
+                    },
+                )],
+                occurrences,
+                false,
+                on_event,
+            );
         }
         let decision = prepared
             .decision
@@ -1870,13 +2528,57 @@ where
                 Err(error) => return ToolBatchControl::Failed(error),
             };
             state.pending_approvals.push(occurrence);
-            let result = self.execute_tool(&prepared, decision, state);
-            state.append_hidden_tool_result(result);
+            let result = self.execute_tool(
+                &prepared,
+                decision,
+                state,
+                &occurrences
+                    .first()
+                    .expect("single approval occurrence is present")
+                    .context,
+                on_event,
+            );
+            state.append_hidden_tool_result(result.result);
+            if emit_event(
+                on_event,
+                tool_call_event(
+                    &occurrences
+                        .first()
+                        .expect("single approval occurrence is present")
+                        .context,
+                    occurrences
+                        .first()
+                        .expect("single approval occurrence is present")
+                        .context
+                        .timer
+                        .suspended(ToolCallStatus::ApprovalRequired),
+                ),
+            )
+            .is_err()
+            {
+                return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
+            }
             return ToolBatchControl::Blocked;
         }
         state.used_approval_grants = staged_approval_grants;
-        let result = self.execute_tool(&prepared, decision, state);
-        self.record_tool_results(input, state, vec![(prepared, result)], false)
+        let result = self.execute_tool(
+            &prepared,
+            decision,
+            state,
+            &occurrences
+                .first()
+                .expect("single tool occurrence is present")
+                .context,
+            on_event,
+        );
+        self.record_tool_results(
+            input,
+            state,
+            vec![(prepared, result)],
+            occurrences,
+            false,
+            on_event,
+        )
     }
 
     /// 在策略评估前规范化一个模型调用，并校验其可执行输入。
@@ -2075,11 +2777,12 @@ where
     fn execute_parallel_reads(
         &self,
         prepared: Vec<PreparedToolCall>,
-    ) -> Vec<(PreparedToolCall, ToolResult)> {
+    ) -> Vec<(PreparedToolCall, RuntimeToolResult)> {
         let broker = &self.tool_broker;
         let workspace_tools = self.workspace_tools.as_ref();
         let cancellation = &self.cancellation;
         let results = parallel_map(prepared.clone(), |worker| {
+            let started = std::time::Instant::now();
             let decision = worker
                 .decision
                 .clone()
@@ -2089,29 +2792,41 @@ where
                 .bound
                 .as_ref()
                 .expect("admitted parallel read is registry-bound");
-            broker.execute(&envelope, decision.clone(), |executor, _| {
+            let result = broker.execute(&envelope, decision.clone(), |executor, _| {
                 execute_workspace_tool_call(
                     workspace_tools,
                     cancellation,
                     &worker.call,
                     executor,
-                    bound,
-                    &decision,
-                    &PermissionProfile::workspace_write(),
+                    WorkspaceToolCallContext {
+                        bound,
+                        decision: &decision,
+                        profile: &PermissionProfile::workspace_write(),
+                        occurrence: None,
+                    },
+                    None,
                 )
-            })
+                .output
+            });
+            RuntimeToolResult {
+                result,
+                duration_ms: Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                event_sink_failed: false,
+            }
         });
         prepared
             .into_iter()
             .zip(results)
             .map(|(backup, result)| {
-                let result = result.unwrap_or_else(|| {
-                    ToolResult::failed_with_kind(
+                let result = result.unwrap_or_else(|| RuntimeToolResult {
+                    result: ToolResult::failed_with_kind(
                         &tool_call_request(&backup.call),
                         ToolFailureKind::Infrastructure,
                         "parallel_read_worker_failed",
                         "parallel read worker failed",
-                    )
+                    ),
+                    duration_ms: None,
+                    event_sink_failed: false,
                 });
                 (backup, result)
             })
@@ -2123,27 +2838,87 @@ where
         &self,
         input: &AgentLoopInput,
         state: &mut AgentLoopState,
-        results: Vec<(PreparedToolCall, ToolResult)>,
-        approval_is_recoverable: bool,
+        results: Vec<(PreparedToolCall, RuntimeToolResult)>,
+        occurrences: &[ModelToolOccurrence],
+        batch_rejected: bool,
+        on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
     ) -> ToolBatchControl {
+        debug_assert_eq!(results.len(), occurrences.len());
         let mut failure = None;
         let mut repairable_failure = None;
-        for (prepared, result) in results {
+        for ((prepared, runtime), occurrence) in results.into_iter().zip(occurrences) {
+            if runtime.event_sink_failed {
+                return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
+            }
+            let tool_duration_ms = runtime
+                .duration_ms
+                .unwrap_or_else(|| occurrence.context.timer.elapsed_ms());
+            let result = runtime.result;
             let result = if self.is_cancelled(input) && result.ok {
                 cancelled_tool_result(&prepared.call)
             } else {
                 result
             };
             let recoverable = is_repairable_tool_result(&result)
-                || (approval_is_recoverable
-                    && result.failure_kind == Some(ToolFailureKind::Approval));
+                || (batch_rejected && result.failure_kind == Some(ToolFailureKind::Approval));
             let non_repairable_error = (!result.ok && !recoverable).then(|| {
                 result
                     .error_code
                     .clone()
                     .unwrap_or_else(|| "tool_execution_failed".to_string())
             });
+            let verification_identity = (prepared.call.tool_name == TOOL_COMMAND).then(|| {
+                child_occurrence_identity(&occurrence.context.identity, "verification", 0)
+            });
+            if let Some(identity) = &verification_identity {
+                let summary = state.completion.summary();
+                if emit_event(
+                    on_event,
+                    AgentLoopEvent::Observation(AgentObservation::Verification(
+                        VerificationObservation {
+                            identity: identity.clone(),
+                            lifecycle: occurrence.context.timer.started(),
+                            required_command_count: summary.required_command_count,
+                            satisfied_command_count: summary.satisfied_command_count,
+                            occurrence_count: summary.successful_command_count,
+                            command_duration_ms: Some(tool_duration_ms),
+                        },
+                    )),
+                )
+                .is_err()
+                {
+                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
+                }
+            }
             let recovery_feedback = state.observe_tool_result(&result, &prepared.fingerprint);
+            if let Some(identity) = verification_identity {
+                let summary = state.completion.summary();
+                let status = if result.ok {
+                    VerificationStatus::CommandPassed
+                } else {
+                    VerificationStatus::CommandFailed
+                };
+                if emit_event(
+                    on_event,
+                    AgentLoopEvent::Observation(AgentObservation::Verification(
+                        VerificationObservation {
+                            identity,
+                            lifecycle: occurrence
+                                .context
+                                .timer
+                                .finished_with_duration(tool_duration_ms, status),
+                            required_command_count: summary.required_command_count,
+                            satisfied_command_count: summary.satisfied_command_count,
+                            occurrence_count: summary.successful_command_count,
+                            command_duration_ms: Some(tool_duration_ms),
+                        },
+                    )),
+                )
+                .is_err()
+                {
+                    return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
+                }
+            }
             if !result.ok && is_repairable_tool_result(&result) {
                 repairable_failure = state.last_repair_failure.clone();
             }
@@ -2157,6 +2932,29 @@ where
             }
             if failure.is_none() {
                 failure = non_repairable_error;
+            }
+            let status = tool_result_status(
+                &prepared,
+                state
+                    .tool_result_occurrences
+                    .last()
+                    .expect("recorded tool occurrence")
+                    .result(),
+                batch_rejected,
+            );
+            if emit_event(
+                on_event,
+                tool_call_event(
+                    &occurrence.context,
+                    occurrence
+                        .context
+                        .timer
+                        .finished_with_duration(tool_duration_ms, status),
+                ),
+            )
+            .is_err()
+            {
+                return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
             }
         }
         if let Some(repairable_failure) = repairable_failure {
@@ -2176,7 +2974,10 @@ where
         prepared: &PreparedToolCall,
         decision: ToolBrokerDecision,
         state: &mut AgentLoopState,
-    ) -> ToolResult {
+        occurrence: &ToolOccurrenceContext,
+        on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    ) -> RuntimeToolResult {
+        let started = std::time::Instant::now();
         let call = &prepared.call;
         let bound = prepared
             .bound
@@ -2184,6 +2985,8 @@ where
             .expect("admitted tool call is registry-bound");
         let envelope = tool_call_request(call);
         let executor_decision = decision.clone();
+        let mut sandbox_execution = None;
+        let mut event_sink_failed = false;
         let mut result = self
             .tool_broker
             .execute(&envelope, decision.clone(), |executor, _| match executor {
@@ -2191,7 +2994,17 @@ where
                     self.execute_plan_update(call, state)
                 }
                 ToolExecutor::Workspace(_) => {
-                    self.execute_workspace_tool(call, executor, bound, &executor_decision)
+                    let execution = self.execute_workspace_tool(
+                        call,
+                        executor,
+                        bound,
+                        &executor_decision,
+                        occurrence,
+                        on_event,
+                    );
+                    sandbox_execution = execution.sandbox_execution;
+                    event_sink_failed = execution.event_sink_failed;
+                    execution.output
                 }
             });
         if matches!(
@@ -2207,7 +3020,15 @@ where
                 &self.policy.profile,
             ));
         }
-        result
+        let duration_ms = sandbox_execution.as_ref().map_or_else(
+            || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            |sandbox| sandbox.duration_ms,
+        );
+        RuntimeToolResult {
+            result,
+            duration_ms: Some(duration_ms),
+            event_sink_failed,
+        }
     }
 
     fn execute_plan_update(&self, call: &ModelToolCall, state: &mut AgentLoopState) -> ToolOutput {
@@ -2234,15 +3055,21 @@ where
         executor: ToolExecutor,
         bound: &BoundToolCall,
         decision: &ToolBrokerDecision,
-    ) -> ToolOutput {
+        occurrence: &ToolOccurrenceContext,
+        on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    ) -> WorkspaceToolExecution {
         execute_workspace_tool_call(
             self.workspace_tools.as_ref(),
             &self.cancellation,
             call,
             executor,
-            bound,
-            decision,
-            &self.policy.profile,
+            WorkspaceToolCallContext {
+                bound,
+                decision,
+                profile: &self.policy.profile,
+                occurrence: Some(occurrence),
+            },
+            Some(on_event),
         )
     }
 }
@@ -2252,24 +3079,39 @@ fn execute_workspace_tool_call(
     cancellation: &CancellationToken,
     call: &ModelToolCall,
     executor: ToolExecutor,
-    bound: &BoundToolCall,
-    decision: &ToolBrokerDecision,
-    profile: &PermissionProfile,
-) -> ToolOutput {
+    context: WorkspaceToolCallContext<'_>,
+    on_event: Option<&mut Option<&mut AgentLoopEventCallback<'_>>>,
+) -> WorkspaceToolExecution {
+    let WorkspaceToolCallContext {
+        bound,
+        decision,
+        profile,
+        occurrence,
+    } = context;
     if cancellation.is_cancelled() {
-        return ToolOutput::failure_with_kind(
-            ToolFailureKind::Cancelled,
-            "tool_cancelled",
-            json!({"summary": "tool execution cancelled"}),
-        );
+        return WorkspaceToolExecution {
+            output: ToolOutput::failure_with_kind(
+                ToolFailureKind::Cancelled,
+                "tool_cancelled",
+                json!({"summary": "tool execution cancelled"}),
+            ),
+            sandbox_execution: None,
+            event_sink_failed: false,
+        };
     }
     let Some(workspace_tools) = workspace_tools else {
-        return ToolOutput::failure_with_kind(
-            ToolFailureKind::Backend,
-            "backend_unavailable",
-            json!({"summary": "workspace tool backend is unavailable"}),
-        );
+        return WorkspaceToolExecution {
+            output: ToolOutput::failure_with_kind(
+                ToolFailureKind::Backend,
+                "backend_unavailable",
+                json!({"summary": "workspace tool backend is unavailable"}),
+            ),
+            sandbox_execution: None,
+            event_sink_failed: false,
+        };
     };
+    let mut sandbox_execution = None;
+    let mut event_sink_failed = false;
     let result = match executor {
         ToolExecutor::Workspace(WorkspaceToolExecutor::Read) => read_tool_input(&call.arguments)
             .and_then(|input| {
@@ -2305,24 +3147,60 @@ fn execute_workspace_tool_call(
                             }
                         })
                     else {
-                        return ToolOutput::failure_with_kind(
-                            ToolFailureKind::PermissionProfile,
-                            "command_scope_missing",
-                            json!({"summary": "command authorization scope is missing"}),
-                        );
+                        return WorkspaceToolExecution {
+                            output: ToolOutput::failure_with_kind(
+                                ToolFailureKind::PermissionProfile,
+                                "command_scope_missing",
+                                json!({"summary": "command authorization scope is missing"}),
+                            ),
+                            sandbox_execution: None,
+                            event_sink_failed: false,
+                        };
                     };
-                    Ok(workspace_tools
-                        .command_cancellable_with_policy(
+                    let execution = if let (Some(occurrence), Some(agent_sink)) =
+                        (occurrence, on_event)
+                    {
+                        let mut sandbox_sink = |boundary| {
+                            if emit_event(agent_sink, sandbox_boundary_event(occurrence, boundary))
+                                .is_err()
+                            {
+                                event_sink_failed = true;
+                                Err(ToolSandboxExecutionSinkError)
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        workspace_tools.command_cancellable_with_policy_events(
+                            input.clone(),
+                            filesystem,
+                            network,
+                            expected_scope,
+                            cancellation,
+                            &mut sandbox_sink,
+                        )
+                    } else {
+                        workspace_tools.command_cancellable_with_policy_observed(
                             input.clone(),
                             filesystem,
                             network,
                             expected_scope,
                             cancellation,
                         )
-                        .map_err(Into::into)
-                        .unwrap_or_else(|error| {
-                            command_workspace_tool_failure(&input, error, profile)
-                        }))
+                    };
+                    Ok(match execution {
+                        Ok(execution) => {
+                            sandbox_execution = Some(execution.sandbox_execution);
+                            execution.output
+                        }
+                        Err(WorkspaceToolError::ObservationSinkFailed) if event_sink_failed => {
+                            ToolOutput::failure_with_kind(
+                                ToolFailureKind::Infrastructure,
+                                "event_sink_failed",
+                                json!({"summary": EVENT_SINK_FAILURE_ERROR}),
+                            )
+                        }
+                        Err(error) => command_workspace_tool_failure(&input, error.into(), profile),
+                    })
                 }
                 Err(error) => Err(error),
             }
@@ -2333,7 +3211,11 @@ fn execute_workspace_tool_call(
             json!({"summary": "tool backend is unavailable"}),
         )),
     };
-    result.unwrap_or_else(workspace_tool_failure)
+    WorkspaceToolExecution {
+        output: result.unwrap_or_else(workspace_tool_failure),
+        sandbox_execution,
+        event_sink_failed,
+    }
 }
 
 fn parallel_map<T, R, F>(items: Vec<T>, worker: F) -> Vec<Option<R>>
@@ -3056,6 +3938,345 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
     }
 }
 
+struct ToolOccurrenceContext {
+    identity: OccurrenceIdentity,
+    timer: OccurrenceTimer,
+    model_turn_ordinal: u32,
+    tool_call_ordinal: u32,
+    tool_call_id_digest: String,
+    tool_name: String,
+}
+
+struct ModelToolOccurrence {
+    call: ModelToolCall,
+    fingerprint: String,
+    invalid_was_observed: bool,
+    context: ToolOccurrenceContext,
+}
+
+struct RuntimeToolResult {
+    result: ToolResult,
+    duration_ms: Option<u64>,
+    event_sink_failed: bool,
+}
+
+struct WorkspaceToolExecution {
+    output: ToolOutput,
+    sandbox_execution: Option<ToolSandboxExecutionObservation>,
+    event_sink_failed: bool,
+}
+
+struct WorkspaceToolCallContext<'a> {
+    bound: &'a BoundToolCall,
+    decision: &'a ToolBrokerDecision,
+    profile: &'a PermissionProfile,
+    occurrence: Option<&'a ToolOccurrenceContext>,
+}
+
+struct ObservedToolDecision {
+    decision: ToolBrokerDecision,
+    cause: PolicyDecisionCause,
+}
+
+fn emit_event(
+    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    event: AgentLoopEvent,
+) -> Result<(), AgentLoopEventSinkError> {
+    match on_event.as_deref_mut() {
+        Some(callback) => callback(event),
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_prompt_assembly_finished(
+    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    identity: OccurrenceIdentity,
+    timer: &OccurrenceTimer,
+    model_turn_ordinal: u32,
+    message_count: u32,
+    tool_count: u32,
+    request_token_count: u32,
+    request_digest: String,
+    compacted: bool,
+    finalization_only: bool,
+    status: PromptAssemblyStatus,
+) -> Result<(), AgentLoopEventSinkError> {
+    emit_event(
+        on_event,
+        AgentLoopEvent::Observation(AgentObservation::PromptAssembly(
+            PromptAssemblyObservation {
+                identity,
+                lifecycle: timer.finished(status),
+                model_turn_ordinal,
+                message_count,
+                tool_count,
+                request_token_count,
+                request_digest,
+                compacted,
+                finalization_only,
+            },
+        )),
+    )
+}
+
+fn emit_final_review_finished(
+    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    final_review: &Option<(OccurrenceIdentity, OccurrenceTimer)>,
+    model_turn_ordinal: u32,
+    status: FinalReviewStatus,
+) -> Result<(), AgentLoopEventSinkError> {
+    let Some((identity, timer)) = final_review else {
+        return Ok(());
+    };
+    emit_event(
+        on_event,
+        AgentLoopEvent::Observation(AgentObservation::FinalReview(FinalReviewObservation {
+            identity: identity.clone(),
+            lifecycle: timer.finished(status),
+            model_turn_ordinal,
+        })),
+    )
+}
+
+fn emit_verification_occurrence(
+    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    input: &AgentLoopInput,
+    model_turn_ordinal: u32,
+    occurrence_ordinal: u32,
+    kind: &str,
+    status: VerificationStatus,
+    summary: &AgentVerification,
+) -> Result<(), AgentLoopEventSinkError> {
+    let timer = OccurrenceTimer::start();
+    let identity = occurrence_identity(input, kind, model_turn_ordinal, occurrence_ordinal, None);
+    for lifecycle in [timer.started(), timer.finished(status)] {
+        emit_event(
+            on_event,
+            AgentLoopEvent::Observation(AgentObservation::Verification(VerificationObservation {
+                identity: identity.clone(),
+                lifecycle,
+                required_command_count: summary.required_command_count,
+                satisfied_command_count: summary.satisfied_command_count,
+                occurrence_count: occurrence_ordinal,
+                command_duration_ms: None,
+            })),
+        )?;
+    }
+    Ok(())
+}
+
+fn occurrence_identity(
+    input: &AgentLoopInput,
+    kind: &str,
+    model_turn_ordinal: u32,
+    ordinal: u32,
+    parent_occurrence_id: Option<String>,
+) -> OccurrenceIdentity {
+    let encoded = format!(
+        "{}\u{0}{}\u{0}{kind}\u{0}{model_turn_ordinal}\u{0}{ordinal}",
+        input.thread_id, input.turn_id
+    );
+    OccurrenceIdentity {
+        occurrence_id: format!("sha256:{:x}", Sha256::digest(encoded.as_bytes())),
+        parent_occurrence_id,
+        ordinal,
+    }
+}
+
+fn child_occurrence_identity(
+    parent: &OccurrenceIdentity,
+    kind: &str,
+    ordinal: u32,
+) -> OccurrenceIdentity {
+    let encoded = format!("{}\u{0}{kind}\u{0}{ordinal}", parent.occurrence_id);
+    OccurrenceIdentity {
+        occurrence_id: format!("sha256:{:x}", Sha256::digest(encoded.as_bytes())),
+        parent_occurrence_id: Some(parent.occurrence_id.clone()),
+        ordinal,
+    }
+}
+
+fn tool_occurrence_context(
+    input: &AgentLoopInput,
+    call: &ModelToolCall,
+    model_turn_ordinal: u32,
+    tool_call_ordinal: u32,
+) -> ToolOccurrenceContext {
+    let prompt_parent = occurrence_identity(input, "prompt_assembly", model_turn_ordinal, 0, None);
+    ToolOccurrenceContext {
+        identity: occurrence_identity(
+            input,
+            "tool_call",
+            model_turn_ordinal,
+            tool_call_ordinal,
+            Some(prompt_parent.occurrence_id),
+        ),
+        timer: OccurrenceTimer::start(),
+        model_turn_ordinal,
+        tool_call_ordinal,
+        tool_call_id_digest: format!("sha256:{:x}", Sha256::digest(call.tool_call_id.as_bytes())),
+        tool_name: safe_tool_name(call),
+    }
+}
+
+fn safe_tool_name(call: &ModelToolCall) -> String {
+    if call.parse_status == ModelToolParseStatus::Valid
+        && !call.tool_name.is_empty()
+        && call.tool_name.len() <= 64
+        && call
+            .tool_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        call.tool_name.clone()
+    } else {
+        "invalid_tool".to_string()
+    }
+}
+
+fn tool_call_event(
+    context: &ToolOccurrenceContext,
+    lifecycle: OccurrenceLifecycle<ToolCallStatus>,
+) -> AgentLoopEvent {
+    AgentLoopEvent::Observation(AgentObservation::ToolCall(ToolCallObservation {
+        identity: context.identity.clone(),
+        lifecycle,
+        model_turn_ordinal: context.model_turn_ordinal,
+        tool_call_ordinal: context.tool_call_ordinal,
+        tool_call_id_digest: context.tool_call_id_digest.clone(),
+        tool_name: context.tool_name.clone(),
+    }))
+}
+
+fn emit_rejected_tool_calls(
+    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    input: &AgentLoopInput,
+    calls: &[ModelToolCall],
+    model_turn_ordinal: u32,
+) -> Result<(), AgentLoopEventSinkError> {
+    for (ordinal, call) in calls.iter().enumerate() {
+        let context = tool_occurrence_context(
+            input,
+            call,
+            model_turn_ordinal,
+            u32::try_from(ordinal).unwrap_or(u32::MAX),
+        );
+        emit_event(on_event, tool_call_event(&context, context.timer.started()))?;
+        emit_event(
+            on_event,
+            tool_call_event(&context, context.timer.finished(ToolCallStatus::Rejected)),
+        )?;
+    }
+    Ok(())
+}
+
+fn tool_result_status(
+    prepared: &PreparedToolCall,
+    result: &ToolResult,
+    batch_rejected: bool,
+) -> ToolCallStatus {
+    if batch_rejected {
+        ToolCallStatus::BatchRejected
+    } else if result.failure_kind == Some(ToolFailureKind::Cancelled) {
+        ToolCallStatus::Cancelled
+    } else if matches!(prepared.decision, Some(ToolBrokerDecision::Deny { .. })) {
+        ToolCallStatus::PolicyDenied
+    } else if prepared.rejection.is_some() {
+        ToolCallStatus::Rejected
+    } else if result.ok {
+        ToolCallStatus::Succeeded
+    } else {
+        ToolCallStatus::Failed
+    }
+}
+
+fn policy_status(decision: &ToolBrokerDecision) -> PolicyDecisionStatus {
+    match decision {
+        ToolBrokerDecision::Allow | ToolBrokerDecision::Approved { .. } => {
+            PolicyDecisionStatus::Allow
+        }
+        ToolBrokerDecision::Ask { .. } => PolicyDecisionStatus::Ask,
+        ToolBrokerDecision::Deny { .. } => PolicyDecisionStatus::Deny,
+    }
+}
+
+fn tool_operation_count(bound: &BoundToolCall, profile: &PermissionProfile) -> u32 {
+    if matches!(
+        bound.executor,
+        ToolExecutor::Workspace(WorkspaceToolExecutor::Command)
+    ) && profile.network_access == NetworkAccess::Allowed
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn safe_policy_cause(cause: &PermissionCause) -> PolicyDecisionCause {
+    match cause {
+        PermissionCause::Explicit => PolicyDecisionCause::Explicit,
+        PermissionCause::Rule => PolicyDecisionCause::Rule,
+        PermissionCause::FilesystemProfile => PolicyDecisionCause::FilesystemProfile,
+        PermissionCause::NetworkProfile => PolicyDecisionCause::NetworkProfile,
+        PermissionCause::ProtectedResource => PolicyDecisionCause::ProtectedResource,
+        PermissionCause::NoMatchingRule => PolicyDecisionCause::NoMatchingRule,
+        PermissionCause::ApprovalPolicy => PolicyDecisionCause::ApprovalPolicy,
+    }
+}
+
+fn sandbox_status(status: ToolSandboxExecutionStatus) -> SandboxExecutionStatus {
+    match status {
+        ToolSandboxExecutionStatus::Ok => SandboxExecutionStatus::Ok,
+        ToolSandboxExecutionStatus::Error => SandboxExecutionStatus::Error,
+        ToolSandboxExecutionStatus::TimedOut => SandboxExecutionStatus::TimedOut,
+        ToolSandboxExecutionStatus::Cancelled => SandboxExecutionStatus::Cancelled,
+    }
+}
+
+fn sandbox_boundary_event(
+    occurrence: &ToolOccurrenceContext,
+    boundary: ToolSandboxExecutionBoundary,
+) -> AgentLoopEvent {
+    let identity = child_occurrence_identity(&occurrence.identity, "sandbox_execution", 0);
+    let observation = match boundary {
+        ToolSandboxExecutionBoundary::Started {
+            command_id,
+            started_at_unix_ms,
+        } => SandboxExecutionOccurrence {
+            identity,
+            lifecycle: OccurrenceLifecycle::Started {
+                queued_at_unix_ms: started_at_unix_ms,
+                started_at_unix_ms,
+            },
+            command_id,
+            command_id_binding_valid: None,
+            workspace_mutation: None,
+            enforcement: None,
+        },
+        ToolSandboxExecutionBoundary::Finished(sandbox) => SandboxExecutionOccurrence {
+            identity,
+            lifecycle: OccurrenceLifecycle::Finished {
+                queued_at_unix_ms: sandbox.started_at_unix_ms,
+                started_at_unix_ms: sandbox.started_at_unix_ms,
+                ended_at_unix_ms: sandbox.ended_at_unix_ms,
+                duration_ms: sandbox.duration_ms,
+                status: sandbox_status(sandbox.status),
+            },
+            command_id: sandbox.command_id,
+            command_id_binding_valid: Some(sandbox.command_id_binding_valid),
+            workspace_mutation: Some(sandbox.workspace_mutation),
+            enforcement: Some(sandbox.enforcement),
+        },
+    };
+    AgentLoopEvent::Observation(AgentObservation::SandboxExecution(observation))
+}
+
+fn safe_request_digest(request: &ModelTurnRequest) -> String {
+    let encoded = serde_json::to_vec(request).unwrap_or_default();
+    format!("sha256:{:x}", Sha256::digest(encoded))
+}
+
 struct ModelToolView {
     tools: Vec<ModelToolSchema>,
     visible_tool_names: Vec<String>,
@@ -3687,15 +4908,15 @@ fn update_plan_tool_input(arguments: &Value) -> Result<AgentPlan, AgentLoopToolE
         .map_err(AgentLoopToolError::InvalidArguments)
 }
 
-fn permission_failure_kind(cause: &PermissionDecisionCause) -> ToolFailureKind {
+fn permission_failure_kind(cause: &PermissionCause) -> ToolFailureKind {
     match cause {
-        PermissionDecisionCause::FilesystemProfile => ToolFailureKind::PermissionProfile,
-        PermissionDecisionCause::NetworkProfile => ToolFailureKind::PermissionProfile,
-        PermissionDecisionCause::ProtectedResource => ToolFailureKind::ProtectedPath,
-        PermissionDecisionCause::ApprovalPolicy => ToolFailureKind::Approval,
-        PermissionDecisionCause::Explicit
-        | PermissionDecisionCause::Rule
-        | PermissionDecisionCause::NoMatchingRule => ToolFailureKind::Policy,
+        PermissionCause::FilesystemProfile => ToolFailureKind::PermissionProfile,
+        PermissionCause::NetworkProfile => ToolFailureKind::PermissionProfile,
+        PermissionCause::ProtectedResource => ToolFailureKind::ProtectedPath,
+        PermissionCause::ApprovalPolicy => ToolFailureKind::Approval,
+        PermissionCause::Explicit | PermissionCause::Rule | PermissionCause::NoMatchingRule => {
+            ToolFailureKind::Policy
+        }
     }
 }
 
@@ -3810,6 +5031,9 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         AgentLoopToolError::Workspace(WorkspaceToolError::SandboxUnavailable) => {
             (ToolFailureKind::Sandbox, "sandbox_unavailable")
         }
+        AgentLoopToolError::Workspace(WorkspaceToolError::ObservationSinkFailed) => {
+            (ToolFailureKind::Infrastructure, "event_sink_failed")
+        }
         AgentLoopToolError::Workspace(WorkspaceToolError::Cancelled) => {
             (ToolFailureKind::Cancelled, "tool_cancelled")
         }
@@ -3855,6 +5079,9 @@ fn workspace_tool_failure(error: AgentLoopToolError) -> ToolOutput {
         }
         AgentLoopToolError::Workspace(WorkspaceToolError::SandboxUnavailable) => {
             "strict sandbox backend is unavailable"
+        }
+        AgentLoopToolError::Workspace(WorkspaceToolError::ObservationSinkFailed) => {
+            EVENT_SINK_FAILURE_ERROR
         }
         AgentLoopToolError::Workspace(WorkspaceToolError::Cancelled) => "tool execution cancelled",
         AgentLoopToolError::Workspace(WorkspaceToolError::RollbackFailed(_)) => {

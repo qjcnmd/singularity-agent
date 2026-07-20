@@ -64,8 +64,10 @@ pub use registry::{
     ToolSpec, WorkspaceToolExecutor, workspace_tool_entries, workspace_tool_specs,
 };
 pub use workspace::{
-    EditToolInput, GrepToolInput, ListToolInput, ReadToolInput, WorkspaceObservation,
-    WorkspacePatch, WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError, WorkspaceTools,
+    CommandToolExecution, EditToolInput, GrepToolInput, ListToolInput, ReadToolInput,
+    SandboxExecutionBoundary, SandboxExecutionCallback, SandboxExecutionObservation,
+    SandboxExecutionSinkError, SandboxExecutionStatus, WorkspaceObservation, WorkspacePatch,
+    WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError, WorkspaceTools,
 };
 
 pub(crate) use broker::contains_artifact_reference;
