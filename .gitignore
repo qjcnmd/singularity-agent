@@ -5,6 +5,7 @@ work/
 
 # Local agent state and isolated worktrees.
 .codex/
+.qoder/
 .worktrees/
 
 # SQLite sidecars created beside runtime databases.
