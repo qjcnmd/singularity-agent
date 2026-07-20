@@ -6,7 +6,7 @@
 
 mod evaluation;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -36,7 +36,7 @@ use singularity_protocol::{
     ApprovalDecisionResult, ApprovalListResult, ArtifactFetchParams, ArtifactFetchResult,
     ConversationMessage, ConversationRole, EvalRunParams, EventClass, EventDelivery, EventGap,
     EventGapReason, EventMetadata, EventRecoveryQuery, EventSubscribeParams, EventSubscribeResult,
-    InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage, Method,
+    InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage, Method, MethodKind,
     ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
@@ -281,6 +281,148 @@ enum TurnTerminalizationResult {
     Preserved,
 }
 
+/// stdout transport 使用的全局输出顺序与事件 cursor reservation。
+///
+/// 一个 reservation 同时占用输出 order 和可选事件 cursor；request worker 在交给
+/// stdout queue 前先取得两者，避免事件 cursor 已分配而 worker 尚未排队时被并发 worker 越过。
+#[derive(Clone, Debug, Default)]
+pub struct OutputOrderCoordinator {
+    state: Arc<Mutex<OutputOrderState>>,
+}
+
+#[derive(Debug, Default)]
+struct OutputOrderState {
+    next_order: u64,
+    next_event_cursor: u64,
+    next_write_order: u64,
+    in_flight: BTreeSet<u64>,
+    ready: BTreeSet<u64>,
+    skipped: BTreeSet<u64>,
+}
+
+/// 一个已经原子预留的 stdout 输出位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputReservation {
+    /// 全局 stdout 输出顺序。
+    pub order: u64,
+    /// 事件输出对应的事件 cursor；控制输出为 `None`。
+    pub event_cursor: Option<u64>,
+}
+
+impl OutputOrderCoordinator {
+    /// 创建新的进程级输出 reservation 协调器。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 原子预留一个输出 order，并按需分配连续事件 cursor。
+    pub fn reserve(&self, event: bool) -> Result<OutputReservation, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "output ordering state poisoned".to_string())?;
+        let order = state.next_order;
+        let next_order = state
+            .next_order
+            .checked_add(1)
+            .ok_or_else(|| "output order exhausted".to_string())?;
+        let event_cursor = if event {
+            let cursor = state
+                .next_event_cursor
+                .checked_add(1)
+                .ok_or_else(|| "event cursor exhausted".to_string())?;
+            state.next_event_cursor = cursor;
+            Some(cursor)
+        } else {
+            None
+        };
+        state.next_order = next_order;
+        state.in_flight.insert(order);
+        Ok(OutputReservation {
+            order,
+            event_cursor,
+        })
+    }
+
+    /// 返回当前已观察到的最大事件 cursor。
+    pub fn current_event_cursor(&self) -> Result<u64, String> {
+        self.state
+            .lock()
+            .map(|state| state.next_event_cursor)
+            .map_err(|_| "output ordering state poisoned".to_string())
+    }
+
+    /// 丢弃未进入 transport queue 的 reservation，避免 direct API 阻塞后续输出。
+    pub fn complete(&self, order: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight.remove(&order);
+            state.skipped.insert(order);
+            advance_write_order(&mut state);
+        }
+    }
+
+    /// 丢弃一段未进入 transport queue 的 reservation。
+    pub fn complete_range(&self, from_order: u64, to_order: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            for order in from_order..=to_order {
+                state.in_flight.remove(&order);
+                state.skipped.insert(order);
+            }
+            advance_write_order(&mut state);
+        }
+    }
+
+    /// 标记一条输出已经进入 transport queue，但仍须由 writer 按 order 写出。
+    pub fn enqueue(&self, order: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight.remove(&order);
+            state.ready.insert(order);
+        }
+    }
+
+    /// 标记一个 gap 输出代表一段连续 reservation。
+    pub fn enqueue_range(&self, from_order: u64, to_order: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            for order in from_order..=to_order {
+                state.in_flight.remove(&order);
+            }
+            state.ready.insert(from_order);
+        }
+    }
+
+    /// 判断指定输出是否正好轮到 writer 写出。
+    pub fn is_next_ready(&self, order: u64) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.next_write_order == order && state.ready.contains(&order))
+            .unwrap_or(false)
+    }
+
+    /// 写入并 flush 成功后推进 writer 游标；`to_order` 用于 gap 的跳跃。
+    pub fn acknowledge_written(&self, from_order: u64, to_order: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.ready.remove(&from_order);
+            state.next_write_order = to_order.saturating_add(1);
+            advance_write_order(&mut state);
+        }
+    }
+}
+
+fn advance_write_order(state: &mut OutputOrderState) {
+    while state.skipped.remove(&state.next_write_order) {
+        state.next_write_order = state.next_write_order.saturating_add(1);
+    }
+}
+
+/// AppServer 交给 stdout transport 的已排序消息。
+#[derive(Debug, Clone)]
+pub struct AppServerOutput {
+    /// 与其他 worker 共享的全局 stdout order。
+    pub reservation: OutputReservation,
+    /// 脱敏 JSON-RPC wire value。
+    pub message: Value,
+}
+
 /// 协调线程、turn、approval、追踪和工作线程的有状态 JSON-RPC 服务。
 pub struct AppServer {
     store: SessionStore,
@@ -292,6 +434,8 @@ pub struct AppServer {
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     execution_stopped: Arc<AtomicBool>,
+    evaluation_cancellation: CancellationToken,
+    output_order: OutputOrderCoordinator,
 }
 
 /// 由请求工作线程与标准输入输出传输层共享的可克隆停止句柄。
@@ -299,13 +443,13 @@ pub struct AppServer {
 pub struct AppServerCancellationHandle {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     execution_stopped: Arc<AtomicBool>,
+    evaluation_cancellation: CancellationToken,
 }
 
 /// 每个 stdio app-server 生命周期共享的事件订阅和传输 cursor。
 #[derive(Debug, Default)]
 struct EventSubscriptionState {
     event_types: Option<Vec<String>>,
-    cursor: u64,
 }
 
 impl AppServerCancellationHandle {
@@ -320,6 +464,7 @@ impl AppServerCancellationHandle {
         {
             cancellation.cancel();
         }
+        self.evaluation_cancellation.cancel();
         Ok(())
     }
 }
@@ -533,6 +678,8 @@ impl AppServer {
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
+            evaluation_cancellation: CancellationToken::new(),
+            output_order: OutputOrderCoordinator::new(),
         }
     }
 
@@ -565,7 +712,13 @@ impl AppServer {
         AppServerCancellationHandle {
             active_turns: Arc::clone(&self.active_turns),
             execution_stopped: Arc::clone(&self.execution_stopped),
+            evaluation_cancellation: self.evaluation_cancellation.clone(),
         }
+    }
+
+    /// 返回当前 app-server 生命周期共享的 stdout reservation 协调器。
+    pub fn output_order_coordinator(&self) -> OutputOrderCoordinator {
+        self.output_order.clone()
     }
 
     /// 为请求工作线程打开独立的存储连接，同时共享停止和事件订阅状态。
@@ -580,6 +733,8 @@ impl AppServer {
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
             execution_stopped: Arc::clone(&self.execution_stopped),
+            evaluation_cancellation: self.evaluation_cancellation.clone(),
+            output_order: self.output_order.clone(),
         })
     }
 
@@ -650,6 +805,23 @@ impl AppServer {
 
     /// 处理一个已解析的 JSON-RPC 请求，并返回零个或多个协议响应或事件。
     pub fn handle(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let outputs = self.handle_with_output(message)?;
+        for output in &outputs {
+            self.output_order.complete(output.reservation.order);
+        }
+        Ok(outputs.into_iter().map(|output| output.message).collect())
+    }
+
+    /// 处理请求并在生成消息时原子预留 stdout order 与事件 cursor。
+    pub fn handle_with_output(
+        &mut self,
+        message: JsonRpcMessage,
+    ) -> AppServerResult<Vec<AppServerOutput>> {
+        let messages = self.handle_unsequenced(message)?;
+        self.sequence_outputs(messages)
+    }
+
+    fn handle_unsequenced(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let notification = message.is_notification();
         let id = message.id().cloned();
         let Some(method_name) = message.method_name() else {
@@ -666,6 +838,13 @@ impl AppServer {
                 Ok(vec![JsonRpcMessage::method_not_found(id).to_wire_value()])
             };
         };
+
+        // A notification-only registry entry may not be invoked as a request.
+        // A request-only method sent without an id remains a JSON-RPC notification
+        // and therefore keeps the no-response contract.
+        if method.spec().kind == MethodKind::Notification && !notification {
+            return Ok(vec![JsonRpcMessage::invalid_request(id).to_wire_value()]);
+        }
 
         if method
             .spec()
@@ -741,6 +920,36 @@ impl AppServer {
             }
             result => result,
         }
+    }
+
+    fn sequence_outputs(&self, messages: Vec<Value>) -> AppServerResult<Vec<AppServerOutput>> {
+        let mut outputs: Vec<AppServerOutput> = Vec::with_capacity(messages.len());
+        let mut subscription_cursor = None;
+        for message in messages {
+            let output = match sequence_output(&self.output_order, message) {
+                Ok(output) => output,
+                Err(error) => {
+                    for output in &outputs {
+                        self.output_order.complete(output.reservation.order);
+                    }
+                    return Err(error);
+                }
+            };
+            if output.message["method"] == "event/gap" {
+                subscription_cursor = output.reservation.event_cursor;
+            }
+            outputs.push(output);
+        }
+        if let Some(cursor) = subscription_cursor {
+            for output in &mut outputs {
+                if output.message["result"]["subscriptionId"] == EVENT_SUBSCRIPTION_ID
+                    && output.message["result"]["cursor"] == 0
+                {
+                    output.message["result"]["cursor"] = cursor.into();
+                }
+            }
+        }
+        Ok(outputs)
     }
 
     fn initialize(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
@@ -962,12 +1171,61 @@ impl AppServer {
 
     fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let mut messages = Vec::new();
-        self.handle_turn_start_streaming(message, |message| messages.push(message))?;
+        self.handle_turn_start_streaming_values(message, |message| messages.push(message))?;
         Ok(messages)
     }
 
-    /// 执行 `turn/start`，并在每个持久化阶段完成时发出生命周期事件。
+    /// 执行 `turn/start`，并在每个阶段完成时返回已预留顺序的输出。
+    pub fn handle_turn_start_streaming_with_output(
+        &mut self,
+        message: JsonRpcMessage,
+        mut emit: impl FnMut(AppServerOutput),
+    ) -> AppServerResult<()> {
+        let coordinator = self.output_order.clone();
+        let mut sequencing_error = None;
+        let result = self.handle_turn_start_streaming_values(message, |message| {
+            if sequencing_error.is_some() {
+                return;
+            }
+            match sequence_output(&coordinator, message) {
+                Ok(output) => emit(output),
+                Err(error) => sequencing_error = Some(error),
+            }
+        });
+        if let Some(error) = sequencing_error {
+            return Err(error);
+        }
+        result
+    }
+
+    /// 执行 `turn/start` 并返回未携带 transport 顺序的兼容消息。
     pub fn handle_turn_start_streaming(
+        &mut self,
+        message: JsonRpcMessage,
+        mut emit: impl FnMut(Value),
+    ) -> AppServerResult<()> {
+        let coordinator = self.output_order.clone();
+        let mut sequencing_error = None;
+        let result = self.handle_turn_start_streaming_values(message, |message| {
+            if sequencing_error.is_some() {
+                return;
+            }
+            match sequence_output(&coordinator, message) {
+                Ok(output) => {
+                    coordinator.complete(output.reservation.order);
+                    emit(output.message);
+                }
+                Err(error) => sequencing_error = Some(error),
+            }
+        });
+        if let Some(error) = sequencing_error {
+            return Err(error);
+        }
+        result
+    }
+
+    /// 执行 `turn/start`，并在每个持久化阶段完成时发出生命周期事件。
+    fn handle_turn_start_streaming_values(
         &mut self,
         message: JsonRpcMessage,
         mut emit: impl FnMut(Value),
@@ -1309,6 +1567,7 @@ impl AppServer {
             &params,
             Arc::clone(&self.sandbox_backend),
             &self.provider_snapshot,
+            &self.evaluation_cancellation,
         ) {
             Ok(result) => json_response(message.required_id(), result),
             Err(error) => match error.kind() {
@@ -1321,6 +1580,16 @@ impl AppServer {
                     Some(message.required_id()),
                     ErrorCode::new(JSON_RPC_INTERNAL_ERROR, "Internal error"),
                 ),
+                evaluation::EvaluationRunErrorKind::Cancelled => {
+                    if let Some(partial) = error.partial_result() {
+                        json_response(message.required_id(), partial.clone())
+                    } else {
+                        json_error(
+                            Some(message.required_id()),
+                            ErrorCode::new(JSON_RPC_INTERNAL_ERROR, "Internal error"),
+                        )
+                    }
+                }
             },
         }
     }
@@ -2437,35 +2706,36 @@ impl AppServer {
 
     fn event_subscribe(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let params: EventSubscribeParams = parse_params(&message)?;
-        let (cursor, gap) = {
+        let current_cursor = self
+            .output_order
+            .current_event_cursor()
+            .map_err(AppServerError::Workspace)?;
+        let gap = {
             let mut state = self.event_filter.lock().map_err(|_| {
                 AppServerError::Workspace("event subscription state poisoned".into())
             })?;
-            if params.cursor == Some(0) || params.cursor.is_some_and(|cursor| cursor > state.cursor)
+            if params.cursor == Some(0)
+                || params.cursor.is_some_and(|cursor| cursor > current_cursor)
             {
                 return Err(AppServerError::InvalidParams(
                     "event subscription cursor is outside the observed range".to_string(),
                 ));
             }
             state.event_types = Some(params.event_types.clone());
-            let cursor = next_event_cursor(&mut state.cursor)?;
             let from_cursor = params.cursor.map_or(1, |cursor| cursor.saturating_add(1));
-            (
-                cursor,
-                EventGap {
-                    reason: EventGapReason::CursorNotReplayed,
-                    from_cursor,
-                    to_cursor: cursor,
-                },
-            )
+            EventGap {
+                reason: EventGapReason::CursorNotReplayed,
+                from_cursor,
+                to_cursor: 0,
+            }
         };
-        let mut messages = vec![self.event_gap_notification(cursor, gap)?];
+        let mut messages = vec![self.event_gap_notification(gap)?];
         messages.extend(json_response(
             message.required_id(),
             EventSubscribeResult {
                 subscription_id: EVENT_SUBSCRIPTION_ID.to_string(),
                 event_types: params.event_types,
-                cursor,
+                cursor: 0,
             },
         )?);
         Ok(messages)
@@ -2483,7 +2753,7 @@ impl AppServer {
     }
 
     fn event_notification(&self, event: AppEvent) -> AppServerResult<Option<Value>> {
-        let mut state = self
+        let state = self
             .event_filter
             .lock()
             .map_err(|_| AppServerError::Workspace("event subscription state poisoned".into()))?;
@@ -2493,13 +2763,12 @@ impl AppServer {
         if !event_types.iter().any(|method| method == event.method()) {
             return Ok(None);
         }
-        let cursor = next_event_cursor(&mut state.cursor)?;
         let (class, delivery, recovery_query) = event_contract(&event);
         Ok(Some(
             event
                 .to_notification_with_metadata(EventMetadata {
-                    sequence: cursor,
-                    cursor,
+                    sequence: 0,
+                    cursor: 0,
                     class,
                     delivery,
                     recovery_query,
@@ -2509,14 +2778,14 @@ impl AppServer {
         ))
     }
 
-    fn event_gap_notification(&self, cursor: u64, gap: EventGap) -> AppServerResult<Value> {
+    fn event_gap_notification(&self, gap: EventGap) -> AppServerResult<Value> {
         Ok(AppEvent {
             method: "event/gap".to_string(),
             params: json!({"gap": gap.clone()}),
         }
         .to_notification_with_metadata(EventMetadata {
-            sequence: cursor,
-            cursor,
+            sequence: 0,
+            cursor: 0,
             class: EventClass::Gap,
             delivery: EventDelivery::Gap,
             recovery_query: None,
@@ -2648,11 +2917,51 @@ impl AppServer {
     }
 }
 
-fn next_event_cursor(cursor: &mut u64) -> AppServerResult<u64> {
-    *cursor = cursor
-        .checked_add(1)
-        .ok_or_else(|| AppServerError::Workspace("event cursor exhausted".to_string()))?;
-    Ok(*cursor)
+fn sequence_output(
+    coordinator: &OutputOrderCoordinator,
+    mut message: Value,
+) -> AppServerResult<AppServerOutput> {
+    let is_event = message
+        .get("params")
+        .and_then(Value::as_object)
+        .is_some_and(|params| params.contains_key("event"));
+    let reservation = coordinator
+        .reserve(is_event)
+        .map_err(AppServerError::Workspace)?;
+    if let Some(cursor) = reservation.event_cursor {
+        let patch_result: AppServerResult<()> = (|| {
+            let is_gap = message["method"] == "event/gap";
+            let params = message
+                .get_mut("params")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    AppServerError::Workspace("event params are unavailable".to_string())
+                })?;
+            if is_gap && let Some(gap) = params.get_mut("gap").and_then(Value::as_object_mut) {
+                gap.insert("toCursor".to_string(), cursor.into());
+            }
+            let metadata = params
+                .get_mut("event")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    AppServerError::Workspace("event metadata is unavailable".to_string())
+                })?;
+            metadata.insert("sequence".to_string(), cursor.into());
+            metadata.insert("cursor".to_string(), cursor.into());
+            if is_gap && let Some(gap) = metadata.get_mut("gap").and_then(Value::as_object_mut) {
+                gap.insert("toCursor".to_string(), cursor.into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = patch_result {
+            coordinator.complete(reservation.order);
+            return Err(error);
+        }
+    }
+    Ok(AppServerOutput {
+        reservation,
+        message,
+    })
 }
 
 fn event_contract(event: &AppEvent) -> (EventClass, EventDelivery, Option<EventRecoveryQuery>) {
@@ -3431,7 +3740,7 @@ mod tests {
     }
 
     #[test]
-    fn initialized_request_receives_a_standard_empty_result() {
+    fn initialized_request_is_rejected_as_an_invalid_envelope() {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server = app_server(store);
         server
@@ -3447,7 +3756,48 @@ mod tests {
         assert_eq!(response.len(), 1);
         assert_eq!(response[0]["jsonrpc"], "2.0");
         assert_eq!(response[0]["id"], 2);
-        assert_eq!(response[0]["result"], serde_json::json!({}));
+        assert_eq!(response[0]["error"]["code"], -32600);
+        assert_eq!(response[0]["error"]["message"], "Invalid Request");
+
+        let still_uninitialized = server
+            .handle_json(r#"{"jsonrpc":"2.0","method":"server/capabilities","id":3,"params":{}}"#)
+            .expect("server remains unacknowledged");
+        assert_eq!(
+            still_uninitialized[0]["error"]["message"],
+            "Not initialized"
+        );
+    }
+
+    #[test]
+    fn event_subscription_binds_gap_cursor_to_one_output_reservation() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let mut server = app_server(store);
+        server
+            .handle_json(
+                r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#,
+            )
+            .expect("initialize");
+        server
+            .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
+            .expect("initialized");
+
+        let message = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"event/subscribe","id":2,"params":{"eventTypes":["thread/started"]}}"#,
+        )
+        .expect("subscription request");
+        let outputs = server
+            .handle_with_output(message)
+            .expect("subscription outputs");
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(
+            outputs[1].reservation.order,
+            outputs[0].reservation.order + 1
+        );
+        assert_eq!(outputs[0].reservation.event_cursor, Some(1));
+        assert_eq!(outputs[1].reservation.event_cursor, None);
+        assert_eq!(outputs[0].message["params"]["event"]["cursor"], 1);
+        assert_eq!(outputs[1].message["result"]["cursor"], 1);
     }
 
     #[test]

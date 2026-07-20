@@ -3,7 +3,7 @@
 //! 输入独立读取；请求工作线程准入队列和传输队列均有界，由单一写入方串行化 JSON 行输出，
 //! state/gap 事件在事件队列中可靠阻塞；progress 事件共用该有界队列但可丢弃，控制响应保持独立。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
 use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use serde_json::Value;
-use singularity_app_server::{AppServer, AppServerCancellationHandle, AppServerError};
+use singularity_app_server::{
+    AppServer, AppServerCancellationHandle, AppServerError, AppServerOutput, OutputOrderCoordinator,
+};
 use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
 use singularity_model::{PROVIDER_CAPABILITY_CACHE_FILE_NAME, ProviderConfigSnapshot};
 use singularity_protocol::{
@@ -43,12 +45,13 @@ struct OutputChannels {
     event: SyncSender<QueuedOutput>,
     pending_event_gap: Arc<Mutex<Option<PendingEventGap>>>,
     send_lock: Arc<Mutex<()>>,
-    order_state: Arc<Mutex<OutputOrderState>>,
+    order_state: OutputOrderCoordinator,
 }
 
 #[derive(Debug)]
 struct QueuedOutput {
     order: u64,
+    to_order: u64,
     message: Value,
 }
 
@@ -58,12 +61,6 @@ struct PendingEventGap {
     to_cursor: u64,
     from_order: u64,
     to_order: u64,
-}
-
-#[derive(Debug, Default)]
-struct OutputOrderState {
-    next_order: u64,
-    in_flight: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +111,7 @@ fn run() -> Result<(), String> {
     );
     let mut server = AppServer::new(store, provider_snapshot);
     let cancellation = server.cancellation_handle();
+    let output_order = server.output_order_coordinator();
     let (control_tx, control_rx) = mpsc::sync_channel::<QueuedOutput>(CONTROL_QUEUE_CAPACITY);
     let (event_tx, event_rx) = mpsc::sync_channel::<QueuedOutput>(EVENT_QUEUE_CAPACITY);
     let outputs = OutputChannels {
@@ -121,11 +119,11 @@ fn run() -> Result<(), String> {
         event: event_tx,
         pending_event_gap: Arc::new(Mutex::new(None)),
         send_lock: Arc::new(Mutex::new(())),
-        order_state: Arc::new(Mutex::new(OutputOrderState::default())),
+        order_state: output_order,
     };
     let (writer_error_tx, writer_error_rx) = mpsc::channel::<String>();
     let writer_cancellation = cancellation.clone();
-    let writer_order_state = Arc::clone(&outputs.order_state);
+    let writer_order_state = outputs.order_state.clone();
     let writer = thread::spawn(move || -> Result<(), String> {
         let mut stdout = io::stdout().lock();
         let result = write_output_queue(
@@ -207,7 +205,64 @@ fn run() -> Result<(), String> {
             }
         };
         if !matches!(payload, JsonRpcPayload::Single(_)) {
-            if let Err(error) = dispatch_batch(&mut server, payload, &outputs, &cancellation) {
+            if is_request_worker_batch(&payload) && server.ready_for_turn_worker() {
+                if request_workers.len() >= MAX_REQUEST_WORKERS {
+                    if let Err(error) = send_output(
+                        &outputs,
+                        OutputKind::Control,
+                        &cancellation,
+                        internal_error_value(None, REQUEST_CAPACITY_EXCEEDED),
+                    ) {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                } else {
+                    match server.turn_worker() {
+                        Ok(mut worker) => {
+                            let worker_outputs = outputs.clone();
+                            let worker_cancellation = cancellation.clone();
+                            match thread::Builder::new()
+                                .name("singularity-request".to_string())
+                                .spawn(move || {
+                                    dispatch_batch(
+                                        &mut worker,
+                                        payload,
+                                        &worker_outputs,
+                                        &worker_cancellation,
+                                    )
+                                }) {
+                                Ok(worker) => request_workers.push(worker),
+                                Err(error) => {
+                                    if let Err(error) = send_output(
+                                        &outputs,
+                                        OutputKind::Control,
+                                        &cancellation,
+                                        internal_error_value(
+                                            None,
+                                            format!("failed to start request worker: {error}"),
+                                        ),
+                                    ) {
+                                        terminal_error = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if let Err(error) = send_output(
+                                &outputs,
+                                OutputKind::Control,
+                                &cancellation,
+                                transport_error_value(None, &error),
+                            ) {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else if let Err(error) = dispatch_batch(&mut server, payload, &outputs, &cancellation)
+            {
                 terminal_error = Some(error);
                 break;
             }
@@ -288,17 +343,10 @@ fn run() -> Result<(), String> {
             }
         } else {
             let notification = message.is_notification();
-            match server.handle(message) {
+            match server.handle_with_output(message) {
                 Ok(messages) => {
-                    for message in messages {
-                        let kind = classify_output(&message);
-                        if notification && kind == OutputKind::Control {
-                            continue;
-                        }
-                        if let Err(error) = send_output(&outputs, kind, &cancellation, message) {
-                            terminal_error = Some(error);
-                            break;
-                        }
+                    if let Err(error) = send_app_server_outputs(&outputs, &cancellation, messages) {
+                        terminal_error = Some(error);
                     }
                 }
                 Err(error) if !notification => {
@@ -342,6 +390,9 @@ fn run() -> Result<(), String> {
 }
 
 fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
+    if message.method_name() == Some(Method::EvalRun.as_str()) {
+        return true;
+    }
     if message.is_notification() {
         return false;
     }
@@ -350,7 +401,18 @@ fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
         Some(method)
             if method == Method::TurnStart.as_str()
                 || method == Method::ApprovalDecision.as_str()
+                || method == Method::EvalRun.as_str()
     )
+}
+
+fn is_request_worker_batch(payload: &JsonRpcPayload) -> bool {
+    let JsonRpcPayload::Batch(items) = payload else {
+        return false;
+    };
+    items.iter().any(|item| match item {
+        JsonRpcBatchItem::Message(message) => is_request_worker_method(message),
+        JsonRpcBatchItem::Invalid { .. } => false,
+    })
 }
 
 /// 按输入顺序串行分发 batch；副作用项不并行，notification 项不产生控制响应。
@@ -375,7 +437,7 @@ fn dispatch_batch(
             return Err("single JSON-RPC payload reached batch dispatcher".to_string());
         }
     };
-    let mut notifications = Vec::new();
+    let mut notifications = Vec::<AppServerOutput>::new();
     let mut responses = Vec::new();
     for item in items {
         match item {
@@ -385,20 +447,30 @@ fn dispatch_batch(
             JsonRpcBatchItem::Message(message) => {
                 let notification = message.is_notification();
                 let request_id = message.id().cloned();
-                match server.handle(message) {
+                match server.handle_with_output(message) {
                     Ok(messages) => {
-                        for value in messages {
-                            match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
+                        for output in messages {
+                            match serde_json::from_value::<JsonRpcMessage>(output.message.clone()) {
                                 Ok(JsonRpcMessage::Notification(_)) if !notification => {
-                                    notifications.push(value);
+                                    notifications.push(output);
                                 }
                                 Ok(JsonRpcMessage::Success(_) | JsonRpcMessage::Error(_))
                                     if !notification =>
                                 {
-                                    responses.push(value);
+                                    responses.push(output.message);
+                                    server
+                                        .output_order_coordinator()
+                                        .complete(output.reservation.order);
                                 }
-                                Ok(_) if notification => {}
+                                Ok(_) if notification => {
+                                    server
+                                        .output_order_coordinator()
+                                        .complete(output.reservation.order);
+                                }
                                 Ok(_) | Err(_) => {
+                                    server
+                                        .output_order_coordinator()
+                                        .complete(output.reservation.order);
                                     responses.push(internal_error_value(
                                         request_id.clone(),
                                         "dispatcher produced an invalid response envelope",
@@ -415,10 +487,7 @@ fn dispatch_batch(
             }
         }
     }
-    for notification in notifications {
-        let kind = classify_output(&notification);
-        send_output(outputs, kind, cancellation, notification)?;
-    }
+    send_app_server_outputs(outputs, cancellation, notifications)?;
     if responses.is_empty() {
         return Ok(());
     }
@@ -441,24 +510,26 @@ fn run_request_worker(
     let request_id = message.id().cloned();
     let mut output_error = None;
     let result = if message.method_name() == Some(Method::TurnStart.as_str()) {
-        worker.handle_turn_start_streaming(message, |message| {
-            let kind = classify_output(&message);
+        worker.handle_turn_start_streaming_with_output(message, |output| {
             if output_error.is_none()
-                && let Err(error) = send_output(&outputs, kind, &cancellation, message)
+                && let Err(error) = send_reserved_output(
+                    &outputs,
+                    &cancellation,
+                    output.reservation.order,
+                    output.message,
+                )
             {
                 output_error = Some(error);
+            } else if output_error.is_some() {
+                outputs.order_state.complete(output.reservation.order);
             }
         })
     } else {
-        worker.handle(message).map(|messages| {
-            for message in messages {
-                let kind = classify_output(&message);
-                if let Err(error) = send_output(&outputs, kind, &cancellation, message) {
-                    output_error = Some(error);
-                    break;
-                }
-            }
-        })
+        match worker.handle_with_output(message) {
+            Ok(messages) => send_app_server_outputs(&outputs, &cancellation, messages)
+                .map_err(AppServerError::Workspace),
+            Err(error) => Err(error),
+        }
     };
     if let Some(error) = output_error {
         return Err(error);
@@ -572,28 +643,73 @@ fn classify_output(value: &Value) -> OutputKind {
 /// 按事件交付合同入队；控制与 state/gap 阻塞 backpressure，progress 可丢弃但记录 gap。
 fn send_output(
     outputs: &OutputChannels,
-    kind: OutputKind,
+    _kind: OutputKind,
     cancellation: &dyn ExecutionStop,
     message: Value,
 ) -> Result<OutputSendStatus, String> {
-    let _send_guard = outputs
-        .send_lock
-        .lock()
-        .map_err(|_| "output ordering state poisoned".to_string())?;
-    flush_pending_event_gap_locked(outputs, cancellation)?;
-    let order = reserve_output_order(outputs)?;
+    let order = outputs
+        .order_state
+        .reserve(false)
+        .map_err(|error| error.to_string())?
+        .order;
+    send_reserved_output(outputs, cancellation, order, message)
+}
+
+fn send_app_server_outputs(
+    outputs: &OutputChannels,
+    cancellation: &dyn ExecutionStop,
+    messages: Vec<AppServerOutput>,
+) -> Result<(), String> {
+    for (index, output) in messages.iter().enumerate() {
+        if let Err(error) = send_reserved_output(
+            outputs,
+            cancellation,
+            output.reservation.order,
+            output.message.clone(),
+        ) {
+            for remaining in &messages[index + 1..] {
+                outputs.order_state.complete(remaining.reservation.order);
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn send_reserved_output(
+    outputs: &OutputChannels,
+    cancellation: &dyn ExecutionStop,
+    order: u64,
+    message: Value,
+) -> Result<OutputSendStatus, String> {
+    let _send_guard = match outputs.send_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            outputs.order_state.complete(order);
+            return Err("output ordering state poisoned".to_string());
+        }
+    };
+    if let Err(error) = flush_pending_event_gap_locked(outputs, cancellation) {
+        outputs.order_state.complete(order);
+        return Err(error);
+    }
+    let kind = classify_output(&message);
     match kind {
         OutputKind::Control => {
             drop(_send_guard);
             outputs
                 .control
-                .send(QueuedOutput { order, message })
+                .send(QueuedOutput {
+                    order,
+                    to_order: order,
+                    message,
+                })
                 .map(|()| {
-                    complete_output_order(outputs, order);
+                    outputs.order_state.enqueue(order);
                     OutputSendStatus::Enqueued
                 })
                 .map_err(|_| {
-                    complete_output_order(outputs, order);
+                    outputs.order_state.complete(order);
                     cancellation.request_execution_stop();
                     "stdout transport unavailable".to_string()
                 })
@@ -602,13 +718,17 @@ fn send_output(
             drop(_send_guard);
             outputs
                 .event
-                .send(QueuedOutput { order, message })
+                .send(QueuedOutput {
+                    order,
+                    to_order: order,
+                    message,
+                })
                 .map(|()| {
-                    complete_output_order(outputs, order);
+                    outputs.order_state.enqueue(order);
                     OutputSendStatus::Enqueued
                 })
                 .map_err(|_| {
-                    complete_output_order(outputs, order);
+                    outputs.order_state.complete(order);
                     cancellation.request_execution_stop();
                     "stdout transport unavailable".to_string()
                 })
@@ -616,21 +736,25 @@ fn send_output(
         // `try_send` cannot block, so keep the ordering guard until a dropped progress event and
         // its reserved order are committed to the same gap. Reliable sends release the guard
         // before backpressure so one slow queue does not serialize unrelated Turn workers.
-        OutputKind::Event => match outputs.event.try_send(QueuedOutput { order, message }) {
+        OutputKind::Event => match outputs.event.try_send(QueuedOutput {
+            order,
+            to_order: order,
+            message,
+        }) {
             Ok(()) => {
-                complete_output_order(outputs, order);
+                outputs.order_state.enqueue(order);
                 Ok(OutputSendStatus::Enqueued)
             }
             Err(TrySendError::Full(output)) => record_event_gap(outputs, &output.message, order)
                 .map_or_else(
                     |error| {
-                        complete_output_order(outputs, order);
+                        outputs.order_state.complete(order);
                         Err(error)
                     },
                     |()| Ok(OutputSendStatus::EventDropped),
                 ),
             Err(TrySendError::Disconnected(_)) => {
-                complete_output_order(outputs, order);
+                outputs.order_state.complete(order);
                 cancellation.request_execution_stop();
                 Err("stdout transport unavailable".to_string())
             }
@@ -684,17 +808,22 @@ fn flush_pending_event_gap_locked(
     )
     .map_err(|_| "failed to serialize event gap".to_string())?
     .to_wire_value();
-    outputs
-        .control
-        .send(QueuedOutput {
-            order: pending.from_order,
-            message,
-        })
-        .map_err(|_| {
+    match outputs.control.send(QueuedOutput {
+        order: pending.from_order,
+        to_order: pending.to_order,
+        message,
+    }) {
+        Ok(()) => outputs
+            .order_state
+            .enqueue_range(pending.from_order, pending.to_order),
+        Err(_) => {
+            outputs
+                .order_state
+                .complete_range(pending.from_order, pending.to_order);
             cancellation.request_execution_stop();
-            "stdout transport unavailable".to_string()
-        })?;
-    complete_output_order_range(outputs, pending.from_order, pending.to_order);
+            return Err("stdout transport unavailable".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -741,41 +870,13 @@ fn record_event_gap(outputs: &OutputChannels, message: &Value, order: u64) -> Re
     Ok(())
 }
 
-fn reserve_output_order(outputs: &OutputChannels) -> Result<u64, String> {
-    let mut state = outputs
-        .order_state
-        .lock()
-        .map_err(|_| "output ordering state poisoned".to_string())?;
-    let order = state.next_order;
-    state.next_order = state
-        .next_order
-        .checked_add(1)
-        .ok_or_else(|| "output order exhausted".to_string())?;
-    state.in_flight.insert(order);
-    Ok(order)
-}
-
-fn complete_output_order(outputs: &OutputChannels, order: u64) {
-    if let Ok(mut state) = outputs.order_state.lock() {
-        state.in_flight.remove(&order);
-    }
-}
-
-fn complete_output_order_range(outputs: &OutputChannels, from_order: u64, to_order: u64) {
-    if let Ok(mut state) = outputs.order_state.lock() {
-        for order in from_order..=to_order {
-            state.in_flight.remove(&order);
-        }
-    }
-}
-
 /// 按发送顺序从两个有界队列取出一条 frame，避免 progress 被后续 control 越过。
 fn next_output(
     control_rx: &Receiver<QueuedOutput>,
     event_rx: &Receiver<QueuedOutput>,
     control_open: &mut bool,
     event_open: &mut bool,
-    order_state: &Arc<Mutex<OutputOrderState>>,
+    order_state: &OutputOrderCoordinator,
     pending: &mut BTreeMap<u64, QueuedOutput>,
 ) -> Option<QueuedOutput> {
     loop {
@@ -802,11 +903,7 @@ fn next_output(
             }
         }
         if let Some(order) = pending.keys().next().copied() {
-            let earlier_in_flight = order_state
-                .lock()
-                .map(|state| state.in_flight.iter().any(|in_flight| *in_flight < order))
-                .unwrap_or(true);
-            if !earlier_in_flight {
+            if order_state.is_next_ready(order) {
                 return pending.remove(&order);
             }
         } else if !*control_open && !*event_open {
@@ -845,7 +942,7 @@ fn write_output_queue(
     event_rx: Receiver<QueuedOutput>,
     stdout: &mut impl Write,
     cancellation: &dyn ExecutionStop,
-    order_state: Arc<Mutex<OutputOrderState>>,
+    order_state: OutputOrderCoordinator,
 ) -> Result<(), String> {
     let mut control_open = true;
     let mut event_open = true;
@@ -866,6 +963,7 @@ fn write_output_queue(
             cancellation.request_execution_stop();
             return Err(format!("failed to flush response: {error}"));
         }
+        order_state.acknowledge_written(output.order, output.to_order);
     }
     Ok(())
 }
@@ -1088,8 +1186,8 @@ fn validate_database_file(path: &Path, allow_missing: bool) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
 
     #[derive(Clone, Default)]
     struct CancellationProbe {
@@ -1124,7 +1222,7 @@ mod tests {
                 event,
                 pending_event_gap: Arc::new(Mutex::new(None)),
                 send_lock: Arc::new(Mutex::new(())),
-                order_state: Arc::new(Mutex::new(OutputOrderState::default())),
+                order_state: OutputOrderCoordinator::new(),
             },
             control_rx,
             event_rx,
@@ -1399,6 +1497,70 @@ mod tests {
     }
 
     #[test]
+    fn reverse_enqueue_race_keeps_event_cursor_and_stdout_order_contiguous() {
+        let (outputs, control_rx, event_rx) = test_output_channels(2, 2);
+        let cancellation = CancellationProbe::default();
+        let first = outputs
+            .order_state
+            .reserve(true)
+            .expect("first event reservation");
+        let second = outputs
+            .order_state
+            .reserve(true)
+            .expect("second event reservation");
+        assert_eq!(first.order, 0);
+        assert_eq!(first.event_cursor, Some(1));
+        assert_eq!(second.order, 1);
+        assert_eq!(second.event_cursor, Some(2));
+
+        let send_gate = Arc::new(Barrier::new(2));
+        let sender_outputs = outputs.clone();
+        let sender_cancellation = cancellation.clone();
+        let sender_gate = Arc::clone(&send_gate);
+        let sender = thread::spawn(move || {
+            send_reserved_output(
+                &sender_outputs,
+                &sender_cancellation,
+                second.order,
+                progress_event(2),
+            )
+            .expect("later event queues first");
+            sender_gate.wait();
+            send_reserved_output(
+                &sender_outputs,
+                &sender_cancellation,
+                first.order,
+                progress_event(1),
+            )
+            .expect("earlier event queues after the barrier");
+        });
+        // The channel/barrier makes the reverse enqueue order deterministic: cursor 2 is
+        // already queued before cursor 1 is released, so the writer must use reservations.
+        send_gate.wait();
+        sender.join().expect("reverse enqueue sender");
+        let order_state = outputs.order_state.clone();
+        drop(outputs);
+
+        let mut stdout = Vec::new();
+        write_output_queue(
+            control_rx,
+            event_rx,
+            &mut stdout,
+            &cancellation,
+            order_state,
+        )
+        .expect("writer drains reserved events");
+        let values = String::from_utf8(stdout)
+            .expect("writer output is UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("JSONL frame"))
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["params"]["event"]["cursor"], 1);
+        assert_eq!(values[1]["params"]["event"]["cursor"], 2);
+    }
+
+    #[test]
     fn gap_is_written_before_matching_control_output_when_progress_queue_is_full() {
         let (outputs, control_rx, event_rx) = test_output_channels(2, 1);
         let cancellation = CancellationProbe::default();
@@ -1423,7 +1585,7 @@ mod tests {
             serde_json::json!({"kind": "control"}),
         )
         .expect("control remains available while events are full");
-        let order_state = Arc::clone(&outputs.order_state);
+        let order_state = outputs.order_state.clone();
         drop(outputs);
 
         let mut stdout = Vec::new();
@@ -1472,7 +1634,7 @@ mod tests {
             serde_json::json!({"kind": "control"}),
         )
         .expect("control fits");
-        let order_state = Arc::clone(&outputs.order_state);
+        let order_state = outputs.order_state.clone();
         drop(outputs);
 
         let mut stdout = DisconnectedWriter;
@@ -1546,6 +1708,49 @@ mod tests {
 
         assert!(control_receiver.try_recv().is_err());
         assert!(event_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn notification_only_request_is_invalid_without_changing_batch_notification_contract() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
+        let cancellation = server.cancellation_handle();
+        let (outputs, control_receiver, event_receiver) = test_output_channels(2, 2);
+        let payload = parse_json_rpc_payload(
+            r#"[
+                {"jsonrpc":"2.0","method":"initialized","id":1,"params":{}},
+                {"jsonrpc":"2.0","method":"initialized","params":{}},
+                {"jsonrpc":"2.0","method":"thread/read","params":{}}
+            ]"#,
+        )
+        .expect("mixed notification batch parses");
+
+        dispatch_batch(&mut server, payload, &outputs, &cancellation)
+            .expect("dispatch mixed notification batch");
+
+        let output = control_receiver
+            .try_recv()
+            .expect("invalid request response");
+        let responses = output.message.as_array().expect("batch response array");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[0]["error"]["code"], -32600);
+        assert!(event_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn evaluation_requests_are_admitted_to_the_blocking_request_worker() {
+        let message: JsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"eval/run","id":1,"params":{"manifest":"manifest.json","runId":"run"}}"#,
+        )
+        .expect("evaluation request");
+
+        assert!(is_request_worker_method(&message));
+        let notification: JsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"eval/run","params":{"manifest":"manifest.json","runId":"run"}}"#,
+        )
+        .expect("evaluation notification");
+        assert!(is_request_worker_method(&notification));
     }
 
     #[test]

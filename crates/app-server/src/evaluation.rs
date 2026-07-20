@@ -16,7 +16,7 @@ use singularity_agent::{
     AgentLoop, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics, AgentStatus,
     AgentVerificationRequirement, agent_control_tool_entries, terminal_command_scope_digests,
 };
-use singularity_core::{contains_sensitive_text, load_project_instructions};
+use singularity_core::{CancellationToken, contains_sensitive_text, load_project_instructions};
 use singularity_evaluation::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
     EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationPromptStructure,
@@ -264,6 +264,17 @@ struct PreparedTaskContext<'a> {
     plan: &'a WorkspacePlan,
     sandbox_backend: &'a SharedSandboxBackend,
     provider_snapshot: &'a ProviderConfigSnapshot,
+    cancellation: &'a CancellationToken,
+}
+
+/// 一个 Evaluation run 内所有 task trial 共享的只读执行上下文。
+struct EvaluationRunContext<'a> {
+    run_id: &'a RunId,
+    run_dir: &'a Path,
+    manifest_dir: &'a Path,
+    sandbox_backend: &'a SharedSandboxBackend,
+    provider_snapshot: &'a ProviderConfigSnapshot,
+    cancellation: &'a CancellationToken,
 }
 
 #[derive(Debug)]
@@ -304,12 +315,14 @@ pub(crate) enum EvaluationRunErrorKind {
     Input,
     Publication,
     Infrastructure,
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct EvaluationRunError {
     kind: EvaluationRunErrorKind,
     message: String,
+    partial_result: Option<Box<EvalRunResult>>,
 }
 
 impl EvaluationRunError {
@@ -317,6 +330,7 @@ impl EvaluationRunError {
         Self {
             kind: EvaluationRunErrorKind::Input,
             message: message.into(),
+            partial_result: None,
         }
     }
 
@@ -324,6 +338,7 @@ impl EvaluationRunError {
         Self {
             kind: EvaluationRunErrorKind::Publication,
             message: message.into(),
+            partial_result: None,
         }
     }
 
@@ -331,11 +346,24 @@ impl EvaluationRunError {
         Self {
             kind: EvaluationRunErrorKind::Infrastructure,
             message: message.into(),
+            partial_result: None,
+        }
+    }
+
+    fn cancelled(message: impl Into<String>, partial_result: Option<EvalRunResult>) -> Self {
+        Self {
+            kind: EvaluationRunErrorKind::Cancelled,
+            message: message.into(),
+            partial_result: partial_result.map(Box::new),
         }
     }
 
     pub(crate) fn kind(&self) -> EvaluationRunErrorKind {
         self.kind
+    }
+
+    pub(crate) fn partial_result(&self) -> Option<&EvalRunResult> {
+        self.partial_result.as_deref()
     }
 }
 
@@ -351,7 +379,17 @@ pub(crate) fn run_evaluation(
     params: &EvalRunParams,
     sandbox_backend: SharedSandboxBackend,
     provider_snapshot: &ProviderConfigSnapshot,
+    cancellation: &CancellationToken,
 ) -> Result<EvalRunResult, EvaluationRunError> {
+    if cancellation.is_cancelled() {
+        let partial = RunId::new(params.run_id.clone())
+            .ok()
+            .map(|run_id| partial_evaluation_result(params, &run_id, &[]));
+        return Err(EvaluationRunError::cancelled(
+            "evaluation cancelled",
+            partial,
+        ));
+    }
     let manifest_path = Path::new(&params.manifest);
     let manifest_json = fs::read_to_string(manifest_path).map_err(|error| {
         EvaluationRunError::input(format!(
@@ -403,16 +441,38 @@ pub(crate) fn run_evaluation(
         ))
     })?;
 
+    let run_context = EvaluationRunContext {
+        run_id: &run_id,
+        run_dir: &run_dir,
+        manifest_dir: manifest.manifest_dir(),
+        sandbox_backend: &sandbox_backend,
+        provider_snapshot,
+        cancellation,
+    };
     let mut task_executions = Vec::new();
     for plan in &plans {
-        task_executions.push(run_task_trials(
-            &run_id,
+        if cancellation.is_cancelled() {
+            let partial = partial_evaluation_result(params, &run_id, &task_executions);
+            return Err(cleanup_incomplete_run(
+                &run_dir,
+                EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
+            ));
+        }
+        task_executions.push(run_task_trials(&run_context, plan, trials_per_task));
+        if cancellation.is_cancelled() {
+            let partial = partial_evaluation_result(params, &run_id, &task_executions);
+            return Err(cleanup_incomplete_run(
+                &run_dir,
+                EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
+            ));
+        }
+    }
+
+    if cancellation.is_cancelled() {
+        let partial = partial_evaluation_result(params, &run_id, &task_executions);
+        return Err(cleanup_incomplete_run(
             &run_dir,
-            manifest.manifest_dir(),
-            plan,
-            trials_per_task,
-            Arc::clone(&sandbox_backend),
-            provider_snapshot,
+            EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
         ));
     }
 
@@ -507,6 +567,33 @@ pub(crate) fn run_evaluation(
     })
 }
 
+fn partial_evaluation_result(
+    params: &EvalRunParams,
+    run_id: &RunId,
+    task_executions: &[TaskEvaluation],
+) -> EvalRunResult {
+    let status = if task_executions
+        .iter()
+        .any(|execution| execution.result.status == EvaluationStatus::Failed)
+    {
+        "failed"
+    } else {
+        "blocked"
+    };
+    EvalRunResult {
+        run_id: run_id.as_str().to_string(),
+        manifest: params.manifest.clone(),
+        runner: RUNNER_NAME.to_string(),
+        status: status.to_string(),
+        blocker: Some("evaluation_cancelled".to_string()),
+        tasks: task_executions.iter().map(task_report).collect(),
+        result_path: None,
+        report_path: None,
+        evidence_path: None,
+        evaluation_passed: false,
+    }
+}
+
 fn cleanup_incomplete_run(run_dir: &Path, mut error: EvaluationRunError) -> EvaluationRunError {
     match fs::remove_dir_all(run_dir) {
         Ok(()) => error,
@@ -541,17 +628,23 @@ fn task_report(execution: &TaskEvaluation) -> Value {
 }
 
 fn run_task_trials(
-    run_id: &RunId,
-    run_dir: &Path,
-    manifest_dir: &Path,
+    context: &EvaluationRunContext<'_>,
     plan: &WorkspacePlan,
     trials_per_task: u32,
-    sandbox_backend: SharedSandboxBackend,
-    provider_snapshot: &ProviderConfigSnapshot,
 ) -> TaskEvaluation {
-    let task_root = run_dir.join(plan.task_id.as_str());
+    let task_root = context.run_dir.join(plan.task_id.as_str());
     let source_dir = task_root.join(SOURCE_DIR);
-    let initial_source = source_provenance(&plan.source, &source_dir, manifest_dir);
+    let initial_source = source_provenance(&plan.source, &source_dir, context.manifest_dir);
+    if context.cancellation.is_cancelled() {
+        return blocked_task_trials(
+            plan,
+            trials_per_task,
+            evaluation_blocker(BlockerKind::AgentRuntime, "evaluation cancelled"),
+            initial_source,
+            Vec::new(),
+            false,
+        );
+    }
     if let Err(error) = fs::create_dir(&task_root) {
         return blocked_task_trials(
             plan,
@@ -568,7 +661,7 @@ fn run_task_trials(
             false,
         );
     }
-    let capability = super::agent_loop_capability(sandbox_backend.as_ref());
+    let capability = super::agent_loop_capability(context.sandbox_backend.as_ref());
     if !capability.available {
         return blocked_task_trials(
             plan,
@@ -583,7 +676,7 @@ fn run_task_trials(
         );
     }
     if matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. })
-        && let Err(error) = provider_snapshot.provider()
+        && let Err(error) = context.provider_snapshot.provider()
     {
         return blocked_task_trials(
             plan,
@@ -598,7 +691,7 @@ fn run_task_trials(
         &plan.source,
         &task_root,
         &source_dir,
-        Arc::clone(&sandbox_backend),
+        Arc::clone(context.sandbox_backend),
     ) {
         Ok(commands) => commands,
         Err((blocker, commands)) => {
@@ -606,22 +699,23 @@ fn run_task_trials(
                 plan,
                 trials_per_task,
                 blocker,
-                source_provenance(&plan.source, &source_dir, manifest_dir),
+                source_provenance(&plan.source, &source_dir, context.manifest_dir),
                 commands,
                 true,
             );
         }
     };
-    let source = source_provenance(&plan.source, &source_dir, manifest_dir);
+    let source = source_provenance(&plan.source, &source_dir, context.manifest_dir);
     let prepared = PreparedTaskContext {
-        run_id,
+        run_id: context.run_id,
         task_root: &task_root,
         source_dir: &source_dir,
         source: &source,
         source_commands: &source_commands,
         plan,
-        sandbox_backend: &sandbox_backend,
-        provider_snapshot,
+        sandbox_backend: context.sandbox_backend,
+        provider_snapshot: context.provider_snapshot,
+        cancellation: context.cancellation,
     };
     let trials = (1..=trials_per_task)
         .map(|trial| run_task(&prepared, trial))
@@ -741,15 +835,8 @@ fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
         );
     }
 
-    let agent_execution = run_agent_stage(
-        prepared.run_id,
-        prepared.source_dir,
-        &task_dir,
-        &prepared.plan.agent,
-        trial,
-        provider,
-        Arc::clone(prepared.sandbox_backend),
-    );
+    let agent_execution =
+        run_agent_stage(prepared, &task_dir, &prepared.plan.agent, trial, provider);
     diagnostics.agent = agent_execution.stage.diagnostics.clone();
     diagnostics.changed_files = agent_execution.changed_files.clone();
     diagnostics.patch_evidence = agent_execution.patch_evidence.clone();
@@ -813,6 +900,18 @@ fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
             diagnostics,
         );
     };
+
+    if prepared.cancellation.is_cancelled() {
+        return finish_task(
+            &prepared.plan.task_id,
+            trial,
+            baseline,
+            agent_execution.stage,
+            StageExecution::skipped("public stage skipped because evaluation was cancelled"),
+            StageExecution::skipped("hidden stage skipped because evaluation was cancelled"),
+            diagnostics,
+        );
+    }
 
     let public = run_verification_stage_with_agent_changes(
         prepared.source_dir,
@@ -1476,17 +1575,21 @@ fn cleanup_evaluator_control_files(
     }
 }
 fn run_agent_stage(
-    run_id: &RunId,
-    source_dir: &Path,
+    prepared: &PreparedTaskContext<'_>,
     task_dir: &Path,
     plan: &AgentStagePlan,
     trial: u32,
     provider: OpenAiProvider,
-    sandbox_backend: SharedSandboxBackend,
 ) -> AgentStageExecution {
     let agent_dir = task_dir.join(AGENT_DIR);
     let projection = &plan.projection;
-    let pristine_source = match snapshot_workspace(source_dir) {
+    if prepared.cancellation.is_cancelled() {
+        return blocked_agent_stage(
+            evaluation_blocker(BlockerKind::AgentRuntime, "evaluation cancelled"),
+            Vec::new(),
+        );
+    }
+    let pristine_source = match snapshot_workspace(prepared.source_dir) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return blocked_agent_stage(
@@ -1495,7 +1598,7 @@ fn run_agent_stage(
             );
         }
     };
-    if let Err(error) = copy_tree_checked(source_dir, &agent_dir) {
+    if let Err(error) = copy_tree_checked(prepared.source_dir, &agent_dir) {
         return blocked_agent_stage(
             evaluation_blocker(BlockerKind::WorkspacePreparation, error),
             Vec::new(),
@@ -1505,7 +1608,7 @@ fn run_agent_stage(
     if let Err(blocker) = run_setup_commands(
         &agent_dir,
         &plan.setup_commands,
-        Arc::clone(&sandbox_backend),
+        Arc::clone(prepared.sandbox_backend),
         &mut command_diagnostics,
     ) {
         return blocked_agent_stage(blocker, command_diagnostics);
@@ -1579,7 +1682,7 @@ fn run_agent_stage(
         projection.task_id.as_str(),
         format!(
             "eval_{}_{}_trial_{trial}",
-            run_id.as_str(),
+            prepared.run_id.as_str(),
             projection.task_id.as_str()
         ),
         prompt,
@@ -1591,7 +1694,7 @@ fn run_agent_stage(
     }
     let workspace_tools = match WorkspaceTools::new(&agent_dir) {
         Ok(tools) => tools
-            .with_shared_sandbox_backend(sandbox_backend)
+            .with_shared_sandbox_backend(Arc::clone(prepared.sandbox_backend))
             .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated),
         Err(error) => {
             return blocked_agent_stage(
@@ -1604,6 +1707,7 @@ fn run_agent_stage(
     let provider_identity = provider.clone();
     let result = AgentLoop::new(provider, ToolBroker::new(resolved_tools.registry), policy)
         .with_workspace_tools(workspace_tools)
+        .with_cancellation_token(prepared.cancellation.clone())
         .run(&input);
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let run_status = result.to_run_status();
@@ -1618,7 +1722,7 @@ fn run_agent_stage(
     let trace = json!({
         "status": run_status.status,
         "completed": run_status.completed,
-        "run_id": run_id.as_str(),
+        "run_id": prepared.run_id.as_str(),
         "thread_id": &input.thread_id,
         "turn_id": &input.turn_id,
         "task_id": projection.task_id.as_str(),
@@ -3263,6 +3367,29 @@ mod tests {
         .expect("short evaluation paths must fit the conservative budget");
     }
 
+    #[test]
+    fn pre_cancelled_evaluation_returns_a_typed_cancelled_error() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = run_evaluation(
+            &EvalRunParams {
+                manifest: "missing-manifest.json".to_string(),
+                run_id: "cancelled-run".to_string(),
+                output_root: None,
+            },
+            Arc::new(SourceSandboxBackend),
+            &ProviderConfigSnapshot::capture(|_| None),
+            &cancellation,
+        )
+        .expect_err("cancelled evaluation must not start");
+
+        assert_eq!(error.kind(), EvaluationRunErrorKind::Cancelled);
+        let partial = error.partial_result().expect("partial terminal result");
+        assert_eq!(partial.status, "blocked");
+        assert_eq!(partial.blocker.as_deref(), Some("evaluation_cancelled"));
+        assert!(partial.tasks.is_empty());
+    }
+
     #[cfg(windows)]
     #[test]
     fn run_evaluation_rejects_long_paths_before_creating_run_directory() {
@@ -3311,6 +3438,7 @@ mod tests {
             &params,
             Arc::new(SourceSandboxBackend),
             &ProviderConfigSnapshot::capture(|_| None),
+            &CancellationToken::new(),
         )
         .expect_err("long evaluation paths must fail before execution");
 
@@ -3685,15 +3813,19 @@ mod tests {
             .workspace_plan(&TaskId::new("source-reuse").expect("task id"))
             .expect("plan");
 
-        let evaluation = run_task_trials(
-            &RunId::new("source-reuse-run").expect("run id"),
-            &run_dir,
-            temp.path(),
-            &plan,
-            3,
-            Arc::new(SourceSandboxBackend),
-            &ProviderConfigSnapshot::capture(|_| None),
-        );
+        let run_id = RunId::new("source-reuse-run").expect("run id");
+        let sandbox_backend: SharedSandboxBackend = Arc::new(SourceSandboxBackend);
+        let provider_snapshot = ProviderConfigSnapshot::capture(|_| None);
+        let cancellation = CancellationToken::new();
+        let context = EvaluationRunContext {
+            run_id: &run_id,
+            run_dir: &run_dir,
+            manifest_dir: temp.path(),
+            sandbox_backend: &sandbox_backend,
+            provider_snapshot: &provider_snapshot,
+            cancellation: &cancellation,
+        };
+        let evaluation = run_task_trials(&context, &plan, 3);
 
         let task_root = run_dir.join("source-reuse");
         assert_eq!(
@@ -3758,6 +3890,7 @@ mod tests {
             &params,
             Arc::new(SourceSandboxBackend),
             &ProviderConfigSnapshot::capture(|_| None),
+            &CancellationToken::new(),
         )
         .expect("blocked run still publishes typed artifacts");
 

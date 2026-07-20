@@ -7,9 +7,10 @@ use singularity_protocol::{
     ConversationMessage, ConversationRole, EventClass, EventDelivery, EventGap, EventGapReason,
     EventMetadata, EventRecoveryQuery, EventSubscribeParams, InitializeParams, InitializeResult,
     ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload,
-    METHOD_REGISTRY, Method, ProviderConfigurationStatus, ThreadIdParams, ThreadReadParams,
-    ThreadReadResult, ThreadStartParams, ThreadStatus, TraceListParams, TraceShowParams,
-    TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus, parse_json_rpc_payload,
+    METHOD_REGISTRY, Method, MethodKind, ProviderConfigurationStatus, ThreadIdParams,
+    ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceListParams,
+    TraceShowParams, TraceTailParams, TurnIdParams, TurnStartParams, TurnStatus,
+    parse_json_rpc_payload,
 };
 
 #[test]
@@ -344,6 +345,8 @@ fn method_registry_is_the_unique_name_and_contract_source() {
             .is_ok()
     );
     assert!(thread_read.validate_params(serde_json::json!({})).is_err());
+    assert_eq!(Method::Initialized.spec().kind, MethodKind::Notification);
+    assert_eq!(Method::ThreadRead.spec().kind, MethodKind::Request);
 }
 
 #[test]
