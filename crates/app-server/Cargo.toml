@@ -26,6 +26,7 @@ singularity_sandbox = { path = "../sandbox" }
 singularity_store = { path = "../store" }
 singularity_tools = { path = "../tools" }
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

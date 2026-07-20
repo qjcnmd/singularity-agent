@@ -1,14 +1,11 @@
 //! `AppServer` 的标准输入输出（stdio）传输层。
 //!
-//! 输入独立读取；请求工作线程准入队列和传输队列均有界，由单一写入方串行化 JSON 行输出，
-//! state/gap 事件在事件队列中可靠阻塞；progress 事件共用该有界队列但可丢弃，控制响应保持独立。
+//! 输入由 Tokio 单一 owner 读取；请求工作和传输队列均有界，由单一异步写入方串行化
+//! JSON 行输出。state/gap 事件可靠阻塞，progress 事件可丢弃但必须记录 gap，控制响应保持独立。
 
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt};
@@ -24,11 +21,12 @@ use singularity_protocol::{
     JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
 };
 use singularity_store::SessionStore;
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
-const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MAX_REQUEST_WORKERS: usize = 16;
-const INPUT_QUEUE_CAPACITY: usize = 64;
 const CONTROL_QUEUE_CAPACITY: usize = 64;
 const EVENT_QUEUE_CAPACITY: usize = 256;
 const REQUEST_CAPACITY_EXCEEDED: &str = "AppServer request capacity exceeded";
@@ -41,8 +39,8 @@ const CACHE_KEY_LOCK_FILE_PREFIX: &str = ".provider-capability-cache.key-lock-";
 
 #[derive(Clone)]
 struct OutputChannels {
-    control: SyncSender<QueuedOutput>,
-    event: SyncSender<QueuedOutput>,
+    control: mpsc::Sender<QueuedOutput>,
+    event: mpsc::Sender<QueuedOutput>,
     pending_event_gap: Arc<Mutex<Option<PendingEventGap>>>,
     send_lock: Arc<Mutex<()>>,
     order_state: OutputOrderCoordinator,
@@ -76,7 +74,7 @@ enum OutputSendStatus {
     EventDropped,
 }
 
-trait ExecutionStop {
+trait ExecutionStop: Send + Sync {
     fn request_execution_stop(&self);
 }
 
@@ -86,12 +84,364 @@ impl ExecutionStop for AppServerCancellationHandle {
     }
 }
 
-/// 启动标准输入输出服务；传输或生命周期关闭失败时以非零状态退出。
-/// 负责 `stdin` 读取、请求工作线程准入、`stdout` 串行化和优雅关闭。
-pub(super) fn run() -> Result<(), String> {
+/// 在单一 Tokio runtime 内运行 stdio 控制面；所有同步 AppServer 工作都跨 blocking 边界。
+pub(super) async fn run() -> Result<(), String> {
     let configured_db_path = std::env::var("SINGULARITY_APP_SERVER_DB")
         .unwrap_or_else(|_| ".singularity/rust-app-server.sqlite3".to_string());
-    let (db_path, capability_cache_path) = prepare_app_server_state_paths(&configured_db_path)?;
+    let server = tokio::task::spawn_blocking(move || initialize_app_server(&configured_db_path))
+        .await
+        .map_err(|error| format!("app-server startup task failed: {error}"))??;
+    let cancellation = server.cancellation_handle();
+    let (control_tx, mut control_rx) = mpsc::channel::<QueuedOutput>(CONTROL_QUEUE_CAPACITY);
+    let (event_tx, mut event_rx) = mpsc::channel::<QueuedOutput>(EVENT_QUEUE_CAPACITY);
+    let outputs = OutputChannels {
+        control: control_tx,
+        event: event_tx,
+        pending_event_gap: Arc::new(Mutex::new(None)),
+        send_lock: Arc::new(Mutex::new(())),
+        order_state: server.output_order_coordinator(),
+    };
+    let writer_cancellation = cancellation.clone();
+    let writer_order_state = outputs.order_state.clone();
+    let mut writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        write_output_queue(
+            &mut control_rx,
+            &mut event_rx,
+            &mut stdout,
+            &writer_cancellation,
+            writer_order_state,
+        )
+        .await
+    });
+    let mut writer_done = false;
+    let mut writer_result = None;
+    let mut writer_timeout = false;
+    let mut server = Some(server);
+    let mut workers = JoinSet::<Result<(), String>>::new();
+    let mut active_workers = 0usize;
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut terminal_error = None;
+
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut writer, if !writer_done => {
+                writer_done = true;
+                writer_result = Some(result);
+                terminal_error = Some(match writer_result.as_ref().expect("writer result") {
+                    Ok(Ok(())) => "stdout writer stopped unexpectedly".to_string(),
+                    Ok(Err(error)) => error.clone(),
+                    Err(error) => format!("stdout writer task failed: {error}"),
+                });
+                break;
+            }
+            result = workers.join_next(), if active_workers > 0 => {
+                active_workers = active_workers.saturating_sub(1);
+                match result {
+                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Err(error))) => {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        terminal_error = Some(format!("request worker task failed: {error}"));
+                        break;
+                    }
+                }
+            }
+            line = lines.next_line() => {
+                let Some(line) = (match line {
+                    Ok(line) => line,
+                    Err(error) => {
+                        terminal_error = Some(format!("failed to read stdin: {error}"));
+                        break;
+                    }
+                }) else {
+                    break;
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let payload = match parse_json_rpc_payload(&line) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        if let Err(error) = send_output_async(
+                            outputs.clone(),
+                            cancellation.clone(),
+                            JsonRpcMessage::parse_error().to_wire_value(),
+                        )
+                        .await
+                        {
+                            terminal_error = Some(error);
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if !matches!(payload, JsonRpcPayload::Single(_)) {
+                    let batch_outputs = outputs.clone();
+                    let batch_cancellation = cancellation.clone();
+                    let current_server = server.take().expect("stdio server owner");
+                    let task = tokio::task::spawn_blocking(move || {
+                        let mut server = current_server;
+                        let result = dispatch_batch(
+                            &mut server,
+                            payload,
+                            &batch_outputs,
+                            &batch_cancellation,
+                        );
+                        (server, result)
+                    });
+                    let (next_server, result) = match task.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            terminal_error = Some(format!("batch dispatch task failed: {error}"));
+                            break;
+                        }
+                    };
+                    server = Some(next_server);
+                    if let Err(error) = result {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    if server.as_ref().expect("stdio server owner").shutdown_requested() {
+                        break;
+                    }
+                    continue;
+                }
+                let JsonRpcPayload::Single(item) = payload else {
+                    unreachable!("non-single JSON-RPC payload reached single dispatcher")
+                };
+                let message = match item {
+                    JsonRpcBatchItem::Message(message) => message,
+                    JsonRpcBatchItem::Invalid { id } => {
+                        if let Err(error) = send_output_async(
+                            outputs.clone(),
+                            cancellation.clone(),
+                            JsonRpcMessage::invalid_request(id).to_wire_value(),
+                        )
+                        .await
+                        {
+                            terminal_error = Some(error);
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let request_id = message.id().cloned();
+                if is_request_worker_method(&message)
+                    && server
+                        .as_ref()
+                        .expect("stdio server owner")
+                        .ready_for_turn_worker()
+                {
+                    if active_workers >= MAX_REQUEST_WORKERS {
+                        if let Err(error) = send_output_async(
+                            outputs.clone(),
+                            cancellation.clone(),
+                            internal_error_value(request_id, REQUEST_CAPACITY_EXCEEDED),
+                        )
+                        .await
+                        {
+                            terminal_error = Some(error);
+                            break;
+                        }
+                        continue;
+                    }
+                    let current_server = server.take().expect("stdio server owner");
+                    let task = tokio::task::spawn_blocking(move || {
+                        let worker = current_server.turn_worker();
+                        (current_server, worker)
+                    });
+                    let (next_server, worker_result) = match task.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            terminal_error = Some(format!("request worker setup failed: {error}"));
+                            break;
+                        }
+                    };
+                    server = Some(next_server);
+                    match worker_result {
+                        Ok(worker) => {
+                            let worker_outputs = outputs.clone();
+                            let worker_cancellation = cancellation.clone();
+                            workers.spawn_blocking(move || {
+                                run_request_worker(
+                                    worker,
+                                    message,
+                                    worker_outputs,
+                                    worker_cancellation,
+                                )
+                            });
+                            active_workers += 1;
+                        }
+                        Err(error) => {
+                            if let Err(error) = send_output_async(
+                                outputs.clone(),
+                                cancellation.clone(),
+                                transport_error_value(request_id, &error),
+                            )
+                            .await
+                            {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    let direct_outputs = outputs.clone();
+                    let direct_cancellation = cancellation.clone();
+                    let current_server = server.take().expect("stdio server owner");
+                    let task = tokio::task::spawn_blocking(move || {
+                        let mut server = current_server;
+                        let notification = message.is_notification();
+                        let request_id = message.id().cloned();
+                        let result = server.handle_with_output(message);
+                        let dispatch_result = match result {
+                            Ok(messages) => send_app_server_outputs(
+                                &direct_outputs,
+                                &direct_cancellation,
+                                messages,
+                            ),
+                            Err(error) if !notification => send_output(
+                                &direct_outputs,
+                                OutputKind::Control,
+                                &direct_cancellation,
+                                transport_error_value(request_id, &error),
+                            )
+                            .map(|_| ()),
+                            Err(_) => Ok(()),
+                        };
+                        (server, dispatch_result)
+                    });
+                    let (next_server, result) = match task.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            terminal_error = Some(format!("request dispatch task failed: {error}"));
+                            break;
+                        }
+                    };
+                    server = Some(next_server);
+                    if let Err(error) = result {
+                        terminal_error = Some(error);
+                        break;
+                    }
+                }
+                if server.as_ref().expect("stdio server owner").shutdown_requested() {
+                    break;
+                }
+            }
+        }
+    }
+
+    let shutdown_deadline = Instant::now() + SHUTDOWN_GRACE;
+    let current_server = server.take().expect("stdio server owner");
+    let stop_result = tokio::task::spawn_blocking(move || current_server.request_execution_stop())
+        .await
+        .map_err(|error| format!("failed to stop executions during shutdown: {error}"))
+        .and_then(|result| {
+            result.map_err(|error| format!("failed to stop executions during shutdown: {error}"))
+        });
+    let mut worker_error = None;
+    while active_workers > 0 {
+        let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) else {
+            worker_error = Some(format!(
+                "timed out waiting for {active_workers} request worker(s) during shutdown"
+            ));
+            workers.abort_all();
+            break;
+        };
+        match tokio::time::timeout(remaining, workers.join_next()).await {
+            Ok(Some(Ok(Ok(())))) => active_workers = active_workers.saturating_sub(1),
+            Ok(Some(Ok(Err(error)))) => {
+                active_workers = active_workers.saturating_sub(1);
+                if worker_error.is_none() {
+                    worker_error = Some(error);
+                }
+            }
+            Ok(Some(Err(error))) => {
+                active_workers = active_workers.saturating_sub(1);
+                if worker_error.is_none() {
+                    worker_error = Some(format!("request worker task failed: {error}"));
+                }
+            }
+            Ok(None) => active_workers = 0,
+            Err(_) => {
+                worker_error = Some(format!(
+                    "timed out waiting for {active_workers} request worker(s) during shutdown"
+                ));
+                workers.abort_all();
+                break;
+            }
+        }
+    }
+
+    let gap_result =
+        if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
+            let gap_outputs = outputs.clone();
+            let gap_cancellation = cancellation.clone();
+            let mut gap_task = tokio::task::spawn_blocking(move || {
+                flush_pending_event_gap(&gap_outputs, &gap_cancellation)
+            });
+            match tokio::time::timeout(remaining, &mut gap_task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(format!("event gap flush task failed: {error}")),
+                Err(_) => {
+                    gap_task.abort();
+                    Err("timed out flushing pending event gap during shutdown".to_string())
+                }
+            }
+        } else {
+            Err("timed out before flushing pending event gap during shutdown".to_string())
+        };
+    drop(outputs);
+
+    if !writer_done {
+        if let Some(remaining) = shutdown_deadline.checked_duration_since(Instant::now()) {
+            match tokio::time::timeout(remaining, &mut writer).await {
+                Ok(result) => {
+                    writer_result = Some(result);
+                }
+                Err(_) => {
+                    writer.abort();
+                    writer_timeout = true;
+                }
+            }
+        } else {
+            writer.abort();
+            writer_timeout = true;
+        }
+    }
+
+    let mut errors = Vec::new();
+    if let Err(error) = stop_result {
+        errors.push(error);
+    }
+    if let Some(error) = worker_error {
+        errors.push(error);
+    }
+    if let Some(error) = terminal_error {
+        errors.push(error);
+    }
+    if let Err(error) = gap_result {
+        errors.push(error);
+    }
+    if writer_timeout {
+        errors.push("timed out waiting for stdout writer during shutdown".to_string());
+    }
+    if let Some(Err(error)) = writer_result {
+        errors.push(format!("stdout writer task failed: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn initialize_app_server(configured_db_path: &str) -> Result<AppServer, String> {
+    let (db_path, capability_cache_path) = prepare_app_server_state_paths(configured_db_path)?;
     let store = SessionStore::open(&db_path)
         .map_err(|error| format!("failed to open app-server store {db_path}: {error}"))?;
     validate_database_file(Path::new(&db_path), false)?;
@@ -102,227 +452,19 @@ pub(super) fn run() -> Result<(), String> {
         |name| std::env::var(name).ok(),
         Some(capability_cache_path),
     );
-    let mut server = AppServer::new(store, provider_snapshot);
-    let cancellation = server.cancellation_handle();
-    let output_order = server.output_order_coordinator();
-    let (control_tx, control_rx) = mpsc::sync_channel::<QueuedOutput>(CONTROL_QUEUE_CAPACITY);
-    let (event_tx, event_rx) = mpsc::sync_channel::<QueuedOutput>(EVENT_QUEUE_CAPACITY);
-    let outputs = OutputChannels {
-        control: control_tx,
-        event: event_tx,
-        pending_event_gap: Arc::new(Mutex::new(None)),
-        send_lock: Arc::new(Mutex::new(())),
-        order_state: output_order,
-    };
-    let (writer_error_tx, writer_error_rx) = mpsc::channel::<String>();
-    let writer_cancellation = cancellation.clone();
-    let writer_order_state = outputs.order_state.clone();
-    let writer = thread::spawn(move || -> Result<(), String> {
-        let mut stdout = io::stdout().lock();
-        let result = write_output_queue(
-            control_rx,
-            event_rx,
-            &mut stdout,
-            &writer_cancellation,
-            writer_order_state,
-        );
-        if let Err(error) = &result {
-            let _ = writer_error_tx.send(error.clone());
-        }
-        result
-    });
-    let (input_tx, input_rx) =
-        mpsc::sync_channel::<Result<Option<String>, String>>(INPUT_QUEUE_CAPACITY);
-    thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            if input_tx
-                .send(
-                    line.map(Some)
-                        .map_err(|error| format!("failed to read stdin: {error}")),
-                )
-                .is_err()
-            {
-                return;
-            }
-        }
-        let _ = input_tx.send(Ok(None));
-    });
-    let mut request_workers = Vec::new();
-    let mut terminal_error = None;
+    Ok(AppServer::new(store, provider_snapshot))
+}
 
-    loop {
-        if let Err(error) = reap_finished_workers(&mut request_workers) {
-            terminal_error = Some(error);
-            break;
-        }
-        match writer_error_rx.try_recv() {
-            Ok(error) => {
-                terminal_error = Some(error);
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                terminal_error = Some("stdout writer stopped unexpectedly".to_string());
-                break;
-            }
-        }
-        let line = match input_rx.recv_timeout(INPUT_POLL_INTERVAL) {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => {
-                terminal_error = Some(error);
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                terminal_error = Some("stdin reader stopped unexpectedly".to_string());
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let payload = match parse_json_rpc_payload(&line) {
-            Ok(payload) => payload,
-            Err(_) => {
-                if let Err(error) = send_output(
-                    &outputs,
-                    OutputKind::Control,
-                    &cancellation,
-                    JsonRpcMessage::parse_error().to_wire_value(),
-                ) {
-                    terminal_error = Some(error);
-                    break;
-                }
-                continue;
-            }
-        };
-        if !matches!(payload, JsonRpcPayload::Single(_)) {
-            if let Err(error) = dispatch_batch(&mut server, payload, &outputs, &cancellation) {
-                terminal_error = Some(error);
-                break;
-            }
-            if server.shutdown_requested() {
-                break;
-            }
-            continue;
-        }
-        let JsonRpcPayload::Single(item) = payload else {
-            unreachable!("non-single payload handled above")
-        };
-        let message = match item {
-            JsonRpcBatchItem::Message(message) => message,
-            JsonRpcBatchItem::Invalid { id } => {
-                if let Err(error) = send_output(
-                    &outputs,
-                    OutputKind::Control,
-                    &cancellation,
-                    JsonRpcMessage::invalid_request(id).to_wire_value(),
-                ) {
-                    terminal_error = Some(error);
-                    break;
-                }
-                continue;
-            }
-        };
-        let request_id = message.id().cloned();
-        if is_request_worker_method(&message) && server.ready_for_turn_worker() {
-            if request_workers.len() >= MAX_REQUEST_WORKERS {
-                if let Err(error) = send_output(
-                    &outputs,
-                    OutputKind::Control,
-                    &cancellation,
-                    internal_error_value(request_id, REQUEST_CAPACITY_EXCEEDED),
-                ) {
-                    terminal_error = Some(error);
-                    break;
-                }
-                continue;
-            }
-            match server.turn_worker() {
-                Ok(worker) => {
-                    let worker_outputs = outputs.clone();
-                    let worker_cancellation = cancellation.clone();
-                    match thread::Builder::new()
-                        .name("singularity-request".to_string())
-                        .spawn(move || {
-                            run_request_worker(worker, message, worker_outputs, worker_cancellation)
-                        }) {
-                        Ok(worker) => request_workers.push(worker),
-                        Err(error) => {
-                            if let Err(error) = send_output(
-                                &outputs,
-                                OutputKind::Control,
-                                &cancellation,
-                                internal_error_value(
-                                    request_id,
-                                    format!("failed to start request worker: {error}"),
-                                ),
-                            ) {
-                                terminal_error = Some(error);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    if let Err(error) = send_output(
-                        &outputs,
-                        OutputKind::Control,
-                        &cancellation,
-                        transport_error_value(request_id, &error),
-                    ) {
-                        terminal_error = Some(error);
-                        break;
-                    }
-                }
-            }
-        } else {
-            let notification = message.is_notification();
-            match server.handle_with_output(message) {
-                Ok(messages) => {
-                    if let Err(error) = send_app_server_outputs(&outputs, &cancellation, messages) {
-                        terminal_error = Some(error);
-                    }
-                }
-                Err(error) if !notification => {
-                    if let Err(error) = send_output(
-                        &outputs,
-                        OutputKind::Control,
-                        &cancellation,
-                        transport_error_value(request_id, &error),
-                    ) {
-                        terminal_error = Some(error);
-                    }
-                }
-                Err(_) => {}
-            }
-            if terminal_error.is_some() {
-                break;
-            }
-        }
-        if server.shutdown_requested() {
-            break;
-        }
-    }
-
-    let shutdown_deadline = Instant::now() + SHUTDOWN_GRACE;
-    let request_worker_result = server
-        .request_execution_stop()
-        .map_err(|error| format!("failed to stop executions during shutdown: {error}"))
-        .and_then(|()| {
-            join_request_workers_during_shutdown(&mut request_workers, shutdown_deadline)
-        });
-    let gap_result = flush_pending_event_gap(&outputs, &cancellation);
-    drop(outputs);
-    let writer_result = join_writer_during_shutdown(writer, shutdown_deadline);
-    request_worker_result?;
-    if let Some(error) = terminal_error {
-        return Err(error);
-    }
-    gap_result?;
-    writer_result?;
-    Ok(())
+async fn send_output_async(
+    outputs: OutputChannels,
+    cancellation: AppServerCancellationHandle,
+    message: Value,
+) -> Result<OutputSendStatus, String> {
+    tokio::task::spawn_blocking(move || {
+        send_output(&outputs, OutputKind::Control, &cancellation, message)
+    })
+    .await
+    .map_err(|error| format!("output dispatch task failed: {error}"))?
 }
 
 fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
@@ -471,80 +613,6 @@ fn run_request_worker(
     Ok(())
 }
 
-fn reap_finished_workers(workers: &mut Vec<JoinHandle<Result<(), String>>>) -> Result<(), String> {
-    let mut active = Vec::with_capacity(workers.len());
-    let mut first_error = None;
-    for worker in workers.drain(..) {
-        if worker.is_finished() {
-            if let Err(error) = join_request_worker(worker)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        } else {
-            active.push(worker);
-        }
-    }
-    *workers = active;
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
-fn join_request_workers_during_shutdown(
-    workers: &mut Vec<JoinHandle<Result<(), String>>>,
-    deadline: Instant,
-) -> Result<(), String> {
-    let mut first_error = None;
-    while !workers.is_empty() {
-        if let Err(error) = reap_finished_workers(workers)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-        if workers.is_empty() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let timeout = format!(
-                "timed out waiting for {} request worker(s) during shutdown",
-                workers.len()
-            );
-            return Err(match first_error {
-                Some(error) => format!("{error}; {timeout}"),
-                None => timeout,
-            });
-        }
-        thread::sleep(INPUT_POLL_INTERVAL);
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
-fn join_writer_during_shutdown(
-    writer: JoinHandle<Result<(), String>>,
-    deadline: Instant,
-) -> Result<(), String> {
-    while !writer.is_finished() {
-        if Instant::now() >= deadline {
-            return Err("timed out waiting for stdout writer during shutdown".to_string());
-        }
-        thread::sleep(INPUT_POLL_INTERVAL);
-    }
-    writer
-        .join()
-        .map_err(|_| "stdout writer panicked".to_string())?
-}
-
-fn join_request_worker(worker: JoinHandle<Result<(), String>>) -> Result<(), String> {
-    worker
-        .join()
-        .map_err(|_| "request worker panicked".to_string())?
-}
-
 fn classify_output(value: &Value) -> OutputKind {
     match serde_json::from_value::<JsonRpcMessage>(value.clone()) {
         Ok(JsonRpcMessage::Notification(notification)) => match notification.params.get("event") {
@@ -647,7 +715,7 @@ fn send_reserved_output(
     match kind {
         OutputKind::Control => outputs
             .control
-            .send(QueuedOutput {
+            .blocking_send(QueuedOutput {
                 order,
                 to_order: order,
                 message,
@@ -663,7 +731,7 @@ fn send_reserved_output(
             }),
         OutputKind::ReliableEvent => outputs
             .event
-            .send(QueuedOutput {
+            .blocking_send(QueuedOutput {
                 order,
                 to_order: order,
                 message,
@@ -697,15 +765,16 @@ fn try_send_event(
             outputs.order_state.enqueue(order);
             Ok(OutputSendStatus::Enqueued)
         }
-        Err(TrySendError::Full(output)) => record_event_gap(outputs, &output.message, order)
-            .map_or_else(
+        Err(mpsc::error::TrySendError::Full(output)) => {
+            record_event_gap(outputs, &output.message, order).map_or_else(
                 |error| {
                     outputs.order_state.complete(order);
                     Err(error)
                 },
                 |()| Ok(OutputSendStatus::EventDropped),
-            ),
-        Err(TrySendError::Disconnected(_)) => {
+            )
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
             outputs.order_state.complete(order);
             cancellation.request_execution_stop();
             Err("stdout transport unavailable".to_string())
@@ -767,7 +836,7 @@ fn enqueue_pending_event_gap(
     pending: PendingEventGap,
     message: Value,
 ) -> Result<(), String> {
-    match outputs.control.send(QueuedOutput {
+    match outputs.control.blocking_send(QueuedOutput {
         order: pending.from_order,
         to_order: pending.to_order,
         message,
@@ -847,10 +916,10 @@ fn record_event_gap(outputs: &OutputChannels, message: &Value, order: u64) -> Re
     Ok(())
 }
 
-/// 按发送顺序从两个有界队列取出一条 frame，避免 progress 被后续 control 越过。
-fn next_output(
-    control_rx: &Receiver<QueuedOutput>,
-    event_rx: &Receiver<QueuedOutput>,
+/// 按发送顺序从两个 Tokio 有界队列取出一条 frame，避免 progress 被后续 control 越过。
+async fn next_output(
+    control_rx: &mut mpsc::Receiver<QueuedOutput>,
+    event_rx: &mut mpsc::Receiver<QueuedOutput>,
     control_open: &mut bool,
     event_open: &mut bool,
     order_state: &OutputOrderCoordinator,
@@ -858,24 +927,30 @@ fn next_output(
 ) -> Option<QueuedOutput> {
     loop {
         if *control_open {
-            match control_rx.try_recv() {
-                Ok(message) => {
-                    pending.insert(message.order, message);
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    *control_open = false;
+            loop {
+                match control_rx.try_recv() {
+                    Ok(message) => {
+                        pending.insert(message.order, message);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        *control_open = false;
+                        break;
+                    }
                 }
             }
         }
         if *event_open {
-            match event_rx.try_recv() {
-                Ok(message) => {
-                    pending.insert(message.order, message);
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    *event_open = false;
+            loop {
+                match event_rx.try_recv() {
+                    Ok(message) => {
+                        pending.insert(message.order, message);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        *event_open = false;
+                        break;
+                    }
                 }
             }
         }
@@ -886,38 +961,28 @@ fn next_output(
         } else if !*control_open && !*event_open {
             return None;
         }
-        let mut received = false;
-        if *control_open {
-            match control_rx.recv_timeout(INPUT_POLL_INTERVAL) {
-                Ok(message) => {
-                    pending.insert(message.order, message);
-                    received = true;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => *control_open = false,
-            }
-        }
-        if *event_open {
-            match event_rx.recv_timeout(INPUT_POLL_INTERVAL) {
-                Ok(message) => {
-                    pending.insert(message.order, message);
-                    received = true;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => *event_open = false,
-            }
-        }
-        if !received && !*control_open && !*event_open {
+        if !*control_open && !*event_open {
             return None;
+        }
+        tokio::select! {
+            biased;
+            message = control_rx.recv(), if *control_open => match message {
+                Some(message) => { pending.insert(message.order, message); }
+                None => *control_open = false,
+            },
+            message = event_rx.recv(), if *event_open => match message {
+                Some(message) => { pending.insert(message.order, message); }
+                None => *event_open = false,
+            },
         }
     }
 }
 
 /// 串行写出控制与事件 frame；真实写入或 flush 失败才触发全局停止。
-fn write_output_queue(
-    control_rx: Receiver<QueuedOutput>,
-    event_rx: Receiver<QueuedOutput>,
-    stdout: &mut impl Write,
+async fn write_output_queue<W: AsyncWrite + Unpin>(
+    control_rx: &mut mpsc::Receiver<QueuedOutput>,
+    event_rx: &mut mpsc::Receiver<QueuedOutput>,
+    stdout: &mut W,
     cancellation: &dyn ExecutionStop,
     order_state: OutputOrderCoordinator,
 ) -> Result<(), String> {
@@ -925,31 +990,37 @@ fn write_output_queue(
     let mut event_open = true;
     let mut pending = BTreeMap::new();
     while let Some(output) = next_output(
-        &control_rx,
-        &event_rx,
+        control_rx,
+        event_rx,
         &mut control_open,
         &mut event_open,
         &order_state,
         &mut pending,
-    ) {
-        if let Err(error) = write_json_line(stdout, &output.message) {
+    )
+    .await
+    {
+        let line = match serde_json::to_vec(&output.message) {
+            Ok(line) => line,
+            Err(error) => {
+                cancellation.request_execution_stop();
+                return Err(format!("failed to serialize response: {error}"));
+            }
+        };
+        if let Err(error) = stdout.write_all(&line).await {
             cancellation.request_execution_stop();
             return Err(format!("failed to write response: {error}"));
         }
-        if let Err(error) = stdout.flush() {
+        if let Err(error) = stdout.write_all(b"\n").await {
+            cancellation.request_execution_stop();
+            return Err(format!("failed to write response: {error}"));
+        }
+        if let Err(error) = stdout.flush().await {
             cancellation.request_execution_stop();
             return Err(format!("failed to flush response: {error}"));
         }
         order_state.acknowledge_written(output.order, output.to_order);
     }
     Ok(())
-}
-
-/// 将一个 JSON-RPC 值严格串行化为一条以换行分隔的 `stdout` 记录。
-fn write_json_line(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut *stdout, value)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    stdout.write_all(b"\n")
 }
 
 fn transport_error_value(id: Option<JsonRpcId>, _error: &AppServerError) -> Value {
@@ -1163,8 +1234,45 @@ fn validate_database_file(path: &Path, allow_missing: bool) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::io;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Barrier};
+    use std::task::{Context, Poll};
+    use std::thread;
+    use tokio::io::AsyncWrite;
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime")
+            .block_on(future)
+    }
+
+    #[derive(Default)]
+    struct VecWriter(Vec<u8>);
+
+    impl AsyncWrite for VecWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.extend_from_slice(buffer);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[derive(Clone, Default)]
     struct CancellationProbe {
@@ -1188,11 +1296,11 @@ mod tests {
         event_capacity: usize,
     ) -> (
         OutputChannels,
-        Receiver<QueuedOutput>,
-        Receiver<QueuedOutput>,
+        mpsc::Receiver<QueuedOutput>,
+        mpsc::Receiver<QueuedOutput>,
     ) {
-        let (control, control_rx) = mpsc::sync_channel(control_capacity);
-        let (event, event_rx) = mpsc::sync_channel(event_capacity);
+        let (control, control_rx) = mpsc::channel(control_capacity);
+        let (event, event_rx) = mpsc::channel(event_capacity);
         (
             OutputChannels {
                 control,
@@ -1370,7 +1478,7 @@ mod tests {
 
     #[test]
     fn control_queue_uses_bounded_backpressure_without_stopping_execution() {
-        let (outputs, control_rx, _event_rx) = test_output_channels(1, 1);
+        let (outputs, mut control_rx, _event_rx) = test_output_channels(1, 1);
         let cancellation = CancellationProbe::default();
         send_output(
             &outputs,
@@ -1380,7 +1488,7 @@ mod tests {
         )
         .expect("first output fits");
 
-        let (attempted_sender, attempted_receiver) = mpsc::channel();
+        let (attempted_sender, attempted_receiver) = std_mpsc::channel();
         let sender_outputs = outputs.clone();
         let sender_cancellation = cancellation.clone();
         let sender = thread::spawn(move || {
@@ -1400,12 +1508,18 @@ mod tests {
         );
         assert_eq!(cancellation.request_count(), 0);
         assert_eq!(
-            control_rx.recv().expect("first control output").message["first"],
+            control_rx
+                .blocking_recv()
+                .expect("first control output")
+                .message["first"],
             true
         );
         sender.join().expect("control sender");
         assert_eq!(
-            control_rx.recv().expect("second control output").message["second"],
+            control_rx
+                .blocking_recv()
+                .expect("second control output")
+                .message["second"],
             true
         );
         assert_eq!(cancellation.request_count(), 0);
@@ -1439,7 +1553,7 @@ mod tests {
 
     #[test]
     fn reliable_state_event_blocks_on_event_queue_without_global_stop() {
-        let (outputs, _control_rx, event_rx) = test_output_channels(1, 1);
+        let (outputs, _control_rx, mut event_rx) = test_output_channels(1, 1);
         let cancellation = CancellationProbe::default();
         send_output(
             &outputs,
@@ -1448,7 +1562,7 @@ mod tests {
             progress_event(1),
         )
         .expect("progress event fits");
-        let (attempted_sender, attempted_receiver) = mpsc::channel();
+        let (attempted_sender, attempted_receiver) = std_mpsc::channel();
         let sender_outputs = outputs.clone();
         let sender_cancellation = cancellation.clone();
         let sender = thread::spawn(move || {
@@ -1467,15 +1581,15 @@ mod tests {
             "state event must apply bounded backpressure"
         );
         assert_eq!(cancellation.request_count(), 0);
-        assert_eq!(event_rx.recv().expect("progress output").order, 0);
+        assert_eq!(event_rx.blocking_recv().expect("progress output").order, 0);
         sender.join().expect("state sender");
-        assert_eq!(event_rx.recv().expect("state output").order, 1);
+        assert_eq!(event_rx.blocking_recv().expect("state output").order, 1);
         assert_eq!(cancellation.request_count(), 0);
     }
 
     #[test]
     fn reverse_enqueue_race_keeps_event_cursor_and_stdout_order_contiguous() {
-        let (outputs, control_rx, event_rx) = test_output_channels(2, 2);
+        let (outputs, mut control_rx, mut event_rx) = test_output_channels(2, 2);
         let cancellation = CancellationProbe::default();
         let first = outputs
             .order_state
@@ -1518,16 +1632,16 @@ mod tests {
         let order_state = outputs.order_state.clone();
         drop(outputs);
 
-        let mut stdout = Vec::new();
-        write_output_queue(
-            control_rx,
-            event_rx,
+        let mut stdout = VecWriter::default();
+        block_on(write_output_queue(
+            &mut control_rx,
+            &mut event_rx,
             &mut stdout,
             &cancellation,
             order_state,
-        )
+        ))
         .expect("writer drains reserved events");
-        let values = String::from_utf8(stdout)
+        let values = String::from_utf8(stdout.0)
             .expect("writer output is UTF-8")
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("JSONL frame"))
@@ -1539,7 +1653,7 @@ mod tests {
 
     #[test]
     fn gap_is_written_before_matching_control_output_when_progress_queue_is_full() {
-        let (outputs, control_rx, event_rx) = test_output_channels(2, 1);
+        let (outputs, mut control_rx, mut event_rx) = test_output_channels(2, 1);
         let cancellation = CancellationProbe::default();
         send_output(
             &outputs,
@@ -1565,16 +1679,16 @@ mod tests {
         let order_state = outputs.order_state.clone();
         drop(outputs);
 
-        let mut stdout = Vec::new();
-        write_output_queue(
-            control_rx,
-            event_rx,
+        let mut stdout = VecWriter::default();
+        block_on(write_output_queue(
+            &mut control_rx,
+            &mut event_rx,
             &mut stdout,
             &cancellation,
             order_state,
-        )
+        ))
         .expect("writer drains both queues");
-        let lines = String::from_utf8(stdout).expect("writer output is UTF-8");
+        let lines = String::from_utf8(stdout.0).expect("writer output is UTF-8");
         let values = lines
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("JSONL frame"))
@@ -1590,7 +1704,7 @@ mod tests {
 
     #[test]
     fn pending_gap_flush_does_not_hold_send_lock_across_control_backpressure() {
-        let (outputs, control_rx, _event_rx) = test_output_channels(1, 1);
+        let (outputs, mut control_rx, _event_rx) = test_output_channels(1, 1);
         let cancellation = CancellationProbe::default();
         send_output(
             &outputs,
@@ -1617,7 +1731,7 @@ mod tests {
             OutputSendStatus::EventDropped
         );
 
-        let (attempted_sender, attempted_receiver) = mpsc::channel();
+        let (attempted_sender, attempted_receiver) = std_mpsc::channel();
         let sender_outputs = outputs.clone();
         let sender_cancellation = cancellation.clone();
         let sender = thread::spawn(move || {
@@ -1637,7 +1751,9 @@ mod tests {
             thread::yield_now();
         }
 
-        control_rx.recv().expect("release occupied control output");
+        control_rx
+            .blocking_recv()
+            .expect("release occupied control output");
         sender
             .join()
             .expect("gap sender")
@@ -1650,19 +1766,30 @@ mod tests {
 
     struct DisconnectedWriter;
 
-    impl Write for DisconnectedWriter {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdout closed"))
+    impl AsyncWrite for DisconnectedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stdout closed",
+            )))
         }
 
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
     #[test]
     fn stdout_writer_disconnect_stops_all_execution() {
-        let (outputs, control_rx, event_rx) = test_output_channels(1, 1);
+        let (outputs, mut control_rx, mut event_rx) = test_output_channels(1, 1);
         let cancellation = CancellationProbe::default();
         send_output(
             &outputs,
@@ -1675,13 +1802,13 @@ mod tests {
         drop(outputs);
 
         let mut stdout = DisconnectedWriter;
-        let error = write_output_queue(
-            control_rx,
-            event_rx,
+        let error = block_on(write_output_queue(
+            &mut control_rx,
+            &mut event_rx,
             &mut stdout,
             &cancellation,
             order_state,
-        )
+        ))
         .expect_err("writer disconnect is transport-fatal");
 
         assert!(error.starts_with("failed to write response:"));
@@ -1693,7 +1820,7 @@ mod tests {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
         let cancellation = server.cancellation_handle();
-        let (outputs, receiver, _event_receiver) = test_output_channels(8, 8);
+        let (outputs, mut receiver, _event_receiver) = test_output_channels(8, 8);
         let payload = parse_json_rpc_payload(
             r#"[
                 {"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}},
@@ -1709,7 +1836,10 @@ mod tests {
 
         dispatch_batch(&mut server, payload, &outputs, &cancellation).expect("dispatch batch");
 
-        let outputs = receiver.try_iter().collect::<Vec<_>>();
+        let mut outputs = Vec::new();
+        while let Ok(output) = receiver.try_recv() {
+            outputs.push(output);
+        }
         assert_eq!(outputs.len(), 1);
         let responses = outputs[0].message.as_array().expect("batch response array");
         assert_eq!(responses.len(), 4);
@@ -1731,7 +1861,7 @@ mod tests {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
         let cancellation = server.cancellation_handle();
-        let (outputs, control_receiver, event_receiver) = test_output_channels(8, 8);
+        let (outputs, mut control_receiver, mut event_receiver) = test_output_channels(8, 8);
         let payload = parse_json_rpc_payload(
             r#"[
                 {"jsonrpc":"2.0","method":"thread/read","params":{}},
@@ -1752,7 +1882,7 @@ mod tests {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
         let cancellation = server.cancellation_handle();
-        let (outputs, control_receiver, event_receiver) = test_output_channels(2, 2);
+        let (outputs, mut control_receiver, mut event_receiver) = test_output_channels(2, 2);
         let payload = parse_json_rpc_payload(
             r#"[
                 {"jsonrpc":"2.0","method":"initialized","id":1,"params":{}},
@@ -1795,7 +1925,7 @@ mod tests {
         let store = SessionStore::open(":memory:").expect("store");
         let mut server = AppServer::new(store, ProviderConfigSnapshot::capture(|_| None));
         let cancellation = server.cancellation_handle();
-        let (outputs, receiver, _event_receiver) = test_output_channels(1, 1);
+        let (outputs, mut receiver, _event_receiver) = test_output_channels(1, 1);
 
         dispatch_batch(
             &mut server,
@@ -1830,38 +1960,54 @@ mod tests {
 
     #[test]
     fn stdout_writer_join_obeys_the_shutdown_deadline() {
-        let (release_sender, release_receiver) = mpsc::channel();
-        let writer = thread::spawn(move || {
-            release_receiver.recv().expect("release writer");
-            Ok(())
-        });
-
-        let error = join_writer_during_shutdown(writer, Instant::now() + Duration::from_millis(20))
-            .expect_err("stalled writer must not outlive the deadline");
-        release_sender.send(()).expect("release detached writer");
+        let error = block_on(async {
+            let (_release_sender, release_receiver) = tokio::sync::oneshot::channel::<()>();
+            let mut writer = tokio::spawn(async move {
+                let _ = release_receiver.await;
+                Ok::<(), String>(())
+            });
+            match tokio::time::timeout(Duration::from_millis(20), &mut writer).await {
+                Err(_) => {
+                    writer.abort();
+                    Err("timed out waiting for stdout writer during shutdown".to_string())
+                }
+                Ok(result) => result
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result),
+            }
+        })
+        .expect_err("stalled writer must not outlive the deadline");
 
         assert_eq!(error, "timed out waiting for stdout writer during shutdown");
     }
 
     #[test]
     fn failed_worker_does_not_drop_other_active_worker_handles() {
-        let failed = thread::spawn(|| Err("worker failed".to_string()));
-        while !failed.is_finished() {
-            thread::yield_now();
-        }
-        let (release_sender, release_receiver) = mpsc::channel();
-        let active = thread::spawn(move || {
-            release_receiver.recv().expect("release active worker");
-            Ok(())
+        block_on(async {
+            let mut workers = JoinSet::<Result<(), String>>::new();
+            workers.spawn(async { Err("worker failed".to_string()) });
+            let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+            workers.spawn(async move {
+                release_receiver.await.expect("release active worker");
+                Ok(())
+            });
+
+            let error = workers
+                .join_next()
+                .await
+                .expect("failed worker result")
+                .expect("failed worker task")
+                .expect_err("failed worker is reported");
+            assert_eq!(error, "worker failed");
+            release_sender.send(()).expect("release active worker");
+            assert_eq!(
+                workers
+                    .join_next()
+                    .await
+                    .expect("active worker result")
+                    .unwrap(),
+                Ok(())
+            );
         });
-        let mut workers = vec![failed, active];
-
-        let error = reap_finished_workers(&mut workers).expect_err("failed worker is reported");
-
-        assert_eq!(error, "worker failed");
-        assert_eq!(workers.len(), 1);
-        release_sender.send(()).expect("release active worker");
-        join_request_workers_during_shutdown(&mut workers, Instant::now() + Duration::from_secs(1))
-            .expect("remaining worker is still tracked");
     }
 }
