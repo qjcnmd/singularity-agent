@@ -16,8 +16,9 @@ use singularity_protocol::{
     EventRecoveryQuery, EventSubscribeParams, InitializeParams, InputItem, ItemEventParams,
     JsonRpcId, JsonRpcMessage, JsonRpcNotification, Method, PermissionProfileName,
     ProviderConfigurationStatus, RpcMethod, Thread, ThreadEventParams, ThreadIdParams,
-    ThreadStartParams, TraceEvent, TraceShowParams, TraceTailParams, Turn, TurnEventParams,
-    TurnIdParams, TurnStartParams, TurnStatus, rpc_methods,
+    ThreadStartParams, TraceEvent, TraceMetric, TraceMetricAvailability,
+    TraceMetricUnavailableReason, TraceMetrics, TraceMetricsParams, TraceShowParams,
+    TraceTailParams, Turn, TurnEventParams, TurnIdParams, TurnStartParams, TurnStatus, rpc_methods,
 };
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
@@ -147,8 +148,10 @@ struct TraceArgs {
 }
 
 #[derive(Debug, Subcommand)]
-// trace 的单事件操作。
+// trace 的子命令操作。
 enum TraceCommand {
+    /// Render server-derived metrics for one run.
+    Metrics { run_id: String },
     /// Show one trace event by id.
     Show { event_id: String },
 }
@@ -286,6 +289,7 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             let mut client = AppServerClient::spawn()?;
             client.initialize()?;
             match args.command {
+                Some(TraceCommand::Metrics { run_id }) => client.trace_metrics(&run_id),
                 Some(TraceCommand::Show { event_id }) => client.trace_show(&event_id),
                 None => {
                     let run_id = args
@@ -667,6 +671,17 @@ impl AppServerClient {
         })?;
         render_trace_event(&reply.result.event);
         Ok(())
+    }
+
+    // 请求并渲染 app-server 派生的 run metrics，不在 CLI 重新聚合 trace。
+    fn trace_metrics(&mut self, run_id: &str) -> Result<(), String> {
+        let reply = self.request::<rpc_methods::TraceMetrics>(&TraceMetricsParams {
+            run_id: run_id.to_string(),
+        })?;
+        if reply.result.metrics.run_id != run_id {
+            return Err("trace metrics response run mismatch".to_string());
+        }
+        render_trace_metrics(&reply.result.metrics)
     }
 
     // 请求并打印当前 pending approval 列表。
@@ -1145,6 +1160,109 @@ fn render_trace_event(event: &TraceEvent) {
         "trace {} {} {}",
         event.event_id, event.component, event.summary
     );
+}
+
+// 先校验完整响应，再输出任何字段，避免畸形结果产生部分成功。
+fn render_trace_metrics(metrics: &TraceMetrics) -> Result<(), String> {
+    for metric in &metrics.metrics {
+        validate_trace_metric(metric)?;
+    }
+
+    println!("trace metrics {}", metrics.run_id);
+    for metric in &metrics.metrics {
+        match &metric.availability {
+            TraceMetricAvailability::Available => {
+                let distribution = metric
+                    .distribution
+                    .as_ref()
+                    .expect("validated available trace metric distribution");
+                println!(
+                    "metric {} available count={} sum={} min={} max={} mean={:.6} p50={} p95={}",
+                    metric.name.as_storage_text(),
+                    distribution.count,
+                    distribution.sum,
+                    distribution.min.expect("validated trace metric min"),
+                    distribution.max.expect("validated trace metric max"),
+                    distribution.mean.expect("validated trace metric mean"),
+                    distribution.p50.expect("validated trace metric p50"),
+                    distribution.p95.expect("validated trace metric p95"),
+                );
+            }
+            TraceMetricAvailability::Unavailable { reason } => {
+                println!(
+                    "metric {} unavailable reason={}",
+                    metric.name.as_storage_text(),
+                    trace_metric_unavailable_reason_text(*reason),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// 校验 availability 与 distribution 的公开一致性及可渲染聚合字段。
+fn validate_trace_metric(metric: &TraceMetric) -> Result<(), String> {
+    let name = metric.name.as_storage_text();
+    match (&metric.availability, metric.distribution.as_ref()) {
+        (TraceMetricAvailability::Available, None) => Err(format!(
+            "invalid trace metrics response: metric {name} is available without distribution"
+        )),
+        (TraceMetricAvailability::Unavailable { .. }, Some(_)) => Err(format!(
+            "invalid trace metrics response: metric {name} is unavailable with distribution"
+        )),
+        (TraceMetricAvailability::Available, Some(distribution)) => {
+            if distribution.count == 0 {
+                return Err(format!(
+                    "invalid trace metrics response: metric {name} distribution has zero count"
+                ));
+            }
+            if distribution.min.is_none() {
+                return Err(format!(
+                    "invalid trace metrics response: metric {name} distribution missing min"
+                ));
+            }
+            if distribution.max.is_none() {
+                return Err(format!(
+                    "invalid trace metrics response: metric {name} distribution missing max"
+                ));
+            }
+            let Some(mean) = distribution.mean else {
+                return Err(format!(
+                    "invalid trace metrics response: metric {name} distribution missing mean"
+                ));
+            };
+            if !mean.is_finite() {
+                return Err(format!(
+                    "invalid trace metrics response: metric {name} distribution has invalid mean"
+                ));
+            }
+            if distribution.p50.is_none() {
+                return Err(format!(
+                    "invalid trace metrics response: metric {name} distribution missing p50"
+                ));
+            }
+            if distribution.p95.is_none() {
+                return Err(format!(
+                    "invalid trace metrics response: metric {name} distribution missing p95"
+                ));
+            }
+            Ok(())
+        }
+        (TraceMetricAvailability::Unavailable { .. }, None) => Ok(()),
+    }
+}
+
+// 将闭集 typed reason 映射为稳定的 storage 文本，不暴露 Debug 或原始响应。
+fn trace_metric_unavailable_reason_text(reason: TraceMetricUnavailableReason) -> &'static str {
+    match reason {
+        TraceMetricUnavailableReason::NoProducer => "no_producer",
+        TraceMetricUnavailableReason::LegacyOnly => "legacy_only",
+        TraceMetricUnavailableReason::IncompleteStartEnd => "incomplete_start_end",
+        TraceMetricUnavailableReason::NonStreamingTtft => "non_streaming_ttft",
+        TraceMetricUnavailableReason::MissingTrueTiming => "missing_true_timing",
+        TraceMetricUnavailableReason::MissingUsage => "missing_usage",
+        TraceMetricUnavailableReason::MissingMetricValue => "missing_metric_value",
+    }
 }
 
 // 将失败、blocked 或未能安全轮询的 turn 映射为 CLI 错误。

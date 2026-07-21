@@ -170,6 +170,205 @@ fn fake_trace_event(event_id: &str, summary: &str) -> serde_json::Value {
     })
 }
 
+// 构造 trace/metrics 的类型化响应测试数据。
+fn fake_trace_metrics_result(run_id: &str, metrics: serde_json::Value) -> serde_json::Value {
+    json!({
+        "metrics": {
+            "runId": run_id,
+            "metrics": metrics,
+        }
+    })
+}
+
+// 验证 metrics CLI 只请求服务端派生结果，并原样渲染服务端聚合值。
+#[test]
+fn cli_trace_metrics_requests_typed_rpc_and_renders_server_aggregates() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let params_path = temp.path().join("trace-metrics-params.json");
+    let methods_path = temp.path().join("trace-metrics-methods.txt");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .interaction(
+                "trace/metrics",
+                vec![
+                    capture_params(&params_path),
+                    respond(fake_trace_metrics_result(
+                        "run_metrics",
+                        json!([
+                            {
+                                "name": "task_duration_ms",
+                                "availability": {"state": "available"},
+                                "distribution": {
+                                    "count": 7,
+                                    "sum": 987654,
+                                    "min": 13,
+                                    "max": 9999,
+                                    "mean": 123.456789,
+                                    "p50": 321,
+                                    "p95": 9876
+                                }
+                            },
+                            {
+                                "name": "provider_error_count",
+                                "availability": {"state": "available"},
+                                "distribution": {
+                                    "count": 1,
+                                    "sum": 0,
+                                    "min": 0,
+                                    "max": 0,
+                                    "mean": 0.0,
+                                    "p50": 0,
+                                    "p95": 0
+                                }
+                            },
+                            {
+                                "name": "provider_input_tokens",
+                                "availability": {
+                                    "state": "unavailable",
+                                    "reason": "missing_usage"
+                                }
+                            }
+                        ]),
+                    )),
+                ],
+            )
+            .shutdown()
+            .trace_methods_to(&methods_path),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["trace", "metrics", "run_metrics"])
+        .output()
+        .expect("trace metrics cli");
+
+    assert!(output.status.success(), "stderr={}", stderr(&output));
+    let params: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(params_path).expect("trace metrics params"))
+            .expect("trace metrics params json");
+    assert_eq!(params, json!({"runId": "run_metrics"}));
+
+    let methods = std::fs::read_to_string(methods_path).expect("trace metrics methods");
+    assert_eq!(
+        methods,
+        "initialize\ninitialized\nevent/subscribe\ntrace/metrics\nserver/shutdown\n"
+    );
+
+    assert_eq!(
+        stdout(&output),
+        concat!(
+            "trace metrics run_metrics\n",
+            "metric task_duration_ms available count=7 sum=987654 min=13 max=9999 mean=123.456789 p50=321 p95=9876\n",
+            "metric provider_error_count available count=1 sum=0 min=0 max=0 mean=0.000000 p50=0 p95=0\n",
+            "metric provider_input_tokens unavailable reason=missing_usage\n",
+        )
+    );
+}
+
+// 验证 typed metrics 结果必须绑定到 CLI 请求的 run id。
+#[test]
+fn cli_trace_metrics_rejects_response_for_different_run() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let db_path = temp.path().join("sessions.sqlite3");
+    let params_path = temp.path().join("trace-metrics-mismatch-params.json");
+    let methods_path = temp.path().join("trace-metrics-mismatch-methods.txt");
+    let fake_server = FakeAppServer::new(
+        temp.path(),
+        Scenario::new()
+            .initialized()
+            .interaction(
+                "trace/metrics",
+                vec![
+                    capture_params(&params_path),
+                    respond(fake_trace_metrics_result("run_other", json!([]))),
+                ],
+            )
+            .shutdown()
+            .trace_methods_to(&methods_path),
+    );
+
+    let output = cli_with_fake_app_server(&fake_server, &db_path)
+        .args(["trace", "metrics", "run_expected"])
+        .output()
+        .expect("trace metrics mismatch cli");
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "trace metrics response run mismatch\n");
+
+    let params: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(params_path).expect("trace metrics mismatch params"),
+    )
+    .expect("trace metrics mismatch params json");
+    assert_eq!(params, json!({"runId": "run_expected"}));
+
+    let methods = std::fs::read_to_string(methods_path).expect("trace metrics mismatch methods");
+    assert_eq!(
+        methods,
+        "initialize\ninitialized\nevent/subscribe\ntrace/metrics\nserver/shutdown\n"
+    );
+}
+
+// 验证 availability 与 distribution 不一致时 CLI fail closed。
+#[test]
+fn cli_trace_metrics_rejects_malformed_availability_distribution() {
+    for (metric, expected_error) in [
+        (
+            json!({
+                "name": "task_duration_ms",
+                "availability": {"state": "available"}
+            }),
+            "metric task_duration_ms is available without distribution",
+        ),
+        (
+            json!({
+                "name": "provider_input_tokens",
+                "availability": {
+                    "state": "unavailable",
+                    "reason": "missing_usage"
+                },
+                "distribution": {
+                    "count": 1,
+                    "sum": 7,
+                    "min": 7,
+                    "max": 7,
+                    "mean": 7.0,
+                    "p50": 7,
+                    "p95": 7
+                }
+            }),
+            "metric provider_input_tokens is unavailable with distribution",
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let db_path = temp.path().join("sessions.sqlite3");
+        let fake_server = FakeAppServer::new(
+            temp.path(),
+            Scenario::new()
+                .initialized()
+                .respond(
+                    "trace/metrics",
+                    fake_trace_metrics_result("run_metrics", json!([metric])),
+                )
+                .shutdown(),
+        );
+
+        let output = cli_with_fake_app_server(&fake_server, &db_path)
+            .args(["trace", "metrics", "run_metrics"])
+            .output()
+            .expect("malformed trace metrics cli");
+
+        assert!(!output.status.success());
+        assert_eq!(
+            stderr(&output),
+            format!("invalid trace metrics response: {expected_error}\n")
+        );
+        assert!(stdout(&output).is_empty());
+    }
+}
+
 // 确认 CLI 能启动并暴露 app-server 协议模式。
 #[test]
 fn cli_exposes_app_server_protocol_mode_without_direct_core_runtime() {
