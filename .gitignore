@@ -21,3 +21,5 @@ work/
 
 # Windows can accidentally create this reserved device name as a file.
 nul
+# Added by code-review-graph
+.code-review-graph/
