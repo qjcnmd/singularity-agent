@@ -1,6 +1,20 @@
 //! provider 配置分层解析、脱敏状态和服务级配置快照。
+use std::fmt;
 
-use super::*;
+use super::{
+    CHAT_COMPLETIONS_PATH, DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_MAX_TOOLS_PER_REQUEST, DEFAULT_PROVIDER_NAME, ENV_API_KEY, ENV_BASE_URL,
+    ENV_CONTEXT_TOKENS, ENV_MAX_OUTPUT_TOKENS, ENV_MODEL, ENV_PROVIDER,
+    MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS, ModelBlockerKind, ModelError,
+    ModelErrorCategory, ModelErrorKind, ModelProviderConfig, OpenAiProvider, OpenAiProviderConfig,
+    PROJECT_ENV_FILE, PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE, PROVIDER_SNAPSHOT_ID_PREFIX,
+    PROVIDER_TIMEOUT_SECONDS, ProviderApiProtocol, ProviderConfigResolution,
+    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderError,
+    ProviderErrorStage, ProviderProtocolContract, ProviderToolReasoningMode, RESPONSES_PATH,
+    chat_completions_endpoint, validate_provider_config,
+};
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 impl fmt::Debug for ProviderConfigSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

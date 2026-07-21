@@ -1,6 +1,16 @@
 //! 模型请求、响应和 provider capability contract 的本地校验。
 
-use super::*;
+use super::{
+    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelProviderConfig, ModelRole,
+    ModelToolCall, ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
+    ModelValidationResult, OpenAiProviderConfig, ProviderAttemptMetadata,
+    ProviderCapabilityMetadata, ProviderError, ProviderErrorStage, ProviderProtocolContract,
+    REQUIRED_TOOL_CHOICE_MISSING_ERROR, REQUIRED_TOOL_CHOICE_REQUIRES_TOOLS_ERROR,
+    REQUIRED_TOOL_CHOICE_UNSUPPORTED_ERROR, TEXT_TOOL_CALL_ENVELOPE_ERROR, ToolChoiceMode,
+    ToolChoicePolicy,
+};
+use serde_json::Value;
+use std::collections::HashSet;
 
 impl ModelValidationResult {
     /// 构造通过校验且无警告的结果。

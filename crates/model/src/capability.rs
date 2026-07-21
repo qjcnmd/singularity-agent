@@ -1,8 +1,45 @@
 //! provider capability probe、进程内/持久化缓存和脱敏 runtime fingerprint。
+use std::fmt;
 
 use super::openai::OpenAiCompletion;
 use super::transport::{add_provider_attempt_metadata, provider_cancelled_error};
-use super::*;
+use super::{
+    CAPABILITY_PROBE_ALTERNATE_LABEL, CAPABILITY_PROBE_CONTINUATION_REQUEST_ID,
+    CAPABILITY_PROBE_CONTRACT_VERSION, CAPABILITY_PROBE_DEVELOPER_INSTRUCTION,
+    CAPABILITY_PROBE_EXPECTED_LABEL, CAPABILITY_PROBE_EXPECTED_VALUE, CAPABILITY_PROBE_REQUEST_ID,
+    CAPABILITY_PROBE_TOOL_A, CAPABILITY_PROBE_TOOL_B, DEFAULT_MAX_TOOLS_PER_REQUEST,
+    HTTP_STATUS_BAD_REQUEST, HTTP_STATUS_NOT_FOUND, HTTP_STATUS_UNPROCESSABLE_ENTITY,
+    MAX_CONFIGURED_CONTEXT_TOKENS, MAX_CONFIGURED_OUTPUT_TOKENS,
+    MAX_PROVIDER_CAPABILITY_CACHE_BYTES, MAX_PROVIDER_CAPABILITY_CACHE_KEY_LOCK_FILES,
+    MAX_PROVIDER_CAPABILITY_CACHE_RECORDS, ModelError, ModelErrorKind, ModelMessage, ModelRole,
+    ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
+    ModelUsage, OpenAiProvider, OpenAiProviderConfig, PROVIDER_ADAPTER_VERSION,
+    PROVIDER_CANCELLATION_POLL_MS, PROVIDER_CAPABILITY_CACHE_INVALIDATION_DEADLINE_CODE,
+    PROVIDER_CAPABILITY_CACHE_KEY_LOCK_PREFIX, PROVIDER_CAPABILITY_CACHE_KEY_LOCK_SUFFIX,
+    PROVIDER_CAPABILITY_CACHE_LOCK_FILE_NAME, PROVIDER_CAPABILITY_CACHE_LOCK_RETRY_MS,
+    PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION, PROVIDER_CAPABILITY_CACHE_TTL_SECONDS,
+    ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityCacheKey,
+    ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
+    ProviderCapabilityMetadata, ProviderCapabilityProbeKey, ProviderCapabilityProfile,
+    ProviderError, ProviderErrorStage, ProviderProtocolContract, ProviderProtocolNegotiation,
+    ProviderRuntimeFingerprint, ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy,
+    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
+};
+use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt};
+use cap_fs_ext::{OpenOptionsFollowExt, OpenOptionsSyncExt};
+use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
+use singularity_core::{CancellationToken, Timestamp};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 impl ProviderCapabilityProbeKey {
     fn cache_key(&self, api_protocol: ProviderApiProtocol) -> ProviderCapabilityCacheKey {

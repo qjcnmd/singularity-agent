@@ -3,7 +3,15 @@
 use super::contract::{
     message_text, provider_response_validation_error, request_uses_tool_protocol,
 };
-use super::*;
+use super::{
+    CHAT_COMPLETIONS_PATH, ModelError, ModelErrorKind, ModelMessage, ModelRole, ModelToolCall,
+    ModelToolParseStatus, ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus,
+    ModelUsage, OpenAiProviderConfig, ProviderError, ProviderErrorStage, ProviderProtocolContract,
+    ProviderToolReasoningMode, RESPONSES_PATH, ToolChoiceMode, V1_CHAT_COMPLETIONS_PATH,
+    V1_RESPONSES_PATH, validate_model_turn_response,
+};
+use serde_json::Value;
+use serde_json::json;
 
 /// 将基础 URL 解析为兼容 OpenAI 的 Chat Completions 端点。
 pub fn chat_completions_endpoint(base_url: &str) -> String {

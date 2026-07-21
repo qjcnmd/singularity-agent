@@ -5,25 +5,16 @@
 //! 模型提供方协商和校验位于此边界，使 `AgentLoop` 只执行选定模型提供方已声明或探测到的
 //! 请求和 tool call。
 
-use std::collections::{HashMap, HashSet};
-use std::fmt;
+use std::collections::HashMap;
 use std::future::Future;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use cap_fs_ext::{
-    FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt, OpenOptionsSyncExt,
-};
-use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use singularity_core::{CancellationToken, Timestamp};
+use serde_json::Value;
+use singularity_core::CancellationToken;
 use thiserror::Error;
-use uuid::Uuid;
 
 const DEFAULT_MAX_TOOL_CALLS: u32 = 1;
 /// 单次模型请求的默认 tool 数量上限。
@@ -1044,6 +1035,7 @@ mod transport_tests {
     use std::time::Duration;
 
     use super::*;
+    use std::time::Instant;
 
     fn test_provider_config(base_url: String) -> OpenAiProviderConfig {
         OpenAiProviderConfig {
