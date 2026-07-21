@@ -1474,57 +1474,102 @@ impl TraceSpanProjection {
         Ok(())
     }
 
-    /// Compare only start/end attributes that must remain stable for one span.
-    pub fn same_identity_attributes(&self, other: &Self) -> bool {
-        same_if_present(
-            self.finalization_only.as_ref(),
-            other.finalization_only.as_ref(),
-        ) && same_if_present(
-            self.model_turn_ordinal.as_ref(),
-            other.model_turn_ordinal.as_ref(),
-        ) && self.provider_name == other.provider_name
-            && self.model_name == other.model_name
-            && self.protocol == other.protocol
-            && self.operation_phase == other.operation_phase
-            && self.attempt_index == other.attempt_index
-            && self.tool.as_ref().map(|value| {
-                (
-                    value.tool_name.clone(),
-                    value.tool_call_id_digest.clone(),
-                    value.tool_call_ordinal,
+    /// Compare only the kind-specific start/end attributes that remain stable for one span.
+    pub fn same_identity_attributes(&self, kind: TraceSpanKind, other: &Self) -> bool {
+        match kind {
+            TraceSpanKind::Task | TraceSpanKind::Turn => true,
+            TraceSpanKind::PromptAssembly => {
+                same_if_start_known(
+                    self.finalization_only.as_ref(),
+                    other.finalization_only.as_ref(),
+                ) && same_if_start_known(
+                    self.model_turn_ordinal.as_ref(),
+                    other.model_turn_ordinal.as_ref(),
                 )
-            }) == other.tool.as_ref().map(|value| {
-                (
-                    value.tool_name.clone(),
-                    value.tool_call_id_digest.clone(),
-                    value.tool_call_ordinal,
-                )
-            })
-            && same_if_present(
-                self.sandbox
+            }
+            TraceSpanKind::ProviderAttempt => {
+                same_if_start_known(self.provider_name.as_ref(), other.provider_name.as_ref())
+                    && same_if_start_known(self.model_name.as_ref(), other.model_name.as_ref())
+                    && same_if_start_known(self.protocol.as_ref(), other.protocol.as_ref())
+                    && same_if_start_known(
+                        self.operation_phase.as_ref(),
+                        other.operation_phase.as_ref(),
+                    )
+                    && same_if_start_known(
+                        self.attempt_index.as_ref(),
+                        other.attempt_index.as_ref(),
+                    )
+                    && same_if_start_known(self.retry_count.as_ref(), other.retry_count.as_ref())
+            }
+            TraceSpanKind::ToolCall => {
+                self.model_turn_ordinal == other.model_turn_ordinal
+                    && self.tool.as_ref().map(|value| {
+                        (
+                            value.tool_name.as_deref(),
+                            value.tool_call_id_digest.as_deref(),
+                            value.tool_call_ordinal,
+                        )
+                    }) == other.tool.as_ref().map(|value| {
+                        (
+                            value.tool_name.as_deref(),
+                            value.tool_call_id_digest.as_deref(),
+                            value.tool_call_ordinal,
+                        )
+                    })
+            }
+            TraceSpanKind::PolicyDecision => {
+                self.policy
                     .as_ref()
-                    .and_then(|value| value.workspace_mutation.as_ref()),
-                other
-                    .sandbox
+                    .map(|value| (value.operation_count, value.resource_count))
+                    == other
+                        .policy
+                        .as_ref()
+                        .map(|value| (value.operation_count, value.resource_count))
+            }
+            TraceSpanKind::ApprovalWait => {
+                self.approval.as_ref().map(|value| value.request_count)
+                    == other.approval.as_ref().map(|value| value.request_count)
+            }
+            TraceSpanKind::SandboxExecution => {
+                self.sandbox.as_ref().map(|value| {
+                    (
+                        value.command_id_digest.as_deref(),
+                        value.command_id_binding_valid,
+                    )
+                }) == other.sandbox.as_ref().map(|value| {
+                    (
+                        value.command_id_digest.as_deref(),
+                        value.command_id_binding_valid,
+                    )
+                })
+            }
+            TraceSpanKind::Verification => {
+                self.verification
                     .as_ref()
-                    .and_then(|value| value.workspace_mutation.as_ref()),
-            )
-            && same_if_present(
-                self.sandbox
+                    .map(|value| (value.required_command_count, value.occurrence_count))
+                    == other
+                        .verification
+                        .as_ref()
+                        .map(|value| (value.required_command_count, value.occurrence_count))
+            }
+            TraceSpanKind::FinalReview => {
+                self.final_review
                     .as_ref()
-                    .and_then(|value| value.enforcement.as_ref()),
-                other
-                    .sandbox
-                    .as_ref()
-                    .and_then(|value| value.enforcement.as_ref()),
-            )
+                    .map(|value| value.model_turn_ordinal)
+                    == other
+                        .final_review
+                        .as_ref()
+                        .map(|value| value.model_turn_ordinal)
+            }
+        }
     }
 }
 
-fn same_if_present<T: PartialEq + ?Sized>(left: Option<&T>, right: Option<&T>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => left == right,
-        _ => true,
+fn same_if_start_known<T: PartialEq + ?Sized>(start: Option<&T>, end: Option<&T>) -> bool {
+    // Fields absent from Start are not identity facts; End-only values remain observations.
+    match start {
+        Some(start) => end.is_some_and(|end| start == end),
+        None => true,
     }
 }
 

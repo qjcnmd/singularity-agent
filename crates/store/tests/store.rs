@@ -7,10 +7,14 @@ use singularity_policy::{
     PermissionResource, ToolId, WorkspaceRelativePath,
 };
 use singularity_protocol::{
-    ItemKind, ThreadStatus, TraceBindingError, TraceEvent, TraceMetricAvailability,
-    TraceMetricSample, TraceMetricSampleKind, TraceProviderProtocol, TraceSandboxEnforcement,
-    TraceSandboxProjection, TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
-    TraceToolProjection, TraceToolStatus, TraceUsage, TraceWorkspaceMutation, TurnStatus,
+    ItemKind, ThreadStatus, TraceApprovalOutcome, TraceApprovalProjection, TraceBindingError,
+    TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent,
+    TraceFinalReviewProjection, TraceFinalReviewStatus, TraceMetricAvailability, TraceMetricSample,
+    TraceMetricSampleKind, TracePolicyCause, TracePolicyDecision, TracePolicyProjection,
+    TraceProviderOperationPhase, TraceProviderProtocol, TraceSandboxEnforcement,
+    TraceSandboxProjection, TraceSandboxStatus, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
+    TraceSpanStatus, TraceToolProjection, TraceToolStatus, TraceUsage, TraceVerificationProjection,
+    TraceVerificationStatus, TraceWorkspaceMutation, TurnStatus,
 };
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
@@ -3930,6 +3934,571 @@ fn prompt_assembly_start_end_contract_is_closed_and_fail_closed() {
         store
             .append_trace_batch(&[stable_start, stable_end])
             .is_err()
+    );
+}
+
+#[test]
+fn typed_trace_span_identity_rejects_every_stable_mismatch_before_insert() {
+    let assert_rejected = |label: &str,
+                           kind: TraceSpanKind,
+                           start_projection: TraceSpanProjection,
+                           end_projection: TraceSpanProjection| {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let run_id = format!("identity_{label}");
+        let mut start = TraceEvent::new(
+            format!("{label}_start"),
+            run_id.clone(),
+            format!("{label}_session"),
+            "identity",
+            "start",
+        );
+        start.span_id = Some(format!("{label}_span"));
+        start.span_kind = Some(kind);
+        start.span_phase = Some(TraceSpanPhase::Start);
+        start.span_projection = Some(start_projection);
+
+        let mut end = TraceEvent::new(
+            format!("{label}_end"),
+            run_id.clone(),
+            format!("{label}_session"),
+            "identity",
+            "end",
+        );
+        end.span_id = Some(format!("{label}_span"));
+        end.span_kind = Some(kind);
+        end.span_phase = Some(TraceSpanPhase::End);
+        end.span_status = Some(TraceSpanStatus::Ok);
+        end.duration_ms = Some(1);
+        end.span_projection = Some(end_projection);
+
+        assert!(
+            store.append_trace_batch(&[start, end]).is_err(),
+            "accepted stable identity mismatch for {label}"
+        );
+        assert!(matches!(
+            store.list_trace(&run_id),
+            Err(StoreError::NotFound(message)) if message == format!("trace run {run_id}")
+        ));
+    };
+
+    let prompt = |model_turn_ordinal, finalization_only| TraceSpanProjection {
+        model_turn_ordinal: Some(model_turn_ordinal),
+        finalization_only: Some(finalization_only),
+        ..TraceSpanProjection::default()
+    };
+    assert_rejected(
+        "prompt_model_turn",
+        TraceSpanKind::PromptAssembly,
+        prompt(1, false),
+        prompt(2, false),
+    );
+    assert_rejected(
+        "prompt_finalization",
+        TraceSpanKind::PromptAssembly,
+        prompt(1, false),
+        prompt(1, true),
+    );
+
+    let provider = || TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        operation_phase: Some(TraceProviderOperationPhase::Completion),
+        attempt_index: Some(1),
+        retry_count: Some(0),
+        ..TraceSpanProjection::default()
+    };
+    let mut end = provider();
+    end.provider_name = Some("other_provider".to_string());
+    assert_rejected(
+        "provider_name",
+        TraceSpanKind::ProviderAttempt,
+        provider(),
+        end,
+    );
+    let mut end = provider();
+    end.model_name = Some("other_model".to_string());
+    assert_rejected(
+        "model_name",
+        TraceSpanKind::ProviderAttempt,
+        provider(),
+        end,
+    );
+    let mut end = provider();
+    end.protocol = Some(TraceProviderProtocol::OpenAiChatCompletions);
+    assert_rejected("protocol", TraceSpanKind::ProviderAttempt, provider(), end);
+    let mut end = provider();
+    end.operation_phase = Some(TraceProviderOperationPhase::CapabilityProbe);
+    assert_rejected(
+        "operation_phase",
+        TraceSpanKind::ProviderAttempt,
+        provider(),
+        end,
+    );
+    let mut end = provider();
+    end.attempt_index = Some(2);
+    assert_rejected(
+        "attempt_index",
+        TraceSpanKind::ProviderAttempt,
+        provider(),
+        end,
+    );
+    let mut end = provider();
+    end.retry_count = Some(1);
+    assert_rejected(
+        "retry_count",
+        TraceSpanKind::ProviderAttempt,
+        provider(),
+        end,
+    );
+
+    let tool = || TraceSpanProjection {
+        model_turn_ordinal: Some(2),
+        tool: Some(TraceToolProjection {
+            tool_name: Some("command".to_string()),
+            tool_call_id_digest: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+            tool_call_ordinal: Some(1),
+            ..TraceToolProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut end = tool();
+    end.model_turn_ordinal = Some(3);
+    assert_rejected("tool_model_turn", TraceSpanKind::ToolCall, tool(), end);
+    let mut end = tool();
+    end.tool.as_mut().expect("tool identity").tool_name = Some("edit".to_string());
+    assert_rejected("tool_name", TraceSpanKind::ToolCall, tool(), end);
+    let mut end = tool();
+    end.tool
+        .as_mut()
+        .expect("tool identity")
+        .tool_call_id_digest =
+        Some("sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string());
+    assert_rejected("tool_call_id_digest", TraceSpanKind::ToolCall, tool(), end);
+    let mut end = tool();
+    end.tool.as_mut().expect("tool identity").tool_call_ordinal = Some(2);
+    assert_rejected("tool_call_ordinal", TraceSpanKind::ToolCall, tool(), end);
+
+    let policy = || TraceSpanProjection {
+        policy: Some(TracePolicyProjection {
+            operation_count: Some(1),
+            resource_count: Some(2),
+            ..TracePolicyProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut end = policy();
+    end.policy
+        .as_mut()
+        .expect("policy identity")
+        .operation_count = Some(2);
+    assert_rejected(
+        "policy_operation_count",
+        TraceSpanKind::PolicyDecision,
+        policy(),
+        end,
+    );
+    let mut end = policy();
+    end.policy.as_mut().expect("policy identity").resource_count = Some(3);
+    assert_rejected(
+        "policy_resource_count",
+        TraceSpanKind::PolicyDecision,
+        policy(),
+        end,
+    );
+
+    let approval = || TraceSpanProjection {
+        approval: Some(TraceApprovalProjection {
+            request_count: Some(1),
+            ..TraceApprovalProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut end = approval();
+    end.approval
+        .as_mut()
+        .expect("approval identity")
+        .request_count = Some(2);
+    assert_rejected(
+        "approval_request_count",
+        TraceSpanKind::ApprovalWait,
+        approval(),
+        end,
+    );
+
+    let sandbox = || TraceSpanProjection {
+        sandbox: Some(TraceSandboxProjection {
+            command_id_digest: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+            command_id_binding_valid: Some(true),
+            ..TraceSandboxProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut end = sandbox();
+    end.sandbox
+        .as_mut()
+        .expect("sandbox identity")
+        .command_id_digest =
+        Some("sha256:1111111111111111111111111111111111111111111111111111111111111111".to_string());
+    assert_rejected(
+        "sandbox_command_id_digest",
+        TraceSpanKind::SandboxExecution,
+        sandbox(),
+        end,
+    );
+    let mut end = sandbox();
+    end.sandbox
+        .as_mut()
+        .expect("sandbox identity")
+        .command_id_binding_valid = Some(false);
+    assert_rejected(
+        "sandbox_command_binding",
+        TraceSpanKind::SandboxExecution,
+        sandbox(),
+        end,
+    );
+
+    let verification = || TraceSpanProjection {
+        verification: Some(TraceVerificationProjection {
+            required_command_count: Some(1),
+            occurrence_count: Some(1),
+            ..TraceVerificationProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut end = verification();
+    end.verification
+        .as_mut()
+        .expect("verification identity")
+        .required_command_count = Some(2);
+    assert_rejected(
+        "verification_required_count",
+        TraceSpanKind::Verification,
+        verification(),
+        end,
+    );
+    let mut end = verification();
+    end.verification
+        .as_mut()
+        .expect("verification identity")
+        .occurrence_count = Some(2);
+    assert_rejected(
+        "verification_occurrence_count",
+        TraceSpanKind::Verification,
+        verification(),
+        end,
+    );
+
+    let final_review = || TraceSpanProjection {
+        final_review: Some(TraceFinalReviewProjection {
+            model_turn_ordinal: Some(2),
+            ..TraceFinalReviewProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut end = final_review();
+    end.final_review
+        .as_mut()
+        .expect("review identity")
+        .model_turn_ordinal = Some(3);
+    assert_rejected(
+        "final_review_model_turn",
+        TraceSpanKind::FinalReview,
+        final_review(),
+        end,
+    );
+}
+
+#[test]
+fn prompt_identity_rejects_known_start_with_missing_end_before_insert() {
+    let assert_rejected = |label: &str, start_projection: TraceSpanProjection| {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let run_id = format!("prompt_identity_{label}");
+        let mut start = TraceEvent::new(
+            format!("{label}_start"),
+            run_id.clone(),
+            format!("{label}_session"),
+            "identity",
+            "start",
+        );
+        start.span_id = Some(format!("{label}_span"));
+        start.span_kind = Some(TraceSpanKind::PromptAssembly);
+        start.span_phase = Some(TraceSpanPhase::Start);
+        start.span_projection = Some(start_projection);
+
+        let mut end = TraceEvent::new(
+            format!("{label}_end"),
+            run_id.clone(),
+            format!("{label}_session"),
+            "identity",
+            "end",
+        );
+        end.span_id = Some(format!("{label}_span"));
+        end.span_kind = Some(TraceSpanKind::PromptAssembly);
+        end.span_phase = Some(TraceSpanPhase::End);
+        end.span_status = Some(TraceSpanStatus::Ok);
+        end.duration_ms = Some(1);
+        end.span_projection = Some(TraceSpanProjection::default());
+
+        assert!(store.append_trace_batch(&[start, end]).is_err());
+        assert!(matches!(
+            store.list_trace(&run_id),
+            Err(StoreError::NotFound(message)) if message == format!("trace run {run_id}")
+        ));
+    };
+
+    assert_rejected(
+        "model_turn_ordinal",
+        TraceSpanProjection {
+            model_turn_ordinal: Some(2),
+            ..TraceSpanProjection::default()
+        },
+    );
+    assert_rejected(
+        "finalization_only",
+        TraceSpanProjection {
+            finalization_only: Some(false),
+            ..TraceSpanProjection::default()
+        },
+    );
+}
+
+#[test]
+fn typed_trace_span_identity_ignores_terminal_results_and_allows_prompt_unknown_start() {
+    let assert_accepted = |label: &str,
+                           kind: TraceSpanKind,
+                           start_projection: Option<TraceSpanProjection>,
+                           end_projection: TraceSpanProjection| {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+        let run_id = format!("terminal_identity_{label}");
+        let mut start = TraceEvent::new(
+            format!("{label}_start"),
+            run_id.clone(),
+            format!("{label}_session"),
+            "identity",
+            "start",
+        );
+        start.span_id = Some(format!("{label}_span"));
+        start.span_kind = Some(kind);
+        start.span_phase = Some(TraceSpanPhase::Start);
+        start.span_projection = start_projection;
+
+        let mut end = TraceEvent::new(
+            format!("{label}_end"),
+            run_id,
+            format!("{label}_session"),
+            "identity",
+            "end",
+        );
+        end.span_id = Some(format!("{label}_span"));
+        end.span_kind = Some(kind);
+        end.span_phase = Some(TraceSpanPhase::End);
+        end.span_status = Some(TraceSpanStatus::Ok);
+        end.duration_ms = Some(1);
+        end.span_projection = Some(end_projection);
+        store
+            .append_trace_batch(&[start, end])
+            .unwrap_or_else(|error| panic!("terminal fields rejected for {label}: {error}"));
+    };
+
+    assert_accepted(
+        "prompt",
+        TraceSpanKind::PromptAssembly,
+        None,
+        TraceSpanProjection {
+            operation_count: Some(1),
+            message_count: Some(2),
+            tool_count: Some(1),
+            request_token_count: Some(3),
+            request_digest: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+            compacted: Some(true),
+            finalization_only: Some(false),
+            model_turn_ordinal: Some(2),
+            ..TraceSpanProjection::default()
+        },
+    );
+
+    let provider = || TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        operation_phase: Some(TraceProviderOperationPhase::Completion),
+        attempt_index: Some(1),
+        retry_count: Some(0),
+        ..TraceSpanProjection::default()
+    };
+    assert_accepted(
+        "provider",
+        TraceSpanKind::ProviderAttempt,
+        Some(provider()),
+        TraceSpanProjection {
+            queue_duration_ms: Some(2),
+            request_send_to_headers_ms: Some(3),
+            retry_backoff_ms: Some(4),
+            usage: Some(TraceUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cached_input_tokens: 1,
+                reasoning_tokens: 0,
+            }),
+            error: Some(TraceErrorProjection {
+                category: TraceErrorCategory::Network,
+                stage: Some(TraceErrorStage::ResponseStatus),
+                code: Some("provider_unavailable".to_string()),
+            }),
+            ..provider()
+        },
+    );
+
+    let tool = || TraceSpanProjection {
+        model_turn_ordinal: Some(2),
+        tool: Some(TraceToolProjection {
+            tool_name: Some("command".to_string()),
+            tool_call_id_digest: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+            tool_call_ordinal: Some(1),
+            ..TraceToolProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    assert_accepted(
+        "tool",
+        TraceSpanKind::ToolCall,
+        Some(tool()),
+        TraceSpanProjection {
+            tool: Some(TraceToolProjection {
+                status: Some(TraceToolStatus::Failed),
+                ..tool().tool.expect("tool identity")
+            }),
+            ..tool()
+        },
+    );
+
+    let policy = || TraceSpanProjection {
+        policy: Some(TracePolicyProjection {
+            operation_count: Some(1),
+            resource_count: Some(2),
+            ..TracePolicyProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    assert_accepted(
+        "policy",
+        TraceSpanKind::PolicyDecision,
+        Some(policy()),
+        TraceSpanProjection {
+            policy: Some(TracePolicyProjection {
+                decision: Some(TracePolicyDecision::Deny),
+                cause: Some(TracePolicyCause::Explicit),
+                ..policy().policy.expect("policy identity")
+            }),
+            ..policy()
+        },
+    );
+
+    let approval = || TraceSpanProjection {
+        approval: Some(TraceApprovalProjection {
+            request_count: Some(1),
+            ..TraceApprovalProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    assert_accepted(
+        "approval",
+        TraceSpanKind::ApprovalWait,
+        Some(approval()),
+        TraceSpanProjection {
+            approval: Some(TraceApprovalProjection {
+                outcome: Some(TraceApprovalOutcome::Deny),
+                ..approval().approval.expect("approval identity")
+            }),
+            ..approval()
+        },
+    );
+
+    let sandbox = || TraceSpanProjection {
+        sandbox: Some(TraceSandboxProjection {
+            command_id_digest: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+            command_id_binding_valid: Some(true),
+            ..TraceSandboxProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    assert_accepted(
+        "sandbox",
+        TraceSpanKind::SandboxExecution,
+        Some(sandbox()),
+        TraceSpanProjection {
+            sandbox: Some(TraceSandboxProjection {
+                status: Some(TraceSandboxStatus::Error),
+                workspace_mutation: Some(TraceWorkspaceMutation::Changed),
+                enforcement: Some(TraceSandboxEnforcement::Strict),
+                ..sandbox().sandbox.expect("sandbox identity")
+            }),
+            ..sandbox()
+        },
+    );
+
+    let verification = || TraceSpanProjection {
+        verification: Some(TraceVerificationProjection {
+            required_command_count: Some(1),
+            satisfied_command_count: Some(0),
+            occurrence_count: Some(1),
+            ..TraceVerificationProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    assert_accepted(
+        "verification",
+        TraceSpanKind::Verification,
+        Some(verification()),
+        TraceSpanProjection {
+            verification: Some(TraceVerificationProjection {
+                satisfied_command_count: Some(1),
+                status: Some(TraceVerificationStatus::CommandPassed),
+                command_duration_ms: Some(5),
+                ..verification().verification.expect("verification identity")
+            }),
+            ..verification()
+        },
+    );
+
+    let final_review = || TraceSpanProjection {
+        final_review: Some(TraceFinalReviewProjection {
+            model_turn_ordinal: Some(2),
+            ..TraceFinalReviewProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    assert_accepted(
+        "final_review",
+        TraceSpanKind::FinalReview,
+        Some(final_review()),
+        TraceSpanProjection {
+            final_review: Some(TraceFinalReviewProjection {
+                status: Some(TraceFinalReviewStatus::Failed),
+                ..final_review().final_review.expect("review identity")
+            }),
+            ..final_review()
+        },
     );
 }
 

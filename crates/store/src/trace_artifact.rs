@@ -1126,7 +1126,10 @@ pub(crate) fn validate_trace_span_batch(events: &[TraceEvent]) -> StoreResult<()
         ) && (start.parent_span_id != end.parent_span_id
             || start.span_kind != end.span_kind
             || match (&start.span_projection, &end.span_projection) {
-                (Some(start), Some(end)) => !start.same_identity_attributes(end),
+                (Some(start_projection), Some(end_projection)) => match start.span_kind {
+                    Some(kind) => !start_projection.same_identity_attributes(kind, end_projection),
+                    None => true,
+                },
                 (None, None) => false,
                 _ => start.span_kind != Some(TraceSpanKind::PromptAssembly),
             })

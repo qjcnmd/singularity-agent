@@ -8,11 +8,16 @@ use singularity_protocol::{
     EventMetadata, EventRecoveryQuery, EventSubscribeParams, InitializeParams, InitializeResult,
     ItemKind, ItemStatus, JsonRpcBatchItem, JsonRpcId, JsonRpcMessage, JsonRpcPayload,
     METHOD_REGISTRY, Method, MethodKind, ProviderConfigurationStatus, ThreadIdParams,
-    ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceEvent,
-    TraceListParams, TraceMetricSample, TraceMetricSampleKind, TraceMetrics, TraceMetricsParams,
-    TraceMetricsResult, TraceProviderProtocol, TraceSandboxEnforcement, TraceShowParams,
+    ThreadReadParams, ThreadReadResult, ThreadStartParams, ThreadStatus, TraceApprovalOutcome,
+    TraceApprovalProjection, TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent,
+    TraceFinalReviewProjection, TraceFinalReviewStatus, TraceListParams, TraceMetricSample,
+    TraceMetricSampleKind, TraceMetrics, TraceMetricsParams, TraceMetricsResult, TracePolicyCause,
+    TracePolicyDecision, TracePolicyProjection, TraceProviderOperationPhase, TraceProviderProtocol,
+    TraceSandboxEnforcement, TraceSandboxProjection, TraceSandboxStatus, TraceShowParams,
     TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus, TraceTailParams,
-    TraceWorkspaceMutation, TurnIdParams, TurnStartParams, TurnStatus, parse_json_rpc_payload,
+    TraceToolProjection, TraceToolStatus, TraceUsage, TraceVerificationProjection,
+    TraceVerificationStatus, TraceWorkspaceMutation, TurnIdParams, TurnStartParams, TurnStatus,
+    parse_json_rpc_payload,
 };
 
 #[test]
@@ -785,10 +790,10 @@ fn trace_projection_carries_safe_agent_observation_identity_and_sandbox_outcome(
             .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::End)
             .is_ok()
     );
-    assert!(prompt_start.same_identity_attributes(&prompt_end));
+    assert!(prompt_start.same_identity_attributes(TraceSpanKind::PromptAssembly, &prompt_end));
     let mut changed_prompt = prompt_start.clone();
     changed_prompt.model_turn_ordinal = Some(3);
-    assert!(!prompt_start.same_identity_attributes(&changed_prompt));
+    assert!(!prompt_start.same_identity_attributes(TraceSpanKind::PromptAssembly, &changed_prompt));
 
     for projection in [
         TraceSpanProjection {
@@ -929,7 +934,7 @@ fn trace_projection_carries_safe_agent_observation_identity_and_sandbox_outcome(
         enforcement: Some(TraceSandboxEnforcement::Strict),
         ..Default::default()
     });
-    assert!(!sandbox.same_identity_attributes(&changed_sandbox));
+    assert!(sandbox.same_identity_attributes(TraceSpanKind::SandboxExecution, &changed_sandbox));
     assert!(
         TraceSpanProjection {
             request_digest: Some("raw prompt".to_string()),
@@ -938,6 +943,230 @@ fn trace_projection_carries_safe_agent_observation_identity_and_sandbox_outcome(
         .validate_for(TraceSpanKind::PromptAssembly, TraceSpanPhase::Start)
         .is_err()
     );
+}
+
+#[test]
+fn trace_span_identity_is_kind_aware_and_excludes_terminal_results() {
+    let provider_start = TraceSpanProjection {
+        provider_name: Some("provider".to_string()),
+        model_name: Some("model".to_string()),
+        protocol: Some(TraceProviderProtocol::OpenAiResponses),
+        operation_phase: Some(TraceProviderOperationPhase::Completion),
+        attempt_index: Some(1),
+        retry_count: Some(0),
+        ..TraceSpanProjection::default()
+    };
+    let mut provider_end = provider_start.clone();
+    provider_end.queue_duration_ms = Some(2);
+    provider_end.request_send_to_headers_ms = Some(3);
+    provider_end.retry_backoff_ms = Some(4);
+    provider_end.usage = Some(TraceUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        total_tokens: 15,
+        cached_input_tokens: 1,
+        reasoning_tokens: 0,
+    });
+    provider_end.error = Some(TraceErrorProjection {
+        category: TraceErrorCategory::Network,
+        stage: Some(TraceErrorStage::ResponseStatus),
+        code: Some("provider_unavailable".to_string()),
+    });
+    assert!(provider_start.same_identity_attributes(TraceSpanKind::ProviderAttempt, &provider_end));
+
+    let tool_start = TraceSpanProjection {
+        model_turn_ordinal: Some(2),
+        tool: Some(TraceToolProjection {
+            tool_name: Some("command".to_string()),
+            tool_call_id_digest: Some(
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            ),
+            tool_call_ordinal: Some(1),
+            ..TraceToolProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut tool_end = tool_start.clone();
+    tool_end.tool.as_mut().expect("tool identity").status = Some(TraceToolStatus::Succeeded);
+    assert!(tool_start.same_identity_attributes(TraceSpanKind::ToolCall, &tool_end));
+
+    let mut policy_end = TraceSpanProjection {
+        policy: Some(TracePolicyProjection {
+            decision: Some(TracePolicyDecision::Allow),
+            cause: Some(TracePolicyCause::Rule),
+            operation_count: Some(1),
+            resource_count: Some(2),
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let policy_start = policy_end.clone();
+    policy_end.policy.as_mut().expect("policy result").decision = Some(TracePolicyDecision::Deny);
+    policy_end.policy.as_mut().expect("policy result").cause = Some(TracePolicyCause::Explicit);
+    assert!(policy_start.same_identity_attributes(TraceSpanKind::PolicyDecision, &policy_end));
+
+    let approval_start = TraceSpanProjection {
+        approval: Some(TraceApprovalProjection {
+            request_count: Some(1),
+            ..TraceApprovalProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut approval_end = approval_start.clone();
+    approval_end
+        .approval
+        .as_mut()
+        .expect("approval result")
+        .outcome = Some(TraceApprovalOutcome::Allow);
+    assert!(approval_start.same_identity_attributes(TraceSpanKind::ApprovalWait, &approval_end));
+
+    let sandbox_start = TraceSpanProjection {
+        sandbox: Some(TraceSandboxProjection {
+            command_id_digest: Some(
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            ),
+            command_id_binding_valid: Some(true),
+            ..TraceSandboxProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut sandbox_end = sandbox_start.clone();
+    sandbox_end.sandbox = Some(TraceSandboxProjection {
+        command_id_digest: sandbox_start
+            .sandbox
+            .as_ref()
+            .expect("sandbox identity")
+            .command_id_digest
+            .clone(),
+        command_id_binding_valid: Some(true),
+        status: Some(TraceSandboxStatus::Ok),
+        workspace_mutation: Some(TraceWorkspaceMutation::Changed),
+        enforcement: Some(TraceSandboxEnforcement::Strict),
+    });
+    assert!(sandbox_start.same_identity_attributes(TraceSpanKind::SandboxExecution, &sandbox_end));
+
+    let verification_start = TraceSpanProjection {
+        verification: Some(TraceVerificationProjection {
+            required_command_count: Some(1),
+            satisfied_command_count: Some(0),
+            occurrence_count: Some(1),
+            ..TraceVerificationProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut verification_end = verification_start.clone();
+    verification_end.verification = Some(TraceVerificationProjection {
+        required_command_count: Some(1),
+        satisfied_command_count: Some(1),
+        occurrence_count: Some(1),
+        status: Some(TraceVerificationStatus::CommandPassed),
+        command_duration_ms: Some(7),
+    });
+    assert!(
+        verification_start.same_identity_attributes(TraceSpanKind::Verification, &verification_end)
+    );
+
+    let final_review_start = TraceSpanProjection {
+        final_review: Some(TraceFinalReviewProjection {
+            model_turn_ordinal: Some(2),
+            ..TraceFinalReviewProjection::default()
+        }),
+        ..TraceSpanProjection::default()
+    };
+    let mut final_review_end = final_review_start.clone();
+    final_review_end
+        .final_review
+        .as_mut()
+        .expect("review result")
+        .status = Some(TraceFinalReviewStatus::Succeeded);
+    assert!(
+        final_review_start.same_identity_attributes(TraceSpanKind::FinalReview, &final_review_end)
+    );
+
+    let mut changed_provider = provider_start.clone();
+    changed_provider.retry_count = Some(1);
+    assert!(
+        !provider_start.same_identity_attributes(TraceSpanKind::ProviderAttempt, &changed_provider)
+    );
+    let mut changed_policy = policy_start.clone();
+    changed_policy
+        .policy
+        .as_mut()
+        .expect("policy identity")
+        .operation_count = Some(2);
+    assert!(!policy_start.same_identity_attributes(TraceSpanKind::PolicyDecision, &changed_policy));
+    let mut changed_sandbox = sandbox_start.clone();
+    changed_sandbox
+        .sandbox
+        .as_mut()
+        .expect("sandbox identity")
+        .command_id_binding_valid = Some(false);
+    assert!(
+        !sandbox_start.same_identity_attributes(TraceSpanKind::SandboxExecution, &changed_sandbox)
+    );
+    let mut changed_verification = verification_start.clone();
+    changed_verification
+        .verification
+        .as_mut()
+        .expect("verification identity")
+        .occurrence_count = Some(2);
+    assert!(
+        !verification_start
+            .same_identity_attributes(TraceSpanKind::Verification, &changed_verification)
+    );
+    let mut changed_review = final_review_start.clone();
+    changed_review
+        .final_review
+        .as_mut()
+        .expect("review identity")
+        .model_turn_ordinal = Some(3);
+    assert!(
+        !final_review_start.same_identity_attributes(TraceSpanKind::FinalReview, &changed_review)
+    );
+}
+
+#[test]
+fn prompt_identity_requires_end_fields_when_start_identity_is_known() {
+    let cases = [
+        (
+            "model_turn_ordinal",
+            TraceSpanProjection {
+                model_turn_ordinal: Some(2),
+                ..TraceSpanProjection::default()
+            },
+            TraceSpanProjection::default(),
+            TraceSpanProjection::default(),
+            TraceSpanProjection {
+                model_turn_ordinal: Some(2),
+                ..TraceSpanProjection::default()
+            },
+        ),
+        (
+            "finalization_only",
+            TraceSpanProjection {
+                finalization_only: Some(false),
+                ..TraceSpanProjection::default()
+            },
+            TraceSpanProjection::default(),
+            TraceSpanProjection::default(),
+            TraceSpanProjection {
+                finalization_only: Some(false),
+                ..TraceSpanProjection::default()
+            },
+        ),
+    ];
+
+    for (field, known_start, unknown_end, unknown_start, known_end) in cases {
+        assert!(
+            !known_start.same_identity_attributes(TraceSpanKind::PromptAssembly, &unknown_end),
+            "accepted known Start with missing End {field}"
+        );
+        assert!(
+            unknown_start.same_identity_attributes(TraceSpanKind::PromptAssembly, &known_end),
+            "rejected unknown Start with known End {field}"
+        );
+    }
 }
 
 #[test]
