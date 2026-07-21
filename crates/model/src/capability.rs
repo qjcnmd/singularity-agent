@@ -885,7 +885,7 @@ mod windows_file_replace {
 fn sync_cache_directory(parent: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        return std::fs::File::open(parent)?.sync_all();
+        std::fs::File::open(parent)?.sync_all()
     }
     #[cfg(not(unix))]
     {

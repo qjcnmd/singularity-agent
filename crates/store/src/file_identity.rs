@@ -222,7 +222,7 @@ pub(crate) fn open_store_file_at(
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn open_store_file(path: &Path, create: bool) -> StoreResult<File> {
     open_protected_store_file(path, create).map(|protected| protected.file)
 }
@@ -244,10 +244,10 @@ pub(crate) fn checked_store_file_identity(file: &File) -> StoreResult<StoreFileI
                 "store file must not have multiple hard links".to_string(),
             ));
         }
-        return Ok(StoreFileIdentity::Unix {
+        Ok(StoreFileIdentity::Unix {
             device: metadata.dev(),
             inode: metadata.ino(),
-        });
+        })
     }
     #[cfg(windows)]
     {

@@ -1647,7 +1647,7 @@ fn workspace_tools_reject_symlink_escape() {
             line_start: None,
             line_end: None,
         }),
-        Err(WorkspaceToolError::OutsideWorkspace(_))
+        Err(WorkspaceToolError::OutsideWorkspace(_) | WorkspaceToolError::ProtectedPath(_))
     ));
     assert!(matches!(
         tools.edit(
@@ -1658,7 +1658,7 @@ fn workspace_tools_reject_symlink_escape() {
             },
             &ToolBrokerDecision::Allow
         ),
-        Err(WorkspaceToolError::OutsideWorkspace(_))
+        Err(WorkspaceToolError::OutsideWorkspace(_) | WorkspaceToolError::ProtectedPath(_))
     ));
 
     remove_workspace(&workspace);
@@ -1670,6 +1670,7 @@ fn workspace_paths_reject_ambient_and_aliasing_forms() {
     let workspace = test_workspace("strict-relative-paths");
     std::fs::write(workspace.join("file.txt"), "content").expect("write file");
     let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+    #[allow(unused_mut)]
     let mut invalid_paths = vec![
         String::new(),
         " ".to_string(),

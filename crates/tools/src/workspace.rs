@@ -1283,9 +1283,8 @@ impl WorkspaceTools {
         };
         #[cfg(not(windows))]
         let namespace_guard = {
-            // The product backend is explicitly unavailable off Windows today. Still bind the
-            // ambient cwd to the same object so a future platform adapter cannot silently bypass
-            // the workspace capability boundary.
+            // Bind the ambient cwd to the same object so the platform adapter cannot silently
+            // bypass the workspace capability boundary.
             let namespace_guard = bind_workspace_root(&command_path)?;
             let guard_identity = directory_object_identity_key(&namespace_guard)
                 .map_err(|error| map_capability_error(error, &path.display))?;
@@ -1405,6 +1404,7 @@ impl WorkspaceTools {
         }
         #[cfg(not(windows))]
         {
+            let _ = directory;
             Ok(_fallback.to_string())
         }
     }
@@ -1421,6 +1421,7 @@ impl WorkspaceTools {
         }
         #[cfg(not(windows))]
         {
+            let _ = file;
             Ok(_fallback.to_string())
         }
     }

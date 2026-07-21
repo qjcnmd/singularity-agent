@@ -7,7 +7,9 @@ use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
     WorkspaceRelativePath,
 };
-use singularity_protocol::{ItemKind, TraceMetricSampleKind};
+use singularity_protocol::ItemKind;
+#[cfg(windows)]
+use singularity_protocol::TraceMetricSampleKind;
 use singularity_store::{RegisterArtifactRefParams, SessionStore, StoreError};
 #[cfg(windows)]
 use std::collections::VecDeque;
@@ -121,19 +123,11 @@ fn configured_provider_drops_cleanly_inside_app_server_runtime() {
 }
 
 fn expected_eval_blocker_kind() -> &'static str {
-    if cfg!(windows) {
-        "workspace_preparation"
-    } else {
-        "environment"
-    }
+    "workspace_preparation"
 }
 
 fn expected_pre_agent_blocked_stage_statuses() -> (&'static str, &'static str) {
-    if cfg!(windows) {
-        ("blocked", "skipped")
-    } else {
-        ("skipped", "blocked")
-    }
+    ("blocked", "skipped")
 }
 
 fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_json::Value {
@@ -795,9 +789,8 @@ fn app_server_reports_agent_loop_capability_as_available() {
     assert!(provider["modelPresent"].is_boolean());
 }
 
-#[cfg(not(windows))]
 #[test]
-fn app_server_reports_default_agent_loop_backend_as_unavailable_off_windows() {
+fn app_server_reports_default_agent_loop_backend_capability() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
@@ -812,15 +805,8 @@ fn app_server_reports_default_agent_loop_backend_as_unavailable_off_windows() {
         .handle_json(r#"{"jsonrpc":"2.0","method":"agent/capability","id":2,"params":{}}"#)
         .unwrap();
 
-    assert_eq!(capability[0]["result"]["agentLoop"]["available"], false);
-    assert_eq!(capability[0]["result"]["agentLoop"]["status"], "blocked");
-    assert!(
-        capability[0]["result"]["agentLoop"]["blockers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|blocker| blocker == "strict_command_sandbox_unavailable")
-    );
+    assert_eq!(capability[0]["result"]["agentLoop"]["available"], true);
+    assert_eq!(capability[0]["result"]["agentLoop"]["status"], "completed");
 }
 
 #[test]
@@ -1011,9 +997,8 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     );
 }
 
-#[cfg(not(windows))]
 #[test]
-fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() {
+fn app_server_eval_run_fails_closed_before_agent_on_invalid_workspace() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
     let mut server = app_server(store);
@@ -1071,9 +1056,12 @@ fn app_server_eval_run_fails_closed_when_agent_loop_capability_is_unavailable() 
 
     assert_eq!(result["runner"], "agent_loop");
     assert_eq!(result["status"], "blocked");
-    assert_eq!(result["blocker"], "environment");
+    assert_eq!(result["blocker"], "workspace_preparation");
     assert_eq!(result["tasks"][0]["trials"][0]["agent_completed"], false);
-    assert_eq!(result["tasks"][0]["blocker"]["kind"], "environment");
+    assert_eq!(
+        result["tasks"][0]["blocker"]["kind"],
+        "workspace_preparation"
+    );
 }
 
 #[test]

@@ -1896,11 +1896,7 @@ fn assert_immediate_terminal_turn_exits_nonzero(status: &str, agent_loop_status:
 
 // 返回当前平台预期的 AgentLoop 状态。
 fn expected_agent_loop_status() -> &'static str {
-    if cfg!(windows) {
-        "completed"
-    } else {
-        "blocked"
-    }
+    "completed"
 }
 
 // 将测试路径转换为 fake server 可消费的 UTF-8 字符串。

@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use super::file_identity::{checked_store_file_identity, open_store_file};
 use super::*;
 

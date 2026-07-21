@@ -109,10 +109,12 @@ pub use contract::{
 };
 pub use openai::{chat_completions_endpoint, provider_error_response, responses_endpoint};
 
+#[cfg(all(test, windows))]
+use capability::replace_existing_atomic;
 #[cfg(test)]
 use capability::{
     ProviderCapabilityCache, ProviderCapabilityCacheError, capability_probe_metadata,
-    capability_probe_tool_reasoning_error, replace_existing_atomic, sha256_hex,
+    capability_probe_tool_reasoning_error, sha256_hex,
 };
 #[cfg(test)]
 use config::provider_initialization_blocker;
