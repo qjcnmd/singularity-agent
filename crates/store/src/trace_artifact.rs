@@ -27,6 +27,77 @@ impl SessionStore {
         self.append_trace_batch(std::slice::from_ref(event))
     }
 
+    /// Append one trace event, treating an identical event id and payload as an idempotent retry.
+    pub fn append_trace_idempotent(&self, event: &TraceEvent) -> StoreResult<TraceEvent> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let sanitized = sanitize_trace_event(event);
+        validate_public_trace_binding(&transaction, &sanitized)?;
+        validate_trace_batch_input(std::slice::from_ref(&sanitized))?;
+        validate_trace_storage_values(std::slice::from_ref(&sanitized))?;
+
+        let existing = transaction
+            .query_row(
+                "select event_id, run_id, session_id, payload, span_id, parent_span_id,
+                        span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
+                        span_projection, metric_samples
+                 from trace_events where event_id = ?1",
+                params![sanitized.event_id],
+                stored_trace_row,
+            )
+            .optional()?;
+        if let Some(row) = existing {
+            let existing = decode_stored_trace_row(row)?;
+            if existing == sanitized {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            if same_typed_start_identity(&existing, &sanitized) {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::AlreadyExists(format!(
+                "trace event {} has different content",
+                sanitized.event_id
+            )));
+        }
+
+        if sanitized.span_phase == Some(TraceSpanPhase::Start)
+            && let Some(span_id) = sanitized.span_id.as_deref()
+        {
+            let existing = transaction
+                .query_row(
+                    "select event_id, run_id, session_id, payload, span_id, parent_span_id,
+                            span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
+                            span_projection, metric_samples
+                     from trace_events
+                     where run_id = ?1 and span_id = ?2 and span_phase = 'start'",
+                    params![sanitized.run_id, span_id],
+                    stored_trace_row,
+                )
+                .optional()?;
+            if let Some(row) = existing {
+                let existing = decode_stored_trace_row(row)?;
+                if same_typed_start_identity(&existing, &sanitized) {
+                    transaction.commit()?;
+                    return Ok(existing);
+                }
+                return Err(StoreError::AlreadyExists(format!(
+                    "typed trace span {span_id} has different start identity"
+                )));
+            }
+        }
+
+        let mut run_ids = BTreeSet::new();
+        run_ids.insert(sanitized.run_id.clone());
+        let mut all_events = load_trace_events(&transaction, &run_ids)?;
+        all_events.push(sanitized.clone());
+        validate_trace_span_batch(&all_events)?;
+        let stored = Self::insert_trace(&transaction, &sanitized)?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
     /// 先整体验证、再在一个 BEGIN IMMEDIATE 中追加 trace batch。
     pub fn append_trace_batch(&self, events: &[TraceEvent]) -> StoreResult<()> {
         if events.is_empty() {
@@ -190,6 +261,43 @@ impl SessionStore {
         validate_trace_span_batch(&events)?;
         derive_trace_metrics(run_id, &events)
     }
+}
+
+fn same_typed_start_identity(existing: &TraceEvent, incoming: &TraceEvent) -> bool {
+    let Some(kind) = existing.span_kind else {
+        return false;
+    };
+    let existing_projection = existing.span_projection.clone().unwrap_or_default();
+    let incoming_projection = incoming.span_projection.clone().unwrap_or_default();
+    existing.span_phase == Some(TraceSpanPhase::Start)
+        && incoming.span_phase == Some(TraceSpanPhase::Start)
+        && existing.run_id == incoming.run_id
+        && existing.session_id == incoming.session_id
+        && existing.span_id == incoming.span_id
+        && existing.parent_span_id == incoming.parent_span_id
+        && incoming.span_kind == Some(kind)
+        && existing_projection.same_identity_attributes(kind, &incoming_projection)
+}
+
+/// Read one persisted typed span start without creating a second trace source.
+pub(crate) fn find_trace_span_start(
+    connection: &Connection,
+    run_id: &str,
+    session_id: &str,
+    span_kind: TraceSpanKind,
+) -> StoreResult<Option<TraceEvent>> {
+    let row = connection
+        .query_row(
+            "select event_id, run_id, session_id, payload, span_id, parent_span_id,
+                    span_kind, span_phase, span_status, duration_ms, time_to_first_token_ms,
+                    span_projection, metric_samples
+             from trace_events
+             where run_id = ?1 and session_id = ?2 and span_kind = ?3 and span_phase = 'start'",
+            params![run_id, session_id, span_kind.as_storage_text()],
+            stored_trace_row,
+        )
+        .optional()?;
+    row.map(decode_stored_trace_row).transpose()
 }
 
 fn validate_trace_batch_input(events: &[TraceEvent]) -> StoreResult<()> {
@@ -1127,7 +1235,7 @@ pub(crate) fn validate_trace_span_batch(events: &[TraceEvent]) -> StoreResult<()
             || start.span_kind != end.span_kind
             || match (&start.span_projection, &end.span_projection) {
                 (Some(start_projection), Some(end_projection)) => match start.span_kind {
-                    Some(kind) => !start_projection.same_identity_attributes(kind, end_projection),
+                    Some(kind) => !same_trace_span_identity(kind, start_projection, end_projection),
                     None => true,
                 },
                 (None, None) => false,
@@ -1149,6 +1257,26 @@ pub(crate) fn validate_trace_span_batch(events: &[TraceEvent]) -> StoreResult<()
         }
     }
     Ok(())
+}
+
+fn same_trace_span_identity(
+    kind: TraceSpanKind,
+    start: &TraceSpanProjection,
+    end: &TraceSpanProjection,
+) -> bool {
+    if kind != TraceSpanKind::SandboxExecution {
+        return start.same_identity_attributes(kind, end);
+    }
+    let Some(start_sandbox) = start.sandbox.as_ref() else {
+        return false;
+    };
+    let Some(end_sandbox) = end.sandbox.as_ref() else {
+        return false;
+    };
+    start_sandbox.command_id_digest == end_sandbox.command_id_digest
+        && start_sandbox
+            .command_id_binding_valid
+            .is_none_or(|value| Some(value) == end_sandbox.command_id_binding_valid)
 }
 
 // Validate every persisted row and its lifecycle before serving a v12 store.

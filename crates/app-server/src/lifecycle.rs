@@ -1,6 +1,8 @@
 //! AppServer construction, turn supervision, cancellation, and shutdown.
 
 use super::*;
+#[cfg(test)]
+use singularity_agent::AgentTextDeltaCallback;
 
 impl AppServer {
     /// 使用平台沙箱和已捕获的模型提供方配置快照创建未初始化的服务。
@@ -17,6 +19,7 @@ impl AppServer {
             execution_stopped: Arc::new(AtomicBool::new(false)),
             evaluation_cancellation: CancellationToken::new(),
             output_order: OutputOrderCoordinator::new(),
+            pending_transport_trace_binding: None,
         }
     }
 
@@ -58,6 +61,11 @@ impl AppServer {
         self.output_order.clone()
     }
 
+    /// 为唯一 stdout transport 打开独立、身份校验的 SQLite trace 连接。
+    pub fn transport_trace_store(&self) -> AppServerResult<SessionStore> {
+        self.store.trusted_reopen().map_err(Into::into)
+    }
+
     /// 为请求工作线程打开独立的存储连接，同时共享停止和事件订阅状态。
     pub fn turn_worker(&self) -> AppServerResult<Self> {
         Ok(Self {
@@ -72,6 +80,7 @@ impl AppServer {
             execution_stopped: Arc::clone(&self.execution_stopped),
             evaluation_cancellation: self.evaluation_cancellation.clone(),
             output_order: self.output_order.clone(),
+            pending_transport_trace_binding: None,
         })
     }
 
@@ -136,7 +145,14 @@ impl AppServer {
 
     pub(super) fn turn_start(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
         let mut messages = Vec::new();
-        self.handle_turn_start_streaming_values(message, |message| messages.push(message))?;
+        let trace_binding = RefCell::new(None);
+        let result = self.handle_turn_start_streaming_values(
+            message,
+            |binding| *trace_binding.borrow_mut() = Some(binding),
+            |message| messages.push(message),
+        );
+        self.pending_transport_trace_binding = trace_binding.into_inner();
+        result?;
         Ok(messages)
     }
 
@@ -148,15 +164,20 @@ impl AppServer {
     ) -> AppServerResult<()> {
         let coordinator = self.output_order.clone();
         let mut sequencing_error = None;
-        let result = self.handle_turn_start_streaming_values(message, |message| {
-            if sequencing_error.is_some() {
-                return;
-            }
-            match sequence_output(&coordinator, message) {
-                Ok(output) => emit(output),
-                Err(error) => sequencing_error = Some(error),
-            }
-        });
+        let trace_binding = RefCell::new(None);
+        let result = self.handle_turn_start_streaming_values(
+            message,
+            |binding| *trace_binding.borrow_mut() = Some(binding),
+            |message| {
+                if sequencing_error.is_some() {
+                    return;
+                }
+                match sequence_output(&coordinator, message, trace_binding.borrow().clone()) {
+                    Ok(output) => emit(output),
+                    Err(error) => sequencing_error = Some(error),
+                }
+            },
+        );
         if let Some(error) = sequencing_error {
             return Err(error);
         }
@@ -171,18 +192,22 @@ impl AppServer {
     ) -> AppServerResult<()> {
         let coordinator = self.output_order.clone();
         let mut sequencing_error = None;
-        let result = self.handle_turn_start_streaming_values(message, |message| {
-            if sequencing_error.is_some() {
-                return;
-            }
-            match sequence_output(&coordinator, message) {
-                Ok(output) => {
-                    coordinator.complete(output.reservation.order);
-                    emit(output.message);
+        let result = self.handle_turn_start_streaming_values(
+            message,
+            |_| {},
+            |message| {
+                if sequencing_error.is_some() {
+                    return;
                 }
-                Err(error) => sequencing_error = Some(error),
-            }
-        });
+                match sequence_output(&coordinator, message, None) {
+                    Ok(output) => {
+                        coordinator.complete(output.reservation.order);
+                        emit(output.message);
+                    }
+                    Err(error) => sequencing_error = Some(error),
+                }
+            },
+        );
         if let Some(error) = sequencing_error {
             return Err(error);
         }
@@ -193,6 +218,7 @@ impl AppServer {
     pub(super) fn handle_turn_start_streaming_values(
         &mut self,
         message: JsonRpcMessage,
+        mut bind_trace: impl FnMut(TransportTraceBinding),
         mut emit: impl FnMut(Value),
     ) -> AppServerResult<()> {
         if message.method_name() != Some(Method::TurnStart.as_str()) {
@@ -286,6 +312,10 @@ impl AppServer {
             Err(error) => return Err(error.into()),
         };
         let turn = started.turn;
+        bind_trace(TransportTraceBinding::for_turn(
+            turn.thread_id.clone(),
+            turn.turn_id.clone(),
+        ));
         let mut assistant_events =
             AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
         active_turn.start_monitor();
@@ -307,7 +337,6 @@ impl AppServer {
                 );
             }
         }
-        let mut delta_error = None;
         let status = match self.run_agent_loop(
             AgentLoopInvocation {
                 thread: &thread,
@@ -318,14 +347,13 @@ impl AppServer {
                 monitor_control: active_turn.monitor_control(),
             },
             workspace_tools,
-            &mut |delta| {
-                if delta_error.is_some() {
-                    return;
+            &mut |event| match event {
+                AgentLoopEvent::FinalTextDelta { delta } => {
+                    let messages = self.project_assistant_delta(&mut assistant_events, &delta)?;
+                    emit_messages(&mut emit, messages);
+                    Ok(())
                 }
-                match self.project_assistant_delta(&mut assistant_events, delta) {
-                    Ok(messages) => emit_messages(&mut emit, messages),
-                    Err(error) => delta_error = Some(error),
-                }
+                AgentLoopEvent::Observation(_) => Ok(()),
             },
         ) {
             Ok(status) => status,
@@ -344,20 +372,6 @@ impl AppServer {
                 );
             }
         };
-        if let Some(error) = delta_error {
-            let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
-            return self.finish_turn_failure(
-                &mut emit,
-                &turn,
-                Some(&assistant_events),
-                &cancellation,
-                monitor_outcome,
-                monitor_failure_or(
-                    monitor_outcome,
-                    turn_failure_from_error(&error, TurnFailureStage::EventNotification),
-                ),
-            );
-        }
         let approval_events = match self.pending_approval_events_for_turn(&turn.turn_id) {
             Ok(events) => events,
             Err(error) => {
@@ -606,7 +620,7 @@ impl AppServer {
         &self,
         invocation: AgentLoopInvocation<'_>,
         workspace_tools: WorkspaceTools,
-        on_text_delta: &mut AgentTextDeltaCallback<'_>,
+        on_event: &mut dyn FnMut(AgentLoopEvent) -> AppServerResult<()>,
     ) -> AppServerResult<AgentRunStatus> {
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
@@ -621,7 +635,8 @@ impl AppServer {
             provider,
             invocation,
             workspace_tools,
-            on_text_delta,
+            on_event,
+            true,
         ) {
             Err(AppServerError::ProjectInstructions(_)) => Ok(safe_failed_agent_status(
                 SAFE_PROJECT_INSTRUCTIONS_FAILURE,
@@ -640,7 +655,7 @@ impl AppServer {
         &self,
         input: ApprovalResumeInput<'_>,
         context: ApprovalResumeContext<'_>,
-        on_text_delta: &mut AgentTextDeltaCallback<'_>,
+        on_event: &mut dyn FnMut(AgentLoopEvent) -> AppServerResult<()>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>> {
         let ApprovalResumeInput {
             request,
@@ -690,7 +705,8 @@ impl AppServer {
             },
             provider,
             context,
-            on_text_delta,
+            on_event,
+            true,
         )
     }
 
@@ -740,6 +756,13 @@ impl AppServer {
             Some(payload) => decode_pending_approval(request, Some(payload))?,
             None => None,
         };
+        let mut on_event = |event| match event {
+            AgentLoopEvent::FinalTextDelta { delta } => {
+                on_text_delta(&delta);
+                Ok(())
+            }
+            AgentLoopEvent::Observation(_) => Ok(()),
+        };
         self.resume_agent_loop_after_gate_with_monitor(
             ApprovalResumeInput {
                 request,
@@ -754,7 +777,8 @@ impl AppServer {
                 monitor_control: None,
                 prepared_workspace_tools,
             },
-            on_text_delta,
+            &mut on_event,
+            false,
         )
     }
 
@@ -763,7 +787,8 @@ impl AppServer {
         input: ApprovalResumeInput<'_>,
         provider: P,
         context: ApprovalResumeContext<'_>,
-        on_text_delta: &mut AgentTextDeltaCallback<'_>,
+        on_event: &mut dyn FnMut(AgentLoopEvent) -> AppServerResult<()>,
+        project_observability: bool,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
     where
         P: Provider,
@@ -863,14 +888,41 @@ impl AppServer {
                 return Ok(Some((turn.clone(), run_status, Vec::new())));
             }
         };
-        let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(workspace_tools)
-            .with_cancellation_token(context.cancellation.clone())
-            .resume_pending_approval_with_text_deltas(
-                &loop_input,
-                &pending_approval,
-                on_text_delta,
-            );
+        let mut projector = if project_observability {
+            Some(observability::TraceProjector::new(
+                &self.store,
+                &thread.thread_id,
+                &turn.turn_id,
+            )?)
+        } else {
+            None
+        };
+        let mut callback_error = None;
+        let result = {
+            let mut callback = |event: AgentLoopEvent| -> Result<(), AgentLoopEventSinkError> {
+                if callback_error.is_some() {
+                    return Err(AgentLoopEventSinkError);
+                }
+                if let Some(projector) = projector.as_mut()
+                    && let Err(error) = projector.project_event(event.clone())
+                {
+                    callback_error = Some(AppServerError::Store(error));
+                    return Err(AgentLoopEventSinkError);
+                }
+                if let Err(error) = on_event(event) {
+                    callback_error = Some(error);
+                    return Err(AgentLoopEventSinkError);
+                }
+                Ok(())
+            };
+            AgentLoop::new(provider, ToolBroker::new(registry), policy)
+                .with_workspace_tools(workspace_tools)
+                .with_cancellation_token(context.cancellation.clone())
+                .resume_pending_approval_with_events(&loop_input, &pending_approval, &mut callback)
+        };
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
         if monitor_infrastructure_failure(context.monitor_control) {
             return Err(AppServerError::TurnExecution {
                 stage: TurnFailureStage::CancellationMonitor,
@@ -879,6 +931,11 @@ impl AppServer {
         }
         let mut run_status = result.to_run_status();
         sanitize_agent_run_status_error(&mut run_status);
+        if let Some(projector) = projector.as_mut() {
+            projector
+                .project_result(&run_status)
+                .map_err(AppServerError::Store)?;
+        }
         let next_approvals = result.pending_approvals.clone();
         if run_status.audit_events.is_empty()
             && pending_approval.pending_tool_call().tool_name.as_str() == TOOL_COMMAND
@@ -954,11 +1011,19 @@ impl AppServer {
             cancellation,
             monitor_control: None,
         };
+        let mut on_event = |event| match event {
+            AgentLoopEvent::FinalTextDelta { delta } => {
+                on_text_delta(&delta);
+                Ok(())
+            }
+            AgentLoopEvent::Observation(_) => Ok(()),
+        };
         self.run_agent_loop_with_provider_and_tools(
             provider,
             invocation,
             workspace_tools,
-            on_text_delta,
+            &mut on_event,
+            false,
         )
     }
 
@@ -967,7 +1032,8 @@ impl AppServer {
         provider: P,
         invocation: AgentLoopInvocation<'_>,
         workspace_tools: WorkspaceTools,
-        on_text_delta: &mut AgentTextDeltaCallback<'_>,
+        on_event: &mut dyn FnMut(AgentLoopEvent) -> AppServerResult<()>,
+        project_observability: bool,
     ) -> AppServerResult<AgentRunStatus>
     where
         P: Provider,
@@ -985,12 +1051,48 @@ impl AppServer {
             &workspace_root,
             invocation.history,
         )?;
-        let result = AgentLoop::new(provider, ToolBroker::new(registry), policy)
-            .with_workspace_tools(workspace_tools)
-            .with_cancellation_token(invocation.cancellation.clone())
-            .run_with_text_deltas(&loop_input, on_text_delta);
+        let mut projector = if project_observability {
+            Some(observability::TraceProjector::new(
+                &self.store,
+                &invocation.thread.thread_id,
+                invocation.turn_id,
+            )?)
+        } else {
+            None
+        };
+        let mut callback_error = None;
+        let result = {
+            let mut callback = |event: AgentLoopEvent| -> Result<(), AgentLoopEventSinkError> {
+                if callback_error.is_some() {
+                    return Err(AgentLoopEventSinkError);
+                }
+                if let Some(projector) = projector.as_mut()
+                    && let Err(error) = projector.project_event(event.clone())
+                {
+                    callback_error = Some(AppServerError::Store(error));
+                    return Err(AgentLoopEventSinkError);
+                }
+                if let Err(error) = on_event(event) {
+                    callback_error = Some(error);
+                    return Err(AgentLoopEventSinkError);
+                }
+                Ok(())
+            };
+            AgentLoop::new(provider, ToolBroker::new(registry), policy)
+                .with_workspace_tools(workspace_tools)
+                .with_cancellation_token(invocation.cancellation.clone())
+                .run_with_events(&loop_input, &mut callback)
+        };
+        if let Some(error) = callback_error {
+            return Err(error);
+        }
         let mut run_status = result.to_run_status();
         sanitize_agent_run_status_error(&mut run_status);
+        if let Some(projector) = projector.as_mut() {
+            projector
+                .project_result(&run_status)
+                .map_err(AppServerError::Store)?;
+        }
         if monitor_infrastructure_failure(invocation.monitor_control) {
             return Err(AppServerError::TurnExecution {
                 stage: TurnFailureStage::CancellationMonitor,

@@ -27,6 +27,7 @@ impl AppServer {
         &mut self,
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<AppServerOutput>> {
+        self.pending_transport_trace_binding = None;
         let messages = self.handle_unsequenced(message)?;
         self.sequence_outputs(messages)
     }

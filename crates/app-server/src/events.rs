@@ -4,13 +4,14 @@ use super::*;
 
 impl AppServer {
     pub(super) fn sequence_outputs(
-        &self,
+        &mut self,
         messages: Vec<Value>,
     ) -> AppServerResult<Vec<AppServerOutput>> {
+        let trace_binding = self.pending_transport_trace_binding.take();
         let mut outputs: Vec<AppServerOutput> = Vec::with_capacity(messages.len());
         let mut subscription_cursor = None;
         for message in messages {
-            let output = match sequence_output(&self.output_order, message) {
+            let output = match sequence_output(&self.output_order, message, trace_binding.clone()) {
                 Ok(output) => output,
                 Err(error) => {
                     for output in &outputs {

@@ -21,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use singularity_core::CancellationToken;
+use singularity_core::{CancellationToken, Timestamp};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -409,6 +409,8 @@ pub enum ProviderCapabilityCacheLookupResult {
 pub struct ProviderCapabilityCacheObservation {
     pub api_protocol: ProviderApiProtocol,
     pub outcome: ProviderCapabilityCacheLookupResult,
+    /// Unix milliseconds captured at the actual cache lookup boundary.
+    pub observed_at_unix_ms: u64,
     pub model_turn_ordinal: Option<u32>,
     pub parent_occurrence_id: Option<String>,
 }

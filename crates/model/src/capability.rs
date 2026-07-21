@@ -99,6 +99,7 @@ fn cache_observation(
     ProviderCapabilityCacheObservation {
         api_protocol,
         outcome,
+        observed_at_unix_ms: Timestamp::now_utc().unix_ms(),
         model_turn_ordinal: None,
         parent_occurrence_id: None,
     }

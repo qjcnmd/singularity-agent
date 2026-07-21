@@ -202,6 +202,23 @@ impl Timestamp {
     pub fn parse(value: &str) -> Result<Self, time::error::Parse> {
         OffsetDateTime::parse(value, &Rfc3339).map(Self)
     }
+
+    /// Construct an RFC 3339 timestamp from non-negative Unix milliseconds.
+    pub fn from_unix_ms(value: u64) -> Option<Self> {
+        let nanos = i128::from(value).checked_mul(1_000_000)?;
+        OffsetDateTime::from_unix_timestamp_nanos(nanos)
+            .ok()
+            .map(Self)
+    }
+
+    /// Return a non-negative Unix timestamp in milliseconds, saturating at `u64::MAX`.
+    pub fn unix_ms(self) -> u64 {
+        let nanos = self.0.unix_timestamp_nanos();
+        if nanos <= 0 {
+            return 0;
+        }
+        u64::try_from(nanos / 1_000_000).unwrap_or(u64::MAX)
+    }
 }
 
 impl Display for Timestamp {

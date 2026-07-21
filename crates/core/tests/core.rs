@@ -22,6 +22,19 @@ fn client_metadata_and_ids_round_trip_as_json() {
 }
 
 #[test]
+fn timestamp_exposes_bounded_unix_milliseconds() {
+    let timestamp = Timestamp::parse("1970-01-01T00:00:01.234Z").expect("parse timestamp");
+
+    assert_eq!(timestamp.unix_ms(), 1_234);
+    assert_eq!(
+        Timestamp::from_unix_ms(1_234)
+            .expect("timestamp from unix milliseconds")
+            .to_string(),
+        "1970-01-01T00:00:01.234Z"
+    );
+}
+
+#[test]
 fn sensitive_text_detects_common_secret_label_formats() {
     for text in [
         "X-API-Key: abcdefgh",

@@ -12,13 +12,15 @@ use cap_fs_ext::{FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollo
 use cap_std::fs::{Dir as CapabilityDir, OpenOptions as CapabilityOpenOptions};
 use serde_json::Value;
 use singularity_app_server::{
-    AppServer, AppServerCancellationHandle, AppServerError, AppServerOutput, OutputOrderCoordinator,
+    AppServer, AppServerCancellationHandle, AppServerError, AppServerOutput,
+    OutputOrderCoordinator, TransportTraceBinding,
 };
-use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR};
+use singularity_core::{ErrorCode, JSON_RPC_INTERNAL_ERROR, Timestamp};
 use singularity_model::{PROVIDER_CAPABILITY_CACHE_FILE_NAME, ProviderConfigSnapshot};
 use singularity_protocol::{
     EventClass, EventDelivery, EventGap, EventGapReason, EventMetadata, JsonRpcBatchItem,
-    JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, parse_json_rpc_payload,
+    JsonRpcId, JsonRpcMessage, JsonRpcPayload, Method, TraceEvent, TraceMetricSample,
+    TraceMetricSampleKind, parse_json_rpc_payload,
 };
 use singularity_store::SessionStore;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -44,6 +46,44 @@ struct OutputChannels {
     pending_event_gap: Arc<Mutex<Option<PendingEventGap>>>,
     send_lock: Arc<Mutex<()>>,
     order_state: OutputOrderCoordinator,
+    trace_sink: Option<TransportTraceSink>,
+}
+
+#[derive(Clone)]
+struct TransportTraceSink {
+    store: Arc<Mutex<SessionStore>>,
+}
+
+impl TransportTraceSink {
+    fn new(store: SessionStore) -> Self {
+        Self {
+            store: Arc::new(Mutex::new(store)),
+        }
+    }
+
+    fn append(
+        &self,
+        binding: &TransportTraceBinding,
+        event_id: String,
+        summary: &str,
+        kind: TraceMetricSampleKind,
+    ) -> Result<(), String> {
+        let mut event = TraceEvent::for_turn(
+            event_id,
+            binding.thread_id.clone(),
+            binding.turn_id.clone(),
+            "transport",
+            summary,
+        );
+        event.timestamp = Some(Timestamp::now_utc().to_string());
+        event.payload = serde_json::json!({"observation": "stdio_transport"});
+        event.metric_samples = vec![TraceMetricSample { kind, count: 1 }];
+        self.store
+            .lock()
+            .map_err(|_| "transport trace store poisoned".to_string())?
+            .append_trace(&event)
+            .map_err(|error| format!("transport trace persistence failed: {error}"))
+    }
 }
 
 #[derive(Debug)]
@@ -51,14 +91,16 @@ struct QueuedOutput {
     order: u64,
     to_order: u64,
     message: Value,
+    trace_binding: Option<TransportTraceBinding>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingEventGap {
     from_cursor: u64,
     to_cursor: u64,
     from_order: u64,
     to_order: u64,
+    trace_binding: Option<TransportTraceBinding>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +136,11 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
     .await
     .map_err(|error| format!("app-server startup task failed: {error}"))??;
     let cancellation = server.cancellation_handle();
+    let trace_sink = TransportTraceSink::new(
+        server
+            .transport_trace_store()
+            .map_err(|error| format!("failed to open transport trace store: {error}"))?,
+    );
     let (control_tx, mut control_rx) = mpsc::channel::<QueuedOutput>(CONTROL_QUEUE_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel::<QueuedOutput>(EVENT_QUEUE_CAPACITY);
     let outputs = OutputChannels {
@@ -102,9 +149,11 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
         pending_event_gap: Arc::new(Mutex::new(None)),
         send_lock: Arc::new(Mutex::new(())),
         order_state: server.output_order_coordinator(),
+        trace_sink: Some(trace_sink),
     };
     let writer_cancellation = cancellation.clone();
     let writer_order_state = outputs.order_state.clone();
+    let writer_trace_sink = outputs.trace_sink.clone();
     let mut writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         write_output_queue(
@@ -113,6 +162,7 @@ pub(super) async fn run(runtime_handle: tokio::runtime::Handle) -> Result<(), St
             &mut stdout,
             &writer_cancellation,
             writer_order_state,
+            writer_trace_sink,
         )
         .await
     });
@@ -597,6 +647,7 @@ fn run_request_worker(
                     &cancellation,
                     output.reservation.order,
                     output.message,
+                    output.trace_binding,
                 )
             {
                 output_error = Some(error);
@@ -667,7 +718,7 @@ fn send_output(
         .reserve(false)
         .map_err(|error| error.to_string())?
         .order;
-    send_reserved_output(outputs, cancellation, order, message)
+    send_reserved_output(outputs, cancellation, order, message, None)
 }
 
 fn send_app_server_outputs(
@@ -681,6 +732,7 @@ fn send_app_server_outputs(
             cancellation,
             output.reservation.order,
             output.message.clone(),
+            output.trace_binding.clone(),
         ) {
             for remaining in &messages[index + 1..] {
                 outputs.order_state.complete(remaining.reservation.order);
@@ -696,11 +748,12 @@ fn send_reserved_output(
     cancellation: &dyn ExecutionStop,
     order: u64,
     message: Value,
+    trace_binding: Option<TransportTraceBinding>,
 ) -> Result<OutputSendStatus, String> {
     let kind = classify_output(&message);
     if kind == OutputKind::Event {
         loop {
-            let pending_gap = {
+            let (pending_gap, send_result) = {
                 let _send_guard = match outputs.send_lock.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
@@ -715,11 +768,32 @@ fn send_reserved_output(
                         return Err(error);
                     }
                 };
-                if pending_gap.is_none() {
-                    return try_send_event(outputs, cancellation, order, message);
-                }
-                pending_gap
+                let send_result = pending_gap.is_none().then(|| {
+                    try_send_event(
+                        outputs,
+                        cancellation,
+                        order,
+                        message.clone(),
+                        trace_binding.clone(),
+                    )
+                });
+                (pending_gap, send_result)
             };
+            if let Some(send_result) = send_result {
+                let status = send_result?;
+                if status == OutputSendStatus::EventDropped {
+                    append_transport_metric(
+                        outputs,
+                        cancellation,
+                        trace_binding.as_ref(),
+                        format!("trace_transport_drop_{order}"),
+                        "best-effort event queue drop",
+                        TraceMetricSampleKind::EventQueueDrop,
+                        true,
+                    )?;
+                }
+                return Ok(status);
+            }
             if let Some((pending, gap_message)) = pending_gap
                 && let Err(error) =
                     enqueue_pending_event_gap(outputs, cancellation, pending, gap_message)
@@ -740,6 +814,7 @@ fn send_reserved_output(
                 order,
                 to_order: order,
                 message,
+                trace_binding,
             })
             .map(|()| OutputSendStatus::Enqueued)
             .map_err(|_| {
@@ -753,6 +828,7 @@ fn send_reserved_output(
                 order,
                 to_order: order,
                 message,
+                trace_binding,
             })
             .map(|()| OutputSendStatus::Enqueued)
             .map_err(|_| {
@@ -770,15 +846,17 @@ fn try_send_event(
     cancellation: &dyn ExecutionStop,
     order: u64,
     message: Value,
+    trace_binding: Option<TransportTraceBinding>,
 ) -> Result<OutputSendStatus, String> {
     match outputs.event.try_send(QueuedOutput {
         order,
         to_order: order,
         message,
+        trace_binding,
     }) {
         Ok(()) => Ok(OutputSendStatus::Enqueued),
         Err(mpsc::error::TrySendError::Full(output)) => {
-            record_event_gap(outputs, &output.message, order).map_or_else(
+            record_event_gap(outputs, &output.message, order, output.trace_binding).map_or_else(
                 |error| {
                     outputs.order_state.complete(order);
                     Err(error)
@@ -803,7 +881,7 @@ fn prepare_pending_event_gap(
         .pending_event_gap
         .lock()
         .map_err(|_| "event gap state poisoned".to_string())?;
-    let Some(pending) = pending_guard.as_ref().copied() else {
+    let Some(pending) = pending_guard.as_ref().cloned() else {
         return Ok(None);
     };
     let gap = EventGap {
@@ -852,6 +930,7 @@ fn enqueue_pending_event_gap(
         order: pending.from_order,
         to_order: pending.to_order,
         message,
+        trace_binding: pending.trace_binding.clone(),
     }) {
         Ok(()) => {}
         Err(_) => {
@@ -862,7 +941,18 @@ fn enqueue_pending_event_gap(
             return Err("stdout transport unavailable".to_string());
         }
     }
-    Ok(())
+    append_transport_metric(
+        outputs,
+        cancellation,
+        pending.trace_binding.as_ref(),
+        format!(
+            "trace_transport_gap_{}_{}",
+            pending.from_order, pending.to_order
+        ),
+        "event gap enqueued",
+        TraceMetricSampleKind::EventGap,
+        true,
+    )
 }
 
 /// 将待发送 gap 放入控制队列，保证它先于同一请求的匹配响应写出。
@@ -884,7 +974,12 @@ fn flush_pending_event_gap(
 }
 
 /// 合并连续丢弃的 progress cursor；state 事件不允许走此路径。
-fn record_event_gap(outputs: &OutputChannels, message: &Value, order: u64) -> Result<(), String> {
+fn record_event_gap(
+    outputs: &OutputChannels,
+    message: &Value,
+    order: u64,
+    trace_binding: Option<TransportTraceBinding>,
+) -> Result<(), String> {
     let metadata = message
         .get("params")
         .and_then(|params| params.get("event"))
@@ -912,11 +1007,13 @@ fn record_event_gap(outputs: &OutputChannels, message: &Value, order: u64) -> Re
                 to_cursor: metadata.cursor,
                 from_order: order,
                 to_order: order,
+                trace_binding: trace_binding.clone(),
             });
         }
         Some(pending)
             if metadata.cursor == pending.to_cursor.saturating_add(1)
-                && order == pending.to_order.saturating_add(1) =>
+                && order == pending.to_order.saturating_add(1)
+                && pending.trace_binding == trace_binding =>
         {
             pending.to_cursor = metadata.cursor;
             pending.to_order = order;
@@ -924,6 +1021,32 @@ fn record_event_gap(outputs: &OutputChannels, message: &Value, order: u64) -> Re
         Some(_) => return Err("non-contiguous dropped progress cursor".to_string()),
     }
     Ok(())
+}
+
+fn append_transport_metric(
+    outputs: &OutputChannels,
+    cancellation: &dyn ExecutionStop,
+    binding: Option<&TransportTraceBinding>,
+    event_id: String,
+    summary: &str,
+    kind: TraceMetricSampleKind,
+    binding_required: bool,
+) -> Result<(), String> {
+    let Some(trace_sink) = outputs.trace_sink.as_ref() else {
+        return Ok(());
+    };
+    let Some(binding) = binding else {
+        if binding_required {
+            cancellation.request_execution_stop();
+            return Err("turn-bound transport observation is missing trace binding".to_string());
+        }
+        return Ok(());
+    };
+    trace_sink
+        .append(binding, event_id, summary, kind)
+        .inspect_err(|_| {
+            cancellation.request_execution_stop();
+        })
 }
 
 /// 将 writer 接收的 frame 与唯一顺序状态提交到同一个 owner 内的短临界步骤。
@@ -1014,6 +1137,7 @@ async fn write_output_queue<W: AsyncWrite + Unpin>(
     stdout: &mut W,
     cancellation: &dyn ExecutionStop,
     order_state: OutputOrderCoordinator,
+    trace_sink: Option<TransportTraceSink>,
 ) -> Result<(), String> {
     let mut control_open = true;
     let mut event_open = true;
@@ -1046,6 +1170,31 @@ async fn write_output_queue<W: AsyncWrite + Unpin>(
         if let Err(error) = stdout.flush().await {
             cancellation.request_execution_stop();
             return Err(format!("failed to flush response: {error}"));
+        }
+        if let (Some(trace_sink), Some(binding)) =
+            (trace_sink.clone(), output.trace_binding.clone())
+        {
+            let order = output.order;
+            let persisted = match tokio::task::spawn_blocking(move || {
+                trace_sink.append(
+                    &binding,
+                    format!("trace_transport_writer_{order}"),
+                    "stdout frame visible",
+                    TraceMetricSampleKind::WriterVisible,
+                )
+            })
+            .await
+            {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    cancellation.request_execution_stop();
+                    return Err(format!("transport trace task failed: {error}"));
+                }
+            };
+            if let Err(error) = persisted {
+                cancellation.request_execution_stop();
+                return Err(error);
+            }
         }
         order_state.acknowledge_written(output.order, output.to_order);
     }
@@ -1328,6 +1477,18 @@ mod tests {
         mpsc::Receiver<QueuedOutput>,
         mpsc::Receiver<QueuedOutput>,
     ) {
+        test_output_channels_with_trace_sink(control_capacity, event_capacity, None)
+    }
+
+    fn test_output_channels_with_trace_sink(
+        control_capacity: usize,
+        event_capacity: usize,
+        trace_sink: Option<TransportTraceSink>,
+    ) -> (
+        OutputChannels,
+        mpsc::Receiver<QueuedOutput>,
+        mpsc::Receiver<QueuedOutput>,
+    ) {
         let (control, control_rx) = mpsc::channel(control_capacity);
         let (event, event_rx) = mpsc::channel(event_capacity);
         (
@@ -1337,10 +1498,48 @@ mod tests {
                 pending_event_gap: Arc::new(Mutex::new(None)),
                 send_lock: Arc::new(Mutex::new(())),
                 order_state: OutputOrderCoordinator::new(),
+                trace_sink,
             },
             control_rx,
             event_rx,
         )
+    }
+
+    fn transport_trace_fixture() -> (
+        tempfile::TempDir,
+        SessionStore,
+        TransportTraceSink,
+        TransportTraceBinding,
+    ) {
+        let directory = tempfile::tempdir().expect("transport trace directory");
+        let store = SessionStore::open(directory.path().join("sessions.sqlite3"))
+            .expect("transport trace store");
+        let thread = store.create_thread(None, None).expect("trace thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "running")
+            .expect("trace turn");
+        let trace_sink = TransportTraceSink::new(
+            store
+                .trusted_reopen()
+                .expect("transport trace store reopen"),
+        );
+        let binding = TransportTraceBinding::for_turn(thread.thread_id, turn.turn_id);
+        (directory, store, trace_sink, binding)
+    }
+
+    fn transport_metric_count(
+        store: &SessionStore,
+        thread_id: &str,
+        kind: TraceMetricSampleKind,
+    ) -> u64 {
+        store
+            .list_trace(thread_id)
+            .expect("transport trace list")
+            .iter()
+            .flat_map(|event| event.metric_samples.iter())
+            .filter(|sample| sample.kind == kind)
+            .map(|sample| sample.count)
+            .sum()
     }
 
     fn progress_event(cursor: u64) -> Value {
@@ -1719,6 +1918,7 @@ mod tests {
                 &sender_cancellation,
                 second.order,
                 progress_event(2),
+                None,
             )
             .expect("later event queues first");
             sender_gate.wait();
@@ -1727,6 +1927,7 @@ mod tests {
                 &sender_cancellation,
                 first.order,
                 progress_event(1),
+                None,
             )
             .expect("earlier event queues after the barrier");
         });
@@ -1744,6 +1945,7 @@ mod tests {
             &mut stdout,
             &cancellation,
             order_state,
+            None,
         ))
         .expect("writer drains reserved events");
         let values = String::from_utf8(stdout.0)
@@ -1791,6 +1993,7 @@ mod tests {
             &mut stdout,
             &cancellation,
             order_state,
+            None,
         ))
         .expect("writer drains both queues");
         let lines = String::from_utf8(stdout.0).expect("writer output is UTF-8");
@@ -1805,6 +2008,129 @@ mod tests {
         assert_eq!(values[1]["params"]["event"]["gap"]["toCursor"], 2);
         assert_eq!(values[2]["kind"], "control");
         assert_eq!(cancellation.request_count(), 0);
+    }
+
+    #[test]
+    fn transport_drop_gap_and_writer_visibility_use_the_bound_sqlite_trace() {
+        let (_directory, store, trace_sink, binding) = transport_trace_fixture();
+        let (outputs, mut control_rx, mut event_rx) =
+            test_output_channels_with_trace_sink(2, 1, Some(trace_sink.clone()));
+        let cancellation = CancellationProbe::default();
+        let first = outputs
+            .order_state
+            .reserve(true)
+            .expect("first bound event reservation");
+        let second = outputs
+            .order_state
+            .reserve(true)
+            .expect("second bound event reservation");
+        assert_eq!(
+            send_reserved_output(
+                &outputs,
+                &cancellation,
+                first.order,
+                progress_event(first.event_cursor.expect("first cursor")),
+                Some(binding.clone()),
+            )
+            .expect("first bound progress event"),
+            OutputSendStatus::Enqueued
+        );
+        assert_eq!(
+            send_reserved_output(
+                &outputs,
+                &cancellation,
+                second.order,
+                progress_event(second.event_cursor.expect("second cursor")),
+                Some(binding.clone()),
+            )
+            .expect("second bound progress event drops"),
+            OutputSendStatus::EventDropped
+        );
+        assert_eq!(
+            transport_metric_count(
+                &store,
+                &binding.thread_id,
+                TraceMetricSampleKind::EventQueueDrop,
+            ),
+            1
+        );
+
+        let queued = event_rx.blocking_recv().expect("release progress queue");
+        assert_eq!(queued.trace_binding.as_ref(), Some(&binding));
+        outputs
+            .event
+            .blocking_send(queued)
+            .expect("restore ordered progress output");
+        flush_pending_event_gap(&outputs, &cancellation).expect("bound gap flush");
+        let gap = control_rx.blocking_recv().expect("bound gap output");
+        assert_eq!(gap.trace_binding.as_ref(), Some(&binding));
+        outputs
+            .control
+            .blocking_send(gap)
+            .expect("restore ordered gap output");
+        assert_eq!(
+            transport_metric_count(&store, &binding.thread_id, TraceMetricSampleKind::EventGap,),
+            1
+        );
+
+        let writer_order_state = outputs.order_state.clone();
+        let writer_trace_sink = outputs.trace_sink.clone();
+        drop(outputs);
+        let mut stdout = VecWriter::default();
+        block_on(write_output_queue(
+            &mut control_rx,
+            &mut event_rx,
+            &mut stdout,
+            &cancellation,
+            writer_order_state,
+            writer_trace_sink,
+        ))
+        .expect("bound writer drains outputs");
+        assert_eq!(
+            transport_metric_count(
+                &store,
+                &binding.thread_id,
+                TraceMetricSampleKind::WriterVisible,
+            ),
+            2
+        );
+        assert_eq!(cancellation.request_count(), 0);
+    }
+
+    #[test]
+    fn transport_trace_persistence_failure_stops_execution() {
+        let (_directory, _store, trace_sink, binding) = transport_trace_fixture();
+        let invalid_binding =
+            TransportTraceBinding::for_turn(binding.thread_id, "turn_missing_transport");
+        let (outputs, _control_rx, _event_rx) =
+            test_output_channels_with_trace_sink(1, 1, Some(trace_sink));
+        let cancellation = CancellationProbe::default();
+        let first = outputs
+            .order_state
+            .reserve(true)
+            .expect("first event reservation");
+        let second = outputs
+            .order_state
+            .reserve(true)
+            .expect("second event reservation");
+        send_reserved_output(
+            &outputs,
+            &cancellation,
+            first.order,
+            progress_event(first.event_cursor.expect("first cursor")),
+            Some(invalid_binding.clone()),
+        )
+        .expect("first invalid-bound event only enters queue");
+        let error = send_reserved_output(
+            &outputs,
+            &cancellation,
+            second.order,
+            progress_event(second.event_cursor.expect("second cursor")),
+            Some(invalid_binding),
+        )
+        .expect_err("drop metric persistence must fail closed");
+        assert!(error.starts_with("transport trace persistence failed:"));
+        assert_eq!(cancellation.request_count(), 1);
     }
 
     #[test]
@@ -1913,6 +2239,7 @@ mod tests {
             &mut stdout,
             &cancellation,
             order_state,
+            None,
         ))
         .expect_err("writer disconnect is transport-fatal");
 
@@ -1933,6 +2260,7 @@ mod tests {
                 order: reservation.order,
                 to_order: reservation.order,
                 message: serde_json::json!({"only": true}),
+                trace_binding: None,
             })
             .expect("single frame enters bounded queue");
         // Deliberately leave the reservation in-flight: this is the state observed when a
@@ -1951,6 +2279,7 @@ mod tests {
                     &mut stdout,
                     &cancellation,
                     order_state,
+                    None,
                 ),
             )
             .await

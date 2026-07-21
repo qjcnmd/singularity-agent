@@ -9,7 +9,9 @@ mod dispatch;
 mod evaluation;
 mod events;
 mod lifecycle;
+mod observability;
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -21,9 +23,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopInput, AgentLoopResult,
-    AgentRunStatus, AgentStatus, AgentTextDeltaCallback, ApprovalGrant, PendingApprovalOccurrence,
-    agent_control_tool_entries, project_audit_event,
+    AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopEvent, AgentLoopEventSinkError,
+    AgentLoopInput, AgentLoopResult, AgentRunStatus, AgentStatus, ApprovalGrant,
+    PendingApprovalOccurrence, agent_control_tool_entries, project_audit_event,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, JSON_RPC_INTERNAL_ERROR, ProjectInstructionError,
@@ -441,6 +443,25 @@ fn advance_write_order(state: &mut OutputOrderState) {
     }
 }
 
+/// stdout transport 使用的真实持久化 Turn 绑定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportTraceBinding {
+    /// Store trace 的 run/thread identity。
+    pub thread_id: String,
+    /// Store trace 的 session/turn identity。
+    pub turn_id: String,
+}
+
+impl TransportTraceBinding {
+    /// 从真实持久化 Turn 建立 transport trace 绑定。
+    pub fn for_turn(thread_id: impl Into<String>, turn_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+        }
+    }
+}
+
 /// AppServer 交给 stdout transport 的已排序消息。
 #[derive(Debug, Clone)]
 pub struct AppServerOutput {
@@ -448,6 +469,8 @@ pub struct AppServerOutput {
     pub reservation: OutputReservation,
     /// 脱敏 JSON-RPC wire value。
     pub message: Value,
+    /// 仅由真实 Turn 生产者提供；transport 不从公共 JSON 反推身份。
+    pub trace_binding: Option<TransportTraceBinding>,
 }
 
 /// 协调线程、turn、approval、追踪和工作线程的有状态 JSON-RPC 服务。
@@ -463,6 +486,7 @@ pub struct AppServer {
     execution_stopped: Arc<AtomicBool>,
     evaluation_cancellation: CancellationToken,
     output_order: OutputOrderCoordinator,
+    pending_transport_trace_binding: Option<TransportTraceBinding>,
 }
 
 /// 由请求工作线程与标准输入输出传输层共享的可克隆停止句柄。
@@ -695,6 +719,7 @@ impl Drop for ActiveTurnGuard {
 fn sequence_output(
     coordinator: &OutputOrderCoordinator,
     mut message: Value,
+    trace_binding: Option<TransportTraceBinding>,
 ) -> AppServerResult<AppServerOutput> {
     let is_event = message
         .get("params")
@@ -736,6 +761,7 @@ fn sequence_output(
     Ok(AppServerOutput {
         reservation,
         message,
+        trace_binding,
     })
 }
 
@@ -4793,5 +4819,25 @@ mod tests {
         assert_eq!(status.final_answer.as_deref(), Some("done"));
         assert_eq!(status.tool_calls, 1);
         assert_eq!(status.approval_count, 0);
+    }
+
+    #[test]
+    fn unsequenced_turn_outputs_carry_one_explicit_transport_trace_binding() {
+        let store = SessionStore::open(":memory:").expect("store");
+        let mut server = app_server(store);
+        let binding = TransportTraceBinding::for_turn("thread_trace", "turn_trace");
+        server.pending_transport_trace_binding = Some(binding.clone());
+
+        let outputs = server
+            .sequence_outputs(vec![json!({"jsonrpc": "2.0", "id": 1, "result": {}})])
+            .expect("sequence bound output");
+        assert_eq!(outputs[0].trace_binding.as_ref(), Some(&binding));
+        server.output_order.complete(outputs[0].reservation.order);
+
+        let unbound = server
+            .sequence_outputs(vec![json!({"jsonrpc": "2.0", "id": 2, "result": {}})])
+            .expect("sequence unbound output");
+        assert!(unbound[0].trace_binding.is_none());
+        server.output_order.complete(unbound[0].reservation.order);
     }
 }

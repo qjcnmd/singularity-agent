@@ -314,6 +314,7 @@ fn runtime_negotiation_metadata() -> ProviderCapabilityMetadata {
     metadata.cache_observations = vec![ProviderCapabilityCacheObservation {
         api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
         outcome: ProviderCapabilityCacheLookupResult::Miss,
+        observed_at_unix_ms: 1,
         model_turn_ordinal: None,
         parent_occurrence_id: None,
     }];
@@ -1191,6 +1192,7 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
         cache_observations: vec![ProviderCapabilityCacheObservation {
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             outcome: ProviderCapabilityCacheLookupResult::Miss,
+            observed_at_unix_ms: 2,
             model_turn_ordinal: None,
             parent_occurrence_id: None,
         }],
@@ -1211,6 +1213,7 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
         cache_observations: vec![ProviderCapabilityCacheObservation {
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             outcome: ProviderCapabilityCacheLookupResult::Hit,
+            observed_at_unix_ms: 3,
             model_turn_ordinal: None,
             parent_occurrence_id: None,
         }],
@@ -2586,6 +2589,7 @@ fn approval_pause_resume_matches_uninterrupted_history_and_result_order() {
             cache_observations: vec![ProviderCapabilityCacheObservation {
                 api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
                 outcome: ProviderCapabilityCacheLookupResult::Miss,
+                observed_at_unix_ms: 4,
                 model_turn_ordinal: None,
                 parent_occurrence_id: None,
             }],
@@ -2609,6 +2613,7 @@ fn approval_pause_resume_matches_uninterrupted_history_and_result_order() {
             cache_observations: vec![ProviderCapabilityCacheObservation {
                 api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
                 outcome: ProviderCapabilityCacheLookupResult::Hit,
+                observed_at_unix_ms: 5,
                 model_turn_ordinal: None,
                 parent_occurrence_id: None,
             }],
@@ -6483,6 +6488,7 @@ fn agent_binds_provider_runtime_observations_to_each_prompt_assembly() {
         cache_observations: vec![ProviderCapabilityCacheObservation {
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             outcome: ProviderCapabilityCacheLookupResult::Miss,
+            observed_at_unix_ms: 6,
             model_turn_ordinal: None,
             parent_occurrence_id: None,
         }],
@@ -6508,6 +6514,7 @@ fn agent_binds_provider_runtime_observations_to_each_prompt_assembly() {
         cache_observations: vec![ProviderCapabilityCacheObservation {
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             outcome: ProviderCapabilityCacheLookupResult::Hit,
+            observed_at_unix_ms: 7,
             model_turn_ordinal: None,
             parent_occurrence_id: None,
         }],
@@ -6529,6 +6536,7 @@ fn agent_binds_provider_runtime_observations_to_each_prompt_assembly() {
         cache_observations: vec![ProviderCapabilityCacheObservation {
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             outcome: ProviderCapabilityCacheLookupResult::Hit,
+            observed_at_unix_ms: 8,
             model_turn_ordinal: None,
             parent_occurrence_id: None,
         }],
@@ -6632,6 +6640,7 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
         cache_observations: vec![ProviderCapabilityCacheObservation {
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             outcome: ProviderCapabilityCacheLookupResult::Miss,
+            observed_at_unix_ms: 9,
             model_turn_ordinal: None,
             parent_occurrence_id: None,
         }],
@@ -6662,6 +6671,7 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
         cache_observations: vec![ProviderCapabilityCacheObservation {
             api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
             outcome: ProviderCapabilityCacheLookupResult::Hit,
+            observed_at_unix_ms: 10,
             model_turn_ordinal: None,
             parent_occurrence_id: None,
         }],

@@ -23,7 +23,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use singularity_core::{contains_sensitive_text, is_protected_path};
+use singularity_core::{Timestamp, contains_sensitive_text, is_protected_path};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, CommandScopeDigest,
     PermissionProfileName, PermissionResource, ToolId, WorkspaceRelativePath,
@@ -101,6 +101,7 @@ mod trace_artifact;
 pub use approval::RecordedApprovalDecision;
 pub use connection::{SessionStore, SessionStoreDescriptor, WorkspaceExecutionGuard};
 pub use error::{StoreError, StoreResult};
+pub(crate) use thread_turn::typed_turn_end_trace;
 pub use thread_turn::{
     AllocatedAssistantItemId, AllocatedTurnId, CommitTurnOutcomeParams, CommittedTurnOutcome,
     CreateStartedTurnParams, StartedTurn, ThreadHistoryPage, TurnOutcomeAuthority,
@@ -115,7 +116,8 @@ pub(crate) use connection::WorkspaceExecutionScope;
 pub(crate) use error::{DbEnum, decode_db_enum, unknown_db_enum};
 pub(crate) use file_identity::StoreIdentityGuard;
 pub(crate) use trace_artifact::{
-    validate_trace_span_batch, validate_trace_span_rows, validate_turn_trace_binding,
+    find_trace_span_start, validate_trace_span_batch, validate_trace_span_rows,
+    validate_turn_trace_binding,
 };
 
 #[cfg(test)]

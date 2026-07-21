@@ -7,7 +7,7 @@ use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
     WorkspaceRelativePath,
 };
-use singularity_protocol::ItemKind;
+use singularity_protocol::{ItemKind, TraceMetricSampleKind};
 use singularity_store::{RegisterArtifactRefParams, SessionStore, StoreError};
 #[cfg(windows)]
 use std::collections::VecDeque;
@@ -2147,6 +2147,16 @@ fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_s
             .payload
             .to_string()
             .contains("late completion")
+    );
+    let writer_visible = traces
+        .iter()
+        .flat_map(|trace| trace.metric_samples.iter())
+        .filter(|sample| sample.kind == TraceMetricSampleKind::WriterVisible)
+        .map(|sample| sample.count)
+        .sum::<u64>();
+    assert!(
+        writer_visible > 0,
+        "turn-bound stdout frames were not traced"
     );
 }
 

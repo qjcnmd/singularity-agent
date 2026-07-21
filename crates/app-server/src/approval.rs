@@ -41,7 +41,14 @@ impl AppServer {
         message: JsonRpcMessage,
     ) -> AppServerResult<Vec<Value>> {
         let mut messages = Vec::new();
-        self.handle_approval_decision_streaming_values(message, |message| messages.push(message))?;
+        let trace_binding = RefCell::new(None);
+        let result = self.handle_approval_decision_streaming_values(
+            message,
+            |binding| *trace_binding.borrow_mut() = Some(binding),
+            |message| messages.push(message),
+        );
+        self.pending_transport_trace_binding = trace_binding.into_inner();
+        result?;
         Ok(messages)
     }
 
@@ -53,15 +60,20 @@ impl AppServer {
     ) -> AppServerResult<()> {
         let coordinator = self.output_order.clone();
         let mut sequencing_error = None;
-        let result = self.handle_approval_decision_streaming_values(message, |message| {
-            if sequencing_error.is_some() {
-                return;
-            }
-            match sequence_output(&coordinator, message) {
-                Ok(output) => emit(output),
-                Err(error) => sequencing_error = Some(error),
-            }
-        });
+        let trace_binding = RefCell::new(None);
+        let result = self.handle_approval_decision_streaming_values(
+            message,
+            |binding| *trace_binding.borrow_mut() = Some(binding),
+            |message| {
+                if sequencing_error.is_some() {
+                    return;
+                }
+                match sequence_output(&coordinator, message, trace_binding.borrow().clone()) {
+                    Ok(output) => emit(output),
+                    Err(error) => sequencing_error = Some(error),
+                }
+            },
+        );
         if let Some(error) = sequencing_error {
             return Err(error);
         }
@@ -71,6 +83,7 @@ impl AppServer {
     fn handle_approval_decision_streaming_values(
         &mut self,
         message: JsonRpcMessage,
+        mut bind_trace: impl FnMut(TransportTraceBinding),
         mut emit: impl FnMut(Value),
     ) -> AppServerResult<()> {
         let decision: ApprovalDecision = parse_params(&message)?;
@@ -85,6 +98,10 @@ impl AppServer {
             }
             Err(error) => return Err(error.into()),
         };
+        bind_trace(TransportTraceBinding::for_turn(
+            pending_request.thread_id.clone(),
+            pending_request.turn_id.clone(),
+        ));
         let is_tool_continuation = pending_request.tool_call_id.is_some();
         if is_tool_continuation
             && !self
@@ -233,7 +250,7 @@ impl AppServer {
         }
         let mut assistant_events = continues_execution
             .then(|| AssistantItemEventState::new(SessionStore::allocate_assistant_item_id()));
-        let mut delta_error = None;
+        let mut continuation_event_failed = false;
         let cancellation = active_turn
             .as_ref()
             .map(|(cancellation, _guard)| cancellation.clone())
@@ -256,17 +273,23 @@ impl AppServer {
                         monitor_control,
                         prepared_workspace_tools: continuation_workspace.clone(),
                     },
-                    &mut |delta| {
-                        if delta_error.is_some() {
-                            return;
+                    &mut |event| match event {
+                        AgentLoopEvent::FinalTextDelta { delta } => {
+                            let Some(assistant_events) = assistant_events.as_mut() else {
+                                return Ok(());
+                            };
+                            let messages =
+                                match self.project_assistant_delta(assistant_events, &delta) {
+                                    Ok(messages) => messages,
+                                    Err(error) => {
+                                        continuation_event_failed = true;
+                                        return Err(error);
+                                    }
+                                };
+                            emit_messages(&mut emit, messages);
+                            Ok(())
                         }
-                        let Some(assistant_events) = assistant_events.as_mut() else {
-                            return;
-                        };
-                        match self.project_assistant_delta(assistant_events, delta) {
-                            Ok(messages) => emit_messages(&mut emit, messages),
-                            Err(error) => delta_error = Some(error),
-                        }
+                        AgentLoopEvent::Observation(_) => Ok(()),
                     },
                 )?;
                 let terminal = if let Some(resumed) = resumed {
@@ -283,11 +306,6 @@ impl AppServer {
                 };
                 Ok(terminal)
             })()
-        };
-        let continuation_event_failed = delta_error.is_some();
-        let continuation = match delta_error {
-            Some(error) => Err(error),
-            None => continuation,
         };
         let monitor_outcome = active_turn
             .as_mut()

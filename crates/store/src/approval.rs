@@ -21,7 +21,7 @@ pub struct RecordedApprovalDecision {
 impl SessionStore {
     /// 校验绑定后保存一个不带 checkpoint 的 approval 请求。
     pub fn create_approval(&self, request: &ApprovalRequest) -> StoreResult<()> {
-        insert_approval(&self.connection, request)?;
+        self.create_approval_with_trace(request, "approval", "approval requested")?;
         Ok(())
     }
 
@@ -245,21 +245,13 @@ impl SessionStore {
             if existing_request_ids.contains(&request.request_id) {
                 continue;
             }
-            let trace = TraceEvent {
-                task_id: Some(request.turn_id.clone()),
-                payload: serde_json::json!({
-                    "request_id": &request.request_id,
-                    "action": &request.action,
-                    "tool_call_id": &request.tool_call_id,
-                }),
-                ..TraceEvent::for_turn(
-                    format!("trace_{}", request.request_id),
-                    request.thread_id.clone(),
-                    request.turn_id.clone(),
-                    component,
-                    summary,
-                )
-            };
+            let mut trace =
+                typed_approval_wait_start_trace(&transaction, request, component, summary)?;
+            trace.payload = serde_json::json!({
+                "request_id": &request.request_id,
+                "action": &request.action,
+                "tool_call_id": &request.tool_call_id,
+            });
             traces.push(Self::insert_turn_trace(
                 &transaction,
                 &trace,
@@ -291,22 +283,12 @@ impl SessionStore {
         }
         let transaction = self.connection.unchecked_transaction()?;
         insert_approval(&transaction, request)?;
-        let trace = TraceEvent::for_turn(
-            format!("trace_{}", request.request_id),
-            request.thread_id.clone(),
-            request.turn_id.clone(),
-            component,
-            summary,
-        );
-        let trace = TraceEvent {
-            task_id: Some(request.turn_id.clone()),
-            payload: serde_json::json!({
-                "request_id": &request.request_id,
-                "action": &request.action,
-                "tool_call_id": &request.tool_call_id,
-            }),
-            ..trace
-        };
+        let mut trace = typed_approval_wait_start_trace(&transaction, request, component, summary)?;
+        trace.payload = serde_json::json!({
+            "request_id": &request.request_id,
+            "action": &request.action,
+            "tool_call_id": &request.tool_call_id,
+        });
         let trace =
             Self::insert_turn_trace(&transaction, &trace, &request.thread_id, &request.turn_id)?;
         transaction.commit()?;
@@ -780,7 +762,7 @@ impl SessionStore {
                 params![decision.request_id],
             )?;
             if pending_tool_call.is_some() {
-                let terminal_trace = TraceEvent {
+                let mut terminal_trace = TraceEvent {
                     task_id: Some(request.turn_id.clone()),
                     payload: serde_json::json!({
                         "request_id": decision.request_id,
@@ -795,6 +777,13 @@ impl SessionStore {
                         "approval denied",
                     )
                 };
+                let current_turn = self.turn_in_transaction(&transaction, &request.turn_id)?;
+                terminal_trace = typed_turn_end_trace(
+                    &transaction,
+                    &terminal_trace,
+                    &current_turn,
+                    &TurnStatus::Failed,
+                )?;
                 let changed = transaction.execute(
                     "update turns set status = ?1, agent_loop_status = 'failed' where turn_id = ?2 and status = ?3 and agent_loop_status = 'blocked'",
                     params![
@@ -817,22 +806,13 @@ impl SessionStore {
             }
         }
         // 将最终决定与其绑定的 turn trace 一并提交。
-        let trace = TraceEvent::for_turn(
-            format!("trace_{}", decision.decision_id),
-            request.thread_id.clone(),
-            request.turn_id.clone(),
-            component,
-            summary,
-        );
-        let trace = TraceEvent {
-            task_id: Some(request.turn_id.clone()),
-            payload: serde_json::json!({
-                "request_id": decision.request_id,
-                "decision_id": decision.decision_id,
-                "outcome": decision.outcome,
-            }),
-            ..trace
-        };
+        let mut trace =
+            typed_approval_wait_end_trace(&transaction, &request, decision, component, summary)?;
+        trace.payload = serde_json::json!({
+            "request_id": decision.request_id,
+            "decision_id": decision.decision_id,
+            "outcome": decision.outcome,
+        });
         let trace =
             Self::insert_turn_trace(&transaction, &trace, &request.thread_id, &request.turn_id)?;
         let turn = self.turn_in_transaction(&transaction, &request.turn_id)?;
@@ -885,6 +865,110 @@ impl SessionStore {
             &payload,
         )
     }
+}
+
+fn typed_approval_wait_start_trace(
+    transaction: &Transaction<'_>,
+    request: &ApprovalRequest,
+    component: &str,
+    summary: &str,
+) -> StoreResult<TraceEvent> {
+    let turn_start = find_trace_span_start(
+        transaction,
+        &request.thread_id,
+        &request.turn_id,
+        TraceSpanKind::Turn,
+    )?
+    .ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "approval {} is missing its bound typed turn start",
+            request.request_id
+        ))
+    })?;
+    let parent_span_id = turn_start.span_id.ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "approval {} has no typed turn parent identity",
+            request.request_id
+        ))
+    })?;
+    let mut event = TraceEvent::for_turn(
+        format!("trace_{}", request.request_id),
+        request.thread_id.clone(),
+        request.turn_id.clone(),
+        component,
+        summary,
+    );
+    event.timestamp = Some(Timestamp::now_utc().to_string());
+    event.span_id = Some(format!("approval_wait_span_{}", request.request_id));
+    event.parent_span_id = Some(parent_span_id);
+    event.span_kind = Some(TraceSpanKind::ApprovalWait);
+    event.span_phase = Some(TraceSpanPhase::Start);
+    Ok(event)
+}
+
+fn typed_approval_wait_end_trace(
+    transaction: &Transaction<'_>,
+    request: &ApprovalRequest,
+    decision: &ApprovalDecision,
+    component: &str,
+    summary: &str,
+) -> StoreResult<TraceEvent> {
+    let start = find_trace_span_start(
+        transaction,
+        &request.thread_id,
+        &request.turn_id,
+        TraceSpanKind::ApprovalWait,
+    )?
+    .ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "approval {} is missing its persisted typed wait start",
+            request.request_id
+        ))
+    })?;
+    let start_timestamp = start
+        .timestamp
+        .as_deref()
+        .and_then(|timestamp| Timestamp::parse(timestamp).ok())
+        .ok_or_else(|| {
+            StoreError::InvalidState(format!(
+                "approval {} typed wait start has no valid timestamp",
+                request.request_id
+            ))
+        })?;
+    let end_timestamp = Timestamp::now_utc();
+    let duration_ms = end_timestamp
+        .unix_ms()
+        .checked_sub(start_timestamp.unix_ms())
+        .ok_or_else(|| {
+            StoreError::InvalidState(format!(
+                "approval {} typed end timestamp precedes its persisted start",
+                request.request_id
+            ))
+        })?;
+    let span_status = match decision.outcome {
+        ApprovalOutcome::Allow => TraceSpanStatus::Ok,
+        ApprovalOutcome::Deny => TraceSpanStatus::Error,
+        ApprovalOutcome::Defer => {
+            return Err(StoreError::InvalidState(
+                "deferred approval must keep its wait span open".to_string(),
+            ));
+        }
+    };
+    let mut event = TraceEvent::for_turn(
+        format!("trace_{}", decision.decision_id),
+        request.thread_id.clone(),
+        request.turn_id.clone(),
+        component,
+        summary,
+    );
+    event.timestamp = Some(end_timestamp.to_string());
+    event.span_id = start.span_id;
+    event.parent_span_id = start.parent_span_id;
+    event.span_kind = Some(TraceSpanKind::ApprovalWait);
+    event.span_phase = Some(TraceSpanPhase::End);
+    event.span_status = Some(span_status);
+    event.duration_ms = Some(duration_ms);
+    Ok(event)
 }
 
 pub(crate) fn decode_final_approval_outcome(value: &str) -> StoreResult<ApprovalOutcome> {

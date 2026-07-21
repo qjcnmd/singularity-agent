@@ -32,6 +32,174 @@ fn workspace_resource(value: &str) -> PermissionResource {
     )
 }
 
+#[test]
+fn typed_turn_start_is_atomic_and_duplicate_start_is_idempotent() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let started = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "hello"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("started turn");
+
+    assert_eq!(started.2.span_kind, Some(TraceSpanKind::Turn));
+    assert_eq!(started.2.span_phase, Some(TraceSpanPhase::Start));
+    assert!(started.2.timestamp.is_some());
+    assert_eq!(
+        store
+            .append_trace_idempotent(&started.2)
+            .expect("duplicate start is idempotent"),
+        started.2
+    );
+    let mut resumed_start = started.2.clone();
+    resumed_start.timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    assert_eq!(
+        store
+            .append_trace_idempotent(&resumed_start)
+            .expect("same occurrence start is idempotent across resume"),
+        started.2
+    );
+    assert_eq!(
+        store
+            .list_trace(&thread.thread_id)
+            .expect("trace list")
+            .iter()
+            .filter(|event| event.span_kind == Some(TraceSpanKind::Turn))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn typed_turn_end_recovers_persisted_start_after_sqlite_reopen() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _, start) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "hello"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("started turn");
+    drop(store);
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let terminal = TraceEvent::for_turn(
+        "trace_terminal_failure",
+        &thread.thread_id,
+        &turn.turn_id,
+        "agent_loop",
+        "terminal failure",
+    );
+    store
+        .commit_turn_outcome(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Failed,
+                agent_loop_status: "failed",
+                assistant_item_id: None,
+                assistant_delta: None,
+                plan: None,
+                trace: &terminal,
+            },
+        )
+        .expect("terminal outcome");
+
+    let trace = store.list_trace(&thread.thread_id).expect("trace list");
+    let end = trace
+        .iter()
+        .find(|event| {
+            event.span_kind == Some(TraceSpanKind::Turn)
+                && event.span_phase == Some(TraceSpanPhase::End)
+        })
+        .expect("typed turn end");
+    assert_eq!(end.span_id, start.span_id);
+    assert_eq!(end.span_status, Some(TraceSpanStatus::Error));
+    assert!(end.timestamp.is_some());
+    assert!(end.duration_ms.is_some());
+}
+
+#[test]
+fn approval_wait_span_defers_without_end_then_closes_once_on_allow() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_typed_wait",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_typed_wait");
+    let checkpoint = serde_json::json!({"checkpoint": "opaque"});
+
+    let started = store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(checkpoint),
+            "approval",
+            "approval requested",
+        )
+        .expect("approval start");
+    let turn_start = store
+        .list_trace(&thread.thread_id)
+        .expect("trace list")
+        .into_iter()
+        .find(|event| {
+            event.span_kind == Some(TraceSpanKind::Turn)
+                && event.span_phase == Some(TraceSpanPhase::Start)
+        })
+        .expect("turn start");
+    assert_eq!(started.span_kind, Some(TraceSpanKind::ApprovalWait));
+    assert_eq!(started.span_phase, Some(TraceSpanPhase::Start));
+    assert_eq!(started.parent_span_id, turn_start.span_id);
+
+    store
+        .record_approval_decision(
+            &ApprovalDecision::new(request.request_id.clone(), ApprovalOutcome::Defer, "later"),
+            "approval",
+            "approval deferred",
+        )
+        .expect("defer");
+    let after_defer = store.list_trace(&thread.thread_id).expect("trace list");
+    assert_eq!(
+        after_defer
+            .iter()
+            .filter(|event| event.span_id == started.span_id)
+            .count(),
+        1
+    );
+    assert!(!after_defer.iter().any(|event| {
+        event.span_id == started.span_id && event.span_phase == Some(TraceSpanPhase::End)
+    }));
+
+    let allowed = store
+        .record_approval_decision(
+            &ApprovalDecision::new(
+                request.request_id.clone(),
+                ApprovalOutcome::Allow,
+                "approved",
+            ),
+            "approval",
+            "approval allowed",
+        )
+        .expect("allow");
+    assert_eq!(allowed.trace.span_kind, Some(TraceSpanKind::ApprovalWait));
+    assert_eq!(allowed.trace.span_phase, Some(TraceSpanPhase::End));
+    assert_eq!(allowed.trace.parent_span_id, turn_start.span_id);
+    assert!(allowed.trace.duration_ms.is_some());
+}
+
 // 验证 thread、turn、item、trace 与 approval 的基础持久化闭环。
 #[test]
 fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
@@ -1785,6 +1953,10 @@ fn approval_batch_rolls_back_when_second_write_hits_existing_trace() {
         .list_trace(&thread.thread_id)
         .expect("trace list")
         .into_iter()
+        .filter(|trace| {
+            !(trace.span_kind == Some(TraceSpanKind::Turn)
+                && trace.span_phase == Some(TraceSpanPhase::Start))
+        })
         .map(|trace| trace.event_id)
         .collect::<Vec<_>>();
     assert_eq!(trace_ids, vec![format!("trace_{}", second.request_id)]);
@@ -2047,6 +2219,10 @@ fn cancellation_request_is_atomic_and_rejects_late_completion() {
         .list_trace(&thread.thread_id)
         .expect("trace list")
         .into_iter()
+        .filter(|trace| {
+            !(trace.span_kind == Some(TraceSpanKind::Turn)
+                && trace.span_phase == Some(TraceSpanPhase::Start))
+        })
         .map(|trace| trace.event_id)
         .collect::<Vec<_>>();
     assert_eq!(trace_ids, vec!["trace_cancel_requested", "trace_cancelled"]);
@@ -2374,8 +2550,13 @@ fn approval_decision_is_written_once_and_kept_in_decision_history() {
             serde_json::to_value(outcome).expect("serialize outcome")
         );
         assert_eq!(
-            store.list_trace(&thread.thread_id).expect("trace list")[0].event_id,
-            trace.event_id
+            store
+                .list_trace(&thread.thread_id)
+                .expect("trace list")
+                .into_iter()
+                .find(|event| event.event_id == trace.event_id)
+                .map(|event| event.event_id),
+            Some(trace.event_id)
         );
         if outcome == ApprovalOutcome::Defer {
             assert!(matches!(

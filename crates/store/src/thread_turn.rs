@@ -323,6 +323,14 @@ impl SessionStore {
         let turn_sequence = Self::next_turn_sequence(&transaction, thread_id)?;
         let turn = Self::new_turn(thread_id, agent_loop_status);
         Self::insert_turn(&transaction, &turn, turn_sequence)?;
+        let trace = typed_turn_start_trace(
+            format!("trace_{}", turn.turn_id),
+            thread_id,
+            &turn.turn_id,
+            "store",
+            "turn started",
+        );
+        Self::insert_turn_trace(&transaction, &trace, thread_id, &turn.turn_id)?;
         transaction.commit()?;
         Ok(turn)
     }
@@ -407,10 +415,10 @@ impl SessionStore {
         let (input, redacted) = sanitize_item_payload(&ItemKind::UserMessage, params.input)?;
         let item = Self::new_item(&turn.turn_id, ItemKind::UserMessage, input);
         Self::insert_item(&transaction, &item, item_sequence, redacted)?;
-        let trace = TraceEvent::for_turn(
+        let trace = typed_turn_start_trace(
             format!("trace_{}", turn.turn_id),
             params.thread_id,
-            turn.turn_id.clone(),
+            &turn.turn_id,
             params.component,
             params.summary,
         );
@@ -595,6 +603,11 @@ impl SessionStore {
                 ));
             }
         }
+        let trace = if is_terminal_turn_status(&status) {
+            typed_turn_end_trace(transaction, trace, &current, &status)?
+        } else {
+            trace.clone()
+        };
         if status == TurnStatus::Interrupted {
             Self::delete_unresolved_pending_approvals(transaction, turn_id)?;
         }
@@ -636,7 +649,7 @@ impl SessionStore {
                 Ok(item)
             })
             .transpose()?;
-        let trace = Self::insert_turn_trace(transaction, trace, &trace_thread_id, turn_id)?;
+        let trace = Self::insert_turn_trace(transaction, &trace, &trace_thread_id, turn_id)?;
         Ok(CommittedTurnOutcome {
             turn,
             plan_item,
@@ -1366,4 +1379,80 @@ impl SessionStore {
             Err(error) => Err(StoreError::Sqlite(error)),
         }
     }
+}
+
+fn typed_turn_start_trace(
+    event_id: impl Into<String>,
+    thread_id: &str,
+    turn_id: &str,
+    component: &str,
+    summary: &str,
+) -> TraceEvent {
+    let mut event = TraceEvent::for_turn(event_id, thread_id, turn_id, component, summary);
+    event.timestamp = Some(Timestamp::now_utc().to_string());
+    event.span_id = Some(format!("turn_span_{turn_id}"));
+    event.span_kind = Some(TraceSpanKind::Turn);
+    event.span_phase = Some(TraceSpanPhase::Start);
+    event
+}
+
+pub(crate) fn typed_turn_end_trace(
+    transaction: &Transaction<'_>,
+    event: &TraceEvent,
+    current: &Turn,
+    status: &TurnStatus,
+) -> StoreResult<TraceEvent> {
+    let start = find_trace_span_start(
+        transaction,
+        &current.thread_id,
+        &current.turn_id,
+        TraceSpanKind::Turn,
+    )?
+    .ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "turn {} is missing its persisted typed start",
+            current.turn_id
+        ))
+    })?;
+    let start_timestamp = start
+        .timestamp
+        .as_deref()
+        .and_then(|timestamp| Timestamp::parse(timestamp).ok())
+        .ok_or_else(|| {
+            StoreError::InvalidState(format!(
+                "turn {} typed start has no valid timestamp",
+                current.turn_id
+            ))
+        })?;
+    let end_timestamp = Timestamp::now_utc();
+    let start_ms = start_timestamp.unix_ms();
+    let end_ms = end_timestamp.unix_ms();
+    let duration_ms = end_ms.checked_sub(start_ms).ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "turn {} typed end timestamp precedes its persisted start",
+            current.turn_id
+        ))
+    })?;
+    let span_status = match status {
+        TurnStatus::Completed => TraceSpanStatus::Ok,
+        TurnStatus::Failed => TraceSpanStatus::Error,
+        TurnStatus::Interrupted => TraceSpanStatus::Cancelled,
+        TurnStatus::Running | TurnStatus::Blocked => {
+            return Err(StoreError::InvalidState(
+                "non-terminal turn cannot produce a typed end".to_string(),
+            ));
+        }
+    };
+    let mut event = event.clone();
+    event.timestamp = Some(end_timestamp.to_string());
+    event.span_id = start.span_id;
+    event.parent_span_id = None;
+    event.span_kind = Some(TraceSpanKind::Turn);
+    event.span_phase = Some(TraceSpanPhase::End);
+    event.span_status = Some(span_status);
+    event.duration_ms = Some(duration_ms);
+    event.time_to_first_token_ms = None;
+    event.span_projection = None;
+    event.metric_samples.clear();
+    Ok(event)
 }
