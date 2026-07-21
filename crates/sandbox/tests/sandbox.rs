@@ -485,9 +485,9 @@ fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
             "-NoProfile".to_string(),
             "-NonInteractive".to_string(),
             "-Command".to_string(),
-            // Read fully before creating the marker; a downstream pipeline sink can create its
-            // output before an upstream access-denied error reaches this catch block.
-            "$ErrorActionPreference='Stop'; $protected=[string]::Concat('generated',[char]46,'pem'); try { $content=Get-Content -LiteralPath $protected -Raw; Set-Content -LiteralPath 'readback.txt' -Value $content; exit 9 } catch { exit 0 }".to_string(),
+            // Only the expected ACL denial passes. A successful read or any unrelated failure
+            // exits non-zero, so marker creation cannot introduce another false positive.
+            "$ErrorActionPreference='Stop'; $protected=[string]::Concat('generated',[char]46,'pem'); try { $null=Get-Content -LiteralPath $protected -Raw } catch [System.UnauthorizedAccessException] { exit 0 }; exit 9".to_string(),
         ],
         path_str(workspace.path()),
         path_str(workspace.path()),
@@ -506,10 +506,6 @@ fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
     );
     assert!(!read_result.sandbox.local_process_fallback);
     assert_eq!(read_result.exit_code, Some(0), "{read_result:#?}");
-    assert!(
-        !workspace.path().join("readback.txt").exists(),
-        "the sandbox identity must remain denied after elevated ACL reconciliation"
-    );
 }
 
 #[cfg(windows)]
@@ -801,8 +797,11 @@ mod linux_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     use std::process::Command;
+    use std::sync::{Mutex, MutexGuard};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     fn path_str(path: &Path) -> &str {
         path.to_str().expect("utf8 path")
@@ -847,6 +846,12 @@ mod linux_tests {
     struct EnvironmentGuard {
         name: &'static str,
         previous: Option<OsString>,
+    }
+
+    fn lock_environment() -> MutexGuard<'static, ()> {
+        ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     impl EnvironmentGuard {
@@ -1008,6 +1013,7 @@ time.sleep(30)
 
     #[test]
     fn linux_env_shebang_resolves_nonstandard_interpreter_from_path() {
+        let _environment = lock_environment();
         let workspace = tempfile::tempdir().expect("workspace");
         let interpreter_home = tempfile::tempdir().expect("interpreter home");
         let interpreter_bin = interpreter_home.path().join("bin");
@@ -1044,6 +1050,7 @@ time.sleep(30)
 
     #[test]
     fn linux_rustup_proxy_runs_real_cargo_toolchain() {
+        let _environment = lock_environment();
         let workspace = tempfile::tempdir().expect("workspace");
         let _target_dir = EnvironmentGuard::remove("CARGO_TARGET_DIR");
         fs::create_dir(workspace.path().join("src")).expect("src");
@@ -1072,6 +1079,7 @@ time.sleep(30)
         use std::os::unix::fs::symlink;
         use std::path::PathBuf;
 
+        let _environment = lock_environment();
         let workspace = tempfile::tempdir().expect("workspace");
         let toolchain_layout = tempfile::tempdir().expect("toolchain layout");
         let cargo_home = toolchain_layout.path().join("cargo-home");
@@ -1413,6 +1421,7 @@ time.sleep(30)
 
     #[test]
     fn linux_child_inherits_secret_isolation_and_kernel_restrictions() {
+        let _environment = lock_environment();
         let python = Path::new("/usr/bin/python3");
         assert!(python.is_file(), "WSL test requires /usr/bin/python3");
         assert!(
