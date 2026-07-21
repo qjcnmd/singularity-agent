@@ -454,9 +454,13 @@ fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
     let mut create_request = CommandRequest::project_verification(
         "sandbox_owned_protected_create",
         vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo generated>generated.pem".to_string(),
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            // Construct the protected suffix at runtime so this fault injection reaches the
+            // post-execution ACL reconciliation below instead of stopping at lexical admission.
+            "$protected=[string]::Concat('generated',[char]46,'pem'); Set-Content -LiteralPath $protected -Value 'generated'".to_string(),
         ],
         path_str(workspace.path()),
         path_str(workspace.path()),
@@ -481,7 +485,9 @@ fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
             "-NoProfile".to_string(),
             "-NonInteractive".to_string(),
             "-Command".to_string(),
-            "$ErrorActionPreference='Stop'; try { Get-Content -LiteralPath 'generated.pem' -Raw | Out-File -LiteralPath 'readback.txt'; exit 9 } catch { exit 0 }".to_string(),
+            // Read fully before creating the marker; a downstream pipeline sink can create its
+            // output before an upstream access-denied error reaches this catch block.
+            "$ErrorActionPreference='Stop'; $protected=[string]::Concat('generated',[char]46,'pem'); try { $content=Get-Content -LiteralPath $protected -Raw; Set-Content -LiteralPath 'readback.txt' -Value $content; exit 9 } catch { exit 0 }".to_string(),
         ],
         path_str(workspace.path()),
         path_str(workspace.path()),
@@ -499,6 +505,7 @@ fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
         SandboxBackendEnforcement::Strict
     );
     assert!(!read_result.sandbox.local_process_fallback);
+    assert_eq!(read_result.exit_code, Some(0), "{read_result:#?}");
     assert!(
         !workspace.path().join("readback.txt").exists(),
         "the sandbox identity must remain denied after elevated ACL reconciliation"
