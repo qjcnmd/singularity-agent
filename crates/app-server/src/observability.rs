@@ -179,12 +179,10 @@ impl<'a> TraceProjector<'a> {
                 &observation.lifecycle,
                 TraceSpanProjection {
                     attempt_index: Some(u64::from(observation.attempt_index)),
-                    model_turn_ordinal: Some(u64::from(observation.model_turn_ordinal)),
                     ..TraceSpanProjection::default()
                 },
                 |_status| TraceSpanProjection {
                     attempt_index: Some(u64::from(observation.attempt_index)),
-                    model_turn_ordinal: Some(u64::from(observation.model_turn_ordinal)),
                     ..TraceSpanProjection::default()
                 },
                 provider_attempt_span_status,
