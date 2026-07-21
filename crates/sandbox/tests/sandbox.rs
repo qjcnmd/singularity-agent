@@ -789,8 +789,8 @@ mod linux_tests {
     use super::*;
     use singularity_core::CancellationToken;
     use singularity_sandbox::{
-        LinuxSandboxBackend, LinuxSandboxProbe, SandboxFilesystemMode, SandboxNetworkMode,
-        WorkspaceMutation, probe_linux_capabilities,
+        LinuxCapability, LinuxSandboxBackend, LinuxSandboxProbe, SandboxFilesystemMode,
+        SandboxNetworkMode, WorkspaceMutation, probe_linux_capabilities,
     };
     use std::ffi::OsString;
     use std::fs::{self, hard_link};
@@ -937,6 +937,7 @@ time.sleep(30)
     fn linux_probe_reports_kernel_controls_without_os_handles() {
         let probe: LinuxSandboxProbe = probe_linux_capabilities();
         assert!(probe.user_namespace);
+        assert!(probe.pid_namespace);
         assert!(probe.mount_namespace);
         assert!(probe.network_namespace);
         assert!(probe.no_new_privs);
@@ -945,6 +946,17 @@ time.sleep(30)
         assert!(probe.process_tree_cleanup);
         assert!(probe.cgroup_v2);
         assert!(!probe.cgroup_delegated);
+    }
+
+    #[test]
+    fn linux_strict_mode_requires_pid_namespace_capability() {
+        let mut probe = probe_linux_capabilities();
+        probe.pid_namespace = false;
+        assert!(!probe.strict_ready());
+        assert_eq!(
+            probe.missing_capability(),
+            Some(LinuxCapability::PidNamespace)
+        );
     }
 
     #[test]

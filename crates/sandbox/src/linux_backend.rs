@@ -140,6 +140,7 @@ const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinuxCapability {
     UserNamespace,
+    PidNamespace,
     MountNamespace,
     NetworkNamespace,
     NoNewPrivs,
@@ -152,6 +153,7 @@ impl LinuxCapability {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UserNamespace => "user_namespace",
+            Self::PidNamespace => "pid_namespace",
             Self::MountNamespace => "mount_namespace",
             Self::NetworkNamespace => "network_namespace",
             Self::NoNewPrivs => "no_new_privs",
@@ -166,19 +168,23 @@ impl LinuxCapability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxSandboxProbe {
     pub user_namespace: bool,
+    pub pid_namespace: bool,
     pub mount_namespace: bool,
     pub network_namespace: bool,
     pub no_new_privs: bool,
     pub seccomp: bool,
     pub landlock_abi: Option<u32>,
     pub process_tree_cleanup: bool,
+    /// Whether cgroup v2 is mounted; observed for diagnostics, not enforcement.
     pub cgroup_v2: bool,
+    /// Whether the caller can delegate a cgroup; observed for diagnostics, not enforcement.
     pub cgroup_delegated: bool,
 }
 
 impl LinuxSandboxProbe {
     pub fn strict_ready(&self) -> bool {
         self.user_namespace
+            && self.pid_namespace
             && self.mount_namespace
             && self.network_namespace
             && self.no_new_privs
@@ -190,6 +196,7 @@ impl LinuxSandboxProbe {
     pub fn missing_capability(&self) -> Option<LinuxCapability> {
         [
             (self.user_namespace, LinuxCapability::UserNamespace),
+            (self.pid_namespace, LinuxCapability::PidNamespace),
             (self.mount_namespace, LinuxCapability::MountNamespace),
             (self.network_namespace, LinuxCapability::NetworkNamespace),
             (self.no_new_privs, LinuxCapability::NoNewPrivs),
@@ -215,6 +222,7 @@ pub fn probe_linux_capabilities() -> LinuxSandboxProbe {
     PROBE
         .get_or_init(|| LinuxSandboxProbe {
             user_namespace: probe_child(unshare_user_namespace),
+            pid_namespace: probe_child(unshare_pid_namespace),
             mount_namespace: probe_child(unshare_mount_namespace),
             network_namespace: probe_child(unshare_network_namespace),
             no_new_privs: probe_child(probe_no_new_privs),
@@ -243,6 +251,10 @@ fn probe_child(probe: fn() -> bool) -> bool {
 
 fn unshare_user_namespace() -> bool {
     unsafe { libc::unshare(libc::CLONE_NEWUSER) == 0 }
+}
+
+fn unshare_pid_namespace() -> bool {
+    unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) == 0 }
 }
 
 fn unshare_mount_namespace() -> bool {
