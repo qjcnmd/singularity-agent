@@ -15,11 +15,12 @@ use singularity_core::{CancellationToken, ProjectInstructions, load_project_inst
 use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage,
     ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
-    ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderApiProtocol,
-    ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
-    ProviderAttemptStatus, ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
-    ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
-    ProviderProtocolNegotiation, ProviderStreamEvent, ToolChoiceMode,
+    ModelTurnResponse, ModelTurnStatus, ModelUsage, PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider,
+    ProviderApiProtocol, ProviderAttemptMetadata, ProviderAttemptOccurrence,
+    ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderCapabilityCacheLookupResult,
+    ProviderCapabilityCacheObservation, ProviderCapabilityMetadata, ProviderCapabilityProfile,
+    ProviderError, ProviderErrorStage, ProviderProtocolContract, ProviderProtocolNegotiation,
+    ProviderStreamEvent, ToolChoiceMode,
 };
 use singularity_policy::{
     CommandScopeDigest, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
@@ -100,6 +101,10 @@ struct StreamingProvider {
     responses: Vec<(Vec<ProviderStreamEvent>, ModelTurnResponse)>,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
     capabilities: ProviderProtocolContract,
+}
+
+struct DeltaThenUnsupportedProvider {
+    fallback_calls: Arc<AtomicUsize>,
 }
 
 struct FinalizationStreamProvider {
@@ -205,6 +210,46 @@ impl Provider for StreamingProvider {
         _cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError> {
         panic!("streaming provider must not use non-stream completion")
+    }
+}
+
+impl Provider for DeltaThenUnsupportedProvider {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        ProviderProtocolContract::default()
+    }
+
+    fn complete_stream(
+        &self,
+        _request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        on_event(ProviderStreamEvent::OutputTextDelta {
+            delta: "untrusted partial".to_string(),
+        });
+        Err(ProviderError::from_model_error(
+            ModelError::new(
+                ModelErrorKind::UnsupportedCapability,
+                "streaming is unsupported after output",
+            )
+            .with_provider_diagnostic(
+                PROVIDER_STREAMING_UNSUPPORTED_CODE,
+                ProviderErrorStage::ResponseValidation,
+            ),
+        ))
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        self.fallback_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ModelTurnResponse::completed(
+            request.request_id.clone(),
+            "fallback_response",
+            "fallback answer",
+        ))
     }
 }
 
@@ -1124,6 +1169,33 @@ fn agent_loop_nonstream_fallback_keeps_text_callback_empty() {
 }
 
 #[test]
+fn agent_loop_rejects_streaming_unsupported_after_a_text_delta_without_fallback() {
+    let fallback_calls = Arc::new(AtomicUsize::new(0));
+    let mut deltas = Vec::new();
+    let result = AgentLoop::new(
+        DeltaThenUnsupportedProvider {
+            fallback_calls: Arc::clone(&fallback_calls),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_policy(),
+    )
+    .run_with_text_deltas(
+        &AgentLoopInput::new("thread_1", "turn_1", "hello"),
+        &mut |delta| deltas.push(delta.to_string()),
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(deltas.is_empty());
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .and_then(|diagnostic| diagnostic.code),
+        Some(PROVIDER_STREAMING_UNSUPPORTED_CODE.to_string())
+    );
+}
+
+#[test]
 fn agent_loop_fails_closed_when_streamed_text_differs_from_terminal_text() {
     let agent_loop = AgentLoop::new(
         StreamingProvider {
@@ -1148,6 +1220,41 @@ fn agent_loop_fails_closed_when_streamed_text_differs_from_terminal_text() {
             .provider_diagnostic
             .and_then(|diagnostic| diagnostic.code),
         Some("provider_stream_text_mismatch".to_string())
+    );
+}
+
+#[test]
+fn agent_loop_does_not_project_stream_deltas_before_response_validation() {
+    let mut invalid =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "hidden");
+    invalid.response_id.clear();
+    let mut deltas = Vec::new();
+    let result = AgentLoop::new(
+        StreamingProvider {
+            responses: vec![(
+                vec![ProviderStreamEvent::OutputTextDelta {
+                    delta: "hidden".to_string(),
+                }],
+                invalid,
+            )],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_policy(),
+    )
+    .run_with_text_deltas(
+        &AgentLoopInput::new("thread_1", "turn_1", "hello"),
+        &mut |delta| deltas.push(delta.to_string()),
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(deltas.is_empty());
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .and_then(|diagnostic| diagnostic.code),
+        Some("provider_response_invalid".to_string())
     );
 }
 

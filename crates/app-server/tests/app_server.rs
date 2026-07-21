@@ -7,17 +7,21 @@ use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
     WorkspaceRelativePath,
 };
-use singularity_protocol::ItemKind;
 #[cfg(windows)]
 use singularity_protocol::TraceMetricSampleKind;
+use singularity_protocol::{ConversationRole, ItemKind};
+use singularity_sandbox::{
+    CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend, SandboxBackendEnforcement,
+    SandboxCapabilities, WorkspaceMutation,
+};
 use singularity_store::{RegisterArtifactRefParams, SessionStore, StoreError};
 #[cfg(windows)]
 use std::collections::VecDeque;
 use std::io::Write;
 #[cfg(windows)]
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 #[cfg(windows)]
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 #[cfg(windows)]
 use std::process::{Child, ChildStdin};
 use std::process::{Command, Stdio};
@@ -48,6 +52,30 @@ fn workspace_root() -> std::path::PathBuf {
 
 fn app_server(store: SessionStore) -> AppServer {
     AppServer::new(store, ProviderConfigSnapshot::capture(|_| None))
+}
+
+struct CompletedSandboxBackend;
+
+impl SandboxBackend for CompletedSandboxBackend {
+    fn name(&self) -> &'static str {
+        "app_server_integration_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        CommandResult::completed(&request.command_id, "command ok")
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+    }
 }
 
 // Request workers must use the typed reopen of an initialized file store;
@@ -2150,6 +2178,68 @@ fn app_server_streams_turn_started_and_interrupts_an_inflight_provider_on_same_s
 
 #[cfg(windows)]
 #[test]
+fn app_server_streams_real_responses_provider_deltas_and_persists_the_final_message() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let (base_url, requests, provider_worker) = streaming_responses_provider();
+    let (mut child, mut input, mut output) = spawn_app_server(&db_path, &workspace, &base_url);
+    initialize_process(&mut input, &mut output);
+    let thread_id = start_process_thread(&mut input, &mut output, &workspace, 2);
+
+    send_json(
+        &mut input,
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "turn/start",
+            "id": 3,
+            "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "stream a short answer"}]
+            }
+        }),
+    );
+    output.recv_method("turn/started", Duration::from_secs(2));
+    let first = output.recv_method("item/agentMessage/delta", Duration::from_secs(5));
+    assert_eq!(first["params"]["delta"], "streamed ");
+    let second = output.recv_method("item/agentMessage/delta", Duration::from_secs(2));
+    assert_eq!(second["params"]["delta"], "answer");
+
+    let terminal = output.recv_id(3, Duration::from_secs(2));
+    assert_eq!(terminal["result"]["turn"]["status"], "completed");
+    assert_eq!(terminal["result"]["turn"]["agent_loop_status"], "completed");
+    output.recv_method("turn/completed", Duration::from_secs(2));
+    let request_bodies = requests
+        .recv_timeout(Duration::from_secs(2))
+        .expect("provider request sequence");
+    assert!(
+        request_bodies.len() >= 2,
+        "capability probe and stream request"
+    );
+    assert!(
+        request_bodies.iter().any(|body| body["stream"] == true),
+        "production provider must issue a streaming Responses request"
+    );
+    provider_worker.join().expect("provider worker joins");
+    shutdown_process(&mut child, &mut input, &mut output, 4);
+
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let history = store
+        .read_thread_history(&thread_id, None, 8)
+        .expect("thread history");
+    assert!(history.messages.iter().any(|message| {
+        message.role == ConversationRole::Assistant && message.content == "streamed answer"
+    }));
+    let traces = store.list_trace(&thread_id).expect("provider trace");
+    assert!(traces.iter().any(|event| {
+        event.span_kind == Some(singularity_protocol::TraceSpanKind::ProviderAttempt)
+            && event.span_phase == Some(singularity_protocol::TraceSpanPhase::End)
+            && event.time_to_first_token_ms.is_some()
+    }));
+}
+
+#[cfg(windows)]
+#[test]
 fn app_server_serializes_shared_workspace_across_processes_and_observes_interrupt() {
     let dir = tempfile::tempdir().expect("temp dir");
     let workspace = dir.path().join("workspace");
@@ -2676,6 +2766,170 @@ fn hanging_provider() -> (
     (format!("http://{address}"), accepted_rx, release_tx, worker)
 }
 
+#[cfg(windows)]
+fn streaming_responses_provider() -> (
+    String,
+    Receiver<Vec<serde_json::Value>>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind streaming provider");
+    let address = listener.local_addr().expect("streaming provider address");
+    let (requests_tx, requests_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut requests = Vec::new();
+        loop {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept streaming provider request");
+            let request_body = read_http_json_body(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_str(&request_body).expect("provider request json");
+            requests.push(request.clone());
+            if request["stream"] == true {
+                let completed = serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response_app_server_stream",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "streamed answer"}]
+                        }],
+                        "usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 2,
+                            "total_tokens": 5,
+                            "input_tokens_details": {"cached_tokens": 0},
+                            "output_tokens_details": {"reasoning_tokens": 0}
+                        }
+                    }
+                });
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"streamed \"}}\n\n"
+                )
+                .expect("write first streaming delta");
+                stream.flush().expect("flush first streaming delta");
+                write!(
+                    stream,
+                    "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}}\n\n"
+                )
+                .expect("write second streaming delta");
+                stream.flush().expect("flush second streaming delta");
+                write!(stream, "event: response.completed\ndata: {completed}\n\n")
+                    .expect("write streaming completion");
+                requests_tx.send(requests).expect("send request sequence");
+                break;
+            }
+            let response = responses_capability_probe_response(&request)
+                .expect("non-stream request must be a capability probe");
+            write_json_response(&mut stream, &response);
+        }
+    });
+    (
+        format!("http://{address}/v1/responses"),
+        requests_rx,
+        worker,
+    )
+}
+
+#[cfg(windows)]
+fn read_http_json_body(stream: &mut TcpStream) -> String {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone provider stream"));
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .expect("read provider request line");
+    assert!(request_line.contains("/v1/responses"));
+    let mut content_length = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read provider header");
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().expect("provider content length");
+        }
+    }
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body).expect("read provider body");
+    String::from_utf8(body).expect("provider request utf8")
+}
+
+#[cfg(windows)]
+fn responses_capability_probe_response(request: &serde_json::Value) -> Option<serde_json::Value> {
+    let tools = request.get("tools")?.as_array()?;
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    if !names.contains(&"singularity_capability_probe_a") {
+        return None;
+    }
+    let continuation = request
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["type"] == "function_call_output")
+        });
+    let strict = tools
+        .iter()
+        .any(|tool| tool.get("strict").and_then(serde_json::Value::as_bool) == Some(true));
+    let arguments = if strict {
+        serde_json::json!({"probe": "schema_sentinel_alpha", "values": [7, 7]})
+    } else {
+        serde_json::json!({})
+    };
+    let mut output = vec![serde_json::json!({
+        "type": "function_call",
+        "call_id": if continuation { "probe_call_continuation" } else { "probe_call_a" },
+        "name": "singularity_capability_probe_a",
+        "arguments": arguments.to_string()
+    })];
+    if !continuation
+        && names.contains(&"singularity_capability_probe_b")
+        && request["parallel_tool_calls"] == true
+    {
+        output.push(serde_json::json!({
+            "type": "function_call",
+            "call_id": "probe_call_b",
+            "name": "singularity_capability_probe_b",
+            "arguments": arguments.to_string()
+        }));
+    }
+    Some(serde_json::json!({
+        "id": if continuation { "capability_probe_continuation_response" } else { "capability_probe_response" },
+        "object": "response",
+        "status": "completed",
+        "output": output,
+        "usage": {
+            "input_tokens": 2,
+            "output_tokens": 1,
+            "total_tokens": 3,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0}
+        }
+    }))
+}
+
+#[cfg(windows)]
+fn write_json_response(stream: &mut TcpStream, body: &serde_json::Value) {
+    let body = body.to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("write provider json response");
+}
+
 fn app_server_bin() -> String {
     std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
         let mut path = workspace_root();
@@ -2897,7 +3151,9 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
         negotiation_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
-    let mut server = app_server(store).with_test_provider(Arc::new(provider));
+    let mut server = app_server(store)
+        .with_test_provider(Arc::new(provider))
+        .with_sandbox_backend(CompletedSandboxBackend);
     server
         .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
         .expect("initialize");

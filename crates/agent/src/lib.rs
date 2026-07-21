@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-
 //! 负责模型 turn、tool 执行、approval 检查点和完成校验的 `AgentLoop` 状态机。
 //!
 //! loop 将模型提供方可见历史与规范化可执行调用分离，所有副作用都经由 `ToolBroker`，
@@ -18,10 +17,9 @@ use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
-    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent, ProviderAttemptMetadata,
-    ProviderAttemptStarted, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
-    ProviderErrorStage, ProviderProtocolContract, ProviderStreamEvent, ToolChoiceMode,
-    is_strict_tool_schema_compatible, provider_error_response,
+    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptMetadata,
+    ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError, ProviderErrorStage,
+    ProviderProtocolContract, is_strict_tool_schema_compatible, provider_error_response,
     validate_model_request_with_capabilities, validate_model_turn_response,
 };
 use singularity_policy::{
@@ -33,11 +31,8 @@ use singularity_policy::{
 use singularity_tools::{
     AgentControlToolExecutor, BoundToolCall, COMMAND_TOOL as TOOL_COMMAND, CommandToolInput,
     EDIT_TOOL as TOOL_EDIT, EditToolInput, GrepToolInput, ListToolInput, PATCH_TOOL as TOOL_PATCH,
-    ReadToolInput, SandboxExecutionBoundary as ToolSandboxExecutionBoundary,
-    SandboxExecutionObservation as ToolSandboxExecutionObservation,
-    SandboxExecutionSinkError as ToolSandboxExecutionSinkError,
-    SandboxExecutionStatus as ToolSandboxExecutionStatus, SandboxFilesystemMode,
-    SandboxNetworkMode, ToolAuthorization, ToolBroker, ToolBrokerDecision, ToolCallRequest,
+    ReadToolInput, SandboxExecutionSinkError as ToolSandboxExecutionSinkError,
+    SandboxFilesystemMode, SandboxNetworkMode, ToolAuthorization, ToolBroker, ToolBrokerDecision,
     ToolCapability, ToolEntry, ToolExecutionMode, ToolExecutor, ToolFailureKind,
     ToolInputValidationError, ToolOutput, ToolResult, ToolSpec, WorkspacePatch, WorkspaceToolError,
     WorkspaceToolExecutor, WorkspaceTools, approximate_token_count,
@@ -48,7 +43,10 @@ use thiserror::Error;
 mod checkpoint;
 mod completion;
 mod context;
+mod model_turn;
 mod observation;
+mod planning;
+mod tool_occurrence;
 
 pub use checkpoint::{ApprovalCheckpoint, PendingApprovalOccurrence, PendingToolCall};
 use completion::{
@@ -59,10 +57,8 @@ pub use context::{
     AgentContextItem, AgentContextItemPriority, AgentContextTrace, ContextBundle,
     assemble_context_items,
 };
-use context::{
-    ContextBudget, assemble_context_items_with_budget, current_turn_excluded,
-    model_messages_from_context,
-};
+use context::{ContextBudget, assemble_context_items_with_budget, current_turn_excluded};
+use model_turn::*;
 use observation::OccurrenceTimer;
 pub use observation::{
     AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentObservation,
@@ -73,11 +69,12 @@ pub use observation::{
     SandboxExecutionStatus, ToolCallObservation, ToolCallStatus, VerificationObservation,
     VerificationStatus,
 };
+use tool_occurrence::*;
 
 #[cfg(test)]
 use completion::ToolResultOccurrenceWire;
 #[cfg(test)]
-use singularity_tools::{WorkspaceObservation, WorkspaceRevision};
+use singularity_tools::{ToolCallRequest, WorkspaceObservation, WorkspaceRevision};
 
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
@@ -213,79 +210,10 @@ pub struct AgentPlan {
     pub steps: Vec<AgentPlanStep>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentPlanValidationFailure {
-    Empty,
-    TooManySteps,
-    EmptyStep,
-    StepTooLong,
-    DuplicateStep,
-    MultipleInProgress,
-}
-
-impl AgentPlanValidationFailure {
-    fn code(self) -> &'static str {
-        match self {
-            Self::Empty => "plan_steps_empty",
-            Self::TooManySteps => "plan_step_limit_exceeded",
-            Self::EmptyStep => "plan_step_empty",
-            Self::StepTooLong => "plan_step_too_long",
-            Self::DuplicateStep => "plan_step_duplicate",
-            Self::MultipleInProgress => "plan_multiple_in_progress",
-        }
-    }
-
-    fn message(self) -> String {
-        match self {
-            Self::Empty => "plan must contain at least one step".to_string(),
-            Self::TooManySteps => {
-                format!("plan must not contain more than {MAX_PLAN_STEPS} steps")
-            }
-            Self::EmptyStep => "plan steps must not be empty".to_string(),
-            Self::StepTooLong => {
-                format!("plan steps must not exceed {MAX_PLAN_STEP_CHARS} characters")
-            }
-            Self::DuplicateStep => "plan steps must be unique".to_string(),
-            Self::MultipleInProgress => "plan may have at most one in_progress step".to_string(),
-        }
-    }
-}
-
 impl AgentPlan {
     /// 校验计划步骤和完成状态契约。
     pub fn validate(&self) -> Result<(), String> {
-        self.validate_contract()
-            .map_err(AgentPlanValidationFailure::message)
-    }
-
-    fn validate_contract(&self) -> Result<(), AgentPlanValidationFailure> {
-        if self.steps.is_empty() {
-            return Err(AgentPlanValidationFailure::Empty);
-        }
-        if self.steps.len() > MAX_PLAN_STEPS {
-            return Err(AgentPlanValidationFailure::TooManySteps);
-        }
-        let mut unique_steps = BTreeSet::new();
-        let mut in_progress_count = 0usize;
-        for plan_step in &self.steps {
-            let normalized_step = plan_step.step.trim();
-            if normalized_step.is_empty() {
-                return Err(AgentPlanValidationFailure::EmptyStep);
-            }
-            if normalized_step.chars().count() > MAX_PLAN_STEP_CHARS {
-                return Err(AgentPlanValidationFailure::StepTooLong);
-            }
-            if !unique_steps.insert(normalized_step.to_string()) {
-                return Err(AgentPlanValidationFailure::DuplicateStep);
-            }
-            if plan_step.status == AgentPlanStepStatus::InProgress {
-                in_progress_count += 1;
-            }
-        }
-        if in_progress_count > 1 {
-            return Err(AgentPlanValidationFailure::MultipleInProgress);
-        }
-        Ok(())
+        planning::validate(&self.steps)
     }
 
     /// 判断计划是否已完成。
@@ -1586,24 +1514,29 @@ where
                 Err(error)
                     if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
                 {
-                    let stream_error = error;
-                    let completion = {
-                        let mut on_attempt = |event| provider_events.borrow_mut().on_attempt(event);
-                        self.provider.complete_observed(
-                            &request,
-                            &self.cancellation,
-                            &mut on_attempt,
-                        )
-                    };
-                    match completion {
-                        Ok(mut response) => {
-                            merge_response_runtime_metadata(&mut response, &stream_error);
-                            response
+                    if provider_events.borrow().streamed_text.is_empty() {
+                        let stream_error = error;
+                        let completion = {
+                            let mut on_attempt =
+                                |event| provider_events.borrow_mut().on_attempt(event);
+                            self.provider.complete_observed(
+                                &request,
+                                &self.cancellation,
+                                &mut on_attempt,
+                            )
+                        };
+                        match completion {
+                            Ok(mut response) => {
+                                merge_response_runtime_metadata(&mut response, &stream_error);
+                                response
+                            }
+                            Err(mut error) => {
+                                merge_provider_error_runtime_metadata(&mut error, &stream_error);
+                                provider_error_model_response(&request, error)
+                            }
                         }
-                        Err(mut error) => {
-                            merge_provider_error_runtime_metadata(&mut error, &stream_error);
-                            provider_error_model_response(&request, error)
-                        }
+                    } else {
+                        provider_error_model_response(&request, error)
                     }
                 }
                 Err(error) => provider_error_model_response(&request, error),
@@ -1618,6 +1551,7 @@ where
                     Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                 );
             }
+            let buffered_text_deltas = provider_events.into_buffered_text_deltas();
             state.observe_model_response(&response, turn_index, &prompt_identity.occurrence_id);
             actual_model_turns = turn_index.saturating_add(1);
             if self.is_cancelled(input) {
@@ -1857,6 +1791,19 @@ where
                     );
                 }
                 if state.allows_final() {
+                    for delta in buffered_text_deltas {
+                        if emit_event(&mut on_event, AgentLoopEvent::FinalTextDelta { delta })
+                            .is_err()
+                        {
+                            return state.finish(
+                                AgentStatus::Failed,
+                                false,
+                                None,
+                                actual_model_turns,
+                                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                            );
+                        }
+                    }
                     if emit_final_review_finished(
                         &mut on_event,
                         &final_review,
@@ -4176,799 +4123,6 @@ fn merge_provider_error_runtime_metadata(error: &mut ProviderError, earlier: &Pr
     }
 }
 
-struct ToolOccurrenceContext {
-    identity: OccurrenceIdentity,
-    timer: OccurrenceTimer,
-    model_turn_ordinal: u32,
-    tool_call_ordinal: u32,
-    tool_call_id_digest: String,
-    tool_name: String,
-}
-
-struct ModelToolOccurrence {
-    call: ModelToolCall,
-    fingerprint: String,
-    invalid_was_observed: bool,
-    context: ToolOccurrenceContext,
-}
-
-struct RuntimeToolResult {
-    result: ToolResult,
-    duration_ms: Option<u64>,
-    event_sink_failed: bool,
-}
-
-struct WorkspaceToolExecution {
-    output: ToolOutput,
-    sandbox_execution: Option<ToolSandboxExecutionObservation>,
-    event_sink_failed: bool,
-}
-
-struct WorkspaceToolCallContext<'a> {
-    bound: &'a BoundToolCall,
-    decision: &'a ToolBrokerDecision,
-    profile: &'a PermissionProfile,
-    occurrence: Option<&'a ToolOccurrenceContext>,
-}
-
-struct ObservedToolDecision {
-    decision: ToolBrokerDecision,
-    cause: PolicyDecisionCause,
-}
-
-fn emit_event(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    event: AgentLoopEvent,
-) -> Result<(), AgentLoopEventSinkError> {
-    match on_event.as_deref_mut() {
-        Some(callback) => callback(event),
-        None => Ok(()),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_prompt_assembly_finished(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    identity: OccurrenceIdentity,
-    timer: &OccurrenceTimer,
-    model_turn_ordinal: u32,
-    message_count: u32,
-    tool_count: u32,
-    request_token_count: u32,
-    request_digest: String,
-    compacted: bool,
-    finalization_only: bool,
-    status: PromptAssemblyStatus,
-) -> Result<(), AgentLoopEventSinkError> {
-    emit_event(
-        on_event,
-        AgentLoopEvent::Observation(AgentObservation::PromptAssembly(
-            PromptAssemblyObservation {
-                identity,
-                lifecycle: timer.finished(status),
-                model_turn_ordinal,
-                message_count,
-                tool_count,
-                request_token_count,
-                request_digest,
-                compacted,
-                finalization_only,
-            },
-        )),
-    )
-}
-
-fn emit_final_review_finished(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    final_review: &Option<(OccurrenceIdentity, OccurrenceTimer)>,
-    model_turn_ordinal: u32,
-    status: FinalReviewStatus,
-) -> Result<(), AgentLoopEventSinkError> {
-    let Some((identity, timer)) = final_review else {
-        return Ok(());
-    };
-    emit_event(
-        on_event,
-        AgentLoopEvent::Observation(AgentObservation::FinalReview(FinalReviewObservation {
-            identity: identity.clone(),
-            lifecycle: timer.finished(status),
-            model_turn_ordinal,
-        })),
-    )
-}
-
-enum ProviderAttemptIdentityScope {
-    Child(OccurrenceIdentity),
-    Root {
-        thread_id: String,
-        turn_id: String,
-        model_turn_ordinal: u32,
-    },
-}
-
-struct ProviderEventBridge<'a, 'callback_ref, 'callback> {
-    identity_scope: ProviderAttemptIdentityScope,
-    finalization_only: bool,
-    on_event: &'a mut Option<&'callback_ref mut AgentLoopEventCallback<'callback>>,
-    streamed_text: String,
-    next_attempt_ordinal: u32,
-    active_attempt: Option<(ProviderAttemptStarted, OccurrenceIdentity)>,
-    event_sink_failed: bool,
-}
-
-impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callback> {
-    fn new(
-        prompt_identity: OccurrenceIdentity,
-        finalization_only: bool,
-        on_event: &'a mut Option<&'callback_ref mut AgentLoopEventCallback<'callback>>,
-    ) -> Self {
-        Self {
-            identity_scope: ProviderAttemptIdentityScope::Child(prompt_identity),
-            finalization_only,
-            on_event,
-            streamed_text: String::new(),
-            next_attempt_ordinal: 0,
-            active_attempt: None,
-            event_sink_failed: false,
-        }
-    }
-
-    fn new_root(
-        input: &AgentLoopInput,
-        model_turn_ordinal: u32,
-        on_event: &'a mut Option<&'callback_ref mut AgentLoopEventCallback<'callback>>,
-    ) -> Self {
-        Self {
-            identity_scope: ProviderAttemptIdentityScope::Root {
-                thread_id: input.thread_id.clone(),
-                turn_id: input.turn_id.clone(),
-                model_turn_ordinal,
-            },
-            finalization_only: false,
-            on_event,
-            streamed_text: String::new(),
-            next_attempt_ordinal: 0,
-            active_attempt: None,
-            event_sink_failed: false,
-        }
-    }
-
-    fn on_stream(&mut self, event: ProviderStreamEvent) {
-        match event {
-            ProviderStreamEvent::OutputTextDelta { delta } => {
-                self.streamed_text.push_str(&delta);
-                if self.finalization_only
-                    && emit_event(self.on_event, AgentLoopEvent::FinalTextDelta { delta }).is_err()
-                {
-                    self.event_sink_failed = true;
-                }
-            }
-        }
-    }
-
-    fn on_attempt(&mut self, event: ProviderAttemptEvent) -> bool {
-        if self.event_sink_failed {
-            return false;
-        }
-        let result = match event {
-            ProviderAttemptEvent::Started(started) => self.start_attempt(started),
-            ProviderAttemptEvent::Finished(finished) => self.finish_attempt(finished),
-        };
-        if result.is_err() {
-            self.event_sink_failed = true;
-            return false;
-        }
-        true
-    }
-
-    fn start_attempt(&mut self, started: ProviderAttemptStarted) -> Result<(), ()> {
-        if self.active_attempt.is_some() {
-            return Err(());
-        }
-        let identity = match &self.identity_scope {
-            ProviderAttemptIdentityScope::Child(parent) => {
-                child_occurrence_identity(parent, "provider_attempt", self.next_attempt_ordinal)
-            }
-            ProviderAttemptIdentityScope::Root {
-                thread_id,
-                turn_id,
-                model_turn_ordinal,
-            } => root_occurrence_identity(
-                thread_id,
-                turn_id,
-                "provider_attempt",
-                *model_turn_ordinal,
-                self.next_attempt_ordinal,
-            ),
-        };
-        let observation = ProviderAttemptObservation {
-            identity: identity.clone(),
-            lifecycle: OccurrenceLifecycle::Started {
-                queued_at_unix_ms: started.started_at_unix_ms,
-                started_at_unix_ms: started.started_at_unix_ms,
-            },
-            operation_phase: started.operation_phase,
-            provider_name: started.provider_name.clone(),
-            model_name: started.model_name.clone(),
-            actual_api_protocol: started.actual_api_protocol,
-            attempt_index: started.attempt_index,
-            retry_count: started.attempt_index.saturating_sub(1),
-            request_send_to_headers_ms: None,
-            time_to_first_text_delta_ms: None,
-            retry_backoff_ms: None,
-            error_category: None,
-            error_stage: None,
-            diagnostic_code: None,
-            usage: None,
-        };
-        emit_event(
-            self.on_event,
-            AgentLoopEvent::Observation(AgentObservation::ProviderAttempt(Box::new(observation))),
-        )
-        .map_err(|_| ())?;
-        self.active_attempt = Some((started, identity));
-        Ok(())
-    }
-
-    fn finish_attempt(
-        &mut self,
-        finished: singularity_model::ProviderAttemptOccurrence,
-    ) -> Result<(), ()> {
-        let Some((started, identity)) = self.active_attempt.take() else {
-            return Err(());
-        };
-        if started.operation_phase != finished.operation_phase
-            || started.provider_name != finished.provider_name
-            || started.model_name != finished.model_name
-            || started.actual_api_protocol != finished.actual_api_protocol
-            || started.attempt_index != finished.attempt_index
-            || started.started_at_unix_ms != finished.started_at_unix_ms
-        {
-            return Err(());
-        }
-        let status = match finished.terminal_status {
-            singularity_model::ProviderAttemptStatus::Ok => ProviderAttemptStatus::Ok,
-            singularity_model::ProviderAttemptStatus::Error => ProviderAttemptStatus::Error,
-            singularity_model::ProviderAttemptStatus::Cancelled => ProviderAttemptStatus::Cancelled,
-        };
-        let usage = finished.usage.map(|usage| ProviderAttemptUsageObservation {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage.total_tokens,
-            cached_input_tokens: usage.cached_input_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-        });
-        let observation = ProviderAttemptObservation {
-            identity,
-            lifecycle: OccurrenceLifecycle::Finished {
-                queued_at_unix_ms: finished.started_at_unix_ms,
-                started_at_unix_ms: finished.started_at_unix_ms,
-                ended_at_unix_ms: finished.ended_at_unix_ms,
-                duration_ms: finished.attempt_duration_ms,
-                status,
-            },
-            operation_phase: finished.operation_phase,
-            provider_name: finished.provider_name,
-            model_name: finished.model_name,
-            actual_api_protocol: finished.actual_api_protocol,
-            attempt_index: finished.attempt_index,
-            retry_count: finished.attempt_index.saturating_sub(1),
-            request_send_to_headers_ms: finished.request_send_to_headers_ms,
-            time_to_first_text_delta_ms: finished.time_to_first_text_delta_ms,
-            retry_backoff_ms: finished.retry_backoff_ms,
-            error_category: finished.error_category,
-            error_stage: finished.error_stage,
-            diagnostic_code: finished.diagnostic_code,
-            usage,
-        };
-        emit_event(
-            self.on_event,
-            AgentLoopEvent::Observation(AgentObservation::ProviderAttempt(Box::new(observation))),
-        )
-        .map_err(|_| ())?;
-        self.next_attempt_ordinal = self.next_attempt_ordinal.saturating_add(1);
-        Ok(())
-    }
-}
-
-fn emit_verification_occurrence(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    input: &AgentLoopInput,
-    model_turn_ordinal: u32,
-    occurrence_ordinal: u32,
-    kind: &str,
-    status: VerificationStatus,
-    summary: &AgentVerification,
-) -> Result<(), AgentLoopEventSinkError> {
-    let timer = OccurrenceTimer::start();
-    let identity = occurrence_identity(input, kind, model_turn_ordinal, occurrence_ordinal, None);
-    for lifecycle in [timer.started(), timer.finished(status)] {
-        emit_event(
-            on_event,
-            AgentLoopEvent::Observation(AgentObservation::Verification(VerificationObservation {
-                identity: identity.clone(),
-                lifecycle,
-                required_command_count: summary.required_command_count,
-                satisfied_command_count: summary.satisfied_command_count,
-                occurrence_count: occurrence_ordinal,
-                command_duration_ms: None,
-            })),
-        )?;
-    }
-    Ok(())
-}
-
-fn occurrence_identity(
-    input: &AgentLoopInput,
-    kind: &str,
-    model_turn_ordinal: u32,
-    ordinal: u32,
-    parent_occurrence_id: Option<String>,
-) -> OccurrenceIdentity {
-    let mut identity = root_occurrence_identity(
-        &input.thread_id,
-        &input.turn_id,
-        kind,
-        model_turn_ordinal,
-        ordinal,
-    );
-    identity.parent_occurrence_id = parent_occurrence_id;
-    identity
-}
-
-fn root_occurrence_identity(
-    thread_id: &str,
-    turn_id: &str,
-    kind: &str,
-    model_turn_ordinal: u32,
-    ordinal: u32,
-) -> OccurrenceIdentity {
-    let encoded = format!(
-        "{}\u{0}{}\u{0}{kind}\u{0}{model_turn_ordinal}\u{0}{ordinal}",
-        thread_id, turn_id
-    );
-    OccurrenceIdentity {
-        occurrence_id: format!("sha256:{:x}", Sha256::digest(encoded.as_bytes())),
-        parent_occurrence_id: None,
-        ordinal,
-    }
-}
-
-fn child_occurrence_identity(
-    parent: &OccurrenceIdentity,
-    kind: &str,
-    ordinal: u32,
-) -> OccurrenceIdentity {
-    let encoded = format!("{}\u{0}{kind}\u{0}{ordinal}", parent.occurrence_id);
-    OccurrenceIdentity {
-        occurrence_id: format!("sha256:{:x}", Sha256::digest(encoded.as_bytes())),
-        parent_occurrence_id: Some(parent.occurrence_id.clone()),
-        ordinal,
-    }
-}
-
-fn tool_occurrence_context(
-    input: &AgentLoopInput,
-    call: &ModelToolCall,
-    model_turn_ordinal: u32,
-    tool_call_ordinal: u32,
-) -> ToolOccurrenceContext {
-    let prompt_parent = occurrence_identity(input, "prompt_assembly", model_turn_ordinal, 0, None);
-    ToolOccurrenceContext {
-        identity: occurrence_identity(
-            input,
-            "tool_call",
-            model_turn_ordinal,
-            tool_call_ordinal,
-            Some(prompt_parent.occurrence_id),
-        ),
-        timer: OccurrenceTimer::start(),
-        model_turn_ordinal,
-        tool_call_ordinal,
-        tool_call_id_digest: format!("sha256:{:x}", Sha256::digest(call.tool_call_id.as_bytes())),
-        tool_name: safe_tool_name(call),
-    }
-}
-
-fn safe_tool_name(call: &ModelToolCall) -> String {
-    if call.parse_status == ModelToolParseStatus::Valid
-        && !call.tool_name.is_empty()
-        && call.tool_name.len() <= 64
-        && call
-            .tool_name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
-    {
-        call.tool_name.clone()
-    } else {
-        "invalid_tool".to_string()
-    }
-}
-
-fn tool_call_event(
-    context: &ToolOccurrenceContext,
-    lifecycle: OccurrenceLifecycle<ToolCallStatus>,
-) -> AgentLoopEvent {
-    AgentLoopEvent::Observation(AgentObservation::ToolCall(ToolCallObservation {
-        identity: context.identity.clone(),
-        lifecycle,
-        model_turn_ordinal: context.model_turn_ordinal,
-        tool_call_ordinal: context.tool_call_ordinal,
-        tool_call_id_digest: context.tool_call_id_digest.clone(),
-        tool_name: context.tool_name.clone(),
-    }))
-}
-
-fn emit_rejected_tool_calls(
-    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
-    input: &AgentLoopInput,
-    calls: &[ModelToolCall],
-    model_turn_ordinal: u32,
-) -> Result<(), AgentLoopEventSinkError> {
-    for (ordinal, call) in calls.iter().enumerate() {
-        let context = tool_occurrence_context(
-            input,
-            call,
-            model_turn_ordinal,
-            u32::try_from(ordinal).unwrap_or(u32::MAX),
-        );
-        emit_event(on_event, tool_call_event(&context, context.timer.started()))?;
-        emit_event(
-            on_event,
-            tool_call_event(&context, context.timer.finished(ToolCallStatus::Rejected)),
-        )?;
-    }
-    Ok(())
-}
-
-fn tool_result_status(
-    prepared: &PreparedToolCall,
-    result: &ToolResult,
-    batch_rejected: bool,
-) -> ToolCallStatus {
-    if batch_rejected {
-        ToolCallStatus::BatchRejected
-    } else if result.failure_kind == Some(ToolFailureKind::Cancelled) {
-        ToolCallStatus::Cancelled
-    } else if matches!(prepared.decision, Some(ToolBrokerDecision::Deny { .. })) {
-        ToolCallStatus::PolicyDenied
-    } else if prepared.rejection.is_some() {
-        ToolCallStatus::Rejected
-    } else if result.ok {
-        ToolCallStatus::Succeeded
-    } else {
-        ToolCallStatus::Failed
-    }
-}
-
-fn policy_status(decision: &ToolBrokerDecision) -> PolicyDecisionStatus {
-    match decision {
-        ToolBrokerDecision::Allow | ToolBrokerDecision::Approved { .. } => {
-            PolicyDecisionStatus::Allow
-        }
-        ToolBrokerDecision::Ask { .. } => PolicyDecisionStatus::Ask,
-        ToolBrokerDecision::Deny { .. } => PolicyDecisionStatus::Deny,
-    }
-}
-
-fn tool_operation_count(bound: &BoundToolCall, profile: &PermissionProfile) -> u32 {
-    if matches!(
-        bound.executor,
-        ToolExecutor::Workspace(WorkspaceToolExecutor::Command)
-    ) && profile.network_access == NetworkAccess::Allowed
-    {
-        2
-    } else {
-        1
-    }
-}
-
-fn safe_policy_cause(cause: &PermissionCause) -> PolicyDecisionCause {
-    match cause {
-        PermissionCause::Explicit => PolicyDecisionCause::Explicit,
-        PermissionCause::Rule => PolicyDecisionCause::Rule,
-        PermissionCause::FilesystemProfile => PolicyDecisionCause::FilesystemProfile,
-        PermissionCause::NetworkProfile => PolicyDecisionCause::NetworkProfile,
-        PermissionCause::ProtectedResource => PolicyDecisionCause::ProtectedResource,
-        PermissionCause::NoMatchingRule => PolicyDecisionCause::NoMatchingRule,
-        PermissionCause::ApprovalPolicy => PolicyDecisionCause::ApprovalPolicy,
-    }
-}
-
-fn sandbox_status(status: ToolSandboxExecutionStatus) -> SandboxExecutionStatus {
-    match status {
-        ToolSandboxExecutionStatus::Ok => SandboxExecutionStatus::Ok,
-        ToolSandboxExecutionStatus::Error => SandboxExecutionStatus::Error,
-        ToolSandboxExecutionStatus::TimedOut => SandboxExecutionStatus::TimedOut,
-        ToolSandboxExecutionStatus::Cancelled => SandboxExecutionStatus::Cancelled,
-    }
-}
-
-fn sandbox_boundary_event(
-    occurrence: &ToolOccurrenceContext,
-    boundary: ToolSandboxExecutionBoundary,
-) -> AgentLoopEvent {
-    let identity = child_occurrence_identity(&occurrence.identity, "sandbox_execution", 0);
-    let observation = match boundary {
-        ToolSandboxExecutionBoundary::Started {
-            command_id,
-            started_at_unix_ms,
-        } => SandboxExecutionOccurrence {
-            identity,
-            lifecycle: OccurrenceLifecycle::Started {
-                queued_at_unix_ms: started_at_unix_ms,
-                started_at_unix_ms,
-            },
-            command_id,
-            command_id_binding_valid: None,
-            workspace_mutation: None,
-            enforcement: None,
-        },
-        ToolSandboxExecutionBoundary::Finished(sandbox) => SandboxExecutionOccurrence {
-            identity,
-            lifecycle: OccurrenceLifecycle::Finished {
-                queued_at_unix_ms: sandbox.started_at_unix_ms,
-                started_at_unix_ms: sandbox.started_at_unix_ms,
-                ended_at_unix_ms: sandbox.ended_at_unix_ms,
-                duration_ms: sandbox.duration_ms,
-                status: sandbox_status(sandbox.status),
-            },
-            command_id: sandbox.command_id,
-            command_id_binding_valid: Some(sandbox.command_id_binding_valid),
-            workspace_mutation: Some(sandbox.workspace_mutation),
-            enforcement: Some(sandbox.enforcement),
-        },
-    };
-    AgentLoopEvent::Observation(AgentObservation::SandboxExecution(observation))
-}
-
-fn safe_request_digest(request: &ModelTurnRequest) -> String {
-    let encoded = serde_json::to_vec(request).unwrap_or_default();
-    format!("sha256:{:x}", Sha256::digest(encoded))
-}
-
-struct ModelToolView {
-    tools: Vec<ModelToolSchema>,
-    visible_tool_names: Vec<String>,
-    max_tool_calls: u32,
-}
-
-impl ModelToolView {
-    fn finalization() -> Self {
-        Self {
-            tools: Vec::new(),
-            visible_tool_names: Vec::new(),
-            max_tool_calls: 0,
-        }
-    }
-}
-
-fn model_turn_request(
-    input: &AgentLoopInput,
-    budget: &ContextBudget,
-    turn_index: u32,
-    state: &AgentLoopState,
-    tool_view: ModelToolView,
-    capabilities: &ProviderProtocolContract,
-    finalization_only: bool,
-) -> ModelTurnRequest {
-    let tools = tool_view.tools;
-    let strict_tool_schema = !tools.is_empty()
-        && capabilities.supports_strict_tool_schema
-        && tools
-            .iter()
-            .all(|tool| is_strict_tool_schema_compatible(&tool.parameters_schema));
-    let mut request = ModelTurnRequest {
-        request_id: format!("model_request_{}_{}", input.turn_id, turn_index),
-        messages: state.messages.clone(),
-        tools,
-        tool_choice: Default::default(),
-        model_preferences: ModelPreferences {
-            max_output_tokens: Some(budget.reserved_output_tokens),
-            ..input.model_preferences.clone()
-        },
-    };
-    if finalization_only {
-        request.tool_choice.mode = ToolChoiceMode::None;
-    }
-    request.tool_choice.max_tool_calls = tool_view.max_tool_calls;
-    request.tool_choice.strict_tool_schema = strict_tool_schema;
-    request
-}
-
-fn model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
-    loop_tools
-        .tool_schema_payloads()
-        .into_iter()
-        .filter_map(|tool| {
-            Some(ModelToolSchema {
-                name: tool.get("name")?.as_str()?.to_string(),
-                description: tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                parameters_schema: tool
-                    .get("input_schema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            })
-        })
-        .collect()
-}
-
-fn visible_model_tool_schemas(loop_tools: &ToolBroker) -> Vec<ModelToolSchema> {
-    model_tool_schemas(loop_tools)
-}
-
-fn model_tool_view(
-    loop_tools: &ToolBroker,
-    capabilities: &ProviderProtocolContract,
-    max_tool_calls: u32,
-) -> Result<ModelToolView, String> {
-    if capabilities.max_tools_per_request == 0 {
-        return Err("provider tool-definition limit must be greater than zero".to_string());
-    }
-    let visible_tools = visible_model_tool_schemas(loop_tools);
-    let visible_tool_names = visible_tools
-        .iter()
-        .map(|tool| tool.name.clone())
-        .collect::<Vec<_>>();
-    if visible_tools.len() > capabilities.max_tools_per_request as usize {
-        return Err(format!(
-            "provider direct tool-definition limit ({}) is below the required tool count ({})",
-            capabilities.max_tools_per_request,
-            visible_tools.len()
-        ));
-    }
-    Ok(ModelToolView {
-        tools: visible_tools,
-        visible_tool_names,
-        max_tool_calls,
-    })
-}
-
-fn resolve_model_tool_calls(
-    provider_calls: &[ModelToolCall],
-    visible_tool_names: &[String],
-) -> Vec<ModelToolCall> {
-    provider_calls
-        .iter()
-        .map(|call| {
-            if call.parse_status != ModelToolParseStatus::Valid {
-                return call.clone();
-            }
-            let mut resolved = call.clone();
-            if resolved.parse_status == ModelToolParseStatus::Valid
-                && !visible_tool_names
-                    .iter()
-                    .any(|tool_name| tool_name == &resolved.tool_name)
-            {
-                resolved.parse_status = ModelToolParseStatus::UnknownTool;
-            }
-            resolved
-        })
-        .collect()
-}
-
-fn model_tool_payload_tokens(tools: &[ModelToolSchema]) -> u32 {
-    serde_json::to_string(tools).map_or(u32::MAX, |payload| approximate_token_count(&payload))
-}
-
-fn reserved_model_tool_tokens(
-    loop_tools: &ToolBroker,
-    capabilities: &ProviderProtocolContract,
-) -> Result<u32, String> {
-    let visible_tools = visible_model_tool_schemas(loop_tools);
-    if visible_tools.len() > capabilities.max_tools_per_request as usize {
-        return Err(format!(
-            "provider direct tool-definition limit ({}) is below the required tool count ({})",
-            capabilities.max_tools_per_request,
-            visible_tools.len()
-        ));
-    }
-    Ok(model_tool_payload_tokens(&visible_tools))
-}
-
-fn model_messages_from_input(
-    input: &AgentLoopInput,
-    context: &ContextBundle,
-    max_tool_calls: u32,
-) -> Vec<ModelMessage> {
-    let mut messages = vec![ModelMessage::text(
-        ModelRole::Developer,
-        developer_instructions(input, max_tool_calls),
-    )];
-    messages.extend(model_messages_from_context(context));
-    messages
-}
-
-fn developer_instructions(input: &AgentLoopInput, max_tool_calls: u32) -> String {
-    let tool_call_instruction = if max_tool_calls == 1 {
-        "Issue at most one tool call per assistant response and wait for its result.".to_string()
-    } else {
-        format!(
-            "Issue up to {max_tool_calls} tool calls in one response only when every call is an independent read-only operation. Issue mutations, commands, plan updates, approval-sensitive calls, and calls that depend on earlier results one at a time and wait for each result."
-        )
-    };
-    let instructions = format!("{AGENT_DEVELOPER_INSTRUCTIONS} {tool_call_instruction}");
-    match input.project_instructions.as_deref() {
-        Some(project) => {
-            format!("{instructions}\n\nProject instructions:\n{project}")
-        }
-        None => instructions,
-    }
-}
-
-fn refresh_developer_instructions(
-    messages: &mut [ModelMessage],
-    input: &AgentLoopInput,
-    max_tool_calls: u32,
-) {
-    if let Some(message) = messages
-        .iter_mut()
-        .find(|message| message.role == ModelRole::Developer)
-    {
-        message.content = developer_instructions(input, max_tool_calls);
-    }
-}
-
-fn assistant_message_text(message: Option<&ModelMessage>) -> String {
-    message
-        .map(|message| message.content.clone())
-        .unwrap_or_default()
-}
-
-fn provider_history_assistant_message(
-    original: Option<&ModelMessage>,
-    model_visible_calls: &[ModelToolCall],
-    execution_calls: &[ModelToolCall],
-) -> ModelMessage {
-    // 在内部 occurrence 中保留拒绝调用的诊断信息，但不把 provider 原始名称或参数重放到下一次请求。
-    debug_assert_eq!(model_visible_calls.len(), execution_calls.len());
-    let mut message = original
-        .cloned()
-        .unwrap_or_else(|| ModelMessage::assistant_tool_calls(Vec::new()));
-    message.tool_calls = model_visible_calls
-        .iter()
-        .zip(execution_calls)
-        .map(|(model_visible_call, execution_call)| {
-            if execution_call.parse_status == ModelToolParseStatus::Valid {
-                model_visible_call.clone()
-            } else {
-                ModelToolCall {
-                    tool_call_id: model_visible_call.tool_call_id.clone(),
-                    tool_name: PROVIDER_HISTORY_REJECTED_TOOL.to_string(),
-                    arguments: json!({}),
-                    raw_arguments: "{}".to_string(),
-                    parse_status: ModelToolParseStatus::Valid,
-                    validation_errors: Vec::new(),
-                }
-            }
-        })
-        .collect();
-    message
-}
-
-fn tool_result_message(tool_result: &ToolResult, provider_tool_name: Option<&str>) -> ModelMessage {
-    let mut payload = tool_result.to_message_payload();
-    if let Some(provider_tool_name) = provider_tool_name {
-        payload["tool_name"] = json!(provider_tool_name);
-    }
-    let mut message = ModelMessage::text(ModelRole::Tool, payload.to_string());
-    message.tool_call_id = Some(tool_result.tool_call_id.clone());
-    message
-}
-
-fn tool_call_request(call: &ModelToolCall) -> ToolCallRequest {
-    // 执行 broker 校验解析后的可执行输入；provider 原始文本保留在模型消息和 approval checkpoint 中，不能定义执行器 payload。
-    ToolCallRequest::new(
-        call.tool_call_id.clone(),
-        call.tool_name.clone(),
-        serde_json::to_string(&call.arguments).expect("model tool arguments serialize"),
-    )
-}
-
 fn audit_events_from_tool_results(tool_results: &[ToolResult]) -> Vec<Value> {
     tool_results
         .iter()
@@ -5373,9 +4527,7 @@ fn permission_failure_kind(cause: &PermissionCause) -> ToolFailureKind {
 fn validate_plan_tool_input_contract(input: &Value) -> Result<(), ToolInputValidationError> {
     let input: AgentPlanUpdateInput = serde_json::from_value(input.clone())
         .map_err(|_| ToolInputValidationError::new("plan_input_shape_invalid"))?;
-    AgentPlan { steps: input.steps }
-        .validate_contract()
-        .map_err(|failure| ToolInputValidationError::new(failure.code()))
+    planning::validate_code(&input.steps).map_err(ToolInputValidationError::new)
 }
 
 fn invalid_tool_arguments_result(
