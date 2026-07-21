@@ -789,6 +789,7 @@ mod linux_tests {
         LinuxSandboxBackend, LinuxSandboxProbe, SandboxFilesystemMode, SandboxNetworkMode,
         WorkspaceMutation, probe_linux_capabilities,
     };
+    use std::ffi::OsString;
     use std::fs::{self, hard_link};
     use std::os::unix::fs::symlink;
     use std::thread;
@@ -824,6 +825,84 @@ mod linux_tests {
         request.filesystem.mode = filesystem;
         request.network.mode = network;
         request
+    }
+
+    struct EnvironmentGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvironmentGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = self.previous.take() {
+                    std::env::set_var(self.name, value);
+                } else {
+                    std::env::remove_var(self.name);
+                }
+            }
+        }
+    }
+
+    fn delayed_orphan_script(delay_seconds: u64) -> String {
+        format!(
+            r#"
+import os
+import time
+
+child = os.fork()
+if child == 0:
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        with open("orphan-setup-failed", "w") as marker:
+            marker.write("setpgid failed")
+        os._exit(91)
+    with open("orphan-ready", "w") as marker:
+        marker.write("ready")
+    time.sleep({delay_seconds})
+    with open("orphan-marker", "w") as marker:
+        marker.write("late")
+    os._exit(0)
+
+while not os.path.exists("orphan-ready"):
+    time.sleep(0.01)
+time.sleep(30)
+"#
+        )
+    }
+
+    fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.is_file() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        path.is_file()
+    }
+
+    fn assert_no_delayed_side_effect(workspace: &Path) {
+        let marker = workspace.join("orphan-marker");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            assert!(!marker.exists(), "orphan child produced a delayed marker");
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!marker.exists(), "orphan child produced a delayed marker");
+        assert!(
+            !workspace.join("orphan-setup-failed").exists(),
+            "the orphan process did not establish its independent process group"
+        );
     }
 
     #[test]
@@ -1064,6 +1143,150 @@ mod linux_tests {
             CommandExecutionStatus::Completed
         );
         assert_eq!(allowed_result.exit_code, Some(0));
+    }
+
+    #[test]
+    fn linux_child_inherits_secret_isolation_and_kernel_restrictions() {
+        let python = Path::new("/usr/bin/python3");
+        assert!(python.is_file(), "WSL test requires /usr/bin/python3");
+        assert!(
+            Path::new("/bin/sh").is_file(),
+            "strict shell is unavailable"
+        );
+        assert!(Path::new("/bin/cat").is_file(), "strict cat is unavailable");
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, "outside").expect("outside file");
+        let outside_file = path_str(&outside_file);
+        assert!(
+            !outside_file.contains('\''),
+            "temporary path unexpectedly contains a shell quote"
+        );
+        let _secret = EnvironmentGuard::set(
+            "SINGULARITY_LINUX_SANDBOX_SECRET_TOKEN",
+            "synthetic-linux-secret-sentinel",
+        );
+        let backend = strict_backend();
+        let script = format!(
+            r#"
+set -eu
+test "$$" -eq 1
+test -z "${{SINGULARITY_LINUX_SANDBOX_SECRET_TOKEN-}}"
+/bin/sh -c 'test "$$" -gt 1 && test -z "${{SINGULARITY_LINUX_SANDBOX_SECRET_TOKEN-}}"'
+if /usr/bin/python3 -c 'import socket; socket.socket().close()'; then exit 41; fi
+if /bin/sh -c '/usr/bin/python3 -c "import socket; socket.socket().close()"'; then exit 42; fi
+if /bin/cat '{outside_file}' >/dev/null 2>&1; then exit 43; fi
+if /bin/sh -c '/bin/cat "{outside_file}" >/dev/null 2>&1'; then exit 44; fi
+printf child-contract-ok
+"#
+        );
+        let result = backend.execute(&request(
+            "linux_child_contract",
+            &["/bin/sh", "-c", &script],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.sandbox.backend, "linux");
+        assert_eq!(
+            result.sandbox.enforcement,
+            SandboxBackendEnforcement::Strict
+        );
+        assert!(result.stdout_preview.contains("child-contract-ok"));
+        assert!(
+            !result
+                .stdout_preview
+                .contains("synthetic-linux-secret-sentinel")
+        );
+        assert!(
+            !result
+                .stderr_preview
+                .contains("synthetic-linux-secret-sentinel")
+        );
+    }
+
+    #[test]
+    fn linux_timeout_and_cancellation_remove_orphaned_process_tree_side_effects() {
+        let python = Path::new("/usr/bin/python3");
+        assert!(python.is_file(), "WSL test requires /usr/bin/python3");
+        let backend = strict_backend();
+
+        let timeout_workspace = tempfile::tempdir().expect("timeout workspace");
+        let timeout_script = delayed_orphan_script(5);
+        let mut timeout_request = request(
+            "linux_orphan_timeout",
+            &["/usr/bin/python3", "-c", &timeout_script],
+            timeout_workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        );
+        timeout_request.timeout_seconds = 3;
+        let timeout_result = backend.execute(&timeout_request);
+        assert_eq!(
+            timeout_result.execution_status,
+            CommandExecutionStatus::TimedOut
+        );
+        assert!(wait_for_file(
+            &timeout_workspace.path().join("orphan-ready"),
+            Duration::from_secs(3)
+        ));
+        assert_no_delayed_side_effect(timeout_workspace.path());
+
+        let cancel_workspace = tempfile::tempdir().expect("cancel workspace");
+        let cancel_script = delayed_orphan_script(2);
+        let cancellation = CancellationToken::new();
+        let cancel_request = request(
+            "linux_orphan_cancel",
+            &["/usr/bin/python3", "-c", &cancel_script],
+            cancel_workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        );
+        let worker_backend = backend.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            worker_backend.execute_cancellable(&cancel_request, &worker_cancellation)
+        });
+        let ready = wait_for_file(
+            &cancel_workspace.path().join("orphan-ready"),
+            Duration::from_secs(1),
+        );
+        cancellation.cancel();
+        let cancelled = worker.join().expect("cancelled orphan command worker");
+        assert!(ready, "cancelled command did not start its derived child");
+        assert_eq!(
+            cancelled.execution_status,
+            CommandExecutionStatus::Cancelled
+        );
+        assert_no_delayed_side_effect(cancel_workspace.path());
+    }
+
+    #[test]
+    fn linux_normal_exit_removes_orphaned_process_tree_side_effects() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = strict_backend();
+        let result = backend.execute(&request(
+            "linux_orphan_normal_exit",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf parent-ok; (printf ready > orphan-ready; sleep 2; printf late > orphan-marker) & while [ ! -f orphan-ready ]; do sleep 0.01; done; exit 0",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout_preview.contains("parent-ok"));
+        assert!(workspace.path().join("orphan-ready").is_file());
+        assert_no_delayed_side_effect(workspace.path());
     }
 
     #[test]
