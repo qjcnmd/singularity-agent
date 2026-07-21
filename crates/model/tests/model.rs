@@ -6,7 +6,7 @@ use singularity_model::{
     ModelErrorCategory, ModelErrorKind, ModelMessage, ModelPreferences, ModelProviderConfig,
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
-    ProviderApiProtocol, ProviderAttemptMetadata, ProviderAttemptOccurrence,
+    ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
     ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderCapabilityCacheLookupResult,
     ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderConfigSnapshot,
     ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
@@ -4538,6 +4538,95 @@ fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
     assert!(success.error_category.is_none());
     assert!(success.usage.is_none());
     assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+}
+
+#[test]
+fn openai_provider_observes_each_retry_as_one_ordered_start_end_pair() {
+    let success_body = r#"{
+        "id": "resp_observed_retry",
+        "choices": [{
+            "message": {"role": "assistant", "content": "done"},
+            "finish_reason": "stop"
+        }]
+    }"#;
+    let (base_url, attempts) = sequence_response_server(vec![
+        ("HTTP/1.1 429 Too Many Requests", "{}"),
+        ("HTTP/1.1 503 Service Unavailable", "{}"),
+        ("HTTP/1.1 200 OK", success_body),
+    ]);
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_observed_retry",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let mut events = Vec::new();
+
+    let response = Provider::complete_observed(
+        &provider,
+        &request,
+        &singularity_core::CancellationToken::new(),
+        &mut |event| {
+            events.push(event);
+            true
+        },
+    )
+    .expect("provider response after observed retries");
+
+    assert_eq!(response.status, ModelTurnStatus::Success);
+    assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(events.len(), 6);
+    for (offset, pair) in events.chunks_exact(2).enumerate() {
+        let ProviderAttemptEvent::Started(started) = &pair[0] else {
+            panic!("attempt must start before its terminal event");
+        };
+        let ProviderAttemptEvent::Finished(finished) = &pair[1] else {
+            panic!("attempt must finish before the next attempt starts");
+        };
+        assert_eq!(started.attempt_index, offset as u32 + 1);
+        assert_eq!(started.operation_phase, finished.operation_phase);
+        assert_eq!(started.provider_name, finished.provider_name);
+        assert_eq!(started.model_name, finished.model_name);
+        assert_eq!(started.actual_api_protocol, finished.actual_api_protocol);
+        assert_eq!(started.attempt_index, finished.attempt_index);
+        assert_eq!(started.started_at_unix_ms, finished.started_at_unix_ms);
+    }
+}
+
+#[test]
+fn openai_provider_rejects_observer_start_before_network_side_effect() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind observer rejection provider");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking observer rejection provider");
+    let address = listener.local_addr().expect("observer rejection address");
+    let provider =
+        OpenAiProvider::new(provider_test_config(format!("http://{address}"))).expect("provider");
+    let request = ModelTurnRequest::new(
+        "request_observer_rejected",
+        vec![ModelMessage::text(ModelRole::User, "hello")],
+    );
+    let mut event_count = 0;
+
+    let error = Provider::complete_observed(
+        &provider,
+        &request,
+        &singularity_core::CancellationToken::new(),
+        &mut |_event| {
+            event_count += 1;
+            false
+        },
+    )
+    .expect_err("observer rejection must fail closed");
+
+    assert_eq!(event_count, 1);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_attempt_observer_failed")
+    );
+    let accept_error = listener
+        .accept()
+        .expect_err("observer rejection must prevent the HTTP connection");
+    assert_eq!(accept_error.kind(), std::io::ErrorKind::WouldBlock);
 }
 
 #[test]

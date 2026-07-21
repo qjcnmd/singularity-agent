@@ -18,7 +18,7 @@ use super::{
     PROVIDER_CAPABILITY_CACHE_KEY_LOCK_PREFIX, PROVIDER_CAPABILITY_CACHE_KEY_LOCK_SUFFIX,
     PROVIDER_CAPABILITY_CACHE_LOCK_FILE_NAME, PROVIDER_CAPABILITY_CACHE_LOCK_RETRY_MS,
     PROVIDER_CAPABILITY_CACHE_SCHEMA_VERSION, PROVIDER_CAPABILITY_CACHE_TTL_SECONDS,
-    ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityCacheKey,
+    ProviderApiProtocol, ProviderAttemptEvent, ProviderAttemptMetadata, ProviderCapabilityCacheKey,
     ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
     ProviderCapabilityMetadata, ProviderCapabilityProbeKey, ProviderCapabilityProfile,
     ProviderError, ProviderErrorStage, ProviderProtocolContract, ProviderProtocolNegotiation,
@@ -1666,8 +1666,9 @@ impl OpenAiProvider {
         epochs: &HashMap<ProviderCapabilityCacheKey, u64>,
         deadline: Instant,
         cache_observations: Vec<ProviderCapabilityCacheObservation>,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<BoundProviderProtocolNegotiation, ProviderError> {
-        let result = self.probe_tool_capabilities(model_name, cancellation, deadline);
+        let result = self.probe_tool_capabilities(model_name, cancellation, deadline, on_attempt);
         let negotiation = match result {
             Ok(negotiation) => negotiation,
             Err(error) => {
@@ -1774,6 +1775,7 @@ impl OpenAiProvider {
         epochs: &HashMap<ProviderCapabilityCacheKey, u64>,
         deadline: Instant,
         mut cache_observations: Vec<ProviderCapabilityCacheObservation>,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<BoundProviderProtocolNegotiation, ProviderError> {
         let Some(persistent_cache) = &self.persistent_capability_cache else {
             return self.probe_and_remember_as_owner(
@@ -1782,6 +1784,7 @@ impl OpenAiProvider {
                 epochs,
                 deadline,
                 cache_observations,
+                on_attempt,
             );
         };
         let protocols = self.config.api_protocol_candidates();
@@ -1821,6 +1824,7 @@ impl OpenAiProvider {
                         epochs,
                         deadline,
                         cache_observations,
+                        on_attempt,
                     );
                 }
             }
@@ -1875,22 +1879,15 @@ impl OpenAiProvider {
             epochs,
             deadline,
             cache_observations,
+            on_attempt,
         )
     }
 
-    pub(super) fn negotiate_openai_tool_capabilities(
+    pub(super) fn negotiate_openai_tool_capabilities_bound_observed(
         &self,
         model_name: &str,
         cancellation: &CancellationToken,
-    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        self.negotiate_openai_tool_capabilities_bound(model_name, cancellation)
-            .map(|bound| bound.negotiation)
-    }
-
-    pub(super) fn negotiate_openai_tool_capabilities_bound(
-        &self,
-        model_name: &str,
-        cancellation: &CancellationToken,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<BoundProviderProtocolNegotiation, ProviderError> {
         let probe_key = self.capability_probe_key(model_name);
         let deadline = Instant::now() + self.capability_probe_deadline;
@@ -1962,6 +1959,7 @@ impl OpenAiProvider {
                     &epochs,
                     deadline,
                     cache_observations.clone(),
+                    on_attempt,
                 );
                 let result = match result {
                     Err(error) => Err(self.invalidate_fresh_probe_rejection(
@@ -2076,6 +2074,7 @@ impl OpenAiProvider {
         model_name: &str,
         cancellation: &CancellationToken,
         deadline: Instant,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         let protocols = self.config.api_protocol_candidates();
         let mut accumulated_metadata: Option<ProviderCapabilityMetadata> = None;
@@ -2085,6 +2084,7 @@ impl OpenAiProvider {
                 cancellation,
                 api_protocol,
                 deadline,
+                on_attempt,
             ) {
                 Ok(mut negotiation) => {
                     if let Some(metadata) = accumulated_metadata.take() {
@@ -2130,6 +2130,7 @@ impl OpenAiProvider {
         cancellation: &CancellationToken,
         api_protocol: ProviderApiProtocol,
         deadline: Instant,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         let mut probe_usage = ModelUsage::default();
         let mut probe_attempt_metadata = ProviderAttemptMetadata::zero();
@@ -2172,6 +2173,7 @@ impl OpenAiProvider {
                 &mut probe_usage,
                 &mut probe_attempt_metadata,
                 deadline,
+                on_attempt,
             ) {
                 Ok(completion) => completion,
                 Err(error) if is_capability_probe_profile_rejection(&error) => {
@@ -2215,6 +2217,7 @@ impl OpenAiProvider {
                     &mut probe_usage,
                     &mut probe_attempt_metadata,
                     deadline,
+                    on_attempt,
                 ) {
                     Ok(completion) => completion,
                     Err(error) => {
@@ -2293,6 +2296,7 @@ impl OpenAiProvider {
                     &mut probe_usage,
                     &mut probe_attempt_metadata,
                     deadline,
+                    on_attempt,
                 ) {
                     Ok(completion) => completion,
                     Err(error) if is_capability_probe_profile_rejection(&error) => {
@@ -2396,6 +2400,7 @@ impl OpenAiProvider {
         probe_usage: &mut ModelUsage,
         probe_attempt_metadata: &mut ProviderAttemptMetadata,
         deadline: Instant,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let model_name = request
             .model_preferences
@@ -2409,6 +2414,7 @@ impl OpenAiProvider {
             api_protocol,
             model_name,
             Some(deadline),
+            on_attempt,
         );
         match &result {
             Ok(completion) => {

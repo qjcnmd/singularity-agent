@@ -52,12 +52,14 @@ struct OutputChannels {
 #[derive(Clone)]
 struct TransportTraceSink {
     store: Arc<Mutex<SessionStore>>,
+    trace_session_id: uuid::Uuid,
 }
 
 impl TransportTraceSink {
     fn new(store: SessionStore) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
+            trace_session_id: uuid::Uuid::new_v4(),
         }
     }
 
@@ -69,7 +71,7 @@ impl TransportTraceSink {
         kind: TraceMetricSampleKind,
     ) -> Result<(), String> {
         let mut event = TraceEvent::for_turn(
-            event_id,
+            format!("{event_id}_{}", self.trace_session_id.simple()),
             binding.thread_id.clone(),
             binding.turn_id.clone(),
             "transport",
@@ -2131,6 +2133,35 @@ mod tests {
         .expect_err("drop metric persistence must fail closed");
         assert!(error.starts_with("transport trace persistence failed:"));
         assert_eq!(cancellation.request_count(), 1);
+    }
+
+    #[test]
+    fn transport_trace_ids_remain_unique_when_a_new_process_restarts_output_order() {
+        let (_directory, store, first_sink, binding) = transport_trace_fixture();
+        let second_sink = TransportTraceSink::new(
+            store
+                .trusted_reopen()
+                .expect("second transport trace store reopen"),
+        );
+
+        for sink in [&first_sink, &second_sink] {
+            sink.append(
+                &binding,
+                "trace_transport_writer_1".to_string(),
+                "stdout frame visible",
+                TraceMetricSampleKind::WriterVisible,
+            )
+            .expect("restarted output order must not collide");
+        }
+
+        assert_eq!(
+            transport_metric_count(
+                &store,
+                &binding.thread_id,
+                TraceMetricSampleKind::WriterVisible,
+            ),
+            2
+        );
     }
 
     #[test]

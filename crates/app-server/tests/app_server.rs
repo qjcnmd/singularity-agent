@@ -2699,11 +2699,45 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     struct SequenceProvider {
         responses: Vec<ModelTurnResponse>,
         seen_requests: Arc<Mutex<Vec<singularity_model::ModelTurnRequest>>>,
+        negotiation_count: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl singularity_model::Provider for SequenceProvider {
         fn protocol_contract(&self) -> ProviderProtocolContract {
             ProviderProtocolContract::default()
+        }
+
+        fn negotiate_tool_capabilities(
+            &self,
+            _model_preferences: &singularity_model::ModelPreferences,
+            _cancellation: &singularity_core::CancellationToken,
+        ) -> Result<singularity_model::ProviderProtocolNegotiation, singularity_model::ProviderError>
+        {
+            let observed_at_unix_ms = self
+                .negotiation_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            Ok(singularity_model::ProviderProtocolNegotiation {
+                contract: ProviderProtocolContract::default(),
+                metadata: singularity_model::ProviderCapabilityMetadata {
+                    api_protocol: singularity_model::ProviderApiProtocol::Declared,
+                    profile: singularity_model::ProviderCapabilityProfile::Declared,
+                    cache_hit: false,
+                    profile_attempts: 0,
+                    fallback_count: 0,
+                    probe_usage: ModelUsage::default(),
+                    probe_attempt_metadata: ProviderAttemptMetadata::default(),
+                    cache_observations: vec![
+                        singularity_model::ProviderCapabilityCacheObservation {
+                            api_protocol: singularity_model::ProviderApiProtocol::Declared,
+                            outcome: singularity_model::ProviderCapabilityCacheLookupResult::Miss,
+                            observed_at_unix_ms,
+                            model_turn_ordinal: None,
+                            parent_occurrence_id: None,
+                        },
+                    ],
+                },
+            })
         }
 
         fn complete(
@@ -2721,6 +2755,85 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
                 .clone();
             response.request_id = request.request_id.clone();
             Ok(response)
+        }
+
+        fn complete_observed(
+            &self,
+            request: &singularity_model::ModelTurnRequest,
+            cancellation: &singularity_core::CancellationToken,
+            on_attempt: &mut dyn FnMut(singularity_model::ProviderAttemptEvent) -> bool,
+        ) -> Result<ModelTurnResponse, singularity_model::ProviderError> {
+            let attempt_index = self.seen_requests.lock().expect("lock").len() as u32 + 1;
+            let started_at_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis() as u64;
+            let started = singularity_model::ProviderAttemptStarted {
+                operation_phase: singularity_model::ProviderAttemptOperationPhase::Completion,
+                provider_name: "test_sequence".to_string(),
+                model_name: "gpt-test".to_string(),
+                actual_api_protocol: singularity_model::ProviderApiProtocol::Declared,
+                attempt_index,
+                started_at_unix_ms,
+            };
+            if !on_attempt(singularity_model::ProviderAttemptEvent::Started(
+                started.clone(),
+            )) {
+                return Err(singularity_model::ProviderError::from_model_error(
+                    singularity_model::ModelError::new(
+                        singularity_model::ModelErrorKind::UnknownProviderError,
+                        "provider attempt observer rejected start",
+                    ),
+                ));
+            }
+            let result = self.complete(request, cancellation);
+            let ended_at_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis() as u64;
+            let (terminal_status, error_category, usage) = match &result {
+                Ok(response) => (
+                    singularity_model::ProviderAttemptStatus::Ok,
+                    None,
+                    Some(response.usage.clone()),
+                ),
+                Err(error) => (
+                    singularity_model::ProviderAttemptStatus::Error,
+                    Some(error.error.category()),
+                    None,
+                ),
+            };
+            let finished = singularity_model::ProviderAttemptOccurrence {
+                operation_phase: started.operation_phase,
+                provider_name: started.provider_name,
+                model_name: started.model_name,
+                actual_api_protocol: started.actual_api_protocol,
+                attempt_index: started.attempt_index,
+                terminal_status,
+                started_at_unix_ms,
+                ended_at_unix_ms,
+                attempt_duration_ms: ended_at_unix_ms.saturating_sub(started_at_unix_ms),
+                request_send_to_headers_ms: Some(0),
+                queue_duration_ms: None,
+                time_to_first_text_delta_ms: None,
+                retry_scheduled: false,
+                retry_backoff_ms: None,
+                error_category,
+                error_stage: None,
+                diagnostic_code: None,
+                usage,
+                model_turn_ordinal: None,
+                parent_occurrence_id: None,
+            };
+            if !on_attempt(singularity_model::ProviderAttemptEvent::Finished(finished)) {
+                return Err(singularity_model::ProviderError::from_model_error(
+                    singularity_model::ModelError::new(
+                        singularity_model::ModelErrorKind::UnknownProviderError,
+                        "provider attempt observer rejected finish",
+                    ),
+                ));
+            }
+            result
         }
     }
 
@@ -2781,6 +2894,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     let provider = SequenceProvider {
         responses: vec![edit_response, verify_response, final_response],
         seen_requests: Arc::clone(&seen_requests),
+        negotiation_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     let mut server = app_server(store).with_test_provider(Arc::new(provider));
@@ -2850,6 +2964,14 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     // 验证 turn 完成
     let store = SessionStore::open(&db_path).expect("reopen store");
     let completed_turn = store.get_turn(&turn_id).expect("turn");
+    let trace = store.list_trace(&thread_id).expect("trace");
+    if completed_turn.status != singularity_protocol::TurnStatus::Completed {
+        let diagnostics = trace
+            .iter()
+            .map(|event| (&event.component, &event.summary, &event.payload))
+            .collect::<Vec<_>>();
+        eprintln!("approval resume diagnostics: {diagnostics:#?}");
+    }
     assert_eq!(
         completed_turn.status,
         singularity_protocol::TurnStatus::Completed,
@@ -2869,7 +2991,6 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     assert_eq!(store.list_approval_decisions().expect("decisions").len(), 1);
 
     // 验证 trace 包含 agent_loop 完成记录
-    let trace = store.list_trace(&thread_id).expect("trace");
     assert!(
         trace.iter().any(|event| {
             event.component == "agent_loop" && event.payload["status"] == "completed"
@@ -2879,9 +3000,101 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
 
     // 验证 provider 收到了恢复后的请求（tool result 在 history 中）
     let requests = seen_requests.lock().expect("requests");
+    assert_eq!(
+        requests.len(),
+        3,
+        "edit, verification, and finalization requests"
+    );
+    let approved_edit_result = requests[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == singularity_model::ModelRole::Tool
+                && message.tool_call_id.as_deref() == Some("call_edit_1")
+        })
+        .expect("approved edit result must precede the resumed model request");
+    let approved_edit_payload: serde_json::Value =
+        serde_json::from_str(&approved_edit_result.content).expect("edit result payload");
+    assert_eq!(approved_edit_payload["ok"], true);
+    let command_result = requests[2]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == singularity_model::ModelRole::Tool
+                && message.tool_call_id.as_deref() == Some("call_cmd_1")
+        })
+        .expect("verification command result must precede finalization");
+    let command_payload: serde_json::Value =
+        serde_json::from_str(&command_result.content).expect("command result payload");
+    assert_eq!(command_payload["ok"], true);
+
+    let provider_events = trace
+        .iter()
+        .filter(|event| {
+            event.span_kind == Some(singularity_protocol::TraceSpanKind::ProviderAttempt)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        provider_events.len(),
+        6,
+        "three attempts need Start and End"
+    );
+    let mut provider_pairs = std::collections::BTreeMap::new();
+    for event in provider_events {
+        let span_id = event.span_id.as_deref().expect("provider span id");
+        let pair = provider_pairs.entry(span_id).or_insert((None, None));
+        match event.span_phase {
+            Some(singularity_protocol::TraceSpanPhase::Start) => pair.0 = Some(event),
+            Some(singularity_protocol::TraceSpanPhase::End) => pair.1 = Some(event),
+            None => panic!("provider span phase"),
+        }
+    }
+    assert_eq!(provider_pairs.len(), 3);
+    for (_span_id, (start, end)) in provider_pairs {
+        let start = start.expect("provider Start");
+        let end = end.expect("provider End");
+        let start_projection = start.span_projection.as_ref().expect("Start projection");
+        let end_projection = end.span_projection.as_ref().expect("End projection");
+        assert_eq!(start_projection.provider_name, end_projection.provider_name);
+        assert_eq!(start_projection.model_name, end_projection.model_name);
+        assert_eq!(start_projection.protocol, end_projection.protocol);
+        assert_eq!(
+            start_projection.operation_phase,
+            end_projection.operation_phase
+        );
+        assert_eq!(start_projection.attempt_index, end_projection.attempt_index);
+        assert_eq!(start_projection.retry_count, end_projection.retry_count);
+        assert_eq!(
+            end.span_status,
+            Some(singularity_protocol::TraceSpanStatus::Ok)
+        );
+    }
+    let verification_statuses = trace
+        .iter()
+        .filter(|event| event.span_phase == Some(singularity_protocol::TraceSpanPhase::End))
+        .filter_map(|event| event.span_projection.as_ref())
+        .filter_map(|projection| projection.verification.as_ref())
+        .filter_map(|verification| verification.status)
+        .collect::<Vec<_>>();
     assert!(
-        requests.len() >= 2,
-        "provider must receive at least the resume request after approval"
+        verification_statuses
+            .contains(&singularity_protocol::TraceVerificationStatus::CommandPassed)
+    );
+    assert!(
+        verification_statuses.contains(&singularity_protocol::TraceVerificationStatus::GatePassed)
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .flat_map(|event| &event.metric_samples)
+            .filter(|sample| {
+                sample.kind
+                    == singularity_protocol::TraceMetricSampleKind::ProviderCapabilityCacheMiss
+            })
+            .map(|sample| sample.count)
+            .sum::<u64>(),
+        2,
+        "initial and resumed capability-cache observations must both persist"
     );
 }
 

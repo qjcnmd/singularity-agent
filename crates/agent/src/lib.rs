@@ -5,6 +5,7 @@
 //! loop 将模型提供方可见历史与规范化可执行调用分离，所有副作用都经由 `ToolBroker`，
 //! 并在完成或恢复不变量不满足时拒绝继续执行。
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
@@ -17,9 +18,9 @@ use singularity_model::{
     DEFAULT_MAX_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS, ModelError, ModelErrorCategory,
     ModelErrorKind, ModelMessage, ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus,
     ModelToolSchema, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
-    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptMetadata,
-    ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError, ProviderErrorStage,
-    ProviderProtocolContract, ProviderStreamEvent, ToolChoiceMode,
+    PROVIDER_STREAMING_UNSUPPORTED_CODE, Provider, ProviderAttemptEvent, ProviderAttemptMetadata,
+    ProviderAttemptStarted, ProviderCapabilityMetadata, ProviderDiagnostic, ProviderError,
+    ProviderErrorStage, ProviderProtocolContract, ProviderStreamEvent, ToolChoiceMode,
     is_strict_tool_schema_compatible, provider_error_response,
     validate_model_request_with_capabilities, validate_model_turn_response,
 };
@@ -68,8 +69,9 @@ pub use observation::{
     FinalReviewObservation, FinalReviewStatus, OccurrenceIdentity, OccurrenceLifecycle,
     PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
     PromptAssemblyObservation, PromptAssemblyStatus, ProviderAttemptObservation,
-    ProviderAttemptStatus, SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation,
-    ToolCallStatus, VerificationObservation, VerificationStatus,
+    ProviderAttemptStatus, ProviderAttemptUsageObservation, SandboxExecutionOccurrence,
+    SandboxExecutionStatus, ToolCallObservation, ToolCallStatus, VerificationObservation,
+    VerificationStatus,
 };
 
 #[cfg(test)]
@@ -1182,7 +1184,7 @@ where
     fn run_internal(
         &self,
         input: &AgentLoopInput,
-        on_event: Option<&mut AgentLoopEventCallback<'_>>,
+        mut on_event: Option<&mut AgentLoopEventCallback<'_>>,
     ) -> AgentLoopResult {
         let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
@@ -1196,10 +1198,11 @@ where
                 }
             };
         state.completion = completion;
-        let (capabilities, mut state) = match self.negotiate_tool_capabilities(input, state, 0) {
-            ControlFlow::Continue(result) => result,
-            ControlFlow::Break(result) => return result,
-        };
+        let (capabilities, mut state) =
+            match self.negotiate_tool_capabilities(input, state, 0, &mut on_event) {
+                ControlFlow::Continue(result) => result,
+                ControlFlow::Break(result) => return result,
+            };
         let max_tool_calls = effective_max_tool_calls(&capabilities);
         let budget = match context_budget(input, &self.tool_broker, &capabilities, max_tool_calls) {
             Ok(budget) => budget,
@@ -1552,60 +1555,25 @@ where
                     Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                 );
             }
-            let provider_attempt_timer = OccurrenceTimer::start();
-            let provider_attempt_identity =
-                child_occurrence_identity(&prompt_identity, "provider_attempt", 0);
-            if emit_event(
+            let provider_events = RefCell::new(ProviderEventBridge::new(
+                prompt_identity.clone(),
+                finalization_only,
                 &mut on_event,
-                AgentLoopEvent::Observation(AgentObservation::ProviderAttempt(
-                    ProviderAttemptObservation {
-                        identity: provider_attempt_identity.clone(),
-                        lifecycle: provider_attempt_timer.started(),
-                        model_turn_ordinal: turn_index,
-                        attempt_index: 0,
-                    },
-                )),
-            )
-            .is_err()
-            {
-                return state.finish(
-                    AgentStatus::Failed,
-                    false,
-                    None,
-                    turn_index,
-                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                );
-            }
-            let mut streamed_text = String::new();
-            let mut event_sink_failed = false;
-            let stream_result = self.provider.complete_stream(
-                &request,
-                &self.cancellation,
-                &mut |event| match event {
-                    ProviderStreamEvent::OutputTextDelta { delta } => {
-                        streamed_text.push_str(&delta);
-                        if finalization_only
-                            && let Some(callback) = on_event.as_deref_mut()
-                            && callback(AgentLoopEvent::FinalTextDelta { delta }).is_err()
-                        {
-                            event_sink_failed = true;
-                        }
-                    }
-                },
-            );
-            if event_sink_failed {
-                return state.finish(
-                    AgentStatus::Failed,
-                    false,
-                    None,
-                    turn_index,
-                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                );
-            }
+            ));
+            let stream_result = {
+                let mut on_stream = |event| provider_events.borrow_mut().on_stream(event);
+                let mut on_attempt = |event| provider_events.borrow_mut().on_attempt(event);
+                self.provider.complete_stream_observed(
+                    &request,
+                    &self.cancellation,
+                    &mut on_stream,
+                    &mut on_attempt,
+                )
+            };
             let response = match stream_result {
                 Ok(response) if response.status == ModelTurnStatus::Success => {
                     let terminal_text = assistant_message_text(response.assistant_message.as_ref());
-                    if streamed_text != terminal_text {
+                    if provider_events.borrow().streamed_text != terminal_text {
                         provider_error_model_response(
                             &request,
                             ProviderError::from_model_error(provider_stream_text_mismatch_error()),
@@ -1619,7 +1587,15 @@ where
                     if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
                 {
                     let stream_error = error;
-                    match self.provider.complete(&request, &self.cancellation) {
+                    let completion = {
+                        let mut on_attempt = |event| provider_events.borrow_mut().on_attempt(event);
+                        self.provider.complete_observed(
+                            &request,
+                            &self.cancellation,
+                            &mut on_attempt,
+                        )
+                    };
+                    match completion {
                         Ok(mut response) => {
                             merge_response_runtime_metadata(&mut response, &stream_error);
                             response
@@ -1632,50 +1608,17 @@ where
                 }
                 Err(error) => provider_error_model_response(&request, error),
             };
-            state.observe_model_response(&response, turn_index, &prompt_identity.occurrence_id);
-            let provider_attempt_status = if response.status == ModelTurnStatus::Success {
-                ProviderAttemptStatus::Ok
-            } else if response
-                .error
-                .as_ref()
-                .is_some_and(|error| error.category() == ModelErrorCategory::Cancelled)
-            {
-                ProviderAttemptStatus::Cancelled
-            } else {
-                ProviderAttemptStatus::Error
-            };
-            let provider_attempt_count = response
-                .provider_attempt_metadata
-                .as_ref()
-                .map_or(1, |metadata| metadata.attempt_count.max(1));
-            for attempt_ordinal in 0..provider_attempt_count {
-                let attempt_identity = if attempt_ordinal == 0 {
-                    provider_attempt_identity.clone()
-                } else {
-                    child_occurrence_identity(&prompt_identity, "provider_attempt", attempt_ordinal)
-                };
-                if emit_event(
-                    &mut on_event,
-                    AgentLoopEvent::Observation(AgentObservation::ProviderAttempt(
-                        ProviderAttemptObservation {
-                            identity: attempt_identity,
-                            lifecycle: provider_attempt_timer.finished(provider_attempt_status),
-                            model_turn_ordinal: turn_index,
-                            attempt_index: attempt_ordinal,
-                        },
-                    )),
-                )
-                .is_err()
-                {
-                    return state.finish(
-                        AgentStatus::Failed,
-                        false,
-                        None,
-                        turn_index.saturating_add(1),
-                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
-                    );
-                }
+            let provider_events = provider_events.into_inner();
+            if provider_events.event_sink_failed || provider_events.active_attempt.is_some() {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                );
             }
+            state.observe_model_response(&response, turn_index, &prompt_identity.occurrence_id);
             actual_model_turns = turn_index.saturating_add(1);
             if self.is_cancelled(input) {
                 if emit_final_review_finished(
@@ -2192,11 +2135,15 @@ where
                 )),
             );
         }
-        let (capabilities, mut state) =
-            match self.negotiate_tool_capabilities(input, state, model_turn_offset) {
-                ControlFlow::Continue(result) => result,
-                ControlFlow::Break(result) => return result,
-            };
+        let (capabilities, mut state) = match self.negotiate_tool_capabilities(
+            input,
+            state,
+            model_turn_offset,
+            &mut on_event,
+        ) {
+            ControlFlow::Continue(result) => result,
+            ControlFlow::Break(result) => return result,
+        };
         let max_tool_calls = effective_max_tool_calls(&capabilities);
         let budget = match context_budget(input, &self.tool_broker, &capabilities, max_tool_calls) {
             Ok(budget) => budget,
@@ -2368,6 +2315,7 @@ where
         input: &AgentLoopInput,
         mut state: AgentLoopState,
         model_turns: u32,
+        on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
     ) -> ControlFlow<AgentLoopResult, (ProviderProtocolContract, AgentLoopState)> {
         if self.is_cancelled(input) {
             return ControlFlow::Break(state.finish(
@@ -2378,10 +2326,27 @@ where
                 None,
             ));
         }
-        match self
-            .provider
-            .negotiate_tool_capabilities(&input.model_preferences, &self.cancellation)
-        {
+        let provider_events =
+            RefCell::new(ProviderEventBridge::new_root(input, model_turns, on_event));
+        let negotiation = {
+            let mut on_attempt = |event| provider_events.borrow_mut().on_attempt(event);
+            self.provider.negotiate_tool_capabilities_observed(
+                &input.model_preferences,
+                &self.cancellation,
+                &mut on_attempt,
+            )
+        };
+        let provider_events = provider_events.into_inner();
+        if provider_events.event_sink_failed || provider_events.active_attempt.is_some() {
+            return ControlFlow::Break(state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turns,
+                Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+            ));
+        }
+        match negotiation {
             Ok(negotiation) => {
                 state.record_provider_negotiation(
                     model_turns,
@@ -4312,6 +4277,200 @@ fn emit_final_review_finished(
     )
 }
 
+enum ProviderAttemptIdentityScope {
+    Child(OccurrenceIdentity),
+    Root {
+        thread_id: String,
+        turn_id: String,
+        model_turn_ordinal: u32,
+    },
+}
+
+struct ProviderEventBridge<'a, 'callback_ref, 'callback> {
+    identity_scope: ProviderAttemptIdentityScope,
+    finalization_only: bool,
+    on_event: &'a mut Option<&'callback_ref mut AgentLoopEventCallback<'callback>>,
+    streamed_text: String,
+    next_attempt_ordinal: u32,
+    active_attempt: Option<(ProviderAttemptStarted, OccurrenceIdentity)>,
+    event_sink_failed: bool,
+}
+
+impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callback> {
+    fn new(
+        prompt_identity: OccurrenceIdentity,
+        finalization_only: bool,
+        on_event: &'a mut Option<&'callback_ref mut AgentLoopEventCallback<'callback>>,
+    ) -> Self {
+        Self {
+            identity_scope: ProviderAttemptIdentityScope::Child(prompt_identity),
+            finalization_only,
+            on_event,
+            streamed_text: String::new(),
+            next_attempt_ordinal: 0,
+            active_attempt: None,
+            event_sink_failed: false,
+        }
+    }
+
+    fn new_root(
+        input: &AgentLoopInput,
+        model_turn_ordinal: u32,
+        on_event: &'a mut Option<&'callback_ref mut AgentLoopEventCallback<'callback>>,
+    ) -> Self {
+        Self {
+            identity_scope: ProviderAttemptIdentityScope::Root {
+                thread_id: input.thread_id.clone(),
+                turn_id: input.turn_id.clone(),
+                model_turn_ordinal,
+            },
+            finalization_only: false,
+            on_event,
+            streamed_text: String::new(),
+            next_attempt_ordinal: 0,
+            active_attempt: None,
+            event_sink_failed: false,
+        }
+    }
+
+    fn on_stream(&mut self, event: ProviderStreamEvent) {
+        match event {
+            ProviderStreamEvent::OutputTextDelta { delta } => {
+                self.streamed_text.push_str(&delta);
+                if self.finalization_only
+                    && emit_event(self.on_event, AgentLoopEvent::FinalTextDelta { delta }).is_err()
+                {
+                    self.event_sink_failed = true;
+                }
+            }
+        }
+    }
+
+    fn on_attempt(&mut self, event: ProviderAttemptEvent) -> bool {
+        if self.event_sink_failed {
+            return false;
+        }
+        let result = match event {
+            ProviderAttemptEvent::Started(started) => self.start_attempt(started),
+            ProviderAttemptEvent::Finished(finished) => self.finish_attempt(finished),
+        };
+        if result.is_err() {
+            self.event_sink_failed = true;
+            return false;
+        }
+        true
+    }
+
+    fn start_attempt(&mut self, started: ProviderAttemptStarted) -> Result<(), ()> {
+        if self.active_attempt.is_some() {
+            return Err(());
+        }
+        let identity = match &self.identity_scope {
+            ProviderAttemptIdentityScope::Child(parent) => {
+                child_occurrence_identity(parent, "provider_attempt", self.next_attempt_ordinal)
+            }
+            ProviderAttemptIdentityScope::Root {
+                thread_id,
+                turn_id,
+                model_turn_ordinal,
+            } => root_occurrence_identity(
+                thread_id,
+                turn_id,
+                "provider_attempt",
+                *model_turn_ordinal,
+                self.next_attempt_ordinal,
+            ),
+        };
+        let observation = ProviderAttemptObservation {
+            identity: identity.clone(),
+            lifecycle: OccurrenceLifecycle::Started {
+                queued_at_unix_ms: started.started_at_unix_ms,
+                started_at_unix_ms: started.started_at_unix_ms,
+            },
+            operation_phase: started.operation_phase,
+            provider_name: started.provider_name.clone(),
+            model_name: started.model_name.clone(),
+            actual_api_protocol: started.actual_api_protocol,
+            attempt_index: started.attempt_index,
+            retry_count: started.attempt_index.saturating_sub(1),
+            request_send_to_headers_ms: None,
+            time_to_first_text_delta_ms: None,
+            retry_backoff_ms: None,
+            error_category: None,
+            error_stage: None,
+            diagnostic_code: None,
+            usage: None,
+        };
+        emit_event(
+            self.on_event,
+            AgentLoopEvent::Observation(AgentObservation::ProviderAttempt(Box::new(observation))),
+        )
+        .map_err(|_| ())?;
+        self.active_attempt = Some((started, identity));
+        Ok(())
+    }
+
+    fn finish_attempt(
+        &mut self,
+        finished: singularity_model::ProviderAttemptOccurrence,
+    ) -> Result<(), ()> {
+        let Some((started, identity)) = self.active_attempt.take() else {
+            return Err(());
+        };
+        if started.operation_phase != finished.operation_phase
+            || started.provider_name != finished.provider_name
+            || started.model_name != finished.model_name
+            || started.actual_api_protocol != finished.actual_api_protocol
+            || started.attempt_index != finished.attempt_index
+            || started.started_at_unix_ms != finished.started_at_unix_ms
+        {
+            return Err(());
+        }
+        let status = match finished.terminal_status {
+            singularity_model::ProviderAttemptStatus::Ok => ProviderAttemptStatus::Ok,
+            singularity_model::ProviderAttemptStatus::Error => ProviderAttemptStatus::Error,
+            singularity_model::ProviderAttemptStatus::Cancelled => ProviderAttemptStatus::Cancelled,
+        };
+        let usage = finished.usage.map(|usage| ProviderAttemptUsageObservation {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        });
+        let observation = ProviderAttemptObservation {
+            identity,
+            lifecycle: OccurrenceLifecycle::Finished {
+                queued_at_unix_ms: finished.started_at_unix_ms,
+                started_at_unix_ms: finished.started_at_unix_ms,
+                ended_at_unix_ms: finished.ended_at_unix_ms,
+                duration_ms: finished.attempt_duration_ms,
+                status,
+            },
+            operation_phase: finished.operation_phase,
+            provider_name: finished.provider_name,
+            model_name: finished.model_name,
+            actual_api_protocol: finished.actual_api_protocol,
+            attempt_index: finished.attempt_index,
+            retry_count: finished.attempt_index.saturating_sub(1),
+            request_send_to_headers_ms: finished.request_send_to_headers_ms,
+            time_to_first_text_delta_ms: finished.time_to_first_text_delta_ms,
+            retry_backoff_ms: finished.retry_backoff_ms,
+            error_category: finished.error_category,
+            error_stage: finished.error_stage,
+            diagnostic_code: finished.diagnostic_code,
+            usage,
+        };
+        emit_event(
+            self.on_event,
+            AgentLoopEvent::Observation(AgentObservation::ProviderAttempt(Box::new(observation))),
+        )
+        .map_err(|_| ())?;
+        self.next_attempt_ordinal = self.next_attempt_ordinal.saturating_add(1);
+        Ok(())
+    }
+}
+
 fn emit_verification_occurrence(
     on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
     input: &AgentLoopInput,
@@ -4346,13 +4505,31 @@ fn occurrence_identity(
     ordinal: u32,
     parent_occurrence_id: Option<String>,
 ) -> OccurrenceIdentity {
+    let mut identity = root_occurrence_identity(
+        &input.thread_id,
+        &input.turn_id,
+        kind,
+        model_turn_ordinal,
+        ordinal,
+    );
+    identity.parent_occurrence_id = parent_occurrence_id;
+    identity
+}
+
+fn root_occurrence_identity(
+    thread_id: &str,
+    turn_id: &str,
+    kind: &str,
+    model_turn_ordinal: u32,
+    ordinal: u32,
+) -> OccurrenceIdentity {
     let encoded = format!(
         "{}\u{0}{}\u{0}{kind}\u{0}{model_turn_ordinal}\u{0}{ordinal}",
-        input.thread_id, input.turn_id
+        thread_id, turn_id
     );
     OccurrenceIdentity {
         occurrence_id: format!("sha256:{:x}", Sha256::digest(encoded.as_bytes())),
-        parent_occurrence_id,
+        parent_occurrence_id: None,
         ordinal,
     }
 }

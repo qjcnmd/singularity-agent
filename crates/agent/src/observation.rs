@@ -7,6 +7,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use singularity_model::{
+    ModelErrorCategory, ProviderApiProtocol, ProviderAttemptOperationPhase, ProviderErrorStage,
+};
 
 /// event sink 拒绝事件时使用的不透明错误；原始 sink 错误不会进入 Agent 结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +34,7 @@ pub enum AgentLoopEvent {
 #[serde(tag = "kind", content = "occurrence", rename_all = "snake_case")]
 pub enum AgentObservation {
     PromptAssembly(PromptAssemblyObservation),
-    ProviderAttempt(ProviderAttemptObservation),
+    ProviderAttempt(Box<ProviderAttemptObservation>),
     ToolCall(ToolCallObservation),
     PolicyDecision(PolicyDecisionObservation),
     SandboxExecution(SandboxExecutionOccurrence),
@@ -213,8 +216,29 @@ pub enum ProviderAttemptStatus {
 pub struct ProviderAttemptObservation {
     pub identity: OccurrenceIdentity,
     pub lifecycle: OccurrenceLifecycle<ProviderAttemptStatus>,
-    pub model_turn_ordinal: u32,
+    pub operation_phase: ProviderAttemptOperationPhase,
+    pub provider_name: String,
+    pub model_name: String,
+    pub actual_api_protocol: ProviderApiProtocol,
     pub attempt_index: u32,
+    pub retry_count: u32,
+    pub request_send_to_headers_ms: Option<u64>,
+    pub time_to_first_text_delta_ms: Option<u64>,
+    pub retry_backoff_ms: Option<u64>,
+    pub error_category: Option<ModelErrorCategory>,
+    pub error_stage: Option<ProviderErrorStage>,
+    pub diagnostic_code: Option<String>,
+    pub usage: Option<ProviderAttemptUsageObservation>,
+}
+
+/// Provider attempt usage fields safe for typed trace projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderAttemptUsageObservation {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub reasoning_tokens: u64,
 }
 
 /// tool-free finalization-only model request 的终态。

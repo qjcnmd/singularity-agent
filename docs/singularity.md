@@ -92,6 +92,8 @@ sg run <goal>
 
 `singularity_app_server` 的 Tokio stdin owner 继续处理 protocol 请求；单请求中的 `turn/start` 和可能继续运行 AgentLoop 的 `approval/decision` 由独立 blocking request worker 使用新的 SQLite connection 执行，因此同一进程可以在 turn 或 approval continuation 运行时接收 `turn/interrupt` 和 `server/shutdown`。batch 始终在 stdin owner 按项串行处理。不同 workspace 可以并发，同一 workspace 由 Store execution guard 串行。进程最多同时接纳 16 个 request worker；stdout 使用容量 64 的控制响应队列和容量 256 的事件通知队列，由单独异步 writer 按全局 reserve order 合并两条队列写出。只有 typed `Progress` + `BestEffort` 事件在 event queue 满时可以丢弃，并以 `event/gap` 显式声明丢弃的 cursor 范围；其非阻塞 `try_send`、order reservation 与 gap commit 在同一短临界区完成，SQLite 写入不在该锁内执行。`State` 和 `Gap` 事件走可靠背压，不静默丢失，并在可能阻塞的发送前释放全局排序锁。Turn 创建与 approval checkpoint 提供显式 `TransportTraceBinding`，transport 不解析公共 JSON 推断 thread/turn；Full 成功登记 drop 后写 `EventQueueDrop`，gap 成功进入可靠队列后写 `EventGap`，frame 的 JSON、换行和 flush 全部成功后由 `spawn_blocking` 写 `WriterVisible`。这些 sample 使用同一 trusted-reopen SQLite Trace；Store/projector/writer 失败会锁存全局 execution stop 并终止 transport。worker 超限和控制队列过载遵守各自的错误或背压合同；真实 transport 断开或 write/flush 失败同样 fail closed。worker 复用同一个 active-turn cancellation registry；stdout 仍由唯一 writer 串行输出 JSONL。
 
+每次 app-server stdio transport 启动时生成独立的 trace-session UUID；drop、gap 和 writer-visible event ID 同时绑定该 UUID 与进程内 output order。output order 只负责本进程排序，不再被误作跨进程全局身份，因此同一 Turn 在新的 CLI/app-server 进程中继续或恢复时可以从本地序号重新开始而不会覆盖或碰撞既有 SQLite Trace。
+
 ## 4. Thread、Turn 与 Continue
 
 ### Thread
@@ -191,6 +193,8 @@ Provider 失败通过 `ProviderDiagnostic` 投影稳定的 `code`、`stage`、tr
 每次 complete 在 current-thread Tokio runtime 中执行可取消 HTTP future；配置、请求校验、HTTP status、body、JSON decode 和 response validation 都使用稳定诊断。请求上限为 1 时发送 `parallel_tool_calls=false`，大于 1 时才发送 `true`；strict 仍由 contract 与本地 schema 检查共同决定。普通请求使用 `tool_choice="auto"`，显式 `Required` 只有 contract 声明支持时才可发送。缺失/重复 call id、非对象参数、reasoning/history 违约或 assistant 文本中的完整 `<tool_call>...</tool_call>` envelope 都在执行前 typed fail closed；文本永不解析执行。合法 Direct tool history 使用 canonical tool name，拒绝历史只保留 `tool_rejected` 占位和 call id 配对，不形成第二套执行路径。
 
 一次 provider complete 最多执行 3 次 attempt，重试只覆盖可重试的网络/timeout 或 response body read 错误，以及 HTTP 429 和 5xx；请求本地校验、JSON decode 和 response validation 不通过时不重试。重试 backoff 以 50 ms 为基数并逐次翻倍（在最多 3 次 attempt 下实际等待 50 ms、100 ms），且每次等待都检查 cancellation。每次响应或错误携带 `ProviderAttemptMetadata` 的 `attempt_count`、`retry_count` 和总 `latency_ms`；AgentLoop 按真实 model turn 累加这些字段。`ModelUsage` 同时累计 input/output/total、cached input、reasoning token 和可选 cost；这些是诊断和 evaluation 投影，不改变 completion 或 blocker 语义。
+
+`ProviderAttemptEvent` 位于真实 reqwest attempt 边界：每次 capability probe 或 completion 在发送 HTTP request 前同步产生 Start，同一个 request 在成功、错误、取消或安排 retry 时产生唯一 End；observer 拒绝 Start 会在网络连接前 fail closed，拒绝 End 会停止后续 retry。AgentLoop 只为这些 typed transport event 绑定 Turn/Prompt parent 与 occurrence identity，`TraceProjector` 按 callback 顺序直接写入 SQLite；最终聚合的 `ProviderAttemptMetadata` 只用于状态和 Evaluation 汇总，不再反向补造第二组 span。Start/End 共享 provider、model、protocol、operation phase、attempt/retry identity，End 追加 send-to-headers、TTFT、backoff、usage 和 typed error。
 
 公共 `providerConfiguration` 只表示配置状态，包含来源、snapshot id、`configured`、`configurationBlocker` 和三个字段的 present/missing；它不声称网络或模型请求已经成功。Provider error 只投影稳定 code、阶段、可靠 transport 类别、HTTP status 和 response validation codes。API key、base URL 原值、Authorization header、原始 response 和原始 prompt 不进入 CLI、Evaluation 或 trace。普通 agent trace 与 Evaluation `agent-trace.json` 可以记录安全的 `provider_protocol`，仅包含可选 contract 和 capability metadata；不会记录 model 名、prompt、raw response、key 或 base_url。HTTP 200 但返回文本伪工具调用时 fail closed，本地完整 `ToolSpec` validation 不关闭。
 
@@ -324,6 +328,8 @@ store 在写入 item、trace 和 artifact reference 前执行敏感文本检查�
 Store 只持久化上游已经完成的 audit projection，再对 trace payload 做递归敏感文本脱敏和 hash 完整性校验；AppServer 在进入该边界前把 provider body、project-instruction 内容、workspace/raw error 和 raw arguments 投影为固定安全摘要及稳定 stage/cause/cleanup 字段，trace 只保存 typed provider diagnostic，不保存 validation 原文。`TraceEvent::for_turn` 固定 `run_id=thread_id`、`session_id=turn_id`、`task_id=turn_id`，所有 turn trace 写入在同一 `BEGIN IMMEDIATE` 事务内校验并插入，list/tail 批量预取绑定后统一验证。唯一可判定的历史 turn-shaped trace 按 `task_id` 归一化，存在歧义则拒绝；读取 roundtrip 不会恢复被投影丢弃的原始字段。`approvals` 直接保存并索引 `thread_id`/`turn_id`，approval request 每次读取都与 JSON payload 比较；Defer 保持 pending/resumable，不产生最终 decision history。`pending_tool_calls.payload` 不作为 Store 的第二 checkpoint schema，Store 只维护其显式关系、幂等和 execution-state；版本化 checkpoint 的唯一 codec seam 在 AppServer/AgentLoop。history 先解码所选 turn 的全部 status、kind 和 item status，再投影 user/agent，坏行不会被 SQL 过滤隐藏。
 
 Trace span 的生命周期由 Store 的 typed API 负责：Turn/Approval/PromptAssembly/ProviderAttempt/ToolCall/PolicyDecision/SandboxExecution/Verification/FinalReview 等 span 只能由明确的 Start、状态变更和 End 事件组成；Start、End、metric sample 与对应 Turn 状态在同一 SQLite 事务中提交，重复 Start 只有在 identity 完全相同时幂等，identity 冲突、非法 parent、缺少 terminal duration 或未知状态均 fail closed。SQLite `trace_events` 是运行时唯一事实源，CLI、transport metrics 和后续导出只能查询或投影它，不得创建并行 collector、队列或内存 registry。
+
+Provider capability-cache metric 的 trace identity 来自同一个 typed lookup observation：绑定后的 Prompt parent、model-turn ordinal、protocol、Hit/Miss、真实 lookup 时间和 occurrence index 共同构成稳定身份。Blocked Turn 恢复时新的 model turn/parent 产生新的 identity，不会因每段局部 vector index 从 0 重启而与暂停前的 metric 冲突；同一 observation 被重复投影仍保持同一 ID 并由 Store 拒绝重复写入。
 
 ## 12. Evaluation
 

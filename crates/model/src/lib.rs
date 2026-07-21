@@ -694,6 +694,26 @@ pub enum ProviderStreamEvent {
     OutputTextDelta { delta: String },
 }
 
+/// One safe runtime boundary event for a real provider HTTP attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderAttemptEvent {
+    /// Emitted immediately before the HTTP request is sent.
+    Started(ProviderAttemptStarted),
+    /// Emitted once when that same request reaches a terminal outcome.
+    Finished(ProviderAttemptOccurrence),
+}
+
+/// The stable, non-sensitive fields known when a provider HTTP attempt starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAttemptStarted {
+    pub operation_phase: ProviderAttemptOperationPhase,
+    pub provider_name: String,
+    pub model_name: String,
+    pub actual_api_protocol: ProviderApiProtocol,
+    pub attempt_index: u32,
+    pub started_at_unix_ms: u64,
+}
+
 /// Typed normalized text-stream capability for one selected provider protocol.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -718,7 +738,8 @@ impl ProviderStreamingCapability {
 }
 
 /// 一次真实 provider HTTP attempt 所属的运行期操作阶段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptOperationPhase {
     /// Provider capability negotiation probe.
     CapabilityProbe,
@@ -727,7 +748,8 @@ pub enum ProviderAttemptOperationPhase {
 }
 
 /// 一次真实 provider HTTP attempt 的终态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptStatus {
     /// The attempt produced a valid provider response.
     Ok,
@@ -837,6 +859,18 @@ pub trait Provider {
         ))
     }
 
+    /// Negotiate tool capabilities while exposing real HTTP attempt boundaries.
+    ///
+    /// Providers without transport-level observations retain the legacy behavior.
+    fn negotiate_tool_capabilities_observed(
+        &self,
+        model_preferences: &ModelPreferences,
+        cancellation: &CancellationToken,
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        self.negotiate_tool_capabilities(model_preferences, cancellation)
+    }
+
     /// Report the typed stream capability for the protocol selected by this provider.
     ///
     /// Legacy providers default to unsupported, even if their unrelated protocol metadata uses
@@ -861,12 +895,33 @@ pub trait Provider {
         Err(provider_streaming_unsupported_error())
     }
 
+    /// Stream visible text and expose each underlying HTTP attempt in real time.
+    fn complete_stream_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        self.complete_stream(request, cancellation, on_event)
+    }
+
     /// 完成一个已校验请求，同时保留取消和类型化模型提供方错误。
     fn complete(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError>;
+
+    /// Complete a request and expose each underlying HTTP attempt in real time.
+    fn complete_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        _on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        self.complete(request, cancellation)
+    }
 }
 
 /// 允许 `Arc<dyn Provider>` 作为透明代理，使测试可以注入动态 provider。
@@ -881,6 +936,15 @@ impl Provider for Arc<dyn Provider + Send + Sync> {
         cancellation: &CancellationToken,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
         (**self).negotiate_tool_capabilities(model_preferences, cancellation)
+    }
+
+    fn negotiate_tool_capabilities_observed(
+        &self,
+        model_preferences: &ModelPreferences,
+        cancellation: &CancellationToken,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        (**self).negotiate_tool_capabilities_observed(model_preferences, cancellation, on_attempt)
     }
 
     fn streaming_capability(
@@ -899,12 +963,31 @@ impl Provider for Arc<dyn Provider + Send + Sync> {
         (**self).complete_stream(request, cancellation, on_event)
     }
 
+    fn complete_stream_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        (**self).complete_stream_observed(request, cancellation, on_event, on_attempt)
+    }
+
     fn complete(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError> {
         (**self).complete(request, cancellation)
+    }
+
+    fn complete_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        (**self).complete_observed(request, cancellation, on_attempt)
     }
 }
 
@@ -1327,7 +1410,13 @@ mod transport_tests {
         .expect("deadline provider");
         provider.capability_probe_deadline = Duration::from_millis(50);
         let error = provider
-            .negotiate_openai_tool_capabilities("gpt-test", &CancellationToken::new())
+            .negotiate_tool_capabilities(
+                &ModelPreferences {
+                    model_name: Some("gpt-test".to_string()),
+                    ..ModelPreferences::default()
+                },
+                &CancellationToken::new(),
+            )
             .expect_err("capability probe deadline must fail closed");
         assert_eq!(
             error.error.code.as_deref(),

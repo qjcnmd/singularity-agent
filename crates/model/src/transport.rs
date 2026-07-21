@@ -21,12 +21,12 @@ use super::{
     OpenAiProvider, OpenAiProviderConfig, PROVIDER_CANCELLATION_POLL_MS,
     PROVIDER_RETRY_BASE_BACKOFF_MS, PROVIDER_RUNTIME_INITIALIZATION_ERROR_CODE,
     PROVIDER_RUNTIME_WORKER_THREADS, PROVIDER_TIMEOUT_SECONDS, Provider, ProviderApiProtocol,
-    ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
-    ProviderAttemptStatus, ProviderCapabilityMetadata, ProviderError, ProviderErrorStage,
-    ProviderProtocolContract, ProviderProtocolNegotiation, ProviderRuntime, ProviderStreamEvent,
-    ProviderStreamingCapability, ProviderToolReasoningMode, ProviderTransportCategory,
-    provider_streaming_unsupported_error, responses_endpoint, validate_model_request,
-    validate_model_request_with_capabilities,
+    ProviderAttemptEvent, ProviderAttemptMetadata, ProviderAttemptOccurrence,
+    ProviderAttemptOperationPhase, ProviderAttemptStarted, ProviderAttemptStatus,
+    ProviderCapabilityMetadata, ProviderError, ProviderErrorStage, ProviderProtocolContract,
+    ProviderProtocolNegotiation, ProviderRuntime, ProviderStreamEvent, ProviderStreamingCapability,
+    ProviderToolReasoningMode, ProviderTransportCategory, provider_streaming_unsupported_error,
+    responses_endpoint, validate_model_request, validate_model_request_with_capabilities,
 };
 use serde_json::Value;
 use singularity_core::CancellationToken;
@@ -89,6 +89,17 @@ impl ProviderAttemptInProgress {
             request_send_to_headers_ms: None,
             time_to_first_text_delta_ms: None,
         }
+    }
+
+    fn started_event(&self) -> ProviderAttemptEvent {
+        ProviderAttemptEvent::Started(ProviderAttemptStarted {
+            operation_phase: self.operation_phase,
+            provider_name: self.provider_name.clone(),
+            model_name: self.model_name.clone(),
+            actual_api_protocol: self.actual_api_protocol,
+            attempt_index: self.attempt_index,
+            started_at_unix_ms: self.started_at_unix_ms,
+        })
     }
 
     fn mark_response_headers_received(&mut self) {
@@ -239,11 +250,11 @@ impl OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    /// Validate the request and resolve the already-negotiated OpenAI protocol.
-    fn prepare_completion_context(
+    fn prepare_completion_context_observed(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<CompletionContext, ProviderError> {
         let local_validation = validate_model_request(request);
         if !local_validation.valid {
@@ -266,8 +277,11 @@ impl OpenAiProvider {
                     .model_name
                     .as_deref()
                     .unwrap_or(&self.config.model_name);
-                let binding = self
-                    .negotiate_openai_tool_capabilities_bound(effective_model_name, cancellation)?;
+                let binding = self.negotiate_openai_tool_capabilities_bound_observed(
+                    effective_model_name,
+                    cancellation,
+                    on_attempt,
+                )?;
                 let api_protocol = binding.negotiation.metadata.api_protocol;
                 capability_binding = Some(binding.clone());
                 (
@@ -327,20 +341,23 @@ impl OpenAiProvider {
         result.map_err(|error| attach_capability_metadata(error, &context.capability_metadata))
     }
 
-    pub(super) fn complete_with_contract(
+    fn complete_with_contract_observed(
         &self,
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
         capabilities: &ProviderProtocolContract,
         api_protocol: ProviderApiProtocol,
         model_name: &str,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<ModelTurnResponse, ProviderError> {
-        let completion = self.complete_with_contract_details(
+        let completion = self.complete_with_contract_details_until(
             request,
             cancellation,
             capabilities,
             api_protocol,
             model_name,
+            None,
+            on_attempt,
         )?;
         if request_uses_tool_protocol(request) && completion.reasoning_content_present {
             return Err(provider_tool_reasoning_history_error(
@@ -359,6 +376,7 @@ impl OpenAiProvider {
         capabilities: &ProviderProtocolContract,
         model_name: &str,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let runtime = self.runtime.as_ref();
         let started_at = Instant::now();
@@ -380,6 +398,7 @@ impl OpenAiProvider {
                 ProviderApiProtocol::OpenAiResponses,
                 metadata.attempt_count,
             );
+            emit_provider_attempt_started(&occurrence, on_attempt)?;
             let response = match block_on_provider_future(
                 runtime,
                 cancellation,
@@ -404,7 +423,7 @@ impl OpenAiProvider {
                         && provider_error_is_retryable(&error) =>
                 {
                     let retry_backoff =
-                        record_provider_retry(&mut metadata, occurrence, &error.error);
+                        record_provider_retry(&mut metadata, occurrence, &error.error, on_attempt)?;
                     wait_stream_retry_backoff(
                         runtime,
                         cancellation,
@@ -415,7 +434,13 @@ impl OpenAiProvider {
                     continue;
                 }
                 Err(error) => {
-                    record_provider_attempt(&mut metadata, occurrence, Some(&error.error), None);
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        Some(&error.error),
+                        None,
+                        on_attempt,
+                    )?;
                     return Err(
                         error.with_provider_attempt_metadata(provider_attempt_metadata(
                             &metadata, started_at,
@@ -434,7 +459,7 @@ impl OpenAiProvider {
                     && http_status_is_retryable(status.as_u16())
                 {
                     let retry_backoff =
-                        record_provider_retry(&mut metadata, occurrence, &error.error);
+                        record_provider_retry(&mut metadata, occurrence, &error.error, on_attempt)?;
                     wait_stream_retry_backoff(
                         runtime,
                         cancellation,
@@ -444,7 +469,13 @@ impl OpenAiProvider {
                     )?;
                     continue;
                 }
-                record_provider_attempt(&mut metadata, occurrence, Some(&error.error), None);
+                record_provider_attempt(
+                    &mut metadata,
+                    occurrence,
+                    Some(&error.error),
+                    None,
+                    on_attempt,
+                )?;
                 return Err(
                     error.with_provider_attempt_metadata(provider_attempt_metadata(
                         &metadata, started_at,
@@ -470,8 +501,12 @@ impl OpenAiProvider {
                         && provider_error_is_retryable(&failure.error) =>
                 {
                     occurrence.set_time_to_first_text_delta(failure.time_to_first_text_delta_ms);
-                    let retry_backoff =
-                        record_provider_retry(&mut metadata, occurrence, &failure.error.error);
+                    let retry_backoff = record_provider_retry(
+                        &mut metadata,
+                        occurrence,
+                        &failure.error.error,
+                        on_attempt,
+                    )?;
                     wait_stream_retry_backoff(
                         runtime,
                         cancellation,
@@ -488,7 +523,8 @@ impl OpenAiProvider {
                         occurrence,
                         Some(&failure.error.error),
                         None,
-                    );
+                        on_attempt,
+                    )?;
                     return Err(failure.error.with_provider_attempt_metadata(
                         provider_attempt_metadata(&metadata, started_at),
                     ));
@@ -508,7 +544,13 @@ impl OpenAiProvider {
                     let occurrence_error = response.error.as_ref();
                     let usage = (usage_available && occurrence_error.is_none())
                         .then(|| response.usage.clone());
-                    record_provider_attempt(&mut metadata, occurrence, occurrence_error, usage);
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        occurrence_error,
+                        usage,
+                        on_attempt,
+                    )?;
                     response.provider_attempt_metadata =
                         Some(provider_attempt_metadata(&metadata, started_at));
                     Ok(OpenAiCompletion {
@@ -517,7 +559,13 @@ impl OpenAiProvider {
                     })
                 }
                 Err(error) => {
-                    record_provider_attempt(&mut metadata, occurrence, Some(&error.error), None);
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        Some(&error.error),
+                        None,
+                        on_attempt,
+                    )?;
                     Err(
                         error.with_provider_attempt_metadata(provider_attempt_metadata(
                             &metadata, started_at,
@@ -528,24 +576,7 @@ impl OpenAiProvider {
         }
     }
 
-    pub(super) fn complete_with_contract_details(
-        &self,
-        request: &ModelTurnRequest,
-        cancellation: &CancellationToken,
-        capabilities: &ProviderProtocolContract,
-        api_protocol: ProviderApiProtocol,
-        model_name: &str,
-    ) -> Result<OpenAiCompletion, ProviderError> {
-        self.complete_with_contract_details_until(
-            request,
-            cancellation,
-            capabilities,
-            api_protocol,
-            model_name,
-            None,
-        )
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn complete_with_contract_details_until(
         &self,
         request: &ModelTurnRequest,
@@ -554,6 +585,7 @@ impl OpenAiProvider {
         api_protocol: ProviderApiProtocol,
         model_name: &str,
         probe_deadline: Option<Instant>,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
     ) -> Result<OpenAiCompletion, ProviderError> {
         let runtime = self.runtime.as_ref();
         let started_at = Instant::now();
@@ -591,6 +623,7 @@ impl OpenAiProvider {
                 api_protocol,
                 metadata.attempt_count,
             );
+            emit_provider_attempt_started(&occurrence, on_attempt)?;
             let response = match block_on_provider_future(
                 runtime,
                 cancellation,
@@ -615,7 +648,7 @@ impl OpenAiProvider {
                         && provider_error_is_retryable(&error) =>
                 {
                     let retry_backoff =
-                        record_provider_retry(&mut metadata, occurrence, &error.error);
+                        record_provider_retry(&mut metadata, occurrence, &error.error, on_attempt)?;
                     wait_provider_backoff(runtime, cancellation, retry_backoff, probe_deadline)
                         .map_err(|cancelled| {
                             cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
@@ -625,7 +658,13 @@ impl OpenAiProvider {
                     continue;
                 }
                 Err(error) => {
-                    record_provider_attempt(&mut metadata, occurrence, Some(&error.error), None);
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        Some(&error.error),
+                        None,
+                        on_attempt,
+                    )?;
                     return Err(
                         error.with_provider_attempt_metadata(provider_attempt_metadata(
                             &metadata, started_at,
@@ -644,7 +683,7 @@ impl OpenAiProvider {
                     && http_status_is_retryable(status.as_u16())
                 {
                     let retry_backoff =
-                        record_provider_retry(&mut metadata, occurrence, &error.error);
+                        record_provider_retry(&mut metadata, occurrence, &error.error, on_attempt)?;
                     wait_provider_backoff(runtime, cancellation, retry_backoff, probe_deadline)
                         .map_err(|cancelled| {
                             cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
@@ -653,7 +692,13 @@ impl OpenAiProvider {
                         })?;
                     continue;
                 }
-                record_provider_attempt(&mut metadata, occurrence, Some(&error.error), None);
+                record_provider_attempt(
+                    &mut metadata,
+                    occurrence,
+                    Some(&error.error),
+                    None,
+                    on_attempt,
+                )?;
                 return Err(
                     error.with_provider_attempt_metadata(provider_attempt_metadata(
                         &metadata, started_at,
@@ -673,7 +718,7 @@ impl OpenAiProvider {
                         && provider_error_is_retryable(&error) =>
                 {
                     let retry_backoff =
-                        record_provider_retry(&mut metadata, occurrence, &error.error);
+                        record_provider_retry(&mut metadata, occurrence, &error.error, on_attempt)?;
                     wait_provider_backoff(runtime, cancellation, retry_backoff, probe_deadline)
                         .map_err(|cancelled| {
                             cancelled.with_provider_attempt_metadata(provider_attempt_metadata(
@@ -683,7 +728,13 @@ impl OpenAiProvider {
                     continue;
                 }
                 Err(error) => {
-                    record_provider_attempt(&mut metadata, occurrence, Some(&error.error), None);
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        Some(&error.error),
+                        None,
+                        on_attempt,
+                    )?;
                     return Err(
                         error.with_provider_attempt_metadata(provider_attempt_metadata(
                             &metadata, started_at,
@@ -691,18 +742,23 @@ impl OpenAiProvider {
                     );
                 }
             };
-            let payload = match serde_json::from_slice::<Value>(&body) {
-                Ok(payload) => payload,
-                Err(_) => {
-                    let error = ProviderError::from_model_error(provider_response_json_error());
-                    record_provider_attempt(&mut metadata, occurrence, Some(&error.error), None);
-                    return Err(
-                        error.with_provider_attempt_metadata(provider_attempt_metadata(
-                            &metadata, started_at,
-                        )),
-                    );
-                }
-            };
+            let payload =
+                match serde_json::from_slice::<Value>(&body) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        let error = ProviderError::from_model_error(provider_response_json_error());
+                        record_provider_attempt(
+                            &mut metadata,
+                            occurrence,
+                            Some(&error.error),
+                            None,
+                            on_attempt,
+                        )?;
+                        return Err(error.with_provider_attempt_metadata(
+                            provider_attempt_metadata(&metadata, started_at),
+                        ));
+                    }
+                };
             let usage_available = payload.get("usage").is_some_and(Value::is_object);
             let reasoning_content_present = match api_protocol {
                 ProviderApiProtocol::OpenAiResponses => {
@@ -729,7 +785,13 @@ impl OpenAiProvider {
                     let occurrence_error = response.error.as_ref();
                     let usage = (usage_available && occurrence_error.is_none())
                         .then(|| response.usage.clone());
-                    record_provider_attempt(&mut metadata, occurrence, occurrence_error, usage);
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        occurrence_error,
+                        usage,
+                        on_attempt,
+                    )?;
                     response.provider_attempt_metadata =
                         Some(provider_attempt_metadata(&metadata, started_at));
                     Ok(OpenAiCompletion {
@@ -738,7 +800,13 @@ impl OpenAiProvider {
                     })
                 }
                 Err(error) => {
-                    record_provider_attempt(&mut metadata, occurrence, Some(&error.error), None);
+                    record_provider_attempt(
+                        &mut metadata,
+                        occurrence,
+                        Some(&error.error),
+                        None,
+                        on_attempt,
+                    )?;
                     Err(
                         error.with_provider_attempt_metadata(provider_attempt_metadata(
                             &metadata, started_at,
@@ -767,13 +835,29 @@ impl Provider for OpenAiProvider {
         model_preferences: &ModelPreferences,
         cancellation: &CancellationToken,
     ) -> Result<ProviderProtocolNegotiation, ProviderError> {
-        self.negotiate_openai_tool_capabilities(
+        let mut ignore_attempt = |_| true;
+        self.negotiate_tool_capabilities_observed(
+            model_preferences,
+            cancellation,
+            &mut ignore_attempt,
+        )
+    }
+
+    fn negotiate_tool_capabilities_observed(
+        &self,
+        model_preferences: &ModelPreferences,
+        cancellation: &CancellationToken,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        self.negotiate_openai_tool_capabilities_bound_observed(
             model_preferences
                 .model_name
                 .as_deref()
                 .unwrap_or(&self.config.model_name),
             cancellation,
+            on_attempt,
         )
+        .map(|bound| bound.negotiation)
     }
 
     fn complete_stream(
@@ -782,11 +866,23 @@ impl Provider for OpenAiProvider {
         cancellation: &CancellationToken,
         on_event: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut ignore_attempt = |_| true;
+        self.complete_stream_observed(request, cancellation, on_event, &mut ignore_attempt)
+    }
+
+    fn complete_stream_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ModelTurnResponse, ProviderError> {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error()
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
-        let context = self.prepare_completion_context(request, cancellation)?;
+        let context =
+            self.prepare_completion_context_observed(request, cancellation, on_attempt)?;
         if self.streaming_capability(context.api_protocol)
             != ProviderStreamingCapability::OutputTextDelta
         {
@@ -807,6 +903,7 @@ impl Provider for OpenAiProvider {
                 &context.capabilities,
                 model_name,
                 on_event,
+                on_attempt,
             )
             .and_then(|completion| {
                 if request_uses_tool_protocol(request) && completion.reasoning_content_present {
@@ -830,23 +927,35 @@ impl Provider for OpenAiProvider {
         request: &ModelTurnRequest,
         cancellation: &CancellationToken,
     ) -> Result<ModelTurnResponse, ProviderError> {
+        let mut ignore_attempt = |_| true;
+        self.complete_observed(request, cancellation, &mut ignore_attempt)
+    }
+
+    fn complete_observed(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+    ) -> Result<ModelTurnResponse, ProviderError> {
         if cancellation.is_cancelled() {
             return Err(provider_cancelled_error()
                 .with_provider_attempt_metadata(ProviderAttemptMetadata::zero()));
         }
-        let context = self.prepare_completion_context(request, cancellation)?;
+        let context =
+            self.prepare_completion_context_observed(request, cancellation, on_attempt)?;
         let effective_model_name = request
             .model_preferences
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
         let result = self
-            .complete_with_contract(
+            .complete_with_contract_observed(
                 request,
                 cancellation,
                 &context.capabilities,
                 context.api_protocol,
                 effective_model_name,
+                on_attempt,
             )
             .map(|mut response| {
                 response.provider_capability_metadata = context.capability_metadata.clone();
@@ -1198,15 +1307,30 @@ fn unix_timestamp_ms() -> u64 {
 }
 
 /// Record one terminal attempt without changing aggregate retry semantics.
+fn emit_provider_attempt_started(
+    occurrence: &ProviderAttemptInProgress,
+    on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+) -> Result<(), ProviderError> {
+    if on_attempt(occurrence.started_event()) {
+        Ok(())
+    } else {
+        Err(provider_attempt_observer_error())
+    }
+}
+
 fn record_provider_attempt(
     metadata: &mut ProviderAttemptMetadata,
     occurrence: ProviderAttemptInProgress,
     error: Option<&ModelError>,
     usage: Option<ModelUsage>,
-) {
-    metadata
-        .occurrences
-        .push(occurrence.finish(error, usage, None));
+    on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+) -> Result<(), ProviderError> {
+    let occurrence = occurrence.finish(error, usage, None);
+    if !on_attempt(ProviderAttemptEvent::Finished(occurrence.clone())) {
+        return Err(provider_attempt_observer_error());
+    }
+    metadata.occurrences.push(occurrence);
+    Ok(())
 }
 
 /// Atomically record the retry aggregate and the occurrence that scheduled it.
@@ -1214,13 +1338,29 @@ fn record_provider_retry(
     metadata: &mut ProviderAttemptMetadata,
     occurrence: ProviderAttemptInProgress,
     error: &ModelError,
-) -> Duration {
+    on_attempt: &mut dyn FnMut(ProviderAttemptEvent) -> bool,
+) -> Result<Duration, ProviderError> {
     metadata.retry_count += 1;
     let retry_backoff = provider_retry_backoff(metadata.retry_count);
-    metadata
-        .occurrences
-        .push(occurrence.finish(Some(error), None, Some(retry_backoff)));
-    retry_backoff
+    let occurrence = occurrence.finish(Some(error), None, Some(retry_backoff));
+    if !on_attempt(ProviderAttemptEvent::Finished(occurrence.clone())) {
+        return Err(provider_attempt_observer_error());
+    }
+    metadata.occurrences.push(occurrence);
+    Ok(retry_backoff)
+}
+
+fn provider_attempt_observer_error() -> ProviderError {
+    ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnknownProviderError,
+            "provider attempt observer rejected the event",
+        )
+        .with_provider_diagnostic(
+            "provider_attempt_observer_failed",
+            ProviderErrorStage::ResponseValidation,
+        ),
+    )
 }
 
 pub(super) fn model_error_from_http_status(

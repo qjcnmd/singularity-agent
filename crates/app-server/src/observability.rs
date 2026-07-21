@@ -3,13 +3,14 @@ use sha2::{Digest, Sha256};
 use singularity_agent::{
     AgentLoopEvent, AgentObservation, AgentRunStatus, FinalReviewStatus, OccurrenceIdentity,
     OccurrenceLifecycle, PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
-    PromptAssemblyStatus, ProviderAttemptStatus as AgentProviderAttemptStatus,
+    PromptAssemblyStatus, ProviderAttemptObservation,
+    ProviderAttemptStatus as AgentProviderAttemptStatus, ProviderAttemptUsageObservation,
     SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallStatus, VerificationStatus,
 };
 use singularity_core::Timestamp;
 use singularity_model::{
-    ModelErrorCategory, ProviderApiProtocol, ProviderAttemptOccurrence,
-    ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderCapabilityCacheLookupResult,
+    ModelErrorCategory, ProviderApiProtocol, ProviderAttemptOperationPhase,
+    ProviderCapabilityCacheLookupResult,
 };
 use singularity_protocol::{
     TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent,
@@ -102,11 +103,11 @@ impl<'a> TraceProjector<'a> {
         }
     }
 
-    /// Project result-only provider occurrences and cache observations after the loop returns.
+    /// Project result-only cache observations after the loop returns.
+    ///
+    /// Provider attempts are projected synchronously from `AgentObservation` so SQLite has the
+    /// Start before the HTTP side effect and the matching End immediately after that attempt.
     pub(crate) fn project_result(&mut self, status: &AgentRunStatus) -> Result<(), StoreError> {
-        for occurrence in &status.provider_attempts.occurrences {
-            self.project_provider_attempt(occurrence)?;
-        }
         if let Some(metadata) = &status.provider_capability_metadata {
             for (index, observation) in metadata.cache_observations.iter().enumerate() {
                 let timestamp = Timestamp::from_unix_ms(observation.observed_at_unix_ms)
@@ -126,7 +127,7 @@ impl<'a> TraceProjector<'a> {
                     }
                 };
                 self.append_metric_sample(
-                    &format!("cache_{index}"),
+                    &cache_observation_identity(observation, index),
                     &timestamp,
                     kind,
                     "provider capability cache observation",
@@ -170,24 +171,9 @@ impl<'a> TraceProjector<'a> {
                 )?;
                 Ok(())
             }
-            AgentObservation::ProviderAttempt(observation) => self.append_lifecycle(
-                self.observation_span(
-                    &observation.identity,
-                    TraceSpanKind::ProviderAttempt,
-                    "provider attempt",
-                ),
-                &observation.lifecycle,
-                TraceSpanProjection {
-                    attempt_index: Some(u64::from(observation.attempt_index)),
-                    ..TraceSpanProjection::default()
-                },
-                |_status| TraceSpanProjection {
-                    attempt_index: Some(u64::from(observation.attempt_index)),
-                    ..TraceSpanProjection::default()
-                },
-                provider_attempt_span_status,
-                |_| Vec::new(),
-            ),
+            AgentObservation::ProviderAttempt(observation) => {
+                self.project_provider_observation(*observation)
+            }
             AgentObservation::ToolCall(observation) => {
                 let start = TraceToolProjection {
                     tool_name: Some(observation.tool_name.clone()),
@@ -342,45 +328,47 @@ impl<'a> TraceProjector<'a> {
         )
     }
 
-    fn project_provider_attempt(
+    fn project_provider_observation(
         &mut self,
-        occurrence: &ProviderAttemptOccurrence,
+        observation: ProviderAttemptObservation,
     ) -> Result<(), StoreError> {
-        let span_id = provider_span_id(occurrence);
-        let parent_span_id = occurrence
-            .parent_occurrence_id
-            .clone()
-            .unwrap_or_else(|| self.turn_span_id.clone());
-        let descriptor = SpanDescriptor {
-            span_id,
-            parent_span_id: Some(parent_span_id),
-            kind: TraceSpanKind::ProviderAttempt,
-            summary: "provider attempt",
-        };
-        let start_projection = provider_projection(occurrence, false);
-        let end_projection = provider_projection(occurrence, true);
-        self.append_span(ProjectedSpan {
-            descriptor: descriptor.clone(),
-            phase: TraceSpanPhase::Start,
-            timestamp_unix_ms: occurrence.started_at_unix_ms,
-            status: None,
-            duration_ms: None,
-            time_to_first_token_ms: None,
-            projection: start_projection,
-            metric_samples: Vec::new(),
-            idempotent_start: true,
-        })?;
-        self.append_span(ProjectedSpan {
-            descriptor,
-            phase: TraceSpanPhase::End,
-            timestamp_unix_ms: occurrence.ended_at_unix_ms,
-            status: Some(provider_span_status(occurrence.terminal_status)),
-            duration_ms: Some(occurrence.attempt_duration_ms),
-            time_to_first_token_ms: occurrence.time_to_first_text_delta_ms,
-            projection: end_projection,
-            metric_samples: Vec::new(),
-            idempotent_start: false,
-        })
+        let descriptor = self.observation_span(
+            &observation.identity,
+            TraceSpanKind::ProviderAttempt,
+            "provider attempt",
+        );
+        match observation.lifecycle {
+            OccurrenceLifecycle::Started {
+                started_at_unix_ms, ..
+            } => self.append_span(ProjectedSpan {
+                descriptor,
+                phase: TraceSpanPhase::Start,
+                timestamp_unix_ms: started_at_unix_ms,
+                status: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                projection: provider_observation_projection(&observation, false),
+                metric_samples: Vec::new(),
+                idempotent_start: true,
+            }),
+            OccurrenceLifecycle::Suspended { .. } => Ok(()),
+            OccurrenceLifecycle::Finished {
+                ended_at_unix_ms,
+                duration_ms,
+                status,
+                ..
+            } => self.append_span(ProjectedSpan {
+                descriptor,
+                phase: TraceSpanPhase::End,
+                timestamp_unix_ms: ended_at_unix_ms,
+                status: Some(provider_attempt_span_status(&status)),
+                duration_ms: Some(duration_ms),
+                time_to_first_token_ms: observation.time_to_first_text_delta_ms,
+                projection: provider_observation_projection(&observation, true),
+                metric_samples: Vec::new(),
+                idempotent_start: false,
+            }),
+        }
     }
 
     fn observation_span(
@@ -510,19 +498,6 @@ impl<'a> TraceProjector<'a> {
 fn trace_event_id(turn_id: &str, identity: &str, phase: TraceSpanPhase) -> String {
     let material = format!("{turn_id}\u{0}{identity}\u{0}{}", phase.as_storage_text());
     format!("trace_obs_{:x}", Sha256::digest(material.as_bytes()))
-}
-
-fn provider_span_id(occurrence: &ProviderAttemptOccurrence) -> String {
-    let material = format!(
-        "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
-        occurrence.provider_name,
-        occurrence.model_name,
-        provider_phase_key(occurrence.operation_phase),
-        provider_protocol_key(occurrence.actual_api_protocol),
-        occurrence.attempt_index,
-        occurrence.started_at_unix_ms,
-    );
-    format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
 }
 
 fn digest_identifier(value: &str) -> String {
@@ -659,14 +634,6 @@ fn final_review_span_status(status: &FinalReviewStatus) -> TraceSpanStatus {
     }
 }
 
-fn provider_span_status(status: ProviderAttemptStatus) -> TraceSpanStatus {
-    match status {
-        ProviderAttemptStatus::Ok => TraceSpanStatus::Ok,
-        ProviderAttemptStatus::Error => TraceSpanStatus::Error,
-        ProviderAttemptStatus::Cancelled => TraceSpanStatus::Cancelled,
-    }
-}
-
 fn provider_attempt_span_status(status: &AgentProviderAttemptStatus) -> TraceSpanStatus {
     match status {
         AgentProviderAttemptStatus::Ok => TraceSpanStatus::Ok,
@@ -675,38 +642,34 @@ fn provider_attempt_span_status(status: &AgentProviderAttemptStatus) -> TraceSpa
     }
 }
 
-fn provider_projection(
-    occurrence: &ProviderAttemptOccurrence,
+fn provider_observation_projection(
+    observation: &ProviderAttemptObservation,
     terminal: bool,
 ) -> TraceSpanProjection {
     TraceSpanProjection {
-        provider_name: non_empty(occurrence.provider_name.clone()),
-        model_name: non_empty(occurrence.model_name.clone()),
-        protocol: Some(provider_protocol(occurrence.actual_api_protocol)),
-        operation_phase: Some(provider_operation_phase(occurrence.operation_phase)),
-        attempt_index: Some(u64::from(occurrence.attempt_index)),
-        retry_count: terminal.then_some(u64::from(occurrence.retry_scheduled)),
-        queue_duration_ms: terminal.then_some(occurrence.queue_duration_ms).flatten(),
+        provider_name: non_empty(observation.provider_name.clone()),
+        model_name: non_empty(observation.model_name.clone()),
+        protocol: Some(provider_protocol(observation.actual_api_protocol)),
+        operation_phase: Some(provider_operation_phase(observation.operation_phase)),
+        attempt_index: Some(u64::from(observation.attempt_index)),
+        retry_count: Some(u64::from(observation.retry_count)),
         request_send_to_headers_ms: terminal
-            .then_some(occurrence.request_send_to_headers_ms)
+            .then_some(observation.request_send_to_headers_ms)
             .flatten(),
-        retry_backoff_ms: terminal.then_some(occurrence.retry_backoff_ms).flatten(),
+        retry_backoff_ms: terminal.then_some(observation.retry_backoff_ms).flatten(),
         usage: terminal
-            .then(|| occurrence.usage.as_ref().map(trace_usage))
+            .then(|| observation.usage.as_ref().map(trace_observed_usage))
             .flatten(),
         error: terminal
             .then(|| {
-                (occurrence.terminal_status != ProviderAttemptStatus::Ok).then(|| {
-                    TraceErrorProjection {
-                        category: occurrence
-                            .error_category
-                            .as_ref()
-                            .map(error_category)
-                            .unwrap_or(TraceErrorCategory::UnknownProviderError),
-                        stage: occurrence.error_stage.as_ref().map(error_stage),
-                        code: occurrence.diagnostic_code.clone().and_then(stable_code),
-                    }
-                })
+                observation
+                    .error_category
+                    .as_ref()
+                    .map(|category| TraceErrorProjection {
+                        category: error_category(category),
+                        stage: observation.error_stage.as_ref().map(error_stage),
+                        code: observation.diagnostic_code.clone().and_then(stable_code),
+                    })
             })
             .flatten(),
         ..TraceSpanProjection::default()
@@ -730,22 +693,31 @@ fn provider_operation_phase(value: ProviderAttemptOperationPhase) -> TraceProvid
     }
 }
 
-fn provider_phase_key(value: ProviderAttemptOperationPhase) -> &'static str {
-    match value {
-        ProviderAttemptOperationPhase::CapabilityProbe => "capability_probe",
-        ProviderAttemptOperationPhase::Completion => "completion",
-    }
-}
-
-fn provider_protocol_key(value: ProviderApiProtocol) -> &'static str {
-    match value {
+fn cache_observation_identity(
+    observation: &singularity_model::ProviderCapabilityCacheObservation,
+    index: usize,
+) -> String {
+    let protocol = match observation.api_protocol {
         ProviderApiProtocol::Declared => "declared",
         ProviderApiProtocol::OpenAiResponses => "openai_responses",
         ProviderApiProtocol::OpenAiChatCompletions => "openai_chat_completions",
-    }
+    };
+    let outcome = match observation.outcome {
+        ProviderCapabilityCacheLookupResult::Hit => "hit",
+        ProviderCapabilityCacheLookupResult::Miss => "miss",
+    };
+    format!(
+        "cache:{}:{}:{protocol}:{outcome}:{}:{index}",
+        observation
+            .parent_occurrence_id
+            .as_deref()
+            .unwrap_or("turn"),
+        observation.model_turn_ordinal.unwrap_or(u32::MAX),
+        observation.observed_at_unix_ms,
+    )
 }
 
-fn trace_usage(value: &singularity_model::ModelUsage) -> TraceUsage {
+fn trace_observed_usage(value: &ProviderAttemptUsageObservation) -> TraceUsage {
     TraceUsage {
         input_tokens: value.input_tokens,
         output_tokens: value.output_tokens,

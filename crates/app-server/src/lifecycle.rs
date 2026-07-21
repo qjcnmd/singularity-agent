@@ -641,7 +641,7 @@ impl AppServer {
                 invocation,
                 workspace_tools,
                 on_event,
-                false,
+                true,
             ) {
                 Err(AppServerError::ProjectInstructions(_)) => Ok(safe_failed_agent_status(
                     SAFE_PROJECT_INSTRUCTIONS_FAILURE,
@@ -723,7 +723,7 @@ impl AppServer {
                 std::sync::Arc::clone(test_provider),
                 context,
                 on_event,
-                false,
+                true,
             );
         }
         let provider = match self.provider_snapshot.provider() {
