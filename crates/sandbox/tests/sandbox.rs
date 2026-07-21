@@ -791,12 +791,22 @@ mod linux_tests {
     };
     use std::ffi::OsString;
     use std::fs::{self, hard_link};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
+    use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
 
     fn path_str(path: &Path) -> &str {
         path.to_str().expect("utf8 path")
+    }
+
+    fn make_executable(path: &Path) {
+        let mut permissions = fs::metadata(path)
+            .expect("executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("mark executable");
     }
 
     fn strict_backend() -> LinuxSandboxBackend {
@@ -836,6 +846,12 @@ mod linux_tests {
         fn set(name: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(name);
             unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::remove_var(name) };
             Self { name, previous }
         }
     }
@@ -917,6 +933,249 @@ time.sleep(30)
         assert!(probe.process_tree_cleanup);
         assert!(probe.cgroup_v2);
         assert!(!probe.cgroup_delegated);
+    }
+
+    #[test]
+    fn linux_nonstandard_executable_does_not_authorize_its_sibling_secret() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runtime = tempfile::tempdir().expect("runtime");
+        let bin = runtime.path().join("bin");
+        fs::create_dir(&bin).expect("runtime bin");
+        let secret = runtime.path().join("secret.txt");
+        fs::write(&secret, "outside-secret").expect("runtime sibling secret");
+        let executable = bin.join("runner");
+        assert!(!path_str(&secret).contains('\''));
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif /bin/cat '{}' >/dev/null 2>&1; then exit 41; fi\nprintf runtime-sibling-denied\n",
+                path_str(&secret)
+            ),
+        )
+        .expect("runtime executable");
+        make_executable(&executable);
+
+        let result = strict_backend().execute(&request(
+            "linux_nonstandard_executable_scope",
+            &[path_str(&executable)],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout_preview.contains("runtime-sibling-denied"));
+        assert!(!result.stdout_preview.contains("outside-secret"));
+    }
+
+    #[test]
+    fn linux_python_venv_preserves_invocation_identity() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let venv = tempfile::tempdir().expect("venv parent");
+        let venv_root = venv.path().join("environment");
+        let setup = Command::new("/usr/bin/python3")
+            .args(["-m", "venv", path_str(&venv_root)])
+            .status()
+            .expect("create Python venv");
+        assert!(setup.success(), "Python venv setup failed: {setup}");
+        let python = venv_root.join("bin/python");
+        let expected = format!("{}|{}", path_str(&venv_root), path_str(&python));
+
+        let result = strict_backend().execute(&request(
+            "linux_python_venv_identity",
+            &[
+                path_str(&python),
+                "-c",
+                "import sys; print(f'{sys.prefix}|{sys.executable}')",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert_eq!(result.stdout_preview.trim(), expected);
+    }
+
+    #[test]
+    fn linux_env_shebang_resolves_nonstandard_interpreter_from_path() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let interpreter_home = tempfile::tempdir().expect("interpreter home");
+        let interpreter_bin = interpreter_home.path().join("bin");
+        fs::create_dir(&interpreter_bin).expect("interpreter bin");
+        let interpreter = interpreter_bin.join("sandbox-python");
+        fs::copy("/usr/bin/python3", &interpreter).expect("copy Python interpreter");
+        make_executable(&interpreter);
+        let script_home = tempfile::tempdir().expect("script home");
+        let script = script_home.path().join("entrypoint");
+        fs::write(
+            &script,
+            "#!/usr/bin/env sandbox-python\nprint('env-shebang-ok')\n",
+        )
+        .expect("env script");
+        make_executable(&script);
+        let host_path = std::env::var("PATH").unwrap_or_default();
+        let _path = EnvironmentGuard::set(
+            "PATH",
+            &format!("{}:{host_path}", path_str(&interpreter_bin)),
+        );
+
+        let result = strict_backend().execute(&request(
+            "linux_env_shebang",
+            &[path_str(&script)],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert!(result.stdout_preview.contains("env-shebang-ok"));
+    }
+
+    #[test]
+    fn linux_rustup_proxy_runs_real_cargo_toolchain() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let _target_dir = EnvironmentGuard::remove("CARGO_TARGET_DIR");
+        fs::create_dir(workspace.path().join("src")).expect("src");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"sandbox-smoke\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("Cargo.toml");
+        fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+
+        let result = strict_backend().execute(&request(
+            "linux_rustup_cargo",
+            &["cargo", "check", "--offline", "--quiet"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert!(workspace.path().join("target/debug").is_dir());
+    }
+
+    #[test]
+    fn linux_rustup_proxy_honors_custom_toolchain_homes() {
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let toolchain_layout = tempfile::tempdir().expect("toolchain layout");
+        let cargo_home = toolchain_layout.path().join("cargo-home");
+        let cargo_bin = cargo_home.join("bin");
+        let rustup_home = toolchain_layout.path().join("rustup-home");
+        fs::create_dir_all(&cargo_bin).expect("custom cargo bin");
+
+        let host_cargo = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("cargo"))
+            .find(|candidate| candidate.is_file())
+            .expect("host cargo proxy");
+        let host_rustup = fs::canonicalize(&host_cargo).expect("canonical rustup proxy");
+        assert_eq!(
+            host_rustup.file_name().and_then(|name| name.to_str()),
+            Some("rustup")
+        );
+        let host_rustup_home = std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".rustup"))
+            })
+            .expect("host rustup home");
+        symlink(&host_rustup, cargo_bin.join("cargo")).expect("custom cargo proxy");
+        symlink(&host_rustup_home, &rustup_home).expect("custom rustup home");
+
+        fs::create_dir(workspace.path().join("src")).expect("src");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"custom-toolchain-home-smoke\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("Cargo.toml");
+        fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+
+        let host_path = std::env::var("PATH").unwrap_or_default();
+        let _path = EnvironmentGuard::set("PATH", &format!("{}:{host_path}", path_str(&cargo_bin)));
+        let _cargo_home = EnvironmentGuard::set("CARGO_HOME", path_str(&cargo_home));
+        let _rustup_home = EnvironmentGuard::set("RUSTUP_HOME", path_str(&rustup_home));
+        let _target_dir = EnvironmentGuard::remove("CARGO_TARGET_DIR");
+
+        let result = strict_backend().execute(&request(
+            "linux_custom_rustup_homes",
+            &["cargo", "check", "--offline", "--quiet"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert!(workspace.path().join("target/debug").is_dir());
+    }
+
+    #[test]
+    fn linux_nonstandard_node_binary_runs_without_authorizing_siblings() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runtime = tempfile::tempdir().expect("runtime");
+        let bin = runtime.path().join("bin");
+        fs::create_dir(&bin).expect("runtime bin");
+        let node = bin.join("node");
+        fs::copy("/usr/bin/node", &node).expect("copy node");
+        make_executable(&node);
+        let secret = runtime.path().join("secret.txt");
+        fs::write(&secret, "outside-secret").expect("runtime sibling secret");
+        assert!(!path_str(&secret).contains('\''));
+        let script = format!(
+            "const fs=require('fs');try{{fs.readFileSync('{}');process.exit(41)}}catch(_){{console.log('node-sibling-denied')}}",
+            path_str(&secret)
+        );
+
+        let result = strict_backend().execute(&request(
+            "linux_nonstandard_node",
+            &[path_str(&node), "-e", &script],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert!(result.stdout_preview.contains("node-sibling-denied"));
+    }
+
+    #[test]
+    fn linux_system_node_and_npm_toolchain_execute() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = strict_backend();
+        let node = backend.execute(&request(
+            "linux_system_node",
+            &["node", "-e", "console.log('node-ok')"],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        ));
+        assert_eq!(node.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(node.exit_code, Some(0), "{}", node.stderr_preview);
+        assert!(node.stdout_preview.contains("node-ok"));
+
+        let npm = backend.execute(&request(
+            "linux_system_npm",
+            &["npm", "--version"],
+            workspace.path(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+        ));
+        assert_eq!(npm.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(npm.exit_code, Some(0), "{}", npm.stderr_preview);
+        assert!(!npm.stdout_preview.trim().is_empty());
     }
 
     #[test]

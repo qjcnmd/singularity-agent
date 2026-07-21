@@ -475,8 +475,8 @@ struct PreparedCommand {
     workspace: PathBuf,
     cwd: PathBuf,
     executable: PathBuf,
-    /// 非标准 toolchain 的只读运行时根。
-    extra_runtime_roots: Vec<PathBuf>,
+    /// 非标准 executable 及已识别 toolchain 布局所需的最小只读路径。
+    runtime_read_paths: Vec<PathBuf>,
     argv: Vec<String>,
     env: Vec<(String, String)>,
     timeout: Duration,
@@ -507,22 +507,21 @@ impl PreparedCommand {
                 SANDBOX_PROTECTED_PATH_DENIED,
             ));
         }
-        let env = sanitized_environment(&environment);
+        let mut env = sanitized_environment(&environment);
         let resolved = resolve_executable(&argv[0], &cwd_path, &env)?;
-        if is_protected_path(&resolved.canonical.to_string_lossy()) {
+        if std::iter::once(&resolved.executable)
+            .chain(std::iter::once(&resolved.invocation))
+            .chain(resolved.runtime_read_paths.iter())
+            .any(|path| is_protected_path(&path.to_string_lossy()))
+        {
             return Err(LinuxSandboxError::PolicyDenied(
                 SANDBOX_PROTECTED_PATH_DENIED,
             ));
         }
-        if let Some(interpreter) = &resolved.interpreter {
-            if is_protected_path(&interpreter.to_string_lossy()) {
-                return Err(LinuxSandboxError::PolicyDenied(
-                    SANDBOX_PROTECTED_PATH_DENIED,
-                ));
-            }
+        for (name, value) in &resolved.environment {
+            set_environment_value(&mut env, name, value);
         }
-        let extra_runtime_roots = resolved.runtime_roots;
-        argv[0] = resolved.canonical.to_string_lossy().into_owned();
+        argv[0] = resolved.invocation.to_string_lossy().into_owned();
         let protected_paths = collect_protected_paths(&workspace)
             .map_err(|_| LinuxSandboxError::PolicyDenied(SANDBOX_PROTECTED_PATH_DENIED))?;
         validate_workspace_hardlinks(&workspace)
@@ -531,8 +530,8 @@ impl PreparedCommand {
         Ok(Self {
             workspace,
             cwd: cwd_path,
-            executable: resolved.canonical,
-            extra_runtime_roots,
+            executable: resolved.executable,
+            runtime_read_paths: resolved.runtime_read_paths,
             argv,
             env,
             timeout: Duration::from_secs(timeout_seconds),
@@ -644,11 +643,42 @@ fn env_value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+fn set_environment_value(env: &mut Vec<(String, String)>, name: &str, value: &str) {
+    env.retain(|(key, _)| key != name);
+    env.push((name.to_string(), value.to_string()));
+}
+
 fn resolve_executable(
     requested: &str,
     cwd: &Path,
     env: &[(String, String)],
 ) -> Result<ResolvedExecutable, LinuxSandboxError> {
+    let (invocation, executable) = resolve_executable_paths(requested, cwd, env)?;
+    let mut runtime_read_paths = runtime_read_paths(&invocation, &executable, env);
+    let mut environment = runtime_environment(&invocation, &executable, env);
+    if let Some(shebang) = resolve_shebang(&executable, cwd, env)? {
+        for path in shebang.runtime_read_paths {
+            push_unique_path(&mut runtime_read_paths, path);
+        }
+        for (name, value) in shebang.environment {
+            if !environment.iter().any(|(existing, _)| existing == &name) {
+                environment.push((name, value));
+            }
+        }
+    }
+    Ok(ResolvedExecutable {
+        executable,
+        invocation,
+        runtime_read_paths,
+        environment,
+    })
+}
+
+fn resolve_executable_paths(
+    requested: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<(PathBuf, PathBuf), LinuxSandboxError> {
     let requested_path = Path::new(requested);
     let candidate = if requested_path.is_absolute() || requested_path.components().count() > 1 {
         if requested_path.is_absolute() {
@@ -673,111 +703,269 @@ fn resolve_executable(
         }
         found.ok_or(LinuxSandboxError::ExecutableUnavailable)?
     };
+    let file_name = candidate
+        .file_name()
+        .ok_or(LinuxSandboxError::ExecutableUnavailable)?;
+    let parent = candidate
+        .parent()
+        .ok_or(LinuxSandboxError::ExecutableUnavailable)?;
+    let invocation = fs::canonicalize(parent)
+        .map_err(|_| LinuxSandboxError::ExecutableUnavailable)?
+        .join(file_name);
     let canonical =
-        fs::canonicalize(candidate).map_err(|_| LinuxSandboxError::ExecutableUnavailable)?;
+        fs::canonicalize(&invocation).map_err(|_| LinuxSandboxError::ExecutableUnavailable)?;
     let metadata =
         fs::metadata(&canonical).map_err(|_| LinuxSandboxError::ExecutableUnavailable)?;
     if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
         return Err(LinuxSandboxError::ExecutableUnavailable);
     }
-    let interpreter = detect_shebang_interpreter(&canonical);
-    let runtime_roots =
-        ResolvedExecutable::derive_runtime_roots(&canonical, interpreter.as_deref());
-    Ok(ResolvedExecutable {
-        canonical,
-        interpreter,
-        runtime_roots,
-    })
+    Ok((invocation, canonical))
 }
 
-/// 类型化的已解析可执行文件，包含规范路径、解释器和只读运行时根。
-///
-/// 只把实际需要的 toolchain root 作为只读路径加入 Landlock policy，
-/// 不允许整个用户目录，不允许 workspace 外写入。
+/// 已解析的 executable 将实际 exec target 与调用身份分开保存。
 #[derive(Debug, Clone)]
 struct ResolvedExecutable {
-    /// 规范化后的可执行文件路径。
-    canonical: PathBuf,
-    /// 若为脚本，则为 shebang 解析出的解释器路径。
-    interpreter: Option<PathBuf>,
-    /// 可执行文件和解释器所需的只读运行时根目录。
-    runtime_roots: Vec<PathBuf>,
+    /// 传给 `execve` 的规范化目标。
+    executable: PathBuf,
+    /// 保留最终 symlink 名称的绝对 `argv[0]`，用于 venv 与 rustup proxy 身份。
+    invocation: PathBuf,
+    /// Landlock 额外允许的文件或明确 toolchain 目录。
+    runtime_read_paths: Vec<PathBuf>,
+    /// 已识别运行时所需的安全环境覆盖。
+    environment: Vec<(String, String)>,
 }
 
-impl ResolvedExecutable {
-    /// 从规范可执行文件路径派生运行时根。
-    ///
-    /// 标准系统目录（/usr, /bin, /lib 等）已由 Landlock 默认规则覆盖；
-    /// 非标准安装目录（如 ~/.rustup, ~/.nvm, /opt/toolchain）需要显式加入。
-    fn derive_runtime_roots(canonical: &Path, interpreter: Option<&Path>) -> Vec<PathBuf> {
-        let standard_prefixes = [
-            "/bin", "/sbin", "/usr", "/lib", "/lib64", "/proc", "/dev", "/run", "/etc",
-        ];
-        let mut roots = Vec::new();
-        let paths: Vec<&Path> = [Some(canonical), interpreter]
-            .into_iter()
-            .flatten()
-            .collect();
-        for path in &paths {
-            let path = *path;
-            let path_str = path.to_string_lossy();
-            // 标准系统路径已被默认 Landlock 规则覆盖
-            if standard_prefixes
-                .iter()
-                .any(|prefix| path_str.starts_with(prefix))
-            {
-                continue;
-            }
-            // 非标准路径：向上找到合理的 toolchain root
-            // 例如 /home/user/.rustup/toolchains/stable/bin/rustc → /home/user/.rustup
-            // 例如 /home/user/.nvm/versions/node/v20/bin/node → /home/user/.nvm
-            // 例如 /opt/python3.12/bin/python → /opt/python3.12
-            if let Some(root) = toolchain_root(path) {
-                if !roots.contains(&root) {
-                    roots.push(root);
-                }
-            }
+#[derive(Debug)]
+struct ResolvedShebang {
+    runtime_read_paths: Vec<PathBuf>,
+    environment: Vec<(String, String)>,
+}
+
+fn runtime_read_paths(
+    invocation: &Path,
+    executable: &Path,
+    env: &[(String, String)],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if !is_standard_runtime_path(executable) {
+        push_unique_path(&mut paths, executable.to_path_buf());
+    }
+    if let Some(root) = python_venv_root(invocation) {
+        for candidate in [
+            root.join("pyvenv.cfg"),
+            root.join("bin"),
+            root.join("lib"),
+            root.join("lib64"),
+        ] {
+            push_existing_canonical_path(&mut paths, &candidate);
         }
-        roots
     }
+    if let Some(root) = rustup_home(invocation, executable, env) {
+        push_unique_path(&mut paths, root);
+    }
+    if let Some(root) =
+        nvm_node_version_root(invocation).or_else(|| nvm_node_version_root(executable))
+    {
+        push_unique_path(&mut paths, root);
+    }
+    if invocation.file_name().is_some_and(|name| name == "node")
+        || executable.file_name().is_some_and(|name| name == "node")
+    {
+        for candidate in [
+            Path::new("/etc/ssl/openssl.cnf"),
+            Path::new("/etc/ssl/certs"),
+        ] {
+            push_existing_canonical_path(&mut paths, candidate);
+        }
+    }
+    paths
 }
 
-/// 从非标准路径的可执行文件推断 toolchain 根目录。
-///
-/// 策略：向上遍历到包含 `bin/` 子目录的祖先，再取该祖先的父目录作为 root。
-/// 例如 `.rustup/toolchains/stable/bin/rustc` → `.rustup/toolchains/stable`
-/// 例如 `.nvm/versions/node/v20.11.0/bin/node` → `.nvm/versions/node/v20.11.0`
-/// 若无法推断则返回可执行文件的祖父目录。
-fn toolchain_root(canonical: &Path) -> Option<PathBuf> {
-    // 找到包含此可执行文件的 bin/ 目录
-    let parent = canonical.parent()?;
-    if parent.file_name()?.to_str()? == "bin" {
-        // bin/ 的父目录即为 toolchain root
-        return parent.parent().map(|p| p.to_path_buf());
+fn runtime_environment(
+    invocation: &Path,
+    executable: &Path,
+    env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut environment = Vec::new();
+    if let Some(root) = python_venv_root(invocation) {
+        environment.push((
+            "VIRTUAL_ENV".to_string(),
+            root.to_string_lossy().into_owned(),
+        ));
     }
-    // 不在 bin/ 下，使用祖父目录作为保守 root
-    canonical.parent()?.parent().map(|p| p.to_path_buf())
+    if let Some(root) = rustup_home(invocation, executable, env) {
+        environment.push((
+            "RUSTUP_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        ));
+        environment.push(("CARGO_HOME".to_string(), format!("{SANDBOX_HOME}/cargo")));
+    }
+    environment
 }
 
-/// 读取文件头部检测 shebang 解释器。
-fn detect_shebang_interpreter(executable: &Path) -> Option<PathBuf> {
-    let mut file = File::open(executable).ok()?;
-    let mut header = [0u8; 256];
-    let n = file.read(&mut header).ok()?;
-    if n < 3 || header[0] != b'#' || header[1] != b'!' {
+fn is_standard_runtime_path(path: &Path) -> bool {
+    [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/share/nodejs",
+        "/proc",
+    ]
+    .into_iter()
+    .any(|root| path.starts_with(Path::new(root)))
+}
+
+fn python_venv_root(invocation: &Path) -> Option<PathBuf> {
+    let bin = invocation.parent()?;
+    if bin.file_name()? != "bin" {
         return None;
     }
-    // 提取 shebang 行的解释器路径
+    let root = bin.parent()?;
+    root.join("pyvenv.cfg")
+        .is_file()
+        .then(|| root.to_path_buf())
+}
+
+fn rustup_home(invocation: &Path, executable: &Path, env: &[(String, String)]) -> Option<PathBuf> {
+    const RUSTUP_PROXIES: [&str; 15] = [
+        "cargo",
+        "cargo-clippy",
+        "cargo-fmt",
+        "cargo-fuzz",
+        "cargo-miri",
+        "clippy-driver",
+        "rls",
+        "rust-analyzer",
+        "rustc",
+        "rustdoc",
+        "rustfmt",
+        "rust-gdb",
+        "rust-gdbgui",
+        "rust-lldb",
+        "rustup",
+    ];
+    if executable.file_name()? != "rustup"
+        || !RUSTUP_PROXIES.contains(&invocation.file_name()?.to_str()?)
+    {
+        return None;
+    }
+    let cargo_home = match env_value(env, "CARGO_HOME") {
+        Some(configured) => fs::canonicalize(configured).ok()?,
+        None => {
+            let cargo_bin = invocation.parent()?;
+            let cargo_home = cargo_bin.parent()?;
+            if cargo_bin.file_name()? != "bin" || cargo_home.file_name()? != ".cargo" {
+                return None;
+            }
+            fs::canonicalize(cargo_home).ok()?
+        }
+    };
+    let invocation_parent = fs::canonicalize(invocation.parent()?).ok()?;
+    if invocation_parent != cargo_home.join("bin") {
+        return None;
+    }
+    let rustup = match env_value(env, "RUSTUP_HOME") {
+        Some(configured) => PathBuf::from(configured),
+        None => cargo_home.parent()?.join(".rustup"),
+    };
+    fs::canonicalize(rustup).ok().filter(|path| path.is_dir())
+}
+
+fn nvm_node_version_root(path: &Path) -> Option<PathBuf> {
+    for root in path.ancestors() {
+        let node = root.parent()?;
+        let versions = node.parent()?;
+        let nvm = versions.parent()?;
+        if node.file_name()? == "node"
+            && versions.file_name()? == "versions"
+            && nvm.file_name()? == ".nvm"
+        {
+            return fs::canonicalize(root).ok().filter(|path| path.is_dir());
+        }
+    }
+    None
+}
+
+fn resolve_shebang(
+    executable: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<Option<ResolvedShebang>, LinuxSandboxError> {
+    let mut file = File::open(executable).map_err(|_| LinuxSandboxError::ExecutableUnavailable)?;
+    let mut header = [0u8; 256];
+    let n = file
+        .read(&mut header)
+        .map_err(|_| LinuxSandboxError::ExecutableUnavailable)?;
+    if n < 2 || header[..2] != *b"#!" {
+        return Ok(None);
+    }
     let line_end = header[2..n]
         .iter()
         .position(|&b| b == 10)
         .map(|p| p + 2)
         .unwrap_or(n);
-    let line = std::str::from_utf8(&header[2..line_end]).ok()?.trim();
-    let interpreter = line.split_whitespace().next()?;
-    let path = Path::new(interpreter);
-    if path.is_absolute() && path.is_file() {
-        fs::canonicalize(path).ok()
+    let line = std::str::from_utf8(&header[2..line_end])
+        .map_err(|_| LinuxSandboxError::ExecutableUnavailable)?
+        .trim();
+    let mut parts = line.split_ascii_whitespace();
+    let interpreter = parts
+        .next()
+        .ok_or(LinuxSandboxError::ExecutableUnavailable)?;
+    if !Path::new(interpreter).is_absolute() {
+        return Err(LinuxSandboxError::ExecutableUnavailable);
+    }
+    let (invocation, canonical) = resolve_executable_paths(interpreter, cwd, env)?;
+    let mut paths = runtime_read_paths(&invocation, &canonical, env);
+    let mut environment = runtime_environment(&invocation, &canonical, env);
+    if canonical == Path::new("/usr/bin/env") {
+        let remaining = parts.collect::<Vec<_>>();
+        let program = match remaining.as_slice() {
+            ["-S", program, ..] | ["--", program, ..] | [program, ..]
+                if !program.starts_with('-') =>
+            {
+                *program
+            }
+            _ => return Err(LinuxSandboxError::ExecutableUnavailable),
+        };
+        let (program_invocation, program_executable) = resolve_executable_paths(program, cwd, env)?;
+        for path in runtime_read_paths(&program_invocation, &program_executable, env) {
+            push_unique_path(&mut paths, path);
+        }
+        for (name, value) in runtime_environment(&program_invocation, &program_executable, env) {
+            if !environment.iter().any(|(existing, _)| existing == &name) {
+                environment.push((name, value));
+            }
+        }
+    }
+    Ok(Some(ResolvedShebang {
+        runtime_read_paths: paths,
+        environment,
+    }))
+}
+
+fn push_existing_canonical_path(paths: &mut Vec<PathBuf>, candidate: &Path) {
+    if let Ok(canonical) = fs::canonicalize(candidate) {
+        push_unique_path(paths, canonical);
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+fn runtime_read_access(path: &Path) -> Option<u64> {
+    if path.is_dir() {
+        Some(LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_EXECUTE)
+    } else if path.is_file() {
+        Some(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_EXECUTE)
     } else {
         None
     }
@@ -948,7 +1136,7 @@ struct ChildContext {
     filesystem: SandboxFilesystemMode,
     network: SandboxNetworkMode,
     protected_paths: Vec<ProtectedPath>,
-    extra_runtime_roots: Vec<PathBuf>,
+    runtime_read_paths: Vec<PathBuf>,
 }
 
 fn run_prepared_command(
@@ -1046,7 +1234,7 @@ fn run_prepared_command(
         filesystem: prepared.filesystem.clone(),
         network: prepared.network.clone(),
         protected_paths: prepared.protected_paths.clone(),
-        extra_runtime_roots: prepared.extra_runtime_roots.clone(),
+        runtime_read_paths: prepared.runtime_read_paths.clone(),
     });
     let mut context = context;
     let mut stack = vec![0u8; 1024 * 1024];
@@ -1621,6 +1809,7 @@ fn install_landlock(context: &ChildContext) -> Result<(), ()> {
         "/lib64",
         "/usr/lib",
         "/usr/lib64",
+        "/usr/share/nodejs",
         "/proc",
     ] {
         let root = Path::new(root);
@@ -1628,11 +1817,9 @@ fn install_landlock(context: &ChildContext) -> Result<(), ()> {
             add_landlock_rule(ruleset, root, runtime_read)?;
         }
     }
-    // 非标准 toolchain 运行时根：只读，不允许写入
-    for root in &context.extra_runtime_roots {
-        if root.is_dir() {
-            add_landlock_rule(ruleset, root, runtime_read)?;
-        }
+    for path in &context.runtime_read_paths {
+        let access = runtime_read_access(path).ok_or(())?;
+        add_landlock_rule(ruleset, path, access)?;
     }
     if Path::new("/run").is_dir() {
         add_landlock_rule(
@@ -1737,18 +1924,16 @@ fn install_seccomp_filter(network_denied: bool) -> Result<(), ()> {
         libc::SYS_prctl,
     ];
     if network_denied {
+        // `socketpair` and message/data transfer syscalls remain available for local process IPC.
+        // A fresh network namespace, closed inherited FDs, and the socket/connect/bind family
+        // below prevent those IPC primitives from becoming external network access.
         blocked.extend([
             libc::SYS_socket,
-            libc::SYS_socketpair,
             libc::SYS_connect,
             libc::SYS_bind,
             libc::SYS_listen,
             libc::SYS_accept,
             libc::SYS_accept4,
-            libc::SYS_sendto,
-            libc::SYS_sendmsg,
-            libc::SYS_recvfrom,
-            libc::SYS_recvmsg,
             libc::SYS_getsockname,
             libc::SYS_getpeername,
             libc::SYS_getsockopt,
