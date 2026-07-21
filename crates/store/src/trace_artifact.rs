@@ -261,6 +261,16 @@ impl SessionStore {
         validate_trace_span_batch(&events)?;
         derive_trace_metrics(run_id, &events)
     }
+
+    /// 直接按 run/session/kind 查找已持久化的 typed span start，不扫描整条 trace。
+    pub fn find_span_start(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        span_kind: TraceSpanKind,
+    ) -> StoreResult<Option<TraceEvent>> {
+        find_trace_span_start(&self.connection, run_id, session_id, span_kind)
+    }
 }
 
 fn same_typed_start_identity(existing: &TraceEvent, incoming: &TraceEvent) -> bool {

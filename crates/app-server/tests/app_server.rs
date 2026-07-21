@@ -2689,6 +2689,202 @@ fn app_server_bin() -> String {
     })
 }
 
+/// 从 JSON-RPC turn/start 入口开始，经过真实 Store、Checkpoint、Approval、
+/// AgentLoop、ToolBroker 和 WorkspaceTools 的确定性 Approval Resume E2E。
+#[test]
+fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
+    use singularity_model::{ModelTurnResponse, ProviderProtocolContract};
+    use std::sync::{Arc, Mutex};
+
+    struct SequenceProvider {
+        responses: Vec<ModelTurnResponse>,
+        seen_requests: Arc<Mutex<Vec<singularity_model::ModelTurnRequest>>>,
+    }
+
+    impl singularity_model::Provider for SequenceProvider {
+        fn protocol_contract(&self) -> ProviderProtocolContract {
+            ProviderProtocolContract::default()
+        }
+
+        fn complete(
+            &self,
+            request: &singularity_model::ModelTurnRequest,
+            _cancellation: &singularity_core::CancellationToken,
+        ) -> Result<ModelTurnResponse, singularity_model::ProviderError> {
+            let mut seen = self.seen_requests.lock().expect("lock");
+            let idx = seen.len();
+            seen.push(request.clone());
+            let mut response = self
+                .responses
+                .get(idx)
+                .unwrap_or_else(|| self.responses.last().expect("response"))
+                .clone();
+            response.request_id = request.request_id.clone();
+            Ok(response)
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".git")).expect("git marker");
+    let file_path = workspace.join("README.md");
+    std::fs::write(&file_path, "before").expect("write readme");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+
+    // 固定模型返回序列：
+    // 1. 请求 edit tool（触发 approval）
+    // 2. 确认 tool result 后请求 command verification
+    // 3. 返回 final answer
+    let mut edit_response = ModelTurnResponse::completed("req_1", "resp_1", "");
+    edit_response
+        .tool_calls
+        .push(singularity_model::ModelToolCall {
+            tool_call_id: "call_edit_1".to_string(),
+            tool_name: "edit".to_string(),
+            raw_arguments: serde_json::json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            })
+            .to_string(),
+            arguments: serde_json::json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "after"
+            }),
+            parse_status: singularity_model::ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+
+    let mut verify_response = ModelTurnResponse::completed("req_2", "resp_2", "");
+    verify_response
+        .tool_calls
+        .push(singularity_model::ModelToolCall {
+            tool_call_id: "call_cmd_1".to_string(),
+            tool_name: "command".to_string(),
+            raw_arguments: serde_json::json!({
+                "command": "type README.md"
+            })
+            .to_string(),
+            arguments: serde_json::json!({
+                "command": "type README.md"
+            }),
+            parse_status: singularity_model::ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+
+    let final_response =
+        ModelTurnResponse::completed("req_3", "resp_3", "Task completed: README.md updated.");
+
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = SequenceProvider {
+        responses: vec![edit_response, verify_response, final_response],
+        seen_requests: Arc::clone(&seen_requests),
+    };
+
+    let mut server = app_server(store).with_test_provider(Arc::new(provider));
+    server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .expect("initialize");
+    server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
+        .expect("initialized");
+    subscribe_events(&mut server);
+
+    // 创建 workspace-write + on-request approval 线程
+    let thread_response = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/start","id":2,"params":{{"cwd":{},"sandboxMode":"workspace-write","approvalPolicy":"on-request"}}}}"#,
+            serde_json::to_string(&workspace.to_string_lossy()).expect("cwd")
+        ))
+        .expect("thread/start");
+    let thread_id = result_message(&thread_response)["thread"]["thread_id"]
+        .as_str()
+        .expect("thread_id")
+        .to_string();
+
+    // turn/start 触发模型调用，模型请求 edit → approval required → turn blocked
+    let _turn_response = server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":3,"params":{{"threadId":"{thread_id}","input":[{{"type":"text","text":"Edit README.md changing before to after"}}]}}}}"#
+        ))
+        .unwrap_or_else(|error| panic!("turn/start failed: {error:?}"));
+
+    // 验证 turn 进入 blocked 状态并有 pending approval
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let pending = store.list_pending_approvals().expect("pending approvals");
+    assert_eq!(pending.len(), 1, "exactly one pending approval expected");
+    let approval_request = &pending[0];
+    assert_eq!(approval_request.thread_id, thread_id);
+    assert_eq!(
+        approval_request.action.as_str(),
+        "edit",
+        "approval must be for the edit tool"
+    );
+
+    // 从 pending approval 获取 turn_id 并验证 turn 状态
+    let turn_id = approval_request.turn_id.clone();
+    let turn = store.get_turn(&turn_id).expect("turn exists");
+    assert_eq!(turn.status, singularity_protocol::TurnStatus::Blocked);
+    assert_eq!(turn.agent_loop_status, "blocked");
+    drop(store);
+
+    // approval/decision allow → 恢复 agent loop → 执行 edit → verification → final answer
+    let decision = ApprovalDecision::new(
+        approval_request.request_id.clone(),
+        ApprovalOutcome::Allow,
+        "operator approved edit",
+    );
+    let _decision_response = server
+        .handle_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "method": "approval/decision",
+                "id": 4,
+                "params": decision,
+            })
+            .to_string(),
+        )
+        .expect("approval/decision");
+
+    // 验证 turn 完成
+    let store = SessionStore::open(&db_path).expect("reopen store");
+    let completed_turn = store.get_turn(&turn_id).expect("turn");
+    assert_eq!(
+        completed_turn.status,
+        singularity_protocol::TurnStatus::Completed,
+        "turn must reach Completed after approval resume"
+    );
+    assert_eq!(completed_turn.agent_loop_status, "completed");
+
+    // 验证 workspace 文件已被修改
+    assert_eq!(
+        std::fs::read_to_string(&file_path).expect("read readme"),
+        "after",
+        "workspace file must be modified by the approved edit"
+    );
+
+    // 验证 approval 已消费
+    assert!(store.list_pending_approvals().expect("pending").is_empty());
+    assert_eq!(store.list_approval_decisions().expect("decisions").len(), 1);
+
+    // 验证 trace 包含 agent_loop 完成记录
+    let trace = store.list_trace(&thread_id).expect("trace");
+    assert!(
+        trace.iter().any(|event| {
+            event.component == "agent_loop" && event.payload["status"] == "completed"
+        }),
+        "trace must contain completed agent_loop event"
+    );
+
+    // 验证 provider 收到了恢复后的请求（tool result 在 history 中）
+    let requests = seen_requests.lock().expect("requests");
+    assert!(
+        requests.len() >= 2,
+        "provider must receive at least the resume request after approval"
+    );
+}
+
 fn result_message(messages: &[serde_json::Value]) -> &serde_json::Value {
     messages
         .iter()

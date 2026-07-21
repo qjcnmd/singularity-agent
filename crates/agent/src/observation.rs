@@ -31,6 +31,7 @@ pub enum AgentLoopEvent {
 #[serde(tag = "kind", content = "occurrence", rename_all = "snake_case")]
 pub enum AgentObservation {
     PromptAssembly(PromptAssemblyObservation),
+    ProviderAttempt(ProviderAttemptObservation),
     ToolCall(ToolCallObservation),
     PolicyDecision(PolicyDecisionObservation),
     SandboxExecution(SandboxExecutionOccurrence),
@@ -193,6 +194,27 @@ pub struct VerificationObservation {
     pub satisfied_command_count: u32,
     pub occurrence_count: u32,
     pub command_duration_ms: Option<u64>,
+}
+
+/// provider transport attempt 的终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptStatus {
+    Ok,
+    Error,
+    Cancelled,
+}
+
+/// 一次真实 provider transport attempt 的 typed 生命周期 occurrence。
+///
+/// Start 在 provider 调用之前投影到 SQLite，End 在调用返回后投影；
+/// 同一 span ID 关联 Start/End，retry 各自拥有独立 occurrence。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProviderAttemptObservation {
+    pub identity: OccurrenceIdentity,
+    pub lifecycle: OccurrenceLifecycle<ProviderAttemptStatus>,
+    pub model_turn_ordinal: u32,
+    pub attempt_index: u32,
 }
 
 /// tool-free finalization-only model request 的终态。

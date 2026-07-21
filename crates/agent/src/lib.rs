@@ -67,9 +67,9 @@ pub use observation::{
     AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentObservation,
     FinalReviewObservation, FinalReviewStatus, OccurrenceIdentity, OccurrenceLifecycle,
     PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
-    PromptAssemblyObservation, PromptAssemblyStatus, SandboxExecutionOccurrence,
-    SandboxExecutionStatus, ToolCallObservation, ToolCallStatus, VerificationObservation,
-    VerificationStatus,
+    PromptAssemblyObservation, PromptAssemblyStatus, ProviderAttemptObservation,
+    ProviderAttemptStatus, SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation,
+    ToolCallStatus, VerificationObservation, VerificationStatus,
 };
 
 #[cfg(test)]
@@ -1552,6 +1552,30 @@ where
                     Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                 );
             }
+            let provider_attempt_timer = OccurrenceTimer::start();
+            let provider_attempt_identity =
+                child_occurrence_identity(&prompt_identity, "provider_attempt", 0);
+            if emit_event(
+                &mut on_event,
+                AgentLoopEvent::Observation(AgentObservation::ProviderAttempt(
+                    ProviderAttemptObservation {
+                        identity: provider_attempt_identity.clone(),
+                        lifecycle: provider_attempt_timer.started(),
+                        model_turn_ordinal: turn_index,
+                        attempt_index: 0,
+                    },
+                )),
+            )
+            .is_err()
+            {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                );
+            }
             let mut streamed_text = String::new();
             let mut event_sink_failed = false;
             let stream_result = self.provider.complete_stream(
@@ -1609,6 +1633,49 @@ where
                 Err(error) => provider_error_model_response(&request, error),
             };
             state.observe_model_response(&response, turn_index, &prompt_identity.occurrence_id);
+            let provider_attempt_status = if response.status == ModelTurnStatus::Success {
+                ProviderAttemptStatus::Ok
+            } else if response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.category() == ModelErrorCategory::Cancelled)
+            {
+                ProviderAttemptStatus::Cancelled
+            } else {
+                ProviderAttemptStatus::Error
+            };
+            let provider_attempt_count = response
+                .provider_attempt_metadata
+                .as_ref()
+                .map_or(1, |metadata| metadata.attempt_count.max(1));
+            for attempt_ordinal in 0..provider_attempt_count {
+                let attempt_identity = if attempt_ordinal == 0 {
+                    provider_attempt_identity.clone()
+                } else {
+                    child_occurrence_identity(&prompt_identity, "provider_attempt", attempt_ordinal)
+                };
+                if emit_event(
+                    &mut on_event,
+                    AgentLoopEvent::Observation(AgentObservation::ProviderAttempt(
+                        ProviderAttemptObservation {
+                            identity: attempt_identity,
+                            lifecycle: provider_attempt_timer.finished(provider_attempt_status),
+                            model_turn_ordinal: turn_index,
+                            attempt_index: attempt_ordinal,
+                        },
+                    )),
+                )
+                .is_err()
+                {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        turn_index.saturating_add(1),
+                        Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                    );
+                }
+            }
             actual_model_turns = turn_index.saturating_add(1);
             if self.is_cancelled(input) {
                 if emit_final_review_finished(

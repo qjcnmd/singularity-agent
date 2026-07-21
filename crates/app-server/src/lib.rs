@@ -487,6 +487,9 @@ pub struct AppServer {
     evaluation_cancellation: CancellationToken,
     output_order: OutputOrderCoordinator,
     pending_transport_trace_binding: Option<TransportTraceBinding>,
+    #[doc(hidden)]
+    pub test_provider_override:
+        Option<std::sync::Arc<dyn singularity_model::Provider + Send + Sync>>,
 }
 
 /// 由请求工作线程与标准输入输出传输层共享的可克隆停止句柄。

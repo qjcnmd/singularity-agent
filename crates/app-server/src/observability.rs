@@ -3,8 +3,8 @@ use sha2::{Digest, Sha256};
 use singularity_agent::{
     AgentLoopEvent, AgentObservation, AgentRunStatus, FinalReviewStatus, OccurrenceIdentity,
     OccurrenceLifecycle, PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
-    PromptAssemblyStatus, SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallStatus,
-    VerificationStatus,
+    PromptAssemblyStatus, ProviderAttemptStatus as AgentProviderAttemptStatus,
+    SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallStatus, VerificationStatus,
 };
 use singularity_core::Timestamp;
 use singularity_model::{
@@ -53,20 +53,14 @@ struct ProjectedSpan {
 }
 
 impl<'a> TraceProjector<'a> {
-    /// Bind the projector to the persisted Turn root rather than reconstructing its identity.
+    /// Bind the projector to the persisted Turn root via a direct typed Store lookup.
     pub(crate) fn new(
         store: &'a SessionStore,
         thread_id: &str,
         turn_id: &str,
     ) -> Result<Self, StoreError> {
         let turn_span_id = store
-            .list_trace(thread_id)?
-            .into_iter()
-            .find(|event| {
-                event.session_id == turn_id
-                    && event.span_kind == Some(TraceSpanKind::Turn)
-                    && event.span_phase == Some(TraceSpanPhase::Start)
-            })
+            .find_span_start(thread_id, turn_id, TraceSpanKind::Turn)?
             .and_then(|event| event.span_id)
             .ok_or_else(|| {
                 StoreError::InvalidState(format!(
@@ -176,6 +170,26 @@ impl<'a> TraceProjector<'a> {
                 )?;
                 Ok(())
             }
+            AgentObservation::ProviderAttempt(observation) => self.append_lifecycle(
+                self.observation_span(
+                    &observation.identity,
+                    TraceSpanKind::ProviderAttempt,
+                    "provider attempt",
+                ),
+                &observation.lifecycle,
+                TraceSpanProjection {
+                    attempt_index: Some(u64::from(observation.attempt_index)),
+                    model_turn_ordinal: Some(u64::from(observation.model_turn_ordinal)),
+                    ..TraceSpanProjection::default()
+                },
+                |_status| TraceSpanProjection {
+                    attempt_index: Some(u64::from(observation.attempt_index)),
+                    model_turn_ordinal: Some(u64::from(observation.model_turn_ordinal)),
+                    ..TraceSpanProjection::default()
+                },
+                provider_attempt_span_status,
+                |_| Vec::new(),
+            ),
             AgentObservation::ToolCall(observation) => {
                 let start = TraceToolProjection {
                     tool_name: Some(observation.tool_name.clone()),
@@ -652,6 +666,14 @@ fn provider_span_status(status: ProviderAttemptStatus) -> TraceSpanStatus {
         ProviderAttemptStatus::Ok => TraceSpanStatus::Ok,
         ProviderAttemptStatus::Error => TraceSpanStatus::Error,
         ProviderAttemptStatus::Cancelled => TraceSpanStatus::Cancelled,
+    }
+}
+
+fn provider_attempt_span_status(status: &AgentProviderAttemptStatus) -> TraceSpanStatus {
+    match status {
+        AgentProviderAttemptStatus::Ok => TraceSpanStatus::Ok,
+        AgentProviderAttemptStatus::Error => TraceSpanStatus::Error,
+        AgentProviderAttemptStatus::Cancelled => TraceSpanStatus::Cancelled,
     }
 }
 

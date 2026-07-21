@@ -878,6 +878,45 @@ pub trait Provider {
     ) -> Result<ModelTurnResponse, ProviderError>;
 }
 
+/// 允许 `Arc<dyn Provider>` 作为透明代理，使测试可以注入动态 provider。
+impl Provider for Arc<dyn Provider + Send + Sync> {
+    fn protocol_contract(&self) -> ProviderProtocolContract {
+        (**self).protocol_contract()
+    }
+
+    fn negotiate_tool_capabilities(
+        &self,
+        model_preferences: &ModelPreferences,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderProtocolNegotiation, ProviderError> {
+        (**self).negotiate_tool_capabilities(model_preferences, cancellation)
+    }
+
+    fn streaming_capability(
+        &self,
+        selected_protocol: ProviderApiProtocol,
+    ) -> ProviderStreamingCapability {
+        (**self).streaming_capability(selected_protocol)
+    }
+
+    fn complete_stream(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        (**self).complete_stream(request, cancellation, on_event)
+    }
+
+    fn complete(
+        &self,
+        request: &ModelTurnRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ModelTurnResponse, ProviderError> {
+        (**self).complete(request, cancellation)
+    }
+}
+
 /// 已解析的兼容 OpenAI 连接设置；敏感信息仅为传输使用而保留。
 #[derive(Clone, PartialEq, Eq)]
 pub struct OpenAiProviderConfig {

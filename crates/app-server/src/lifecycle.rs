@@ -20,7 +20,18 @@ impl AppServer {
             evaluation_cancellation: CancellationToken::new(),
             output_order: OutputOrderCoordinator::new(),
             pending_transport_trace_binding: None,
+            test_provider_override: None,
         }
+    }
+
+    /// 仅测试：注入动态 provider 覆盖，使 JSON-RPC E2E 测试无需真实 HTTP 端点。
+    #[doc(hidden)]
+    pub fn with_test_provider(
+        mut self,
+        provider: std::sync::Arc<dyn singularity_model::Provider + Send + Sync>,
+    ) -> Self {
+        self.test_provider_override = Some(provider);
+        self
     }
 
     /// 替换服务使用的 sandbox backend。
@@ -81,6 +92,7 @@ impl AppServer {
             evaluation_cancellation: self.evaluation_cancellation.clone(),
             output_order: self.output_order.clone(),
             pending_transport_trace_binding: None,
+            test_provider_override: self.test_provider_override.clone(),
         })
     }
 
@@ -623,6 +635,25 @@ impl AppServer {
         workspace_tools: WorkspaceTools,
         on_event: &mut dyn FnMut(AgentLoopEvent) -> AppServerResult<()>,
     ) -> AppServerResult<AgentRunStatus> {
+        if let Some(test_provider) = &self.test_provider_override {
+            return match self.run_agent_loop_with_provider_and_tools(
+                std::sync::Arc::clone(test_provider),
+                invocation,
+                workspace_tools,
+                on_event,
+                false,
+            ) {
+                Err(AppServerError::ProjectInstructions(_)) => Ok(safe_failed_agent_status(
+                    SAFE_PROJECT_INSTRUCTIONS_FAILURE,
+                    "project_instructions",
+                )),
+                Err(AppServerError::Workspace(_)) => Ok(safe_failed_agent_status(
+                    SAFE_WORKSPACE_FAILURE,
+                    "workspace",
+                )),
+                result => result,
+            };
+        }
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
             Err(error) => {
@@ -679,6 +710,21 @@ impl AppServer {
         }
         if pending_approval.is_none() {
             return Ok(None);
+        }
+        if let Some(test_provider) = &self.test_provider_override {
+            return self.resume_agent_loop_after_gate_with_monitor(
+                ApprovalResumeInput {
+                    request,
+                    decision,
+                    turn,
+                    thread,
+                    pending_approval,
+                },
+                std::sync::Arc::clone(test_provider),
+                context,
+                on_event,
+                false,
+            );
         }
         let provider = match self.provider_snapshot.provider() {
             Ok(provider) => provider,
