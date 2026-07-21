@@ -50,6 +50,7 @@ pub fn provider_error_response(
         provider_name: None,
         model_name: request.model_preferences.model_name.clone(),
         provider_attempt_metadata,
+        provider_capability_metadata: None,
     }
 }
 
@@ -611,6 +612,7 @@ pub(super) fn finalize_provider_response(
         provider_name: Some(config.provider_name.clone()),
         model_name: Some(model_name.to_string()),
         provider_attempt_metadata: None,
+        provider_capability_metadata: None,
     };
     let available_tool_names = request
         .tools

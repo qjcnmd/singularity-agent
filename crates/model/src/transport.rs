@@ -14,6 +14,7 @@ use super::openai::{
     parse_openai_responses_response,
 };
 use super::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The single validated protocol choice shared by one provider completion.
 struct CompletionContext {
@@ -44,6 +45,7 @@ struct ProviderAttemptInProgress {
     actual_api_protocol: ProviderApiProtocol,
     attempt_index: u32,
     started_at: Instant,
+    started_at_unix_ms: u64,
     request_send_to_headers_ms: Option<u64>,
     time_to_first_text_delta_ms: Option<u64>,
 }
@@ -63,6 +65,7 @@ impl ProviderAttemptInProgress {
             actual_api_protocol,
             attempt_index,
             started_at: Instant::now(),
+            started_at_unix_ms: unix_timestamp_ms(),
             request_send_to_headers_ms: None,
             time_to_first_text_delta_ms: None,
         }
@@ -87,6 +90,7 @@ impl ProviderAttemptInProgress {
             Some(ModelErrorKind::Cancelled) => ProviderAttemptStatus::Cancelled,
             Some(_) => ProviderAttemptStatus::Error,
         };
+        let ended_at_unix_ms = unix_timestamp_ms().max(self.started_at_unix_ms);
         ProviderAttemptOccurrence {
             operation_phase: self.operation_phase,
             provider_name: self.provider_name,
@@ -94,6 +98,8 @@ impl ProviderAttemptInProgress {
             actual_api_protocol: self.actual_api_protocol,
             attempt_index: self.attempt_index,
             terminal_status,
+            started_at_unix_ms: self.started_at_unix_ms,
+            ended_at_unix_ms,
             attempt_duration_ms: duration_millis(self.started_at.elapsed()),
             request_send_to_headers_ms: self.request_send_to_headers_ms,
             queue_duration_ms: None,
@@ -104,6 +110,8 @@ impl ProviderAttemptInProgress {
             error_stage: error.and_then(|error| error.stage.clone()),
             diagnostic_code: error.and_then(|error| error.code.clone()),
             usage,
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
         }
     }
 }
@@ -789,6 +797,10 @@ impl Provider for OpenAiProvider {
                 } else {
                     Ok(completion.response)
                 }
+            })
+            .map(|mut response| {
+                response.provider_capability_metadata = context.capability_metadata.clone();
+                response
             });
         self.finish_completion_result(result, cancellation, &context)
     }
@@ -808,13 +820,18 @@ impl Provider for OpenAiProvider {
             .model_name
             .as_deref()
             .unwrap_or(&self.config.model_name);
-        let result = self.complete_with_contract(
-            request,
-            cancellation,
-            &context.capabilities,
-            context.api_protocol,
-            effective_model_name,
-        );
+        let result = self
+            .complete_with_contract(
+                request,
+                cancellation,
+                &context.capabilities,
+                context.api_protocol,
+                effective_model_name,
+            )
+            .map(|mut response| {
+                response.provider_capability_metadata = context.capability_metadata.clone();
+                response
+            });
         self.finish_completion_result(result, cancellation, &context)
     }
 }
@@ -1150,6 +1167,14 @@ pub(super) fn add_provider_attempt_metadata(
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Record one terminal attempt without changing aggregate retry semantics.

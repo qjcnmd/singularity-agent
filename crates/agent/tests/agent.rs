@@ -17,8 +17,9 @@ use singularity_model::{
     ModelPreferences, ModelRole, ModelToolCall, ModelToolParseStatus, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider, ProviderApiProtocol,
     ProviderAttemptMetadata, ProviderAttemptOccurrence, ProviderAttemptOperationPhase,
-    ProviderAttemptStatus, ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError,
-    ProviderProtocolContract, ProviderProtocolNegotiation, ProviderStreamEvent, ToolChoiceMode,
+    ProviderAttemptStatus, ProviderCapabilityCacheLookupResult, ProviderCapabilityCacheObservation,
+    ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderError, ProviderProtocolContract,
+    ProviderProtocolNegotiation, ProviderStreamEvent, ToolChoiceMode,
 };
 use singularity_policy::{
     CommandScopeDigest, NetworkAccess, PermissionDecisionOutcome, PermissionOperation,
@@ -72,6 +73,8 @@ fn provider_attempt_occurrence(
         actual_api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
         attempt_index,
         terminal_status,
+        started_at_unix_ms: 1,
+        ended_at_unix_ms: 2,
         attempt_duration_ms: 10,
         request_send_to_headers_ms: Some(4),
         queue_duration_ms: None,
@@ -82,6 +85,8 @@ fn provider_attempt_occurrence(
         error_stage: None,
         diagnostic_code: None,
         usage: Some(ModelUsage::default()),
+        model_turn_ordinal: None,
+        parent_occurrence_id: None,
     }
 }
 
@@ -300,7 +305,24 @@ fn negotiated_capability_metadata() -> ProviderCapabilityMetadata {
             latency_ms: 7,
             ..Default::default()
         },
+        cache_observations: Vec::new(),
     }
+}
+
+fn runtime_negotiation_metadata() -> ProviderCapabilityMetadata {
+    let mut metadata = negotiated_capability_metadata();
+    metadata.cache_observations = vec![ProviderCapabilityCacheObservation {
+        api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+        outcome: ProviderCapabilityCacheLookupResult::Miss,
+        model_turn_ordinal: None,
+        parent_occurrence_id: None,
+    }];
+    metadata.probe_attempt_metadata.occurrences = vec![provider_attempt_occurrence(
+        1,
+        "provider-probe",
+        ProviderAttemptStatus::Ok,
+    )];
+    metadata
 }
 
 struct BlockingProvider {
@@ -475,7 +497,8 @@ fn agent_loop_uses_negotiated_parallel_capability_and_keeps_optional_tools_non_s
         supports_parallel_tool_calls: true,
         ..ProviderProtocolContract::default()
     };
-    let metadata = negotiated_capability_metadata();
+    let metadata = runtime_negotiation_metadata();
+    let mut events = Vec::new();
     let agent_loop = AgentLoop::new(
         NegotiatingProvider {
             responses: vec![ModelTurnResponse::completed(
@@ -495,12 +518,50 @@ fn agent_loop_uses_negotiated_parallel_capability_and_keeps_optional_tools_non_s
         allow_read_policy(),
     );
 
-    let result = agent_loop.run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+    let result = agent_loop.run_with_events(
+        &AgentLoopInput::new("thread_1", "turn_1", "inspect"),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(negotiation_calls.load(Ordering::SeqCst), 1);
     assert_eq!(result.provider_protocol_contract, Some(negotiated_contract));
-    assert_eq!(result.provider_capability_metadata, Some(metadata));
+    let prompt_id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::PromptAssembly(observation))
+                if matches!(observation.lifecycle, OccurrenceLifecycle::Started { .. }) =>
+            {
+                Some(observation.identity.occurrence_id.clone())
+            }
+            _ => None,
+        })
+        .expect("PromptAssembly start");
+    let capability = result
+        .provider_capability_metadata
+        .as_ref()
+        .expect("negotiation metadata");
+    assert_eq!(capability.cache_observations.len(), 1);
+    assert_eq!(
+        capability.cache_observations[0]
+            .parent_occurrence_id
+            .as_deref(),
+        Some(prompt_id.as_str())
+    );
+    assert_eq!(
+        capability.probe_attempt_metadata.occurrences[0]
+            .parent_occurrence_id
+            .as_deref(),
+        Some(prompt_id.as_str())
+    );
+    assert_eq!(capability.cache_observations[0].model_turn_ordinal, Some(0));
+    assert_eq!(
+        capability.probe_attempt_metadata.occurrences[0].model_turn_ordinal,
+        Some(0)
+    );
     let requests = seen_requests.lock().expect("seen requests lock");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].tool_choice.max_tool_calls, 8);
@@ -571,6 +632,131 @@ fn capability_negotiation_failure_and_typed_cancel_skip_model_and_tool_execution
             assert!(result.provider_diagnostic.is_some());
         }
     }
+}
+
+#[test]
+fn capability_negotiation_error_does_not_bind_an_unemitted_prompt_parent() {
+    let metadata = runtime_negotiation_metadata();
+    let error = ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnsupportedCapability,
+            "capability negotiation failed",
+        )
+        .with_provider_diagnostic(
+            "capability_negotiation_failed",
+            singularity_model::ProviderErrorStage::ResponseValidation,
+        ),
+    )
+    .with_capability_metadata(metadata);
+    let mut events = Vec::new();
+    let result = AgentLoop::new(
+        NegotiatingProvider {
+            responses: vec![ModelTurnResponse::completed(
+                "request_1",
+                "response_1",
+                "unused",
+            )],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            negotiation_calls: Arc::new(AtomicUsize::new(0)),
+            static_capabilities: ProviderProtocolContract::default(),
+            negotiated_capabilities: Err(error),
+        },
+        workspace_tool_broker_for_test(),
+        allow_read_policy(),
+    )
+    .run_with_events(
+        &AgentLoopInput::new("thread_pre_request", "turn_pre_request", "inspect"),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
+
+    assert!(events.iter().all(|event| {
+        !matches!(
+            event,
+            AgentLoopEvent::Observation(AgentObservation::PromptAssembly(_))
+        )
+    }));
+    let metadata = result
+        .provider_capability_metadata
+        .expect("negotiation metadata");
+    assert!(
+        metadata
+            .cache_observations
+            .iter()
+            .all(|observation| observation.model_turn_ordinal == Some(0)
+                && observation.parent_occurrence_id.is_none())
+    );
+    assert!(
+        metadata
+            .probe_attempt_metadata
+            .occurrences
+            .iter()
+            .all(|occurrence| occurrence.model_turn_ordinal == Some(0)
+                && occurrence.parent_occurrence_id.is_none())
+    );
+}
+
+#[test]
+fn pre_request_context_failure_does_not_bind_an_unemitted_prompt_parent() {
+    let metadata = runtime_negotiation_metadata();
+    let mut events = Vec::new();
+    let result = AgentLoop::new(
+        NegotiatingProvider {
+            responses: vec![ModelTurnResponse::completed(
+                "request_1",
+                "response_1",
+                "unused",
+            )],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            negotiation_calls: Arc::new(AtomicUsize::new(0)),
+            static_capabilities: ProviderProtocolContract::default(),
+            negotiated_capabilities: Ok(ProviderProtocolNegotiation {
+                contract: ProviderProtocolContract::default(),
+                metadata,
+            }),
+        },
+        workspace_tool_broker_for_test(),
+        allow_read_policy(),
+    )
+    .run_with_events(
+        &AgentLoopInput::new(
+            "thread_pre_request",
+            "turn_context_failure",
+            "a".repeat(DEFAULT_MAX_CONTEXT_TOKENS as usize * 4 + 1),
+        ),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(events.iter().all(|event| {
+        !matches!(
+            event,
+            AgentLoopEvent::Observation(AgentObservation::PromptAssembly(_))
+        )
+    }));
+    let metadata = result
+        .provider_capability_metadata
+        .expect("negotiation metadata");
+    assert!(
+        metadata
+            .cache_observations
+            .iter()
+            .all(|observation| observation.model_turn_ordinal == Some(0)
+                && observation.parent_occurrence_id.is_none())
+    );
+    assert!(
+        metadata
+            .probe_attempt_metadata
+            .occurrences
+            .iter()
+            .all(|occurrence| occurrence.model_turn_ordinal == Some(0)
+                && occurrence.parent_occurrence_id.is_none())
+    );
 }
 
 #[test]
@@ -992,10 +1178,47 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
         tool_call_id: None,
         tool_calls: vec![call],
     });
-    let final_response =
+    tool_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        occurrences: vec![provider_attempt_occurrence(
+            1,
+            "provider-setup",
+            ProviderAttemptStatus::Ok,
+        )],
+        ..Default::default()
+    });
+    tool_response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        cache_observations: vec![ProviderCapabilityCacheObservation {
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            outcome: ProviderCapabilityCacheLookupResult::Miss,
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
+        }],
+        ..negotiated_capability_metadata()
+    });
+    let mut final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_final", "done");
+    final_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        occurrences: vec![provider_attempt_occurrence(
+            2,
+            "provider-finalization",
+            ProviderAttemptStatus::Ok,
+        )],
+        ..Default::default()
+    });
+    final_response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        cache_observations: vec![ProviderCapabilityCacheObservation {
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            outcome: ProviderCapabilityCacheLookupResult::Hit,
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
+        }],
+        ..negotiated_capability_metadata()
+    });
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let mut deltas = Vec::new();
+    let mut events = Vec::new();
     let result = AgentLoop::new(
         StreamingProvider {
             responses: vec![
@@ -1028,14 +1251,20 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
             .expect("bind workspace tools")
             .with_sandbox_backend(AgentStrictBackend),
     )
-    .run_with_text_deltas(
+    .run_with_events(
         &AgentLoopInput::new("thread_1", "turn_1", "verify")
             .with_max_turns(2)
             .with_verification_requirements([AgentVerificationRequirement::new(
                 verification_digest,
                 1,
             )]),
-        &mut |delta| deltas.push(delta.to_string()),
+        &mut |event| {
+            if let AgentLoopEvent::FinalTextDelta { delta } = &event {
+                deltas.push(delta.clone());
+            }
+            events.push(event);
+            Ok(())
+        },
     );
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -1045,6 +1274,57 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::None);
     assert!(requests[1].tools.is_empty());
+    let prompt_ids = events.iter().fold(Vec::new(), |mut prompt_ids, event| {
+        if let AgentLoopEvent::Observation(AgentObservation::PromptAssembly(observation)) = event
+            && !prompt_ids.contains(&observation.identity.occurrence_id)
+        {
+            prompt_ids.push(observation.identity.occurrence_id.clone());
+        }
+        prompt_ids
+    });
+    assert_eq!(prompt_ids.len(), 2);
+    assert_eq!(
+        result
+            .provider_attempts
+            .occurrences
+            .iter()
+            .map(|occurrence| (
+                occurrence.model_turn_ordinal,
+                occurrence.parent_occurrence_id.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(0), Some(prompt_ids[0].clone())),
+            (Some(1), Some(prompt_ids[1].clone())),
+        ]
+    );
+    let capability = result
+        .provider_capability_metadata
+        .as_ref()
+        .expect("finalization capability observations");
+    assert_eq!(
+        capability
+            .cache_observations
+            .iter()
+            .map(|observation| (
+                observation.outcome,
+                observation.model_turn_ordinal,
+                observation.parent_occurrence_id.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ProviderCapabilityCacheLookupResult::Miss,
+                Some(0),
+                Some(prompt_ids[0].clone()),
+            ),
+            (
+                ProviderCapabilityCacheLookupResult::Hit,
+                Some(1),
+                Some(prompt_ids[1].clone()),
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -2293,10 +2573,49 @@ fn approval_pause_resume_matches_uninterrupted_history_and_result_order() {
                 "line_end": null
             }),
         ));
+        response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+            attempt_count: 1,
+            occurrences: vec![provider_attempt_occurrence(
+                1,
+                "provider-approval-read",
+                ProviderAttemptStatus::Ok,
+            )],
+            ..Default::default()
+        });
+        response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+            cache_observations: vec![ProviderCapabilityCacheObservation {
+                api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+                outcome: ProviderCapabilityCacheLookupResult::Miss,
+                model_turn_ordinal: None,
+                parent_occurrence_id: None,
+            }],
+            ..negotiated_capability_metadata()
+        });
         response
     };
-    let final_response =
-        || ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+    let final_response = || {
+        let mut response =
+            ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
+        response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+            attempt_count: 1,
+            occurrences: vec![provider_attempt_occurrence(
+                2,
+                "provider-approval-final",
+                ProviderAttemptStatus::Ok,
+            )],
+            ..Default::default()
+        });
+        response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+            cache_observations: vec![ProviderCapabilityCacheObservation {
+                api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+                outcome: ProviderCapabilityCacheLookupResult::Hit,
+                model_turn_ordinal: None,
+                parent_occurrence_id: None,
+            }],
+            ..negotiated_capability_metadata()
+        });
+        response
+    };
 
     let uninterrupted_requests = Arc::new(Mutex::new(Vec::new()));
     let uninterrupted = AgentLoop::new(
@@ -2325,7 +2644,19 @@ fn approval_pause_resume_matches_uninterrupted_history_and_result_order() {
     .with_workspace_tools(WorkspaceTools::new(workspace.path()).expect("bind workspace tools"));
     let blocked = paused.run(&input);
     assert_eq!(blocked.status, AgentStatus::Blocked);
+    assert_eq!(
+        blocked
+            .provider_capability_metadata
+            .as_ref()
+            .expect("blocked capability observations")
+            .cache_observations
+            .len(),
+        1
+    );
     let pending = pending_approval(&blocked);
+    let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
+    assert!(checkpoint.get("cache_observations").is_none());
+    assert!(checkpoint.get("provider_capability_metadata").is_none());
     let resumed_grant = ApprovalGrant::allow(
         pending.pending_tool_call().request_id.clone(),
         pending.pending_tool_call().tool_name.clone(),
@@ -2350,6 +2681,31 @@ fn approval_pause_resume_matches_uninterrupted_history_and_result_order() {
     assert_eq!(resumed.model_turns, uninterrupted_result.model_turns);
     assert_eq!(resumed.verification, uninterrupted_result.verification);
     assert_eq!(resumed.tool_results, uninterrupted_result.tool_results);
+    assert_eq!(
+        resumed
+            .provider_capability_metadata
+            .as_ref()
+            .expect("resumed capability observations")
+            .cache_observations
+            .iter()
+            .map(|observation| observation.outcome)
+            .collect::<Vec<_>>(),
+        [ProviderCapabilityCacheLookupResult::Hit]
+    );
+    assert_eq!(
+        uninterrupted_result
+            .provider_capability_metadata
+            .as_ref()
+            .expect("uninterrupted capability observations")
+            .cache_observations
+            .iter()
+            .map(|observation| observation.outcome)
+            .collect::<Vec<_>>(),
+        [
+            ProviderCapabilityCacheLookupResult::Miss,
+            ProviderCapabilityCacheLookupResult::Hit
+        ]
+    );
     let uninterrupted_requests = uninterrupted_requests.lock().expect("requests");
     let resumed_requests = resumed_requests.lock().expect("requests");
     assert_eq!(uninterrupted_requests.len(), 2);
@@ -6108,6 +6464,145 @@ fn plan_tool_contract_preserves_actionable_validation_causes() {
 }
 
 #[test]
+fn agent_binds_provider_runtime_observations_to_each_prompt_assembly() {
+    let mut first = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    first.tool_calls.push(plan_tool_call(
+        "plan_call_1",
+        serde_json::json!([{"step": "inspect", "status": "in_progress"}]),
+    ));
+    first.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 2,
+        retry_count: 1,
+        occurrences: vec![
+            provider_attempt_occurrence(91, "provider-first", ProviderAttemptStatus::Error),
+            provider_attempt_occurrence(92, "provider-first-retry", ProviderAttemptStatus::Ok),
+        ],
+        ..Default::default()
+    });
+    first.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        cache_observations: vec![ProviderCapabilityCacheObservation {
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            outcome: ProviderCapabilityCacheLookupResult::Miss,
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
+        }],
+        ..negotiated_capability_metadata()
+    });
+
+    let mut complete_plan_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    complete_plan_response.tool_calls.push(plan_tool_call(
+        "plan_call_2",
+        serde_json::json!([{"step": "inspect", "status": "completed"}]),
+    ));
+    complete_plan_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        occurrences: vec![provider_attempt_occurrence(
+            93,
+            "provider-plan-complete",
+            ProviderAttemptStatus::Ok,
+        )],
+        ..Default::default()
+    });
+    complete_plan_response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        cache_observations: vec![ProviderCapabilityCacheObservation {
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            outcome: ProviderCapabilityCacheLookupResult::Hit,
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
+        }],
+        ..negotiated_capability_metadata()
+    });
+
+    let mut final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+    final_response.provider_attempt_metadata = Some(ProviderAttemptMetadata {
+        attempt_count: 1,
+        occurrences: vec![provider_attempt_occurrence(
+            94,
+            "provider-final",
+            ProviderAttemptStatus::Ok,
+        )],
+        ..Default::default()
+    });
+    final_response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        cache_observations: vec![ProviderCapabilityCacheObservation {
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            outcome: ProviderCapabilityCacheLookupResult::Hit,
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
+        }],
+        ..negotiated_capability_metadata()
+    });
+
+    let mut events = Vec::new();
+    let agent = agent_loop_with_plan_capabilities(
+        vec![first, complete_plan_response, final_response],
+        allow_read_policy(),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract::default(),
+    );
+    let result = agent.run_with_events(
+        &AgentLoopInput::new("thread_runtime", "turn_runtime", "inspect"),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
+
+    let prompt_ids = events.iter().fold(Vec::new(), |mut prompt_ids, event| {
+        if let AgentLoopEvent::Observation(AgentObservation::PromptAssembly(observation)) = event
+            && !prompt_ids.contains(&observation.identity.occurrence_id)
+        {
+            prompt_ids.push(observation.identity.occurrence_id.clone());
+        }
+        prompt_ids
+    });
+    assert_eq!(prompt_ids.len(), 1);
+    assert_eq!(result.model_turns, 1);
+    assert_eq!(
+        result
+            .provider_attempts
+            .occurrences
+            .iter()
+            .map(|occurrence| {
+                (
+                    occurrence.model_turn_ordinal,
+                    occurrence.parent_occurrence_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(0), Some(prompt_ids[0].clone())),
+            (Some(0), Some(prompt_ids[0].clone())),
+        ]
+    );
+    let capability = result
+        .provider_capability_metadata
+        .as_ref()
+        .expect("aggregated capability metadata");
+    assert_eq!(
+        capability
+            .cache_observations
+            .iter()
+            .map(|observation| (
+                observation.outcome,
+                observation.model_turn_ordinal,
+                observation.parent_occurrence_id.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            ProviderCapabilityCacheLookupResult::Miss,
+            Some(0),
+            Some(prompt_ids[0].clone()),
+        ),]
+    );
+    let public = serde_json::to_string(&result).expect("serialize result");
+    assert!(!public.contains("cache_observations"));
+    assert!(!public.contains("provider_capability_metadata"));
+}
+
+#[test]
 fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
     let mut plan_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
@@ -6133,6 +6628,15 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
         ],
         ..Default::default()
     });
+    plan_response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        cache_observations: vec![ProviderCapabilityCacheObservation {
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            outcome: ProviderCapabilityCacheLookupResult::Miss,
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
+        }],
+        ..negotiated_capability_metadata()
+    });
     let mut final_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "done");
     final_response.usage = ModelUsage {
@@ -6154,14 +6658,30 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
         )],
         ..Default::default()
     });
+    final_response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        cache_observations: vec![ProviderCapabilityCacheObservation {
+            api_protocol: ProviderApiProtocol::OpenAiChatCompletions,
+            outcome: ProviderCapabilityCacheLookupResult::Hit,
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
+        }],
+        ..negotiated_capability_metadata()
+    });
 
+    let mut events = Vec::new();
     let result = agent_loop_with_plan_capabilities(
         vec![plan_response, final_response],
         allow_read_policy(),
         Arc::new(Mutex::new(Vec::new())),
         ProviderProtocolContract::default(),
     )
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+    .run_with_events(
+        &AgentLoopInput::new("thread_1", "turn_1", "inspect"),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.model_usage.input_tokens, 240);
@@ -6172,6 +6692,7 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
     assert_eq!(result.provider_attempts.attempt_count, 3);
     assert_eq!(result.provider_attempts.retry_count, 1);
     assert_eq!(result.provider_attempts.latency_ms, 105);
+    assert_eq!(result.model_turns, 2);
     assert_eq!(
         result
             .provider_attempts
@@ -6192,6 +6713,58 @@ fn agent_loop_aggregates_provider_attempts_latency_and_token_usage() {
             "provider-plan-first",
             "provider-plan-retry",
             "provider-final"
+        ]
+    );
+    let prompt_ids = events.iter().fold(Vec::new(), |mut prompt_ids, event| {
+        if let AgentLoopEvent::Observation(AgentObservation::PromptAssembly(observation)) = event
+            && !prompt_ids.contains(&observation.identity.occurrence_id)
+        {
+            prompt_ids.push(observation.identity.occurrence_id.clone());
+        }
+        prompt_ids
+    });
+    assert_eq!(prompt_ids.len(), 2);
+    assert_eq!(
+        result
+            .provider_attempts
+            .occurrences
+            .iter()
+            .map(|occurrence| (
+                occurrence.model_turn_ordinal,
+                occurrence.parent_occurrence_id.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(0), Some(prompt_ids[0].clone())),
+            (Some(0), Some(prompt_ids[0].clone())),
+            (Some(1), Some(prompt_ids[1].clone())),
+        ]
+    );
+    let capability = result
+        .provider_capability_metadata
+        .as_ref()
+        .expect("capability observation aggregate");
+    assert_eq!(
+        capability
+            .cache_observations
+            .iter()
+            .map(|observation| (
+                observation.outcome,
+                observation.model_turn_ordinal,
+                observation.parent_occurrence_id.clone(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ProviderCapabilityCacheLookupResult::Miss,
+                Some(0),
+                Some(prompt_ids[0].clone()),
+            ),
+            (
+                ProviderCapabilityCacheLookupResult::Hit,
+                Some(1),
+                Some(prompt_ids[1].clone()),
+            ),
         ]
     );
     let status = result.to_run_status();

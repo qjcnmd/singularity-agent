@@ -797,16 +797,23 @@ impl AgentLoopState {
 
     fn record_provider_negotiation(
         &mut self,
+        model_turn_ordinal: u32,
         contract: &ProviderProtocolContract,
         metadata: &ProviderCapabilityMetadata,
     ) {
         self.provider_protocol_contract = Some(contract.clone());
-        self.provider_capability_metadata = Some(metadata.clone());
+        self.record_provider_capability_metadata(metadata, model_turn_ordinal, None);
     }
 
-    fn record_provider_negotiation_error(&mut self, error: &ProviderError) {
+    fn record_provider_negotiation_error(
+        &mut self,
+        model_turn_ordinal: u32,
+        error: &ProviderError,
+    ) {
         self.provider_protocol_contract = None;
-        self.provider_capability_metadata = error.capability_metadata.as_deref().cloned();
+        if let Some(metadata) = error.capability_metadata.as_deref() {
+            self.record_provider_capability_metadata(metadata, model_turn_ordinal, None);
+        }
     }
 
     fn approval_count(&self) -> u32 {
@@ -814,7 +821,12 @@ impl AgentLoopState {
             .saturating_add(self.pending_approvals.len() as u32)
     }
 
-    fn observe_model_response(&mut self, response: &ModelTurnResponse) {
+    fn observe_model_response(
+        &mut self,
+        response: &ModelTurnResponse,
+        model_turn_ordinal: u32,
+        parent_occurrence_id: &str,
+    ) {
         self.model_usage.input_tokens = self
             .model_usage
             .input_tokens
@@ -862,9 +874,64 @@ impl AgentLoopState {
                     .map(|(offset, mut occurrence)| {
                         occurrence.attempt_index = first_attempt_index
                             .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+                        occurrence.model_turn_ordinal = Some(model_turn_ordinal);
+                        occurrence.parent_occurrence_id = Some(parent_occurrence_id.to_string());
                         occurrence
                     }),
             );
+        }
+        if let Some(metadata) = &response.provider_capability_metadata {
+            self.record_provider_capability_metadata(
+                metadata,
+                model_turn_ordinal,
+                Some(parent_occurrence_id),
+            );
+        }
+    }
+
+    fn record_provider_capability_metadata(
+        &mut self,
+        metadata: &ProviderCapabilityMetadata,
+        model_turn_ordinal: u32,
+        parent_occurrence_id: Option<&str>,
+    ) {
+        let mut metadata = metadata.clone();
+        let parent_occurrence_id = parent_occurrence_id.map(str::to_string);
+        for observation in &mut metadata.cache_observations {
+            observation.model_turn_ordinal = Some(model_turn_ordinal);
+            observation.parent_occurrence_id = parent_occurrence_id.clone();
+        }
+        for occurrence in &mut metadata.probe_attempt_metadata.occurrences {
+            occurrence.model_turn_ordinal = Some(model_turn_ordinal);
+            occurrence.parent_occurrence_id = parent_occurrence_id.clone();
+        }
+        self.provider_capability_metadata = Some(match self.provider_capability_metadata.take() {
+            Some(previous) => merge_provider_capability_metadata(previous, metadata),
+            None => metadata,
+        });
+    }
+
+    /// Bind pre-request negotiation evidence only after its real PromptAssembly start is emitted.
+    fn bind_unbound_provider_runtime_observations(
+        &mut self,
+        model_turn_ordinal: u32,
+        parent_occurrence_id: &str,
+    ) {
+        let Some(metadata) = &mut self.provider_capability_metadata else {
+            return;
+        };
+        let parent_occurrence_id = parent_occurrence_id.to_string();
+        for observation in &mut metadata.cache_observations {
+            if observation.parent_occurrence_id.is_none() {
+                observation.model_turn_ordinal = Some(model_turn_ordinal);
+                observation.parent_occurrence_id = Some(parent_occurrence_id.clone());
+            }
+        }
+        for occurrence in &mut metadata.probe_attempt_metadata.occurrences {
+            if occurrence.parent_occurrence_id.is_none() {
+                occurrence.model_turn_ordinal = Some(model_turn_ordinal);
+                occurrence.parent_occurrence_id = Some(parent_occurrence_id.clone());
+            }
         }
     }
 
@@ -1272,6 +1339,10 @@ where
                     Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                 );
             }
+            state.bind_unbound_provider_runtime_observations(
+                turn_index,
+                &prompt_identity.occurrence_id,
+            );
             let tool_view = if finalization_only {
                 ModelToolView::finalization()
             } else {
@@ -1511,7 +1582,7 @@ where
                 Ok(response) if response.status == ModelTurnStatus::Success => {
                     let terminal_text = assistant_message_text(response.assistant_message.as_ref());
                     if streamed_text != terminal_text {
-                        provider_error_response(
+                        provider_error_model_response(
                             &request,
                             ProviderError::from_model_error(provider_stream_text_mismatch_error()),
                         )
@@ -1523,14 +1594,21 @@ where
                 Err(error)
                     if error.error.code.as_deref() == Some(PROVIDER_STREAMING_UNSUPPORTED_CODE) =>
                 {
+                    let stream_error = error;
                     match self.provider.complete(&request, &self.cancellation) {
-                        Ok(response) => response,
-                        Err(error) => provider_error_response(&request, error),
+                        Ok(mut response) => {
+                            merge_response_runtime_metadata(&mut response, &stream_error);
+                            response
+                        }
+                        Err(mut error) => {
+                            merge_provider_error_runtime_metadata(&mut error, &stream_error);
+                            provider_error_model_response(&request, error)
+                        }
                     }
                 }
-                Err(error) => provider_error_response(&request, error),
+                Err(error) => provider_error_model_response(&request, error),
             };
-            state.observe_model_response(&response);
+            state.observe_model_response(&response, turn_index, &prompt_identity.occurrence_id);
             actual_model_turns = turn_index.saturating_add(1);
             if self.is_cancelled(input) {
                 if emit_final_review_finished(
@@ -2238,7 +2316,11 @@ where
             .negotiate_tool_capabilities(&input.model_preferences, &self.cancellation)
         {
             Ok(negotiation) => {
-                state.record_provider_negotiation(&negotiation.contract, &negotiation.metadata);
+                state.record_provider_negotiation(
+                    model_turns,
+                    &negotiation.contract,
+                    &negotiation.metadata,
+                );
                 if self.is_cancelled(input) {
                     return ControlFlow::Break(state.finish(
                         AgentStatus::Cancelled,
@@ -2251,7 +2333,7 @@ where
                 ControlFlow::Continue((negotiation.contract, state))
             }
             Err(error) => {
-                state.record_provider_negotiation_error(&error);
+                state.record_provider_negotiation_error(model_turns, &error);
                 if self.is_cancelled(input)
                     || error.error.category() == ModelErrorCategory::Cancelled
                 {
@@ -3952,6 +4034,109 @@ fn failed_result(error: impl Into<String>) -> AgentLoopResult {
         provider_diagnostic: None,
         provider_protocol_contract: None,
         provider_capability_metadata: None,
+    }
+}
+
+fn provider_error_model_response(
+    request: &ModelTurnRequest,
+    error: ProviderError,
+) -> ModelTurnResponse {
+    let provider_capability_metadata = error.capability_metadata.as_deref().cloned();
+    let mut response = provider_error_response(request, error);
+    response.provider_capability_metadata = provider_capability_metadata;
+    response
+}
+
+fn merge_provider_attempt_metadata(
+    mut previous: ProviderAttemptMetadata,
+    current: ProviderAttemptMetadata,
+) -> ProviderAttemptMetadata {
+    let first_attempt_index = previous.attempt_count.saturating_add(1);
+    previous.attempt_count = previous.attempt_count.saturating_add(current.attempt_count);
+    previous.retry_count = previous.retry_count.saturating_add(current.retry_count);
+    previous.latency_ms = previous.latency_ms.saturating_add(current.latency_ms);
+    previous
+        .occurrences
+        .extend(
+            current
+                .occurrences
+                .into_iter()
+                .enumerate()
+                .map(|(offset, mut occurrence)| {
+                    occurrence.attempt_index = first_attempt_index
+                        .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+                    occurrence
+                }),
+        );
+    previous
+}
+
+fn merge_model_usage(previous: &mut ModelUsage, current: &ModelUsage) {
+    previous.input_tokens = previous.input_tokens.saturating_add(current.input_tokens);
+    previous.output_tokens = previous.output_tokens.saturating_add(current.output_tokens);
+    previous.total_tokens = previous.total_tokens.saturating_add(current.total_tokens);
+    previous.cached_input_tokens = previous
+        .cached_input_tokens
+        .saturating_add(current.cached_input_tokens);
+    previous.reasoning_tokens = previous
+        .reasoning_tokens
+        .saturating_add(current.reasoning_tokens);
+    if let Some(cost) = current.cost_estimate {
+        previous.cost_estimate =
+            Some(previous.cost_estimate.unwrap_or_default().max(0.0) + cost.max(0.0));
+    }
+}
+
+fn merge_provider_capability_metadata(
+    previous: ProviderCapabilityMetadata,
+    mut current: ProviderCapabilityMetadata,
+) -> ProviderCapabilityMetadata {
+    let mut observations = previous.cache_observations;
+    observations.append(&mut current.cache_observations);
+    current.cache_observations = observations;
+    current.profile_attempts = current
+        .profile_attempts
+        .saturating_add(previous.profile_attempts);
+    current.fallback_count = current
+        .fallback_count
+        .saturating_add(previous.fallback_count);
+    merge_model_usage(&mut current.probe_usage, &previous.probe_usage);
+    current.probe_attempt_metadata = merge_provider_attempt_metadata(
+        previous.probe_attempt_metadata,
+        current.probe_attempt_metadata,
+    );
+    current
+}
+
+fn merge_response_runtime_metadata(response: &mut ModelTurnResponse, earlier: &ProviderError) {
+    if let Some(metadata) = earlier.capability_metadata.as_deref() {
+        response.provider_capability_metadata =
+            Some(match response.provider_capability_metadata.take() {
+                Some(current) => merge_provider_capability_metadata(metadata.clone(), current),
+                None => metadata.clone(),
+            });
+    }
+    if let Some(metadata) = &earlier.provider_attempt_metadata {
+        response.provider_attempt_metadata =
+            Some(match response.provider_attempt_metadata.take() {
+                Some(current) => merge_provider_attempt_metadata(metadata.clone(), current),
+                None => metadata.clone(),
+            });
+    }
+}
+
+fn merge_provider_error_runtime_metadata(error: &mut ProviderError, earlier: &ProviderError) {
+    if let Some(metadata) = earlier.capability_metadata.as_deref() {
+        error.capability_metadata = Some(Box::new(match error.capability_metadata.take() {
+            Some(current) => merge_provider_capability_metadata(metadata.clone(), *current),
+            None => metadata.clone(),
+        }));
+    }
+    if let Some(metadata) = &earlier.provider_attempt_metadata {
+        error.provider_attempt_metadata = Some(match error.provider_attempt_metadata.take() {
+            Some(current) => merge_provider_attempt_metadata(metadata.clone(), current),
+            None => metadata.clone(),
+        });
     }
 }
 

@@ -7,8 +7,9 @@ use singularity_model::{
     ModelRole, ModelToolCall, ModelToolParseStatus, ModelToolSchema, ModelTurnRequest,
     ModelTurnResponse, ModelTurnStatus, ModelUsage, OpenAiProvider, OpenAiProviderConfig, Provider,
     ProviderApiProtocol, ProviderAttemptMetadata, ProviderAttemptOccurrence,
-    ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderCapabilityProfile,
-    ProviderConfigSnapshot, ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
+    ProviderAttemptOperationPhase, ProviderAttemptStatus, ProviderCapabilityCacheLookupResult,
+    ProviderCapabilityMetadata, ProviderCapabilityProfile, ProviderConfigSnapshot,
+    ProviderConfigSource, ProviderConfigurationStatus, ProviderErrorStage,
     ProviderProtocolContract, ProviderStreamEvent, ProviderStreamingCapability,
     ProviderToolReasoningMode, ToolChoiceMode, ToolChoicePolicy, chat_completions_endpoint,
     classify_model_error, resolve_provider_config, responses_endpoint, validate_model_request,
@@ -3915,6 +3916,15 @@ fn openai_cancelled_capability_probe_does_not_publish_cache() {
         .expect("cancelled probe result")
         .expect_err("cancelled probe must fail");
     assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
+    assert_eq!(
+        error
+            .capability_metadata
+            .as_ref()
+            .expect("cancelled lookup observation")
+            .cache_observations
+            .len(),
+        1
+    );
     assert!(
         !cache_path.exists(),
         "cancelled probe must not publish a record"
@@ -3956,6 +3966,14 @@ fn openai_cached_capability_rejection_invalidates_persistent_record() {
             .validation_errors
             .contains(&"tool_reasoning_content_requires_adapter_history_support".to_string())
     );
+    assert!(
+        !error
+            .capability_metadata
+            .as_ref()
+            .expect("rejection lookup observations")
+            .cache_observations
+            .is_empty()
+    );
     let invalidated: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&cache_path).expect("read invalidated cache"),
     )
@@ -3972,6 +3990,15 @@ fn openai_cached_capability_rejection_invalidates_persistent_record() {
     )
     .expect("reprobe after invalidation");
     assert!(!negotiation.metadata.cache_hit);
+    assert_eq!(
+        negotiation
+            .metadata
+            .cache_observations
+            .iter()
+            .map(|observation| observation.outcome)
+            .collect::<Vec<_>>(),
+        vec![ProviderCapabilityCacheLookupResult::Miss]
+    );
     assert_eq!(
         requests.recv_timeout(Duration::from_secs(1)).unwrap().len(),
         5
@@ -4082,6 +4109,7 @@ fn provider_runtime_fingerprint_is_stable_partitioned_and_secret_free() {
             fallback_count: 0,
             probe_usage: ModelUsage::default(),
             probe_attempt_metadata: ProviderAttemptMetadata::default(),
+            cache_observations: Vec::new(),
         },
     };
     let negotiated = first.runtime_fingerprint_for_negotiation(Some("gpt-test"), &negotiation);
@@ -4484,6 +4512,11 @@ fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
         assert!(occurrence.request_send_to_headers_ms.is_some());
         assert!(occurrence.queue_duration_ms.is_none());
         assert!(occurrence.time_to_first_text_delta_ms.is_none());
+        assert!(occurrence.ended_at_unix_ms >= occurrence.started_at_unix_ms);
+        assert!(
+            occurrence.attempt_duration_ms
+                <= occurrence.ended_at_unix_ms - occurrence.started_at_unix_ms + 1
+        );
     }
     for occurrence in &metadata.occurrences[..2] {
         assert_eq!(occurrence.terminal_status, ProviderAttemptStatus::Error);
@@ -4505,6 +4538,67 @@ fn openai_provider_retries_transient_http_errors_with_attempt_metadata() {
     assert!(success.error_category.is_none());
     assert!(success.usage.is_none());
     assert_eq!(attempts.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+}
+
+#[test]
+fn provider_capability_cache_lookup_observations_are_closed_and_runtime_only() {
+    let (base_url, _requests, _started) = delayed_probe_server(
+        vec![("HTTP/1.1 200 OK", PROBE_STRICT_PARALLEL_RESPONSE)],
+        Duration::ZERO,
+    );
+    let provider = OpenAiProvider::new(provider_test_config(base_url)).expect("provider");
+    let cancellation = singularity_core::CancellationToken::new();
+
+    let negotiation = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &cancellation,
+    )
+    .expect("initial capability negotiation");
+    let cached = Provider::negotiate_tool_capabilities(
+        &provider,
+        &ModelPreferences::default(),
+        &cancellation,
+    )
+    .expect("cached capability negotiation");
+
+    assert_eq!(
+        negotiation
+            .metadata
+            .cache_observations
+            .iter()
+            .map(|observation| observation.outcome)
+            .collect::<Vec<_>>(),
+        vec![ProviderCapabilityCacheLookupResult::Miss]
+    );
+    assert_eq!(
+        cached
+            .metadata
+            .cache_observations
+            .iter()
+            .map(|observation| observation.outcome)
+            .collect::<Vec<_>>(),
+        vec![ProviderCapabilityCacheLookupResult::Hit]
+    );
+
+    let mut response = ModelTurnResponse::completed("runtime_response", "response", "done");
+    response.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        cache_observations: cached.metadata.cache_observations.clone(),
+        ..negotiation.metadata
+    });
+    let wire = serde_json::to_value(&response).expect("serialize model response");
+    assert!(wire.get("provider_capability_metadata").is_none());
+    let schema = serde_json::to_value(schema_for!(ModelTurnResponse)).expect("response schema");
+    assert!(
+        schema["properties"]
+            .get("provider_capability_metadata")
+            .is_none()
+    );
+    assert!(
+        schema["definitions"]
+            .get("ProviderCapabilityCacheObservation")
+            .is_none()
+    );
 }
 
 #[test]
@@ -5430,6 +5524,8 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
             actual_api_protocol: ProviderApiProtocol::OpenAiResponses,
             attempt_index: 1,
             terminal_status: ProviderAttemptStatus::Ok,
+            started_at_unix_ms: 1,
+            ended_at_unix_ms: 2,
             attempt_duration_ms: 25,
             request_send_to_headers_ms: Some(10),
             queue_duration_ms: None,
@@ -5440,6 +5536,8 @@ fn model_boundary_objects_are_schema_backed_and_round_trip() {
             error_stage: None,
             diagnostic_code: None,
             usage: Some(ModelUsage::default()),
+            model_turn_ordinal: None,
+            parent_occurrence_id: None,
         });
     let runtime_wire = serde_json::to_value(&runtime_attempt_metadata)
         .expect("serialize runtime attempt metadata");

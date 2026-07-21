@@ -395,6 +395,24 @@ pub struct ModelUsage {
 }
 
 /// 描述能力探测和选定协议配置档案的清理后证据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCapabilityCacheLookupResult {
+    Hit,
+    Miss,
+}
+
+/// 一次真实 capability-cache 逻辑查找的短生命周期 typed 结果。
+///
+/// Provider 只填充真实 cache boundary 与 Hit/Miss；AgentLoop 在真实
+/// PromptAssembly ownership boundary 绑定 model-turn 和 parent occurrence。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCapabilityCacheObservation {
+    pub api_protocol: ProviderApiProtocol,
+    pub outcome: ProviderCapabilityCacheLookupResult,
+    pub model_turn_ordinal: Option<u32>,
+    pub parent_occurrence_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderCapabilityMetadata {
     pub api_protocol: ProviderApiProtocol,
@@ -404,6 +422,10 @@ pub struct ProviderCapabilityMetadata {
     pub fallback_count: u32,
     pub probe_usage: ModelUsage,
     pub probe_attempt_metadata: ProviderAttemptMetadata,
+    /// Runtime-only lookup observations; persistence and public schema expose no entries.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub cache_observations: Vec<ProviderCapabilityCacheObservation>,
 }
 
 /// 模型提供方能力协商返回的契约和诊断信息。
@@ -639,6 +661,10 @@ pub struct ModelTurnResponse {
     pub model_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_attempt_metadata: Option<ProviderAttemptMetadata>,
+    /// Runtime-only capability metadata delivered with this response/error.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub provider_capability_metadata: Option<ProviderCapabilityMetadata>,
 }
 
 impl ModelTurnResponse {
@@ -661,6 +687,7 @@ impl ModelTurnResponse {
             provider_name: None,
             model_name: None,
             provider_attempt_metadata: None,
+            provider_capability_metadata: None,
         }
     }
 }
@@ -725,6 +752,10 @@ pub struct ProviderAttemptOccurrence {
     /// 该 aggregate 内按真实 HTTP attempt 顺序排列的 1-based 索引。
     pub attempt_index: u32,
     pub terminal_status: ProviderAttemptStatus,
+    /// The wall-clock timestamp captured when this transport attempt was created.
+    pub started_at_unix_ms: u64,
+    /// The wall-clock timestamp captured when this transport attempt was terminalized.
+    pub ended_at_unix_ms: u64,
     /// 从 attempt 创建到响应解析或失败终结的墙钟时长，不含 retry backoff。
     pub attempt_duration_ms: u64,
     /// 从发送请求到收到响应 headers；未收到 headers 时不可用。
@@ -742,6 +773,10 @@ pub struct ProviderAttemptOccurrence {
     pub diagnostic_code: Option<String>,
     /// 成功响应明确提供 usage 时才存在。
     pub usage: Option<ModelUsage>,
+    /// Bound by AgentLoop at the model-response ownership boundary.
+    pub model_turn_ordinal: Option<u32>,
+    /// Stable PromptAssembly parent occurrence bound by AgentLoop.
+    pub parent_occurrence_id: Option<String>,
 }
 
 /// 一次模型提供方操作记录的 aggregate 尝试次数、重试次数和运行期 occurrences。
@@ -777,6 +812,7 @@ impl ProviderCapabilityMetadata {
             fallback_count: 0,
             probe_usage: ModelUsage::default(),
             probe_attempt_metadata: ProviderAttemptMetadata::zero(),
+            cache_observations: Vec::new(),
         }
     }
 }
