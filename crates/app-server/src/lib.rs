@@ -4843,4 +4843,101 @@ mod tests {
         assert!(unbound[0].trace_binding.is_none());
         server.output_order.complete(unbound[0].reservation.order);
     }
+
+    /// Verification Span 按 occurrence_id 分组，每个 ID 恰好一个 Start 和一个 End。
+    #[test]
+    fn verification_spans_are_paired_by_occurrence_id() {
+        use singularity_agent::{
+            AgentLoopEvent, AgentObservation, OccurrenceIdentity, OccurrenceLifecycle,
+            VerificationObservation, VerificationStatus,
+        };
+        use singularity_protocol::{TraceSpanKind, TraceSpanPhase};
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+        let thread = store.create_thread(None, None).expect("thread");
+        let (turn, _item, _trace) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                "running",
+                serde_json::json!([{"type": "text", "text": "verify"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("turn");
+
+        let mut projector =
+            observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
+                .expect("projector");
+
+        // 投影三个不同 occurrence_id 的 verification observation
+        for ordinal in 0..3u32 {
+            // 每个 ordinal 使用不同的 occurrence_id
+            let identity = OccurrenceIdentity {
+                occurrence_id: format!("sha256:{}{:02x}", "cd".repeat(31), ordinal),
+                parent_occurrence_id: None,
+                ordinal,
+            };
+            let started = VerificationObservation {
+                identity: identity.clone(),
+                lifecycle: OccurrenceLifecycle::Started {
+                    queued_at_unix_ms: 100 + u64::from(ordinal),
+                    started_at_unix_ms: 101 + u64::from(ordinal),
+                },
+                required_command_count: 1,
+                satisfied_command_count: 0,
+                occurrence_count: ordinal + 1,
+                command_duration_ms: None,
+            };
+            projector
+                .project_event(AgentLoopEvent::Observation(AgentObservation::Verification(
+                    started,
+                )))
+                .expect("project start");
+
+            let finished = VerificationObservation {
+                identity,
+                lifecycle: OccurrenceLifecycle::Finished {
+                    queued_at_unix_ms: 100 + u64::from(ordinal),
+                    started_at_unix_ms: 101 + u64::from(ordinal),
+                    ended_at_unix_ms: 200 + u64::from(ordinal),
+                    duration_ms: 99,
+                    status: VerificationStatus::CommandPassed,
+                },
+                required_command_count: 1,
+                satisfied_command_count: 1,
+                occurrence_count: ordinal + 1,
+                command_duration_ms: Some(50),
+            };
+            projector
+                .project_event(AgentLoopEvent::Observation(AgentObservation::Verification(
+                    finished,
+                )))
+                .expect("project end");
+        }
+
+        // 读取 trace 并按 span_id 分组
+        let trace = store.list_trace(&thread.thread_id).expect("trace");
+        let mut spans: BTreeMap<String, Vec<TraceSpanPhase>> = BTreeMap::new();
+        for event in &trace {
+            if event.span_kind == Some(TraceSpanKind::Verification)
+                && let (Some(span_id), Some(phase)) = (&event.span_id, event.span_phase)
+            {
+                spans.entry(span_id.clone()).or_default().push(phase);
+            }
+        }
+
+        // 每个 occurrence_id 恰好一个 Start 和一个 End
+        assert_eq!(spans.len(), 3, "three distinct verification span ids");
+        for (span_id, phases) in &spans {
+            let starts = phases
+                .iter()
+                .filter(|p| **p == TraceSpanPhase::Start)
+                .count();
+            let ends = phases.iter().filter(|p| **p == TraceSpanPhase::End).count();
+            assert_eq!(starts, 1, "span {span_id} must have exactly one Start");
+            assert_eq!(ends, 1, "span {span_id} must have exactly one End");
+        }
+    }
 }
