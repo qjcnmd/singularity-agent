@@ -589,6 +589,7 @@ impl AppServer {
             Arc::clone(&self.sandbox_backend),
             &self.provider_snapshot,
             &self.evaluation_cancellation,
+            &self.store,
         ) {
             Ok(result) => json_response(message.required_id(), result),
             Err(error) => match error.kind() {

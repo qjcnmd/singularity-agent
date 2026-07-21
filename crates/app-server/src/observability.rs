@@ -24,10 +24,11 @@ use singularity_store::{SessionStore, StoreError};
 use singularity_tools::{SandboxBackendEnforcement, WorkspaceMutation};
 
 /// Projects already-typed Agent/Provider runtime occurrences into the single Store trace stream.
-pub(super) struct TraceProjector<'a> {
+pub(crate) struct TraceProjector<'a> {
     store: &'a SessionStore,
-    thread_id: String,
-    turn_id: String,
+    run_id: String,
+    session_id: String,
+    task_id: Option<String>,
     turn_span_id: String,
 }
 
@@ -53,7 +54,7 @@ struct ProjectedSpan {
 
 impl<'a> TraceProjector<'a> {
     /// Bind the projector to the persisted Turn root rather than reconstructing its identity.
-    pub(super) fn new(
+    pub(crate) fn new(
         store: &'a SessionStore,
         thread_id: &str,
         turn_id: &str,
@@ -74,14 +75,33 @@ impl<'a> TraceProjector<'a> {
             })?;
         Ok(Self {
             store,
-            thread_id: thread_id.to_string(),
-            turn_id: turn_id.to_string(),
+            run_id: thread_id.to_string(),
+            session_id: turn_id.to_string(),
+            task_id: Some(turn_id.to_string()),
             turn_span_id,
         })
     }
 
+    /// Bind the projector to an evaluation run that intentionally has no
+    /// ordinary Thread/Turn rows.  The run/session ids remain explicit in the
+    /// trace and Store still validates the typed span graph and payload.
+    pub(crate) fn new_external(
+        store: &'a SessionStore,
+        run_id: &str,
+        session_id: &str,
+        turn_span_id: &str,
+    ) -> Self {
+        Self {
+            store,
+            run_id: run_id.to_string(),
+            session_id: session_id.to_string(),
+            task_id: None,
+            turn_span_id: turn_span_id.to_string(),
+        }
+    }
+
     /// Project one AgentLoop event in callback order; FinalTextDelta has no trace side effect.
-    pub(super) fn project_event(&mut self, event: AgentLoopEvent) -> Result<(), StoreError> {
+    pub(crate) fn project_event(&mut self, event: AgentLoopEvent) -> Result<(), StoreError> {
         match event {
             AgentLoopEvent::FinalTextDelta { .. } => Ok(()),
             AgentLoopEvent::Observation(observation) => self.project_observation(observation),
@@ -89,7 +109,7 @@ impl<'a> TraceProjector<'a> {
     }
 
     /// Project result-only provider occurrences and cache observations after the loop returns.
-    pub(super) fn project_result(&mut self, status: &AgentRunStatus) -> Result<(), StoreError> {
+    pub(crate) fn project_result(&mut self, status: &AgentRunStatus) -> Result<(), StoreError> {
         for occurrence in &status.provider_attempts.occurrences {
             self.project_provider_attempt(occurrence)?;
         }
@@ -415,11 +435,8 @@ impl<'a> TraceProjector<'a> {
         let timestamp = Timestamp::from_unix_ms(span.timestamp_unix_ms).ok_or_else(|| {
             StoreError::InvalidState("trace occurrence timestamp is out of range".to_string())
         })?;
-        let mut event = TraceEvent::for_turn(
-            trace_event_id(&self.turn_id, &span.descriptor.span_id, span.phase),
-            self.thread_id.clone(),
-            self.turn_id.clone(),
-            "observability",
+        let mut event = self.new_trace_event(
+            trace_event_id(&self.session_id, &span.descriptor.span_id, span.phase),
             span.descriptor.summary,
         );
         event.timestamp = Some(timestamp.to_string());
@@ -447,17 +464,34 @@ impl<'a> TraceProjector<'a> {
         kind: TraceMetricSampleKind,
         summary: &str,
     ) -> Result<(), StoreError> {
-        let mut event = TraceEvent::for_turn(
-            trace_event_id(&self.turn_id, identity, TraceSpanPhase::End),
-            self.thread_id.clone(),
-            self.turn_id.clone(),
-            "observability",
+        let mut event = self.new_trace_event(
+            trace_event_id(&self.session_id, identity, TraceSpanPhase::End),
             summary,
         );
         event.timestamp = Some(timestamp.to_string());
         event.payload = json!({"observation": "provider_capability_cache"});
         event.metric_samples = vec![TraceMetricSample { kind, count: 1 }];
         self.store.append_trace(&event)
+    }
+
+    fn new_trace_event(&self, event_id: String, summary: &str) -> TraceEvent {
+        if self.task_id.is_some() {
+            TraceEvent::for_turn(
+                event_id,
+                self.run_id.clone(),
+                self.session_id.clone(),
+                "observability",
+                summary,
+            )
+        } else {
+            TraceEvent::new(
+                event_id,
+                self.run_id.clone(),
+                self.session_id.clone(),
+                "observability",
+                summary,
+            )
+        }
     }
 }
 

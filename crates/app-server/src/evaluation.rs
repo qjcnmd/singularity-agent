@@ -6,17 +6,20 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 use singularity_agent::{
-    AgentLoop, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics, AgentStatus,
-    AgentVerificationRequirement, agent_control_tool_entries, terminal_command_scope_digests,
+    AgentLoop, AgentLoopEventSinkError, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics,
+    AgentStatus, AgentVerificationRequirement, agent_control_tool_entries,
+    terminal_command_scope_digests,
 };
-use singularity_core::{CancellationToken, contains_sensitive_text, load_project_instructions};
+use singularity_core::{
+    CancellationToken, Timestamp, contains_sensitive_text, load_project_instructions,
+};
 use singularity_evaluation::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
     EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationPromptStructure,
@@ -34,7 +37,10 @@ use singularity_policy::{
     PermissionOperation, PermissionProfile, PermissionResource, PermissionRule, PolicyEngine,
     SettingsScope, WorkspaceRelativePath,
 };
-use singularity_protocol::{EvalRunParams, EvalRunResult};
+use singularity_protocol::{
+    EvalRunParams, EvalRunResult, TraceEvent, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
+    TraceSpanStatus,
+};
 use singularity_tools::{
     CommandEnvironmentPolicy, CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend,
     SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, ToolAuthorization, ToolBroker,
@@ -55,13 +61,14 @@ use command::{
 };
 use evidence::{
     agent_command_observation, build_evaluation_evidence, canonical_json_digest, content_digest,
-    safe_command_scope_digest,
 };
 use workspace::{
     WorkspaceChangeEvidence, apply_agent_changes, copy_tree_checked, evaluation_changed_paths,
     patch_evidence_digest, path_is_allowed, snapshot_workspace, validate_tree,
     workspace_change_evidence, workspace_tree_digest,
 };
+
+use super::observability::TraceProjector;
 
 const RUNNER_NAME: &str = "agent_loop";
 const OUTPUT_ROOT_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
@@ -322,6 +329,8 @@ struct PreparedTaskContext<'a> {
     sandbox_backend: &'a SharedSandboxBackend,
     provider_snapshot: &'a ProviderConfigSnapshot,
     cancellation: &'a CancellationToken,
+    trace_store: &'a singularity_store::SessionStore,
+    trace_failures: &'a Arc<Mutex<Vec<String>>>,
 }
 
 /// 一个 Evaluation run 内所有 task trial 共享的只读执行上下文。
@@ -332,6 +341,145 @@ struct EvaluationRunContext<'a> {
     sandbox_backend: &'a SharedSandboxBackend,
     provider_snapshot: &'a ProviderConfigSnapshot,
     cancellation: &'a CancellationToken,
+    trace_store: &'a singularity_store::SessionStore,
+    trace_failures: Arc<Mutex<Vec<String>>>,
+}
+
+fn record_trace_failure(failures: &Arc<Mutex<Vec<String>>>, error: impl Into<String>) {
+    if let Ok(mut failures) = failures.lock() {
+        failures.push(error.into());
+    }
+}
+
+fn evaluation_span_id(run_id: &RunId, scope: &str, kind: TraceSpanKind) -> String {
+    format!(
+        "eval_span:{}",
+        content_digest(
+            format!(
+                "{}\u{0}{}\u{0}{}",
+                run_id.as_str(),
+                scope,
+                kind.as_storage_text()
+            )
+            .as_bytes()
+        )
+    )
+}
+
+struct EvaluationTraceSink<'a> {
+    store: &'a singularity_store::SessionStore,
+    run_id: &'a RunId,
+    failures: &'a Arc<Mutex<Vec<String>>>,
+}
+
+impl<'a> EvaluationTraceSink<'a> {
+    fn start(
+        &self,
+        session_id: &str,
+        span_id: &str,
+        parent_span_id: Option<&str>,
+        kind: TraceSpanKind,
+        summary: &str,
+    ) {
+        let mut event = TraceEvent::new(
+            format!("{span_id}:start"),
+            self.run_id.as_str(),
+            session_id,
+            "evaluation",
+            summary,
+        );
+        event.timestamp = Some(Timestamp::now_utc().to_string());
+        event.span_id = Some(span_id.to_string());
+        event.parent_span_id = parent_span_id.map(str::to_string);
+        event.span_kind = Some(kind);
+        event.span_phase = Some(TraceSpanPhase::Start);
+        event.span_projection = Some(TraceSpanProjection::default());
+        event.payload = json!({"evaluation_span": kind.as_storage_text()});
+        if let Err(error) = self.store.append_trace_idempotent(&event) {
+            record_trace_failure(self.failures, format!("{summary} start: {error}"));
+        }
+    }
+
+    fn end(
+        &self,
+        session_id: &str,
+        span_id: &str,
+        parent_span_id: Option<&str>,
+        kind: TraceSpanKind,
+        status: TraceSpanStatus,
+        started: Instant,
+    ) {
+        let mut event = TraceEvent::new(
+            format!("{span_id}:end"),
+            self.run_id.as_str(),
+            session_id,
+            "evaluation",
+            match kind {
+                TraceSpanKind::Task => "evaluation task",
+                TraceSpanKind::Turn => "evaluation trial",
+                _ => "evaluation span",
+            },
+        );
+        event.timestamp = Some(Timestamp::now_utc().to_string());
+        event.span_id = Some(span_id.to_string());
+        event.parent_span_id = parent_span_id.map(str::to_string);
+        event.span_kind = Some(kind);
+        event.span_phase = Some(TraceSpanPhase::End);
+        event.span_status = Some(status);
+        event.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        event.span_projection = Some(TraceSpanProjection::default());
+        event.payload = json!({"evaluation_span": kind.as_storage_text()});
+        if let Err(error) = self.store.append_trace(&event) {
+            record_trace_failure(
+                self.failures,
+                format!(
+                    "{} end: {error}",
+                    match kind {
+                        TraceSpanKind::Task => "evaluation task",
+                        TraceSpanKind::Turn => "evaluation trial",
+                        _ => "evaluation span",
+                    }
+                ),
+            );
+        }
+    }
+}
+
+struct EvaluationTrialTrace<'a> {
+    sink: EvaluationTraceSink<'a>,
+    session_id: String,
+    turn_span_id: String,
+    task_span_id: String,
+}
+
+impl<'a> EvaluationTrialTrace<'a> {
+    fn new(
+        store: &'a singularity_store::SessionStore,
+        run_id: &'a RunId,
+        failures: &'a Arc<Mutex<Vec<String>>>,
+        session_id: String,
+        turn_span_id: String,
+        task_span_id: String,
+    ) -> Self {
+        Self {
+            sink: EvaluationTraceSink {
+                store,
+                run_id,
+                failures,
+            },
+            session_id,
+            turn_span_id,
+            task_span_id,
+        }
+    }
+}
+
+fn evaluation_status_trace_status(status: EvaluationStatus) -> TraceSpanStatus {
+    match status {
+        EvaluationStatus::Completed => TraceSpanStatus::Ok,
+        EvaluationStatus::Pending | EvaluationStatus::Running => TraceSpanStatus::Unset,
+        EvaluationStatus::Failed | EvaluationStatus::Blocked => TraceSpanStatus::Error,
+    }
 }
 
 #[derive(Debug)]
@@ -437,6 +585,7 @@ pub(crate) fn run_evaluation(
     sandbox_backend: SharedSandboxBackend,
     provider_snapshot: &ProviderConfigSnapshot,
     cancellation: &CancellationToken,
+    trace_store: &singularity_store::SessionStore,
 ) -> Result<EvalRunResult, EvaluationRunError> {
     if cancellation.is_cancelled() {
         let partial = RunId::new(params.run_id.clone())
@@ -507,6 +656,8 @@ pub(crate) fn run_evaluation(
         sandbox_backend: &cancellable_sandbox_backend,
         provider_snapshot,
         cancellation,
+        trace_store,
+        trace_failures: Arc::new(Mutex::new(Vec::new())),
     };
     let mut task_executions = Vec::new();
     for plan in &plans {
@@ -532,6 +683,18 @@ pub(crate) fn run_evaluation(
         return Err(cleanup_incomplete_run(
             &run_dir,
             EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
+        ));
+    }
+
+    if let Ok(failures) = run_context.trace_failures.lock()
+        && !failures.is_empty()
+    {
+        return Err(cleanup_incomplete_run(
+            &run_dir,
+            EvaluationRunError::infrastructure(format!(
+                "evaluation SQLite trace projection failed: {}",
+                failures.join("; ")
+            )),
         ));
     }
 
@@ -696,6 +859,39 @@ fn run_task_trials(
     plan: &WorkspacePlan,
     trials_per_task: u32,
 ) -> TaskEvaluation {
+    let scope = format!("task:{}", plan.task_id.as_str());
+    let session_id = scope.clone();
+    let span_id = evaluation_span_id(context.run_id, &scope, TraceSpanKind::Task);
+    let started = Instant::now();
+    let trace = EvaluationTraceSink {
+        store: context.trace_store,
+        run_id: context.run_id,
+        failures: &context.trace_failures,
+    };
+    trace.start(
+        &session_id,
+        &span_id,
+        None,
+        TraceSpanKind::Task,
+        "evaluation task",
+    );
+    let evaluation = run_task_trials_inner(context, plan, trials_per_task);
+    trace.end(
+        &session_id,
+        &span_id,
+        None,
+        TraceSpanKind::Task,
+        evaluation_status_trace_status(evaluation.result.status),
+        started,
+    );
+    evaluation
+}
+
+fn run_task_trials_inner(
+    context: &EvaluationRunContext<'_>,
+    plan: &WorkspacePlan,
+    trials_per_task: u32,
+) -> TaskEvaluation {
     let task_root = context.run_dir.join(plan.task_id.as_str());
     let source_dir = task_root.join(SOURCE_DIR);
     let initial_source = source_provenance(&plan.source, &source_dir, context.manifest_dir);
@@ -780,6 +976,8 @@ fn run_task_trials(
         sandbox_backend: context.sandbox_backend,
         provider_snapshot: context.provider_snapshot,
         cancellation: context.cancellation,
+        trace_store: context.trace_store,
+        trace_failures: &context.trace_failures,
     };
     let trials = (1..=trials_per_task)
         .map(|trial| run_task(&prepared, trial))
@@ -840,6 +1038,47 @@ fn task_evaluation_from_trials(plan: &WorkspacePlan, trials: Vec<TaskExecution>)
 }
 
 fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
+    let scope = format!("trial:{}:{}", prepared.plan.task_id.as_str(), trial);
+    let session_id = scope.clone();
+    let span_id = evaluation_span_id(prepared.run_id, &scope, TraceSpanKind::Turn);
+    let task_span_id = evaluation_span_id(
+        prepared.run_id,
+        &format!("task:{}", prepared.plan.task_id.as_str()),
+        TraceSpanKind::Task,
+    );
+    let started = Instant::now();
+    let trace = EvaluationTrialTrace::new(
+        prepared.trace_store,
+        prepared.run_id,
+        prepared.trace_failures,
+        session_id,
+        span_id,
+        task_span_id,
+    );
+    trace.sink.start(
+        &trace.session_id,
+        &trace.turn_span_id,
+        Some(&trace.task_span_id),
+        TraceSpanKind::Turn,
+        "evaluation trial",
+    );
+    let execution = run_task_inner(prepared, trial, &trace);
+    trace.sink.end(
+        &trace.session_id,
+        &trace.turn_span_id,
+        Some(&trace.task_span_id),
+        TraceSpanKind::Turn,
+        evaluation_status_trace_status(execution.result.status),
+        started,
+    );
+    execution
+}
+
+fn run_task_inner(
+    prepared: &PreparedTaskContext<'_>,
+    trial: u32,
+    trace: &EvaluationTrialTrace<'_>,
+) -> TaskExecution {
     let task_dir = prepared.task_root.join(format!("trial-{trial:04}"));
     let mut diagnostics = TaskDiagnostics {
         source: Some(prepared.source.clone()),
@@ -899,8 +1138,14 @@ fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
         );
     }
 
-    let agent_execution =
-        run_agent_stage(prepared, &task_dir, &prepared.plan.agent, trial, provider);
+    let agent_execution = run_agent_stage(
+        prepared,
+        &task_dir,
+        &prepared.plan.agent,
+        trial,
+        provider,
+        trace,
+    );
     diagnostics.agent = agent_execution.stage.diagnostics.clone();
     diagnostics.changed_files = agent_execution.changed_files.clone();
     diagnostics.patch_evidence = agent_execution.patch_evidence.clone();
@@ -1644,6 +1889,7 @@ fn run_agent_stage(
     plan: &AgentStagePlan,
     trial: u32,
     provider: OpenAiProvider,
+    trace: &EvaluationTrialTrace<'_>,
 ) -> AgentStageExecution {
     let agent_dir = task_dir.join(AGENT_DIR);
     let projection = &plan.projection;
@@ -1769,12 +2015,32 @@ fn run_agent_stage(
     };
     let agent_started = Instant::now();
     let provider_identity = provider.clone();
+    let mut projector = TraceProjector::new_external(
+        prepared.trace_store,
+        prepared.run_id.as_str(),
+        &trace.session_id,
+        &trace.turn_span_id,
+    );
+    let trace_failures = Arc::clone(prepared.trace_failures);
+    let mut on_event = |event| match projector.project_event(event) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            record_trace_failure(&trace_failures, format!("agent event projection: {error}"));
+            Err(AgentLoopEventSinkError)
+        }
+    };
     let result = AgentLoop::new(provider, ToolBroker::new(resolved_tools.registry), policy)
         .with_workspace_tools(workspace_tools)
         .with_cancellation_token(prepared.cancellation.clone())
-        .run(&input);
+        .run_with_events(&input, &mut on_event);
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let run_status = result.to_run_status();
+    if let Err(error) = projector.project_result(&run_status) {
+        record_trace_failure(
+            prepared.trace_failures,
+            format!("agent result projection: {error}"),
+        );
+    }
     let provider_evidence = provider_evidence(
         &provider_identity,
         run_status.provider_protocol_contract.as_ref(),
@@ -1783,53 +2049,55 @@ fn run_agent_stage(
     let (observed_smoke_scope_digests, local_process_fallback_unknown_count) =
         agent_command_observation(&result, projection.smoke_commands.len());
     let trace_path = task_dir.join(AGENT_TRACE_FILE);
-    let trace = json!({
-        "status": run_status.status,
-        "completed": run_status.completed,
-        "run_id": prepared.run_id.as_str(),
-        "thread_id": &input.thread_id,
-        "turn_id": &input.turn_id,
-        "task_id": projection.task_id.as_str(),
-        "trial": trial,
-        "model_turns": run_status.model_turns,
-        "model_turn_limit": run_status.model_turn_limit,
-        "context": run_status.context_trace.as_ref().map(|context| json!({
-            "included_item_ids": context.included_item_ids.iter().map(safe_text).collect::<Vec<_>>(),
-            "excluded_item_ids": context.excluded_item_ids.iter().map(safe_text).collect::<Vec<_>>(),
-            "budget": &context.budget,
-            "compaction_count": context.compaction_count,
-            "compacted_message_count": context.compacted_message_count,
-            "last_compaction_before_tokens": context.last_compaction_before_tokens,
-            "last_compaction_after_tokens": context.last_compaction_after_tokens,
-        })),
-        "tool_calls": run_status.tool_calls,
-        "plan": run_status.plan,
-        "plan_update_count": run_status.plan_update_count,
-        "recovery_metrics": run_status.recovery_metrics,
-        "model_usage": run_status.model_usage,
-        "provider_attempts": run_status.provider_attempts,
-        "provider_protocol": {
-            "contract": &run_status.provider_protocol_contract,
-            "capability_metadata": &run_status.provider_capability_metadata,
-        },
-        "provider_identity": &provider_evidence,
-        "prompt_structure": &prompt_structure,
-        "prompt_fingerprint": &prompt_fingerprint,
-        "tool_schema_fingerprint": &tool_schema_fingerprint,
-        "tool_outcomes": result.tool_results.iter().map(|tool_result| json!({
-            "tool_call_id": safe_text(&tool_result.tool_call_id),
-            "tool_name": safe_text(&tool_result.tool_name),
-            "ok": tool_result.ok,
-            "error_code": tool_result.error_code.as_deref().map(safe_text),
-            "truncated": tool_result.truncated,
-            "result_id": safe_command_scope_digest(tool_result),
-        })).collect::<Vec<_>>(),
-        "approval_count": run_status.approval_count,
-        "verification": run_status.verification,
-        "audit_events": run_status.audit_events,
-        "error": run_status.error.as_deref().map(safe_text),
-        "provider_diagnostic": run_status.provider_diagnostic,
-    });
+    let trace = match evaluation_agent_trace(
+        prepared.trace_store,
+        prepared.run_id.as_str(),
+        &trace.session_id,
+        &trace.task_span_id,
+    ) {
+        Ok(trace) => trace,
+        Err(error) => {
+            record_trace_failure(prepared.trace_failures, error.clone());
+            return AgentStageExecution {
+                stage: StageExecution::blocked(
+                    evaluation_blocker(BlockerKind::WorkspacePreparation, error.clone()),
+                    command_diagnostics,
+                ),
+                workspace: None,
+                changed_files: Vec::new(),
+                patch_evidence: Vec::new(),
+                patch_digest: None,
+                patch_evidence_path: None,
+                disallowed_changed_files: Vec::new(),
+                smoke_command_satisfied: false,
+                model_turns: result.model_turns,
+                tool_calls: result.tool_calls,
+                approval_count: result.approval_count,
+                plan_update_count: result.plan_update_count,
+                plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
+                recovery_metrics: result.recovery_metrics.clone(),
+                compaction_count: result
+                    .context_trace
+                    .as_ref()
+                    .map_or(0, |trace| trace.compaction_count),
+                verification_required_command_count: result.verification.required_command_count,
+                verification_satisfied_command_count: result.verification.satisfied_command_count,
+                model_usage: result.model_usage.clone(),
+                provider_attempts: result.provider_attempts.clone(),
+                agent_duration_ms,
+                audit_events: run_status.audit_events,
+                observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
+                local_process_fallback_unknown_count,
+                trace_path: None,
+                error: Some(safe_text(error)),
+                provider_diagnostic: run_status.provider_diagnostic,
+                prompt_structure: Some(prompt_structure.clone()),
+                prompt_fingerprint: Some(prompt_fingerprint.clone()),
+                tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
+                provider_evidence: Some(provider_evidence.clone()),
+            };
+        }
+    };
     let trace_path_string = match write_json_atomic(&trace_path, &trace) {
         Ok(()) => Some(trace_path.to_string_lossy().into_owned()),
         Err(error) => {
@@ -2352,6 +2620,32 @@ fn command_script_from_argv(argv: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn evaluation_agent_trace(
+    store: &singularity_store::SessionStore,
+    run_id: &str,
+    session_id: &str,
+    task_span_id: &str,
+) -> Result<Value, String> {
+    let events = store
+        .list_trace(run_id)
+        .map_err(|error| format!("failed to query evaluation SQLite trace: {error}"))?
+        .into_iter()
+        .filter(|event| {
+            event.session_id == session_id || event.span_id.as_deref() == Some(task_span_id)
+        })
+        .collect::<Vec<TraceEvent>>();
+    if events.is_empty() {
+        return Err("evaluation SQLite trace contains no events for the trial".to_string());
+    }
+    serde_json::to_value(json!({
+        "schema": "evaluation.agent-trace/v2",
+        "run_id": run_id,
+        "session_id": session_id,
+        "events": events,
+    }))
+    .map_err(|error| format!("failed to serialize evaluation SQLite trace: {error}"))
 }
 
 fn agent_verification_requirements(
@@ -3435,6 +3729,7 @@ mod tests {
     fn pre_cancelled_evaluation_returns_a_typed_cancelled_error() {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
         let error = run_evaluation(
             &EvalRunParams {
                 manifest: "missing-manifest.json".to_string(),
@@ -3444,6 +3739,7 @@ mod tests {
             Arc::new(SourceSandboxBackend),
             &ProviderConfigSnapshot::capture(|_| None),
             &cancellation,
+            &trace_store,
         )
         .expect_err("cancelled evaluation must not start");
 
@@ -3596,12 +3892,14 @@ mod tests {
             run_id,
             output_root: Some(output_root.to_string_lossy().into_owned()),
         };
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let error = run_evaluation(
             &params,
             Arc::new(SourceSandboxBackend),
             &ProviderConfigSnapshot::capture(|_| None),
             &CancellationToken::new(),
+            &trace_store,
         )
         .expect_err("long evaluation paths must fail before execution");
 
@@ -3980,6 +4278,7 @@ mod tests {
         let sandbox_backend: SharedSandboxBackend = Arc::new(SourceSandboxBackend);
         let provider_snapshot = ProviderConfigSnapshot::capture(|_| None);
         let cancellation = CancellationToken::new();
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
         let context = EvaluationRunContext {
             run_id: &run_id,
             run_dir: &run_dir,
@@ -3987,6 +4286,8 @@ mod tests {
             sandbox_backend: &sandbox_backend,
             provider_snapshot: &provider_snapshot,
             cancellation: &cancellation,
+            trace_store: &trace_store,
+            trace_failures: Arc::new(Mutex::new(Vec::new())),
         };
         let evaluation = run_task_trials(&context, &plan, 3);
 
@@ -4048,12 +4349,14 @@ mod tests {
             run_id: "blocked-artifacts-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
         };
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let response = run_evaluation(
             &params,
             Arc::new(SourceSandboxBackend),
             &ProviderConfigSnapshot::capture(|_| None),
             &CancellationToken::new(),
+            &trace_store,
         )
         .expect("blocked run still publishes typed artifacts");
 
@@ -4248,6 +4551,58 @@ mod tests {
         );
         assert!(!path.exists());
         assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 0);
+    }
+
+    #[test]
+    fn evaluation_agent_trace_is_exported_from_store_events() {
+        let store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let run_id = "evaluation-trace-run";
+        let task_span = "task-span";
+        let turn_span = "turn-span";
+        let mut task_start = TraceEvent::new(
+            "task-start",
+            run_id,
+            "task:task-1",
+            "evaluation",
+            "evaluation task",
+        );
+        task_start.span_id = Some(task_span.to_string());
+        task_start.span_kind = Some(TraceSpanKind::Task);
+        task_start.span_phase = Some(TraceSpanPhase::Start);
+        task_start.span_projection = Some(TraceSpanProjection::default());
+        task_start.payload = json!({"evaluation_span": "task"});
+        let mut turn_start = TraceEvent::new(
+            "turn-start",
+            run_id,
+            "trial:task-1:1",
+            "evaluation",
+            "evaluation trial",
+        );
+        turn_start.span_id = Some(turn_span.to_string());
+        turn_start.parent_span_id = Some(task_span.to_string());
+        turn_start.span_kind = Some(TraceSpanKind::Turn);
+        turn_start.span_phase = Some(TraceSpanPhase::Start);
+        turn_start.span_projection = Some(TraceSpanProjection::default());
+        turn_start.payload = json!({"evaluation_span": "turn"});
+        let mut turn_end = turn_start.clone();
+        turn_end.event_id = "turn-end".to_string();
+        turn_end.span_phase = Some(TraceSpanPhase::End);
+        turn_end.span_status = Some(TraceSpanStatus::Ok);
+        turn_end.duration_ms = Some(1);
+        let mut task_end = task_start.clone();
+        task_end.event_id = "task-end".to_string();
+        task_end.span_phase = Some(TraceSpanPhase::End);
+        task_end.span_status = Some(TraceSpanStatus::Ok);
+        task_end.duration_ms = Some(1);
+        store
+            .append_trace_batch(&[task_start, turn_start, turn_end, task_end])
+            .expect("store trace");
+
+        let trace = evaluation_agent_trace(&store, run_id, "trial:task-1:1", task_span)
+            .expect("export trace");
+        assert_eq!(trace["schema"], "evaluation.agent-trace/v2");
+        assert_eq!(trace["events"].as_array().expect("events").len(), 4);
+        assert_eq!(trace["events"][2]["span_phase"], "end");
     }
 
     #[test]
