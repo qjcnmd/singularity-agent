@@ -1724,6 +1724,34 @@ fn openai_provider_config_uses_redacted_status_and_endpoint_rules() {
 }
 
 #[test]
+fn provider_config_rejects_an_unregistered_provider_instead_of_using_openai_transport() {
+    let error = OpenAiProviderConfig::from_env(|name| match name {
+        "SINGULARITY_MODEL_PROVIDER" => Some("unregistered_provider".to_string()),
+        "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
+        "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
+        "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
+        _ => None,
+    })
+    .expect_err("unknown provider must fail closed");
+
+    assert_eq!(error.error.kind, ModelErrorKind::UnsupportedCapability);
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_adapter_unsupported")
+    );
+    assert_eq!(
+        error.error.stage,
+        Some(ProviderErrorStage::ClientInitialization)
+    );
+    assert_eq!(
+        error.error.provider_name.as_deref(),
+        Some("unregistered_provider")
+    );
+    assert!(!error.message.contains("sk-secret-value"));
+    assert!(!error.message.contains("provider.example"));
+}
+
+#[test]
 fn openai_provider_negotiates_responses_api_and_replays_typed_function_items() {
     let (base_url, requests) = responses_provider_server(serde_json::json!({
         "id": "response_actual",

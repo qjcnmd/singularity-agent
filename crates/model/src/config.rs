@@ -229,6 +229,19 @@ impl OpenAiProviderConfig {
         let provider_name = values
             .provider_name
             .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string());
+        if provider_name != DEFAULT_PROVIDER_NAME {
+            return Err(ProviderError::from_model_error(
+                ModelError::new(
+                    ModelErrorKind::UnsupportedCapability,
+                    "configured model provider has no registered production adapter",
+                )
+                .with_provider(provider_name)
+                .with_provider_diagnostic(
+                    "provider_adapter_unsupported",
+                    ProviderErrorStage::ClientInitialization,
+                ),
+            ));
+        }
         let model_name = values
             .model_name
             .ok_or_else(|| missing_provider_config_error(ENV_MODEL, source))?;
