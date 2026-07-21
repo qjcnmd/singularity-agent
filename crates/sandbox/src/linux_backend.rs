@@ -475,6 +475,8 @@ struct PreparedCommand {
     workspace: PathBuf,
     cwd: PathBuf,
     executable: PathBuf,
+    /// 非标准 toolchain 的只读运行时根。
+    extra_runtime_roots: Vec<PathBuf>,
     argv: Vec<String>,
     env: Vec<(String, String)>,
     timeout: Duration,
@@ -506,13 +508,21 @@ impl PreparedCommand {
             ));
         }
         let env = sanitized_environment(&environment);
-        let executable = resolve_executable(&argv[0], &cwd_path, &env)?;
-        if is_protected_path(&executable.to_string_lossy()) {
+        let resolved = resolve_executable(&argv[0], &cwd_path, &env)?;
+        if is_protected_path(&resolved.canonical.to_string_lossy()) {
             return Err(LinuxSandboxError::PolicyDenied(
                 SANDBOX_PROTECTED_PATH_DENIED,
             ));
         }
-        argv[0] = executable.to_string_lossy().into_owned();
+        if let Some(interpreter) = &resolved.interpreter {
+            if is_protected_path(&interpreter.to_string_lossy()) {
+                return Err(LinuxSandboxError::PolicyDenied(
+                    SANDBOX_PROTECTED_PATH_DENIED,
+                ));
+            }
+        }
+        let extra_runtime_roots = resolved.runtime_roots;
+        argv[0] = resolved.canonical.to_string_lossy().into_owned();
         let protected_paths = collect_protected_paths(&workspace)
             .map_err(|_| LinuxSandboxError::PolicyDenied(SANDBOX_PROTECTED_PATH_DENIED))?;
         validate_workspace_hardlinks(&workspace)
@@ -521,7 +531,8 @@ impl PreparedCommand {
         Ok(Self {
             workspace,
             cwd: cwd_path,
-            executable,
+            executable: resolved.canonical,
+            extra_runtime_roots,
             argv,
             env,
             timeout: Duration::from_secs(timeout_seconds),
@@ -637,7 +648,7 @@ fn resolve_executable(
     requested: &str,
     cwd: &Path,
     env: &[(String, String)],
-) -> Result<PathBuf, LinuxSandboxError> {
+) -> Result<ResolvedExecutable, LinuxSandboxError> {
     let requested_path = Path::new(requested);
     let candidate = if requested_path.is_absolute() || requested_path.components().count() > 1 {
         if requested_path.is_absolute() {
@@ -669,7 +680,107 @@ fn resolve_executable(
     if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
         return Err(LinuxSandboxError::ExecutableUnavailable);
     }
-    Ok(canonical)
+    let interpreter = detect_shebang_interpreter(&canonical);
+    let runtime_roots =
+        ResolvedExecutable::derive_runtime_roots(&canonical, interpreter.as_deref());
+    Ok(ResolvedExecutable {
+        canonical,
+        interpreter,
+        runtime_roots,
+    })
+}
+
+/// 类型化的已解析可执行文件，包含规范路径、解释器和只读运行时根。
+///
+/// 只把实际需要的 toolchain root 作为只读路径加入 Landlock policy，
+/// 不允许整个用户目录，不允许 workspace 外写入。
+#[derive(Debug, Clone)]
+struct ResolvedExecutable {
+    /// 规范化后的可执行文件路径。
+    canonical: PathBuf,
+    /// 若为脚本，则为 shebang 解析出的解释器路径。
+    interpreter: Option<PathBuf>,
+    /// 可执行文件和解释器所需的只读运行时根目录。
+    runtime_roots: Vec<PathBuf>,
+}
+
+impl ResolvedExecutable {
+    /// 从规范可执行文件路径派生运行时根。
+    ///
+    /// 标准系统目录（/usr, /bin, /lib 等）已由 Landlock 默认规则覆盖；
+    /// 非标准安装目录（如 ~/.rustup, ~/.nvm, /opt/toolchain）需要显式加入。
+    fn derive_runtime_roots(canonical: &Path, interpreter: Option<&Path>) -> Vec<PathBuf> {
+        let standard_prefixes = [
+            "/bin", "/sbin", "/usr", "/lib", "/lib64", "/proc", "/dev", "/run", "/etc",
+        ];
+        let mut roots = Vec::new();
+        let paths: Vec<&Path> = [Some(canonical), interpreter]
+            .into_iter()
+            .flatten()
+            .collect();
+        for path in &paths {
+            let path = *path;
+            let path_str = path.to_string_lossy();
+            // 标准系统路径已被默认 Landlock 规则覆盖
+            if standard_prefixes
+                .iter()
+                .any(|prefix| path_str.starts_with(prefix))
+            {
+                continue;
+            }
+            // 非标准路径：向上找到合理的 toolchain root
+            // 例如 /home/user/.rustup/toolchains/stable/bin/rustc → /home/user/.rustup
+            // 例如 /home/user/.nvm/versions/node/v20/bin/node → /home/user/.nvm
+            // 例如 /opt/python3.12/bin/python → /opt/python3.12
+            if let Some(root) = toolchain_root(path) {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+        roots
+    }
+}
+
+/// 从非标准路径的可执行文件推断 toolchain 根目录。
+///
+/// 策略：向上遍历到包含 `bin/` 子目录的祖先，再取该祖先的父目录作为 root。
+/// 例如 `.rustup/toolchains/stable/bin/rustc` → `.rustup/toolchains/stable`
+/// 例如 `.nvm/versions/node/v20.11.0/bin/node` → `.nvm/versions/node/v20.11.0`
+/// 若无法推断则返回可执行文件的祖父目录。
+fn toolchain_root(canonical: &Path) -> Option<PathBuf> {
+    // 找到包含此可执行文件的 bin/ 目录
+    let parent = canonical.parent()?;
+    if parent.file_name()?.to_str()? == "bin" {
+        // bin/ 的父目录即为 toolchain root
+        return parent.parent().map(|p| p.to_path_buf());
+    }
+    // 不在 bin/ 下，使用祖父目录作为保守 root
+    canonical.parent()?.parent().map(|p| p.to_path_buf())
+}
+
+/// 读取文件头部检测 shebang 解释器。
+fn detect_shebang_interpreter(executable: &Path) -> Option<PathBuf> {
+    let mut file = File::open(executable).ok()?;
+    let mut header = [0u8; 256];
+    let n = file.read(&mut header).ok()?;
+    if n < 3 || header[0] != b'#' || header[1] != b'!' {
+        return None;
+    }
+    // 提取 shebang 行的解释器路径
+    let line_end = header[2..n]
+        .iter()
+        .position(|&b| b == 10)
+        .map(|p| p + 2)
+        .unwrap_or(n);
+    let line = std::str::from_utf8(&header[2..line_end]).ok()?.trim();
+    let interpreter = line.split_whitespace().next()?;
+    let path = Path::new(interpreter);
+    if path.is_absolute() && path.is_file() {
+        fs::canonicalize(path).ok()
+    } else {
+        None
+    }
 }
 
 fn is_protected_relative(workspace: &Path, path: &Path) -> bool {
@@ -837,6 +948,7 @@ struct ChildContext {
     filesystem: SandboxFilesystemMode,
     network: SandboxNetworkMode,
     protected_paths: Vec<ProtectedPath>,
+    extra_runtime_roots: Vec<PathBuf>,
 }
 
 fn run_prepared_command(
@@ -934,6 +1046,7 @@ fn run_prepared_command(
         filesystem: prepared.filesystem.clone(),
         network: prepared.network.clone(),
         protected_paths: prepared.protected_paths.clone(),
+        extra_runtime_roots: prepared.extra_runtime_roots.clone(),
     });
     let mut context = context;
     let mut stack = vec![0u8; 1024 * 1024];
@@ -1511,6 +1624,12 @@ fn install_landlock(context: &ChildContext) -> Result<(), ()> {
         "/proc",
     ] {
         let root = Path::new(root);
+        if root.is_dir() {
+            add_landlock_rule(ruleset, root, runtime_read)?;
+        }
+    }
+    // 非标准 toolchain 运行时根：只读，不允许写入
+    for root in &context.extra_runtime_roots {
         if root.is_dir() {
             add_landlock_rule(ruleset, root, runtime_read)?;
         }
