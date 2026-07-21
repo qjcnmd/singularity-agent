@@ -2969,6 +2969,10 @@ where
             let verification_identity = (prepared.call.tool_name == TOOL_COMMAND).then(|| {
                 child_occurrence_identity(&occurrence.context.identity, "verification", 0)
             });
+            // The occurrence ordinal identifies this verification span; the successful-command
+            // total is a mutable metric and cannot be used as a Start/End identity attribute.
+            let verification_occurrence_count =
+                occurrence.context.tool_call_ordinal.saturating_add(1);
             if let Some(identity) = &verification_identity {
                 let summary = state.completion.summary();
                 if emit_event(
@@ -2979,7 +2983,7 @@ where
                             lifecycle: occurrence.context.timer.started(),
                             required_command_count: summary.required_command_count,
                             satisfied_command_count: summary.satisfied_command_count,
-                            occurrence_count: summary.successful_command_count,
+                            occurrence_count: verification_occurrence_count,
                             command_duration_ms: Some(tool_duration_ms),
                         },
                     )),
@@ -3008,7 +3012,7 @@ where
                                 .finished_with_duration(tool_duration_ms, status),
                             required_command_count: summary.required_command_count,
                             satisfied_command_count: summary.satisfied_command_count,
-                            occurrence_count: summary.successful_command_count,
+                            occurrence_count: verification_occurrence_count,
                             command_duration_ms: Some(tool_duration_ms),
                         },
                     )),

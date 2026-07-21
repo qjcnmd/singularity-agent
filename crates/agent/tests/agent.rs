@@ -5271,6 +5271,7 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
         .for_operation(PermissionOperation::Write),
     );
 
+    let mut events = Vec::new();
     let result = AgentLoop::new(
         StaticProvider {
             responses: vec![
@@ -5294,7 +5295,7 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
                 calls: AtomicUsize::new(0),
             }),
     )
-    .run(
+    .run_with_events(
         &AgentLoopInput::new("thread_1", "turn_1", "edit and verify")
             .with_max_turns(5)
             .with_verification_requirements([AgentVerificationRequirement::new(
@@ -5307,6 +5308,10 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
                 ),
                 1,
             )]),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
     );
 
     assert_eq!(
@@ -5321,6 +5326,18 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
     assert_eq!(result.verification.required_command_count, 1);
     assert_eq!(result.verification.satisfied_command_count, 1);
     assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
+    let verification_events = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::Verification(value)) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(verification_events.len() >= 4);
+    for pair in verification_events.chunks_exact(2) {
+        assert_eq!(pair[0].identity, pair[1].identity);
+        assert_eq!(pair[0].occurrence_count, pair[1].occurrence_count);
+    }
     assert_eq!(
         std::fs::read_to_string(file_path).expect("read file"),
         "command mutation"
