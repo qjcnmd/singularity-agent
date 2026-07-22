@@ -140,10 +140,7 @@ impl SandboxBackend for WindowsSandboxBackend {
             &request.command_id,
             cancellation,
             prepared,
-            matches!(
-                request.filesystem.mode,
-                SandboxFilesystemMode::WorkspaceWrite
-            ),
+            should_monitor_workspace_change(request),
         )
     }
 
@@ -202,6 +199,13 @@ impl SandboxBackend for WindowsSandboxBackend {
             ),
         )
     }
+}
+
+fn should_monitor_workspace_change(request: &CommandRequest) -> bool {
+    matches!(
+        request.filesystem.mode,
+        SandboxFilesystemMode::WorkspaceWrite
+    ) && !request.is_trusted_workspace_preparation()
 }
 
 fn execute_prepared_command(
@@ -305,8 +309,23 @@ fn format_workspace_protected_glob(
     component_pattern: &str,
 ) -> String {
     let root = workspace_root.to_string_lossy().replace('\\', "/");
+    let root = escape_glob_literal(&root);
     let separator = if root.ends_with('/') { "" } else { "/" };
     format!("{root}{separator}**/{component_pattern}")
+}
+
+fn escape_glob_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '?' | '*' | '[' | ']' | '{' | '}') {
+            escaped.push('[');
+            escaped.push(character);
+            escaped.push(']');
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 struct PreparedCommand {
@@ -978,6 +997,45 @@ mod tests {
 
         assert_eq!(mutation, WorkspaceMutation::Unknown);
         assert!(summary.is_none());
+    }
+
+    #[test]
+    fn trusted_workspace_preparation_uses_snapshot_without_protected_monitor_noise() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let trusted = CommandRequest::trusted_workspace_preparation(
+            "trusted",
+            vec!["git".to_string(), "init".to_string()],
+            workspace.path().to_string_lossy().into_owned(),
+            workspace.path().to_string_lossy().into_owned(),
+        );
+        let ordinary = CommandRequest::project_verification(
+            "ordinary",
+            vec!["git".to_string(), "init".to_string()],
+            workspace.path().to_string_lossy().into_owned(),
+            workspace.path().to_string_lossy().into_owned(),
+        );
+
+        assert!(!should_monitor_workspace_change(&trusted));
+        assert!(should_monitor_workspace_change(&ordinary));
+    }
+
+    #[test]
+    fn protected_globs_treat_workspace_root_metacharacters_as_literals() {
+        let parent = tempfile::tempdir().expect("parent");
+        let workspace = parent.path().join("repo[bar]");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let protected = workspace.join(".env");
+        std::fs::write(&protected, "secret").expect("protected file");
+        let workspace =
+            AbsolutePathBuf::from_absolute_path_checked(&workspace).expect("absolute workspace");
+
+        let resolved = resolve_existing_protected_paths(&workspace).expect("protected paths");
+
+        assert!(
+            resolved
+                .iter()
+                .any(|path| path.as_path() == protected.as_path())
+        );
     }
 
     #[test]

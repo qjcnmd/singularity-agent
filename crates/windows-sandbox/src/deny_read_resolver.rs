@@ -227,11 +227,7 @@ fn push_absolute_path(
 fn glob_scan_plan(pattern: &str, configured_max_depth: Option<usize>) -> GlobScanPlan {
     // 从第一个 glob 元字符前的最深词法目录开始扫描；例如 `C:\repo\**\*.env`
     // 只扫描 `C:\repo`，避免退回当前目录或盘符根目录。
-    let first_glob = pattern
-        .char_indices()
-        .find(|(_, ch)| matches!(ch, '*' | '?' | '['))
-        .map(|(index, _)| index)
-        .unwrap_or(pattern.len());
+    let first_glob = first_unescaped_glob_index(pattern);
     let literal_prefix = &pattern[..first_glob];
     let Some(separator_index) = literal_prefix.rfind(['/', '\\']) else {
         return GlobScanPlan {
@@ -250,7 +246,7 @@ fn glob_scan_plan(pattern: &str, configured_max_depth: Option<usize>) -> GlobSca
             .is_some_and(|ch| *ch == b':');
     if separator_index == 0 || is_drive_root_separator {
         return GlobScanPlan {
-            root: PathBuf::from(&literal_prefix[..=separator_index]),
+            root: PathBuf::from(unescape_glob_literal(&literal_prefix[..=separator_index])),
             max_depth: effective_glob_scan_max_depth(pattern_suffix, configured_max_depth),
             recursive: pattern_suffix
                 .split(['/', '\\'])
@@ -258,12 +254,56 @@ fn glob_scan_plan(pattern: &str, configured_max_depth: Option<usize>) -> GlobSca
         };
     }
     GlobScanPlan {
-        root: PathBuf::from(literal_prefix[..separator_index].to_string()),
+        root: PathBuf::from(unescape_glob_literal(&literal_prefix[..separator_index])),
         max_depth: effective_glob_scan_max_depth(pattern_suffix, configured_max_depth),
         recursive: pattern_suffix
             .split(['/', '\\'])
             .any(|component| component == "**"),
     }
+}
+
+fn first_unescaped_glob_index(pattern: &str) -> usize {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 2 < bytes.len()
+            && bytes[index] == b'['
+            && bytes[index + 2] == b']'
+            && matches!(bytes[index + 1], b'?' | b'*' | b'[' | b']' | b'{' | b'}')
+        {
+            index += 3;
+            continue;
+        }
+        if matches!(bytes[index], b'*' | b'?' | b'[') {
+            return index;
+        }
+        index += 1;
+    }
+    pattern.len()
+}
+
+fn unescape_glob_literal(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut unescaped = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 2 < bytes.len()
+            && bytes[index] == b'['
+            && bytes[index + 2] == b']'
+            && matches!(bytes[index + 1], b'?' | b'*' | b'[' | b']' | b'{' | b'}')
+        {
+            unescaped.push(char::from(bytes[index + 1]));
+            index += 3;
+            continue;
+        }
+        let character = value[index..]
+            .chars()
+            .next()
+            .expect("index remains on a character boundary");
+        unescaped.push(character);
+        index += character.len_utf8();
+    }
+    unescaped
 }
 
 fn effective_glob_scan_max_depth(
@@ -435,6 +475,14 @@ mod tests {
         assert_eq!(
             glob_scan_plan(r"C:\*.env", /*configured_max_depth*/ None).root,
             PathBuf::from(r"C:\")
+        );
+        assert_eq!(
+            glob_scan_plan(
+                "C:/repo[[]bar[]]/**/*.env",
+                /*configured_max_depth*/ None,
+            )
+            .root,
+            PathBuf::from(r"C:\repo[bar]")
         );
     }
 
