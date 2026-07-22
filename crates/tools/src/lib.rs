@@ -41,7 +41,7 @@ pub use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, CommandSemanticStatus, DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    WorkspaceMutation,
+    WorkspaceChangeSummary, WorkspaceMutation,
 };
 
 mod broker;
@@ -89,7 +89,8 @@ pub(crate) use registry::{
     MUTATION_TEMP_FILE_ATTEMPTS, PROMPT_INJECTION_MARKERS, REDACTED_TOOL_OUTPUT,
     TOOL_APPROVAL_REQUIRED_ERROR, TOOL_CONTRACT_INVALID_ERROR, TOOL_DENIED_ERROR,
     TOOL_SANDBOX_UNAVAILABLE_ERROR, TRUNCATED_OUTPUT_OMITTED, TRUNCATED_RAW_OUTPUT_KEYS,
-    UNKNOWN_TOOL_ERROR, WORKSPACE_MUTATION_NOT_APPROVED, WORKSPACE_OBSERVATION_METADATA,
+    UNKNOWN_TOOL_ERROR, WORKSPACE_CHANGE_SUMMARY_METADATA, WORKSPACE_MUTATION_NOT_APPROVED,
+    WORKSPACE_OBSERVATION_METADATA,
 };
 #[cfg(windows)]
 pub(crate) use registry::{

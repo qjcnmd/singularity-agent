@@ -12,6 +12,7 @@ pub(crate) const TOOL_CONTRACT_INVALID_ERROR: &str = "tool_contract_invalid";
 pub(crate) const WORKSPACE_MUTATION_NOT_APPROVED: &str =
     "workspace mutation requires allowed tool decision";
 pub(crate) const WORKSPACE_OBSERVATION_METADATA: &str = "workspace_observation";
+pub(crate) const WORKSPACE_CHANGE_SUMMARY_METADATA: &str = "workspace_change_summary";
 pub(crate) const DUPLICATE_PATCH_TARGET: &str = "patch contains duplicate canonical target";
 pub(crate) const MUTATION_TEMP_FILE_ATTEMPTS: usize = 64;
 pub(crate) const DEFAULT_READ_MAX_CHARS: usize = 8_192;

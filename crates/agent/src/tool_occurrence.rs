@@ -237,7 +237,6 @@ enum ProviderAttemptIdentityScope {
 
 pub(super) struct ProviderEventBridge<'a, 'callback_ref, 'callback> {
     identity_scope: ProviderAttemptIdentityScope,
-    pub(super) finalization_only: bool,
     pub(super) on_event: &'a mut Option<&'callback_ref mut AgentLoopEventCallback<'callback>>,
     pub(super) streamed_text: String,
     buffered_text_deltas: Vec<String>,
@@ -249,12 +248,10 @@ pub(super) struct ProviderEventBridge<'a, 'callback_ref, 'callback> {
 impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callback> {
     pub(super) fn new(
         prompt_identity: OccurrenceIdentity,
-        finalization_only: bool,
         on_event: &'a mut Option<&'callback_ref mut AgentLoopEventCallback<'callback>>,
     ) -> Self {
         Self {
             identity_scope: ProviderAttemptIdentityScope::Child(prompt_identity),
-            finalization_only,
             on_event,
             streamed_text: String::new(),
             buffered_text_deltas: Vec::new(),
@@ -275,7 +272,6 @@ impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callb
                 turn_id: input.turn_id.clone(),
                 model_turn_ordinal,
             },
-            finalization_only: false,
             on_event,
             streamed_text: String::new(),
             buffered_text_deltas: Vec::new(),
@@ -289,23 +285,17 @@ impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callb
         match event {
             ProviderStreamEvent::OutputTextDelta { delta } => {
                 self.streamed_text.push_str(&delta);
-                self.buffered_text_deltas.push(delta.clone());
-                if self.finalization_only
-                    && emit_event(self.on_event, AgentLoopEvent::FinalTextDelta { delta }).is_err()
-                {
-                    self.event_sink_failed = true;
-                }
+                self.buffered_text_deltas.push(delta);
             }
         }
     }
 
-    /// Return first-turn deltas for projection after the caller accepts the complete response.
+    /// Return deltas only after the caller has validated the complete provider response.
+    ///
+    /// Final-review responses are typed internal envelopes. They must remain buffered until the
+    /// runtime parses the verdict and projects only the accepted user-facing answer.
     pub(super) fn into_buffered_text_deltas(self) -> Vec<String> {
-        if self.finalization_only {
-            Vec::new()
-        } else {
-            self.buffered_text_deltas
-        }
+        self.buffered_text_deltas
     }
 
     pub(super) fn on_attempt(&mut self, event: ProviderAttemptEvent) -> bool {

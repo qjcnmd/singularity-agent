@@ -165,6 +165,7 @@ pub struct ApprovalCheckpoint {
     pub(super) verification_change: Option<super::VerificationChangeSummary>,
     pub(super) verification_failure_history: Vec<String>,
     pub(super) repair_plan: Option<super::RepairPlanState>,
+    pub(super) repair_attempts: u32,
     pub(super) final_review_verdict: Option<super::FinalReviewVerdict>,
     pub(super) last_completion_error: Option<String>,
     pub(super) plan: Option<AgentPlan>,
@@ -200,6 +201,7 @@ struct ApprovalCheckpointWire {
     verification_failure_history: Vec<String>,
     #[serde(default)]
     repair_plan: Option<super::RepairPlanState>,
+    repair_attempts: u32,
     #[serde(default)]
     final_review_verdict: Option<super::FinalReviewVerdict>,
     last_completion_error: Option<String>,
@@ -236,6 +238,7 @@ impl From<&ApprovalCheckpoint> for ApprovalCheckpointWire {
             verification_change: checkpoint.verification_change.clone(),
             verification_failure_history: checkpoint.verification_failure_history.clone(),
             repair_plan: checkpoint.repair_plan.clone(),
+            repair_attempts: checkpoint.repair_attempts,
             final_review_verdict: checkpoint.final_review_verdict,
             last_completion_error: checkpoint.last_completion_error.clone(),
             plan: checkpoint.plan.clone(),
@@ -296,6 +299,7 @@ impl ApprovalCheckpoint {
             verification_change: wire.verification_change,
             verification_failure_history: wire.verification_failure_history,
             repair_plan: wire.repair_plan,
+            repair_attempts: wire.repair_attempts,
             final_review_verdict: wire.final_review_verdict,
             last_completion_error: wire.last_completion_error,
             plan: wire.plan,
@@ -409,7 +413,9 @@ impl ApprovalCheckpoint {
             }
         }
         if let Some(repair) = &self.repair_plan {
-            if repair.plan.attempt == 0 || repair.plan.attempt > repair.plan.max_attempts {
+            if repair.plan.attempt == 0
+                || repair.plan.attempt > repair.plan.max_attempts.saturating_add(1)
+            {
                 return Err("approval checkpoint repair plan budget is invalid".to_string());
             }
             if repair.plan.max_attempts == 0
@@ -429,6 +435,16 @@ impl ApprovalCheckpoint {
             {
                 return Err("approval checkpoint repair plan binding is invalid".to_string());
             }
+        }
+        if self.repair_attempts > super::MAX_REPAIR_PLAN_ATTEMPTS.saturating_add(1) {
+            return Err("approval checkpoint repair attempt ledger is invalid".to_string());
+        }
+        if self
+            .repair_plan
+            .as_ref()
+            .is_some_and(|repair| repair.plan.attempt != self.repair_attempts)
+        {
+            return Err("approval checkpoint repair attempt ledger is not monotonic".to_string());
         }
         if self.final_review_verdict == Some(super::FinalReviewVerdict::Accept)
             && (!self.completion.allows_final()

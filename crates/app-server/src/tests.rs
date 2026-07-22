@@ -3,13 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use singularity_agent::{AgentRecoveryMetrics, PendingToolCall};
 use singularity_model::{
-    ModelError, ModelErrorCategory, ModelErrorKind, ModelRole, ModelToolCall, ModelToolParseStatus,
-    ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage, Provider,
-    ProviderAttemptMetadata, ProviderError, ProviderProtocolContract, ProviderStreamEvent,
+    ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelRole, ModelToolCall,
+    ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
+    Provider, ProviderAttemptMetadata, ProviderError, ProviderProtocolContract,
+    ProviderStreamEvent,
 };
 use singularity_policy::{ToolId, WorkspaceRelativePath};
 use singularity_protocol::ItemKind;
-use singularity_sandbox::{CommandScriptRequest, WorkspaceMutation};
+use singularity_sandbox::{CommandScriptRequest, WorkspaceChangeSummary, WorkspaceMutation};
 use singularity_tools::{CommandRequest, CommandResult};
 
 use super::*;
@@ -42,7 +43,7 @@ fn pending_approval_for_test(
         "tool_name": &request.action,
         "raw_arguments": &raw_arguments,
         "resources": &request.resources,
-        "checkpoint_version": 2,
+        "checkpoint_version": 3,
         "project_instructions_digest": null,
         "messages": [{
             "role": "assistant",
@@ -69,6 +70,7 @@ fn pending_approval_for_test(
             "terminal_command_revisions": [],
             "unresolved_failures": []
         },
+        "repair_attempts": 0,
         "last_completion_error": null,
         "plan": null,
         "plan_update_count": 0,
@@ -1211,6 +1213,46 @@ struct StreamingProvider {
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
 }
 
+fn typed_final_review_fixture(
+    request: &ModelTurnRequest,
+    mut response: ModelTurnResponse,
+) -> ModelTurnResponse {
+    if !request.tools.is_empty() {
+        return response;
+    }
+    let Some(answer) = response
+        .assistant_message
+        .as_ref()
+        .map(|message| message.content.clone())
+        .filter(|content| !content.trim().is_empty())
+    else {
+        return response;
+    };
+    if serde_json::from_str::<Value>(&answer).is_ok() {
+        return response;
+    }
+    let Some(template) = request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ModelRole::Developer)
+        .and_then(|message| message.content.split_once("with no markdown: "))
+        .and_then(|(_, value)| value.split_once(". The revision"))
+        .map(|(value, _)| value)
+    else {
+        return response;
+    };
+    let Ok(mut value) =
+        serde_json::from_str::<Value>(&template.replace("accept|reject|repair", "accept"))
+    else {
+        return response;
+    };
+    value["final_answer"] = json!(answer);
+    value["reason"] = json!("");
+    response.assistant_message = Some(ModelMessage::text(ModelRole::Assistant, value.to_string()));
+    response
+}
+
 impl Provider for StreamingProvider {
     fn protocol_contract(&self) -> ProviderProtocolContract {
         ProviderProtocolContract::default()
@@ -1229,11 +1271,35 @@ impl Provider for StreamingProvider {
             .responses
             .get(response_index)
             .unwrap_or_else(|| self.responses.last().expect("streaming response"));
-        for event in events {
-            on_event(event.clone());
-        }
+        let original_text = response
+            .assistant_message
+            .as_ref()
+            .map(|message| message.content.clone());
         let mut response = response.clone();
         response.request_id = request.request_id.clone();
+        let response = typed_final_review_fixture(request, response);
+        let terminal_text = response
+            .assistant_message
+            .as_ref()
+            .map(|message| message.content.as_str());
+        if terminal_text != original_text.as_deref() {
+            let chars = terminal_text
+                .unwrap_or_default()
+                .chars()
+                .collect::<Vec<_>>();
+            let chunks = events.len().max(1);
+            for index in 0..chunks {
+                let start = chars.len() * index / chunks;
+                let end = chars.len() * (index + 1) / chunks;
+                on_event(ProviderStreamEvent::OutputTextDelta {
+                    delta: chars[start..end].iter().collect(),
+                });
+            }
+        } else {
+            for event in events {
+                on_event(event.clone());
+            }
+        }
         Ok(response)
     }
 
@@ -1265,7 +1331,7 @@ impl Provider for StaticProvider {
             .unwrap_or_else(|| self.responses.last().expect("static provider response"))
             .clone();
         response.request_id = request.request_id.clone();
-        Ok(response)
+        Ok(typed_final_review_fixture(request, response))
     }
 }
 
@@ -2968,7 +3034,7 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
         .record_approval_decision(&decision, "approval", "approval decision recorded")
         .expect("record approval");
     let pending_payload = recorded.pending_tool_call.expect("checkpoint payload");
-    assert_eq!(pending_payload["checkpoint_version"], 2);
+    assert_eq!(pending_payload["checkpoint_version"], 3);
     assert!(
         pending_payload["project_instructions_digest"]
             .as_str()
@@ -3313,21 +3379,19 @@ impl SandboxBackend for MutatingCommandSandboxBackend {
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
-        CommandResult::completed(&request.command_id, "command ok")
-            .with_workspace_mutation(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                WorkspaceMutation::Changed
-            } else {
-                WorkspaceMutation::Unchanged
-            })
-            .with_sandbox_execution(
-                self.name(),
-                singularity_tools::SandboxBackendEnforcement::Strict,
-            )
+        self.result(&request.command_id)
     }
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
-        CommandResult::completed(&request.command_id, "command ok")
-            .with_workspace_mutation(if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+        self.result(&request.command_id)
+    }
+}
+
+impl MutatingCommandSandboxBackend {
+    fn result(&self, command_id: &str) -> CommandResult {
+        let changed = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        let result = CommandResult::completed(command_id, "command ok")
+            .with_workspace_mutation(if changed {
                 WorkspaceMutation::Changed
             } else {
                 WorkspaceMutation::Unchanged
@@ -3335,7 +3399,15 @@ impl SandboxBackend for MutatingCommandSandboxBackend {
             .with_sandbox_execution(
                 self.name(),
                 singularity_tools::SandboxBackendEnforcement::Strict,
-            )
+            );
+        if changed {
+            result.with_workspace_change_summary(WorkspaceChangeSummary::new(
+                vec![".".to_string()],
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ))
+        } else {
+            result
+        }
     }
 }
 

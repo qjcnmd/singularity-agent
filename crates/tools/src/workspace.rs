@@ -213,6 +213,11 @@ impl WorkspaceRevision {
     pub fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
     }
+
+    /// Return the bounded numeric revision for internal typed prompts.
+    pub fn value(self) -> u64 {
+        self.0
+    }
 }
 
 /// 一次 tool 结果实际观察到的工作区 revision 与变化事实。
@@ -805,6 +810,7 @@ impl WorkspaceTools {
             u64::try_from(backend_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         drop(bound_command_cwd);
         let mutation = result.workspace_mutation;
+        let workspace_change_summary = result.workspace_change_summary.clone();
         let execution = result.sandbox.clone();
         let command_id_binding_valid = result.command_id == request.command_id;
         let sandbox_execution = SandboxExecutionObservation {
@@ -866,6 +872,9 @@ impl WorkspaceTools {
             ) => WorkspaceObservation::unchanged(self.current_workspace_revision()),
         };
         Self::attach_workspace_observation(&mut output, &observation)?;
+        if let Some(summary) = workspace_change_summary {
+            output.metadata[WORKSPACE_CHANGE_SUMMARY_METADATA] = json!(summary);
+        }
         output.metadata["result_id"] = json!(expected_scope.as_str());
         output.metadata["audit"] = json!({
             "cwd": request.cwd,

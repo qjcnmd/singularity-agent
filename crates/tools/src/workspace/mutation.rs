@@ -117,11 +117,19 @@ impl WorkspaceTools {
             .iter()
             .map(|mutation| mutation.relative.clone())
             .collect::<Vec<_>>();
+        let diff_digest = workspace_diff_digest(&prepared);
         let revision = self.advance_workspace_revision()?;
         let mut output = ToolOutput::success(json!({
-                "changed_files": changed_files,
+            "changed_files": changed_files,
             "rolled_back": false,
         }));
+        output.metadata[WORKSPACE_CHANGE_SUMMARY_METADATA] = json!(WorkspaceChangeSummary::new(
+            prepared
+                .iter()
+                .map(|mutation| mutation.relative.clone())
+                .collect(),
+            diff_digest,
+        ));
         Self::attach_workspace_observation(&mut output, &WorkspaceObservation::changed(revision))?;
         Ok(output)
     }
@@ -1092,6 +1100,31 @@ impl WorkspaceTools {
             Err(WorkspaceToolError::RollbackFailed(failures.join("; ")))
         }
     }
+}
+
+/// Hash the canonical bytes that were replaced by one atomic patch.
+fn workspace_diff_digest(prepared: &[PreparedMutation]) -> String {
+    let mut entries = prepared
+        .iter()
+        .map(|mutation| {
+            (
+                mutation.relative.as_str(),
+                mutation.original.as_bytes(),
+                mutation.updated.as_bytes(),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    let mut hasher = Sha256::new();
+    for (path, original, updated) in entries {
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update((original.len() as u64).to_le_bytes());
+        hasher.update(original);
+        hasher.update((updated.len() as u64).to_le_bytes());
+        hasher.update(updated);
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn publish_temporary(

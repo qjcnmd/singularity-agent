@@ -11,10 +11,11 @@ use singularity_tools::{
     ListToolInput, ReadToolInput, SandboxExecutionBoundary, SandboxExecutionStatus,
     ToolAuthorization, ToolBroker, ToolBrokerDecision, ToolCallRequest, ToolCapability, ToolEntry,
     ToolExecutionMode, ToolExecutor, ToolExposure, ToolFailureKind, ToolInputValidationError,
-    ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspaceMutation, WorkspacePatch,
-    WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError, WorkspaceToolExecutor,
-    WorkspaceTools, approximate_token_count, command_scope_digest, command_script_scope_digest,
-    command_script_scope_digest_with_policy, workspace_tool_entries, workspace_tool_specs,
+    ToolOutput, ToolRegistry, ToolResult, ToolSpec, WorkspaceChangeSummary, WorkspaceMutation,
+    WorkspacePatch, WorkspacePatchChange, WorkspaceRevision, WorkspaceToolError,
+    WorkspaceToolExecutor, WorkspaceTools, approximate_token_count, command_scope_digest,
+    command_script_scope_digest, command_script_scope_digest_with_policy, workspace_tool_entries,
+    workspace_tool_specs,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2259,6 +2260,50 @@ fn workspace_mutation_tools_guard_expected_content_and_protected_paths() {
         "TOKEN=secret"
     );
 
+    remove_workspace(&workspace);
+}
+
+#[test]
+fn workspace_mutation_summary_hashes_published_before_and_after_bytes() {
+    let workspace = test_workspace("mutation-summary");
+    let path = workspace.join("contract.txt");
+    std::fs::write(&path, "before").expect("write fixture");
+    let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+
+    let first = tools
+        .edit(
+            EditToolInput {
+                path: "contract.txt".to_string(),
+                expected: "before".to_string(),
+                replacement: "after-one".to_string(),
+            },
+            &ToolBrokerDecision::Allow,
+        )
+        .expect("first edit");
+    let first_summary: WorkspaceChangeSummary =
+        serde_json::from_value(first.metadata["workspace_change_summary"].clone())
+            .expect("first workspace change summary");
+
+    let second = tools
+        .edit(
+            EditToolInput {
+                path: "contract.txt".to_string(),
+                expected: "after-one".to_string(),
+                replacement: "after-two".to_string(),
+            },
+            &ToolBrokerDecision::Allow,
+        )
+        .expect("second edit");
+    let second_summary: WorkspaceChangeSummary =
+        serde_json::from_value(second.metadata["workspace_change_summary"].clone())
+            .expect("second workspace change summary");
+
+    assert_eq!(first_summary.changed_files, ["contract.txt"]);
+    assert_eq!(second_summary.changed_files, ["contract.txt"]);
+    assert!(first_summary.diff_digest.starts_with("sha256:"));
+    assert_eq!(first_summary.diff_digest.len(), 71);
+    assert_ne!(first_summary.diff_digest, second_summary.diff_digest);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "after-two");
     remove_workspace(&workspace);
 }
 

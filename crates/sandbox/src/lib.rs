@@ -98,6 +98,24 @@ pub enum WorkspaceMutation {
     Unknown,
 }
 
+/// Producer-owned summary of concrete workspace paths and published content diff digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceChangeSummary {
+    pub changed_files: Vec<String>,
+    pub diff_digest: String,
+}
+
+impl WorkspaceChangeSummary {
+    /// Construct a producer-owned summary; the consuming runtime validates its bounds and digest.
+    pub fn new(changed_files: Vec<String>, diff_digest: impl Into<String>) -> Self {
+        Self {
+            changed_files,
+            diff_digest: diff_digest.into(),
+        }
+    }
+}
+
 /// 与命令请求使用的工作区根目录配对的文件系统策略。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxFilesystemPolicy {
@@ -349,6 +367,9 @@ pub struct CommandResult {
     #[serde(skip)]
     #[schemars(skip)]
     pub workspace_mutation: WorkspaceMutation,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub workspace_change_summary: Option<WorkspaceChangeSummary>,
 }
 
 /// 输出限制辅助函数返回的有界文本预览。
@@ -382,6 +403,7 @@ impl CommandResult {
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
             workspace_mutation: WorkspaceMutation::Unknown,
+            workspace_change_summary: None,
         }
     }
 
@@ -487,6 +509,7 @@ impl CommandResult {
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
             workspace_mutation: WorkspaceMutation::Unknown,
+            workspace_change_summary: None,
         }
     }
 
@@ -503,6 +526,12 @@ impl CommandResult {
     /// 绑定 backend 对受保护工作区变化的明确执行观察。
     pub fn with_workspace_mutation(mut self, mutation: WorkspaceMutation) -> Self {
         self.workspace_mutation = mutation;
+        self
+    }
+
+    /// Bind a trusted producer summary to the command result.
+    pub fn with_workspace_change_summary(mut self, summary: WorkspaceChangeSummary) -> Self {
+        self.workspace_change_summary = Some(summary);
         self
     }
 
@@ -526,6 +555,7 @@ impl CommandResult {
             redacted: true,
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
             workspace_mutation: WorkspaceMutation::Unknown,
+            workspace_change_summary: None,
         }
     }
 }

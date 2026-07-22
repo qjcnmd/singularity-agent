@@ -125,6 +125,85 @@ struct FinalizationAwareProvider {
     capabilities: ProviderProtocolContract,
 }
 
+// Keep existing provider fixtures focused on the answer text while exercising the production
+// typed final-review parser. Real providers must return this object themselves.
+fn typed_fixture_final_review(
+    request: &ModelTurnRequest,
+    mut response: ModelTurnResponse,
+) -> ModelTurnResponse {
+    if request.tool_choice.mode != ToolChoiceMode::None || !request.tools.is_empty() {
+        return response;
+    }
+    let Some(message) = response.assistant_message.as_ref() else {
+        return response;
+    };
+    if message.content.trim().is_empty() {
+        return response;
+    }
+    if serde_json::from_str::<serde_json::Value>(&message.content).is_ok() {
+        return response;
+    }
+    let Some(instruction) = request.messages.iter().rev().find(|message| {
+        message.role == ModelRole::Developer
+            && message
+                .content
+                .contains("Return exactly one JSON object for the terminal review")
+    }) else {
+        return response;
+    };
+    let Some(template) = instruction
+        .content
+        .split_once("with no markdown: ")
+        .and_then(|(_, value)| value.split_once(". The revision").map(|(value, _)| value))
+    else {
+        return response;
+    };
+    let (verdict, final_answer, reason) = match message.content.as_str() {
+        "__fixture_review_repair__" => ("repair", "", "semantic contract remains incomplete"),
+        "__fixture_review_reject__" => ("reject", "", "semantic contract remains incomplete"),
+        answer => ("accept", answer, ""),
+    };
+    let template = template.replace("accept|reject|repair", verdict);
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&template) else {
+        return response;
+    };
+    value["final_answer"] = serde_json::json!(final_answer);
+    value["reason"] = serde_json::json!(reason);
+    if let Ok(content) = serde_json::to_string(&value) {
+        response.assistant_message = Some(ModelMessage::text(ModelRole::Assistant, content));
+    }
+    response
+}
+
+fn stream_fixture_response(
+    request: &ModelTurnRequest,
+    events: &[ProviderStreamEvent],
+    response: ModelTurnResponse,
+    on_event: &mut dyn FnMut(ProviderStreamEvent),
+) -> ModelTurnResponse {
+    let typed = typed_fixture_final_review(request, response.clone());
+    let original_text = response
+        .assistant_message
+        .as_ref()
+        .map(|message| message.content.as_str());
+    let typed_text = typed
+        .assistant_message
+        .as_ref()
+        .map(|message| message.content.as_str());
+    if typed_text != original_text {
+        if let Some(delta) = typed_text {
+            on_event(ProviderStreamEvent::OutputTextDelta {
+                delta: delta.to_string(),
+            });
+        }
+    } else {
+        for event in events {
+            on_event(event.clone());
+        }
+    }
+    typed
+}
+
 fn project_instruction_snapshot(content: &str) -> ProjectInstructions {
     let workspace = tempfile::tempdir().expect("project instruction workspace");
     std::fs::write(workspace.path().join("AGENTS.md"), content)
@@ -154,7 +233,10 @@ impl Provider for FinalizationAwareProvider {
             if self.cancel_on_finalization {
                 cancellation.cancel();
             }
-            return self.final_response.clone();
+            return self
+                .final_response
+                .clone()
+                .map(|response| typed_fixture_final_review(request, response));
         }
         Ok(self.repeated_tool_response.clone())
     }
@@ -173,11 +255,13 @@ impl Provider for StaticProvider {
         let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
         let response_index = seen_requests.len();
         seen_requests.push(request.clone());
-        Ok(self
-            .responses
-            .get(response_index)
-            .unwrap_or_else(|| self.responses.last().expect("static provider response"))
-            .clone())
+        Ok(typed_fixture_final_review(
+            request,
+            self.responses
+                .get(response_index)
+                .unwrap_or_else(|| self.responses.last().expect("static provider response"))
+                .clone(),
+        ))
     }
 }
 
@@ -199,10 +283,12 @@ impl Provider for StreamingProvider {
             .responses
             .get(response_index)
             .unwrap_or_else(|| self.responses.last().expect("streaming provider response"));
-        for event in events {
-            on_event(event.clone());
-        }
-        Ok(response.clone())
+        Ok(stream_fixture_response(
+            request,
+            events,
+            response.clone(),
+            on_event,
+        ))
     }
 
     fn complete(
@@ -272,13 +358,27 @@ impl Provider for FinalizationStreamProvider {
         if !finalization_only {
             return Ok(self.setup_response.clone());
         }
-        for event in &self.final_events {
-            on_event(event.clone());
-        }
         if self.cancel_on_finalization {
+            for event in &self.final_events {
+                on_event(event.clone());
+            }
             cancellation.cancel();
         }
-        self.final_response.clone()
+        match self.final_response.clone() {
+            Ok(response) if !self.cancel_on_finalization => Ok(stream_fixture_response(
+                request,
+                &self.final_events,
+                response,
+                on_event,
+            )),
+            Ok(response) => Ok(typed_fixture_final_review(request, response)),
+            Err(error) => {
+                for event in &self.final_events {
+                    on_event(event.clone());
+                }
+                Err(error)
+            }
+        }
     }
 
     fn complete(
@@ -320,15 +420,17 @@ impl Provider for NegotiatingProvider {
         let mut seen_requests = self.seen_requests.lock().expect("seen requests lock");
         let response_index = seen_requests.len();
         seen_requests.push(request.clone());
-        Ok(self
-            .responses
-            .get(response_index)
-            .unwrap_or_else(|| {
-                self.responses
-                    .last()
-                    .expect("negotiating provider response")
-            })
-            .clone())
+        Ok(typed_fixture_final_review(
+            request,
+            self.responses
+                .get(response_index)
+                .unwrap_or_else(|| {
+                    self.responses
+                        .last()
+                        .expect("negotiating provider response")
+                })
+                .clone(),
+        ))
     }
 }
 
@@ -1380,7 +1482,7 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.final_answer.as_deref(), Some("done"));
-    assert_eq!(deltas, ["do", "ne"]);
+    assert_eq!(deltas, ["done"]);
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::None);
@@ -1439,7 +1541,7 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
 }
 
 #[test]
-fn agent_loop_keeps_partial_callback_text_when_terminal_validation_fails() {
+fn agent_loop_withholds_unvalidated_final_review_text_when_terminal_validation_fails() {
     let verification_argv = test_command("verify");
     let verification_digest = command_script_scope_digest_with_policy(
         &verification_argv.join(" "),
@@ -1466,8 +1568,19 @@ fn agent_loop_keeps_partial_callback_text_when_terminal_validation_fails() {
         tool_call_id: None,
         tool_calls: vec![call],
     });
-    let mismatched =
-        ModelTurnResponse::completed("model_request_turn_1_1", "response_final", "terminal");
+    let mismatched = ModelTurnResponse::completed(
+        "model_request_turn_1_1",
+        "response_final",
+        serde_json::json!({
+            "verdict": "accept",
+            "workspace_revision": 0,
+            "change_digest": null,
+            "verification_digests": [verification_digest],
+            "final_answer": "terminal",
+            "reason": ""
+        })
+        .to_string(),
+    );
     let mut deltas = Vec::new();
     let result = AgentLoop::new(
         StreamingProvider {
@@ -1507,7 +1620,7 @@ fn agent_loop_keeps_partial_callback_text_when_terminal_validation_fails() {
     );
 
     assert_eq!(result.status, AgentStatus::Failed);
-    assert_eq!(deltas, ["partial"]);
+    assert!(deltas.is_empty());
     assert_eq!(
         result
             .provider_diagnostic
@@ -1518,7 +1631,7 @@ fn agent_loop_keeps_partial_callback_text_when_terminal_validation_fails() {
 }
 
 #[test]
-fn agent_loop_keeps_partial_callback_text_when_finalization_stream_fails() {
+fn agent_loop_withholds_unvalidated_final_review_text_when_stream_fails() {
     let (input, setup_response) = finalization_stream_fixture();
     let error = ProviderError::from_model_error(
         ModelError::new(
@@ -1545,7 +1658,7 @@ fn agent_loop_keeps_partial_callback_text_when_finalization_stream_fails() {
     assert_eq!(result.status, AgentStatus::Failed);
     assert!(!result.completed);
     assert!(result.final_answer.is_none());
-    assert_eq!(deltas, ["partial"]);
+    assert!(deltas.is_empty());
     assert_eq!(
         result
             .provider_diagnostic
@@ -1555,7 +1668,7 @@ fn agent_loop_keeps_partial_callback_text_when_finalization_stream_fails() {
 }
 
 #[test]
-fn agent_loop_keeps_partial_callback_text_when_finalization_is_cancelled() {
+fn agent_loop_withholds_unvalidated_final_review_text_when_cancelled() {
     let (input, setup_response) = finalization_stream_fixture();
     let late_terminal =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_late", "late terminal");
@@ -1574,7 +1687,7 @@ fn agent_loop_keeps_partial_callback_text_when_finalization_is_cancelled() {
     assert_eq!(result.status, AgentStatus::Cancelled);
     assert!(!result.completed);
     assert!(result.final_answer.is_none());
-    assert_eq!(deltas, ["partial"]);
+    assert!(deltas.is_empty());
 }
 
 #[test]
@@ -1663,7 +1776,7 @@ fn approval_resume_projects_finalization_text_deltas() {
 
     assert_eq!(resumed.status, AgentStatus::Completed);
     assert_eq!(resumed.final_answer.as_deref(), Some("resumed"));
-    assert_eq!(deltas, ["re", "sumed"]);
+    assert_eq!(deltas, ["resumed"]);
     assert_eq!(seen_requests.lock().expect("seen requests").len(), 2);
 }
 
@@ -1858,7 +1971,7 @@ fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() 
     .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&input);
 
-    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert_eq!(result.model_turns, 3);
     assert_eq!(result.final_answer.as_deref(), Some("recovered"));
     assert_eq!(result.tool_results.len(), 2);
@@ -2408,7 +2521,7 @@ fn agent_loop_does_not_create_partial_approval_for_a_batch() {
     .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
     .run(&AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3));
 
-    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert!(result.pending_approvals.is_empty());
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
@@ -2524,7 +2637,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         "approval_turn_1_call_1"
     );
     let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
-    assert_eq!(checkpoint["checkpoint_version"], 2);
+    assert_eq!(checkpoint["checkpoint_version"], 3);
     assert_eq!(checkpoint["thread_id"], "thread_1");
     assert_eq!(checkpoint["turn_id"], "turn_1");
     assert_eq!(checkpoint["request_id"], "approval_turn_1_call_1");
@@ -2590,6 +2703,21 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     assert!(
         incomplete
             .expect_err("incomplete checkpoint must fail")
+            .contains("invalid approval checkpoint")
+    );
+
+    let mut missing_repair_ledger = checkpoint.clone();
+    missing_repair_ledger
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("repair_attempts");
+    let missing_repair_ledger = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
+        &missing_repair_ledger,
+    );
+    assert!(
+        missing_repair_ledger
+            .expect_err("missing repair ledger must fail")
             .contains("invalid approval checkpoint")
     );
 }
@@ -5545,6 +5673,56 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
     );
 }
 
+#[test]
+fn dynamic_verification_fails_closed_when_command_omits_trusted_change_summary() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let file_path = workspace.path().join("README.md");
+    std::fs::write(&file_path, "before").expect("write file");
+    let mut command_response =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    command_response.tool_calls.push(tool_call(
+        "mutating_command",
+        "command",
+        serde_json::json!({
+            "command": test_command_script("success"),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![command_response],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(CommandMutatingBackend {
+                workspace: workspace.path().to_path_buf(),
+                calls: AtomicUsize::new(0),
+            }),
+    )
+    .run(&AgentLoopInput::new(
+        "thread_1",
+        "turn_1",
+        "run the mutating command",
+    ));
+
+    assert_eq!(result.status, AgentStatus::Failed, "result={result:?}");
+    assert!(result.error.as_deref().is_some_and(|error| error.contains(
+        "workspace mutation did not provide a trusted changed-files and diff digest summary"
+    )));
+    assert_eq!(
+        std::fs::read_to_string(file_path).expect("read mutated file"),
+        "command mutation"
+    );
+}
+
 struct AgentStrictBackend;
 
 struct ExecutionCountingBackend {
@@ -5774,6 +5952,36 @@ struct AgentFailThenSucceedBackend {
     calls: AtomicUsize,
 }
 
+struct AgentAlwaysFailBackend;
+
+impl SandboxBackend for AgentAlwaysFailBackend {
+    fn name(&self) -> &'static str {
+        "agent_always_fail_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        CommandResult::executed(&request.command_id, 1, 1, "", "failed", false)
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        CommandResult::executed(&request.command_id, 1, 1, "", "failed", false)
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
+
 impl SandboxBackend for AgentFailThenSucceedBackend {
     fn name(&self) -> &'static str {
         "agent_fail_then_succeed_test"
@@ -5818,16 +6026,42 @@ impl SandboxBackend for AgentFailThenSucceedBackend {
 
 struct AgentSemanticFixtureBackend {
     file_path: PathBuf,
-    repaired_source: String,
 }
 
 impl AgentSemanticFixtureBackend {
     fn result(&self, command_id: &str) -> CommandResult {
-        let source = std::fs::read_to_string(&self.file_path).expect("read semantic fixture");
-        let result = if source == self.repaired_source {
-            CommandResult::completed(command_id, "boundary contract passed")
+        let output_dir = tempfile::tempdir().expect("semantic fixture output");
+        let executable = output_dir
+            .path()
+            .join(format!("semantic_fixture{}", std::env::consts::EXE_SUFFIX));
+        let compile = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&self.file_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("execute rustc for semantic fixture");
+        let result = if compile.status.success() {
+            let executed = std::process::Command::new(&executable)
+                .output()
+                .expect("execute semantic fixture");
+            CommandResult::executed(
+                command_id,
+                executed.status.code().unwrap_or(1),
+                1,
+                String::from_utf8_lossy(&executed.stdout),
+                String::from_utf8_lossy(&executed.stderr),
+                false,
+            )
         } else {
-            CommandResult::executed(command_id, 1, 1, "", "boundary contract failed", false)
+            CommandResult::executed(
+                command_id,
+                compile.status.code().unwrap_or(1),
+                1,
+                String::from_utf8_lossy(&compile.stdout),
+                String::from_utf8_lossy(&compile.stderr),
+                false,
+            )
         };
         result
             .with_workspace_mutation(WorkspaceMutation::Unchanged)
@@ -7144,7 +7378,7 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
     )
     .run(&AgentLoopInput::new("thread_1", "turn_1", "finish the plan").with_max_turns(4));
 
-    assert_eq!(result.status, AgentStatus::Completed);
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert_eq!(result.final_answer.as_deref(), Some("done"));
     assert_eq!(result.plan_update_count, 2);
     assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
@@ -7272,28 +7506,28 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
     let fixtures = [
         (
             AgentVerificationRisk::EmptyCollection,
-            "empty_collection.py",
-            "def total(values):\n    return sum(values)\n",
-            "def total(values):\n    return None if not values else sum(values)\n",
-            "def total(values):\n    return sum(values)\n",
+            "empty_collection.rs",
+            "fn total(values: &[i64]) -> i64 { values.iter().sum() }\nfn main() { assert_eq!(total(&[1, 2]), 3); }\n",
+            "fn total(values: &[i64]) -> Option<i64> { (!values.is_empty()).then(|| values.iter().sum()) }\nfn main() { let total: i64 = total(&[]); assert_eq!(total, 0); }\n",
+            "fn total(values: &[i64]) -> i64 { values.iter().sum() }\nfn main() { let empty_total: i64 = total(&[]); assert_eq!(empty_total, 0); assert_eq!(total(&[1, 2]), 3); }\n",
             "empty collection",
             "empty_collection",
         ),
         (
             AgentVerificationRisk::OptionalNull,
-            "optional_null.py",
-            "def label(value):\n    return value\n",
-            "def label(value):\n    return value.strip()\n",
-            "def label(value):\n    return None if value is None else value.strip()\n",
+            "optional_null.rs",
+            "fn label(value: Option<&str>) -> String { value.unwrap_or_default().trim().to_string() }\nfn main() { assert_eq!(label(Some(\" ready \")), \"ready\"); }\n",
+            "fn label(value: Option<&str>) -> String { value.unwrap().trim().to_string() }\nfn main() { assert_eq!(label(None), \"\"); }\n",
+            "fn label(value: Option<&str>) -> String { value.unwrap_or_default().trim().to_string() }\nfn main() { assert_eq!(label(None), \"\"); assert_eq!(label(Some(\" ready \")), \"ready\"); }\n",
             "Optional/Null",
             "optional_null",
         ),
         (
             AgentVerificationRisk::DivisionByZero,
-            "zero_index_division.py",
-            "def ratio(total, count):\n    return total\n",
-            "def ratio(total, count):\n    return total / count\n",
-            "def ratio(total, count):\n    return 0 if count == 0 else total / count\n",
+            "zero_index_division.rs",
+            "fn ratio(total: i64, count: i64) -> i64 { if count == 0 { 0 } else { total / count } }\nfn main() { assert_eq!(ratio(6, 2), 3); }\n",
+            "fn ratio(total: i64, count: i64) -> i64 { total / count }\nfn main() { assert_eq!(ratio(1, 0), 0); }\n",
+            "fn ratio(total: i64, count: i64) -> i64 { if count == 0 { 0 } else { total / count } }\nfn main() { assert_eq!(ratio(1, 0), 0); assert_eq!(ratio(6, 2), 3); }\n",
             "division by zero",
             "zero_index_division",
         ),
@@ -7450,7 +7684,6 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
                 .expect("workspace tools")
                 .with_sandbox_backend(AgentSemanticFixtureBackend {
                     file_path: file_path.clone(),
-                    repaired_source: repaired_source.to_string(),
                 }),
         )
         .run_with_events(
@@ -7525,6 +7758,393 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
         assert_eq!(requests.len(), 8);
         assert!(requests[7].tools.is_empty());
     }
+}
+
+#[test]
+fn final_review_repair_requires_mutation_replan_and_second_review() {
+    let workspace = tempfile::tempdir().expect("review workspace");
+    let fixture_name = "review_contract.rs";
+    let original = "fn value() -> i32 { 1 }\n";
+    let incomplete = "fn value() -> i32 { 2 }\n";
+    std::fs::write(workspace.path().join(fixture_name), original).expect("write review fixture");
+    let command = test_command_script("success");
+
+    let edit_response = |turn_index: u32, call_id: &str, expected: &str, replacement: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_review_{turn_index}"),
+            format!("response_{call_id}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "edit",
+            serde_json::json!({
+                "path": fixture_name,
+                "expected": expected,
+                "replacement": replacement
+            }),
+        ));
+        response
+    };
+    let plan_response = |turn_index: u32, call_id: &str, gap: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_review_{turn_index}"),
+            format!("response_{call_id}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "update_plan",
+            serde_json::json!({
+                "steps": [{"step": "verify the repaired value contract", "status": "completed"}],
+                "verification": [{
+                    "risk": "zero_value",
+                    "evidence": format!("changed {fixture_name}"),
+                    "affected_symbol": format!("{fixture_name}::value"),
+                    "current_gap": gap,
+                    "action": {
+                        "command": command,
+                        "cwd": ".",
+                        "timeout_seconds": 5,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                }]
+            }),
+        ));
+        response
+    };
+    let command_response = |turn_index: u32, call_id: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_review_{turn_index}"),
+            format!("response_{call_id}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "command",
+            serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+        ));
+        response
+    };
+
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let mut events = Vec::new();
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit_response(0, "candidate_edit", original, incomplete),
+                plan_response(
+                    1,
+                    "candidate_plan",
+                    "the value contract has not been reviewed",
+                ),
+                command_response(2, "candidate_check"),
+                ModelTurnResponse::completed(
+                    "model_request_turn_review_3",
+                    "response_review_repair",
+                    "__fixture_review_repair__",
+                ),
+                edit_response(4, "repair_edit", incomplete, original),
+                plan_response(
+                    5,
+                    "repair_plan",
+                    "the prior final review rejected the semantic value contract",
+                ),
+                command_response(6, "repair_check"),
+                ModelTurnResponse::completed(
+                    "model_request_turn_review_7",
+                    "response_review_accept",
+                    "completed",
+                ),
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind review workspace")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run_with_events(
+        &AgentLoopInput::new("thread_review", "turn_review", "restore the value contract")
+            .with_max_turns(8),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.final_answer.as_deref(), Some("completed"));
+    assert_eq!(
+        result.verification.final_review_verdict,
+        Some(FinalReviewVerdict::Accept)
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join(fixture_name)).unwrap(),
+        original
+    );
+    assert_eq!(seen_requests.lock().expect("seen review requests").len(), 8);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::FinalReview(review))
+            if review.verdict == Some(FinalReviewVerdict::Repair)
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::RepairPlanning(repair))
+            if repair.reason == AgentRepairReason::FinalReviewRejected
+                && repair.attempt == 1
+                && matches!(repair.lifecycle, OccurrenceLifecycle::Finished {
+                    status: RepairPlanningStatus::Planned,
+                    ..
+                })
+    )));
+}
+
+#[test]
+fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
+    let workspace = tempfile::tempdir().expect("repair budget workspace");
+    let fixture_name = "repair_budget.txt";
+    std::fs::write(workspace.path().join(fixture_name), "v0").expect("write repair fixture");
+    let command = test_command_script("failure");
+
+    let edit_response = |turn_index: u32, expected: &str, replacement: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_budget_{turn_index}"),
+            format!("response_edit_{turn_index}"),
+            "",
+        );
+        let call_id = format!("edit_{turn_index}");
+        response.tool_calls.push(tool_call(
+            &call_id,
+            "edit",
+            serde_json::json!({
+                "path": fixture_name,
+                "expected": expected,
+                "replacement": replacement
+            }),
+        ));
+        response
+    };
+    let plan_response = |turn_index: u32| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_budget_{turn_index}"),
+            format!("response_plan_{turn_index}"),
+            "",
+        );
+        let call_id = format!("plan_{turn_index}");
+        response.tool_calls.push(tool_call(
+            &call_id,
+            "update_plan",
+            serde_json::json!({
+                "steps": [{"step": "repair and verify the bounded fixture", "status": "completed"}],
+                "verification": [{
+                    "risk": "general_mutation",
+                    "evidence": format!("changed {fixture_name}"),
+                    "affected_symbol": fixture_name,
+                    "current_gap": "command_exit_nonzero was observed; rerun after repair",
+                    "action": {
+                        "command": command,
+                        "cwd": ".",
+                        "timeout_seconds": 5,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                }]
+            }),
+        ));
+        response
+    };
+    let command_response = |turn_index: u32| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_budget_{turn_index}"),
+            format!("response_command_{turn_index}"),
+            "",
+        );
+        let call_id = format!("command_{turn_index}");
+        response.tool_calls.push(tool_call(
+            &call_id,
+            "command",
+            serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+        ));
+        response
+    };
+    let read_response = |turn_index: u32| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_budget_{turn_index}"),
+            format!("response_read_{turn_index}"),
+            "",
+        );
+        let call_id = format!("read_{turn_index}");
+        response.tool_calls.push(tool_call(
+            &call_id,
+            "read",
+            serde_json::json!({"path": fixture_name}),
+        ));
+        response
+    };
+
+    let responses = vec![
+        edit_response(0, "v0", "v1"),
+        plan_response(1),
+        command_response(2),
+        edit_response(3, "v1", "v2"),
+        plan_response(4),
+        command_response(5),
+        read_response(6),
+        read_response(7),
+        edit_response(8, "v2", "v3"),
+        plan_response(9),
+        command_response(10),
+        edit_response(11, "v3", "v4"),
+        plan_response(12),
+        command_response(13),
+    ];
+    let policy = allow_read_execute_policy()
+        .with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        )
+        .with_rule(
+            PermissionRule::new(
+                "ask_read",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Ask,
+            )
+            .for_operation(PermissionOperation::Read)
+            .for_resource(workspace_resource(fixture_name)),
+        );
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses,
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind repair budget workspace")
+            .with_sandbox_backend(AgentAlwaysFailBackend),
+    );
+    let input = AgentLoopInput::new(
+        "thread_budget",
+        "turn_budget",
+        "repair within the bounded budget",
+    )
+    .with_max_turns(14);
+
+    let first_blocked = agent_loop.run(&input);
+    assert_eq!(
+        first_blocked.status,
+        AgentStatus::Blocked,
+        "result={first_blocked:?}"
+    );
+    let first_pending = pending_approval(&first_blocked);
+    let first_checkpoint = first_pending.encode_checkpoint().expect("first checkpoint");
+    assert_eq!(first_checkpoint["checkpoint_version"], 3);
+    assert_eq!(
+        first_checkpoint["repair_attempts"], 2,
+        "checkpoint={first_checkpoint}"
+    );
+    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 2);
+
+    let first_resumed_input = input.clone().with_approval_grant(ApprovalGrant::allow(
+        first_pending.pending_tool_call().request_id.clone(),
+        first_pending.pending_tool_call().tool_name.clone(),
+        first_pending.pending_tool_call().resources.clone(),
+    ));
+    let first_restored = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &first_checkpoint,
+    )
+    .expect("restore first checkpoint");
+    let second_blocked = agent_loop.resume_pending_approval(&first_resumed_input, &first_restored);
+    assert_eq!(
+        second_blocked.status,
+        AgentStatus::Blocked,
+        "result={second_blocked:?} raw={} last={}",
+        first_checkpoint["raw_arguments"],
+        first_checkpoint["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+    );
+    let second_pending = pending_approval(&second_blocked);
+    let second_checkpoint = second_pending
+        .encode_checkpoint()
+        .expect("second checkpoint");
+    assert_eq!(second_checkpoint["repair_attempts"], 2);
+    assert_eq!(second_checkpoint["repair_plan"]["plan"]["attempt"], 2);
+
+    let second_resumed_input = first_resumed_input.with_approval_grant(ApprovalGrant::allow(
+        second_pending.pending_tool_call().request_id.clone(),
+        second_pending.pending_tool_call().tool_name.clone(),
+        second_pending.pending_tool_call().resources.clone(),
+    ));
+    let second_restored = PendingApprovalOccurrence::from_checkpoint_payload(
+        second_pending.request().clone(),
+        &second_checkpoint,
+    )
+    .expect("restore second checkpoint");
+    let mut events = Vec::new();
+    let exhausted = agent_loop.resume_pending_approval_with_events(
+        &second_resumed_input,
+        &second_restored,
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
+
+    assert_eq!(
+        exhausted.status,
+        AgentStatus::Failed,
+        "result={exhausted:?}"
+    );
+    assert!(
+        exhausted
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("repair planning budget exhausted"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join(fixture_name)).unwrap(),
+        "v4"
+    );
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 14);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::RepairPlanning(repair))
+            if repair.reason == AgentRepairReason::VerificationFailed
+                && repair.attempt == 4
+                && matches!(repair.lifecycle, OccurrenceLifecycle::Finished {
+                    status: RepairPlanningStatus::Exhausted,
+                    ..
+                })
+    )));
 }
 
 #[test]

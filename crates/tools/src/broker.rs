@@ -334,6 +334,9 @@ pub struct ToolResult {
     #[serde(skip)]
     #[schemars(skip)]
     workspace_observation: Option<WorkspaceObservation>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    workspace_change_summary: Option<WorkspaceChangeSummary>,
 }
 
 impl ToolResult {
@@ -357,6 +360,7 @@ impl ToolResult {
             truncated: false,
             audit_metadata: None,
             workspace_observation: None,
+            workspace_change_summary: None,
         };
         result.context_token_count = Some(approximate_token_count(
             &result.to_message_payload().to_string(),
@@ -413,6 +417,17 @@ impl ToolResult {
     /// 返回只供 completion/checkpoint 使用的 workspace observation。
     pub fn workspace_observation(&self) -> Option<&WorkspaceObservation> {
         self.workspace_observation.as_ref()
+    }
+
+    /// Return the producer-owned summary of the bytes and paths changed by this mutation.
+    pub fn workspace_change_summary(&self) -> Option<&WorkspaceChangeSummary> {
+        self.workspace_change_summary.as_ref()
+    }
+
+    /// Bind a trusted mutation summary in tests and internal adapters.
+    pub fn with_workspace_change_summary(mut self, summary: WorkspaceChangeSummary) -> Self {
+        self.workspace_change_summary = Some(summary);
+        self
     }
 
     /// 绑定内部 workspace observation；该字段不会序列化到模型 payload。
@@ -472,6 +487,10 @@ impl ToolResult {
         tool_result.workspace_observation = result
             .metadata
             .get(WORKSPACE_OBSERVATION_METADATA)
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        tool_result.workspace_change_summary = result
+            .metadata
+            .get(WORKSPACE_CHANGE_SUMMARY_METADATA)
             .and_then(|value| serde_json::from_value(value.clone()).ok());
         tool_result
     }

@@ -325,6 +325,10 @@ impl CompletionTracker {
             .fold(0u32, u32::saturating_add)
     }
 
+    pub(super) fn terminal_command_scope_digests(&self) -> Vec<String> {
+        self.terminal_command_scope_digests.clone()
+    }
+
     pub(super) fn satisfied_command_count(&self) -> u32 {
         let terminal_counts = self.terminal_command_counts();
         self.required_command_counts
