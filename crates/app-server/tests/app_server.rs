@@ -7,9 +7,9 @@ use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
     WorkspaceRelativePath,
 };
+use singularity_protocol::ItemKind;
 #[cfg(windows)]
-use singularity_protocol::TraceMetricSampleKind;
-use singularity_protocol::{ConversationRole, ItemKind};
+use singularity_protocol::{ConversationRole, TraceMetricSampleKind};
 use singularity_sandbox::{
     CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend, SandboxBackendEnforcement,
     SandboxCapabilities, WorkspaceMutation,
