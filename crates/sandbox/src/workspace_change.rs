@@ -546,6 +546,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let workspace = tempfile::tempdir().expect("workspace");
+        let mut initial_permissions = std::fs::metadata(workspace.path())
+            .expect("initial root metadata")
+            .permissions();
+        initial_permissions.set_mode(0o755);
+        std::fs::set_permissions(workspace.path(), initial_permissions)
+            .expect("set initial root mode");
         let before = snapshot_workspace(workspace.path()).expect("before snapshot");
         let mut permissions = std::fs::metadata(workspace.path())
             .expect("root metadata")

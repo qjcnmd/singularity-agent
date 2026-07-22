@@ -3174,6 +3174,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
         "verification": [{
             "risk": "general_mutation",
             "evidence": "README.md changed by the approved edit",
+            "affected_path": "README.md",
             "affected_symbol": "README.md::document",
             "current_gap": "the edited document has not been verified",
             "action": {

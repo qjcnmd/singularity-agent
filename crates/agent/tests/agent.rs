@@ -6057,6 +6057,7 @@ impl AgentSemanticFixtureBackend {
             .join(format!("semantic_fixture{}", std::env::consts::EXE_SUFFIX));
         let compile = std::process::Command::new("rustc")
             .arg("--edition=2021")
+            .args(["--crate-name", "semantic_fixture"])
             .arg(&self.file_path)
             .arg("-o")
             .arg(&executable)
@@ -7524,10 +7525,10 @@ fn verified_completed_plan_enters_tool_free_finalization() {
 
 #[test]
 fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
-    let fixtures = [
+    let fixtures = vec![
         (
             AgentVerificationRisk::EmptyCollection,
-            "empty_collection.rs",
+            "empty collection.rs",
             "fn total(values: &[i64]) -> i64 { values.iter().sum() }\nfn main() { assert_eq!(total(&[1, 2]), 3); }\n",
             "fn total(values: &[i64]) -> Option<i64> { (!values.is_empty()).then(|| values.iter().sum()) }\nfn main() { let total: i64 = total(&[]); assert_eq!(total, 0); }\n",
             "fn total(values: &[i64]) -> i64 { values.iter().sum() }\nfn main() { let empty_total: i64 = total(&[]); assert_eq!(empty_total, 0); assert_eq!(total(&[1, 2]), 3); }\n",
@@ -7553,6 +7554,20 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
             "zero_index_division",
         ),
     ];
+    #[cfg(unix)]
+    let fixtures = {
+        let mut fixtures = fixtures;
+        fixtures.push((
+            AgentVerificationRisk::GeneralMutation,
+            " leading\ntrailing.rs ",
+            "fn main() { assert_eq!(2 + 2, 4); }\n",
+            "fn main() { assert_eq!(2 + 2, 5); }\n",
+            "fn main() { assert_eq!(2 + 2, 4); }\n",
+            "exact path binding",
+            "structured_path",
+        ));
+        fixtures
+    };
     for (
         risk,
         fixture_name,
@@ -7599,6 +7614,7 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
                 "verification": [{
                     "risk": risk,
                     "evidence": format!("changed {fixture_name}"),
+                    "affected_path": fixture_name,
                     "affected_symbol": format!("{fixture_name}::fixture_boundary"),
                     "current_gap": "verification evidence is not yet recorded",
                     "action": {
@@ -7646,6 +7662,7 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
                 "verification": [{
                     "risk": risk,
                     "evidence": format!("changed {fixture_name}"),
+                    "affected_path": fixture_name,
                     "affected_symbol": format!("{fixture_name}::fixture_boundary"),
                     "current_gap": "command_exit_nonzero was observed; rerun after repair",
                     "action": {
@@ -7778,6 +7795,18 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
         let requests = seen_requests.lock().expect("requests");
         assert_eq!(requests.len(), 8);
         assert!(requests[7].tools.is_empty());
+        if fixture_name.contains('\n') {
+            let planning_feedback = requests[2]
+                .messages
+                .iter()
+                .find(|message| {
+                    message.role == ModelRole::Developer
+                        && message.content.contains("trusted_change=")
+                })
+                .expect("structured mutation feedback");
+            assert!(!planning_feedback.content.contains(fixture_name));
+            assert!(planning_feedback.content.contains("\\n"));
+        }
     }
 }
 
@@ -7821,6 +7850,7 @@ fn final_review_repair_requires_mutation_replan_and_second_review() {
                 "verification": [{
                     "risk": "zero_value",
                     "evidence": format!("changed {fixture_name}"),
+                    "affected_path": fixture_name,
                     "affected_symbol": format!("{fixture_name}::value"),
                     "current_gap": gap,
                     "action": {
@@ -7976,6 +8006,7 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
                 "verification": [{
                     "risk": "general_mutation",
                     "evidence": format!("changed {fixture_name}"),
+                    "affected_path": fixture_name,
                     "affected_symbol": fixture_name,
                     "current_gap": "command_exit_nonzero was observed; rerun after repair",
                     "action": {

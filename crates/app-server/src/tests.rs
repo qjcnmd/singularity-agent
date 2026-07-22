@@ -1862,6 +1862,7 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
         "verification": [{
             "risk": "general_mutation",
             "evidence": ". changed by the workspace command",
+            "affected_path": ".",
             "affected_symbol": ".::workspace",
             "current_gap": "the changed workspace has not been verified",
             "action": {
@@ -2939,6 +2940,7 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
         "verification": [{
             "risk": "general_mutation",
             "evidence": "README.md changed by the approved edit",
+            "affected_path": "README.md",
             "affected_symbol": "README.md::document",
             "current_gap": "the edited document has not been verified",
             "action": {

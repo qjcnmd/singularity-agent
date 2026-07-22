@@ -252,6 +252,8 @@ pub struct AgentVerificationAction {
 pub struct AgentVerificationEntry {
     pub risk: AgentVerificationRisk,
     pub evidence: String,
+    /// Exact producer-owned relative path affected by this verification entry.
+    pub affected_path: String,
     pub affected_symbol: String,
     pub current_gap: String,
     pub action: AgentVerificationAction,
@@ -464,6 +466,7 @@ pub fn agent_control_tool_entries() -> Vec<ToolEntry> {
                                 "enum": ["general_mutation", "empty_collection", "optional_null", "zero_value", "index_boundary", "division_by_zero"]
                             },
                             "evidence": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
+                            "affected_path": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
                             "affected_symbol": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
                             "current_gap": {"type": "string", "minLength": 1, "maxLength": MAX_VERIFICATION_TEXT_CHARS},
                             "action": {
@@ -480,7 +483,7 @@ pub fn agent_control_tool_entries() -> Vec<ToolEntry> {
                             },
                             "required": {"type": "integer", "minimum": 1, "maximum": MAX_VERIFICATION_REQUIREMENTS}
                         },
-                        "required": ["risk", "evidence", "affected_symbol", "current_gap", "action", "required"],
+                        "required": ["risk", "evidence", "affected_path", "affected_symbol", "current_gap", "action", "required"],
                         "additionalProperties": false
                     }
                 }
@@ -1312,6 +1315,7 @@ impl AgentLoopState {
                         json!({
                             "risk": entry.risk,
                             "evidence": entry.evidence,
+                            "affected_path": entry.affected_path,
                             "affected_symbol": entry.affected_symbol,
                             "current_gap": entry.current_gap,
                             "required": entry.required,
@@ -4157,10 +4161,18 @@ where
                         .collect::<Vec<_>>()
                         .join(",")
                 };
-                state.messages.push(ModelMessage::text(ModelRole::Developer, format!(
-                        "A real workspace mutation requires a revision-bound verification entry in the same update_plan call before any command. changed_paths={} diff_digest={} prior_verification_failures={failure_hint}. Each entry must include affected_symbol using '<path>::<symbol>', evidence naming the changed path, a non-empty current_gap, and an exact action command/profile.",
-                        change.changed_paths.join(","), change.diff_digest
-                    )));
+                let trusted_change = serde_json::to_string(&json!({
+                    "changed_paths": change.changed_paths,
+                    "diff_digest": change.diff_digest,
+                    "prior_verification_failures": failure_hint,
+                }))
+                .unwrap_or_else(|_| "{}".to_string());
+                state.messages.push(ModelMessage::text(
+                    ModelRole::Developer,
+                    format!(
+                        "A real workspace mutation requires a revision-bound verification entry in the same update_plan call before any command. trusted_change={trusted_change}. Each entry must include affected_path exactly matching one changed_paths value, an affected_symbol, bounded evidence and current_gap, and an exact action command/profile."
+                    ),
+                ));
             }
             if failure.is_none() {
                 failure = non_repairable_error;
@@ -4365,26 +4377,13 @@ where
             if !risks.contains(&entry.risk) {
                 risks.push(entry.risk);
             }
-            let affected_path = entry
-                .affected_symbol
-                .split_once("::")
-                .map_or(entry.affected_symbol.as_str(), |(path, _)| path);
             if !change
                 .changed_paths
                 .iter()
-                .any(|path| path == affected_path)
-            {
-                return Err(format!(
-                    "verification affected symbol is not present in the observed mutation: {affected_path}"
-                ));
-            }
-            if !entry
-                .evidence
-                .split_whitespace()
-                .any(|token| change.changed_paths.iter().any(|path| token == path))
+                .any(|path| path == &entry.affected_path)
             {
                 return Err(
-                    "verification evidence must name a path changed by the current mutation"
+                    "verification affected path is not present in the observed mutation"
                         .to_string(),
                 );
             }
@@ -5361,6 +5360,7 @@ fn validate_verification_entry_shape(entry: &AgentVerificationEntry) -> Result<(
         return Err("verification entry text fields must not be empty".to_string());
     }
     if entry.evidence.chars().count() > MAX_VERIFICATION_TEXT_CHARS
+        || entry.affected_path.chars().count() > MAX_VERIFICATION_TEXT_CHARS
         || entry.affected_symbol.chars().count() > MAX_VERIFICATION_TEXT_CHARS
         || entry.current_gap.chars().count() > MAX_VERIFICATION_TEXT_CHARS
     {
@@ -5373,6 +5373,9 @@ fn validate_verification_entry_shape(entry: &AgentVerificationEntry) -> Result<(
         || contains_sensitive_text(&entry.current_gap)
     {
         return Err("verification entry contains sensitive text".to_string());
+    }
+    if !is_bounded_workspace_relative_path(&entry.affected_path) {
+        return Err("verification entry affected_path is not a bounded relative path".to_string());
     }
     if entry.action.command.trim().is_empty()
         || entry.action.command.chars().count() > MAX_VERIFICATION_COMMAND_CHARS
@@ -5824,6 +5827,7 @@ fn safe_plan_summary(plan: &AgentPlan) -> Value {
 fn safe_verification_entry_summary(entry: &AgentVerificationEntry) -> Value {
     json!({
         "risk": entry.risk,
+        "affected_path": entry.affected_path,
         "affected_symbol": entry.affected_symbol.chars().take(MAX_VERIFICATION_TEXT_CHARS).collect::<String>(),
         "required": entry.required,
         "action_scope_digest": command_script_scope_digest_with_policy(
@@ -5863,13 +5867,12 @@ fn verification_change_summary(
     let changed_paths = observed_paths;
     let mut normalized = BTreeSet::new();
     for path in changed_paths {
-        let path = path.trim();
-        if !is_bounded_workspace_relative_path(path) {
+        if !is_bounded_workspace_relative_path(&path) {
             return Err(
                 "workspace mutation changed path is outside the bounded relative scope".to_string(),
             );
         }
-        normalized.insert(path.to_string());
+        normalized.insert(path);
     }
     if normalized.is_empty() {
         return Err("workspace mutation did not provide a changed path summary".to_string());
@@ -5882,9 +5885,9 @@ fn verification_change_summary(
 }
 
 fn is_bounded_workspace_relative_path(path: &str) -> bool {
-    let path = path.trim();
     !path.is_empty()
         && path.chars().count() <= MAX_VERIFICATION_TEXT_CHARS
+        && !path.contains('\0')
         && !std::path::Path::new(path).is_absolute()
         && std::path::Path::new(path).components().all(|component| {
             matches!(

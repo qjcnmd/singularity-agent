@@ -196,6 +196,7 @@ fn resolve_command_cwd(workspace: &Path, cwd: Option<&str>) -> Result<PathBuf, S
 pub(super) fn command_succeeded(result: &CommandResult) -> bool {
     result.execution_status == CommandExecutionStatus::Completed
         && result.semantic_status == CommandSemanticStatus::Succeeded
+        && result.workspace_mutation != singularity_tools::WorkspaceMutation::Unknown
         && !result.sandbox.local_process_fallback
         && result.sandbox.enforcement != singularity_tools::SandboxBackendEnforcement::Unavailable
 }
@@ -345,6 +346,15 @@ mod tests {
         );
 
         assert!(command_succeeded(&result));
+    }
+
+    #[test]
+    fn successful_exit_with_unknown_workspace_mutation_fails_closed() {
+        let result = CommandResult::completed("unknown_mutation", "ok")
+            .with_workspace_mutation(WorkspaceMutation::Unknown)
+            .with_sandbox_execution("strict", SandboxBackendEnforcement::Strict);
+
+        assert!(!command_succeeded(&result));
     }
 
     #[test]
