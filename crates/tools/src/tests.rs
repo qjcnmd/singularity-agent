@@ -147,7 +147,7 @@ mod mutation_tests {
         let result =
             tools.atomic_write_with_hook(&path, "after", original_identity.as_deref(), |_| {
                 std::fs::remove_file(&target).expect("remove original");
-                std::fs::write(&target, "concurrent").expect("write concurrent target");
+                std::fs::write(&target, "after!").expect("write concurrent target");
             });
 
         assert!(matches!(
@@ -157,7 +157,7 @@ mod mutation_tests {
                 published_identity: None,
             })
         ));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "concurrent");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "after!");
         assert!(
             std::fs::read_dir(&workspace)
                 .expect("read workspace")

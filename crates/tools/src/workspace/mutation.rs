@@ -227,7 +227,7 @@ impl WorkspaceTools {
         let original_permissions = initial_target.map(|state| state.permissions);
         let (temporary_name, mut temporary_file) = create_unique_temp_file(parent.dir())
             .map_err(|error| map_capability_error(error, &path.display))?;
-        let temporary_identity = file_object_identity_key(&temporary_file)
+        let mut temporary_identity = file_object_identity_key(&temporary_file)
             .map_err(|error| map_capability_error(error, &path.display))?;
         let write_result = temporary_file.write_all(content.as_bytes()).and_then(|()| {
             if let Some(permissions) = original_permissions {
@@ -245,6 +245,8 @@ impl WorkspaceTools {
             )
             .into());
         }
+        temporary_identity = file_object_identity_key(&temporary_file)
+            .map_err(|error| map_capability_error(error, &path.display))?;
         before_rename(&temporary_name);
         let source_identity = open_file_from_parent(parent.dir(), &temporary_name)
             .and_then(|file| file_object_identity_key(&file))
@@ -284,8 +286,15 @@ impl WorkspaceTools {
             .into());
         }
         drop(temporary_file);
-        after_rename()
-            .map_err(|error| AtomicWriteFailure::published(error, temporary_identity.clone()))?;
+        if let Err(error) = after_rename() {
+            let published_identity = self
+                .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
+                .ok()
+                .flatten()
+                .map(|state| state.identity)
+                .unwrap_or_else(|| temporary_identity.clone());
+            return Err(AtomicWriteFailure::published(error, published_identity));
+        }
         let published_state = self
             .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
             .map_err(|error| {
@@ -300,7 +309,7 @@ impl WorkspaceTools {
                     temporary_identity.clone(),
                 )
             })?;
-        if published_state.identity != temporary_identity {
+        if published_state.object_identity != temporary_identity {
             return Err(AtomicWriteFailure::published(
                 WorkspaceToolError::ConcurrentMutation(path.display.clone()),
                 temporary_identity,
@@ -329,13 +338,15 @@ impl WorkspaceTools {
                 if is_protected_path(&actual) {
                     return Err(CapabilityAccessError::Protected(actual));
                 }
-                let identity = file_object_identity_key(&file)?;
+                let identity = file_target_identity_key(&file)?;
+                let object_identity = file_object_identity_key(&file)?;
                 let permissions = file
                     .metadata()
                     .map_err(CapabilityAccessError::Io)?
                     .permissions();
                 Ok(Some(AtomicTargetState {
                     identity,
+                    object_identity,
                     permissions,
                 }))
             }
@@ -489,6 +500,7 @@ impl From<WorkspaceToolError> for AtomicWriteFailure {
 
 struct AtomicTargetState {
     identity: String,
+    object_identity: String,
     permissions: CapabilityPermissions,
 }
 

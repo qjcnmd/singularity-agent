@@ -1123,7 +1123,7 @@ impl WorkspaceTools {
         else {
             return Ok((String::new(), None));
         };
-        let identity = file_object_identity_key(&file)
+        let identity = file_target_identity_key(&file)
             .map_err(|error| map_capability_error(error, &path.display))?;
         let mut content = String::new();
         file.read_to_string(&mut content).map_err(io_error)?;
@@ -1911,6 +1911,42 @@ fn file_object_identity_key(file: &CapabilityFile) -> Result<String, CapabilityA
         return Err(CapabilityAccessError::Unsupported);
     }
     Ok(format!("object:{:x}:{:x}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn file_target_identity_key(file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std()
+        .metadata()
+        .map_err(CapabilityAccessError::Io)?;
+    if metadata.dev() == 0 && metadata.ino() == 0 {
+        return Err(CapabilityAccessError::Unsupported);
+    }
+    // Linux may reuse an inode immediately after unlink/recreate. Use stable
+    // content-state fields rather than ctime, which can drift on WSL-mounted
+    // filesystems during an otherwise successful rename.
+    Ok(format!(
+        "target-state:{:x}:{:x}:{:x}:{:x}:{:x}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.len()
+    ))
+}
+
+#[cfg(windows)]
+fn file_target_identity_key(file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
+    file_object_identity_key(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_target_identity_key(file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
+    file_object_identity_key(file)
 }
 
 #[cfg(windows)]
