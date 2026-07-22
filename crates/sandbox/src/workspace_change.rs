@@ -455,11 +455,12 @@ mod tests {
         );
 
         std::fs::write(workspace.path().join("a\\b"), b"flat").expect("restore flat file");
+        let restored = snapshot_workspace(workspace.path()).expect("restored snapshot");
         std::fs::write(workspace.path().join("a").join("b"), b"changed")
             .expect("change nested file");
         let after_nested = snapshot_workspace(workspace.path()).expect("nested snapshot");
         assert_eq!(
-            before
+            restored
                 .change_summary(&after_nested)
                 .expect("nested summary")
                 .expect("nested changed")
