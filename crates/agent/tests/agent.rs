@@ -8107,6 +8107,16 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
         missing_change.expect_err("planned mutation must retain its change summary"),
         "approval checkpoint workspace change summary is missing"
     );
+    let mut unbound_plan = first_checkpoint.clone();
+    unbound_plan["verification_plan"]["revision"] = serde_json::Value::Null;
+    let unbound_plan = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &unbound_plan,
+    );
+    assert_eq!(
+        unbound_plan.expect_err("mutated checkpoint plan must remain revision bound"),
+        "approval checkpoint verification plan revision binding is missing"
+    );
     let mut parent_path = first_checkpoint.clone();
     parent_path["verification_change"]["changed_paths"] = serde_json::json!(["../outside"]);
     let parent_path = PendingApprovalOccurrence::from_checkpoint_payload(
@@ -8116,6 +8126,27 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     assert_eq!(
         parent_path.expect_err("parent path must fail closed"),
         "approval checkpoint verification change summary is invalid"
+    );
+    let mut rebound_path = first_checkpoint.clone();
+    rebound_path["verification_change"]["changed_paths"] = serde_json::json!(["different.txt"]);
+    let rebound_path = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &rebound_path,
+    );
+    assert_eq!(
+        rebound_path.expect_err("valid-looking path cannot replace producer evidence"),
+        "approval checkpoint verification change summary is not bound to its tool occurrence"
+    );
+    let mut rebound_digest = first_checkpoint.clone();
+    rebound_digest["verification_change"]["diff_digest"] =
+        serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+    let rebound_digest = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &rebound_digest,
+    );
+    assert_eq!(
+        rebound_digest.expect_err("valid-looking digest cannot replace producer evidence"),
+        "approval checkpoint verification change summary is not bound to its tool occurrence"
     );
     let mut reset_ledger = first_checkpoint.clone();
     reset_ledger["repair_attempts"] = serde_json::json!(0);
@@ -8127,6 +8158,18 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     assert_eq!(
         reset.expect_err("repair attempt ledger cannot be reset"),
         "approval checkpoint repair attempt metrics are inconsistent"
+    );
+    let mut coordinated_reset = first_checkpoint.clone();
+    coordinated_reset["repair_attempts"] = serde_json::json!(0);
+    coordinated_reset["recovery_metrics"]["repair_attempt_count"] = serde_json::json!(0);
+    coordinated_reset["repair_plan"] = serde_json::Value::Null;
+    let coordinated_reset = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &coordinated_reset,
+    );
+    assert_eq!(
+        coordinated_reset.expect_err("observed failures prevent a coordinated ledger reset"),
+        "approval checkpoint repair attempt ledger is below observed failures"
     );
 
     let first_resumed_input = input.clone().with_approval_grant(ApprovalGrant::allow(

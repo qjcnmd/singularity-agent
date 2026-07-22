@@ -399,14 +399,50 @@ impl ApprovalCheckpoint {
         {
             return Err("approval checkpoint verification change summary is invalid".to_string());
         }
-        if self.completion.workspace_mutated()
-            && self
-                .verification_plan
-                .as_ref()
-                .is_some_and(|plan| plan.revision.is_some())
-            && self.verification_change.is_none()
-        {
+        if self.completion.workspace_mutated() && self.verification_change.is_none() {
             return Err("approval checkpoint workspace change summary is missing".to_string());
+        }
+        if self.completion.workspace_mutated() {
+            let producer = self
+                .tool_result_occurrences
+                .iter()
+                .rev()
+                .find(|occurrence| {
+                    occurrence
+                        .result()
+                        .workspace_observation()
+                        .is_some_and(|observation| {
+                            observation.mutation() == singularity_tools::WorkspaceMutation::Changed
+                        })
+                })
+                .and_then(|occurrence| {
+                    let result = occurrence.result();
+                    Some((
+                        result.workspace_observation()?.revision()?,
+                        result.workspace_change_summary()?,
+                    ))
+                })
+                .ok_or_else(|| {
+                    "approval checkpoint mutation evidence is missing from its tool occurrence"
+                        .to_string()
+                })?;
+            let producer_paths = producer
+                .1
+                .changed_files
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let change = self.verification_change.as_ref().expect("checked above");
+            if producer.0 != change.revision
+                || producer.1.diff_digest != change.diff_digest
+                || producer_paths.len() != producer.1.changed_files.len()
+                || producer_paths.into_iter().collect::<Vec<_>>() != change.changed_paths
+            {
+                return Err(
+                    "approval checkpoint verification change summary is not bound to its tool occurrence"
+                        .to_string(),
+                );
+            }
         }
         if let Some(plan) = &self.verification_plan {
             plan.plan.validate().map_err(|error| {
@@ -417,6 +453,11 @@ impl ApprovalCheckpoint {
             {
                 return Err(
                     "approval checkpoint verification plan revision binding is invalid".to_string(),
+                );
+            }
+            if self.completion.workspace_mutated() && plan.revision.is_none() {
+                return Err(
+                    "approval checkpoint verification plan revision binding is missing".to_string(),
                 );
             }
         }
@@ -449,6 +490,21 @@ impl ApprovalCheckpoint {
         }
         if self.repair_attempts != self.recovery_metrics.repair_attempt_count {
             return Err("approval checkpoint repair attempt metrics are inconsistent".to_string());
+        }
+        let observed_failed_repairs = u32::try_from(
+            self.tool_result_occurrences
+                .iter()
+                .filter(|occurrence| {
+                    let result = occurrence.result();
+                    !result.ok && super::is_repairable_tool_result(result)
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        if self.repair_attempts < observed_failed_repairs {
+            return Err(
+                "approval checkpoint repair attempt ledger is below observed failures".to_string(),
+            );
         }
         if self
             .repair_plan

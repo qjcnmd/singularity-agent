@@ -245,8 +245,7 @@ fn reconcile_workspace_change(
     match (observation, snapshot_change) {
         (None, Some(Ok(None))) => (WorkspaceMutation::Unchanged, None),
         (None, Some(Ok(Some(summary)))) => (WorkspaceMutation::Changed, Some(summary)),
-        (Some(WorkspaceChangeObservation::Unchanged), Some(Ok(None)))
-        | (Some(WorkspaceChangeObservation::Changed), Some(Ok(None))) => {
+        (Some(WorkspaceChangeObservation::Unchanged), Some(Ok(None))) => {
             (WorkspaceMutation::Unchanged, None)
         }
         (Some(WorkspaceChangeObservation::Changed), Some(Ok(Some(summary)))) => {

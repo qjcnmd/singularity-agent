@@ -6409,6 +6409,7 @@ mod context_accounting_tests {
             context_token_count: result.context_token_count(),
             audit_metadata: result.audit_metadata().cloned(),
             workspace_observation: result.workspace_observation().cloned(),
+            workspace_change_summary: result.workspace_change_summary().cloned(),
         };
         legacy.context_token_count = None;
         let restored = ToolResultOccurrence::from_wire(legacy, ToolResultVisibility::Visible)
@@ -6422,6 +6423,7 @@ mod context_accounting_tests {
             context_token_count: result.context_token_count(),
             audit_metadata: result.audit_metadata().cloned(),
             workspace_observation: result.workspace_observation().cloned(),
+            workspace_change_summary: result.workspace_change_summary().cloned(),
         };
         inconsistent.context_token_count = Some(expected.saturating_add(1));
         assert!(
@@ -6439,6 +6441,7 @@ mod context_accounting_tests {
             context_token_count: large.context_token_count(),
             audit_metadata: large.audit_metadata().cloned(),
             workspace_observation: large.workspace_observation().cloned(),
+            workspace_change_summary: large.workspace_change_summary().cloned(),
         };
         untrusted_legacy.context_token_count = None;
         assert!(

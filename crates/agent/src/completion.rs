@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use singularity_tools::{
-    ToolFailureKind, ToolResult, WorkspaceMutation, WorkspaceObservation, WorkspaceRevision,
+    ToolFailureKind, ToolResult, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceObservation,
+    WorkspaceRevision,
 };
 
 use super::{
@@ -415,6 +416,8 @@ pub(super) struct ToolResultOccurrenceWire {
     pub(super) audit_metadata: Option<Value>,
     #[serde(default)]
     pub(super) workspace_observation: Option<WorkspaceObservation>,
+    #[serde(default)]
+    pub(super) workspace_change_summary: Option<WorkspaceChangeSummary>,
 }
 
 impl Serialize for ToolResultOccurrence {
@@ -429,6 +432,7 @@ impl Serialize for ToolResultOccurrence {
             context_token_count: self.result.context_token_count(),
             audit_metadata: self.result.audit_metadata().cloned(),
             workspace_observation: self.result.workspace_observation().cloned(),
+            workspace_change_summary: self.result.workspace_change_summary().cloned(),
         }
         .serialize(serializer)
     }
@@ -479,6 +483,7 @@ impl ToolResultOccurrence {
             wire.context_token_count,
             wire.audit_metadata,
             wire.workspace_observation,
+            wire.workspace_change_summary,
         )
     }
 
@@ -489,6 +494,7 @@ impl ToolResultOccurrence {
         context_token_count: Option<u32>,
         audit_metadata: Option<Value>,
         workspace_observation: Option<WorkspaceObservation>,
+        workspace_change_summary: Option<WorkspaceChangeSummary>,
     ) -> Result<Self, String> {
         result.result_id = result_id;
         if result.failure_kind == Some(ToolFailureKind::Approval)
@@ -537,6 +543,9 @@ impl ToolResultOccurrence {
         }
         if let Some(observation) = workspace_observation {
             result = result.with_workspace_observation(observation);
+        }
+        if let Some(summary) = workspace_change_summary {
+            result = result.with_workspace_change_summary(summary);
         }
         let occurrence = Self { result, visibility };
         occurrence.validate()?;

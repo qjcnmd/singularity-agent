@@ -1238,6 +1238,89 @@ time.sleep(30)
     }
 
     #[test]
+    fn linux_workspace_change_distinguishes_backslash_from_separator() {
+        let backend = strict_backend();
+
+        let flat_workspace = tempfile::tempdir().expect("flat workspace");
+        fs::write(flat_workspace.path().join("a\\b"), "flat").expect("flat file");
+        fs::create_dir(flat_workspace.path().join("a")).expect("nested directory");
+        fs::write(flat_workspace.path().join("a").join("b"), "nested").expect("nested file");
+        let flat = backend.execute(&request(
+            "linux_backslash_name",
+            &["/bin/sh", "-c", "printf changed > 'a\\b'"],
+            flat_workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+        assert_eq!(flat.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            flat.workspace_change_summary
+                .expect("flat summary")
+                .changed_files,
+            ["a\\b"]
+        );
+
+        let nested_workspace = tempfile::tempdir().expect("nested workspace");
+        fs::write(nested_workspace.path().join("a\\b"), "flat").expect("flat file");
+        fs::create_dir(nested_workspace.path().join("a")).expect("nested directory");
+        fs::write(nested_workspace.path().join("a").join("b"), "nested").expect("nested file");
+        let nested = backend.execute(&request(
+            "linux_nested_name",
+            &["/bin/sh", "-c", "printf changed > a/b"],
+            nested_workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+        assert_eq!(nested.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            nested
+                .workspace_change_summary
+                .expect("nested summary")
+                .changed_files,
+            ["a/b"]
+        );
+    }
+
+    #[test]
+    fn linux_workspace_change_observes_file_and_directory_permissions() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("script.sh"), "#!/bin/sh\n").expect("script");
+        fs::create_dir(workspace.path().join("data")).expect("data directory");
+        let backend = strict_backend();
+
+        let file = backend.execute(&request(
+            "linux_chmod_file",
+            &["/bin/chmod", "755", "script.sh"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+        assert_eq!(file.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            file.workspace_change_summary
+                .expect("file permission summary")
+                .changed_files,
+            ["script.sh"]
+        );
+
+        let directory = backend.execute(&request(
+            "linux_chmod_directory",
+            &["/bin/chmod", "700", "data"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+        assert_eq!(directory.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            directory
+                .workspace_change_summary
+                .expect("directory permission summary")
+                .changed_files,
+            ["data"]
+        );
+    }
+
+    #[test]
     fn linux_external_hardlink_is_rejected_before_execution() {
         let workspace = tempfile::tempdir().expect("workspace");
         let outside = tempfile::tempdir().expect("outside");

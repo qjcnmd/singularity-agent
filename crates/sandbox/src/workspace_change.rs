@@ -1,9 +1,15 @@
 //! Trusted, bounded workspace snapshots used to bind mutating commands to verification.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
+
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
 
 #[cfg(windows)]
 use cap_fs_ext::DirEntryExt as _;
@@ -17,26 +23,32 @@ use singularity_core::is_protected_path;
 use super::WorkspaceChangeSummary;
 
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
+const MAX_SNAPSHOT_DEPTH: usize = 256;
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CHANGED_FILES: usize = 64;
 const MAX_CHANGED_PATH_CHARS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 enum SnapshotEntry {
-    Directory,
+    Directory {
+        metadata: EntryMetadata,
+    },
     File {
-        metadata: FileMetadata,
+        metadata: EntryMetadata,
         content_digest: String,
     },
     Symlink {
+        metadata: EntryMetadata,
         target_digest: String,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct FileMetadata {
+struct EntryMetadata {
+    object_kind: u8,
     length: u64,
     readonly: bool,
+    platform_permissions: u64,
     modified_seconds: u64,
     modified_nanos: u32,
     device: u64,
@@ -47,7 +59,9 @@ struct FileMetadata {
 /// A capability-relative snapshot that contains only bounded metadata and content digests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WorkspaceSnapshot {
+    root: EntryMetadata,
     entries: BTreeMap<String, SnapshotEntry>,
+    protected_entries: BTreeMap<String, EntryMetadata>,
 }
 
 impl WorkspaceSnapshot {
@@ -56,7 +70,15 @@ impl WorkspaceSnapshot {
         &self,
         after: &Self,
     ) -> Result<Option<WorkspaceChangeSummary>, String> {
-        let changed_files = self
+        if (self.root.device, self.root.inode) != (after.root.device, after.root.inode) {
+            return Err("workspace root identity changed between trusted observations".to_string());
+        }
+        if self.protected_entries != after.protected_entries {
+            return Err(
+                "protected workspace state changed between trusted observations".to_string(),
+            );
+        }
+        let mut changed_files = self
             .entries
             .keys()
             .chain(after.entries.keys())
@@ -65,6 +87,9 @@ impl WorkspaceSnapshot {
             .filter(|path| self.entries.get(*path) != after.entries.get(*path))
             .cloned()
             .collect::<Vec<_>>();
+        if self.root != after.root {
+            changed_files.push(".".to_string());
+        }
         if changed_files.is_empty() {
             return Ok(None);
         }
@@ -79,7 +104,7 @@ impl WorkspaceSnapshot {
             .iter()
             .map(|path| (path, self.entries.get(path), after.entries.get(path)))
             .collect::<Vec<_>>();
-        let encoded = serde_json::to_vec(&changed_entries)
+        let encoded = serde_json::to_vec(&(self.root.clone(), after.root.clone(), changed_entries))
             .map_err(|error| format!("workspace change summary encoding failed: {error}"))?;
         Ok(Some(WorkspaceChangeSummary::new(
             changed_files,
@@ -92,36 +117,63 @@ impl WorkspaceSnapshot {
 pub(super) fn snapshot_workspace(workspace: &Path) -> Result<WorkspaceSnapshot, String> {
     let root = Dir::open_ambient_dir(workspace, ambient_authority())
         .map_err(|error| format!("workspace change snapshot is unavailable: {error}"))?;
+    let root_before = root
+        .dir_metadata()
+        .and_then(|metadata| entry_metadata(&metadata))
+        .map_err(|error| format!("workspace root metadata failed: {error}"))?;
     let mut state = SnapshotState {
         entries: BTreeMap::new(),
+        protected_entries: BTreeMap::new(),
+        visited_entries: 0,
         total_file_bytes: 0,
     };
-    visit_directory(&root, Path::new(""), &mut state)?;
+    visit_directory(&root, Path::new(""), 0, &mut state)?;
+    let root_after = root
+        .dir_metadata()
+        .and_then(|metadata| entry_metadata(&metadata))
+        .map_err(|error| format!("workspace root revalidation failed: {error}"))?;
+    if root_before != root_after {
+        return Err("workspace changed while its root snapshot was being captured".to_string());
+    }
     Ok(WorkspaceSnapshot {
+        root: root_before,
         entries: state.entries,
+        protected_entries: state.protected_entries,
     })
 }
 
 struct SnapshotState {
     entries: BTreeMap<String, SnapshotEntry>,
+    protected_entries: BTreeMap<String, EntryMetadata>,
+    visited_entries: usize,
     total_file_bytes: u64,
 }
 
 fn visit_directory(
     directory: &Dir,
     relative_parent: &Path,
+    depth: usize,
     state: &mut SnapshotState,
 ) -> Result<(), String> {
+    if depth > MAX_SNAPSHOT_DEPTH {
+        return Err("workspace change snapshot exceeds the depth bound".to_string());
+    }
     let mut entries = directory
         .entries()
         .map_err(|error| format!("workspace change snapshot enumeration failed: {error}"))?
+        .map(|entry| {
+            state.visited_entries = state.visited_entries.saturating_add(1);
+            if state.visited_entries > MAX_SNAPSHOT_ENTRIES {
+                return Err(std::io::Error::other(
+                    "workspace change snapshot exceeds the entry bound",
+                ));
+            }
+            entry
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("workspace change snapshot enumeration failed: {error}"))?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        if state.entries.len() >= MAX_SNAPSHOT_ENTRIES {
-            return Err("workspace change snapshot exceeds the entry bound".to_string());
-        }
         let name = entry.file_name();
         let name_text = name
             .to_str()
@@ -129,6 +181,11 @@ fn visit_directory(
         let relative = relative_parent.join(&name);
         let relative_text = workspace_relative_path(&relative)?;
         if is_protected_path(name_text) || is_protected_path(&relative_text) {
+            let metadata = directory
+                .symlink_metadata(&name)
+                .and_then(|metadata| entry_metadata(&metadata))
+                .map_err(|error| format!("workspace protected-path metadata failed: {error}"))?;
+            state.protected_entries.insert(relative_text, metadata);
             continue;
         }
         let file_type = entry
@@ -149,10 +206,29 @@ fn visit_directory(
             let child = directory
                 .open_dir_nofollow(&name)
                 .map_err(|error| format!("workspace change directory open failed: {error}"))?;
+            let before = child
+                .dir_metadata()
+                .and_then(|metadata| entry_metadata(&metadata))
+                .map_err(|error| format!("workspace change directory metadata failed: {error}"))?;
+            visit_directory(&child, &relative, depth + 1, state)?;
+            let after = child
+                .dir_metadata()
+                .and_then(|metadata| entry_metadata(&metadata))
+                .map_err(|error| {
+                    format!("workspace change directory revalidation failed: {error}")
+                })?;
+            let path_after = directory
+                .symlink_metadata(&name)
+                .and_then(|metadata| entry_metadata(&metadata))
+                .map_err(|error| format!("workspace change path revalidation failed: {error}"))?;
+            if before != after || before != path_after {
+                return Err(
+                    "workspace changed while its directory snapshot was being captured".to_string(),
+                );
+            }
             state
                 .entries
-                .insert(relative_text.clone(), SnapshotEntry::Directory);
-            visit_directory(&child, &relative, state)?;
+                .insert(relative_text, SnapshotEntry::Directory { metadata: before });
             continue;
         } else if file_type.is_file() {
             snapshot_file(directory, Path::new(&name), state)?
@@ -167,6 +243,10 @@ fn visit_directory(
 }
 
 fn snapshot_symlink(directory: &Dir, name: &Path) -> Result<SnapshotEntry, String> {
+    let metadata_before = directory
+        .symlink_metadata(name)
+        .and_then(|metadata| entry_metadata(&metadata))
+        .map_err(|error| format!("workspace change link metadata failed: {error}"))?;
     let first = directory
         .read_link(name)
         .map_err(|error| format!("workspace change link read failed: {error}"))?;
@@ -176,11 +256,16 @@ fn snapshot_symlink(directory: &Dir, name: &Path) -> Result<SnapshotEntry, Strin
     if first != second {
         return Err("workspace changed while its link snapshot was being captured".to_string());
     }
+    let metadata_after = directory
+        .symlink_metadata(name)
+        .and_then(|metadata| entry_metadata(&metadata))
+        .map_err(|error| format!("workspace change link revalidation failed: {error}"))?;
+    if metadata_before != metadata_after {
+        return Err("workspace changed while its link snapshot was being captured".to_string());
+    }
     Ok(SnapshotEntry::Symlink {
-        target_digest: format!(
-            "sha256:{:x}",
-            Sha256::digest(first.as_os_str().to_string_lossy().as_bytes())
-        ),
+        metadata: metadata_before,
+        target_digest: hash_os_str(first.as_os_str()),
     })
 }
 
@@ -196,7 +281,7 @@ fn snapshot_file(
         .map_err(|error| format!("workspace change file open failed: {error}"))?;
     let before = file
         .metadata()
-        .and_then(|metadata| file_metadata(&metadata))
+        .and_then(|metadata| entry_metadata(&metadata))
         .map_err(|error| format!("workspace change file metadata failed: {error}"))?;
     state.total_file_bytes = state
         .total_file_bytes
@@ -218,11 +303,11 @@ fn snapshot_file(
     }
     let after = file
         .metadata()
-        .and_then(|metadata| file_metadata(&metadata))
+        .and_then(|metadata| entry_metadata(&metadata))
         .map_err(|error| format!("workspace change file revalidation failed: {error}"))?;
     let path_after = directory
         .symlink_metadata(name)
-        .and_then(|metadata| file_metadata(&metadata))
+        .and_then(|metadata| entry_metadata(&metadata))
         .map_err(|error| format!("workspace change path revalidation failed: {error}"))?;
     if before != after || before != path_after {
         return Err("workspace changed while its file snapshot was being captured".to_string());
@@ -233,19 +318,26 @@ fn snapshot_file(
     })
 }
 
-fn file_metadata(metadata: &Metadata) -> std::io::Result<FileMetadata> {
-    if !metadata.is_file() || metadata.is_symlink() {
-        return Err(std::io::Error::other(
-            "workspace snapshot object changed type",
-        ));
-    }
+fn entry_metadata(metadata: &Metadata) -> std::io::Result<EntryMetadata> {
     let modified = metadata.modified()?.into_std();
     let modified = modified
         .duration_since(UNIX_EPOCH)
         .map_err(|_| std::io::Error::other("workspace file timestamp predates the epoch"))?;
-    Ok(FileMetadata {
+    Ok(EntryMetadata {
+        object_kind: if metadata.is_symlink() {
+            3
+        } else if metadata.is_dir() {
+            2
+        } else if metadata.is_file() {
+            1
+        } else {
+            return Err(std::io::Error::other(
+                "workspace snapshot found an unsupported object type",
+            ));
+        },
         length: metadata.len(),
         readonly: metadata.permissions().readonly(),
+        platform_permissions: platform_permissions(metadata),
         modified_seconds: modified.as_secs(),
         modified_nanos: modified.subsec_nanos(),
         device: metadata.dev(),
@@ -258,7 +350,34 @@ fn workspace_relative_path(path: &Path) -> Result<String, String> {
     let text = path
         .to_str()
         .ok_or_else(|| "workspace change snapshot contains a non-Unicode path".to_string())?;
-    Ok(text.replace('\\', "/"))
+    #[cfg(windows)]
+    return Ok(text.replace('\\', "/"));
+    #[cfg(not(windows))]
+    Ok(text.to_string())
+}
+
+#[cfg(unix)]
+fn platform_permissions(metadata: &Metadata) -> u64 {
+    u64::from(cap_std::fs::PermissionsExt::mode(&metadata.permissions()))
+}
+
+#[cfg(windows)]
+fn platform_permissions(metadata: &Metadata) -> u64 {
+    u64::from(cap_std::fs::MetadataExt::file_attributes(metadata))
+}
+
+#[cfg(unix)]
+fn hash_os_str(value: &OsStr) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
+#[cfg(windows)]
+fn hash_os_str(value: &OsStr) -> String {
+    let mut hasher = Sha256::new();
+    for unit in value.encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -300,5 +419,117 @@ mod tests {
         let after = snapshot_workspace(workspace.path()).expect("after snapshot");
 
         assert_eq!(before.change_summary(&after).expect("summary"), None);
+    }
+
+    #[test]
+    fn protected_path_creation_fails_closed_without_exposing_its_name() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        std::fs::write(workspace.path().join(".env"), b"opaque").expect("protected file");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+
+        assert_eq!(
+            before.change_summary(&after).expect_err("must fail closed"),
+            "protected workspace state changed between trusted observations"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_backslash_component_does_not_collide_with_path_separator() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("a\\b"), b"flat").expect("flat file");
+        std::fs::create_dir(workspace.path().join("a")).expect("nested directory");
+        std::fs::write(workspace.path().join("a").join("b"), b"nested").expect("nested file");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+
+        std::fs::write(workspace.path().join("a\\b"), b"changed").expect("change flat file");
+        let after_flat = snapshot_workspace(workspace.path()).expect("flat snapshot");
+        assert_eq!(
+            before
+                .change_summary(&after_flat)
+                .expect("flat summary")
+                .expect("flat changed")
+                .changed_files,
+            ["a\\b"]
+        );
+
+        std::fs::write(workspace.path().join("a\\b"), b"flat").expect("restore flat file");
+        std::fs::write(workspace.path().join("a").join("b"), b"changed")
+            .expect("change nested file");
+        let after_nested = snapshot_workspace(workspace.path()).expect("nested snapshot");
+        assert_eq!(
+            before
+                .change_summary(&after_nested)
+                .expect("nested summary")
+                .expect("nested changed")
+                .changed_files,
+            ["a/b"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_symlink_digest_preserves_non_unicode_target_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let link = workspace.path().join("link");
+        symlink(OsString::from_vec(vec![0xff]), &link).expect("first link");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        std::fs::remove_file(&link).expect("remove first link");
+        symlink(OsString::from_vec(vec![0xfe]), &link).expect("second link");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+
+        assert!(
+            before
+                .change_summary(&after)
+                .expect("summary")
+                .expect("target changed")
+                .changed_files
+                .contains(&"link".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_directory_identity_and_permissions_are_observed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first = workspace.path().join("first");
+        let second = workspace.path().join("second");
+        std::fs::create_dir(&first).expect("first directory");
+        std::fs::create_dir(&second).expect("second directory");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        let temporary = workspace.path().join("temporary");
+        std::fs::rename(&first, &temporary).expect("move first");
+        std::fs::rename(&second, &first).expect("move second");
+        std::fs::rename(&temporary, &second).expect("move temporary");
+        let swapped = snapshot_workspace(workspace.path()).expect("swapped snapshot");
+        let swapped_paths = before
+            .change_summary(&swapped)
+            .expect("swapped summary")
+            .expect("identity changed")
+            .changed_files;
+        assert!(swapped_paths.contains(&"first".to_string()));
+        assert!(swapped_paths.contains(&"second".to_string()));
+
+        let mut permissions = std::fs::metadata(&first)
+            .expect("directory metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&first, permissions).expect("chmod directory");
+        let chmod = snapshot_workspace(workspace.path()).expect("chmod snapshot");
+        assert!(
+            swapped
+                .change_summary(&chmod)
+                .expect("chmod summary")
+                .expect("permissions changed")
+                .changed_files
+                .contains(&"first".to_string())
+        );
     }
 }
