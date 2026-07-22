@@ -2164,6 +2164,7 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
     )
     .for_operation(PermissionOperation::Read)
     .for_resource(workspace_resource("README.md"));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let mut events = Vec::new();
     let result = agent_loop_with_capabilities(
         vec![
@@ -2172,7 +2173,7 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
             ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done"),
         ],
         allow_read_policy().with_rule(ask_readme),
-        Arc::new(Mutex::new(Vec::new())),
+        Arc::clone(&seen_requests),
         ProviderProtocolContract {
             supports_parallel_tool_calls: true,
             ..ProviderProtocolContract::default()
@@ -2197,6 +2198,42 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
     assert_eq!(
         result.tool_results[1].failure_kind,
         Some(singularity_tools::ToolFailureKind::Input)
+    );
+    let sibling_payload = result.tool_results[0].to_message_payload();
+    assert_eq!(sibling_payload["content"]["batch_executed"], false);
+    assert_eq!(sibling_payload["content"]["call_executed"], false);
+    assert_eq!(
+        sibling_payload["content"]["execution_mode"],
+        "parallel_read"
+    );
+    assert_eq!(sibling_payload["content"]["trigger_tool_name"], "read");
+    assert_eq!(
+        sibling_payload["content"]["trigger_error_code"],
+        "invalid_tool_arguments"
+    );
+    assert_eq!(
+        sibling_payload["content"]["trigger_category"],
+        "preflight_failure"
+    );
+    assert!(
+        sibling_payload["content"]["required_next_action"]
+            .as_str()
+            .is_some_and(|value| value.contains("submit") && value.contains("alone"))
+    );
+    let rejected_payload = result.tool_results[1].to_message_payload();
+    assert_eq!(rejected_payload["content"]["batch_executed"], false);
+    assert_eq!(rejected_payload["content"]["call_executed"], false);
+    assert_eq!(
+        rejected_payload["content"]["safety_category"],
+        "preflight_failure"
+    );
+    assert_eq!(
+        rejected_payload["content"]["call_preflight_status"],
+        "rejected"
+    );
+    assert_eq!(
+        rejected_payload["content"]["validation_code"],
+        "read_input_schema_mismatch"
     );
     assert!(
         !result.tool_results[0]
@@ -2225,6 +2262,21 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
         })
         .count();
     assert_eq!(batch_rejections, 2);
+    let requests = seen_requests.lock().expect("seen requests");
+    let tool_messages = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::Tool)
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 2);
+    assert_eq!(tool_messages[0].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(tool_messages[1].tool_call_id.as_deref(), Some("call_2"));
+    for message in tool_messages {
+        let payload: serde_json::Value =
+            serde_json::from_str(&message.content).expect("batch rejection payload");
+        assert_eq!(payload["content"]["batch_executed"], false);
+        assert_eq!(payload["content"]["call_executed"], false);
+    }
 }
 
 #[test]
@@ -2282,6 +2334,29 @@ fn agent_loop_rejects_a_mutating_batch_without_partial_write() {
     assert_eq!(
         result.tool_results[1].error_code.as_deref(),
         Some("tool_batch_rejected")
+    );
+    let mutation_payload = result.tool_results[0].to_message_payload();
+    assert_eq!(mutation_payload["content"]["batch_executed"], false);
+    assert_eq!(mutation_payload["content"]["call_executed"], false);
+    assert_eq!(mutation_payload["content"]["execution_mode"], "exclusive");
+    assert_eq!(mutation_payload["content"]["trigger_tool_name"], "edit");
+    assert_eq!(
+        mutation_payload["content"]["trigger_error_code"],
+        "exclusive_tool_requires_single_call"
+    );
+    assert_eq!(mutation_payload["content"]["trigger_category"], "exclusive");
+    let sibling_payload = result.tool_results[1].to_message_payload();
+    assert_eq!(sibling_payload["content"]["batch_executed"], false);
+    assert_eq!(sibling_payload["content"]["call_executed"], false);
+    assert_eq!(
+        sibling_payload["content"]["execution_mode"],
+        "parallel_read"
+    );
+    assert_eq!(sibling_payload["content"]["trigger_tool_name"], "edit");
+    assert!(
+        sibling_payload["content"]["required_next_action"]
+            .as_str()
+            .is_some_and(|value| value.contains("wait for its result"))
     );
 }
 
@@ -2341,6 +2416,24 @@ fn agent_loop_does_not_create_partial_approval_for_a_batch() {
     assert_eq!(
         result.tool_results[1].error_code.as_deref(),
         Some("tool_batch_rejected")
+    );
+    let approval_payload = result.tool_results[0].to_message_payload();
+    assert_eq!(approval_payload["content"]["batch_executed"], false);
+    assert_eq!(approval_payload["content"]["call_executed"], false);
+    assert_eq!(
+        approval_payload["content"]["execution_mode"],
+        "parallel_read"
+    );
+    assert_eq!(
+        approval_payload["content"]["trigger_error_code"],
+        "approval_required"
+    );
+    let sibling_payload = result.tool_results[1].to_message_payload();
+    assert_eq!(sibling_payload["content"]["batch_executed"], false);
+    assert_eq!(sibling_payload["content"]["call_executed"], false);
+    assert_eq!(
+        sibling_payload["content"]["trigger_category"],
+        "approval_sensitive"
     );
 }
 

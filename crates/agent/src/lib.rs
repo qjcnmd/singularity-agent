@@ -1032,6 +1032,121 @@ struct PreparedToolCall {
     rejection: Option<ToolResult>,
 }
 
+/// 描述导致多调用批次整批拒绝的首个安全边界，不携带原始参数。
+struct BatchRejectionTrigger {
+    tool_name: String,
+    error_code: String,
+    execution_mode: Option<ToolExecutionMode>,
+    category: &'static str,
+    reason: &'static str,
+}
+
+fn batch_rejection_trigger(prepared: &[PreparedToolCall]) -> Option<BatchRejectionTrigger> {
+    prepared
+        .iter()
+        .find_map(|call| {
+            call.rejection.as_ref().map(|result| BatchRejectionTrigger {
+                tool_name: call.call.tool_name.clone(),
+                error_code: result
+                    .error_code
+                    .clone()
+                    .unwrap_or_else(|| "tool_preflight_rejected".to_string()),
+                execution_mode: call.bound.as_ref().map(|bound| bound.execution_mode),
+                category: "preflight_failure",
+                reason: "the batch contains a call rejected during preflight validation",
+            })
+        })
+        .or_else(|| {
+            prepared.iter().find_map(|call| {
+                matches!(call.decision, Some(ToolBrokerDecision::Ask { .. })).then(|| {
+                    BatchRejectionTrigger {
+                        tool_name: call.call.tool_name.clone(),
+                        error_code: "approval_required".to_string(),
+                        execution_mode: call.bound.as_ref().map(|bound| bound.execution_mode),
+                        category: "approval_sensitive",
+                        reason: "the batch contains an approval-sensitive call that requires approval",
+                    }
+                })
+            })
+        })
+        .or_else(|| {
+            prepared.iter().find_map(|call| {
+                (call.bound.as_ref().map(|bound| bound.execution_mode)
+                    == Some(ToolExecutionMode::Exclusive))
+                .then(|| BatchRejectionTrigger {
+                    tool_name: call.call.tool_name.clone(),
+                    error_code: "exclusive_tool_requires_single_call".to_string(),
+                    execution_mode: Some(ToolExecutionMode::Exclusive),
+                    category: "exclusive",
+                    reason: "the batch contains an exclusive call that must be submitted alone",
+                })
+            })
+        })
+}
+
+fn batch_rejection_contract_result(
+    prepared: &PreparedToolCall,
+    trigger: &BatchRejectionTrigger,
+    mut result: ToolResult,
+) -> ToolResult {
+    const REQUIRED_NEXT_ACTION: &str = "Correct any preflight failure first. Submit each exclusive, mutation, command, plan, or approval-sensitive call alone, then wait for its result before submitting dependent calls. Independent read-only calls may be submitted together.";
+
+    let audit = result.audit_metadata().cloned();
+    let mut content = match result.content.take() {
+        Some(Value::Object(content)) => content,
+        Some(content) => serde_json::Map::from_iter([("detail".to_string(), content)]),
+        None => result
+            .preview
+            .take()
+            .map_or_else(serde_json::Map::new, |preview| {
+                serde_json::Map::from_iter([("detail".to_string(), json!(preview))])
+            }),
+    };
+    content.insert("batch_executed".to_string(), json!(false));
+    content.insert("call_executed".to_string(), json!(false));
+    content.insert(
+        "call_preflight_status".to_string(),
+        json!(if prepared.rejection.is_some() {
+            "rejected"
+        } else {
+            "passed"
+        }),
+    );
+    if let Some(execution_mode) = prepared.bound.as_ref().map(|bound| bound.execution_mode) {
+        content.insert("execution_mode".to_string(), json!(execution_mode));
+    } else {
+        content.insert("safety_category".to_string(), json!("preflight_failure"));
+    }
+    content.insert("rejection_reason".to_string(), json!(trigger.reason));
+    content.insert("trigger_tool_name".to_string(), json!(trigger.tool_name));
+    content.insert("trigger_error_code".to_string(), json!(trigger.error_code));
+    if let Some(execution_mode) = trigger.execution_mode {
+        content.insert("trigger_execution_mode".to_string(), json!(execution_mode));
+    }
+    content.insert("trigger_category".to_string(), json!(trigger.category));
+    content.insert(
+        "required_next_action".to_string(),
+        json!(REQUIRED_NEXT_ACTION),
+    );
+
+    let output = ToolOutput::failure_with_kind(
+        result
+            .failure_kind
+            .clone()
+            .unwrap_or(ToolFailureKind::Capability),
+        result
+            .error_code
+            .clone()
+            .unwrap_or_else(|| "tool_batch_rejected".to_string()),
+        Value::Object(content),
+    );
+    let mut enriched = ToolResult::from_result(&tool_call_request(&prepared.call), &output);
+    if let Some(audit) = audit {
+        enriched = enriched.with_audit(audit);
+    }
+    enriched
+}
+
 enum ToolBatchControl {
     Continue,
     Blocked,
@@ -2533,10 +2648,12 @@ where
                     || matches!(call.decision, Some(ToolBrokerDecision::Ask { .. }))
             })
         {
+            let trigger = batch_rejection_trigger(&prepared)
+                .expect("a rejected batch has a rejection trigger");
             let results = prepared
                 .drain(..)
                 .map(|call| {
-                    let result = self.batch_rejection_result(&call);
+                    let result = self.batch_rejection_result(&call, &trigger);
                     (
                         call,
                         RuntimeToolResult {
@@ -2792,31 +2909,36 @@ where
         ToolResult::from_result(&envelope, &output)
     }
 
-    fn batch_rejection_result(&self, prepared: &PreparedToolCall) -> ToolResult {
-        if let Some(result) = &prepared.rejection {
-            return result.clone();
-        }
+    fn batch_rejection_result(
+        &self,
+        prepared: &PreparedToolCall,
+        trigger: &BatchRejectionTrigger,
+    ) -> ToolResult {
         let envelope = tool_call_request(&prepared.call);
-        let mut result = match prepared.decision.as_ref() {
-            Some(decision @ ToolBrokerDecision::Ask { .. }) => {
-                self.decision_result(&prepared.call, decision)
-            }
-            _ if prepared.bound.as_ref().map(|bound| bound.execution_mode)
-                == Some(ToolExecutionMode::Exclusive) =>
-            {
-                ToolResult::failed_with_kind(
+        let mut result = if let Some(result) = &prepared.rejection {
+            result.clone()
+        } else {
+            match prepared.decision.as_ref() {
+                Some(decision @ ToolBrokerDecision::Ask { .. }) => {
+                    self.decision_result(&prepared.call, decision)
+                }
+                _ if prepared.bound.as_ref().map(|bound| bound.execution_mode)
+                    == Some(ToolExecutionMode::Exclusive) =>
+                {
+                    ToolResult::failed_with_kind(
+                        &envelope,
+                        ToolFailureKind::Capability,
+                        "exclusive_tool_requires_single_call",
+                        "state-changing and approval-sensitive tools must be submitted alone",
+                    )
+                }
+                _ => ToolResult::failed_with_kind(
                     &envelope,
                     ToolFailureKind::Capability,
-                    "exclusive_tool_requires_single_call",
-                    "state-changing and approval-sensitive tools must be submitted alone",
-                )
+                    "tool_batch_rejected",
+                    "the tool batch was rejected before execution",
+                ),
             }
-            _ => ToolResult::failed_with_kind(
-                &envelope,
-                ToolFailureKind::Capability,
-                "tool_batch_rejected",
-                "the tool batch was rejected before execution",
-            ),
         };
         if prepared.call.tool_name == TOOL_COMMAND && result.audit_metadata().is_none() {
             let decision = prepared
@@ -2831,7 +2953,7 @@ where
                 &self.policy.profile,
             ));
         }
-        result
+        batch_rejection_contract_result(prepared, trigger, result)
     }
 
     fn decision_result(&self, call: &ModelToolCall, decision: &ToolBrokerDecision) -> ToolResult {
