@@ -7,8 +7,9 @@ use super::{
     COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
     CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
-    SandboxFilesystemMode, SandboxNetworkMode, WorkspaceMutation, command_request_denial,
-    command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
+    SandboxFilesystemMode, SandboxNetworkMode, WorkspaceChangeSummary, WorkspaceMutation,
+    WorkspaceSnapshot, command_request_denial, command_script_request_denial, is_secret_env_name,
+    path_has_sensitive_component, snapshot_workspace,
 };
 use singularity_core::{
     PROTECTED_METADATA_PATH_NAMES, PROTECTED_PATH_CONTAINS_MARKERS, PROTECTED_PATH_EXACT_MARKERS,
@@ -33,6 +34,8 @@ const UNSAFE_BATCH_ARGUMENT: &str = "batch command contains unsupported shell sy
 const ELEVATED_FAILURE_PREFIX: &str = "elevated Windows sandbox failed";
 const RESTRICTED_FAILURE_PREFIX: &str = "restricted-token Windows sandbox failed";
 const PROTECTED_PATH_ENFORCEMENT_FAILED: &str = "protected workspace path enforcement failed";
+const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
+    "capability_not_supported:workspace_change_summary";
 
 #[derive(Debug)]
 struct ResolvedExecutable {
@@ -45,6 +48,7 @@ enum PrepareCommandError {
     Executable(ExecutableResolutionError),
     Backend(String),
     ProtectedPaths(String),
+    WorkspaceObservation,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -123,6 +127,14 @@ impl SandboxBackend for WindowsSandboxBackend {
                     .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
+            Err(PrepareCommandError::WorkspaceObservation) => {
+                return CommandResult::unsupported(
+                    &request.command_id,
+                    WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE,
+                )
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
+            }
         };
         execute_prepared_command(
             &request.command_id,
@@ -171,6 +183,14 @@ impl SandboxBackend for WindowsSandboxBackend {
                     .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
+            Err(PrepareCommandError::WorkspaceObservation) => {
+                return CommandResult::unsupported(
+                    &request.command_id,
+                    WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE,
+                )
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
+            }
         };
         execute_prepared_command(
             &request.command_id,
@@ -190,6 +210,8 @@ fn execute_prepared_command(
     prepared: PreparedCommand,
     observe_workspace_change: bool,
 ) -> CommandResult {
+    let workspace = prepared.workspace_roots[0].as_path().to_path_buf();
+    let before = prepared.before.clone();
     let mut monitor = None;
     let result = match execute_windows_sandbox(
         command_id,
@@ -204,15 +226,34 @@ fn execute_prepared_command(
                 .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable);
         }
     };
-    let mutation = match monitor {
-        Some(monitor) => match monitor.finish() {
-            Ok(WorkspaceChangeObservation::Unchanged) => WorkspaceMutation::Unchanged,
-            Ok(WorkspaceChangeObservation::Changed) => WorkspaceMutation::Changed,
-            Ok(WorkspaceChangeObservation::Unknown) | Err(_) => WorkspaceMutation::Unknown,
-        },
-        None => WorkspaceMutation::Unknown,
-    };
-    result.with_workspace_mutation(mutation)
+    let observation = monitor.and_then(|monitor| monitor.finish().ok());
+    let snapshot_change = before.map(|before| {
+        snapshot_workspace(&workspace).and_then(|after| before.change_summary(&after))
+    });
+    let (mutation, summary) = reconcile_workspace_change(observation, snapshot_change);
+    let result = result.with_workspace_mutation(mutation);
+    match summary {
+        Some(summary) => result.with_workspace_change_summary(summary),
+        None => result,
+    }
+}
+
+fn reconcile_workspace_change(
+    observation: Option<WorkspaceChangeObservation>,
+    snapshot_change: Option<Result<Option<WorkspaceChangeSummary>, String>>,
+) -> (WorkspaceMutation, Option<WorkspaceChangeSummary>) {
+    match (observation, snapshot_change) {
+        (None, Some(Ok(None))) => (WorkspaceMutation::Unchanged, None),
+        (None, Some(Ok(Some(summary)))) => (WorkspaceMutation::Changed, Some(summary)),
+        (Some(WorkspaceChangeObservation::Unchanged), Some(Ok(None)))
+        | (Some(WorkspaceChangeObservation::Changed), Some(Ok(None))) => {
+            (WorkspaceMutation::Unchanged, None)
+        }
+        (Some(WorkspaceChangeObservation::Changed), Some(Ok(Some(summary)))) => {
+            (WorkspaceMutation::Changed, Some(summary))
+        }
+        _ => (WorkspaceMutation::Unknown, None),
+    }
 }
 
 /// 将 core 的 protected path 规则投影为 resolver 可展开的 workspace glob。
@@ -282,12 +323,20 @@ struct PreparedCommand {
     protected_deny_read_paths: Vec<AbsolutePathBuf>,
     protected_deny_write_paths: Vec<AbsolutePathBuf>,
     protect_workspace_metadata: bool,
+    before: Option<WorkspaceSnapshot>,
 }
 
 impl PreparedCommand {
     fn from_request(request: &CommandRequest) -> Result<Self, PrepareCommandError> {
         let workspace_root = canonical_directory(Path::new(&request.filesystem.workspace_root))
             .map_err(PrepareCommandError::Backend)?;
+        let before = matches!(
+            request.filesystem.mode,
+            SandboxFilesystemMode::WorkspaceWrite
+        )
+        .then(|| snapshot_workspace(&workspace_root))
+        .transpose()
+        .map_err(|_| PrepareCommandError::WorkspaceObservation)?;
         let cwd =
             canonical_directory(Path::new(&request.cwd)).map_err(PrepareCommandError::Backend)?;
         let env_map = child_environment(&request.environment);
@@ -354,12 +403,20 @@ impl PreparedCommand {
             protected_deny_read_paths,
             protected_deny_write_paths,
             protect_workspace_metadata,
+            before,
         })
     }
 
     fn from_script_request(request: &CommandScriptRequest) -> Result<Self, PrepareCommandError> {
         let workspace_root = canonical_directory(Path::new(&request.filesystem.workspace_root))
             .map_err(PrepareCommandError::Backend)?;
+        let before = matches!(
+            request.filesystem.mode,
+            SandboxFilesystemMode::WorkspaceWrite
+        )
+        .then(|| snapshot_workspace(&workspace_root))
+        .transpose()
+        .map_err(|_| PrepareCommandError::WorkspaceObservation)?;
         let cwd =
             canonical_directory(Path::new(&request.cwd)).map_err(PrepareCommandError::Backend)?;
         let env_map = child_environment(&request.environment);
@@ -430,6 +487,7 @@ impl PreparedCommand {
             protected_deny_read_paths,
             protected_deny_write_paths,
             protect_workspace_metadata: true,
+            before,
         })
     }
 }

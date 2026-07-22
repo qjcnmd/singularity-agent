@@ -2,6 +2,7 @@
 
 #![allow(clippy::needless_update)]
 
+use sha2::{Digest, Sha256};
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentObservation, AgentPlan, AgentPlanStep,
@@ -31,8 +32,8 @@ use singularity_policy::{
 use singularity_tools::{
     CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend, SandboxCapabilities,
     SandboxFilesystemMode, SandboxNetworkMode, ToolBroker, ToolFailureKind, ToolRegistry,
-    WorkspaceMutation, WorkspaceTools, command_script_scope_digest_with_policy,
-    workspace_tool_entries,
+    WorkspaceChangeSummary, WorkspaceMutation, WorkspaceTools,
+    command_script_scope_digest_with_policy, workspace_tool_entries,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5622,6 +5623,7 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
             .with_sandbox_backend(CommandMutatingBackend {
                 workspace: dir.path().to_path_buf(),
                 calls: AtomicUsize::new(0),
+                include_summary: true,
             }),
     )
     .run_with_events(
@@ -5705,6 +5707,7 @@ fn dynamic_verification_fails_closed_when_command_omits_trusted_change_summary()
             .with_sandbox_backend(CommandMutatingBackend {
                 workspace: workspace.path().to_path_buf(),
                 calls: AtomicUsize::new(0),
+                include_summary: false,
             }),
     )
     .run(&AgentLoopInput::new(
@@ -5756,6 +5759,7 @@ impl SandboxBackend for ExecutionCountingBackend {
 struct CommandMutatingBackend {
     workspace: PathBuf,
     calls: AtomicUsize,
+    include_summary: bool,
 }
 
 impl SandboxBackend for CommandMutatingBackend {
@@ -5774,11 +5778,24 @@ impl SandboxBackend for CommandMutatingBackend {
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
         let changed = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        let mut summary = None;
         if changed {
-            std::fs::write(self.workspace.join("README.md"), "command mutation")
-                .expect("command mutation");
+            let path = self.workspace.join("README.md");
+            let before = std::fs::read(&path).expect("read before command mutation");
+            let after = b"command mutation";
+            std::fs::write(&path, after).expect("command mutation");
+            let mut hasher = Sha256::new();
+            hasher.update(b"README.md");
+            hasher.update(&before);
+            hasher.update(after);
+            if self.include_summary {
+                summary = Some(WorkspaceChangeSummary::new(
+                    vec!["README.md".to_string()],
+                    format!("sha256:{:x}", hasher.finalize()),
+                ));
+            }
         }
-        CommandResult::completed(&request.command_id, "command ok")
+        let result = CommandResult::completed(&request.command_id, "command ok")
             .with_workspace_mutation(if changed {
                 WorkspaceMutation::Changed
             } else {
@@ -5787,7 +5804,11 @@ impl SandboxBackend for CommandMutatingBackend {
             .with_sandbox_execution(
                 self.name(),
                 singularity_tools::SandboxBackendEnforcement::Strict,
-            )
+            );
+        match summary {
+            Some(summary) => result.with_workspace_change_summary(summary),
+            None => result,
+        }
     }
 }
 
@@ -8069,6 +8090,44 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
         "checkpoint={first_checkpoint}"
     );
     assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 2);
+    assert_eq!(
+        first_checkpoint["recovery_metrics"]["repair_attempt_count"],
+        2
+    );
+    let mut missing_change_summary = first_checkpoint.clone();
+    missing_change_summary
+        .as_object_mut()
+        .expect("checkpoint object")
+        .remove("verification_change");
+    let missing_change = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &missing_change_summary,
+    );
+    assert_eq!(
+        missing_change.expect_err("planned mutation must retain its change summary"),
+        "approval checkpoint workspace change summary is missing"
+    );
+    let mut parent_path = first_checkpoint.clone();
+    parent_path["verification_change"]["changed_paths"] = serde_json::json!(["../outside"]);
+    let parent_path = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &parent_path,
+    );
+    assert_eq!(
+        parent_path.expect_err("parent path must fail closed"),
+        "approval checkpoint verification change summary is invalid"
+    );
+    let mut reset_ledger = first_checkpoint.clone();
+    reset_ledger["repair_attempts"] = serde_json::json!(0);
+    reset_ledger["repair_plan"] = serde_json::Value::Null;
+    let reset = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &reset_ledger,
+    );
+    assert_eq!(
+        reset.expect_err("repair attempt ledger cannot be reset"),
+        "approval checkpoint repair attempt metrics are inconsistent"
+    );
 
     let first_resumed_input = input.clone().with_approval_grant(ApprovalGrant::allow(
         first_pending.pending_tool_call().request_id.clone(),

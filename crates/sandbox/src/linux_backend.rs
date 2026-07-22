@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use singularity_core::{CancellationToken, is_protected_path};
 
@@ -27,7 +27,7 @@ use super::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, CommandSemanticStatus, DEFAULT_MAX_OUTPUT_CHARS, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    WorkspaceMutation,
+    WorkspaceChangeSummary, WorkspaceMutation, WorkspaceSnapshot, snapshot_workspace,
 };
 
 const BACKEND_NAME: &str = "linux";
@@ -37,6 +37,8 @@ const SANDBOX_PROTECTED_PATH_DENIED: &str = "linux sandbox protected path denied
 const SANDBOX_CWD_DENIED: &str = "linux sandbox cwd is outside workspace";
 const SANDBOX_EXECUTABLE_UNAVAILABLE: &str = "linux sandbox executable unavailable";
 const SANDBOX_HARDLINK_DENIED: &str = "linux sandbox workspace hardlink safety check failed";
+const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
+    "capability_not_supported:workspace_change_summary";
 const SANDBOX_CHILD_CANCELLED: &str = "linux sandbox command cancelled";
 const SANDBOX_CHILD_TIMED_OUT: &str = "linux sandbox command timed out";
 const SANDBOX_HOME: &str = "/run/singularity-home";
@@ -303,6 +305,7 @@ fn cgroup_is_writable() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxSandboxError {
     Unavailable,
+    WorkspaceObservationUnavailable,
     CapabilityNotSupported(LinuxCapability),
     PolicyDenied(&'static str),
     ExecutableUnavailable,
@@ -312,6 +315,9 @@ impl LinuxSandboxError {
     fn into_result(self, command_id: &str) -> CommandResult {
         match self {
             Self::Unavailable => CommandResult::backend_error(command_id, SANDBOX_UNAVAILABLE),
+            Self::WorkspaceObservationUnavailable => {
+                CommandResult::unsupported(command_id, WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE)
+            }
             Self::CapabilityNotSupported(capability) => CommandResult::unsupported(
                 command_id,
                 format!("capability_not_supported:{}", capability.as_str()),
@@ -538,7 +544,14 @@ impl PreparedCommand {
             .map_err(|_| LinuxSandboxError::PolicyDenied(SANDBOX_PROTECTED_PATH_DENIED))?;
         validate_workspace_hardlinks(&workspace)
             .map_err(|_| LinuxSandboxError::PolicyDenied(SANDBOX_HARDLINK_DENIED))?;
-        let before = snapshot_workspace(&workspace);
+        let before = if matches!(filesystem.mode, SandboxFilesystemMode::WorkspaceWrite) {
+            Some(
+                snapshot_workspace(&workspace)
+                    .map_err(|_| LinuxSandboxError::WorkspaceObservationUnavailable)?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
             workspace,
             cwd: cwd_path,
@@ -1070,70 +1083,6 @@ fn validate_workspace_hardlinks(workspace: &Path) -> Result<(), ()> {
         .ok_or(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileFingerprint {
-    file_type: u32,
-    size: u64,
-    mode: u32,
-    device: u64,
-    inode: u64,
-    modified_seconds: i64,
-    modified_nanos: i64,
-    link_target: Option<PathBuf>,
-}
-
-type WorkspaceSnapshot = BTreeMap<PathBuf, FileFingerprint>;
-
-fn snapshot_workspace(workspace: &Path) -> Option<WorkspaceSnapshot> {
-    fn visit(root: &Path, current: &Path, snapshot: &mut WorkspaceSnapshot) -> Result<(), ()> {
-        let mut entries = fs::read_dir(current)
-            .map_err(|_| ())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ())?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let relative = path.strip_prefix(root).map_err(|_| ())?.to_path_buf();
-            let component = entry.file_name();
-            if is_protected_path(&component.to_string_lossy()) {
-                continue;
-            }
-            let metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
-            let modified = metadata.modified().map_err(|_| ())?;
-            let since_epoch = modified.duration_since(UNIX_EPOCH).map_err(|_| ())?;
-            let link_target = metadata
-                .file_type()
-                .is_symlink()
-                .then(|| fs::read_link(&path))
-                .transpose()
-                .ok()
-                .flatten();
-            snapshot.insert(
-                relative,
-                FileFingerprint {
-                    file_type: metadata.mode() & libc::S_IFMT,
-                    size: metadata.size(),
-                    mode: metadata.mode(),
-                    device: metadata.dev(),
-                    inode: metadata.ino(),
-                    modified_seconds: since_epoch.as_secs() as i64,
-                    modified_nanos: since_epoch.subsec_nanos() as i64,
-                    link_target,
-                },
-            );
-            if metadata.is_dir() {
-                visit(root, &path, snapshot)?;
-            }
-        }
-        Ok(())
-    }
-
-    let mut snapshot = BTreeMap::new();
-    visit(workspace, workspace, &mut snapshot)
-        .ok()
-        .map(|_| snapshot)
-}
-
 struct ChildContext {
     ready_read: RawFd,
     status_write: RawFd,
@@ -1318,20 +1267,20 @@ fn run_prepared_command(
         stderr: stderr_thread.join().unwrap_or_default(),
     };
     let child_setup = read_child_setup_status(status_read);
-    let mutation = match (&prepared.before, snapshot_workspace(&prepared.workspace)) {
-        (Some(before), Some(after)) if before == &after => WorkspaceMutation::Unchanged,
-        (Some(_), Some(_)) => WorkspaceMutation::Changed,
-        _ => WorkspaceMutation::Unknown,
-    };
+    let (mutation, summary) = observed_workspace_change(&prepared.before, &prepared.workspace);
     if let Some(kind) = child_setup {
         let error = if kind == CHILD_SETUP_CAPABILITY {
             LinuxSandboxError::CapabilityNotSupported(LinuxCapability::Landlock)
         } else {
             LinuxSandboxError::Unavailable
         };
-        return error
+        let result = error
             .into_result(command_id)
             .with_workspace_mutation(mutation);
+        return match summary {
+            Some(summary) => result.with_workspace_change_summary(summary),
+            None => result,
+        };
     }
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     let mut result = if interrupted == InterruptKind::Cancelled {
@@ -1367,7 +1316,24 @@ fn run_prepared_command(
     result = result
         .with_workspace_mutation(mutation)
         .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Strict);
-    result
+    match summary {
+        Some(summary) => result.with_workspace_change_summary(summary),
+        None => result,
+    }
+}
+
+fn observed_workspace_change(
+    before: &Option<WorkspaceSnapshot>,
+    workspace: &Path,
+) -> (WorkspaceMutation, Option<WorkspaceChangeSummary>) {
+    let Some(before) = before else {
+        return (WorkspaceMutation::Unknown, None);
+    };
+    match snapshot_workspace(workspace).and_then(|after| before.change_summary(&after)) {
+        Ok(None) => (WorkspaceMutation::Unchanged, None),
+        Ok(Some(summary)) => (WorkspaceMutation::Changed, Some(summary)),
+        Err(_) => (WorkspaceMutation::Unknown, None),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

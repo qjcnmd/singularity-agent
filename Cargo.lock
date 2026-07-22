@@ -1596,11 +1596,14 @@ dependencies = [
 name = "singularity_sandbox"
 version = "0.1.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "dunce",
  "libc",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "singularity_core",
  "singularity_windows_sandbox",
  "tempfile",

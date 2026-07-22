@@ -432,6 +432,11 @@ fn windows_elevated_backend_executes_network_denied_command() {
         changed_result.workspace_mutation,
         WorkspaceMutation::Changed
     );
+    let summary = changed_result
+        .workspace_change_summary
+        .expect("trusted Windows workspace change summary");
+    assert_eq!(summary.changed_files, ["changed.txt"]);
+    assert!(summary.diff_digest.starts_with("sha256:"));
 }
 
 #[cfg(windows)]
@@ -1221,6 +1226,11 @@ time.sleep(30)
         assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        let summary = result
+            .workspace_change_summary
+            .expect("trusted Linux workspace change summary");
+        assert_eq!(summary.changed_files, ["output.txt"]);
+        assert!(summary.diff_digest.starts_with("sha256:"));
         assert_eq!(
             fs::read_to_string(workspace.path().join("output.txt")).unwrap(),
             "changed"

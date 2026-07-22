@@ -1393,6 +1393,8 @@ impl AgentLoopState {
     ) -> Result<AgentRepairPlan, AgentRepairPlan> {
         let attempt = self.repair_attempts.saturating_add(1);
         self.repair_attempts = attempt;
+        self.recovery_metrics.repair_attempt_count =
+            self.recovery_metrics.repair_attempt_count.saturating_add(1);
         let plan = AgentRepairPlan {
             reason,
             attempt,
@@ -1481,8 +1483,6 @@ impl AgentLoopState {
             self.last_repair_failure = None;
             return None;
         }
-        self.recovery_metrics.repair_attempt_count =
-            self.recovery_metrics.repair_attempt_count.saturating_add(1);
         let error_code = tool_result
             .error_code
             .as_deref()
@@ -3987,18 +3987,16 @@ where
                         "workspace mutation revision is missing".to_string(),
                     );
                 };
-                if verification_planning_available {
-                    match verification_change_summary(&prepared.call, &result, revision) {
-                        Ok(summary) => state.verification_change = Some(summary),
-                        Err(error) => {
-                            state
-                                .completion
-                                .mark_workspace_revision_invalid("mutation_diff_summary_invalid");
-                            state.verification_planning_required = true;
-                            state.verification_plan = None;
-                            let _ = state.completion.replace_requirements(&[]);
-                            return ToolBatchControl::Failed(error);
-                        }
+                match verification_change_summary(&prepared.call, &result, revision) {
+                    Ok(summary) => state.verification_change = Some(summary),
+                    Err(error) => {
+                        state
+                            .completion
+                            .mark_workspace_revision_invalid("mutation_diff_summary_invalid");
+                        state.verification_planning_required = true;
+                        state.verification_plan = None;
+                        let _ = state.completion.replace_requirements(&[]);
+                        return ToolBatchControl::Failed(error);
                     }
                 }
                 let had_bound_plan = state
@@ -5866,13 +5864,7 @@ fn verification_change_summary(
     let mut normalized = BTreeSet::new();
     for path in changed_paths {
         let path = path.trim();
-        if path.is_empty()
-            || path.chars().count() > MAX_VERIFICATION_TEXT_CHARS
-            || std::path::Path::new(path).is_absolute()
-            || std::path::Path::new(path)
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
+        if !is_bounded_workspace_relative_path(path) {
             return Err(
                 "workspace mutation changed path is outside the bounded relative scope".to_string(),
             );
@@ -5887,6 +5879,19 @@ fn verification_change_summary(
         changed_paths: normalized.into_iter().collect(),
         diff_digest: producer_summary.diff_digest.clone(),
     })
+}
+
+fn is_bounded_workspace_relative_path(path: &str) -> bool {
+    let path = path.trim();
+    !path.is_empty()
+        && path.chars().count() <= MAX_VERIFICATION_TEXT_CHARS
+        && !std::path::Path::new(path).is_absolute()
+        && std::path::Path::new(path).components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
 }
 
 fn mutation_paths_from_call(call: &ModelToolCall) -> Result<Vec<String>, String> {

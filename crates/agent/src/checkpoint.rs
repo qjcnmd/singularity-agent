@@ -392,13 +392,21 @@ impl ApprovalCheckpoint {
                 || change.changed_paths.is_empty()
                 || change.changed_paths.len() > super::MAX_VERIFICATION_REQUIREMENTS
                 || Some(change.revision) != self.completion.workspace_revision
-                || change.changed_paths.iter().any(|path| {
-                    path.trim().is_empty()
-                        || path.chars().count() > super::MAX_VERIFICATION_TEXT_CHARS
-                        || std::path::Path::new(path).is_absolute()
-                }))
+                || change
+                    .changed_paths
+                    .iter()
+                    .any(|path| !super::is_bounded_workspace_relative_path(path)))
         {
             return Err("approval checkpoint verification change summary is invalid".to_string());
+        }
+        if self.completion.workspace_mutated()
+            && self
+                .verification_plan
+                .as_ref()
+                .is_some_and(|plan| plan.revision.is_some())
+            && self.verification_change.is_none()
+        {
+            return Err("approval checkpoint workspace change summary is missing".to_string());
         }
         if let Some(plan) = &self.verification_plan {
             plan.plan.validate().map_err(|error| {
@@ -438,6 +446,9 @@ impl ApprovalCheckpoint {
         }
         if self.repair_attempts > super::MAX_REPAIR_PLAN_ATTEMPTS.saturating_add(1) {
             return Err("approval checkpoint repair attempt ledger is invalid".to_string());
+        }
+        if self.repair_attempts != self.recovery_metrics.repair_attempt_count {
+            return Err("approval checkpoint repair attempt metrics are inconsistent".to_string());
         }
         if self
             .repair_plan
