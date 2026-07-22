@@ -21,11 +21,13 @@ use singularity_tools::{
 use super::observation::OccurrenceTimer;
 use super::{
     AgentLoopEvent, AgentLoopEventCallback, AgentLoopEventSinkError, AgentLoopInput,
-    AgentObservation, AgentVerification, FinalReviewObservation, FinalReviewStatus,
-    OccurrenceIdentity, OccurrenceLifecycle, PolicyDecisionCause, PolicyDecisionStatus,
-    PreparedToolCall, PromptAssemblyObservation, PromptAssemblyStatus, ProviderAttemptObservation,
-    ProviderAttemptStatus, ProviderAttemptUsageObservation, SandboxExecutionOccurrence,
-    SandboxExecutionStatus, ToolCallObservation, ToolCallStatus, VerificationObservation,
+    AgentObservation, AgentRepairPlan, AgentVerification, FinalReviewObservation,
+    FinalReviewStatus, FinalReviewVerdict, OccurrenceIdentity, OccurrenceLifecycle,
+    PolicyDecisionCause, PolicyDecisionStatus, PreparedToolCall, PromptAssemblyObservation,
+    PromptAssemblyStatus, ProviderAttemptObservation, ProviderAttemptStatus,
+    ProviderAttemptUsageObservation, RepairPlanningObservation, RepairPlanningStatus,
+    SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallObservation, ToolCallStatus,
+    VerificationObservation, VerificationPlanObservation, VerificationPlanStatus,
     VerificationStatus,
 };
 
@@ -117,6 +119,27 @@ pub(super) fn emit_final_review_finished(
     model_turn_ordinal: u32,
     status: FinalReviewStatus,
 ) -> Result<(), AgentLoopEventSinkError> {
+    let verdict = match status {
+        FinalReviewStatus::Succeeded => Some(FinalReviewVerdict::Accept),
+        FinalReviewStatus::Failed => Some(FinalReviewVerdict::Reject),
+        FinalReviewStatus::Cancelled => Some(FinalReviewVerdict::Cancelled),
+    };
+    emit_final_review_finished_with_verdict(
+        on_event,
+        final_review,
+        model_turn_ordinal,
+        status,
+        verdict,
+    )
+}
+
+pub(super) fn emit_final_review_finished_with_verdict(
+    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    final_review: &Option<(OccurrenceIdentity, OccurrenceTimer)>,
+    model_turn_ordinal: u32,
+    status: FinalReviewStatus,
+    verdict: Option<FinalReviewVerdict>,
+) -> Result<(), AgentLoopEventSinkError> {
     let Some((identity, timer)) = final_review else {
         return Ok(());
     };
@@ -126,8 +149,81 @@ pub(super) fn emit_final_review_finished(
             identity: identity.clone(),
             lifecycle: timer.finished(status),
             model_turn_ordinal,
+            verdict,
         })),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_verification_plan_occurrence(
+    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    input: &AgentLoopInput,
+    model_turn_ordinal: u32,
+    occurrence_ordinal: u32,
+    revision: Option<singularity_tools::WorkspaceRevision>,
+    risk_count: u32,
+    requirement_count: u32,
+    satisfied_requirement_count: u32,
+    status: VerificationPlanStatus,
+) -> Result<(), AgentLoopEventSinkError> {
+    let timer = OccurrenceTimer::start();
+    let identity = occurrence_identity(
+        input,
+        "verification_plan",
+        model_turn_ordinal,
+        occurrence_ordinal,
+        None,
+    );
+    for lifecycle in [timer.started(), timer.finished(status)] {
+        emit_event(
+            on_event,
+            AgentLoopEvent::Observation(AgentObservation::VerificationPlan(
+                VerificationPlanObservation {
+                    identity: identity.clone(),
+                    lifecycle,
+                    revision,
+                    risk_count,
+                    requirement_count,
+                    satisfied_requirement_count,
+                },
+            )),
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn emit_repair_planning_occurrence(
+    on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+    input: &AgentLoopInput,
+    model_turn_ordinal: u32,
+    occurrence_ordinal: u32,
+    plan: &AgentRepairPlan,
+    status: RepairPlanningStatus,
+) -> Result<(), AgentLoopEventSinkError> {
+    let timer = OccurrenceTimer::start();
+    let identity = occurrence_identity(
+        input,
+        "repair_planning",
+        model_turn_ordinal,
+        occurrence_ordinal,
+        None,
+    );
+    for lifecycle in [timer.started(), timer.finished(status)] {
+        emit_event(
+            on_event,
+            AgentLoopEvent::Observation(AgentObservation::RepairPlanning(
+                RepairPlanningObservation {
+                    identity: identity.clone(),
+                    lifecycle,
+                    reason: plan.reason,
+                    attempt: plan.attempt,
+                    max_attempts: plan.max_attempts,
+                    required_revision: plan.required_revision,
+                },
+            )),
+        )?;
+    }
+    Ok(())
 }
 
 enum ProviderAttemptIdentityScope {

@@ -161,6 +161,11 @@ pub struct ApprovalCheckpoint {
     pub(super) approval_count: u32,
     pub(super) model_turns: u32,
     pub(super) completion: CompletionTracker,
+    pub(super) verification_plan: Option<super::VerificationPlanState>,
+    pub(super) verification_change: Option<super::VerificationChangeSummary>,
+    pub(super) verification_failure_history: Vec<String>,
+    pub(super) repair_plan: Option<super::RepairPlanState>,
+    pub(super) final_review_verdict: Option<super::FinalReviewVerdict>,
     pub(super) last_completion_error: Option<String>,
     pub(super) plan: Option<AgentPlan>,
     pub(super) plan_update_count: u32,
@@ -187,6 +192,16 @@ struct ApprovalCheckpointWire {
     approval_count: u32,
     model_turns: u32,
     completion: CompletionTracker,
+    #[serde(default)]
+    verification_plan: Option<super::VerificationPlanState>,
+    #[serde(default)]
+    verification_change: Option<super::VerificationChangeSummary>,
+    #[serde(default)]
+    verification_failure_history: Vec<String>,
+    #[serde(default)]
+    repair_plan: Option<super::RepairPlanState>,
+    #[serde(default)]
+    final_review_verdict: Option<super::FinalReviewVerdict>,
     last_completion_error: Option<String>,
     plan: Option<AgentPlan>,
     plan_update_count: u32,
@@ -217,6 +232,11 @@ impl From<&ApprovalCheckpoint> for ApprovalCheckpointWire {
             approval_count: checkpoint.approval_count,
             model_turns: checkpoint.model_turns,
             completion: checkpoint.completion.clone(),
+            verification_plan: checkpoint.verification_plan.clone(),
+            verification_change: checkpoint.verification_change.clone(),
+            verification_failure_history: checkpoint.verification_failure_history.clone(),
+            repair_plan: checkpoint.repair_plan.clone(),
+            final_review_verdict: checkpoint.final_review_verdict,
             last_completion_error: checkpoint.last_completion_error.clone(),
             plan: checkpoint.plan.clone(),
             plan_update_count: checkpoint.plan_update_count,
@@ -272,6 +292,11 @@ impl ApprovalCheckpoint {
             approval_count: wire.approval_count,
             model_turns: wire.model_turns,
             completion: wire.completion,
+            verification_plan: wire.verification_plan,
+            verification_change: wire.verification_change,
+            verification_failure_history: wire.verification_failure_history,
+            repair_plan: wire.repair_plan,
+            final_review_verdict: wire.final_review_verdict,
             last_completion_error: wire.last_completion_error,
             plan: wire.plan,
             plan_update_count: wire.plan_update_count,
@@ -350,6 +375,68 @@ impl ApprovalCheckpoint {
         }
         if !self.completion.is_consistent() {
             return Err("approval checkpoint workspace revision state is invalid".to_string());
+        }
+        if self
+            .verification_failure_history
+            .iter()
+            .any(|failure| failure.trim().is_empty() || failure.chars().count() > 128)
+        {
+            return Err("approval checkpoint verification failure history is invalid".to_string());
+        }
+        if let Some(change) = &self.verification_change
+            && (!super::is_sha256_fingerprint(&change.diff_digest)
+                || change.changed_paths.is_empty()
+                || change.changed_paths.len() > super::MAX_VERIFICATION_REQUIREMENTS
+                || Some(change.revision) != self.completion.workspace_revision
+                || change.changed_paths.iter().any(|path| {
+                    path.trim().is_empty()
+                        || path.chars().count() > super::MAX_VERIFICATION_TEXT_CHARS
+                        || std::path::Path::new(path).is_absolute()
+                }))
+        {
+            return Err("approval checkpoint verification change summary is invalid".to_string());
+        }
+        if let Some(plan) = &self.verification_plan {
+            plan.plan.validate().map_err(|error| {
+                format!("approval checkpoint verification plan is invalid: {error}")
+            })?;
+            if let Some(revision) = plan.revision
+                && Some(revision) != self.completion.workspace_revision
+            {
+                return Err(
+                    "approval checkpoint verification plan revision binding is invalid".to_string(),
+                );
+            }
+        }
+        if let Some(repair) = &self.repair_plan {
+            if repair.plan.attempt == 0 || repair.plan.attempt > repair.plan.max_attempts {
+                return Err("approval checkpoint repair plan budget is invalid".to_string());
+            }
+            if repair.plan.max_attempts == 0
+                || repair.plan.max_attempts > super::MAX_REPAIR_PLAN_ATTEMPTS
+            {
+                return Err("approval checkpoint repair plan bound is invalid".to_string());
+            }
+            if !repair.signature.is_empty() && !is_sha256_fingerprint(&repair.signature) {
+                return Err("approval checkpoint repair plan signature is invalid".to_string());
+            }
+            if repair.plan.required_revision
+                != self
+                    .verification_plan
+                    .as_ref()
+                    .and_then(|plan| plan.revision)
+                || repair.plan.required_check_count != self.completion.required_command_count()
+            {
+                return Err("approval checkpoint repair plan binding is invalid".to_string());
+            }
+        }
+        if self.final_review_verdict == Some(super::FinalReviewVerdict::Accept)
+            && (!self.completion.allows_final()
+                || self.plan.as_ref().is_some_and(|plan| !plan.is_completed()))
+        {
+            return Err(
+                "approval checkpoint accepted review lacks completion evidence".to_string(),
+            );
         }
         for occurrence in &self.tool_result_occurrences {
             occurrence.validate()?;

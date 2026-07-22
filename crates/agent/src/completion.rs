@@ -68,6 +68,39 @@ impl CompletionTracker {
         })
     }
 
+    /// Activate exact command requirements once a real workspace mutation creates a verification
+    /// boundary. Read-only turns keep the legacy requirement state unchanged until this point.
+    pub(super) fn activate_requirements(
+        &mut self,
+        requirements: &[AgentVerificationRequirement],
+    ) -> Result<(), String> {
+        let next = Self::from_requirements(requirements)?;
+        if self.required_command_counts.is_empty() {
+            self.required_command_counts = next.required_command_counts;
+            return Ok(());
+        }
+        if self.required_command_counts == next.required_command_counts {
+            Ok(())
+        } else {
+            Err("verification requirements changed after execution began".to_string())
+        }
+    }
+
+    /// Replace exact requirements after a new mutation invalidates the prior evidence window.
+    pub(super) fn replace_requirements(
+        &mut self,
+        requirements: &[AgentVerificationRequirement],
+    ) -> Result<(), String> {
+        let next = Self::from_requirements(requirements)?;
+        self.required_command_counts = next.required_command_counts;
+        self.clear_terminal_command_observations();
+        Ok(())
+    }
+
+    pub(super) fn workspace_mutated(&self) -> bool {
+        self.workspace_mutated
+    }
+
     pub(super) fn observe(&mut self, tool_result: &ToolResult) {
         self.observe_with_window(tool_result, None);
     }
@@ -259,6 +292,7 @@ impl CompletionTracker {
                 u32::from(self.workspace_mutated && !self.terminal_command_scope_digests.is_empty())
             },
             unresolved_failures: self.unresolved_failures.iter().cloned().collect(),
+            final_review_verdict: None,
         }
     }
 

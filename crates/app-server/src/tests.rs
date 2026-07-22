@@ -1775,7 +1775,7 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
         validation_errors: Vec::new(),
     });
     let mut verification_response =
-        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "verifying");
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "verifying");
     verification_response.tool_calls.push(ModelToolCall {
         tool_call_id: "call_verify".to_string(),
         tool_name: "command".to_string(),
@@ -1791,6 +1791,33 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
         parse_status: ModelToolParseStatus::Valid,
         validation_errors: Vec::new(),
     });
+    let plan_arguments = json!({
+        "steps": [{"step": "verify the workspace mutation", "status": "completed"}],
+        "verification": [{
+            "risk": "general_mutation",
+            "evidence": ". changed by the workspace command",
+            "affected_symbol": ".::workspace",
+            "current_gap": "the changed workspace has not been verified",
+            "action": {
+                "command": "test-program verify",
+                "cwd": ".",
+                "timeout_seconds": 5,
+                "sandbox_mode": "workspace_write",
+                "network_access": "denied"
+            },
+            "required": 1
+        }]
+    });
+    let mut plan_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "planning");
+    plan_response.tool_calls.push(ModelToolCall {
+        tool_call_id: "call_plan".to_string(),
+        tool_name: "update_plan".to_string(),
+        arguments: plan_arguments.clone(),
+        raw_arguments: plan_arguments.to_string(),
+        parse_status: ModelToolParseStatus::Valid,
+        validation_errors: Vec::new(),
+    });
     let status = server
         .run_agent_loop_with_provider_and_text_deltas(
             StreamingProvider {
@@ -1800,6 +1827,12 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
                             delta: "mutating".to_string(),
                         }],
                         mutation_response,
+                    ),
+                    (
+                        vec![ProviderStreamEvent::OutputTextDelta {
+                            delta: "planning".to_string(),
+                        }],
+                        plan_response,
                     ),
                     (
                         vec![ProviderStreamEvent::OutputTextDelta {
@@ -1817,8 +1850,8 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
                             },
                         ],
                         ModelTurnResponse::completed(
-                            "model_request_turn_1_2",
-                            "response_3",
+                            "model_request_turn_1_3",
+                            "response_4",
                             "done",
                         ),
                     ),
@@ -1869,6 +1902,8 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
             "item/started",
             "item/agentMessage/delta",
             "item/agentMessage/delta",
+            "item/started",
+            "item/completed",
             "item/completed",
             "turn/completed",
         ]
@@ -1877,13 +1912,15 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
     assert_eq!(events[2]["params"]["delta"], "ne");
     let events_json = serde_json::to_string(&events).expect("events json");
     assert!(!events_json.contains("mutating"));
+    assert!(!events_json.contains("planning"));
     assert!(!events_json.contains("verifying"));
     let item_id = assistant_events.item_id.as_str();
     assert!(
-        events[..4]
+        events[..3]
             .iter()
             .all(|event| event["params"]["item"]["item_id"] == item_id)
     );
+    assert_eq!(events[5]["params"]["item"]["item_id"], item_id);
     assert_eq!(
         committed
             .assistant_item
@@ -2815,7 +2852,7 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
         validation_errors: Vec::new(),
     });
     let mut verification_response =
-        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
     verification_response.tool_calls.push(ModelToolCall {
         tool_call_id: "call_verify".to_string(),
         tool_name: TOOL_COMMAND.to_string(),
@@ -2831,8 +2868,35 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
         parse_status: ModelToolParseStatus::Valid,
         validation_errors: Vec::new(),
     });
+    let plan_arguments = json!({
+        "steps": [{"step": "verify README.md", "status": "completed"}],
+        "verification": [{
+            "risk": "general_mutation",
+            "evidence": "README.md changed by the approved edit",
+            "affected_symbol": "README.md::document",
+            "current_gap": "the edited document has not been verified",
+            "action": {
+                "command": "cmd.exe /C \"echo verified\"",
+                "cwd": ".",
+                "timeout_seconds": 5,
+                "sandbox_mode": "workspace_write",
+                "network_access": "denied"
+            },
+            "required": 1
+        }]
+    });
+    let mut plan_response =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    plan_response.tool_calls.push(ModelToolCall {
+        tool_call_id: "call_plan".to_string(),
+        tool_name: "update_plan".to_string(),
+        arguments: plan_arguments.clone(),
+        raw_arguments: plan_arguments.to_string(),
+        parse_status: ModelToolParseStatus::Valid,
+        validation_errors: Vec::new(),
+    });
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
     let initial_seen_requests = Arc::new(Mutex::new(Vec::new()));
     let initial_provider = StaticProvider {
         responses: vec![initial_response],
@@ -2841,6 +2905,7 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
     let resumed_seen_requests = Arc::new(Mutex::new(Vec::new()));
     let resumed_provider = StreamingProvider {
         responses: vec![
+            (Vec::new(), plan_response),
             (Vec::new(), verification_response),
             (
                 vec![
@@ -2951,8 +3016,8 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
     assert_eq!(resumed.0.turn_id, turn.turn_id);
     assert_eq!(resumed.1.status, AgentStatus::Completed);
     assert_eq!(resumed.1.final_answer.as_deref(), Some("done"));
-    assert_eq!(resumed.1.model_turns, 3);
-    assert_eq!(resumed.1.tool_calls, 2);
+    assert_eq!(resumed.1.model_turns, 4);
+    assert_eq!(resumed.1.tool_calls, 3);
     assert_eq!(resumed.1.approval_count, 1);
     assert!(resumed.1.verification.required);
     assert!(resumed.1.verification.passed);
@@ -2982,6 +3047,8 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
             "item/started",
             "item/agentMessage/delta",
             "item/agentMessage/delta",
+            "item/started",
+            "item/completed",
             "item/completed",
             "turn/completed",
         ]
@@ -2989,9 +3056,13 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
     assert_eq!(realtime_events[1]["params"]["delta"], "do");
     assert_eq!(realtime_events[2]["params"]["delta"], "ne");
     assert!(
-        realtime_events[..4].iter().all(|event| {
+        realtime_events[..3].iter().all(|event| {
             event["params"]["item"]["item_id"] == assistant_events.item_id.as_str()
         })
+    );
+    assert_eq!(
+        realtime_events[5]["params"]["item"]["item_id"],
+        assistant_events.item_id.as_str()
     );
     assert_eq!(
         committed
@@ -3024,7 +3095,7 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
         "after"
     );
     let requests = resumed_seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].messages[0].role, ModelRole::Developer);
     assert_eq!(requests[0].messages[1].role, ModelRole::User);
     assert_eq!(requests[0].messages[1].content, "previous approval user");

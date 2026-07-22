@@ -5,11 +5,12 @@
 use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentObservation, AgentPlan, AgentPlanStep,
-    AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentRunStatus, AgentStatus,
-    AgentVerificationRequirement, ApprovalGrant, FinalReviewStatus, OccurrenceLifecycle,
+    AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentRepairReason,
+    AgentRunStatus, AgentStatus, AgentVerificationRequirement, AgentVerificationRisk,
+    ApprovalGrant, FinalReviewStatus, FinalReviewVerdict, OccurrenceLifecycle,
     PendingApprovalOccurrence, PolicyDecisionCause, PolicyDecisionStatus, PromptAssemblyStatus,
-    SandboxExecutionStatus, ToolCallStatus, VerificationStatus, agent_control_tool_entries,
-    assemble_context_items,
+    RepairPlanningStatus, SandboxExecutionStatus, ToolCallStatus, VerificationPlanStatus,
+    VerificationStatus, agent_control_tool_entries, assemble_context_items,
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
@@ -5815,6 +5816,46 @@ impl SandboxBackend for AgentFailThenSucceedBackend {
     }
 }
 
+struct AgentSemanticFixtureBackend {
+    file_path: PathBuf,
+    repaired_source: String,
+}
+
+impl AgentSemanticFixtureBackend {
+    fn result(&self, command_id: &str) -> CommandResult {
+        let source = std::fs::read_to_string(&self.file_path).expect("read semantic fixture");
+        let result = if source == self.repaired_source {
+            CommandResult::completed(command_id, "boundary contract passed")
+        } else {
+            CommandResult::executed(command_id, 1, 1, "", "boundary contract failed", false)
+        };
+        result
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_sandbox_execution(
+                self.name(),
+                singularity_tools::SandboxBackendEnforcement::Strict,
+            )
+    }
+}
+
+impl SandboxBackend for AgentSemanticFixtureBackend {
+    fn name(&self) -> &'static str {
+        "agent_semantic_fixture_test"
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn execute(&self, request: &CommandRequest) -> CommandResult {
+        self.result(&request.command_id)
+    }
+
+    fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
+        self.result(&request.command_id)
+    }
+}
+
 struct AgentExecutableUnavailableBackend {
     calls: AtomicUsize,
 }
@@ -7227,6 +7268,266 @@ fn verified_completed_plan_enters_tool_free_finalization() {
 }
 
 #[test]
+fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
+    let fixtures = [
+        (
+            AgentVerificationRisk::EmptyCollection,
+            "empty_collection.py",
+            "def total(values):\n    return sum(values)\n",
+            "def total(values):\n    return None if not values else sum(values)\n",
+            "def total(values):\n    return sum(values)\n",
+            "empty collection",
+            "empty_collection",
+        ),
+        (
+            AgentVerificationRisk::OptionalNull,
+            "optional_null.py",
+            "def label(value):\n    return value\n",
+            "def label(value):\n    return value.strip()\n",
+            "def label(value):\n    return None if value is None else value.strip()\n",
+            "Optional/Null",
+            "optional_null",
+        ),
+        (
+            AgentVerificationRisk::DivisionByZero,
+            "zero_index_division.py",
+            "def ratio(total, count):\n    return total\n",
+            "def ratio(total, count):\n    return total / count\n",
+            "def ratio(total, count):\n    return 0 if count == 0 else total / count\n",
+            "division by zero",
+            "zero_index_division",
+        ),
+    ];
+    for (
+        risk,
+        fixture_name,
+        fixture_source,
+        incomplete_source,
+        repaired_source,
+        goal,
+        command_name,
+    ) in fixtures
+    {
+        let workspace = tempfile::tempdir().expect("fixture workspace");
+        let file_path = workspace.path().join(fixture_name);
+        std::fs::write(&file_path, fixture_source).expect("fixture source");
+        let command = test_command_script(command_name);
+        let mut incomplete_patch =
+            ModelTurnResponse::completed("model_request_turn_fixture_0", "response_1", "");
+        incomplete_patch.tool_calls.push(tool_call(
+            "incomplete_patch",
+            "edit",
+            serde_json::json!({
+                "path": fixture_name,
+                "expected": "not present",
+                "replacement": "after"
+            }),
+        ));
+        let mut repaired_patch =
+            ModelTurnResponse::completed("model_request_turn_fixture_1", "response_2", "");
+        repaired_patch.tool_calls.push(tool_call(
+            "repaired_patch",
+            "edit",
+            serde_json::json!({
+                "path": fixture_name,
+                "expected": fixture_source,
+                "replacement": incomplete_source
+            }),
+        ));
+        let mut initial_plan =
+            ModelTurnResponse::completed("model_request_turn_fixture_2", "response_3", "");
+        initial_plan.tool_calls.push(tool_call(
+            "initial_verification_plan",
+            "update_plan",
+            serde_json::json!({
+                "steps": [{"step": "repair and verify the changed fixture", "status": "in_progress"}],
+                "verification": [{
+                    "risk": risk,
+                    "evidence": format!("changed {fixture_name}"),
+                    "affected_symbol": format!("{fixture_name}::fixture_boundary"),
+                    "current_gap": "verification evidence is not yet recorded",
+                    "action": {
+                        "command": command,
+                        "cwd": ".",
+                        "timeout_seconds": 5,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                }]
+            }),
+        ));
+        let mut failed_check =
+            ModelTurnResponse::completed("model_request_turn_fixture_3", "response_4", "");
+        failed_check.tool_calls.push(tool_call(
+            "failed_check",
+            "command",
+            serde_json::json!({
+                "command": command,
+                "cwd": ".",
+                "timeout_seconds": 5
+            }),
+        ));
+        let mut repaired_patch_again =
+            ModelTurnResponse::completed("model_request_turn_fixture_4", "response_5", "");
+        repaired_patch_again.tool_calls.push(tool_call(
+            "repaired_patch_again",
+            "edit",
+            serde_json::json!({
+                "path": fixture_name,
+                "expected": incomplete_source,
+                "replacement": repaired_source
+            }),
+        ));
+        // The second mutation must invalidate the first plan and force a fresh, failure-aware
+        // entry before the final verification command.
+        let mut replanned_patch =
+            ModelTurnResponse::completed("model_request_turn_fixture_5", "response_6", "");
+        replanned_patch.tool_calls.push(tool_call(
+            "replanned_verification",
+            "update_plan",
+            serde_json::json!({
+                "steps": [{"step": "repair and verify the changed fixture", "status": "completed"}],
+                "verification": [{
+                    "risk": risk,
+                    "evidence": format!("changed {fixture_name}"),
+                    "affected_symbol": format!("{fixture_name}::fixture_boundary"),
+                    "current_gap": "command_exit_nonzero was observed; rerun after repair",
+                    "action": {
+                        "command": command,
+                        "cwd": ".",
+                        "timeout_seconds": 5,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                }]
+            }),
+        ));
+        let mut repaired_check =
+            ModelTurnResponse::completed("model_request_turn_fixture_6", "response_7", "");
+        repaired_check.tool_calls.push(tool_call(
+            "repaired_check",
+            "command",
+            serde_json::json!({
+                "command": command,
+                "cwd": ".",
+                "timeout_seconds": 5
+            }),
+        ));
+        let final_response =
+            ModelTurnResponse::completed("model_request_turn_fixture_7", "response_8", "completed");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let policy = allow_read_execute_policy().with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        );
+        let mut events = Vec::new();
+        let result = AgentLoop::new(
+            StaticProvider {
+                responses: vec![
+                    incomplete_patch,
+                    repaired_patch,
+                    initial_plan,
+                    failed_check,
+                    repaired_patch_again,
+                    replanned_patch,
+                    repaired_check,
+                    final_response,
+                ],
+                seen_requests: Arc::clone(&seen_requests),
+                capabilities: ProviderProtocolContract::default(),
+            },
+            agent_tool_broker_for_test(true),
+            policy,
+        )
+        .with_workspace_tools(
+            WorkspaceTools::new(workspace.path())
+                .expect("workspace tools")
+                .with_sandbox_backend(AgentSemanticFixtureBackend {
+                    file_path: file_path.clone(),
+                    repaired_source: repaired_source.to_string(),
+                }),
+        )
+        .run_with_events(
+            &AgentLoopInput::new("thread_fixture", "turn_fixture", goal).with_max_turns(8),
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result.status,
+            AgentStatus::Completed,
+            "error={:?} tools={:?} verification={:?}",
+            result.error,
+            result
+                .tool_results
+                .iter()
+                .map(|tool| (&tool.tool_name, &tool.error_code, tool.ok))
+                .collect::<Vec<_>>(),
+            result.verification
+        );
+        assert_eq!(
+            result.verification.final_review_verdict,
+            Some(FinalReviewVerdict::Accept)
+        );
+        assert_eq!(result.final_answer.as_deref(), Some("completed"));
+        assert_eq!(result.verification.required_command_count, 1);
+        assert_eq!(
+            std::fs::read_to_string(file_path).expect("fixture result"),
+            repaired_source
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentLoopEvent::Observation(AgentObservation::VerificationPlan(value))
+                if matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                    status: VerificationPlanStatus::Planned,
+                    ..
+                }) && value.risk_count == 1
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentLoopEvent::Observation(AgentObservation::VerificationPlan(value))
+                if matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                    status: VerificationPlanStatus::Rejected,
+                    ..
+                }) && value.risk_count == 1
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentLoopEvent::Observation(AgentObservation::RepairPlanning(value))
+                if value.reason == AgentRepairReason::VerificationFailed
+                    && matches!(value.lifecycle, OccurrenceLifecycle::Finished {
+                        status: RepairPlanningStatus::Planned,
+                        ..
+                    })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentLoopEvent::Observation(AgentObservation::FinalReview(value))
+                if value.verdict == Some(FinalReviewVerdict::Accept)
+        )));
+        assert!(result.tool_results.iter().any(
+            |tool_result| tool_result.error_code.as_deref() == Some("expected_content_missing")
+        ));
+        assert!(
+            result.tool_results.iter().any(
+                |tool_result| tool_result.error_code.as_deref() == Some("command_exit_nonzero")
+            )
+        );
+        let requests = seen_requests.lock().expect("requests");
+        assert_eq!(requests.len(), 8);
+        assert!(requests[7].tools.is_empty());
+    }
+}
+
+#[test]
 fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
     #[derive(Clone, Copy)]
     enum FinalizationCase {
@@ -7766,7 +8067,18 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
             .expect("bind workspace tools")
             .with_sandbox_backend(AgentStrictBackend),
     );
-    let input = AgentLoopInput::new("thread_1", "turn_1", "edit").with_max_turns(3);
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit")
+        .with_max_turns(3)
+        .with_verification_requirements([AgentVerificationRequirement::new(
+            command_script_scope_digest_with_policy(
+                &test_command_script("success"),
+                ".",
+                5,
+                SandboxFilesystemMode::WorkspaceWrite,
+                SandboxNetworkMode::Denied,
+            ),
+            1,
+        )]);
     let blocked = agent_loop.run(&input);
 
     assert_eq!(blocked.status, AgentStatus::Blocked);

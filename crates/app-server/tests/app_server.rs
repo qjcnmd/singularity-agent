@@ -3101,8 +3101,9 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
 
     // 固定模型返回序列：
     // 1. 请求 edit tool（触发 approval）
-    // 2. 确认 tool result 后请求 command verification
-    // 3. 返回 final answer
+    // 2. 基于已批准的真实 mutation 声明 revision-bound verification plan
+    // 3. 执行计划绑定的 command verification
+    // 4. 返回 final answer
     let mut edit_response = ModelTurnResponse::completed("req_1", "resp_1", "");
     edit_response
         .tool_calls
@@ -3124,29 +3125,65 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
             validation_errors: Vec::new(),
         });
 
-    let mut verify_response = ModelTurnResponse::completed("req_2", "resp_2", "");
+    let plan_arguments = serde_json::json!({
+        "steps": [{"step": "verify README.md", "status": "completed"}],
+        "verification": [{
+            "risk": "general_mutation",
+            "evidence": "README.md changed by the approved edit",
+            "affected_symbol": "README.md::document",
+            "current_gap": "the edited document has not been verified",
+            "action": {
+                "command": "type README.md",
+                "cwd": ".",
+                "timeout_seconds": 30,
+                "sandbox_mode": "workspace_write",
+                "network_access": "denied"
+            },
+            "required": 1
+        }]
+    });
+    let mut plan_response = ModelTurnResponse::completed("req_2", "resp_2", "");
+    plan_response
+        .tool_calls
+        .push(singularity_model::ModelToolCall {
+            tool_call_id: "call_plan_1".to_string(),
+            tool_name: "update_plan".to_string(),
+            raw_arguments: plan_arguments.to_string(),
+            arguments: plan_arguments,
+            parse_status: singularity_model::ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+
+    let mut verify_response = ModelTurnResponse::completed("req_3", "resp_3", "");
     verify_response
         .tool_calls
         .push(singularity_model::ModelToolCall {
             tool_call_id: "call_cmd_1".to_string(),
             tool_name: "command".to_string(),
             raw_arguments: serde_json::json!({
-                "command": "type README.md"
+                "command": "type README.md",
+                "timeout_seconds": 30
             })
             .to_string(),
             arguments: serde_json::json!({
-                "command": "type README.md"
+                "command": "type README.md",
+                "timeout_seconds": 30
             }),
             parse_status: singularity_model::ModelToolParseStatus::Valid,
             validation_errors: Vec::new(),
         });
 
     let final_response =
-        ModelTurnResponse::completed("req_3", "resp_3", "Task completed: README.md updated.");
+        ModelTurnResponse::completed("req_4", "resp_4", "Task completed: README.md updated.");
 
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let provider = SequenceProvider {
-        responses: vec![edit_response, verify_response, final_response],
+        responses: vec![
+            edit_response,
+            plan_response,
+            verify_response,
+            final_response,
+        ],
         seen_requests: Arc::clone(&seen_requests),
         negotiation_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
@@ -3258,8 +3295,8 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     let requests = seen_requests.lock().expect("requests");
     assert_eq!(
         requests.len(),
-        3,
-        "edit, verification, and finalization requests"
+        4,
+        "edit, planning, verification, and finalization requests"
     );
     let approved_edit_result = requests[1]
         .messages
@@ -3272,7 +3309,18 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     let approved_edit_payload: serde_json::Value =
         serde_json::from_str(&approved_edit_result.content).expect("edit result payload");
     assert_eq!(approved_edit_payload["ok"], true);
-    let command_result = requests[2]
+    let plan_result = requests[2]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == singularity_model::ModelRole::Tool
+                && message.tool_call_id.as_deref() == Some("call_plan_1")
+        })
+        .expect("verification plan result must precede the verification request");
+    let plan_payload: serde_json::Value =
+        serde_json::from_str(&plan_result.content).expect("plan result payload");
+    assert_eq!(plan_payload["ok"], true);
+    let command_result = requests[3]
         .messages
         .iter()
         .find(|message| {
@@ -3290,11 +3338,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
             event.span_kind == Some(singularity_protocol::TraceSpanKind::ProviderAttempt)
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        provider_events.len(),
-        6,
-        "three attempts need Start and End"
-    );
+    assert_eq!(provider_events.len(), 8, "four attempts need Start and End");
     let mut provider_pairs = std::collections::BTreeMap::new();
     for event in provider_events {
         let span_id = event.span_id.as_deref().expect("provider span id");
@@ -3305,7 +3349,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
             None => panic!("provider span phase"),
         }
     }
-    assert_eq!(provider_pairs.len(), 3);
+    assert_eq!(provider_pairs.len(), 4);
     for (_span_id, (start, end)) in provider_pairs {
         let start = start.expect("provider Start");
         let end = end.expect("provider End");

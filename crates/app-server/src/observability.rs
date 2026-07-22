@@ -5,7 +5,9 @@ use singularity_agent::{
     OccurrenceLifecycle, PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
     PromptAssemblyStatus, ProviderAttemptObservation,
     ProviderAttemptStatus as AgentProviderAttemptStatus, ProviderAttemptUsageObservation,
-    SandboxExecutionOccurrence, SandboxExecutionStatus, ToolCallStatus, VerificationStatus,
+    RepairPlanningObservation, RepairPlanningStatus, SandboxExecutionOccurrence,
+    SandboxExecutionStatus, ToolCallStatus, VerificationPlanObservation, VerificationPlanStatus,
+    VerificationStatus,
 };
 use singularity_core::Timestamp;
 use singularity_model::{
@@ -263,6 +265,12 @@ impl<'a> TraceProjector<'a> {
                     verification_metric_samples,
                 )
             }
+            AgentObservation::VerificationPlan(observation) => {
+                self.project_verification_plan(observation)
+            }
+            AgentObservation::RepairPlanning(observation) => {
+                self.project_repair_planning(observation)
+            }
             AgentObservation::FinalReview(observation) => {
                 let start = TraceFinalReviewProjection {
                     model_turn_ordinal: Some(u64::from(observation.model_turn_ordinal)),
@@ -324,6 +332,72 @@ impl<'a> TraceProjector<'a> {
                 ..TraceSpanProjection::default()
             },
             sandbox_span_status,
+            |_| Vec::new(),
+        )
+    }
+
+    fn project_verification_plan(
+        &mut self,
+        observation: VerificationPlanObservation,
+    ) -> Result<(), StoreError> {
+        let start = TraceVerificationProjection {
+            required_command_count: Some(u64::from(observation.requirement_count)),
+            satisfied_command_count: Some(u64::from(observation.satisfied_requirement_count)),
+            occurrence_count: Some(u64::from(observation.risk_count)),
+            ..TraceVerificationProjection::default()
+        };
+        self.append_lifecycle(
+            self.observation_span(
+                &observation.identity,
+                TraceSpanKind::Verification,
+                "verification plan",
+            ),
+            &observation.lifecycle,
+            TraceSpanProjection {
+                verification: Some(start.clone()),
+                ..TraceSpanProjection::default()
+            },
+            |status| TraceSpanProjection {
+                verification: Some(TraceVerificationProjection {
+                    status: Some(verification_plan_status(*status)),
+                    ..start.clone()
+                }),
+                ..TraceSpanProjection::default()
+            },
+            verification_plan_span_status,
+            |_| Vec::new(),
+        )
+    }
+
+    fn project_repair_planning(
+        &mut self,
+        observation: RepairPlanningObservation,
+    ) -> Result<(), StoreError> {
+        let start = TraceVerificationProjection {
+            required_command_count: Some(u64::from(observation.max_attempts)),
+            satisfied_command_count: Some(u64::from(observation.attempt)),
+            occurrence_count: Some(u64::from(observation.attempt)),
+            ..TraceVerificationProjection::default()
+        };
+        self.append_lifecycle(
+            self.observation_span(
+                &observation.identity,
+                TraceSpanKind::Verification,
+                "repair planning",
+            ),
+            &observation.lifecycle,
+            TraceSpanProjection {
+                verification: Some(start.clone()),
+                ..TraceSpanProjection::default()
+            },
+            |status| TraceSpanProjection {
+                verification: Some(TraceVerificationProjection {
+                    status: Some(repair_planning_status(*status)),
+                    ..start.clone()
+                }),
+                ..TraceSpanProjection::default()
+            },
+            repair_planning_span_status,
             |_| Vec::new(),
         )
     }
@@ -582,6 +656,38 @@ fn verification_metric_samples(status: &VerificationStatus) -> Vec<TraceMetricSa
             count: 1,
         }],
         _ => Vec::new(),
+    }
+}
+
+fn verification_plan_status(status: VerificationPlanStatus) -> TraceVerificationStatus {
+    match status {
+        VerificationPlanStatus::Planned => TraceVerificationStatus::CommandPassed,
+        VerificationPlanStatus::Rejected => TraceVerificationStatus::GateRejected,
+        VerificationPlanStatus::Cancelled => TraceVerificationStatus::CommandFailed,
+    }
+}
+
+fn verification_plan_span_status(status: &VerificationPlanStatus) -> TraceSpanStatus {
+    match status {
+        VerificationPlanStatus::Planned => TraceSpanStatus::Ok,
+        VerificationPlanStatus::Rejected => TraceSpanStatus::Error,
+        VerificationPlanStatus::Cancelled => TraceSpanStatus::Cancelled,
+    }
+}
+
+fn repair_planning_status(status: RepairPlanningStatus) -> TraceVerificationStatus {
+    match status {
+        RepairPlanningStatus::Planned => TraceVerificationStatus::RepairRequested,
+        RepairPlanningStatus::Exhausted => TraceVerificationStatus::GateRejected,
+        RepairPlanningStatus::Cancelled => TraceVerificationStatus::CommandFailed,
+    }
+}
+
+fn repair_planning_span_status(status: &RepairPlanningStatus) -> TraceSpanStatus {
+    match status {
+        RepairPlanningStatus::Planned => TraceSpanStatus::Error,
+        RepairPlanningStatus::Exhausted => TraceSpanStatus::Error,
+        RepairPlanningStatus::Cancelled => TraceSpanStatus::Cancelled,
     }
 }
 
