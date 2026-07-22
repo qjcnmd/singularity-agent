@@ -1,7 +1,6 @@
 //! 工作区文件读取、目录列举和文本搜索操作。
 
 use super::*;
-
 impl WorkspaceTools {
     /// 在工作区内读取有界文件内容。
     pub fn read(&self, input: ReadToolInput) -> Result<ToolOutput, WorkspaceToolError> {
@@ -33,15 +32,20 @@ impl WorkspaceTools {
         let relative = target.display.clone();
         check_cancelled(cancellation)?;
         let file = self.open_file_at(&target)?;
+        let initial_metadata = self
+            .file_revision_metadata(&relative, &file)
+            .map_err(|error| map_capability_error(error, &relative))?;
         check_cancelled(cancellation)?;
         let mut reader = CancellableLineReader::new(file);
         let mut line = Vec::new();
+        let mut content_hasher = Sha256::new();
         let mut preview = String::new();
         let mut preview_truncated = false;
         let mut actual_line_start = None;
         let mut actual_line_end = None;
         let mut total_lines = 0usize;
         let mut last_line_partial = false;
+        let mut binary_line = None;
 
         loop {
             check_cancelled(cancellation)?;
@@ -52,17 +56,13 @@ impl WorkspaceTools {
                 break;
             }
             total_lines = total_lines.saturating_add(1);
+            content_hasher.update(&line);
+            if binary_line.is_some() {
+                continue;
+            }
             if is_binary(&line) {
-                check_cancelled(cancellation)?;
-                return Ok(ToolOutput::success(json!({
-                    "path": relative,
-                    "binary": true,
-                    "preview": BINARY_CONTENT_PREVIEW,
-                    "truncated": true,
-                    "line_start": Value::Null,
-                    "line_end": Value::Null,
-                    "total_lines": total_lines,
-                })));
+                binary_line = Some(total_lines);
+                continue;
             }
             let text = std::str::from_utf8(&line)
                 .map(str::to_string)
@@ -90,6 +90,34 @@ impl WorkspaceTools {
         }
 
         check_cancelled(cancellation)?;
+        let file = reader.into_inner();
+        let post_metadata = self
+            .file_revision_metadata(&relative, &file)
+            .map_err(|error| map_capability_error(error, &relative))?;
+        if !post_metadata.same_metadata(&initial_metadata) {
+            return Err(WorkspaceToolError::ConcurrentMutation(relative));
+        }
+        let observed_revision =
+            initial_metadata.with_digest(format!("sha256:{:x}", content_hasher.finalize()));
+        let current_revision =
+            self.current_file_content_revision_with_cancellation(&target, cancellation)?;
+        drop(file);
+        if current_revision.as_ref() != Some(&observed_revision) {
+            return Err(WorkspaceToolError::ConcurrentMutation(
+                target.display.clone(),
+            ));
+        }
+        if let Some(binary_line) = binary_line {
+            return Ok(ToolOutput::success(json!({
+                "path": target.display,
+                "binary": true,
+                "preview": BINARY_CONTENT_PREVIEW,
+                "truncated": true,
+                "line_start": Value::Null,
+                "line_end": Value::Null,
+                "total_lines": binary_line,
+            })));
+        }
         let next_line_start = actual_line_end.and_then(|line_end| {
             if last_line_partial {
                 None
@@ -493,6 +521,10 @@ impl<R: Read> CancellableLineReader<R> {
             chunk_start: 0,
             chunk_end: 0,
         }
+    }
+
+    fn into_inner(self) -> R {
+        self.reader
     }
 
     fn read_until(

@@ -142,10 +142,10 @@ mod mutation_tests {
         std::fs::write(&target, "before").expect("write target");
         let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
-        let (_, original_identity) = tools.existing_text_or_empty(&path).expect("read original");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
 
         let result =
-            tools.atomic_write_with_hook(&path, "after", original_identity.as_deref(), |_| {
+            tools.atomic_write_with_hook(&path, "after", original_revision.as_ref(), |_| {
                 std::fs::remove_file(&target).expect("remove original");
                 std::fs::write(&target, "after!").expect("write concurrent target");
             });
@@ -154,7 +154,7 @@ mod mutation_tests {
             result,
             Err(AtomicWriteFailure {
                 error: WorkspaceToolError::ConcurrentMutation(_),
-                published_identity: None,
+                published_revision: None,
             })
         ));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "after!");
@@ -177,13 +177,13 @@ mod mutation_tests {
         std::fs::write(&target, "before").expect("write target");
         let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
-        let (_, original_identity) = tools.existing_text_or_empty(&path).expect("read original");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
         let mut replacement_path = None;
 
         let result = tools.atomic_write_with_hook(
             &path,
             "after",
-            original_identity.as_deref(),
+            original_revision.as_ref(),
             |temporary_name| {
                 let temporary_path = workspace.join(temporary_name);
                 std::fs::remove_file(&temporary_path).expect("remove owned temp");
@@ -196,7 +196,7 @@ mod mutation_tests {
             result,
             Err(AtomicWriteFailure {
                 error: WorkspaceToolError::ConcurrentMutation(_),
-                published_identity: None,
+                published_revision: None,
             })
         ));
         let replacement_path = replacement_path.expect("replacement path");
@@ -215,11 +215,11 @@ mod mutation_tests {
         let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let existing_path = CapabilityRelativePath::parse("existing.txt").expect("existing path");
         let created_path = CapabilityRelativePath::parse("created.txt").expect("created path");
-        let (original, original_identity) = tools
+        let (original, original_revision) = tools
             .existing_text_or_empty(&existing_path)
             .expect("read existing");
         let existing_published = tools
-            .atomic_write(&existing_path, "after", original_identity.as_deref())
+            .atomic_write(&existing_path, "after", original_revision.as_ref())
             .expect("publish existing");
         let created_published = tools
             .atomic_write(&created_path, "created", None)
@@ -231,9 +231,9 @@ mod mutation_tests {
                     relative: "existing.txt".to_string(),
                     original,
                     updated: "after".to_string(),
-                    original_identity,
+                    original_revision,
                 },
-                published_identity: existing_published,
+                published_revision: existing_published,
             },
             PublishedMutation {
                 prepared: PreparedMutation {
@@ -241,9 +241,9 @@ mod mutation_tests {
                     relative: "created.txt".to_string(),
                     original: String::new(),
                     updated: "created".to_string(),
-                    original_identity: None,
+                    original_revision: None,
                 },
-                published_identity: created_published,
+                published_revision: created_published,
             },
         ];
 
@@ -266,14 +266,14 @@ mod mutation_tests {
         std::fs::write(&target, "before").expect("write target");
         let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
-        let (original, original_identity) =
+        let (original, original_revision) =
             tools.existing_text_or_empty(&path).expect("read original");
 
         let failure = tools
             .atomic_write_with_hooks(
                 &path,
                 "published",
-                original_identity.as_deref(),
+                original_revision.as_ref(),
                 |_| {},
                 || {
                     Err(WorkspaceToolError::ConcurrentMutation(
@@ -282,23 +282,208 @@ mod mutation_tests {
                 },
             )
             .expect_err("post-publish verification fails");
-        let published_identity = failure
-            .published_identity
+        let published_revision = failure
+            .published_revision
             .expect("failure retains published identity");
+        let published_revision = *published_revision;
         let published = vec![PublishedMutation {
             prepared: PreparedMutation {
                 path,
                 relative: "target.txt".to_string(),
                 original,
                 updated: "published".to_string(),
-                original_identity,
+                original_revision,
             },
-            published_identity,
+            published_revision,
         }];
 
         tools
             .rollback_published(&published)
             .expect("rollback current published mutation");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn atomic_write_rejects_same_object_temp_content_tampering() {
+        let workspace = test_workspace("temp-content-tampering");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+
+        let result = tools.atomic_write_with_hook(
+            &path,
+            "after",
+            original_revision.as_ref(),
+            |temporary_name| {
+                std::fs::write(workspace.join(temporary_name), "other")
+                    .expect("tamper with owned temp content");
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(AtomicWriteFailure {
+                error: WorkspaceToolError::ConcurrentMutation(_),
+                published_revision: None,
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        assert!(
+            std::fs::read_dir(&workspace)
+                .expect("read workspace")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("singularity-tmp"))
+        );
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn atomic_write_cleans_temp_when_target_revision_cannot_be_read() {
+        let workspace = test_workspace("target-revision-error-cleanup");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+
+        let failure = tools
+            .atomic_write_with_hook(&path, "after", original_revision.as_ref(), |_| {
+                std::fs::remove_file(&target).expect("remove target");
+                std::fs::create_dir(&target).expect("replace target with directory");
+            })
+            .expect_err("an unreadable target revision must fail closed");
+
+        assert!(failure.published_revision.is_none());
+        assert!(target.is_dir());
+        assert!(
+            std::fs::read_dir(&workspace)
+                .expect("read workspace")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("singularity-tmp"))
+        );
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn post_publish_replacement_is_not_claimed_or_overwritten_by_rollback() {
+        let workspace = test_workspace("post-publish-external-replacement");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+
+        let failure = tools
+            .atomic_write_with_hooks(
+                &path,
+                "published",
+                original_revision.as_ref(),
+                |_| {},
+                || {
+                    std::fs::remove_file(&target).expect("remove published target");
+                    std::fs::write(&target, "external").expect("write external target");
+                    Err(WorkspaceToolError::ReadFailed(
+                        "injected failure".to_string(),
+                    ))
+                },
+            )
+            .expect_err("external replacement must fail closed");
+
+        assert!(matches!(
+            failure,
+            AtomicWriteFailure {
+                error: WorkspaceToolError::ConcurrentMutation(_),
+                published_revision: None,
+            }
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "external");
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn post_publish_disappearance_is_not_claimed_for_rollback() {
+        let workspace = test_workspace("post-publish-disappearance");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+
+        let failure = tools
+            .atomic_write_with_hooks(
+                &path,
+                "published",
+                original_revision.as_ref(),
+                |_| {},
+                || {
+                    std::fs::remove_file(&target).expect("remove published target");
+                    Ok(())
+                },
+            )
+            .expect_err("a missing published target must fail closed");
+
+        assert!(matches!(
+            failure,
+            AtomicWriteFailure {
+                error: WorkspaceToolError::ConcurrentMutation(_),
+                published_revision: None,
+            }
+        ));
+        assert!(!target.exists());
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn post_publish_same_object_content_tampering_is_rolled_back() {
+        let workspace = test_workspace("post-publish-content-tampering");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (original, original_revision) =
+            tools.existing_text_or_empty(&path).expect("read original");
+
+        let failure = tools
+            .atomic_write_with_hooks(
+                &path,
+                "published",
+                original_revision.as_ref(),
+                |_| {},
+                || {
+                    std::fs::write(&target, "tampered").expect("tamper published target");
+                    Ok(())
+                },
+            )
+            .expect_err("tampered published content must fail closed");
+        let published_revision = failure
+            .published_revision
+            .expect("owned published object remains safe to roll back");
+        assert!(matches!(
+            failure.error,
+            WorkspaceToolError::ConcurrentMutation(_)
+        ));
+        tools
+            .rollback_published(&[PublishedMutation {
+                prepared: PreparedMutation {
+                    path,
+                    relative: "target.txt".to_string(),
+                    original,
+                    updated: "published".to_string(),
+                    original_revision,
+                },
+                published_revision: *published_revision,
+            }])
+            .expect("roll back owned tampered publication");
+
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
         remove_workspace(&workspace);
     }
@@ -310,10 +495,10 @@ mod mutation_tests {
         std::fs::write(&target, "before").expect("write target");
         let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
-        let (original, original_identity) =
+        let (original, original_revision) =
             tools.existing_text_or_empty(&path).expect("read original");
-        let published_identity = tools
-            .atomic_write(&path, "published", original_identity.as_deref())
+        let published_revision = tools
+            .atomic_write(&path, "published", original_revision.as_ref())
             .expect("publish mutation");
         std::fs::remove_file(&target).expect("remove published target");
         std::fs::write(&target, "concurrent").expect("write concurrent target");
@@ -323,9 +508,9 @@ mod mutation_tests {
                 relative: "target.txt".to_string(),
                 original,
                 updated: "published".to_string(),
-                original_identity,
+                original_revision,
             },
-            published_identity,
+            published_revision,
         }];
 
         assert!(matches!(
@@ -381,6 +566,100 @@ mod mutation_tests {
             .expect("patch script");
 
         assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o751);
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn atomic_write_rejects_same_length_replacement_with_restored_mtime() {
+        let workspace = test_workspace("same-length-restored-mtime");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let original_modified = std::fs::metadata(&target)
+            .expect("target metadata")
+            .modified()
+            .expect("target modified time");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+
+        std::fs::remove_file(&target).expect("remove original target");
+        std::fs::write(&target, "after!").expect("recreate target content");
+        let replacement = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .expect("open replacement");
+        replacement
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .expect("restore replacement mtime");
+
+        let result = tools.atomic_write(&path, "updated", original_revision.as_ref());
+
+        assert!(matches!(
+            result,
+            Err(AtomicWriteFailure {
+                error: WorkspaceToolError::ConcurrentMutation(_),
+                published_revision: None,
+            })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "after!",
+            "a same-length replacement with restored mtime must not be overwritten"
+        );
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn atomic_write_rejects_same_content_recreated_object_with_restored_mtime() {
+        let workspace = test_workspace("same-content-recreated-object");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let original_modified = std::fs::metadata(&target)
+            .expect("target metadata")
+            .modified()
+            .expect("target modified time");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+
+        std::fs::remove_file(&target).expect("remove original target");
+        std::fs::write(&target, "before").expect("recreate target content");
+        let replacement = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .expect("open replacement");
+        replacement
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .expect("restore replacement mtime");
+
+        let result = tools.atomic_write(&path, "updated", original_revision.as_ref());
+
+        assert!(matches!(
+            result,
+            Err(AtomicWriteFailure {
+                error: WorkspaceToolError::ConcurrentMutation(_),
+                published_revision: None,
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        remove_workspace(&workspace);
+    }
+
+    #[test]
+    fn content_revision_rejects_mutation_after_pre_read_metadata() {
+        let workspace = test_workspace("mutation-during-read");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let result = tools.read_file_with_revision_after_metadata_hook_for_test(&path, || {
+            std::fs::write(&target, "changed").expect("mutate target after pre-read metadata");
+        });
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceToolError::ConcurrentMutation(_))
+        ));
         remove_workspace(&workspace);
     }
 }

@@ -44,7 +44,7 @@ impl WorkspaceTools {
                     "{DUPLICATE_PATCH_TARGET}: {relative}"
                 )));
             }
-            let (original, original_identity) = self.existing_text_or_empty(&target)?;
+            let (original, original_revision) = self.existing_text_or_empty(&target)?;
             let updated = if let Some(expected) = &change.expected {
                 if !original.contains(expected) {
                     return Err(WorkspaceToolError::ExpectedContentMissing(relative));
@@ -63,7 +63,7 @@ impl WorkspaceTools {
                 relative,
                 original,
                 updated,
-                original_identity,
+                original_revision,
             });
         }
         let mut created_directories = Vec::new();
@@ -84,21 +84,21 @@ impl WorkspaceTools {
             match self.atomic_write(
                 &mutation.path,
                 &mutation.updated,
-                mutation.original_identity.as_deref(),
+                mutation.original_revision.as_ref(),
             ) {
-                Ok(published_identity) => published.push(PublishedMutation {
+                Ok(published_revision) => published.push(PublishedMutation {
                     prepared: mutation.clone(),
-                    published_identity,
+                    published_revision,
                 }),
                 Err(write_failure) => {
                     let AtomicWriteFailure {
                         error: write_error,
-                        published_identity,
+                        published_revision,
                     } = write_failure;
-                    if let Some(published_identity) = published_identity {
+                    if let Some(published_revision) = published_revision {
                         published.push(PublishedMutation {
                             prepared: mutation.clone(),
-                            published_identity,
+                            published_revision: *published_revision,
                         });
                     }
                     let file_rollback = self.rollback_published(&published);
@@ -192,36 +192,41 @@ impl WorkspaceTools {
         &self,
         path: &CapabilityRelativePath,
         content: &str,
-        expected_identity: Option<&str>,
-    ) -> Result<String, AtomicWriteFailure> {
-        self.atomic_write_with_hook(path, content, expected_identity, |_| {})
+        expected_revision: Option<&WorkspaceContentRevision>,
+    ) -> Result<WorkspaceContentRevision, AtomicWriteFailure> {
+        self.atomic_write_with_hook(path, content, expected_revision, |_| {})
     }
 
     pub(crate) fn atomic_write_with_hook(
         &self,
         path: &CapabilityRelativePath,
         content: &str,
-        expected_identity: Option<&str>,
+        expected_revision: Option<&WorkspaceContentRevision>,
         before_rename: impl FnOnce(&OsStr),
-    ) -> Result<String, AtomicWriteFailure> {
-        self.atomic_write_with_hooks(path, content, expected_identity, before_rename, || Ok(()))
+    ) -> Result<WorkspaceContentRevision, AtomicWriteFailure> {
+        self.atomic_write_with_hooks(path, content, expected_revision, before_rename, || Ok(()))
     }
 
     pub(crate) fn atomic_write_with_hooks(
         &self,
         path: &CapabilityRelativePath,
         content: &str,
-        expected_identity: Option<&str>,
+        expected_revision: Option<&WorkspaceContentRevision>,
         before_rename: impl FnOnce(&OsStr),
         after_rename: impl FnOnce() -> Result<(), WorkspaceToolError>,
-    ) -> Result<String, AtomicWriteFailure> {
+    ) -> Result<WorkspaceContentRevision, AtomicWriteFailure> {
         let parent = self
             .open_parent_directory(&path.relative, false)
             .map_err(|error| map_capability_error(error, &path.display))?;
         let initial_target = self
-            .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
+            .atomic_target_state(
+                parent.dir(),
+                &parent.actual_relative,
+                &parent.name,
+                &path.display,
+            )
             .map_err(|error| map_capability_error(error, &path.display))?;
-        if initial_target.as_ref().map(|state| state.identity.as_str()) != expected_identity {
+        if initial_target.as_ref().map(|state| &state.revision) != expected_revision {
             return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into());
         }
         let original_permissions = initial_target.map(|state| state.permissions);
@@ -245,24 +250,97 @@ impl WorkspaceTools {
             )
             .into());
         }
-        temporary_identity = file_object_identity_key(&temporary_file)
-            .map_err(|error| map_capability_error(error, &path.display))?;
+        temporary_identity = match file_object_identity_key(&temporary_file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(temporary_file);
+                return Err(cleanup_owned_file(
+                    parent.dir(),
+                    &temporary_name,
+                    &temporary_identity,
+                    map_capability_error(error, &path.display),
+                )
+                .into());
+            }
+        };
+        let temporary_revision =
+            match self.file_revision_metadata(&path.display, &temporary_file) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    drop(temporary_file);
+                    return Err(cleanup_owned_file(
+                        parent.dir(),
+                        &temporary_name,
+                        &temporary_identity,
+                        map_capability_error(error, &path.display),
+                    )
+                    .into());
+                }
+            }
+            .with_digest(format!("sha256:{:x}", Sha256::digest(content.as_bytes())));
         before_rename(&temporary_name);
-        let source_identity = open_file_from_parent(parent.dir(), &temporary_name)
-            .and_then(|file| file_object_identity_key(&file))
-            .map_err(|error| map_capability_error(error, &path.display))?;
-        if source_identity != temporary_identity {
+        let mut source_file = match open_file_from_parent(parent.dir(), &temporary_name) {
+            Ok(file) => file,
+            Err(error) => {
+                drop(temporary_file);
+                return Err(cleanup_owned_file(
+                    parent.dir(),
+                    &temporary_name,
+                    &temporary_identity,
+                    map_capability_error(error, &path.display),
+                )
+                .into());
+            }
+        };
+        let source_revision =
+            match self.read_file_bytes_with_revision(&path.display, &mut source_file) {
+                Ok((_, revision)) => revision,
+                Err(error) => {
+                    drop(source_file);
+                    drop(temporary_file);
+                    return Err(cleanup_owned_file(
+                        parent.dir(),
+                        &temporary_name,
+                        &temporary_identity,
+                        map_capability_error(error, &path.display),
+                    )
+                    .into());
+                }
+            };
+        if source_revision != temporary_revision {
+            drop(source_file);
             drop(temporary_file);
+            if source_revision.object_identity == temporary_identity {
+                return Err(cleanup_owned_file(
+                    parent.dir(),
+                    &temporary_name,
+                    &temporary_identity,
+                    WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                )
+                .into());
+            }
             return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into());
         }
-        let current_identity = self
-            .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
-            .map_err(|error| map_capability_error(error, &path.display))?;
-        if current_identity
-            .as_ref()
-            .map(|state| state.identity.as_str())
-            != expected_identity
-        {
+        let current_target = match self.atomic_target_state(
+            parent.dir(),
+            &parent.actual_relative,
+            &parent.name,
+            &path.display,
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                drop(source_file);
+                drop(temporary_file);
+                return Err(cleanup_owned_file(
+                    parent.dir(),
+                    &temporary_name,
+                    &temporary_identity,
+                    map_capability_error(error, &path.display),
+                )
+                .into());
+            }
+        };
+        if current_target.as_ref().map(|state| &state.revision) != expected_revision {
             drop(temporary_file);
             return Err(cleanup_owned_file(
                 parent.dir(),
@@ -287,35 +365,38 @@ impl WorkspaceTools {
         }
         drop(temporary_file);
         if let Err(error) = after_rename() {
-            let published_identity = self
-                .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
-                .ok()
-                .flatten()
-                .map(|state| state.identity)
-                .unwrap_or_else(|| temporary_identity.clone());
-            return Err(AtomicWriteFailure::published(error, published_identity));
+            return match self.atomic_target_state(
+                parent.dir(),
+                &parent.actual_relative,
+                &parent.name,
+                &path.display,
+            ) {
+                Ok(Some(state)) if state.revision.object_identity == temporary_identity => {
+                    Err(AtomicWriteFailure::published(error, state.revision))
+                }
+                Ok(_) => Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into()),
+                Err(state_error) => Err(map_capability_error(state_error, &path.display).into()),
+            };
         }
         let published_state = self
-            .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
-            .map_err(|error| {
-                AtomicWriteFailure::published(
-                    map_capability_error(error, &path.display),
-                    temporary_identity.clone(),
-                )
-            })?
-            .ok_or_else(|| {
-                AtomicWriteFailure::published(
-                    WorkspaceToolError::ConcurrentMutation(path.display.clone()),
-                    temporary_identity.clone(),
-                )
-            })?;
-        if published_state.object_identity != temporary_identity {
+            .atomic_target_state(
+                parent.dir(),
+                &parent.actual_relative,
+                &parent.name,
+                &path.display,
+            )
+            .map_err(|error| map_capability_error(error, &path.display))?
+            .ok_or_else(|| WorkspaceToolError::ConcurrentMutation(path.display.clone()))?;
+        if published_state.revision.object_identity != temporary_identity {
+            return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into());
+        }
+        if published_state.revision.content_digest != temporary_revision.content_digest {
             return Err(AtomicWriteFailure::published(
                 WorkspaceToolError::ConcurrentMutation(path.display.clone()),
-                temporary_identity,
+                published_state.revision,
             ));
         }
-        Ok(published_state.identity)
+        Ok(published_state.revision)
     }
 
     fn atomic_target_state(
@@ -323,6 +404,7 @@ impl WorkspaceTools {
         parent: &CapabilityDir,
         parent_relative: &str,
         name: &OsStr,
+        revision_relative: &str,
     ) -> Result<Option<AtomicTargetState>, CapabilityAccessError> {
         match parent.symlink_metadata(name) {
             Ok(metadata) => {
@@ -332,21 +414,20 @@ impl WorkspaceTools {
                 if !metadata.is_file() {
                     return Err(CapabilityAccessError::NotRegularFile);
                 }
-                let file = open_file_from_parent(parent, name)?;
+                let mut file = open_file_from_parent(parent, name)?;
                 let actual = self
                     .actual_relative_for_file(&file, &join_relative_path(parent_relative, name))?;
                 if is_protected_path(&actual) {
                     return Err(CapabilityAccessError::Protected(actual));
                 }
-                let identity = file_target_identity_key(&file)?;
-                let object_identity = file_object_identity_key(&file)?;
                 let permissions = file
                     .metadata()
                     .map_err(CapabilityAccessError::Io)?
                     .permissions();
+                let (_, revision) =
+                    self.read_file_bytes_with_revision(revision_relative, &mut file)?;
                 Ok(Some(AtomicTargetState {
-                    identity,
-                    object_identity,
+                    revision,
                     permissions,
                 }))
             }
@@ -361,16 +442,16 @@ impl WorkspaceTools {
     ) -> Result<(), WorkspaceToolError> {
         let mut failures = Vec::new();
         for mutation in published.iter().rev() {
-            let result = if mutation.prepared.original_identity.is_some() {
+            let result = if mutation.prepared.original_revision.is_some() {
                 self.atomic_write(
                     &mutation.prepared.path,
                     &mutation.prepared.original,
-                    Some(&mutation.published_identity),
+                    Some(&mutation.published_revision),
                 )
                 .map(|_| ())
                 .map_err(|failure| failure.error)
             } else {
-                self.remove_created_file(&mutation.prepared.path, &mutation.published_identity)
+                self.remove_created_file(&mutation.prepared.path, &mutation.published_revision)
             };
             if let Err(error) = result {
                 failures.push(format!("{}: {error}", mutation.prepared.relative));
@@ -386,7 +467,7 @@ impl WorkspaceTools {
     fn remove_created_file(
         &self,
         path: &CapabilityRelativePath,
-        expected_identity: &str,
+        expected_revision: &WorkspaceContentRevision,
     ) -> Result<(), WorkspaceToolError> {
         let parent = match self.open_parent_directory(&path.relative, false) {
             Ok(parent) => parent,
@@ -394,11 +475,16 @@ impl WorkspaceTools {
             Err(error) => return Err(map_capability_error(error, &path.display)),
         };
         let current_identity = self
-            .atomic_target_state(parent.dir(), &parent.actual_relative, &parent.name)
+            .atomic_target_state(
+                parent.dir(),
+                &parent.actual_relative,
+                &parent.name,
+                &path.display,
+            )
             .map_err(|error| map_capability_error(error, &path.display))?;
         match current_identity {
             None => Ok(()),
-            Some(state) if state.identity == expected_identity => parent
+            Some(state) if state.revision == *expected_revision => parent
                 .dir()
                 .remove_file_or_symlink(&parent.name)
                 .map_err(io_error),
@@ -466,25 +552,25 @@ pub(crate) struct PreparedMutation {
     pub(crate) relative: String,
     pub(crate) original: String,
     pub(crate) updated: String,
-    pub(crate) original_identity: Option<String>,
+    pub(crate) original_revision: Option<WorkspaceContentRevision>,
 }
 
 pub(crate) struct PublishedMutation {
     pub(crate) prepared: PreparedMutation,
-    pub(crate) published_identity: String,
+    pub(crate) published_revision: WorkspaceContentRevision,
 }
 
 #[derive(Debug)]
 pub(crate) struct AtomicWriteFailure {
     pub(crate) error: WorkspaceToolError,
-    pub(crate) published_identity: Option<String>,
+    pub(crate) published_revision: Option<Box<WorkspaceContentRevision>>,
 }
 
 impl AtomicWriteFailure {
-    fn published(error: WorkspaceToolError, published_identity: String) -> Self {
+    fn published(error: WorkspaceToolError, published_revision: WorkspaceContentRevision) -> Self {
         Self {
             error,
-            published_identity: Some(published_identity),
+            published_revision: Some(Box::new(published_revision)),
         }
     }
 }
@@ -493,14 +579,13 @@ impl From<WorkspaceToolError> for AtomicWriteFailure {
     fn from(error: WorkspaceToolError) -> Self {
         Self {
             error,
-            published_identity: None,
+            published_revision: None,
         }
     }
 }
 
 struct AtomicTargetState {
-    identity: String,
-    object_identity: String,
+    revision: WorkspaceContentRevision,
     permissions: CapabilityPermissions,
 }
 

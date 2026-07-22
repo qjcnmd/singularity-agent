@@ -1111,7 +1111,7 @@ impl WorkspaceTools {
     pub(crate) fn existing_text_or_empty(
         &self,
         path: &CapabilityRelativePath,
-    ) -> Result<(String, Option<String>), WorkspaceToolError> {
+    ) -> Result<(String, Option<WorkspaceContentRevision>), WorkspaceToolError> {
         if path.relative == Path::new(".") {
             return Err(WorkspaceToolError::ReadFailed(
                 "workspace path is not a regular file".to_string(),
@@ -1123,11 +1123,135 @@ impl WorkspaceTools {
         else {
             return Ok((String::new(), None));
         };
-        let identity = file_target_identity_key(&file)
+        let (bytes, revision) = self
+            .read_file_bytes_with_revision(&path.display, &mut file)
             .map_err(|error| map_capability_error(error, &path.display))?;
-        let mut content = String::new();
-        file.read_to_string(&mut content).map_err(io_error)?;
-        Ok((content, Some(identity)))
+        let current_revision = self.current_file_content_revision(path)?;
+        drop(file);
+        if current_revision.as_ref() != Some(&revision) {
+            return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()));
+        }
+        let content = String::from_utf8(bytes).map_err(|error| {
+            WorkspaceToolError::ReadFailed(format!("workspace file is not valid utf-8: {error}"))
+        })?;
+        Ok((content, Some(revision)))
+    }
+
+    fn file_revision_metadata(
+        &self,
+        relative: &str,
+        file: &CapabilityFile,
+    ) -> Result<WorkspaceContentRevision, CapabilityAccessError> {
+        let metadata = file.metadata().map_err(classify_io_error)?;
+        if metadata_is_symlink_or_reparse(&metadata) {
+            return Err(CapabilityAccessError::Unsafe);
+        }
+        if !metadata.is_file() {
+            return Err(CapabilityAccessError::NotRegularFile);
+        }
+        let object_identity = file_object_identity_key(file)?;
+        let stable_metadata = file_content_revision_metadata_key(file)?;
+        Ok(WorkspaceContentRevision::metadata_only(
+            relative,
+            "regular",
+            object_identity,
+            stable_metadata,
+        ))
+    }
+
+    fn read_file_bytes_with_revision(
+        &self,
+        relative: &str,
+        file: &mut CapabilityFile,
+    ) -> Result<(Vec<u8>, WorkspaceContentRevision), CapabilityAccessError> {
+        self.read_file_bytes_with_revision_and_hook(relative, file, || {})
+    }
+
+    fn read_file_bytes_with_revision_and_hook(
+        &self,
+        relative: &str,
+        file: &mut CapabilityFile,
+        after_metadata: impl FnOnce(),
+    ) -> Result<(Vec<u8>, WorkspaceContentRevision), CapabilityAccessError> {
+        let pre_metadata = self.file_revision_metadata(relative, file)?;
+        after_metadata();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(CapabilityAccessError::Io)?;
+        let post_metadata = self.file_revision_metadata(relative, file)?;
+        if !pre_metadata.same_metadata(&post_metadata) {
+            return Err(CapabilityAccessError::ConcurrentMutation);
+        }
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        Ok((bytes, pre_metadata.with_digest(digest)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_file_with_revision_after_metadata_hook_for_test(
+        &self,
+        path: &CapabilityRelativePath,
+        after_metadata: impl FnOnce(),
+    ) -> Result<(), WorkspaceToolError> {
+        let mut file = self
+            .open_existing_file(path)
+            .map_err(|error| map_capability_error(error, &path.display))?
+            .ok_or_else(|| {
+                WorkspaceToolError::ReadFailed("workspace path is unavailable".to_string())
+            })?;
+        self.read_file_bytes_with_revision_and_hook(&path.display, &mut file, after_metadata)
+            .map(|_| ())
+            .map_err(|error| map_capability_error(error, &path.display))
+    }
+
+    fn current_file_content_revision(
+        &self,
+        path: &CapabilityRelativePath,
+    ) -> Result<Option<WorkspaceContentRevision>, WorkspaceToolError> {
+        let Some(mut file) = self
+            .open_existing_file(path)
+            .map_err(|error| map_capability_error(error, &path.display))?
+        else {
+            return Ok(None);
+        };
+        self.read_file_bytes_with_revision(&path.display, &mut file)
+            .map(|(_, revision)| Some(revision))
+            .map_err(|error| map_capability_error(error, &path.display))
+    }
+
+    fn current_file_content_revision_with_cancellation(
+        &self,
+        path: &CapabilityRelativePath,
+        cancellation: &dyn Fn() -> bool,
+    ) -> Result<Option<WorkspaceContentRevision>, WorkspaceToolError> {
+        let Some(mut file) = self
+            .open_existing_file(path)
+            .map_err(|error| map_capability_error(error, &path.display))?
+        else {
+            return Ok(None);
+        };
+        let initial_metadata = self
+            .file_revision_metadata(&path.display, &file)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        let mut hasher = Sha256::new();
+        let mut chunk = [0u8; FILE_READ_CHUNK_SIZE];
+        loop {
+            check_cancelled(cancellation)?;
+            let bytes_read = file.read(&mut chunk).map_err(io_error)?;
+            check_cancelled(cancellation)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&chunk[..bytes_read]);
+        }
+        let final_metadata = self
+            .file_revision_metadata(&path.display, &file)
+            .map_err(|error| map_capability_error(error, &path.display))?;
+        if !initial_metadata.same_metadata(&final_metadata) {
+            return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()));
+        }
+        Ok(Some(
+            initial_metadata.with_digest(format!("sha256:{:x}", hasher.finalize())),
+        ))
     }
 
     fn duplicate_target_key(
@@ -1542,6 +1666,48 @@ impl CapabilityRelativePath {
     }
 }
 
+/// 工作区文件在一次安全读取/写入保护中的内容 revision。
+///
+/// 该值同时绑定路径、文件类型、对象身份、稳定元数据和正文摘要；任何一个
+/// 组成部分变化都必须使依赖旧 revision 的原子写入失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceContentRevision {
+    pub(crate) relative: String,
+    pub(crate) file_type: String,
+    pub(crate) object_identity: String,
+    pub(crate) stable_metadata: String,
+    pub(crate) content_digest: String,
+}
+
+impl WorkspaceContentRevision {
+    fn metadata_only(
+        relative: &str,
+        file_type: impl Into<String>,
+        object_identity: impl Into<String>,
+        stable_metadata: impl Into<String>,
+    ) -> Self {
+        Self {
+            relative: relative.to_string(),
+            file_type: file_type.into(),
+            object_identity: object_identity.into(),
+            stable_metadata: stable_metadata.into(),
+            content_digest: String::new(),
+        }
+    }
+
+    fn with_digest(mut self, content_digest: String) -> Self {
+        self.content_digest = content_digest;
+        self
+    }
+
+    fn same_metadata(&self, other: &Self) -> bool {
+        self.relative == other.relative
+            && self.file_type == other.file_type
+            && self.object_identity == other.object_identity
+            && self.stable_metadata == other.stable_metadata
+    }
+}
+
 #[derive(Debug)]
 struct ParentDirectory<'a> {
     directory: ParentDirectoryKind<'a>,
@@ -1575,6 +1741,7 @@ enum CapabilityAccessError {
     Unsafe,
     Protected(String),
     PathIdentityUnsupported,
+    ConcurrentMutation,
     NotDirectory,
     NotRegularFile,
     HardLinked,
@@ -1731,6 +1898,9 @@ fn map_capability_error(error: CapabilityAccessError, relative: &str) -> Workspa
         }
         CapabilityAccessError::HardLinked => {
             WorkspaceToolError::HardLinkRejected(relative.to_string())
+        }
+        CapabilityAccessError::ConcurrentMutation => {
+            WorkspaceToolError::ConcurrentMutation(relative.to_string())
         }
         CapabilityAccessError::Unsupported => {
             WorkspaceToolError::PathIdentityUnsupported(relative.to_string())
@@ -1914,7 +2084,9 @@ fn file_object_identity_key(file: &CapabilityFile) -> Result<String, CapabilityA
 }
 
 #[cfg(unix)]
-fn file_target_identity_key(file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
+fn file_content_revision_metadata_key(
+    file: &CapabilityFile,
+) -> Result<String, CapabilityAccessError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let metadata = file
@@ -1926,26 +2098,47 @@ fn file_target_identity_key(file: &CapabilityFile) -> Result<String, CapabilityA
     if metadata.dev() == 0 && metadata.ino() == 0 {
         return Err(CapabilityAccessError::Unsupported);
     }
-    // Linux may reuse an inode immediately after unlink/recreate. Use stable
-    // content-state fields rather than ctime, which can drift on WSL-mounted
-    // filesystems during an otherwise successful rename.
     Ok(format!(
-        "target-state:{:x}:{:x}:{:x}:{:x}:{:x}",
+        "content-state:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
         metadata.dev(),
         metadata.ino(),
         metadata.mtime(),
         metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
         metadata.len()
     ))
 }
 
 #[cfg(windows)]
-fn file_target_identity_key(file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
-    file_object_identity_key(file)
+fn file_content_revision_metadata_key(
+    file: &CapabilityFile,
+) -> Result<String, CapabilityAccessError> {
+    let standard_file = file
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std();
+    let metadata = standard_file
+        .metadata()
+        .map_err(CapabilityAccessError::Io)?;
+    let modified = metadata
+        .modified()
+        .map_err(|_| CapabilityAccessError::Unsupported)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| CapabilityAccessError::Unsupported)?;
+    Ok(format!(
+        "content-state:{}:{:x}:{:x}:{:x}",
+        file_object_identity_key(file)?,
+        metadata.len(),
+        modified.as_secs(),
+        modified.subsec_nanos()
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_target_identity_key(file: &CapabilityFile) -> Result<String, CapabilityAccessError> {
+fn file_content_revision_metadata_key(
+    file: &CapabilityFile,
+) -> Result<String, CapabilityAccessError> {
     file_object_identity_key(file)
 }
 
