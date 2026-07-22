@@ -226,7 +226,7 @@ fn execute_prepared_command(
                 .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable);
         }
     };
-    let observation = monitor.and_then(|monitor| monitor.finish().ok());
+    let observation = monitor.map(|monitor| monitor.finish().map_err(|_| ()));
     let snapshot_change = before.map(|before| {
         snapshot_workspace(&workspace).and_then(|after| before.change_summary(&after))
     });
@@ -239,16 +239,16 @@ fn execute_prepared_command(
 }
 
 fn reconcile_workspace_change(
-    observation: Option<WorkspaceChangeObservation>,
+    observation: Option<Result<WorkspaceChangeObservation, ()>>,
     snapshot_change: Option<Result<Option<WorkspaceChangeSummary>, String>>,
 ) -> (WorkspaceMutation, Option<WorkspaceChangeSummary>) {
     match (observation, snapshot_change) {
         (None, Some(Ok(None))) => (WorkspaceMutation::Unchanged, None),
         (None, Some(Ok(Some(summary)))) => (WorkspaceMutation::Changed, Some(summary)),
-        (Some(WorkspaceChangeObservation::Unchanged), Some(Ok(None))) => {
+        (Some(Ok(WorkspaceChangeObservation::Unchanged)), Some(Ok(None))) => {
             (WorkspaceMutation::Unchanged, None)
         }
-        (Some(WorkspaceChangeObservation::Changed), Some(Ok(Some(summary)))) => {
+        (Some(Ok(WorkspaceChangeObservation::Changed)), Some(Ok(Some(summary)))) => {
             (WorkspaceMutation::Changed, Some(summary))
         }
         _ => (WorkspaceMutation::Unknown, None),
@@ -970,6 +970,14 @@ mod tests {
         let mut file = fs::File::create(path).expect("create test file");
         file.write_all(contents.as_bytes())
             .expect("write test file");
+    }
+
+    #[test]
+    fn workspace_monitor_failure_cannot_be_reconciled_as_unchanged() {
+        let (mutation, summary) = reconcile_workspace_change(Some(Err(())), Some(Ok(None)));
+
+        assert_eq!(mutation, WorkspaceMutation::Unknown);
+        assert!(summary.is_none());
     }
 
     #[test]
