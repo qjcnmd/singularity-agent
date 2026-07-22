@@ -218,13 +218,15 @@ pub(super) fn infrastructure_blocker(
             format!("{context}: sandbox enforcement is unavailable"),
         ));
     }
-    if result.workspace_mutation == singularity_tools::WorkspaceMutation::Unknown {
-        return Some(evaluation_blocker(
-            BlockerKind::Sandbox,
-            format!("{context}: workspace mutation could not be verified"),
-        ));
-    }
     match result.execution_status {
+        CommandExecutionStatus::Completed
+            if result.workspace_mutation == singularity_tools::WorkspaceMutation::Unknown =>
+        {
+            Some(evaluation_blocker(
+                BlockerKind::Sandbox,
+                format!("{context}: workspace mutation could not be verified"),
+            ))
+        }
         CommandExecutionStatus::Completed => None,
         CommandExecutionStatus::BackendError
         | CommandExecutionStatus::PolicyDenied
@@ -394,6 +396,7 @@ mod tests {
             ("", "fatal error LNK1104: cannot open file 'missing.obj'"),
         ] {
             let result = CommandResult::executed("path_error", 101, 0, stdout, stderr, false)
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict);
 
             assert!(infrastructure_blocker(&result, "verification command failed").is_none());
