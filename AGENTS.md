@@ -18,9 +18,10 @@
 不要开启 `auto_watch`，直到已验证的上游版本修复 dirty worktree 下的重复索引问题。
 
 ## 命令与磁盘
-1. 默认删除本次产生且可重建的 Cargo target、临时 evaluation、测试缓存、日志、临时工作树和一次性中间文件；用户明确要求保留时除外。
-2. 删除或移动目录前先解析并校验绝对路径位于当前工作区或本次明确指定的临时目录。不得删除源码、用户数据、任务开始前已存在且归属不明的产物。
-3. 最终回复说明已清理的产物
+1. 当前 Windows 工作站的本项目 Cargo 产物必须写入 `D:\CargoTargets\singularity-agent`，通过本地不提交的 `.cargo/config.toml` 或等价的任务级 `CARGO_TARGET_DIR` 配置实现；运行 Cargo 前用 `cargo metadata --no-deps --format-version 1 --locked` 核对 `target_directory`，不得静默回落到 C 盘工作区的 `target/`。其他环境使用已明确归属的任务级 target，不提交机器专用绝对路径配置。
+2. 每次任务结束时，无论 Issue 是否关闭或验证是否成功，默认清理本次产生且可重建的 Cargo target、临时 evaluation、测试缓存、日志、临时工作树和一次性中间文件；用户明确要求保留时除外。Cargo 产物优先使用已核对 target 的 `cargo clean` 清理。
+3. 删除或移动目录前先解析并校验绝对路径位于当前工作区或本次明确指定的临时目录。不得删除源码、用户数据、任务开始前已存在且归属不明的产物。
+4. 最终回复说明产物实际写入位置、已清理内容、清理失败项和保留原因。
 
 ## 项目实现与目标仓库语言边界
 
