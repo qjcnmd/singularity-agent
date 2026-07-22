@@ -22,3 +22,7 @@ singularity_sandbox = { path = "../sandbox" }
 
 [target.'cfg(windows)'.dependencies]
 winx = "0.36.4"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+uuid.workspace = true

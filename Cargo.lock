@@ -1631,6 +1631,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",
@@ -1638,6 +1639,7 @@ dependencies = [
  "singularity_core",
  "singularity_policy",
  "singularity_sandbox",
+ "uuid",
  "winx",
 ]
 

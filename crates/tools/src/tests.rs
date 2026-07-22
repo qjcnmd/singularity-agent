@@ -170,6 +170,45 @@ mod mutation_tests {
         remove_workspace(&workspace);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_never_overwrites_a_concurrently_created_target() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let workspace = test_workspace("concurrent-create-noreplace");
+        let target = workspace.join("target.txt");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let mut external_identity = None;
+
+        let result = tools.atomic_write_with_hook(&path, "owned", None, |_| {
+            std::fs::write(&target, "external").expect("create concurrent target");
+            let metadata = std::fs::metadata(&target).expect("concurrent target metadata");
+            external_identity = Some((metadata.dev(), metadata.ino()));
+        });
+
+        assert!(matches!(
+            result,
+            Err(AtomicWriteFailure {
+                error: WorkspaceToolError::ConcurrentMutation(_),
+                published_revision: None,
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "external");
+        let metadata = std::fs::metadata(&target).expect("final target metadata");
+        assert_eq!(external_identity, Some((metadata.dev(), metadata.ino())));
+        assert!(
+            std::fs::read_dir(&workspace)
+                .expect("read workspace")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("singularity-tmp"))
+        );
+        remove_workspace(&workspace);
+    }
+
     #[test]
     fn atomic_write_does_not_delete_a_replaced_temp_source() {
         let workspace = test_workspace("temp-replacement");
@@ -264,9 +303,15 @@ mod mutation_tests {
         let workspace = test_workspace("post-publish-rollback");
         let target = workspace.join("target.txt");
         std::fs::write(&target, "before").expect("write target");
+        #[cfg(unix)]
+        let original_identity = {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::metadata(&target).expect("original metadata");
+            (metadata.dev(), metadata.ino())
+        };
         let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
-        let (original, original_revision) =
+        let (_original, original_revision) =
             tools.existing_text_or_empty(&path).expect("read original");
 
         let failure = tools
@@ -282,25 +327,34 @@ mod mutation_tests {
                 },
             )
             .expect_err("post-publish verification fails");
-        let published_revision = failure
-            .published_revision
-            .expect("failure retains published identity");
-        let published_revision = *published_revision;
-        let published = vec![PublishedMutation {
-            prepared: PreparedMutation {
-                path,
-                relative: "target.txt".to_string(),
-                original,
-                updated: "published".to_string(),
-                original_revision,
-            },
-            published_revision,
-        }];
-
-        tools
-            .rollback_published(&published)
-            .expect("rollback current published mutation");
+        #[cfg(unix)]
+        assert!(failure.published_revision.is_none());
+        #[cfg(not(unix))]
+        {
+            let published_revision = *failure
+                .published_revision
+                .expect("failure retains published identity");
+            let published = vec![PublishedMutation {
+                prepared: PreparedMutation {
+                    path,
+                    relative: "target.txt".to_string(),
+                    original: _original,
+                    updated: "published".to_string(),
+                    original_revision,
+                },
+                published_revision,
+            }];
+            tools
+                .rollback_published(&published)
+                .expect("rollback current published mutation");
+        }
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::metadata(&target).expect("restored metadata");
+            assert_eq!((metadata.dev(), metadata.ino()), original_identity);
+        }
         remove_workspace(&workspace);
     }
 
@@ -375,12 +429,17 @@ mod mutation_tests {
 
     #[test]
     fn post_publish_replacement_is_not_claimed_or_overwritten_by_rollback() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
         let workspace = test_workspace("post-publish-external-replacement");
         let target = workspace.join("target.txt");
         std::fs::write(&target, "before").expect("write target");
         let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
         let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+        #[cfg(unix)]
+        let mut external_identity = None;
 
         let failure = tools
             .atomic_write_with_hooks(
@@ -391,6 +450,11 @@ mod mutation_tests {
                 || {
                     std::fs::remove_file(&target).expect("remove published target");
                     std::fs::write(&target, "external").expect("write external target");
+                    #[cfg(unix)]
+                    {
+                        let metadata = std::fs::metadata(&target).expect("external metadata");
+                        external_identity = Some((metadata.dev(), metadata.ino()));
+                    }
                     Err(WorkspaceToolError::ReadFailed(
                         "injected failure".to_string(),
                     ))
@@ -398,14 +462,110 @@ mod mutation_tests {
             )
             .expect_err("external replacement must fail closed");
 
-        assert!(matches!(
-            failure,
-            AtomicWriteFailure {
-                error: WorkspaceToolError::ConcurrentMutation(_),
-                published_revision: None,
-            }
-        ));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "external");
+        #[cfg(not(unix))]
+        {
+            assert!(matches!(
+                failure,
+                AtomicWriteFailure {
+                    error: WorkspaceToolError::ConcurrentMutation(_),
+                    published_revision: None,
+                }
+            ));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "external");
+        }
+        #[cfg(unix)]
+        {
+            assert!(failure.published_revision.is_none());
+            assert!(matches!(
+                failure.error,
+                WorkspaceToolError::RollbackFailed(_)
+            ));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+            let external_entries = std::fs::read_dir(&workspace)
+                .expect("read workspace")
+                .filter_map(|entry| {
+                    let entry = entry.expect("entry");
+                    (entry.path() != target
+                        && matches!(
+                            std::fs::read_to_string(entry.path()),
+                            Ok(content) if content == "external"
+                        ))
+                    .then_some(entry.path())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(external_entries.len(), 1);
+            let metadata = std::fs::metadata(&external_entries[0]).expect("preserved metadata");
+            assert_eq!(external_identity, Some((metadata.dev(), metadata.ino())));
+        }
+        remove_workspace(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_exchange_backup_inspection_failure_restores_the_concurrent_object() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let workspace = test_workspace("post-exchange-backup-inspection");
+        let target = workspace.join("target.txt");
+        let saved_original = workspace.join("saved-original.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let original_metadata = std::fs::metadata(&target).expect("original metadata");
+        let original_identity = (original_metadata.dev(), original_metadata.ino());
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+        let exchanged_backup = RefCell::new(None::<PathBuf>);
+        let concurrent_identity = RefCell::new(None);
+
+        let failure = tools
+            .atomic_write_with_hooks(
+                &path,
+                "published",
+                original_revision.as_ref(),
+                |temporary_name| {
+                    exchanged_backup.replace(Some(workspace.join(temporary_name)));
+                },
+                || {
+                    let backup = exchanged_backup
+                        .borrow()
+                        .clone()
+                        .expect("record exchanged backup path");
+                    std::fs::rename(&backup, &saved_original).expect("preserve original object");
+                    std::fs::create_dir(&backup).expect("replace backup with directory");
+                    let metadata = std::fs::metadata(&backup).expect("concurrent metadata");
+                    concurrent_identity.replace(Some((metadata.dev(), metadata.ino())));
+                    Ok(())
+                },
+            )
+            .expect_err("backup inspection failure must restore the exchange");
+
+        assert!(failure.published_revision.is_none());
+        assert!(matches!(failure.error, WorkspaceToolError::ReadFailed(_)));
+        assert!(target.is_dir());
+        let target_metadata = std::fs::metadata(&target).expect("restored concurrent metadata");
+        assert_eq!(
+            *concurrent_identity.borrow(),
+            Some((target_metadata.dev(), target_metadata.ino()))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&saved_original).expect("read preserved original"),
+            "before"
+        );
+        let saved_metadata = std::fs::metadata(&saved_original).expect("saved original metadata");
+        assert_eq!(
+            (saved_metadata.dev(), saved_metadata.ino()),
+            original_identity
+        );
+        assert!(
+            std::fs::read_dir(&workspace)
+                .expect("read workspace")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("singularity"))
+        );
         remove_workspace(&workspace);
     }
 
@@ -438,7 +598,10 @@ mod mutation_tests {
                 published_revision: None,
             }
         ));
+        #[cfg(not(unix))]
         assert!(!target.exists());
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
         remove_workspace(&workspace);
     }
 
@@ -449,7 +612,7 @@ mod mutation_tests {
         std::fs::write(&target, "before").expect("write target");
         let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
         let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
-        let (original, original_revision) =
+        let (_original, original_revision) =
             tools.existing_text_or_empty(&path).expect("read original");
 
         let failure = tools
@@ -464,25 +627,30 @@ mod mutation_tests {
                 },
             )
             .expect_err("tampered published content must fail closed");
-        let published_revision = failure
-            .published_revision
-            .expect("owned published object remains safe to roll back");
         assert!(matches!(
             failure.error,
             WorkspaceToolError::ConcurrentMutation(_)
         ));
-        tools
-            .rollback_published(&[PublishedMutation {
-                prepared: PreparedMutation {
-                    path,
-                    relative: "target.txt".to_string(),
-                    original,
-                    updated: "published".to_string(),
-                    original_revision,
-                },
-                published_revision: *published_revision,
-            }])
-            .expect("roll back owned tampered publication");
+        #[cfg(unix)]
+        assert!(failure.published_revision.is_none());
+        #[cfg(not(unix))]
+        {
+            let published_revision = *failure
+                .published_revision
+                .expect("owned published object remains safe to roll back");
+            tools
+                .rollback_published(&[PublishedMutation {
+                    prepared: PreparedMutation {
+                        path,
+                        relative: "target.txt".to_string(),
+                        original: _original,
+                        updated: "published".to_string(),
+                        original_revision,
+                    },
+                    published_revision,
+                }])
+                .expect("roll back owned tampered publication");
+        }
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
         remove_workspace(&workspace);

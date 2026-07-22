@@ -229,7 +229,15 @@ impl WorkspaceTools {
         if initial_target.as_ref().map(|state| &state.revision) != expected_revision {
             return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into());
         }
-        let original_permissions = initial_target.map(|state| state.permissions);
+        let target_was_present = initial_target.is_some();
+        #[cfg(unix)]
+        let original_revision = initial_target.as_ref().map(|state| state.revision.clone());
+        let original_identity = initial_target
+            .as_ref()
+            .map(|state| state.revision.object_identity.clone());
+        let original_permissions = initial_target
+            .as_ref()
+            .map(|state| state.permissions.clone());
         let (temporary_name, mut temporary_file) = create_unique_temp_file(parent.dir())
             .map_err(|error| map_capability_error(error, &path.display))?;
         let mut temporary_identity = file_object_identity_key(&temporary_file)
@@ -350,53 +358,340 @@ impl WorkspaceTools {
             )
             .into());
         }
-        if let Err(error) = parent
-            .dir()
-            .rename(&temporary_name, parent.dir(), &parent.name)
-        {
+        drop(source_file);
+        if let Err(error) = publish_temporary(
+            parent.dir(),
+            &temporary_name,
+            &parent.name,
+            target_was_present,
+        ) {
             drop(temporary_file);
+            let publish_error = match error {
+                CapabilityAccessError::Missing | CapabilityAccessError::ConcurrentMutation => {
+                    WorkspaceToolError::ConcurrentMutation(path.display.clone())
+                }
+                CapabilityAccessError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => {
+                    WorkspaceToolError::ConcurrentMutation(path.display.clone())
+                }
+                CapabilityAccessError::Unsupported => WorkspaceToolError::PathIdentityUnsupported(
+                    "workspace atomic publish primitive is unavailable".to_string(),
+                ),
+                other => map_capability_error(other, &path.display),
+            };
             return Err(cleanup_owned_file(
                 parent.dir(),
                 &temporary_name,
                 &temporary_identity,
-                io_error(error),
+                publish_error,
             )
             .into());
         }
         drop(temporary_file);
-        if let Err(error) = after_rename() {
+        let after_rename_result = after_rename();
+        #[cfg(unix)]
+        if target_was_present {
+            let backup_state = self.atomic_target_state(
+                parent.dir(),
+                &parent.actual_relative,
+                &temporary_name,
+                &path.display,
+            );
+            let backup_failure = match backup_state {
+                Ok(Some(state))
+                    if original_revision.as_ref().is_some_and(|revision| {
+                        same_mutation_revision(revision, &state.revision)
+                    }) =>
+                {
+                    None
+                }
+                Ok(_) => Some(WorkspaceToolError::ConcurrentMutation(path.display.clone())),
+                Err(error) => Some(map_capability_error(error, &path.display)),
+            };
+            if let Some(backup_failure) = backup_failure {
+                let restore = self.restore_exchanged_entries(
+                    parent.dir(),
+                    &parent.name,
+                    &temporary_name,
+                    &path.display,
+                );
+                if let Err(error) = restore {
+                    if let Ok(Some(state)) = self.atomic_target_state(
+                        parent.dir(),
+                        &parent.actual_relative,
+                        &parent.name,
+                        &path.display,
+                    ) && state.revision.object_identity == temporary_identity
+                    {
+                        return Err(AtomicWriteFailure::published(error, state.revision));
+                    }
+                    return Err(error.into());
+                }
+                return Err(cleanup_owned_file(
+                    parent.dir(),
+                    &temporary_name,
+                    &temporary_identity,
+                    backup_failure,
+                )
+                .into());
+            }
+        }
+        #[cfg(unix)]
+        {
+            let published_before_hook = self.atomic_target_state(
+                parent.dir(),
+                &parent.actual_relative,
+                &parent.name,
+                &path.display,
+            );
+            let published_is_owned = matches!(
+                published_before_hook,
+                Ok(Some(ref state))
+                    if state.revision.object_identity == temporary_identity
+                        && state.revision.content_digest == temporary_revision.content_digest
+            );
+            if !published_is_owned {
+                if target_was_present {
+                    self.restore_exchanged_entries(
+                        parent.dir(),
+                        &parent.name,
+                        &temporary_name,
+                        &path.display,
+                    )?;
+                    return Err(cleanup_owned_file(
+                        parent.dir(),
+                        &temporary_name,
+                        &temporary_identity,
+                        WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                    )
+                    .into());
+                }
+                match mutation_rename_noreplace(parent.dir(), &parent.name, &temporary_name) {
+                    Ok(()) => {
+                        return Err(
+                            WorkspaceToolError::ConcurrentMutation(path.display.clone()).into()
+                        );
+                    }
+                    Err(error) => {
+                        return Err(map_capability_error(error, &path.display).into());
+                    }
+                }
+            }
+        }
+        if let Err(error) = after_rename_result {
+            #[cfg(unix)]
+            {
+                if target_was_present {
+                    return Err(self
+                        .restore_failed_exchange(
+                            parent.dir(),
+                            &parent.name,
+                            &temporary_name,
+                            &temporary_identity,
+                            &path.display,
+                            error,
+                        )
+                        .into());
+                }
+                return match self.atomic_target_state(
+                    parent.dir(),
+                    &parent.actual_relative,
+                    &parent.name,
+                    &path.display,
+                ) {
+                    Ok(Some(state))
+                        if state.revision.object_identity == temporary_identity
+                            && state.revision.content_digest
+                                == temporary_revision.content_digest =>
+                    {
+                        match self.remove_created_file_unix(path, &state.revision) {
+                            Ok(()) => Err(error.into()),
+                            Err(cleanup_error) => Err(cleanup_error.into()),
+                        }
+                    }
+                    Ok(_) => {
+                        Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into())
+                    }
+                    Err(state_error) => {
+                        Err(map_capability_error(state_error, &path.display).into())
+                    }
+                };
+            }
+            #[cfg(not(unix))]
             return match self.atomic_target_state(
                 parent.dir(),
                 &parent.actual_relative,
                 &parent.name,
                 &path.display,
             ) {
-                Ok(Some(state)) if state.revision.object_identity == temporary_identity => {
-                    Err(AtomicWriteFailure::published(error, state.revision))
+                Ok(Some(state))
+                    if state.revision.object_identity == temporary_identity
+                        && state.revision.content_digest == temporary_revision.content_digest =>
+                {
+                    let rollback_error =
+                        if let Some(original_identity) = original_identity.as_deref() {
+                            cleanup_owned_file(
+                                parent.dir(),
+                                &temporary_name,
+                                original_identity,
+                                error.clone(),
+                            )
+                        } else {
+                            error.clone()
+                        };
+                    Err(AtomicWriteFailure::published(
+                        rollback_error,
+                        state.revision,
+                    ))
                 }
                 Ok(_) => Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into()),
                 Err(state_error) => Err(map_capability_error(state_error, &path.display).into()),
             };
         }
-        let published_state = self
-            .atomic_target_state(
+        let published_state_result = self.atomic_target_state(
+            parent.dir(),
+            &parent.actual_relative,
+            &parent.name,
+            &path.display,
+        );
+        let published_state = match published_state_result {
+            Ok(Some(state))
+                if state.revision.object_identity == temporary_identity
+                    && state.revision.content_digest == temporary_revision.content_digest =>
+            {
+                state
+            }
+            outcome => {
+                #[cfg(unix)]
+                if target_was_present {
+                    return Err(self
+                        .restore_failed_exchange(
+                            parent.dir(),
+                            &parent.name,
+                            &temporary_name,
+                            &temporary_identity,
+                            &path.display,
+                            WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                        )
+                        .into());
+                }
+                #[cfg(not(unix))]
+                if let Ok(Some(ref state)) = outcome
+                    && state.revision.object_identity == temporary_identity
+                {
+                    return Err(AtomicWriteFailure::published(
+                        WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                        state.revision.clone(),
+                    ));
+                }
+                return match outcome {
+                    Ok(_) => {
+                        Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into())
+                    }
+                    Err(error) => Err(map_capability_error(error, &path.display).into()),
+                };
+            }
+        };
+        if let Some(original_identity) = original_identity.as_deref() {
+            let cleanup_error = cleanup_owned_file(
                 parent.dir(),
-                &parent.actual_relative,
-                &parent.name,
-                &path.display,
-            )
-            .map_err(|error| map_capability_error(error, &path.display))?
-            .ok_or_else(|| WorkspaceToolError::ConcurrentMutation(path.display.clone()))?;
-        if published_state.revision.object_identity != temporary_identity {
-            return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into());
-        }
-        if published_state.revision.content_digest != temporary_revision.content_digest {
-            return Err(AtomicWriteFailure::published(
+                &temporary_name,
+                original_identity,
                 WorkspaceToolError::ConcurrentMutation(path.display.clone()),
-                published_state.revision,
-            ));
+            );
+            if cleanup_error != WorkspaceToolError::ConcurrentMutation(path.display.clone()) {
+                return Err(AtomicWriteFailure::published(
+                    cleanup_error,
+                    published_state.revision,
+                ));
+            }
         }
         Ok(published_state.revision)
+    }
+
+    /// Reconcile an exchange whose old entry was not the revision observed
+    /// during preflight.  The published entry is first detached into a
+    /// quarantine with NOREPLACE; the unexpected old entry is then restored
+    /// with another NOREPLACE move.  At no point is a concurrently created
+    /// destination overwritten.
+    #[cfg(unix)]
+    fn restore_failed_exchange(
+        &self,
+        parent: &CapabilityDir,
+        target: &OsStr,
+        backup: &OsStr,
+        published_identity: &str,
+        relative: &str,
+        failure: WorkspaceToolError,
+    ) -> WorkspaceToolError {
+        if let Err(error) = self.restore_exchanged_entries(parent, target, backup, relative) {
+            return error;
+        }
+        cleanup_owned_file(parent, backup, published_identity, failure)
+    }
+
+    #[cfg(unix)]
+    fn restore_exchanged_entries(
+        &self,
+        parent: &CapabilityDir,
+        target: &OsStr,
+        backup: &OsStr,
+        relative: &str,
+    ) -> Result<(), WorkspaceToolError> {
+        let quarantine = loop {
+            let quarantine = mutation_quarantine_name(parent, "published")
+                .map_err(|error| map_capability_error(error, relative))?;
+            match mutation_rename_noreplace(parent, target, &quarantine) {
+                Ok(()) => break quarantine,
+                Err(CapabilityAccessError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(CapabilityAccessError::Missing) => {
+                    return mutation_rename_noreplace(parent, backup, target)
+                        .map_err(|error| map_capability_error(error, relative));
+                }
+                Err(CapabilityAccessError::Unsupported) => {
+                    return Err(WorkspaceToolError::PathIdentityUnsupported(
+                        relative.to_string(),
+                    ));
+                }
+                Err(error) => return Err(map_capability_error(error, relative)),
+            }
+        };
+
+        match mutation_rename_noreplace(parent, backup, target) {
+            Ok(()) => {}
+            Err(CapabilityAccessError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                return Err(WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: concurrent target appeared during exchange restoration"
+                )));
+            }
+            Err(CapabilityAccessError::Missing) => {
+                let _ = mutation_rename_noreplace(parent, &quarantine, target);
+                return Err(WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: exchanged backup disappeared during restoration"
+                )));
+            }
+            Err(CapabilityAccessError::Unsupported) => {
+                return Err(WorkspaceToolError::PathIdentityUnsupported(
+                    relative.to_string(),
+                ));
+            }
+            Err(error) => return Err(map_capability_error(error, relative)),
+        }
+        match mutation_rename_noreplace(parent, &quarantine, backup) {
+            Ok(()) => Ok(()),
+            Err(CapabilityAccessError::Unsupported) => Err(
+                WorkspaceToolError::PathIdentityUnsupported(relative.to_string()),
+            ),
+            Err(error) => Err(WorkspaceToolError::RollbackFailed(format!(
+                "{relative}: exchanged source restoration failed: {}",
+                map_capability_error(error, relative)
+            ))),
+        }
     }
 
     fn atomic_target_state(
@@ -469,6 +764,123 @@ impl WorkspaceTools {
         path: &CapabilityRelativePath,
         expected_revision: &WorkspaceContentRevision,
     ) -> Result<(), WorkspaceToolError> {
+        #[cfg(unix)]
+        {
+            self.remove_created_file_unix(path, expected_revision)
+        }
+        #[cfg(not(unix))]
+        {
+            self.remove_created_file_non_unix(path, expected_revision)
+        }
+    }
+
+    #[cfg(unix)]
+    fn remove_created_file_unix(
+        &self,
+        path: &CapabilityRelativePath,
+        expected_revision: &WorkspaceContentRevision,
+    ) -> Result<(), WorkspaceToolError> {
+        let parent = match self.open_parent_directory(&path.relative, false) {
+            Ok(parent) => parent,
+            Err(CapabilityAccessError::Missing) => return Ok(()),
+            Err(error) => return Err(map_capability_error(error, &path.display)),
+        };
+        let quarantine = loop {
+            let quarantine = mutation_quarantine_name(parent.dir(), "created-file")
+                .map_err(|error| map_capability_error(error, &path.display))?;
+            match mutation_rename_noreplace(parent.dir(), &parent.name, &quarantine) {
+                Ok(()) => break quarantine,
+                Err(CapabilityAccessError::Missing) => return Ok(()),
+                Err(CapabilityAccessError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(CapabilityAccessError::Unsupported) => {
+                    return Err(WorkspaceToolError::PathIdentityUnsupported(
+                        path.display.clone(),
+                    ));
+                }
+                Err(error) => return Err(map_capability_error(error, &path.display)),
+            }
+        };
+        let quarantined = self.atomic_target_state(
+            parent.dir(),
+            &parent.actual_relative,
+            &quarantine,
+            &path.display,
+        );
+        let quarantined_revision = match quarantined {
+            Ok(Some(state)) => state.revision,
+            Ok(None) => {
+                return match restore_quarantined_entry(
+                    parent.dir(),
+                    &quarantine,
+                    &parent.name,
+                    &path.display,
+                ) {
+                    Ok(()) => Err(WorkspaceToolError::RollbackFailed(format!(
+                        "{}: quarantined created file disappeared",
+                        path.display
+                    ))),
+                    Err(error) => Err(error),
+                };
+            }
+            Err(error) => {
+                let state_error = map_capability_error(error, &path.display);
+                return match restore_quarantined_entry(
+                    parent.dir(),
+                    &quarantine,
+                    &parent.name,
+                    &path.display,
+                ) {
+                    Ok(()) => Err(state_error),
+                    Err(restore_error) => Err(restore_error),
+                };
+            }
+        };
+        if !same_mutation_revision(&quarantined_revision, expected_revision) {
+            return match restore_quarantined_entry(
+                parent.dir(),
+                &quarantine,
+                &parent.name,
+                &path.display,
+            ) {
+                Ok(()) => Err(WorkspaceToolError::ConcurrentMutation(path.display.clone())),
+                Err(error) => Err(error),
+            };
+        }
+        match mutation_unlink_file(parent.dir(), &quarantine) {
+            Ok(()) | Err(CapabilityAccessError::Missing) => Ok(()),
+            Err(error) => {
+                let cleanup_error = match error {
+                    CapabilityAccessError::Unsupported => {
+                        WorkspaceToolError::PathIdentityUnsupported(path.display.clone())
+                    }
+                    error => io_error(std::io::Error::other(format!(
+                        "created file quarantine cleanup failed: {}",
+                        map_capability_error(error, &path.display)
+                    ))),
+                };
+                match restore_quarantined_entry(
+                    parent.dir(),
+                    &quarantine,
+                    &parent.name,
+                    &path.display,
+                ) {
+                    Ok(()) => Err(cleanup_error),
+                    Err(restore_error) => Err(restore_error),
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn remove_created_file_non_unix(
+        &self,
+        path: &CapabilityRelativePath,
+        expected_revision: &WorkspaceContentRevision,
+    ) -> Result<(), WorkspaceToolError> {
         let parent = match self.open_parent_directory(&path.relative, false) {
             Ok(parent) => parent,
             Err(CapabilityAccessError::Missing) => return Ok(()),
@@ -493,6 +905,142 @@ impl WorkspaceTools {
     }
 
     pub(crate) fn remove_created_directories(
+        &self,
+        created: &mut [CreatedDirectory],
+    ) -> Result<(), WorkspaceToolError> {
+        #[cfg(unix)]
+        {
+            self.remove_created_directories_unix(created)
+        }
+        #[cfg(not(unix))]
+        {
+            self.remove_created_directories_non_unix(created)
+        }
+    }
+
+    #[cfg(unix)]
+    fn remove_created_directories_unix(
+        &self,
+        created: &mut [CreatedDirectory],
+    ) -> Result<(), WorkspaceToolError> {
+        let mut failures = Vec::new();
+        for directory in created.iter_mut().rev() {
+            let result = (|| {
+                let parent = match self.open_parent_directory(&directory.path.relative, false) {
+                    Ok(parent) => parent,
+                    Err(CapabilityAccessError::Missing) => return Ok(()),
+                    Err(error) => {
+                        return Err(map_capability_error(error, &directory.path.display));
+                    }
+                };
+                let quarantine = loop {
+                    let quarantine = mutation_quarantine_name(parent.dir(), "created-dir")
+                        .map_err(|error| map_capability_error(error, &directory.path.display))?;
+                    match mutation_rename_noreplace(parent.dir(), &parent.name, &quarantine) {
+                        Ok(()) => break quarantine,
+                        Err(CapabilityAccessError::Missing) => return Ok(()),
+                        Err(CapabilityAccessError::Io(error))
+                            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                        {
+                            continue;
+                        }
+                        Err(CapabilityAccessError::Unsupported) => {
+                            return Err(WorkspaceToolError::PathIdentityUnsupported(
+                                directory.path.display.clone(),
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(map_capability_error(error, &directory.path.display));
+                        }
+                    }
+                };
+                drop(directory._guard.take());
+                let opened = match open_directory_component(parent.dir(), &quarantine, false) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        let open_error = map_capability_error(error, &directory.path.display);
+                        return match restore_quarantined_entry(
+                            parent.dir(),
+                            &quarantine,
+                            &parent.name,
+                            &directory.path.display,
+                        ) {
+                            Ok(()) => Err(open_error),
+                            Err(restore_error) => Err(restore_error),
+                        };
+                    }
+                };
+                let identity = match directory_object_identity_key(&opened) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        drop(opened);
+                        let identity_error = map_capability_error(error, &directory.path.display);
+                        return match restore_quarantined_entry(
+                            parent.dir(),
+                            &quarantine,
+                            &parent.name,
+                            &directory.path.display,
+                        ) {
+                            Ok(()) => Err(identity_error),
+                            Err(restore_error) => Err(restore_error),
+                        };
+                    }
+                };
+                drop(opened);
+                if identity != directory.identity {
+                    return match restore_quarantined_entry(
+                        parent.dir(),
+                        &quarantine,
+                        &parent.name,
+                        &directory.path.display,
+                    ) {
+                        Ok(()) => Err(WorkspaceToolError::ConcurrentMutation(
+                            directory.path.display.clone(),
+                        )),
+                        Err(error) => Err(error),
+                    };
+                }
+                match mutation_unlink_directory(parent.dir(), &quarantine) {
+                    Ok(()) | Err(CapabilityAccessError::Missing) => Ok(()),
+                    Err(error) => {
+                        // A non-empty directory (or another cleanup error) is
+                        // recoverable only if its original name is still free.
+                        let cleanup_error = match error {
+                            CapabilityAccessError::Unsupported => {
+                                WorkspaceToolError::PathIdentityUnsupported(
+                                    directory.path.display.clone(),
+                                )
+                            }
+                            error => io_error(std::io::Error::other(format!(
+                                "created directory quarantine cleanup failed: {}",
+                                map_capability_error(error, &directory.path.display)
+                            ))),
+                        };
+                        match restore_quarantined_entry(
+                            parent.dir(),
+                            &quarantine,
+                            &parent.name,
+                            &directory.path.display,
+                        ) {
+                            Ok(()) => Err(cleanup_error),
+                            Err(restore_error) => Err(restore_error),
+                        }
+                    }
+                }
+            })();
+            if let Err(error) = result {
+                failures.push(format!("{}: {error}", directory.path.display));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkspaceToolError::RollbackFailed(failures.join("; ")))
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn remove_created_directories_non_unix(
         &self,
         created: &mut [CreatedDirectory],
     ) -> Result<(), WorkspaceToolError> {
@@ -544,6 +1092,42 @@ impl WorkspaceTools {
             Err(WorkspaceToolError::RollbackFailed(failures.join("; ")))
         }
     }
+}
+
+fn publish_temporary(
+    parent: &CapabilityDir,
+    temporary_name: &OsStr,
+    target_name: &OsStr,
+    target_was_present: bool,
+) -> Result<(), CapabilityAccessError> {
+    #[cfg(unix)]
+    {
+        if target_was_present {
+            mutation_rename_exchange(parent, temporary_name, target_name)
+        } else {
+            mutation_rename_noreplace(parent, temporary_name, target_name)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target_was_present;
+        parent
+            .rename(temporary_name, parent, target_name)
+            .map_err(classify_io_error)
+    }
+}
+
+/// A rename changes Unix ctime even when the object and bytes are untouched;
+/// rollback ownership therefore compares the stable object identity and
+/// digest, not path-sensitive metadata which the namespace operation itself
+/// is allowed to update.
+#[cfg(unix)]
+fn same_mutation_revision(
+    expected: &WorkspaceContentRevision,
+    observed: &WorkspaceContentRevision,
+) -> bool {
+    expected.object_identity == observed.object_identity
+        && expected.content_digest == observed.content_digest
 }
 
 #[derive(Clone)]

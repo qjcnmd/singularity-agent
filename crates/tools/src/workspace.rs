@@ -1988,7 +1988,250 @@ fn create_unique_temp_file(
     )))
 }
 
+/// Move a directory entry without replacing an entry which appeared at the
+/// destination.  Unix mutation cleanup uses this primitive as the first step
+/// of its quarantine protocol; the operation is relative to an already-open
+/// capability directory and therefore never reconstructs an ambient path.
+#[cfg(unix)]
+fn mutation_rename_noreplace(
+    parent: &CapabilityDir,
+    source: &OsStr,
+    destination: &OsStr,
+) -> Result<(), CapabilityAccessError> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::fs::renameat_with(
+            parent,
+            source,
+            parent,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(classify_mutation_primitive_error)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (parent, source, destination);
+        Err(CapabilityAccessError::Unsupported)
+    }
+}
+
+/// Atomically exchange two entries in one capability directory.
+#[cfg(unix)]
+fn mutation_rename_exchange(
+    parent: &CapabilityDir,
+    source: &OsStr,
+    destination: &OsStr,
+) -> Result<(), CapabilityAccessError> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::fs::renameat_with(
+            parent,
+            source,
+            parent,
+            destination,
+            rustix::fs::RenameFlags::EXCHANGE,
+        )
+        .map_err(classify_mutation_primitive_error)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (parent, source, destination);
+        Err(CapabilityAccessError::Unsupported)
+    }
+}
+
+/// Remove a quarantined regular file by its capability directory and name.
+#[cfg(unix)]
+fn mutation_unlink_file(parent: &CapabilityDir, name: &OsStr) -> Result<(), CapabilityAccessError> {
+    rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty())
+        .map_err(classify_mutation_primitive_error)
+}
+
+/// Remove a quarantined empty directory by its capability directory and name.
+#[cfg(unix)]
+fn mutation_unlink_directory(
+    parent: &CapabilityDir,
+    name: &OsStr,
+) -> Result<(), CapabilityAccessError> {
+    rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::REMOVEDIR)
+        .map_err(classify_mutation_primitive_error)
+}
+
+/// Allocate an unguessable quarantine name.  The name check is only a
+/// collision hint; `RENAME_NOREPLACE` remains the authoritative collision
+/// guard, so a concurrent creator cannot be overwritten.
+#[cfg(unix)]
+fn mutation_quarantine_name(
+    parent: &CapabilityDir,
+    kind: &str,
+) -> Result<OsString, CapabilityAccessError> {
+    for _ in 0..MUTATION_TEMP_FILE_ATTEMPTS {
+        let name = OsString::from(format!(
+            ".singularity-quarantine-{kind}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        match parent.symlink_metadata(&name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(name),
+            Ok(_) => continue,
+            Err(error) => return Err(classify_io_error(error)),
+        }
+    }
+    Err(CapabilityAccessError::Io(std::io::Error::other(
+        "failed to allocate workspace quarantine name",
+    )))
+}
+
+/// Restore a quarantined entry without overwriting anything which appeared at
+/// its original name while ownership was being checked.
+#[cfg(unix)]
+fn restore_quarantined_entry(
+    parent: &CapabilityDir,
+    quarantine: &OsStr,
+    original: &OsStr,
+    context: &str,
+) -> Result<(), WorkspaceToolError> {
+    mutation_rename_noreplace(parent, quarantine, original).map_err(|error| {
+        WorkspaceToolError::RollbackFailed(format!(
+            "{context}: quarantined entry restoration failed: {}",
+            map_capability_error(error, context)
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn classify_mutation_primitive_error(error: rustix::io::Errno) -> CapabilityAccessError {
+    // These calls always use a valid, fixed flag set and one already-open
+    // parent directory. Linux filesystems which do not implement renameat2
+    // flags may report EINVAL instead of EOPNOTSUPP.
+    if matches!(
+        error,
+        rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS | rustix::io::Errno::NOTSUP
+    ) {
+        CapabilityAccessError::Unsupported
+    } else {
+        classify_io_error(std::io::Error::from(error))
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn renameat2_einval_is_an_explicit_capability_blocker() {
+    assert!(matches!(
+        classify_mutation_primitive_error(rustix::io::Errno::INVAL),
+        CapabilityAccessError::Unsupported
+    ));
+}
+
 fn cleanup_owned_file(
+    parent: &CapabilityDir,
+    name: &OsStr,
+    expected_identity: &str,
+    failure: WorkspaceToolError,
+) -> WorkspaceToolError {
+    #[cfg(unix)]
+    {
+        cleanup_owned_file_unix(parent, name, expected_identity, failure)
+    }
+    #[cfg(not(unix))]
+    {
+        cleanup_owned_file_non_unix(parent, name, expected_identity, failure)
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_owned_file_unix(
+    parent: &CapabilityDir,
+    name: &OsStr,
+    expected_identity: &str,
+    failure: WorkspaceToolError,
+) -> WorkspaceToolError {
+    // First move the entry to a unique quarantine name with NOREPLACE.  This
+    // makes the namespace mutation conditional: a replacement at `name` is
+    // moved as a whole and can be inspected/restored, never unlinked by a
+    // stale identity check.
+    let quarantine = loop {
+        let quarantine = match mutation_quarantine_name(parent, "file") {
+            Ok(name) => name,
+            Err(_) => {
+                return WorkspaceToolError::RollbackFailed(
+                    "workspace temporary file quarantine allocation failed".to_string(),
+                );
+            }
+        };
+        match mutation_rename_noreplace(parent, name, &quarantine) {
+            Ok(()) => break quarantine,
+            Err(CapabilityAccessError::Missing) => return failure,
+            Err(CapabilityAccessError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                continue;
+            }
+            Err(CapabilityAccessError::Unsupported) => {
+                return WorkspaceToolError::PathIdentityUnsupported(
+                    "workspace conditional file cleanup primitive is unavailable".to_string(),
+                );
+            }
+            Err(_) => {
+                return WorkspaceToolError::RollbackFailed(
+                    "workspace temporary file quarantine failed".to_string(),
+                );
+            }
+        }
+    };
+
+    let quarantined_identity = match open_file_from_parent(parent, &quarantine)
+        .and_then(|file| file_object_identity_key(&file))
+    {
+        Ok(identity) => identity,
+        Err(_) => {
+            return match restore_quarantined_entry(
+                parent,
+                &quarantine,
+                name,
+                "workspace temporary file",
+            ) {
+                Ok(()) => WorkspaceToolError::RollbackFailed(
+                    "workspace temporary file quarantine identity check failed".to_string(),
+                ),
+                Err(error) => error,
+            };
+        }
+    };
+    if quarantined_identity != expected_identity {
+        return match restore_quarantined_entry(
+            parent,
+            &quarantine,
+            name,
+            "workspace temporary file",
+        ) {
+            Ok(()) => WorkspaceToolError::RollbackFailed(
+                "workspace temporary file was replaced before cleanup".to_string(),
+            ),
+            Err(error) => error,
+        };
+    }
+    match mutation_unlink_file(parent, &quarantine) {
+        Ok(()) | Err(CapabilityAccessError::Missing) => failure,
+        Err(error) => {
+            let cleanup_error = match error {
+                CapabilityAccessError::Unsupported => WorkspaceToolError::PathIdentityUnsupported(
+                    "workspace conditional file cleanup primitive is unavailable".to_string(),
+                ),
+                _ => WorkspaceToolError::RollbackFailed(
+                    "workspace temporary file cleanup failed".to_string(),
+                ),
+            };
+            match restore_quarantined_entry(parent, &quarantine, name, "workspace temporary file") {
+                Ok(()) => cleanup_error,
+                Err(restore_error) => restore_error,
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_owned_file_non_unix(
     parent: &CapabilityDir,
     name: &OsStr,
     expected_identity: &str,
