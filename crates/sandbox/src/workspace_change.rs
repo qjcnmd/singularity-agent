@@ -87,7 +87,7 @@ impl WorkspaceSnapshot {
             .filter(|path| self.entries.get(*path) != after.entries.get(*path))
             .cloned()
             .collect::<Vec<_>>();
-        if self.root != after.root {
+        if root_behavior_changed(&self.root, &after.root) {
             changed_files.push(".".to_string());
         }
         if changed_files.is_empty() {
@@ -356,6 +356,12 @@ fn workspace_relative_path(path: &Path) -> Result<String, String> {
     Ok(text.to_string())
 }
 
+fn root_behavior_changed(before: &EntryMetadata, after: &EntryMetadata) -> bool {
+    before.object_kind != after.object_kind
+        || before.readonly != after.readonly
+        || before.platform_permissions != after.platform_permissions
+}
+
 #[cfg(unix)]
 fn platform_permissions(metadata: &Metadata) -> u64 {
     u64::from(cap_std::fs::PermissionsExt::mode(&metadata.permissions()))
@@ -531,6 +537,30 @@ mod tests {
                 .expect("permissions changed")
                 .changed_files
                 .contains(&"first".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_workspace_root_permission_change_is_observed_without_child_noise() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        let mut permissions = std::fs::metadata(workspace.path())
+            .expect("root metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(workspace.path(), permissions).expect("chmod root");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+
+        assert_eq!(
+            before
+                .change_summary(&after)
+                .expect("summary")
+                .expect("root changed")
+                .changed_files,
+            ["."]
         );
     }
 }
