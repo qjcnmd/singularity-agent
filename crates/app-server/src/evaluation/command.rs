@@ -218,6 +218,12 @@ pub(super) fn infrastructure_blocker(
             format!("{context}: sandbox enforcement is unavailable"),
         ));
     }
+    if result.workspace_mutation == singularity_tools::WorkspaceMutation::Unknown {
+        return Some(evaluation_blocker(
+            BlockerKind::Sandbox,
+            format!("{context}: workspace mutation could not be verified"),
+        ));
+    }
     match result.execution_status {
         CommandExecutionStatus::Completed => None,
         CommandExecutionStatus::BackendError
@@ -355,6 +361,12 @@ mod tests {
             .with_sandbox_execution("strict", SandboxBackendEnforcement::Strict);
 
         assert!(!command_succeeded(&result));
+        assert_eq!(
+            infrastructure_blocker(&result, "verification command failed")
+                .expect("unknown mutation must block")
+                .kind,
+            BlockerKind::Sandbox
+        );
     }
 
     #[test]

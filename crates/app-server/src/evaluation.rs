@@ -4193,7 +4193,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_expected_failure_with_path_marker_passes_semantically() {
+    fn baseline_expected_failure_with_unknown_mutation_is_blocked() {
         let temp = tempfile::tempdir().expect("temp");
         let execution = run_verification_after_setup(
             temp.path(),
@@ -4204,8 +4204,11 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(execution.result.status, StageStatus::Passed);
-        assert!(execution.result.blocker.is_none());
+        assert_eq!(execution.result.status, StageStatus::Blocked);
+        assert_eq!(
+            execution.result.blocker.expect("sandbox blocker").kind,
+            BlockerKind::Sandbox
+        );
         assert_eq!(execution.diagnostics.commands.len(), 1);
     }
 

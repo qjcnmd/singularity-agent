@@ -181,11 +181,16 @@ fn visit_directory(
         let relative = relative_parent.join(&name);
         let relative_text = workspace_relative_path(&relative)?;
         if is_protected_path(name_text) || is_protected_path(&relative_text) {
-            let metadata = directory
-                .symlink_metadata(&name)
-                .and_then(|metadata| entry_metadata(&metadata))
-                .map_err(|error| format!("workspace protected-path metadata failed: {error}"))?;
-            state.protected_entries.insert(relative_text, metadata);
+            #[cfg(not(windows))]
+            {
+                let metadata = directory
+                    .symlink_metadata(&name)
+                    .and_then(|metadata| entry_metadata(&metadata))
+                    .map_err(|error| {
+                        format!("workspace protected-path metadata failed: {error}")
+                    })?;
+                state.protected_entries.insert(relative_text, metadata);
+            }
             continue;
         }
         let file_type = entry
@@ -427,6 +432,7 @@ mod tests {
         assert_eq!(before.change_summary(&after).expect("summary"), None);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn protected_path_creation_fails_closed_without_exposing_its_name() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -438,6 +444,17 @@ mod tests {
             before.change_summary(&after).expect_err("must fail closed"),
             "protected workspace state changed between trusted observations"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_sentinel_materialization_is_excluded_from_snapshot_diff() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        std::fs::create_dir(workspace.path().join(".git")).expect("protected sentinel");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+
+        assert_eq!(before.change_summary(&after).expect("summary"), None);
     }
 
     #[cfg(unix)]
