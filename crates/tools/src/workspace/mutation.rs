@@ -8,6 +8,8 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static FORCE_DIRECTORY_CLEANUP_IDENTITY_COLLISION: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static TAMPER_QUARANTINED_FILE_AFTER_OWNERSHIP_CHECK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 impl WorkspaceTools {
@@ -21,6 +23,12 @@ impl WorkspaceTools {
     #[cfg(all(test, unix))]
     pub(crate) fn force_next_directory_cleanup_identity_collision_for_test(&self) {
         FORCE_DIRECTORY_CLEANUP_IDENTITY_COLLISION.with(|force| force.set(true));
+    }
+
+    /// Mutate the next quarantined file after its initial ownership check.
+    #[cfg(all(test, unix))]
+    pub(crate) fn tamper_next_quarantined_file_after_ownership_check_for_test(&self) {
+        TAMPER_QUARANTINED_FILE_AFTER_OWNERSHIP_CHECK.with(|tamper| tamper.set(true));
     }
 
     fn cleanup_temporary_file_failure(
@@ -1012,8 +1020,28 @@ impl WorkspaceTools {
                     continue;
                 }
                 Err(CapabilityAccessError::Missing) => {
-                    return mutation_rename_noreplace(parent, backup, target)
-                        .map_err(|error| map_capability_error(error, relative));
+                    return match mutation_rename_noreplace(parent, backup, target) {
+                        Ok(()) => Ok(()),
+                        Err(CapabilityAccessError::Missing) => {
+                            Err(WorkspaceToolError::RollbackFailed(format!(
+                                "{relative}: exchanged backup disappeared during restoration"
+                            )))
+                        }
+                        Err(CapabilityAccessError::Io(error))
+                            if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                        {
+                            Err(WorkspaceToolError::RollbackFailed(format!(
+                                "{relative}: concurrent target appeared during exchange restoration"
+                            )))
+                        }
+                        Err(CapabilityAccessError::Unsupported) => Err(
+                            WorkspaceToolError::PathIdentityUnsupported(relative.to_string()),
+                        ),
+                        Err(error) => Err(WorkspaceToolError::RollbackFailed(format!(
+                            "{relative}: exchanged backup restoration failed: {}",
+                            map_capability_error(error, relative)
+                        ))),
+                    };
                 }
                 Err(CapabilityAccessError::Unsupported) => {
                     return Err(WorkspaceToolError::PathIdentityUnsupported(
@@ -1088,6 +1116,8 @@ impl WorkspaceTools {
                 "{relative}: cleanup ownership changed; entry preserved"
             )));
         }
+        let initial_ownership = unix_file_ownership_revision(&pinned, &initial_revision)
+            .map_err(|error| map_capability_error(error, relative))?;
         let quarantine = loop {
             let quarantine = mutation_quarantine_name(parent, "owned-file")
                 .map_err(|error| map_capability_error(error, relative))?;
@@ -1111,53 +1141,118 @@ impl WorkspaceTools {
                 Err(error) => return Err(map_capability_error(error, relative)),
             }
         };
+        tamper_quarantined_file_after_ownership_check_for_test(parent, &quarantine)
+            .map_err(|error| map_capability_error(error, relative))?;
         if pinned.rewind().is_err() {
-            return Err(WorkspaceToolError::RollbackFailed(format!(
-                "{relative}: quarantined cleanup ownership could not be verified"
-            )));
+            return Err(restore_quarantined_cleanup_failure(
+                parent,
+                &quarantine,
+                name,
+                relative,
+                WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: quarantined cleanup ownership could not be verified"
+                )),
+            ));
         }
         let pinned_revision = match self.read_file_bytes_with_revision(relative, &mut pinned) {
             Ok((_, revision)) => revision,
             Err(_) => {
-                return Err(WorkspaceToolError::RollbackFailed(format!(
-                    "{relative}: quarantined cleanup ownership could not be verified"
-                )));
+                return Err(restore_quarantined_cleanup_failure(
+                    parent,
+                    &quarantine,
+                    name,
+                    relative,
+                    WorkspaceToolError::RollbackFailed(format!(
+                        "{relative}: quarantined cleanup ownership could not be verified"
+                    )),
+                ));
             }
         };
+        let pinned_ownership = match unix_file_ownership_revision(&pinned, &pinned_revision) {
+            Ok(ownership) => ownership,
+            Err(error) => {
+                return Err(restore_quarantined_cleanup_failure(
+                    parent,
+                    &quarantine,
+                    name,
+                    relative,
+                    map_capability_error(error, relative),
+                ));
+            }
+        };
+        if pinned_ownership != initial_ownership {
+            return Err(restore_quarantined_cleanup_failure(
+                parent,
+                &quarantine,
+                name,
+                relative,
+                WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: quarantined cleanup ownership changed; entry preserved"
+                )),
+            ));
+        }
         let mut quarantined = match open_file_from_parent(parent, &quarantine) {
             Ok(file) => file,
             Err(_) => {
-                return Err(WorkspaceToolError::RollbackFailed(format!(
-                    "{relative}: quarantined cleanup entry could not be verified"
-                )));
+                return Err(restore_quarantined_cleanup_failure(
+                    parent,
+                    &quarantine,
+                    name,
+                    relative,
+                    WorkspaceToolError::RollbackFailed(format!(
+                        "{relative}: quarantined cleanup entry could not be verified"
+                    )),
+                ));
             }
         };
         let quarantined_revision =
             match self.read_file_bytes_with_revision(relative, &mut quarantined) {
                 Ok((_, revision)) => revision,
                 Err(_) => {
-                    return Err(WorkspaceToolError::RollbackFailed(format!(
-                        "{relative}: quarantined cleanup entry could not be verified"
-                    )));
+                    return Err(restore_quarantined_cleanup_failure(
+                        parent,
+                        &quarantine,
+                        name,
+                        relative,
+                        WorkspaceToolError::RollbackFailed(format!(
+                            "{relative}: quarantined cleanup entry could not be verified"
+                        )),
+                    ));
                 }
             };
         if quarantined_revision != pinned_revision {
-            return Err(WorkspaceToolError::RollbackFailed(format!(
-                "{relative}: quarantined cleanup ownership changed; entry preserved"
-            )));
+            return Err(restore_quarantined_cleanup_failure(
+                parent,
+                &quarantine,
+                name,
+                relative,
+                WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: quarantined cleanup ownership changed; entry preserved"
+                )),
+            ));
         }
         match mutation_unlink_file(parent, &quarantine) {
             Ok(()) => Ok(()),
             Err(CapabilityAccessError::Missing) => Err(WorkspaceToolError::RollbackFailed(
                 format!("{relative}: quarantined cleanup ownership changed before unlink"),
             )),
-            Err(CapabilityAccessError::Unsupported) => Err(
+            Err(CapabilityAccessError::Unsupported) => Err(restore_quarantined_cleanup_failure(
+                parent,
+                &quarantine,
+                name,
+                relative,
                 WorkspaceToolError::PathIdentityUnsupported(relative.to_string()),
-            ),
-            Err(error) => Err(WorkspaceToolError::RollbackFailed(format!(
-                "{relative}: quarantined cleanup failed: {}",
-                map_capability_error(error, relative)
-            ))),
+            )),
+            Err(error) => Err(restore_quarantined_cleanup_failure(
+                parent,
+                &quarantine,
+                name,
+                relative,
+                WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: quarantined cleanup failed: {}",
+                    map_capability_error(error, relative)
+                )),
+            )),
         }
     }
 
@@ -1249,7 +1344,12 @@ impl WorkspaceTools {
     ) -> Result<(), WorkspaceToolError> {
         let parent = match self.open_parent_directory(&path.relative, false) {
             Ok(parent) => parent,
-            Err(CapabilityAccessError::Missing) => return Ok(()),
+            Err(CapabilityAccessError::Missing) => {
+                return Err(WorkspaceToolError::RollbackFailed(format!(
+                    "{}: cleanup ownership could not be established; parent is missing",
+                    path.display
+                )));
+            }
             Err(error) => return Err(map_capability_error(error, &path.display)),
         };
         self.remove_owned_file_revision_unix(
@@ -1670,6 +1770,40 @@ fn prepare_directory_identity_collision_for_test(
     }
     let _ = (parent, quarantine);
     Ok(false)
+}
+
+#[cfg(unix)]
+fn tamper_quarantined_file_after_ownership_check_for_test(
+    parent: &CapabilityDir,
+    quarantine: &OsStr,
+) -> Result<(), CapabilityAccessError> {
+    #[cfg(test)]
+    if TAMPER_QUARANTINED_FILE_AFTER_OWNERSHIP_CHECK.with(|tamper| tamper.replace(false)) {
+        let mut options = nofollow_file_options(false, true, false);
+        options.truncate(true);
+        let mut file = parent
+            .open_with(quarantine, &options)
+            .map_err(classify_io_error)?;
+        file.write_all(b"concurrent quarantined mutation")
+            .map_err(CapabilityAccessError::Io)?;
+        file.sync_all().map_err(CapabilityAccessError::Io)?;
+    }
+    let _ = (parent, quarantine);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restore_quarantined_cleanup_failure(
+    parent: &CapabilityDir,
+    quarantine: &OsStr,
+    original: &OsStr,
+    relative: &str,
+    failure: WorkspaceToolError,
+) -> WorkspaceToolError {
+    match restore_quarantined_entry(parent, quarantine, original, relative) {
+        Ok(()) => failure,
+        Err(restore_error) => restore_error,
+    }
 }
 
 #[cfg(unix)]

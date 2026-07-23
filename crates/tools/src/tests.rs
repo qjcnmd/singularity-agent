@@ -408,6 +408,51 @@ mod mutation_tests {
         remove_workspace(&workspace);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_same_object_content_changed_after_initial_ownership_check() {
+        let workspace = test_workspace("quarantined-content-tampering");
+        let target = workspace.join("target.txt");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        tools.tamper_next_quarantined_file_after_ownership_check_for_test();
+
+        let failure = tools
+            .atomic_write_with_hooks(
+                &path,
+                "published",
+                None,
+                |_| {},
+                || {
+                    Err(WorkspaceToolError::ReadFailed(
+                        "injected post-publish failure".to_string(),
+                    ))
+                },
+            )
+            .expect_err("changed quarantined ownership must fail closed");
+
+        assert!(failure.published_revision.is_none());
+        assert!(matches!(
+            failure.error,
+            WorkspaceToolError::RollbackFailed(ref message)
+                if message.contains("ownership changed")
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("preserved concurrent content"),
+            "concurrent quarantined mutation"
+        );
+        assert!(
+            std::fs::read_dir(&workspace)
+                .expect("read workspace")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("singularity-quarantine"))
+        );
+        remove_workspace(&workspace);
+    }
+
     #[test]
     fn atomic_write_rejects_same_object_temp_content_tampering() {
         let workspace = test_workspace("temp-content-tampering");
@@ -830,6 +875,46 @@ mod mutation_tests {
             Err(WorkspaceToolError::RollbackFailed(_))
         ));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "concurrent");
+        remove_workspace(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_reports_a_missing_parent_and_preserves_the_moved_created_file() {
+        let workspace = test_workspace("rollback-moved-parent");
+        std::fs::create_dir(workspace.join("new")).expect("create parent");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("new/created.txt").expect("relative path");
+        let published_revision = tools
+            .atomic_write(&path, "published", None)
+            .expect("publish created file");
+        std::fs::rename(workspace.join("new"), workspace.join("concurrent"))
+            .expect("move created file parent");
+        let published = vec![PublishedMutation {
+            prepared: PreparedMutation {
+                path,
+                relative: "new/created.txt".to_string(),
+                original: String::new(),
+                updated: "published".to_string(),
+                original_revision: None,
+            },
+            published_revision,
+        }];
+
+        let failure = tools
+            .rollback_published(&published)
+            .expect_err("missing parent ownership must fail closed");
+
+        assert!(matches!(
+            failure,
+            WorkspaceToolError::RollbackFailed(ref message)
+                if message.contains("cleanup ownership could not be established")
+        ));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("concurrent/created.txt"))
+                .expect("preserved moved created file"),
+            "published"
+        );
         remove_workspace(&workspace);
     }
 
