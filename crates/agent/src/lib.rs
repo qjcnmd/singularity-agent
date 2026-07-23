@@ -118,6 +118,9 @@ const MAX_VERIFICATION_COMMAND_CHARS: usize = 8_000;
 const MAX_VERIFICATION_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_REPAIR_PLAN_ATTEMPTS: u32 = 3;
 const MAX_REPAIR_CONTEXT_CHARS: usize = 512;
+const MAX_REPAIR_CONTEXT_PATHS: usize = 8;
+const MAX_REPAIR_CONTEXT_PATH_CHARS: usize = 160;
+const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 8_192;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
 const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan: choose a materially different repair strategy that addresses the failed requirement, then rerun the revision-bound verification before final review. Do not repeat the previous repair action or claim success without new evidence.";
@@ -914,6 +917,7 @@ struct AgentLoopState {
     /// Monotonic repair-attempt ledger for the current episode. The active plan may be cleared
     /// after real progress, but this counter survives that transition and approval checkpoints.
     repair_attempts: u32,
+    repair_cycles: Vec<RepairCycleRecord>,
     final_review_verdict: Option<FinalReviewVerdict>,
     last_completion_error: Option<String>,
     plan: Option<AgentPlan>,
@@ -957,6 +961,15 @@ struct RepairPlanState {
     failed_tool_name: Option<String>,
 }
 
+/// Producer-owned evidence for one committed repair decision and its revision-bound verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RepairCycleRecord {
+    attempt: u32,
+    revision: WorkspaceRevision,
+    command_scope_digest: String,
+    verification_passed: bool,
+}
+
 /// Strict model output used by the terminal final-review request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -990,6 +1003,7 @@ impl AgentLoopState {
             verification_failure_history: BTreeSet::new(),
             repair_plan: None,
             repair_attempts: 0,
+            repair_cycles: Vec::new(),
             final_review_verdict: None,
             last_completion_error: None,
             plan: None,
@@ -1233,6 +1247,7 @@ impl AgentLoopState {
                 .collect(),
             repair_plan: self.repair_plan.clone(),
             repair_attempts: self.repair_attempts,
+            repair_cycles: self.repair_cycles.clone(),
             final_review_verdict: self.final_review_verdict,
             last_completion_error: self.last_completion_error.clone(),
             plan: self.plan.clone(),
@@ -1273,6 +1288,11 @@ impl AgentLoopState {
         if !self.completion.allows_final() {
             reasons.push(self.completion.rejection_reason());
         }
+        if self.repair_plan.is_some() && reasons.is_empty() {
+            reasons.push(
+                "completion gate rejected final answer: repair plan remains active".to_string(),
+            );
+        }
         reasons.join("; ")
     }
 
@@ -1291,12 +1311,32 @@ impl AgentLoopState {
     }
 
     fn repair_feedback(&self) -> String {
+        self.repair_feedback_with_failure(None)
+    }
+
+    fn repair_feedback_with_failure(&self, failure: Option<&ToolResult>) -> String {
         let Some(plan) = self.repair_plan.as_ref() else {
             return REPAIR_PLAN_INSTRUCTIONS.to_string();
         };
         let reason = plan.plan.reason;
-        let context = self.build_repair_context(reason, None);
+        let context = self.build_repair_context(reason, failure);
         let context = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
+        let context = if context.chars().count() <= MAX_REPAIR_CONTEXT_SERIALIZED_CHARS {
+            context
+        } else {
+            // Preserve the required shape without admitting an unbounded model message if a
+            // future producer weakens one of the field-level limits.
+            json!({
+                "failed_requirement": "bounded repair context exceeded its safe limit",
+                "evidence": "bounded repair evidence unavailable",
+                "affected_path": "unavailable",
+                "affected_symbol": "unavailable",
+                "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
+                "previous_action": "bounded repair action unavailable",
+                "previous_result": "bounded repair result unavailable",
+            })
+            .to_string()
+        };
         format!("{REPAIR_PLAN_INSTRUCTIONS} repair_context={context}")
     }
 
@@ -1408,12 +1448,12 @@ impl AgentLoopState {
         failed_tool_name: Option<&str>,
     ) -> Result<AgentRepairPlan, AgentRepairPlan> {
         let signature = signature.into();
-        // A failure observed after a real mutation may be the first point at which the repair
-        // episode exists.  Bind that already-observed revision so its terminal command can commit
-        // the first cycle without granting a second prospective attempt for the same evidence.
+        // Bind the current changed revision so the verification cycle that proves this repair
+        // decision is revision-bound, while the attempt is still consumed only by its terminal
+        // verification command.
         let required_revision = self
-            .completion
-            .workspace_mutated()
+            .last_repair_failure
+            .is_none()
             .then_some(self.completion.workspace_revision)
             .flatten();
         let required_check_count = self.completion.summary().required_command_count;
@@ -1539,7 +1579,12 @@ impl AgentLoopState {
                     "changed_paths": change
                         .changed_paths
                         .iter()
-                        .map(|path| bounded_repair_text(path))
+                        .take(MAX_REPAIR_CONTEXT_PATHS)
+                        .map(|path| {
+                            path.chars()
+                                .take(MAX_REPAIR_CONTEXT_PATH_CHARS)
+                                .collect::<String>()
+                        })
                         .collect::<Vec<_>>(),
                     "diff_digest": bounded_repair_text(&change.diff_digest),
                     "workspace_revision": change.revision.value(),
@@ -1602,6 +1647,15 @@ impl AgentLoopState {
         active.plan.required_revision = Some(revision);
     }
 
+    fn note_repair_verification_binding(&mut self) {
+        let Some(active) = self.repair_plan.as_mut() else {
+            return;
+        };
+        if active.plan.required_revision == self.completion.workspace_revision {
+            active.plan.required_check_count = self.completion.required_command_count();
+        }
+    }
+
     /// Commit exactly one repair attempt for a new mutation revision followed by its terminal
     /// command observation.  A failed command remains visible as a consumed cycle and opens the
     /// next prospective attempt; the third failed cycle terminates before another mutation can
@@ -1612,6 +1666,9 @@ impl AgentLoopState {
         result: &ToolResult,
     ) -> Option<RepairCycleCommit> {
         if tool_name != TOOL_COMMAND || result.tool_name != TOOL_COMMAND {
+            return None;
+        }
+        if !result.ok && !is_repairable_tool_result(result) {
             return None;
         }
         let observation = result.workspace_observation()?;
@@ -1645,6 +1702,12 @@ impl AgentLoopState {
         self.recovery_metrics.repair_attempt_count = self.repair_attempts;
         active.plan.attempt = self.repair_attempts;
         let committed_attempt = self.repair_attempts;
+        self.repair_cycles.push(RepairCycleRecord {
+            attempt: committed_attempt,
+            revision,
+            command_scope_digest: command_scope_digest.to_string(),
+            verification_passed: result.ok,
+        });
         if result.ok {
             self.repair_plan = None;
             self.last_repair_failure = None;
@@ -4237,6 +4300,9 @@ where
                 state.note_repair_mutation(revision);
             }
             let plan_bound = state.bind_verification_plan(changed);
+            if plan_bound {
+                state.note_repair_verification_binding();
+            }
             let plan_started = (plan_bound
                 && state.verification_plan.as_ref().is_some_and(|plan| {
                     previous_verification_plan
@@ -4351,17 +4417,20 @@ where
             }
             let provider_tool_name = (prepared.call.parse_status != ModelToolParseStatus::Valid)
                 .then_some(PROVIDER_HISTORY_REJECTED_TOOL);
+            let repair_feedback = state
+                .repair_plan
+                .is_some()
+                .then(|| state.repair_feedback_with_failure(Some(&result)));
             state.append_visible_tool_result(result, provider_tool_name);
             if let Some(feedback) = recovery_feedback {
                 state
                     .messages
                     .push(ModelMessage::text(ModelRole::Developer, feedback));
             }
-            if state.repair_plan.is_some() {
-                state.messages.push(ModelMessage::text(
-                    ModelRole::Developer,
-                    state.repair_feedback(),
-                ));
+            if let Some(repair_feedback) = repair_feedback {
+                state
+                    .messages
+                    .push(ModelMessage::text(ModelRole::Developer, repair_feedback));
             }
             if changed
                 && state.verification_planning_required
@@ -5492,6 +5561,7 @@ fn restore_checkpoint(
         state.verification_plan.is_none() && state.completion.workspace_mutated();
     state.repair_plan = checkpoint.repair_plan;
     state.repair_attempts = checkpoint.repair_attempts;
+    state.repair_cycles = checkpoint.repair_cycles;
     state.final_review_verdict = checkpoint.final_review_verdict;
     state.last_completion_error = checkpoint.last_completion_error;
     state.plan = checkpoint.plan;

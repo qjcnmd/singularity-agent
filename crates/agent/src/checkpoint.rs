@@ -166,6 +166,7 @@ pub struct ApprovalCheckpoint {
     pub(super) verification_failure_history: Vec<String>,
     pub(super) repair_plan: Option<super::RepairPlanState>,
     pub(super) repair_attempts: u32,
+    pub(super) repair_cycles: Vec<super::RepairCycleRecord>,
     pub(super) final_review_verdict: Option<super::FinalReviewVerdict>,
     pub(super) last_completion_error: Option<String>,
     pub(super) plan: Option<AgentPlan>,
@@ -203,6 +204,8 @@ struct ApprovalCheckpointWire {
     repair_plan: Option<super::RepairPlanState>,
     repair_attempts: u32,
     #[serde(default)]
+    repair_cycles: Vec<super::RepairCycleRecord>,
+    #[serde(default)]
     final_review_verdict: Option<super::FinalReviewVerdict>,
     last_completion_error: Option<String>,
     plan: Option<AgentPlan>,
@@ -239,6 +242,7 @@ impl From<&ApprovalCheckpoint> for ApprovalCheckpointWire {
             verification_failure_history: checkpoint.verification_failure_history.clone(),
             repair_plan: checkpoint.repair_plan.clone(),
             repair_attempts: checkpoint.repair_attempts,
+            repair_cycles: checkpoint.repair_cycles.clone(),
             final_review_verdict: checkpoint.final_review_verdict,
             last_completion_error: checkpoint.last_completion_error.clone(),
             plan: checkpoint.plan.clone(),
@@ -300,6 +304,7 @@ impl ApprovalCheckpoint {
             verification_failure_history: wire.verification_failure_history,
             repair_plan: wire.repair_plan,
             repair_attempts: wire.repair_attempts,
+            repair_cycles: wire.repair_cycles,
             final_review_verdict: wire.final_review_verdict,
             last_completion_error: wire.last_completion_error,
             plan: wire.plan,
@@ -489,6 +494,32 @@ impl ApprovalCheckpoint {
         }
         if self.repair_attempts != self.recovery_metrics.repair_attempt_count {
             return Err("approval checkpoint repair attempt metrics are inconsistent".to_string());
+        }
+        if self.repair_cycles.len() != usize::try_from(self.repair_attempts).unwrap_or(usize::MAX) {
+            return Err("approval checkpoint repair cycle ledger is inconsistent".to_string());
+        }
+        for (index, cycle) in self.repair_cycles.iter().enumerate() {
+            let expected_attempt = u32::try_from(index + 1).unwrap_or(u32::MAX);
+            if cycle.attempt != expected_attempt
+                || !super::is_sha256_fingerprint(&cycle.command_scope_digest)
+                || self.repair_cycles[..index]
+                    .iter()
+                    .any(|previous| previous.revision.value() >= cycle.revision.value())
+                || !self.tool_result_occurrences.iter().any(|occurrence| {
+                    let result = occurrence.result();
+                    result.tool_name == super::TOOL_COMMAND
+                        && result.ok == cycle.verification_passed
+                        && super::tool_result_command_scope_digest(result)
+                            == Some(cycle.command_scope_digest.as_str())
+                        && result.workspace_observation().is_some_and(|observation| {
+                            observation.mutation()
+                                == singularity_tools::WorkspaceMutation::Unchanged
+                                && observation.revision() == Some(cycle.revision)
+                        })
+                })
+            {
+                return Err("approval checkpoint repair cycle evidence is invalid".to_string());
+            }
         }
         if self
             .repair_plan

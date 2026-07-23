@@ -8158,14 +8158,14 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
     );
 
     assert_eq!(result.status, AgentStatus::Blocked, "result={result:?}");
-    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     let pending = pending_approval(&result);
     let checkpoint = pending
         .encode_checkpoint()
         .expect("repair context checkpoint");
-    assert_eq!(checkpoint["repair_attempts"], 1);
+    assert_eq!(checkpoint["repair_attempts"], 0);
     assert_eq!(
-        checkpoint["repair_plan"]["plan"]["attempt"], 2,
+        checkpoint["repair_plan"]["plan"]["attempt"], 1,
         "checkpoint={checkpoint}"
     );
     assert_eq!(
@@ -8287,6 +8287,9 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
         edit_response(8, "v2", "v3"),
         plan_response(9),
         command_response(10),
+        edit_response(11, "v3", "v4"),
+        plan_response(12),
+        command_response(13),
     ];
     let policy = allow_read_execute_policy()
         .with_rule(
@@ -8338,13 +8341,13 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     let first_checkpoint = first_pending.encode_checkpoint().expect("first checkpoint");
     assert_eq!(first_checkpoint["checkpoint_version"], 3);
     assert_eq!(
-        first_checkpoint["repair_attempts"], 2,
+        first_checkpoint["repair_attempts"], 1,
         "checkpoint={first_checkpoint}"
     );
-    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 3);
+    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 2);
     assert_eq!(
         first_checkpoint["recovery_metrics"]["repair_attempt_count"],
-        2
+        1
     );
     let mut missing_change_summary = first_checkpoint.clone();
     missing_change_summary
@@ -8421,7 +8424,19 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     );
     assert_eq!(
         coordinated_reset.expect_err("unresolved failures require a coordinated repair state"),
-        "approval checkpoint repair state is missing for unresolved failure"
+        "approval checkpoint repair cycle ledger is inconsistent"
+    );
+    let mut active_ledger_reset = first_checkpoint.clone();
+    active_ledger_reset["repair_attempts"] = serde_json::json!(0);
+    active_ledger_reset["recovery_metrics"]["repair_attempt_count"] = serde_json::json!(0);
+    active_ledger_reset["repair_plan"]["plan"]["attempt"] = serde_json::json!(1);
+    let active_ledger_reset = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &active_ledger_reset,
+    );
+    assert_eq!(
+        active_ledger_reset.expect_err("active repair ledger cannot be rolled back"),
+        "approval checkpoint repair cycle ledger is inconsistent"
     );
 
     let first_resumed_input = input.clone().with_approval_grant(ApprovalGrant::allow(
@@ -8450,8 +8465,8 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     let second_checkpoint = second_pending
         .encode_checkpoint()
         .expect("second checkpoint");
-    assert_eq!(second_checkpoint["repair_attempts"], 2);
-    assert_eq!(second_checkpoint["repair_plan"]["plan"]["attempt"], 3);
+    assert_eq!(second_checkpoint["repair_attempts"], 1);
+    assert_eq!(second_checkpoint["repair_plan"]["plan"]["attempt"], 2);
 
     let second_resumed_input = first_resumed_input.with_approval_grant(ApprovalGrant::allow(
         second_pending.pending_tool_call().request_id.clone(),
@@ -8492,9 +8507,9 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     )));
     assert_eq!(
         std::fs::read_to_string(workspace.path().join(fixture_name)).unwrap(),
-        "v3"
+        "v4"
     );
-    assert_eq!(seen_requests.lock().expect("seen requests").len(), 11);
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 14);
     assert!(events.iter().any(|event| matches!(
         event,
         AgentLoopEvent::Observation(AgentObservation::RepairPlanning(repair))
@@ -8515,6 +8530,7 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
         .expect("mutation-bound repair context");
     assert!(repair_context.content.contains(fixture_name));
     assert!(repair_context.content.contains("diff_digest"));
+    assert!(repair_context.content.chars().count() < 10_000);
     assert!(
         !repair_context
             .content
@@ -8682,12 +8698,12 @@ fn repair_cycle_requires_matching_scope_and_all_revision_checks() {
     let first_checkpoint = first_pending
         .encode_checkpoint()
         .expect("multi-check checkpoint");
-    assert_eq!(first_checkpoint["repair_attempts"], 1);
+    assert_eq!(first_checkpoint["repair_attempts"], 0);
     assert_eq!(
         first_checkpoint["recovery_metrics"]["repair_attempt_count"],
-        1
+        0
     );
-    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 2);
+    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 1);
     assert_eq!(
         first_checkpoint["repair_plan"]["plan"]["required_revision"],
         2
@@ -8706,7 +8722,7 @@ fn repair_cycle_requires_matching_scope_and_all_revision_checks() {
     .expect("restore multi-check checkpoint");
     let result = agent_loop.resume_pending_approval(&input.with_approval_grant(grant), &restored);
     assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
-    assert_eq!(result.recovery_metrics.repair_attempt_count, 2);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
     assert_eq!(
         std::fs::read_to_string(workspace.path().join(fixture_name)).expect("read result"),
         "v2"
