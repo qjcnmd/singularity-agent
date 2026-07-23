@@ -1067,9 +1067,6 @@ time.sleep(30)
         )
         .expect("Cargo.toml");
         fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
-        // Keep this rustup-routing test independent from WSL OverlayFS new-directory behavior.
-        fs::create_dir(workspace.path().join("target")).expect("target directory");
-
         let result = strict_backend().execute(&request(
             "linux_rustup_cargo",
             &["cargo", "check", "--offline", "--quiet"],
@@ -1125,9 +1122,6 @@ time.sleep(30)
         )
         .expect("Cargo.toml");
         fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
-        // Keep this rustup-routing test independent from WSL OverlayFS new-directory behavior.
-        fs::create_dir(workspace.path().join("target")).expect("target directory");
-
         let host_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvironmentGuard::set("PATH", &format!("{}:{host_path}", path_str(&cargo_bin)));
         let _cargo_home = EnvironmentGuard::set("CARGO_HOME", path_str(&cargo_home));
@@ -1258,13 +1252,19 @@ time.sleep(30)
         fs::write(workspace.path().join("delete.txt"), "delete").expect("delete fixture");
         fs::create_dir(workspace.path().join("data")).expect("data fixture");
         fs::write(workspace.path().join("data/old.txt"), "old").expect("nested fixture");
+        fs::create_dir(workspace.path().join("rename-dir")).expect("rename directory fixture");
+        fs::write(
+            workspace.path().join("rename-dir/value.txt"),
+            "directory rename",
+        )
+        .expect("rename directory child");
 
         let result = strict_backend().execute(&request(
             "linux_transaction_commit",
             &[
                 "/bin/sh",
                 "-c",
-                "set -eu; printf created > created.txt; printf after > update.txt; mv rename.txt renamed.txt; rm delete.txt data/old.txt; mkdir data/new; printf nested > data/new/value.txt",
+                "set -eu; printf created > created.txt; printf after > update.txt; mv rename.txt renamed.txt; mv rename-dir renamed-dir; rm delete.txt data/old.txt; mkdir data/new; printf nested > data/new/value.txt",
             ],
             workspace.path(),
             SandboxFilesystemMode::WorkspaceWrite,
@@ -1298,6 +1298,11 @@ time.sleep(30)
             fs::read_to_string(workspace.path().join("data/new/value.txt")).unwrap(),
             "nested"
         );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("renamed-dir/value.txt")).unwrap(),
+            "directory rename"
+        );
+        assert!(!workspace.path().join("rename-dir").exists());
     }
 
     #[test]
@@ -1336,6 +1341,146 @@ time.sleep(30)
                 .expect("post-epoch timestamp")
                 .as_secs();
             assert_eq!(modified, expected_seconds, "{relative}");
+        }
+    }
+
+    #[test]
+    fn linux_workspace_transaction_noop_preserves_internal_hardlinks_exactly() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first_path = workspace.path().join("first.txt");
+        let second_path = workspace.path().join("second.txt");
+        fs::write(&first_path, "unchanged").expect("first fixture");
+        hard_link(&first_path, &second_path).expect("internal hardlink");
+        let before = fs::metadata(&first_path).expect("before metadata");
+
+        let result = strict_backend().execute(&request(
+            "linux_transaction_hardlink_noop",
+            &["/bin/true"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
+        assert!(result.workspace_change_summary.is_none());
+        let first = fs::metadata(&first_path).expect("first metadata");
+        let second = fs::metadata(&second_path).expect("second metadata");
+        assert_eq!(fs::read(&first_path).unwrap(), b"unchanged");
+        assert_eq!(fs::read(&second_path).unwrap(), b"unchanged");
+        assert_eq!(first.ino(), before.ino());
+        assert_eq!(second.ino(), before.ino());
+        assert_eq!(first.nlink(), 2);
+        assert_eq!(first.modified().unwrap(), before.modified().unwrap());
+    }
+
+    #[test]
+    fn linux_workspace_transaction_rejects_tmpdir_resolving_inside_workspace() {
+        let _environment = lock_environment();
+        let workspace = tempfile::tempdir().expect("workspace");
+        let transaction_root = workspace.path().join("transaction-temp");
+        fs::create_dir(&transaction_root).expect("transaction temp");
+        let link_owner = tempfile::tempdir().expect("link owner");
+        let temporary_link = link_owner.path().join("tmp-link");
+        symlink(&transaction_root, &temporary_link).expect("temporary-root symlink");
+        let _temporary_root = EnvironmentGuard::set("TMPDIR", path_str(&temporary_link));
+
+        let result = strict_backend().execute(&request(
+            "linux_transaction_tmpdir_inside_workspace",
+            &["/bin/true"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Unsupported);
+        assert!(
+            result
+                .stderr_preview
+                .contains("capability_not_supported:overlay_filesystem")
+        );
+        assert_eq!(
+            fs::read_dir(&transaction_root).unwrap().count(),
+            0,
+            "transaction storage must not be created inside the workspace"
+        );
+    }
+
+    #[test]
+    fn linux_workspace_transaction_commits_directory_delete_and_rebuild() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::create_dir(workspace.path().join("deleted")).expect("deleted fixture");
+        fs::write(workspace.path().join("deleted/old.txt"), "old").expect("deleted child");
+        fs::create_dir(workspace.path().join("rebuilt")).expect("rebuilt fixture");
+        fs::write(workspace.path().join("rebuilt/old.txt"), "old").expect("rebuilt child");
+
+        let result = strict_backend().execute(&request(
+            "linux_transaction_directory_whiteouts",
+            &[
+                "/bin/sh",
+                "-c",
+                "set -eu; rm -rf deleted; rm -rf rebuilt; mkdir rebuilt; printf new > rebuilt/new.txt",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            result.stderr_preview
+        );
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert!(!workspace.path().join("deleted").exists());
+        assert!(!workspace.path().join("rebuilt/old.txt").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("rebuilt/new.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn linux_workspace_transaction_rejects_untrusted_xattrs_and_special_objects() {
+        for (id, script) in [
+            (
+                "ordinary_xattr",
+                "python3 -c \"import os; os.setxattr('file.txt', 'user.untrusted', b'x')\"",
+            ),
+            (
+                "redirect_xattr",
+                "python3 -c \"import os; os.setxattr('directory', 'user.overlay.redirect', b'elsewhere')\"",
+            ),
+            (
+                "metacopy_xattr",
+                "python3 -c \"import os; os.setxattr('file.txt', 'user.overlay.metacopy', b'y')\"",
+            ),
+            ("fifo", "mkfifo named-pipe"),
+        ] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            fs::write(workspace.path().join("file.txt"), "before").expect("file fixture");
+            fs::create_dir(workspace.path().join("directory")).expect("directory fixture");
+            let result = strict_backend().execute(&request(
+                &format!("linux_transaction_{id}"),
+                &["/bin/sh", "-c", script],
+                workspace.path(),
+                SandboxFilesystemMode::WorkspaceWrite,
+                SandboxNetworkMode::Denied,
+            ));
+
+            assert_eq!(
+                result.execution_status,
+                CommandExecutionStatus::PolicyDenied,
+                "{id}: {}",
+                result.stderr_preview
+            );
+            assert_eq!(
+                fs::read_to_string(workspace.path().join("file.txt")).unwrap(),
+                "before"
+            );
+            assert!(!workspace.path().join("named-pipe").exists());
         }
     }
 
@@ -1433,40 +1578,6 @@ time.sleep(30)
             "original"
         );
         assert!(!workspace.path().join("moved").exists());
-    }
-
-    #[test]
-    fn linux_workspace_transaction_detects_real_workspace_drift_before_commit() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let workspace_path = workspace.path().to_path_buf();
-        let backend = strict_backend();
-        let worker = thread::spawn(move || {
-            backend.execute(&request(
-                "linux_workspace_drift",
-                &[
-                    "/bin/sh",
-                    "-c",
-                    "sleep 1; printf transaction > transaction.txt",
-                ],
-                &workspace_path,
-                SandboxFilesystemMode::WorkspaceWrite,
-                SandboxNetworkMode::Denied,
-            ))
-        });
-        thread::sleep(Duration::from_millis(200));
-        fs::write(workspace.path().join("external.txt"), "external")
-            .expect("concurrent real workspace change");
-
-        let result = worker.join().expect("sandbox worker");
-        assert_eq!(
-            result.execution_status,
-            CommandExecutionStatus::PolicyDenied
-        );
-        assert_eq!(
-            fs::read_to_string(workspace.path().join("external.txt")).unwrap(),
-            "external"
-        );
-        assert!(!workspace.path().join("transaction.txt").exists());
     }
 
     #[test]
