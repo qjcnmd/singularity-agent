@@ -13,8 +13,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation result 的 schema 版本。
 pub enum EvaluationResultSchemaVersion {
-    #[serde(rename = "evaluation.result/v7")]
-    V7,
+    #[serde(rename = "evaluation.result/v8")]
+    V8,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,12 +142,23 @@ pub enum BlockerKind {
 #[serde(deny_unknown_fields)]
 /// Evaluation 或阶段的阻塞原因。
 pub struct EvaluationBlocker {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     pub kind: BlockerKind,
     pub message: String,
 }
 
 impl EvaluationBlocker {
     fn validate(&self, context: &str) -> Result<()> {
+        if self
+            .code
+            .as_deref()
+            .is_some_and(|code| code.trim().is_empty())
+        {
+            return Err(validation_error(format!(
+                "{context} blocker.code must not be empty"
+            )));
+        }
         if self.message.trim().is_empty() {
             return Err(validation_error(format!(
                 "{context} blocker.message must not be empty"
@@ -155,6 +166,50 @@ impl EvaluationBlocker {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Stable result projection of the sandbox preflight outcome.
+pub enum EvaluationSandboxPreflightOutcome {
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Bounded fact for a platform-specific sandbox control.
+pub enum EvaluationSandboxPreflightFact {
+    Passed,
+    Failed,
+    NotApplicable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Run-level sandbox facts captured before provider/trial sampling.
+pub struct EvaluationSandboxPreflight {
+    pub outcome: EvaluationSandboxPreflightOutcome,
+    pub error_code: Option<String>,
+    pub profile: String,
+    pub backend: String,
+    pub missing_capabilities: Vec<String>,
+    pub os: String,
+    pub arch: String,
+    pub kernel: Option<String>,
+    pub filesystem: Option<String>,
+    pub overlayfs: EvaluationSandboxPreflightFact,
+    pub user_namespace: EvaluationSandboxPreflightFact,
+    pub mount_namespace: EvaluationSandboxPreflightFact,
+    pub pid_namespace: EvaluationSandboxPreflightFact,
+    pub network_namespace: EvaluationSandboxPreflightFact,
+    pub no_new_privs: EvaluationSandboxPreflightFact,
+    pub seccomp: EvaluationSandboxPreflightFact,
+    pub landlock: EvaluationSandboxPreflightFact,
+    pub transactional_workspace: EvaluationSandboxPreflightFact,
+    pub network_denied: EvaluationSandboxPreflightFact,
+    pub protected_paths: EvaluationSandboxPreflightFact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,6 +565,10 @@ impl EvaluationTaskResult {
 pub struct EvaluationRunSummary {
     pub task_count: u32,
     pub trials_per_task: u32,
+    /// Number of trials requested by the manifest, including runs blocked before sampling.
+    pub configured_trial_count: u32,
+    /// Number of trials that actually entered AgentLoop sampling.
+    pub sampled_trial_count: u32,
     pub trial_count: u32,
     pub completed_trial_count: u32,
     pub failed_trial_count: u32,
@@ -568,6 +627,8 @@ impl EvaluationRunSummary {
         Self {
             task_count,
             trials_per_task,
+            configured_trial_count: task_count.saturating_mul(trials_per_task),
+            sampled_trial_count: trial_count,
             trial_count,
             completed_trial_count,
             failed_trial_count,
@@ -581,6 +642,18 @@ impl EvaluationRunSummary {
             task_success_rate_basis_points,
             meets_core_task_success_threshold: task_success_rate_basis_points
                 >= CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS,
+        }
+    }
+
+    /// Construct a run summary for a preflight blocker with no sampled trials.
+    pub fn for_preflight_blocker(task_count: u32, trials_per_task: u32) -> Self {
+        Self {
+            task_count,
+            trials_per_task,
+            configured_trial_count: task_count.saturating_mul(trials_per_task),
+            sampled_trial_count: 0,
+            trial_count: 0,
+            ..Self::default()
         }
     }
 }
@@ -615,6 +688,8 @@ pub struct EvaluationResult {
     pub evaluation_passed: bool,
     pub summary: EvaluationRunSummary,
     pub tasks: Vec<EvaluationTaskResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_preflight: Option<EvaluationSandboxPreflight>,
 }
 
 impl EvaluationResult {
@@ -631,13 +706,34 @@ impl EvaluationResult {
         let evaluation_passed =
             !tasks.is_empty() && tasks.iter().all(|task| task.evaluation_passed);
         Self {
-            schema_version: EvaluationResultSchemaVersion::V7,
+            schema_version: EvaluationResultSchemaVersion::V8,
             run_id,
             status,
             blocker,
             evaluation_passed,
             summary: EvaluationRunSummary::from_tasks(&tasks, trials_per_task),
             tasks,
+            sandbox_preflight: None,
+        }
+    }
+
+    /// Construct a run-level environment blocker without fabricating sampled trials.
+    pub fn blocked_by_sandbox_preflight(
+        run_id: RunId,
+        task_count: u32,
+        trials_per_task: u32,
+        blocker: EvaluationBlocker,
+        sandbox_preflight: EvaluationSandboxPreflight,
+    ) -> Self {
+        Self {
+            schema_version: EvaluationResultSchemaVersion::V8,
+            run_id,
+            status: EvaluationStatus::Blocked,
+            blocker: Some(blocker),
+            evaluation_passed: false,
+            summary: EvaluationRunSummary::for_preflight_blocker(task_count, trials_per_task),
+            tasks: Vec::new(),
+            sandbox_preflight: Some(sandbox_preflight),
         }
     }
 
@@ -649,9 +745,49 @@ impl EvaluationResult {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.tasks.is_empty() || self.summary.trials_per_task == 0 {
+        if self.summary.trials_per_task == 0 {
             return Err(validation_error(
                 "evaluation result requires tasks and a positive trials_per_task",
+            ));
+        }
+        let Some(preflight) = self.sandbox_preflight.as_ref() else {
+            return Err(validation_error(
+                "evaluation result requires sandbox preflight evidence",
+            ));
+        };
+        validate_sandbox_preflight(preflight, "evaluation result sandbox_preflight")?;
+        if self.tasks.is_empty() {
+            let expected_summary = EvaluationRunSummary::for_preflight_blocker(
+                self.summary.task_count,
+                self.summary.trials_per_task,
+            );
+            if self.status != EvaluationStatus::Blocked
+                || self.evaluation_passed
+                || self.summary.task_count == 0
+                || self.summary != expected_summary
+                || self.blocker.as_ref().is_none_or(|blocker| {
+                    blocker.kind != BlockerKind::Environment
+                        || !blocker
+                            .code
+                            .as_deref()
+                            .is_some_and(|code| code.starts_with("sandbox_preflight_"))
+                })
+                || preflight.outcome != EvaluationSandboxPreflightOutcome::Unsupported
+                || self
+                    .blocker
+                    .as_ref()
+                    .and_then(|blocker| blocker.code.as_deref())
+                    != preflight.error_code.as_deref()
+            {
+                return Err(validation_error(
+                    "empty evaluation result must be one sandbox preflight blocker with zero sampled trials",
+                ));
+            }
+            return Ok(());
+        }
+        if preflight.outcome != EvaluationSandboxPreflightOutcome::Supported {
+            return Err(validation_error(
+                "sampled evaluation result cannot carry an unsupported sandbox preflight",
             ));
         }
         let mut task_ids = BTreeSet::new();
@@ -688,6 +824,81 @@ impl EvaluationResult {
         }
         Ok(())
     }
+}
+
+pub(crate) fn validate_sandbox_preflight(
+    preflight: &EvaluationSandboxPreflight,
+    context: &str,
+) -> Result<()> {
+    const MAX_FACT_CHARS: usize = 128;
+    let valid_text =
+        |value: &str| !value.trim().is_empty() && value.chars().count() <= MAX_FACT_CHARS;
+    let missing = preflight
+        .missing_capabilities
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if preflight.profile != "workspace_write_network_denied"
+        || !valid_text(&preflight.backend)
+        || !valid_text(&preflight.os)
+        || !valid_text(&preflight.arch)
+        || preflight
+            .kernel
+            .as_deref()
+            .is_some_and(|value| !valid_text(value))
+        || preflight
+            .filesystem
+            .as_deref()
+            .is_some_and(|value| !valid_text(value))
+        || preflight
+            .error_code
+            .as_deref()
+            .is_some_and(|code| !valid_text(code) || !code.starts_with("sandbox_preflight_"))
+        || missing.len() != preflight.missing_capabilities.len()
+        || preflight
+            .missing_capabilities
+            .iter()
+            .any(|capability| !valid_text(capability))
+    {
+        return Err(validation_error(format!(
+            "{context} must contain bounded backend, platform, profile, and error fields"
+        )));
+    }
+    match preflight.outcome {
+        EvaluationSandboxPreflightOutcome::Supported
+            if preflight.error_code.is_some()
+                || !preflight.missing_capabilities.is_empty()
+                || [
+                    preflight.overlayfs,
+                    preflight.user_namespace,
+                    preflight.mount_namespace,
+                    preflight.pid_namespace,
+                    preflight.network_namespace,
+                    preflight.no_new_privs,
+                    preflight.seccomp,
+                    preflight.landlock,
+                    preflight.transactional_workspace,
+                    preflight.network_denied,
+                    preflight.protected_paths,
+                ]
+                .contains(&EvaluationSandboxPreflightFact::Unknown)
+                || preflight.transactional_workspace != EvaluationSandboxPreflightFact::Passed
+                || preflight.network_denied != EvaluationSandboxPreflightFact::Passed
+                || preflight.protected_paths != EvaluationSandboxPreflightFact::Passed =>
+        {
+            return Err(validation_error(format!(
+                "{context} supported outcome requires a fully verified strict contract"
+            )));
+        }
+        EvaluationSandboxPreflightOutcome::Unsupported
+            if preflight.error_code.is_none() || preflight.missing_capabilities.is_empty() =>
+        {
+            return Err(validation_error(format!(
+                "{context} unsupported outcome requires error_code and missing capabilities"
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn aggregate_status(statuses: &[EvaluationStatus]) -> EvaluationStatus {

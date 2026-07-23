@@ -32,7 +32,8 @@ use super::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, CommandSemanticStatus, DEFAULT_MAX_OUTPUT_CHARS, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    WorkspaceChangeSummary, WorkspaceMutation, WorkspaceSnapshot, snapshot_workspace,
+    SandboxPreflightFact, SandboxPreflightReport, WorkspaceChangeSummary, WorkspaceMutation,
+    WorkspaceSnapshot, snapshot_workspace,
 };
 
 const BACKEND_NAME: &str = "linux";
@@ -584,6 +585,121 @@ impl SandboxBackend for LinuxSandboxBackend {
         }
     }
 
+    fn preflight(
+        &self,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> SandboxPreflightReport {
+        let mut report = super::baseline_sandbox_preflight(self);
+        report.os = "linux".to_string();
+        report.kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|value| value.trim().chars().take(128).collect());
+        report.filesystem = linux_filesystem_fact(workspace);
+        let probe = &self.probe;
+        report.user_namespace = fact(probe.user_namespace);
+        report.mount_namespace = fact(probe.mount_namespace);
+        report.pid_namespace = fact(probe.pid_namespace);
+        report.network_namespace = fact(probe.network_namespace);
+        report.no_new_privs = fact(probe.no_new_privs);
+        report.seccomp = fact(probe.seccomp);
+        report.landlock = fact(probe.landlock_abi.is_some_and(|abi| abi >= 3));
+        if !probe.strict_ready() {
+            report.outcome = super::SandboxPreflightOutcome::Unsupported;
+            report.error_code = Some("sandbox_preflight_linux_capability_missing".to_string());
+            for (available, name) in [
+                (probe.user_namespace, "user_namespace"),
+                (probe.mount_namespace, "mount_namespace"),
+                (probe.pid_namespace, "pid_namespace"),
+                (probe.network_namespace, "network_namespace"),
+                (probe.no_new_privs, "no_new_privs"),
+                (probe.seccomp, "seccomp"),
+                (probe.landlock_abi.is_some_and(|abi| abi >= 3), "landlock"),
+                (probe.process_tree_cleanup, "process_tree_cleanup"),
+            ] {
+                if !available && !report.missing_capabilities.iter().any(|item| item == name) {
+                    report.missing_capabilities.push(name.to_string());
+                }
+            }
+            return report;
+        }
+        if cancellation.is_cancelled() {
+            report.unsupported("sandbox_preflight_cancelled", &["cancellation"]);
+            return report;
+        }
+        const PROBE_FILE: &str = "singularity-preflight.txt";
+        let result = super::preflight_command(
+            self,
+            workspace,
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("printf preflight > {PROBE_FILE}"),
+            ],
+            SandboxNetworkMode::Denied,
+            cancellation,
+            "write",
+        );
+        if super::preflight_write_verified(&result, PROBE_FILE) {
+            // A strict write probe traverses the same transactional execution path as
+            // evaluation commands, including the overlay mount setup; static
+            // `copy_on_write` capability alone is not treated as execution evidence.
+            report.overlayfs = SandboxPreflightFact::Passed;
+            report.transactional_workspace = SandboxPreflightFact::Passed;
+            let host_network_namespace = fs::read_link("/proc/self/ns/net")
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+            let network_result = super::preflight_command(
+                self,
+                workspace,
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "readlink /proc/self/ns/net".to_string(),
+                ],
+                SandboxNetworkMode::Denied,
+                cancellation,
+                "network_namespace",
+            );
+            let network_denied = super::preflight_unchanged_verified(&network_result)
+                && host_network_namespace.is_some_and(|host| {
+                    !network_result.stdout_preview.trim().is_empty()
+                        && network_result.stdout_preview.trim() != host
+                });
+            let protected_denied = preflight_protected_write_denied(self, workspace, cancellation);
+            report.network_denied = fact(network_denied);
+            report.protected_paths = fact(protected_denied);
+            if network_denied && protected_denied {
+                report.outcome = super::SandboxPreflightOutcome::Supported;
+                report.error_code = None;
+            } else {
+                let mut missing = Vec::new();
+                if !network_denied {
+                    missing.push("network_denied");
+                }
+                if !protected_denied {
+                    missing.push("protected_metadata_admission");
+                }
+                report.unsupported("sandbox_preflight_policy_probe_failed", &missing);
+            }
+        } else {
+            report.overlayfs = SandboxPreflightFact::Failed;
+            report.transactional_workspace = SandboxPreflightFact::Failed;
+            report.network_denied = SandboxPreflightFact::Failed;
+            report.protected_paths = SandboxPreflightFact::Failed;
+            report.unsupported(
+                "sandbox_preflight_write_unverified",
+                &[
+                    "overlay_filesystem",
+                    "transactional_workspace",
+                    "network_denied",
+                    "protected_metadata_admission",
+                ],
+            );
+        }
+        report
+    }
+
     fn execute(&self, request: &CommandRequest) -> CommandResult {
         self.execute_cancellable(request, &CancellationToken::new())
     }
@@ -638,6 +754,119 @@ impl SandboxBackend for LinuxSandboxBackend {
             cancellation,
         )
     }
+}
+
+fn fact(available: bool) -> SandboxPreflightFact {
+    if available {
+        SandboxPreflightFact::Passed
+    } else {
+        SandboxPreflightFact::Failed
+    }
+}
+
+fn preflight_protected_write_denied(
+    backend: &LinuxSandboxBackend,
+    workspace: &Path,
+    cancellation: &CancellationToken,
+) -> bool {
+    const SENTINEL: &str = "protected-sentinel";
+    let protected_dir = workspace.join(".git");
+    let protected_file = protected_dir.join("singularity-preflight-protected.txt");
+    if fs::create_dir(&protected_dir).is_err() || fs::write(&protected_file, SENTINEL).is_err() {
+        let _ = fs::remove_dir_all(&protected_dir);
+        return false;
+    }
+    let read_result = super::preflight_command(
+        backend,
+        workspace,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "cat .git/singularity-preflight-protected.txt".to_string(),
+        ],
+        SandboxNetworkMode::Denied,
+        cancellation,
+        "protected_read",
+    );
+    let write_result = super::preflight_command(
+        backend,
+        workspace,
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf tampered > .git/singularity-preflight-protected.txt".to_string(),
+        ],
+        SandboxNetworkMode::Denied,
+        cancellation,
+        "protected_write",
+    );
+    let preserved = fs::read_to_string(&protected_file).ok().as_deref() == Some(SENTINEL);
+    let cleanup_succeeded = fs::remove_dir_all(&protected_dir).is_ok();
+    preserved
+        && cleanup_succeeded
+        && protected_probe_denied(&read_result)
+        && !read_result.stdout_preview.contains(SENTINEL)
+        && protected_probe_denied(&write_result)
+}
+
+fn protected_probe_denied(result: &CommandResult) -> bool {
+    let classified = match result.execution_status {
+        CommandExecutionStatus::PolicyDenied => {
+            result.semantic_status == CommandSemanticStatus::PolicyBlocked
+        }
+        CommandExecutionStatus::Completed => {
+            result.semantic_status != CommandSemanticStatus::Succeeded
+                && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
+        }
+        _ => false,
+    };
+    classified
+        && result.workspace_mutation != WorkspaceMutation::Changed
+        && !result.sandbox.local_process_fallback
+}
+
+fn linux_filesystem_fact(workspace: &Path) -> Option<String> {
+    let canonical_workspace =
+        fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    linux_filesystem_from_mountinfo(&mountinfo, &canonical_workspace)
+}
+
+fn linux_filesystem_from_mountinfo(mountinfo: &str, workspace: &Path) -> Option<String> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (mount_fields, filesystem_fields) = line.split_once(" - ")?;
+            let fields = mount_fields.split_whitespace().collect::<Vec<_>>();
+            let mountpoint = fields.get(4).map(|value| decode_mountinfo_path(value))?;
+            let mountpoint = Path::new(&mountpoint);
+            if workspace != mountpoint && !workspace.starts_with(mountpoint) {
+                return None;
+            }
+            let filesystem = filesystem_fields.split_whitespace().next()?.to_string();
+            Some((mountpoint.components().count(), filesystem))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, filesystem)| filesystem.chars().take(64).collect())
+}
+
+fn decode_mountinfo_path(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 3 < bytes.len() && bytes[index] == b'\\' {
+            let octal = &bytes[index + 1..index + 4];
+            if octal.iter().all(|byte| (b'0'..=b'7').contains(byte)) {
+                decoded.push((octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + octal[2] - b'0');
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 #[derive(Debug, Clone)]
@@ -4113,6 +4342,32 @@ fn close_all_extra_fds() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_fact_uses_the_longest_mountpoint_for_workspace() {
+        let mountinfo = concat!(
+            "36 29 0:32 / / rw,relatime - overlay overlay rw\n",
+            "37 36 0:33 / /mnt/c rw,relatime - 9p drvfs rw\n",
+            "38 36 0:34 / /mnt/c/project rw,relatime - ext4 /dev/vdb rw\n",
+        );
+        assert_eq!(
+            linux_filesystem_from_mountinfo(mountinfo, Path::new("/mnt/c/project/src")),
+            Some("ext4".to_string())
+        );
+        assert_eq!(
+            linux_filesystem_from_mountinfo(mountinfo, Path::new("/mnt/c/other")),
+            Some("9p".to_string())
+        );
+        assert_eq!(
+            linux_filesystem_from_mountinfo(mountinfo, Path::new("/tmp")),
+            Some("overlay".to_string())
+        );
+        let escaped = "40 29 0:40 / /workspace\\040with\\040space rw - ext4 /dev/vdc rw\n";
+        assert_eq!(
+            linux_filesystem_from_mountinfo(escaped, Path::new("/workspace with space/project")),
+            Some("ext4".to_string())
+        );
+    }
 
     fn request(id: &str, script: &str, workspace: &Path) -> CommandRequest {
         CommandRequest::project_verification(

@@ -1607,6 +1607,7 @@ dependencies = [
  "singularity_core",
  "singularity_windows_sandbox",
  "tempfile",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

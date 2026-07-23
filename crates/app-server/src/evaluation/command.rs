@@ -198,7 +198,7 @@ pub(super) fn command_succeeded(result: &CommandResult) -> bool {
         && result.semantic_status == CommandSemanticStatus::Succeeded
         && result.workspace_mutation != singularity_tools::WorkspaceMutation::Unknown
         && !result.sandbox.local_process_fallback
-        && result.sandbox.enforcement != singularity_tools::SandboxBackendEnforcement::Unavailable
+        && result.sandbox.enforcement == singularity_tools::SandboxBackendEnforcement::Strict
 }
 
 /// 将 sandbox/backend 状态映射为基础设施 blocker。
@@ -212,10 +212,10 @@ pub(super) fn infrastructure_blocker(
             format!("{context}: local process fallback is forbidden"),
         ));
     }
-    if result.sandbox.enforcement == singularity_tools::SandboxBackendEnforcement::Unavailable {
+    if result.sandbox.enforcement != singularity_tools::SandboxBackendEnforcement::Strict {
         return Some(evaluation_blocker(
             BlockerKind::Sandbox,
-            format!("{context}: sandbox enforcement is unavailable"),
+            format!("{context}: strict sandbox enforcement is required"),
         ));
     }
     match result.execution_status {
@@ -411,10 +411,16 @@ mod tests {
             (SandboxBackendEnforcement::Unavailable, false),
         ] {
             let result = CommandResult::completed("command", "ok")
-                .with_sandbox_execution("test", enforcement);
+                .with_sandbox_execution("test", enforcement)
+                .with_workspace_mutation(singularity_tools::WorkspaceMutation::Unchanged);
 
             assert_eq!(
                 CommandDiagnostic::new("verification", &result).is_strictly_sandboxed(),
+                expected
+            );
+            assert_eq!(command_succeeded(&result), expected);
+            assert_eq!(
+                infrastructure_blocker(&result, "verification command").is_none(),
                 expected
             );
         }

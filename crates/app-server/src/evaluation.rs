@@ -23,9 +23,11 @@ use singularity_core::{
 use singularity_evaluation::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
     EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationPromptStructure,
-    EvaluationProviderEvidence, EvaluationResult, EvaluationStageResults, EvaluationStatus,
-    EvaluationTaskResult, EvaluationTrialResult, PatchFormat, PlannedWorkspaceSource, RunId,
-    StageResult, StageStatus, TaskId, VerificationStagePlan, WorkspacePlan,
+    EvaluationProviderEvidence, EvaluationResult, EvaluationSandboxPreflight,
+    EvaluationSandboxPreflightFact, EvaluationSandboxPreflightOutcome, EvaluationStageResults,
+    EvaluationStatus, EvaluationTaskResult, EvaluationTrialResult, PatchFormat,
+    PlannedWorkspaceSource, RunId, StageResult, StageStatus, TaskId, VerificationStagePlan,
+    WorkspacePlan,
 };
 use singularity_model::{
     ModelErrorCategory, ModelUsage, OpenAiProvider, ProviderAttemptMetadata,
@@ -43,8 +45,9 @@ use singularity_protocol::{
 };
 use singularity_tools::{
     CommandEnvironmentPolicy, CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend,
-    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, ToolAuthorization, ToolBroker,
-    ToolCapability, ToolExecutor, ToolRegistry, WorkspaceToolExecutor, WorkspaceTools,
+    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact,
+    SandboxPreflightOutcome, SandboxPreflightReport, ToolAuthorization, ToolBroker, ToolCapability,
+    ToolExecutor, ToolRegistry, WorkspaceToolExecutor, WorkspaceTools,
     command_script_scope_digest_with_policy, workspace_tool_entries,
 };
 
@@ -60,7 +63,8 @@ use command::{
     run_command_spec, run_workspace_preparation_command, sandbox_network_mode,
 };
 use evidence::{
-    agent_command_observation, build_evaluation_evidence, canonical_json_digest, content_digest,
+    agent_command_observation, build_evaluation_evidence, build_preflight_evidence,
+    canonical_json_digest, content_digest,
 };
 use workspace::{
     WorkspaceChangeEvidence, apply_agent_changes, copy_tree_checked, evaluation_changed_paths,
@@ -145,6 +149,14 @@ impl SandboxBackend for CancellationAwareSandboxBackend {
     ) -> CommandResult {
         self.backend
             .execute_script_cancellable(request, cancellation)
+    }
+
+    fn preflight(
+        &self,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> SandboxPreflightReport {
+        self.backend.preflight(workspace, cancellation)
     }
 }
 
@@ -318,6 +330,15 @@ struct TaskEvaluation {
     trials: Vec<TaskExecution>,
 }
 
+/// Materialized source state prepared before any provider trial in the run.
+struct PreparedTaskSource {
+    task_root: PathBuf,
+    source_dir: PathBuf,
+    source: SourceProvenance,
+    source_commands: Vec<CommandDiagnostic>,
+    blocker: Option<EvaluationBlocker>,
+}
+
 /// 同一 prepared source 派生全部隔离 trial 时共享的只读任务上下文。
 struct PreparedTaskContext<'a> {
     run_id: &'a RunId,
@@ -343,6 +364,12 @@ struct EvaluationRunContext<'a> {
     cancellation: &'a CancellationToken,
     trace_store: &'a singularity_store::SessionStore,
     trace_failures: Arc<Mutex<Vec<String>>>,
+    sandbox_preflight: &'a SandboxPreflightReport,
+}
+
+struct SandboxPreflightFailure {
+    report: SandboxPreflightReport,
+    blocker: EvaluationBlocker,
 }
 
 fn record_trace_failure(failures: &Arc<Mutex<Vec<String>>>, error: impl Into<String>) {
@@ -649,6 +676,29 @@ pub(crate) fn run_evaluation(
 
     let cancellable_sandbox_backend =
         cancellation_aware_sandbox_backend(&sandbox_backend, cancellation);
+    let preflight =
+        match run_sandbox_preflight(&run_dir, &plans, &cancellable_sandbox_backend, cancellation) {
+            Ok(report) => report,
+            Err(failure) => {
+                let preflight = sandbox_preflight_evidence(&failure.report);
+                let result = EvaluationResult::blocked_by_sandbox_preflight(
+                    run_id.clone(),
+                    u32::try_from(plans.len()).unwrap_or(u32::MAX),
+                    trials_per_task,
+                    failure.blocker,
+                    preflight.clone(),
+                );
+                return publish_preflight_blocked_run(
+                    params,
+                    &run_dir,
+                    manifest_digest,
+                    &plans,
+                    trials_per_task,
+                    result,
+                    preflight,
+                );
+            }
+        };
     let run_context = EvaluationRunContext {
         run_id: &run_id,
         run_dir: &run_dir,
@@ -658,9 +708,17 @@ pub(crate) fn run_evaluation(
         cancellation,
         trace_store,
         trace_failures: Arc::new(Mutex::new(Vec::new())),
+        sandbox_preflight: &preflight,
     };
+    // Materialize every task source before entering the first provider trial. This keeps
+    // source preparation failures deterministic and prevents a later task from being
+    // prepared after an earlier task has already sampled the provider.
+    let prepared_sources = plans
+        .iter()
+        .map(|plan| prepare_task_source(&run_context, plan))
+        .collect::<Vec<_>>();
     let mut task_executions = Vec::new();
-    for plan in &plans {
+    for (plan, prepared_source) in plans.iter().zip(&prepared_sources) {
         if cancellation.is_cancelled() {
             let partial = partial_evaluation_result(params, &run_id, &task_executions);
             return Err(cleanup_incomplete_run(
@@ -668,7 +726,12 @@ pub(crate) fn run_evaluation(
                 EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
             ));
         }
-        task_executions.push(run_task_trials(&run_context, plan, trials_per_task));
+        task_executions.push(run_task_trials_with_prepared_source(
+            &run_context,
+            plan,
+            trials_per_task,
+            prepared_source,
+        ));
         if cancellation.is_cancelled() {
             let partial = partial_evaluation_result(params, &run_id, &task_executions);
             return Err(cleanup_incomplete_run(
@@ -702,7 +765,8 @@ pub(crate) fn run_evaluation(
         .iter()
         .map(|execution| execution.result.clone())
         .collect::<Vec<_>>();
-    let result = EvaluationResult::from_tasks(run_id.clone(), trials_per_task, tasks);
+    let mut result = EvaluationResult::from_tasks(run_id.clone(), trials_per_task, tasks);
+    result.sandbox_preflight = Some(sandbox_preflight_evidence(&preflight));
     if let Err(error) = result.validate() {
         return Err(cleanup_incomplete_run(
             &run_dir,
@@ -720,6 +784,7 @@ pub(crate) fn run_evaluation(
         &plans,
         &task_executions,
         &run_dir,
+        sandbox_preflight_evidence(&preflight),
     ) {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -760,6 +825,8 @@ pub(crate) fn run_evaluation(
         "manifest": params.manifest,
         "runner": RUNNER_NAME,
         "tasks": task_reports,
+        "summary": result.summary,
+        "sandbox_preflight": sandbox_preflight_evidence(&preflight),
         "result_path": result_path.to_string_lossy(),
         "report_path": report_path.to_string_lossy(),
         "evidence_path": evidence_path.to_string_lossy(),
@@ -854,6 +921,7 @@ fn task_report(execution: &TaskEvaluation) -> Value {
     report
 }
 
+#[cfg(test)]
 fn run_task_trials(
     context: &EvaluationRunContext<'_>,
     plan: &WorkspacePlan,
@@ -875,7 +943,8 @@ fn run_task_trials(
         TraceSpanKind::Task,
         "evaluation task",
     );
-    let evaluation = run_task_trials_inner(context, plan, trials_per_task);
+    let prepared_source = prepare_task_source(context, plan);
+    let evaluation = run_task_trials_inner(context, plan, trials_per_task, &prepared_source);
     trace.end(
         &session_id,
         &span_id,
@@ -887,91 +956,223 @@ fn run_task_trials(
     evaluation
 }
 
+fn publish_preflight_blocked_run(
+    params: &EvalRunParams,
+    run_dir: &Path,
+    manifest_digest: String,
+    plans: &[WorkspacePlan],
+    trials_per_task: u32,
+    result: EvaluationResult,
+    preflight: EvaluationSandboxPreflight,
+) -> Result<EvalRunResult, EvaluationRunError> {
+    let run_id = &result.run_id;
+    if let Err(error) = result.validate() {
+        return Err(cleanup_incomplete_run(
+            run_dir,
+            EvaluationRunError::infrastructure(format!(
+                "invalid sandbox-preflight-blocked evaluation result: {error}"
+            )),
+        ));
+    }
+    let evidence = match build_preflight_evidence(
+        run_id,
+        manifest_digest,
+        plans,
+        trials_per_task,
+        preflight.clone(),
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return Err(cleanup_incomplete_run(
+                run_dir,
+                EvaluationRunError::infrastructure(error),
+            ));
+        }
+    };
+    if let Err(error) = evidence.validate_against_result(&result) {
+        return Err(cleanup_incomplete_run(
+            run_dir,
+            EvaluationRunError::infrastructure(format!(
+                "sandbox preflight evidence/result mismatch: {error}"
+            )),
+        ));
+    }
+    let publication_dir = run_dir.join(PUBLICATION_DIR);
+    let result_path = publication_dir.join(RESULT_FILE);
+    let report_path = publication_dir.join(REPORT_FILE);
+    let evidence_path = publication_dir.join(EVIDENCE_FILE);
+    let status = enum_string(result.status).map_err(|error| {
+        cleanup_incomplete_run(run_dir, EvaluationRunError::infrastructure(error))
+    })?;
+    let blocker = result
+        .blocker
+        .as_ref()
+        .map(blocker_code)
+        .transpose()
+        .map_err(|error| {
+            cleanup_incomplete_run(run_dir, EvaluationRunError::infrastructure(error))
+        })?;
+    let report = json!({
+        "manifest": params.manifest,
+        "runner": RUNNER_NAME,
+        "tasks": [],
+        "summary": result.summary,
+        "sandbox_preflight": preflight,
+        "result_path": result_path.to_string_lossy(),
+        "report_path": report_path.to_string_lossy(),
+        "evidence_path": evidence_path.to_string_lossy(),
+    });
+    let published = publish_evaluation_artifacts(run_dir, run_id, &result, &report, &evidence)
+        .map_err(|error| cleanup_incomplete_run(run_dir, EvaluationRunError::publication(error)))?;
+    Ok(EvalRunResult {
+        run_id: run_id.as_str().to_string(),
+        manifest: params.manifest.clone(),
+        runner: RUNNER_NAME.to_string(),
+        status,
+        blocker,
+        tasks: Vec::new(),
+        result_path: Some(published.result_path.to_string_lossy().into_owned()),
+        report_path: Some(published.report_path.to_string_lossy().into_owned()),
+        evidence_path: Some(published.evidence_path.to_string_lossy().into_owned()),
+        evaluation_passed: false,
+    })
+}
+
+fn run_task_trials_with_prepared_source(
+    context: &EvaluationRunContext<'_>,
+    plan: &WorkspacePlan,
+    trials_per_task: u32,
+    prepared_source: &PreparedTaskSource,
+) -> TaskEvaluation {
+    let scope = format!("task:{}", plan.task_id.as_str());
+    let session_id = scope.clone();
+    let span_id = evaluation_span_id(context.run_id, &scope, TraceSpanKind::Task);
+    let started = Instant::now();
+    let trace = EvaluationTraceSink {
+        store: context.trace_store,
+        run_id: context.run_id,
+        failures: &context.trace_failures,
+    };
+    trace.start(
+        &session_id,
+        &span_id,
+        None,
+        TraceSpanKind::Task,
+        "evaluation task",
+    );
+    let evaluation = run_task_trials_inner(context, plan, trials_per_task, prepared_source);
+    trace.end(
+        &session_id,
+        &span_id,
+        None,
+        TraceSpanKind::Task,
+        evaluation_status_trace_status(evaluation.result.status),
+        started,
+    );
+    evaluation
+}
+
+fn prepare_task_source(
+    context: &EvaluationRunContext<'_>,
+    plan: &WorkspacePlan,
+) -> PreparedTaskSource {
+    let task_root = context.run_dir.join(plan.task_id.as_str());
+    let source_dir = task_root.join(SOURCE_DIR);
+    let initial_source = source_provenance(&plan.source, &source_dir, context.manifest_dir);
+    let mut prepared = PreparedTaskSource {
+        task_root,
+        source_dir,
+        source: initial_source,
+        source_commands: Vec::new(),
+        blocker: None,
+    };
+    if context.cancellation.is_cancelled() {
+        prepared.blocker = Some(evaluation_blocker(
+            BlockerKind::AgentRuntime,
+            "evaluation cancelled",
+        ));
+        return prepared;
+    }
+    if let Err(error) = fs::create_dir(&prepared.task_root) {
+        prepared.blocker = Some(evaluation_blocker(
+            BlockerKind::WorkspacePreparation,
+            format!(
+                "failed to create task directory {}: {error}",
+                prepared.task_root.display()
+            ),
+        ));
+        return prepared;
+    }
+    if context.sandbox_preflight.outcome != SandboxPreflightOutcome::Supported {
+        prepared.blocker = Some(sandbox_preflight_blocker(
+            context
+                .sandbox_preflight
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "sandbox_preflight_unavailable".to_string()),
+            "validated sandbox preflight contract is not supported",
+        ));
+        return prepared;
+    }
+    if matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. })
+        && let Err(error) = context.provider_snapshot.provider()
+    {
+        prepared.blocker = Some(provider_blocker(&error));
+        return prepared;
+    }
+    match prepare_source(
+        &plan.source,
+        &prepared.task_root,
+        &prepared.source_dir,
+        Arc::clone(context.sandbox_backend),
+    ) {
+        Ok(commands) => {
+            prepared.source_commands = commands;
+            prepared.source =
+                source_provenance(&plan.source, &prepared.source_dir, context.manifest_dir);
+        }
+        Err((blocker, commands)) => {
+            prepared.source_commands = commands;
+            prepared.blocker = Some(blocker);
+            prepared.source =
+                source_provenance(&plan.source, &prepared.source_dir, context.manifest_dir);
+        }
+    }
+    prepared
+}
+
 fn run_task_trials_inner(
     context: &EvaluationRunContext<'_>,
     plan: &WorkspacePlan,
     trials_per_task: u32,
+    prepared_source: &PreparedTaskSource,
 ) -> TaskEvaluation {
-    let task_root = context.run_dir.join(plan.task_id.as_str());
-    let source_dir = task_root.join(SOURCE_DIR);
-    let initial_source = source_provenance(&plan.source, &source_dir, context.manifest_dir);
+    if let Some(blocker) = &prepared_source.blocker {
+        return blocked_task_trials(
+            plan,
+            trials_per_task,
+            blocker.clone(),
+            prepared_source.source.clone(),
+            prepared_source.source_commands.clone(),
+            matches!(blocker.kind, BlockerKind::WorkspacePreparation),
+        );
+    }
     if context.cancellation.is_cancelled() {
         return blocked_task_trials(
             plan,
             trials_per_task,
             evaluation_blocker(BlockerKind::AgentRuntime, "evaluation cancelled"),
-            initial_source,
-            Vec::new(),
+            prepared_source.source.clone(),
+            prepared_source.source_commands.clone(),
             false,
         );
     }
-    if let Err(error) = fs::create_dir(&task_root) {
-        return blocked_task_trials(
-            plan,
-            trials_per_task,
-            evaluation_blocker(
-                BlockerKind::WorkspacePreparation,
-                format!(
-                    "failed to create task directory {}: {error}",
-                    task_root.display()
-                ),
-            ),
-            initial_source,
-            Vec::new(),
-            false,
-        );
-    }
-    let capability = super::agent_loop_capability(context.sandbox_backend.as_ref());
-    if !capability.available {
-        return blocked_task_trials(
-            plan,
-            trials_per_task,
-            evaluation_blocker(
-                BlockerKind::Environment,
-                format!("{}: {}", capability.status.as_str(), capability.reason),
-            ),
-            initial_source,
-            Vec::new(),
-            false,
-        );
-    }
-    if matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. })
-        && let Err(error) = context.provider_snapshot.provider()
-    {
-        return blocked_task_trials(
-            plan,
-            trials_per_task,
-            provider_blocker(&error),
-            initial_source,
-            Vec::new(),
-            false,
-        );
-    }
-    let source_commands = match prepare_source(
-        &plan.source,
-        &task_root,
-        &source_dir,
-        Arc::clone(context.sandbox_backend),
-    ) {
-        Ok(commands) => commands,
-        Err((blocker, commands)) => {
-            return blocked_task_trials(
-                plan,
-                trials_per_task,
-                blocker,
-                source_provenance(&plan.source, &source_dir, context.manifest_dir),
-                commands,
-                true,
-            );
-        }
-    };
-    let source = source_provenance(&plan.source, &source_dir, context.manifest_dir);
     let prepared = PreparedTaskContext {
         run_id: context.run_id,
-        task_root: &task_root,
-        source_dir: &source_dir,
-        source: &source,
-        source_commands: &source_commands,
+        task_root: &prepared_source.task_root,
+        source_dir: &prepared_source.source_dir,
+        source: &prepared_source.source,
+        source_commands: &prepared_source.source_commands,
         plan,
         sandbox_backend: context.sandbox_backend,
         provider_snapshot: context.provider_snapshot,
@@ -2816,9 +3017,149 @@ fn provider_response_stage(diagnostic: &ProviderDiagnostic) -> bool {
 
 fn evaluation_blocker(kind: BlockerKind, message: impl Into<String>) -> EvaluationBlocker {
     EvaluationBlocker {
+        code: None,
         kind,
         message: safe_text(message.into()),
     }
+}
+
+fn sandbox_preflight_blocker(
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> EvaluationBlocker {
+    EvaluationBlocker {
+        code: Some(code.into()),
+        kind: BlockerKind::Environment,
+        message: safe_text(message.into()),
+    }
+}
+
+fn sandbox_preflight_evidence(report: &SandboxPreflightReport) -> EvaluationSandboxPreflight {
+    EvaluationSandboxPreflight {
+        outcome: match report.outcome {
+            SandboxPreflightOutcome::Supported => EvaluationSandboxPreflightOutcome::Supported,
+            SandboxPreflightOutcome::Unsupported => EvaluationSandboxPreflightOutcome::Unsupported,
+        },
+        error_code: report.error_code.clone(),
+        profile: report.profile.clone(),
+        backend: report.backend.clone(),
+        missing_capabilities: report.missing_capabilities.clone(),
+        os: report.os.clone(),
+        arch: report.arch.clone(),
+        kernel: report.kernel.clone(),
+        filesystem: report.filesystem.clone(),
+        overlayfs: sandbox_preflight_fact(report.overlayfs),
+        user_namespace: sandbox_preflight_fact(report.user_namespace),
+        mount_namespace: sandbox_preflight_fact(report.mount_namespace),
+        pid_namespace: sandbox_preflight_fact(report.pid_namespace),
+        network_namespace: sandbox_preflight_fact(report.network_namespace),
+        no_new_privs: sandbox_preflight_fact(report.no_new_privs),
+        seccomp: sandbox_preflight_fact(report.seccomp),
+        landlock: sandbox_preflight_fact(report.landlock),
+        transactional_workspace: sandbox_preflight_fact(report.transactional_workspace),
+        network_denied: sandbox_preflight_fact(report.network_denied),
+        protected_paths: sandbox_preflight_fact(report.protected_paths),
+    }
+}
+
+fn sandbox_preflight_fact(fact: SandboxPreflightFact) -> EvaluationSandboxPreflightFact {
+    match fact {
+        SandboxPreflightFact::Passed => EvaluationSandboxPreflightFact::Passed,
+        SandboxPreflightFact::Failed => EvaluationSandboxPreflightFact::Failed,
+        SandboxPreflightFact::NotApplicable => EvaluationSandboxPreflightFact::NotApplicable,
+        SandboxPreflightFact::Unknown => EvaluationSandboxPreflightFact::Unknown,
+    }
+}
+
+fn run_sandbox_preflight(
+    run_dir: &Path,
+    plans: &[WorkspacePlan],
+    sandbox_backend: &SharedSandboxBackend,
+    cancellation: &CancellationToken,
+) -> Result<SandboxPreflightReport, Box<SandboxPreflightFailure>> {
+    if plans.is_empty() {
+        let mut report = sandbox_backend.preflight(run_dir, cancellation);
+        report.outcome = SandboxPreflightOutcome::Unsupported;
+        report.error_code = Some("sandbox_preflight_empty_task_set".to_string());
+        report.missing_capabilities.push("task_set".to_string());
+        return Err(Box::new(SandboxPreflightFailure {
+            report,
+            blocker: sandbox_preflight_blocker(
+                "sandbox_preflight_empty_task_set",
+                "sandbox preflight requires at least one task",
+            ),
+        }));
+    }
+    if cancellation.is_cancelled() {
+        let mut report = sandbox_backend.preflight(run_dir, cancellation);
+        report.outcome = SandboxPreflightOutcome::Unsupported;
+        report.error_code = Some("sandbox_preflight_cancelled".to_string());
+        report.missing_capabilities.push("cancellation".to_string());
+        return Err(Box::new(SandboxPreflightFailure {
+            report,
+            blocker: sandbox_preflight_blocker(
+                "sandbox_preflight_cancelled",
+                "evaluation sandbox preflight was cancelled",
+            ),
+        }));
+    }
+    // The run-owned scratch directory is on the same filesystem as task roots. One probe
+    // therefore establishes the backend/profile contract for the entire task set without
+    // touching any task source or starting a provider trial.
+    let scratch = run_dir.join(".sandbox-preflight");
+    if let Err(error) = fs::create_dir_all(&scratch) {
+        let mut report = sandbox_backend.preflight(run_dir, cancellation);
+        report.outcome = SandboxPreflightOutcome::Unsupported;
+        report.error_code = Some("sandbox_preflight_scratch_unavailable".to_string());
+        report
+            .missing_capabilities
+            .push("scratch_workspace".to_string());
+        return Err(Box::new(SandboxPreflightFailure {
+            report,
+            blocker: sandbox_preflight_blocker(
+                "sandbox_preflight_scratch_unavailable",
+                format!("sandbox preflight scratch workspace unavailable: {error}"),
+            ),
+        }));
+    }
+    let mut report = sandbox_backend.preflight(&scratch, cancellation);
+    if let Err(error) = fs::remove_dir_all(&scratch) {
+        report.outcome = SandboxPreflightOutcome::Unsupported;
+        report.error_code = Some("sandbox_preflight_scratch_cleanup".to_string());
+        report
+            .missing_capabilities
+            .push("scratch_cleanup".to_string());
+        return Err(Box::new(SandboxPreflightFailure {
+            report,
+            blocker: sandbox_preflight_blocker(
+                "sandbox_preflight_scratch_cleanup",
+                format!("sandbox preflight scratch cleanup failed: {error}"),
+            ),
+        }));
+    }
+    if report.outcome == SandboxPreflightOutcome::Supported
+        && !report.proves_supported_contract_for(sandbox_backend.name())
+    {
+        report.outcome = SandboxPreflightOutcome::Unsupported;
+        report.error_code = Some("sandbox_preflight_contract_invalid".to_string());
+        report
+            .missing_capabilities
+            .push("validated_backend_contract".to_string());
+    }
+    if report.outcome == SandboxPreflightOutcome::Unsupported {
+        let code = report
+            .error_code
+            .clone()
+            .unwrap_or_else(|| "sandbox_preflight_unavailable".to_string());
+        return Err(Box::new(SandboxPreflightFailure {
+            report,
+            blocker: sandbox_preflight_blocker(
+                code.clone(),
+                format!("sandbox preflight unsupported: {code}"),
+            ),
+        }));
+    }
+    Ok(report)
 }
 
 fn stage_result(status: StageStatus, blocker: Option<EvaluationBlocker>) -> StageResult {
@@ -3215,6 +3556,31 @@ mod tests {
         ToolCapabilityRequirement {
             capability: ToolCapabilityName::new(name).expect("capability name"),
             minimum_version: 1,
+        }
+    }
+
+    fn supported_sandbox_preflight(backend: &str) -> SandboxPreflightReport {
+        SandboxPreflightReport {
+            outcome: SandboxPreflightOutcome::Supported,
+            error_code: None,
+            profile: "workspace_write_network_denied".to_string(),
+            backend: backend.to_string(),
+            missing_capabilities: Vec::new(),
+            os: "test".to_string(),
+            arch: "test".to_string(),
+            kernel: Some("test-kernel".to_string()),
+            filesystem: Some("test-filesystem".to_string()),
+            overlayfs: SandboxPreflightFact::NotApplicable,
+            user_namespace: SandboxPreflightFact::NotApplicable,
+            mount_namespace: SandboxPreflightFact::NotApplicable,
+            pid_namespace: SandboxPreflightFact::NotApplicable,
+            network_namespace: SandboxPreflightFact::NotApplicable,
+            no_new_privs: SandboxPreflightFact::NotApplicable,
+            seccomp: SandboxPreflightFact::NotApplicable,
+            landlock: SandboxPreflightFact::NotApplicable,
+            transactional_workspace: SandboxPreflightFact::Passed,
+            network_denied: SandboxPreflightFact::Passed,
+            protected_paths: SandboxPreflightFact::Passed,
         }
     }
 
@@ -3762,7 +4128,7 @@ mod tests {
         }
 
         fn capabilities(&self) -> SandboxCapabilities {
-            SandboxCapabilities::strict()
+            SandboxCapabilities::strict().with_change_detection()
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -4037,7 +4403,15 @@ mod tests {
         }
 
         fn capabilities(&self) -> SandboxCapabilities {
-            SandboxCapabilities::strict()
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn preflight(
+            &self,
+            _workspace: &Path,
+            _cancellation: &CancellationToken,
+        ) -> SandboxPreflightReport {
+            supported_sandbox_preflight(self.name())
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -4062,6 +4436,74 @@ mod tests {
             }
             CommandResult::completed(&request.command_id, "ok")
                 .with_workspace_mutation(WorkspaceMutation::Changed)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    struct UnsupportedPreflightBackend {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl SandboxBackend for UnsupportedPreflightBackend {
+        fn name(&self) -> &'static str {
+            "unsupported_preflight_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn preflight(
+            &self,
+            _workspace: &Path,
+            _cancellation: &CancellationToken,
+        ) -> SandboxPreflightReport {
+            let mut report = supported_sandbox_preflight(self.name());
+            report.outcome = SandboxPreflightOutcome::Unsupported;
+            report.error_code = Some("sandbox_preflight_test_unsupported".to_string());
+            report.missing_capabilities = vec!["transactional_workspace".to_string()];
+            report.transactional_workspace = SandboxPreflightFact::Failed;
+            report
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            CommandResult::backend_error(
+                &request.command_id,
+                "unsupported preflight must prevent command execution",
+            )
+            .with_workspace_mutation(WorkspaceMutation::Unknown)
+            .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    struct AgentLoopReachBackend;
+
+    impl SandboxBackend for AgentLoopReachBackend {
+        fn name(&self) -> &'static str {
+            "agent_loop_reach_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn preflight(
+            &self,
+            _workspace: &Path,
+            _cancellation: &CancellationToken,
+        ) -> SandboxPreflightReport {
+            supported_sandbox_preflight(self.name())
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            let result = if request.argv.first().map(String::as_str) == Some("verify-baseline") {
+                CommandResult::executed(&request.command_id, 1, 0, "", "expected failure", false)
+            } else {
+                CommandResult::completed(&request.command_id, "verified")
+            };
+            result
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
@@ -4282,6 +4724,28 @@ mod tests {
         let provider_snapshot = ProviderConfigSnapshot::capture(|_| None);
         let cancellation = CancellationToken::new();
         let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let sandbox_preflight = SandboxPreflightReport {
+            outcome: SandboxPreflightOutcome::Supported,
+            error_code: None,
+            profile: "workspace_write_network_denied".to_string(),
+            backend: sandbox_backend.name().to_string(),
+            missing_capabilities: Vec::new(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            kernel: None,
+            filesystem: None,
+            overlayfs: SandboxPreflightFact::NotApplicable,
+            user_namespace: SandboxPreflightFact::NotApplicable,
+            mount_namespace: SandboxPreflightFact::NotApplicable,
+            pid_namespace: SandboxPreflightFact::NotApplicable,
+            network_namespace: SandboxPreflightFact::NotApplicable,
+            no_new_privs: SandboxPreflightFact::NotApplicable,
+            seccomp: SandboxPreflightFact::NotApplicable,
+            landlock: SandboxPreflightFact::NotApplicable,
+            transactional_workspace: SandboxPreflightFact::Passed,
+            network_denied: SandboxPreflightFact::Passed,
+            protected_paths: SandboxPreflightFact::Passed,
+        };
         let context = EvaluationRunContext {
             run_id: &run_id,
             run_dir: &run_dir,
@@ -4291,6 +4755,7 @@ mod tests {
             cancellation: &cancellation,
             trace_store: &trace_store,
             trace_failures: Arc::new(Mutex::new(Vec::new())),
+            sandbox_preflight: &sandbox_preflight,
         };
         let evaluation = run_task_trials(&context, &plan, 3);
 
@@ -4313,7 +4778,216 @@ mod tests {
     }
 
     #[test]
-    fn v5_blocked_run_publishes_v7_result_and_v2_evidence_as_one_artifact_set() {
+    fn supported_preflight_reaches_agent_loop_and_calls_provider() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking provider fixture");
+        let provider_address = listener.local_addr().expect("provider address");
+        let provider = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("provider read timeout");
+                        let mut request = [0u8; 8192];
+                        let _ = stream.read(&mut request);
+                        let body = br#"{"error":{"message":"fixture authentication rejected","type":"authentication_error"}}"#;
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("provider response headers");
+                        stream.write_all(body).expect("provider response body");
+                        return 1usize;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return 0;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("provider fixture accept failed: {error}"),
+                }
+            }
+        });
+
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let output_root = temp.path().join("output");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let manifest_path = temp.path().join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "evaluation.task_set/v5",
+                "trial_count": 1,
+                "tasks": [{
+                    "task_id": "preflight-supported",
+                    "description": "supported preflight reaches AgentLoop",
+                    "capabilities": ["repository_context"],
+                    "workspace": {"source": {"type": "local", "path": "fixture"}},
+                    "agent": {
+                        "instructions": "inspect README.md",
+                        "allowed_paths": ["README.md"],
+                        "required_tool_capabilities": [
+                            {"capability": "workspace_read", "minimum_version": 1}
+                        ]
+                    },
+                    "evaluator": {
+                        "baseline": {"commands": [{"argv": ["verify-baseline"]}]},
+                        "public": {"commands": [{"argv": ["verify-public"]}]},
+                        "hidden": {"commands": [{"argv": ["verify-hidden"]}]}
+                    }
+                }]
+            }))
+            .expect("manifest JSON"),
+        )
+        .expect("manifest file");
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "preflight-supported-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let base_url = format!("http://{provider_address}/v1");
+        let provider_snapshot = ProviderConfigSnapshot::capture(|name| match name {
+            "SINGULARITY_API_KEY" => Some("fixture-key".to_string()),
+            "SINGULARITY_BASE_URL" => Some(base_url.clone()),
+            "SINGULARITY_MODEL" => Some("fixture-model".to_string()),
+            _ => None,
+        });
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+
+        let response = run_evaluation(
+            &params,
+            Arc::new(AgentLoopReachBackend),
+            &provider_snapshot,
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("provider rejection still publishes evaluation artifacts");
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result path"))
+                .expect("result artifact"),
+        )
+        .expect("result v8");
+        let provider_calls = provider.join().expect("provider fixture join");
+
+        assert_eq!(
+            provider_calls, 1,
+            "AgentLoop must issue one provider request; result={result:?}"
+        );
+        assert_eq!(result.summary.configured_trial_count, 1);
+        assert_eq!(result.summary.sampled_trial_count, 1);
+        assert_eq!(result.summary.trial_count, 1);
+        assert_eq!(result.tasks.len(), 1);
+        assert_eq!(result.tasks[0].trials.len(), 1);
+        let agent = &result.tasks[0].trials[0].stages.agent;
+        assert_eq!(agent.status, StageStatus::Blocked);
+        assert!(agent.blocker.as_ref().is_some_and(|blocker| matches!(
+            blocker.kind,
+            BlockerKind::ProviderAuthentication | BlockerKind::ProviderResponse
+        )));
+        assert!(
+            output_root
+                .join("preflight-supported-run")
+                .join("preflight-supported")
+                .join("trial-0001")
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn unsupported_preflight_publishes_one_environment_blocker_without_trials_or_commands() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let output_root = temp.path().join("output");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let manifest_path = temp.path().join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "evaluation.task_set/v5",
+                "trial_count": 2,
+                "tasks": [{
+                    "task_id": "preflight-blocked",
+                    "description": "preflight must fail before sampling",
+                    "capabilities": ["repository_context"],
+                    "workspace": {"source": {"type": "local", "path": "fixture"}},
+                    "agent": {
+                        "instructions": "inspect",
+                        "allowed_paths": ["README.md"],
+                        "required_tool_capabilities": [
+                            {"capability": "workspace_read", "minimum_version": 1}
+                        ]
+                    },
+                    "evaluator": {
+                        "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
+                        "public": {"commands": [{"argv": ["cargo", "test"]}]},
+                        "hidden": {"commands": [{"argv": ["cargo", "check"]}]}
+                    }
+                }]
+            }))
+            .expect("manifest JSON"),
+        )
+        .expect("manifest file");
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "preflight-blocked-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let executions = Arc::new(AtomicUsize::new(0));
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+
+        let response = run_evaluation(
+            &params,
+            Arc::new(UnsupportedPreflightBackend {
+                executions: Arc::clone(&executions),
+            }),
+            &ProviderConfigSnapshot::capture(|_| None),
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("preflight blocker publishes typed artifacts");
+
+        assert_eq!(response.status, "blocked");
+        assert!(response.tasks.is_empty());
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result path"))
+                .expect("result artifact"),
+        )
+        .expect("result v8");
+        assert!(result.tasks.is_empty());
+        assert_eq!(result.summary.configured_trial_count, 2);
+        assert_eq!(result.summary.sampled_trial_count, 0);
+        assert_eq!(result.summary.trial_count, 0);
+        assert_eq!(result.summary.blocked_trial_count, 0);
+        assert_eq!(
+            result
+                .blocker
+                .as_ref()
+                .and_then(|blocker| blocker.code.as_deref()),
+            Some("sandbox_preflight_test_unsupported")
+        );
+        let run_dir = output_root.join("preflight-blocked-run");
+        assert!(!run_dir.join("preflight-blocked").exists());
+        assert!(run_dir.join(PUBLICATION_DIR).is_dir());
+    }
+
+    #[test]
+    fn v5_blocked_run_publishes_v8_result_and_v3_evidence_as_one_artifact_set() {
         let temp = tempfile::tempdir().expect("temp");
         let fixture = temp.path().join("fixture");
         let output_root = temp.path().join("output");
@@ -4369,11 +5043,11 @@ mod tests {
         let result = EvaluationResult::from_json_str(
             &fs::read_to_string(&result_path).expect("result artifact"),
         )
-        .expect("result v7");
+        .expect("result v8");
         let evidence = singularity_evaluation::EvaluationEvidence::from_json_str(
             &fs::read_to_string(&evidence_path).expect("evidence artifact"),
         )
-        .expect("evidence v2");
+        .expect("evidence v3");
         evidence
             .validate_against_result(&result)
             .expect("result/evidence binding");
@@ -4471,7 +5145,7 @@ mod tests {
             &run_id,
             &json!({"status": "completed"}),
             &json!({"runner": RUNNER_NAME}),
-            &json!({"schema_version": "evaluation.evidence/v2"}),
+            &json!({"schema_version": "evaluation.evidence/v3"}),
         )
         .expect_err("publish must fail");
 
@@ -4506,9 +5180,9 @@ mod tests {
         let published = publish_evaluation_artifacts(
             temp.path(),
             &run_id,
-            &json!({"schema_version": "evaluation.result/v7"}),
+            &json!({"schema_version": "evaluation.result/v8"}),
             &json!({"runner": RUNNER_NAME}),
-            &json!({"schema_version": "evaluation.evidence/v2"}),
+            &json!({"schema_version": "evaluation.evidence/v3"}),
         )
         .expect("publish artifact set");
 

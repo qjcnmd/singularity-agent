@@ -597,6 +597,176 @@ pub struct SandboxCapabilities {
     pub change_detection: bool,
 }
 
+/// Stable outcome of the run-level sandbox preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPreflightOutcome {
+    Supported,
+    Unsupported,
+}
+
+/// A bounded fact about one platform-specific or cross-platform control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPreflightFact {
+    Passed,
+    Failed,
+    NotApplicable,
+    Unknown,
+}
+
+/// Stable, redacted facts collected before an Evaluation run samples a provider.
+///
+/// Platform adapters may refine the platform-specific facts, while the portable
+/// fields describe the command sandbox contract consumed by AppServer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxPreflightReport {
+    pub outcome: SandboxPreflightOutcome,
+    pub error_code: Option<String>,
+    pub profile: String,
+    pub backend: String,
+    pub missing_capabilities: Vec<String>,
+    pub os: String,
+    pub arch: String,
+    pub kernel: Option<String>,
+    pub filesystem: Option<String>,
+    pub overlayfs: SandboxPreflightFact,
+    pub user_namespace: SandboxPreflightFact,
+    pub mount_namespace: SandboxPreflightFact,
+    pub pid_namespace: SandboxPreflightFact,
+    pub network_namespace: SandboxPreflightFact,
+    pub no_new_privs: SandboxPreflightFact,
+    pub seccomp: SandboxPreflightFact,
+    pub landlock: SandboxPreflightFact,
+    pub transactional_workspace: SandboxPreflightFact,
+    pub network_denied: SandboxPreflightFact,
+    pub protected_paths: SandboxPreflightFact,
+}
+
+impl SandboxPreflightReport {
+    fn from_capabilities(backend: &(impl SandboxBackend + ?Sized)) -> Self {
+        let capabilities = backend.capabilities();
+        let mut missing_capabilities = Vec::new();
+        let required = [
+            (capabilities.filesystem_isolation, "filesystem_isolation"),
+            (capabilities.network_isolation, "network_isolation"),
+            (capabilities.env_isolation, "env_isolation"),
+            (capabilities.path_admission, "path_admission"),
+            (capabilities.process_tree_kill, "process_tree_kill"),
+            (capabilities.timeout, "timeout"),
+            (capabilities.output_limit, "output_limit"),
+            (capabilities.change_detection, "transactional_workspace"),
+        ];
+        for (available, name) in required {
+            if !available {
+                missing_capabilities.push(name.to_string());
+            }
+        }
+        let unavailable = !missing_capabilities.is_empty()
+            || capabilities.enforcement() != SandboxBackendEnforcement::Strict;
+        Self {
+            outcome: if unavailable {
+                SandboxPreflightOutcome::Unsupported
+            } else {
+                SandboxPreflightOutcome::Supported
+            },
+            error_code: unavailable.then(|| "sandbox_preflight_unavailable".to_string()),
+            profile: "workspace_write_network_denied".to_string(),
+            backend: backend.name().to_string(),
+            missing_capabilities,
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            kernel: None,
+            filesystem: None,
+            overlayfs: SandboxPreflightFact::NotApplicable,
+            user_namespace: SandboxPreflightFact::NotApplicable,
+            mount_namespace: SandboxPreflightFact::NotApplicable,
+            pid_namespace: SandboxPreflightFact::NotApplicable,
+            network_namespace: SandboxPreflightFact::NotApplicable,
+            no_new_privs: SandboxPreflightFact::NotApplicable,
+            seccomp: SandboxPreflightFact::NotApplicable,
+            landlock: SandboxPreflightFact::NotApplicable,
+            transactional_workspace: if capabilities.change_detection {
+                SandboxPreflightFact::Unknown
+            } else {
+                SandboxPreflightFact::Failed
+            },
+            network_denied: if capabilities.network_isolation {
+                SandboxPreflightFact::Unknown
+            } else {
+                SandboxPreflightFact::Failed
+            },
+            protected_paths: if capabilities.path_admission {
+                SandboxPreflightFact::Unknown
+            } else {
+                SandboxPreflightFact::Failed
+            },
+        }
+    }
+
+    pub(crate) fn unsupported(&mut self, code: &'static str, missing: &[&str]) {
+        self.outcome = SandboxPreflightOutcome::Unsupported;
+        self.error_code = Some(code.to_string());
+        for capability in missing {
+            if !self
+                .missing_capabilities
+                .iter()
+                .any(|item| item == capability)
+            {
+                self.missing_capabilities.push((*capability).to_string());
+            }
+        }
+    }
+
+    /// Verify that a supported report belongs to the selected backend and proves every strict
+    /// Evaluation control before the caller is allowed to sample a provider.
+    pub fn proves_supported_contract_for(&self, backend_name: &str) -> bool {
+        const MAX_FACT_CHARS: usize = 128;
+        let valid_text =
+            |value: &str| !value.trim().is_empty() && value.chars().count() <= MAX_FACT_CHARS;
+        let facts = [
+            self.overlayfs,
+            self.user_namespace,
+            self.mount_namespace,
+            self.pid_namespace,
+            self.network_namespace,
+            self.no_new_privs,
+            self.seccomp,
+            self.landlock,
+            self.transactional_workspace,
+            self.network_denied,
+            self.protected_paths,
+        ];
+        self.outcome == SandboxPreflightOutcome::Supported
+            && self.error_code.is_none()
+            && self.profile == "workspace_write_network_denied"
+            && self.backend == backend_name
+            && valid_text(&self.backend)
+            && valid_text(&self.os)
+            && valid_text(&self.arch)
+            && self.kernel.as_deref().is_none_or(valid_text)
+            && self.filesystem.as_deref().is_none_or(valid_text)
+            && self.missing_capabilities.is_empty()
+            && !facts.contains(&SandboxPreflightFact::Unknown)
+            && self.transactional_workspace == SandboxPreflightFact::Passed
+            && self.network_denied == SandboxPreflightFact::Passed
+            && self.protected_paths == SandboxPreflightFact::Passed
+            && (self.os != "linux"
+                || (self.kernel.is_some()
+                    && self.filesystem.is_some()
+                    && self.overlayfs == SandboxPreflightFact::Passed
+                    && self.user_namespace == SandboxPreflightFact::Passed
+                    && self.mount_namespace == SandboxPreflightFact::Passed
+                    && self.pid_namespace == SandboxPreflightFact::Passed
+                    && self.network_namespace == SandboxPreflightFact::Passed
+                    && self.no_new_privs == SandboxPreflightFact::Passed
+                    && self.seccomp == SandboxPreflightFact::Passed
+                    && self.landlock == SandboxPreflightFact::Passed))
+            && (self.os != "windows" || (self.kernel.is_some() && self.filesystem.is_some()))
+    }
+}
+
 impl SandboxCapabilities {
     /// 返回完整严格命令执行能力。
     pub fn strict() -> Self {
@@ -696,6 +866,18 @@ pub trait SandboxBackend {
     fn name(&self) -> &'static str;
     /// 报告该 backend 在当前平台能够强制执行的控制项。
     fn capabilities(&self) -> SandboxCapabilities;
+
+    /// Probe the strict Evaluation command contract in a caller-owned scratch workspace.
+    ///
+    /// The default implementation exercises the portable workspace-write, denied-network and
+    /// protected-path boundaries. Platform adapters can refine the returned OS/kernel facts.
+    fn preflight(
+        &self,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> SandboxPreflightReport {
+        default_sandbox_preflight(self, workspace, cancellation)
+    }
     /// 执行一个请求；不可用或不支持的 backend 必须返回阻塞结果。
     fn execute(&self, request: &CommandRequest) -> CommandResult;
 
@@ -734,6 +916,69 @@ pub trait SandboxBackend {
         }
         self.execute_script(request)
     }
+}
+
+pub(crate) fn baseline_sandbox_preflight(
+    backend: &(impl SandboxBackend + ?Sized),
+) -> SandboxPreflightReport {
+    SandboxPreflightReport::from_capabilities(backend)
+}
+
+pub(crate) fn default_sandbox_preflight(
+    backend: &(impl SandboxBackend + ?Sized),
+    _workspace: &Path,
+    _cancellation: &CancellationToken,
+) -> SandboxPreflightReport {
+    let mut report = baseline_sandbox_preflight(backend);
+    report.unsupported("sandbox_preflight_not_implemented", &["preflight_probe"]);
+    report
+}
+
+pub(crate) fn preflight_command(
+    backend: &(impl SandboxBackend + ?Sized),
+    workspace: &Path,
+    argv: Vec<String>,
+    network: SandboxNetworkMode,
+    cancellation: &CancellationToken,
+    label: &str,
+) -> CommandResult {
+    let mut request = CommandRequest::project_verification(
+        format!("sandbox_preflight_{}", label.replace(' ', "_")),
+        argv,
+        workspace.to_string_lossy().into_owned(),
+        workspace.to_string_lossy().into_owned(),
+    );
+    request.timeout_seconds = 15;
+    request.network.mode = network;
+    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    backend.execute_cancellable(&request, cancellation)
+}
+
+pub(crate) fn preflight_write_verified(
+    result: &CommandResult,
+    expected_relative_path: &str,
+) -> bool {
+    result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::Succeeded
+        && result.workspace_mutation == WorkspaceMutation::Changed
+        && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
+        && !result.sandbox.local_process_fallback
+        && result
+            .workspace_change_summary
+            .as_ref()
+            .is_some_and(|summary| {
+                summary.changed_files.len() == 1
+                    && summary.changed_files[0] == expected_relative_path
+                    && summary.diff_digest.starts_with("sha256:")
+            })
+}
+
+pub(crate) fn preflight_unchanged_verified(result: &CommandResult) -> bool {
+    result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::Succeeded
+        && result.workspace_mutation == WorkspaceMutation::Unchanged
+        && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
+        && !result.sandbox.local_process_fallback
 }
 
 #[cfg(target_os = "linux")]

@@ -1,15 +1,20 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::iter::once;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use std::os::windows::ffi::OsStrExt;
 
 use super::{
     COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
     CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
-    SandboxFilesystemMode, SandboxNetworkMode, WorkspaceChangeSummary, WorkspaceMutation,
-    WorkspaceSnapshot, command_request_denial, command_script_request_denial, is_secret_env_name,
-    path_has_sensitive_component, snapshot_workspace,
+    SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightReport,
+    WorkspaceChangeSummary, WorkspaceMutation, WorkspaceSnapshot, command_request_denial,
+    command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
+    snapshot_workspace,
 };
 use singularity_core::{
     PROTECTED_METADATA_PATH_NAMES, PROTECTED_PATH_CONTAINS_MARKERS, PROTECTED_PATH_EXACT_MARKERS,
@@ -89,6 +94,112 @@ impl SandboxBackend for WindowsSandboxBackend {
 
     fn capabilities(&self) -> SandboxCapabilities {
         SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn preflight(
+        &self,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> SandboxPreflightReport {
+        let mut report = super::baseline_sandbox_preflight(self);
+        report.os = "windows".to_string();
+        report.kernel = windows_kernel_fact();
+        report.filesystem = windows_filesystem_fact(workspace);
+        if report.outcome == super::SandboxPreflightOutcome::Unsupported {
+            return report;
+        }
+        if cancellation.is_cancelled() {
+            report.unsupported("sandbox_preflight_cancelled", &["cancellation"]);
+            return report;
+        }
+        const PROBE_FILE: &str = "singularity-preflight.txt";
+        let result = super::preflight_command(
+            self,
+            workspace,
+            vec![
+                "cmd.exe".to_string(),
+                "/C".to_string(),
+                format!("echo preflight>{PROBE_FILE}"),
+            ],
+            SandboxNetworkMode::Denied,
+            cancellation,
+            "write",
+        );
+        if super::preflight_write_verified(&result, PROBE_FILE) {
+            report.transactional_workspace = SandboxPreflightFact::Passed;
+            let network_denied = TcpListener::bind("127.0.0.1:0")
+                .ok()
+                .and_then(|listener| {
+                    listener.set_nonblocking(true).ok()?;
+                    let port = listener.local_addr().ok()?.port();
+                    let result = super::preflight_command(
+                        self,
+                        workspace,
+                        vec![
+                            "powershell.exe".to_string(),
+                            "-NoProfile".to_string(),
+                            "-NonInteractive".to_string(),
+                            "-Command".to_string(),
+                            format!(
+                                "$c=[Net.Sockets.TcpClient]::new();try{{$c.Connect('127.0.0.1',{port});$c.Dispose();exit 0}}catch{{$c.Dispose();exit 42}}"
+                            ),
+                        ],
+                        SandboxNetworkMode::Denied,
+                        cancellation,
+                        "network_denied",
+                    );
+                    let no_connection = listener.accept().is_err_and(|error| {
+                        error.kind() == std::io::ErrorKind::WouldBlock
+                    });
+                    Some(
+                        result.execution_status == CommandExecutionStatus::Completed
+                            && result.exit_code == Some(42)
+                            && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
+                            && !result.sandbox.local_process_fallback
+                            && no_connection,
+                    )
+                })
+                .unwrap_or(false);
+            let protected_denied = preflight_protected_write_denied(self, workspace, cancellation);
+            report.network_denied = fact(network_denied);
+            report.protected_paths = fact(protected_denied);
+            if network_denied && protected_denied {
+                report.outcome = super::SandboxPreflightOutcome::Supported;
+                report.error_code = None;
+            } else {
+                let mut missing = Vec::new();
+                if !network_denied {
+                    missing.push("network_denied");
+                }
+                if !protected_denied {
+                    missing.push("protected_metadata_admission");
+                }
+                report.unsupported("sandbox_preflight_policy_probe_failed", &missing);
+            }
+        } else {
+            report.transactional_workspace = SandboxPreflightFact::Failed;
+            report.network_denied = SandboxPreflightFact::Failed;
+            report.protected_paths = SandboxPreflightFact::Failed;
+            if result
+                .stderr_preview
+                .contains("unsupported_nested_git_marker:")
+            {
+                report.unsupported(
+                    "sandbox_preflight_workspace_layout",
+                    &["workspace_layout", "protected_metadata_admission"],
+                );
+            } else {
+                report.unsupported(
+                    "sandbox_preflight_write_unverified",
+                    &[
+                        "transactional_workspace",
+                        "network_denied",
+                        "protected_metadata_admission",
+                    ],
+                );
+            }
+        }
+        report
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -199,6 +310,155 @@ impl SandboxBackend for WindowsSandboxBackend {
             ),
         )
     }
+}
+
+fn fact(available: bool) -> SandboxPreflightFact {
+    if available {
+        SandboxPreflightFact::Passed
+    } else {
+        SandboxPreflightFact::Failed
+    }
+}
+
+fn preflight_protected_write_denied(
+    backend: &WindowsSandboxBackend,
+    workspace: &Path,
+    cancellation: &CancellationToken,
+) -> bool {
+    const SENTINEL: &str = "protected-sentinel";
+    let protected_dir = workspace.join(".git");
+    let protected_file = protected_dir.join("singularity-preflight-protected.txt");
+    if std::fs::create_dir(&protected_dir).is_err()
+        || std::fs::write(&protected_file, SENTINEL).is_err()
+    {
+        let _ = std::fs::remove_dir_all(&protected_dir);
+        return false;
+    }
+    let read_result = super::preflight_command(
+        backend,
+        workspace,
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "type .git\\singularity-preflight-protected.txt".to_string(),
+        ],
+        SandboxNetworkMode::Denied,
+        cancellation,
+        "protected_read",
+    );
+    let write_result = super::preflight_command(
+        backend,
+        workspace,
+        vec![
+            "cmd.exe".to_string(),
+            "/C".to_string(),
+            "echo tampered>.git\\singularity-preflight-protected.txt".to_string(),
+        ],
+        SandboxNetworkMode::Denied,
+        cancellation,
+        "protected_write",
+    );
+    let preserved = std::fs::read_to_string(&protected_file).ok().as_deref() == Some(SENTINEL);
+    let cleanup_succeeded = std::fs::remove_dir_all(&protected_dir).is_ok();
+    preserved
+        && cleanup_succeeded
+        && protected_probe_denied(&read_result)
+        && !read_result.stdout_preview.contains(SENTINEL)
+        && protected_probe_denied(&write_result)
+}
+
+fn protected_probe_denied(result: &CommandResult) -> bool {
+    let classified = match result.execution_status {
+        CommandExecutionStatus::PolicyDenied => {
+            result.semantic_status == CommandSemanticStatus::PolicyBlocked
+        }
+        CommandExecutionStatus::Completed => {
+            result.semantic_status != CommandSemanticStatus::Succeeded
+                && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
+        }
+        _ => false,
+    };
+    classified
+        && result.workspace_mutation != WorkspaceMutation::Changed
+        && !result.sandbox.local_process_fallback
+}
+
+#[cfg(windows)]
+fn windows_filesystem_fact(workspace: &Path) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
+
+    let path = workspace
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>();
+    let mut volume = [0u16; 261];
+    let volume_len = u32::try_from(volume.len()).ok()?;
+    // SAFETY: all pointers refer to writable buffers with explicit lengths and are NUL
+    // terminated where required by the Win32 API.
+    let resolved = unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), volume_len) };
+    if resolved == 0 {
+        return None;
+    }
+    let mut filesystem = [0u16; 64];
+    let filesystem_len = u32::try_from(filesystem.len()).ok()?;
+    // SAFETY: `volume` and `filesystem` are valid NUL-terminated/writable buffers for the
+    // duration of this call; unused serial/flags outputs are passed as null pointers.
+    let queried = unsafe {
+        GetVolumeInformationW(
+            volume.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            filesystem.as_mut_ptr(),
+            filesystem_len,
+        )
+    };
+    if queried == 0 {
+        return None;
+    }
+    let length = filesystem
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(filesystem.len());
+    Some(
+        String::from_utf16_lossy(&filesystem[..length])
+            .chars()
+            .take(64)
+            .collect(),
+    )
+}
+
+#[cfg(windows)]
+fn windows_kernel_fact() -> Option<String> {
+    #[repr(C)]
+    struct RtlOsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut RtlOsVersionInfo) -> i32;
+    }
+
+    let mut info = RtlOsVersionInfo {
+        size: std::mem::size_of::<RtlOsVersionInfo>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform: 0,
+        service_pack: [0; 128],
+    };
+    // SAFETY: `info` is initialized with its structure size and remains valid for the call.
+    let status = unsafe { RtlGetVersion(&mut info) };
+    (status == 0).then(|| format!("{}.{}.{}", info.major, info.minor, info.build))
 }
 
 fn should_monitor_workspace_change(request: &CommandRequest) -> bool {

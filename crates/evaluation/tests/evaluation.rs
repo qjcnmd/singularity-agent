@@ -7,7 +7,8 @@ use singularity_evaluation::{
     BlockerKind, EvaluationBlocker, EvaluationCapability, EvaluationError, EvaluationEvidence,
     EvaluationEvidenceSchemaVersion, EvaluationEvidenceSummary, EvaluationManifest,
     EvaluationPromptStructure, EvaluationProviderEvidence, EvaluationResult,
-    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationScopeEvidence,
+    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationSandboxPreflight,
+    EvaluationSandboxPreflightFact, EvaluationSandboxPreflightOutcome, EvaluationScopeEvidence,
     EvaluationStageResults, EvaluationStatus, EvaluationTaskEvidence, EvaluationTaskResult,
     EvaluationTrialEvidence, EvaluationTrialResult, EvidenceVerdict, RunId, StageResult,
     StageStatus, TaskId, TaskSetSchemaVersion, ToolCapabilityName, ToolCapabilityRequirement,
@@ -158,6 +159,7 @@ fn failed_trial(trial: u32) -> EvaluationTrialResult {
 
 fn blocked_trial(trial: u32) -> EvaluationTrialResult {
     let blocker = EvaluationBlocker {
+        code: None,
         kind: BlockerKind::Network,
         message: "provider unavailable".to_string(),
     };
@@ -208,7 +210,44 @@ fn result_for(task: EvaluationTaskResult, trials_per_task: u32) -> EvaluationRes
 }
 
 fn result_for_tasks(tasks: Vec<EvaluationTaskResult>, trials_per_task: u32) -> EvaluationResult {
-    EvaluationResult::from_tasks(RunId::new("run-1").expect("run id"), trials_per_task, tasks)
+    let mut result =
+        EvaluationResult::from_tasks(RunId::new("run-1").expect("run id"), trials_per_task, tasks);
+    result.sandbox_preflight = Some(supported_preflight());
+    result
+}
+
+fn supported_preflight() -> EvaluationSandboxPreflight {
+    EvaluationSandboxPreflight {
+        outcome: EvaluationSandboxPreflightOutcome::Supported,
+        error_code: None,
+        profile: "workspace_write_network_denied".to_string(),
+        backend: "test".to_string(),
+        missing_capabilities: Vec::new(),
+        os: "test".to_string(),
+        arch: "test".to_string(),
+        kernel: None,
+        filesystem: None,
+        overlayfs: EvaluationSandboxPreflightFact::Passed,
+        user_namespace: EvaluationSandboxPreflightFact::NotApplicable,
+        mount_namespace: EvaluationSandboxPreflightFact::NotApplicable,
+        pid_namespace: EvaluationSandboxPreflightFact::NotApplicable,
+        network_namespace: EvaluationSandboxPreflightFact::NotApplicable,
+        no_new_privs: EvaluationSandboxPreflightFact::NotApplicable,
+        seccomp: EvaluationSandboxPreflightFact::NotApplicable,
+        landlock: EvaluationSandboxPreflightFact::NotApplicable,
+        transactional_workspace: EvaluationSandboxPreflightFact::Passed,
+        network_denied: EvaluationSandboxPreflightFact::Passed,
+        protected_paths: EvaluationSandboxPreflightFact::Passed,
+    }
+}
+
+fn unsupported_preflight() -> EvaluationSandboxPreflight {
+    let mut preflight = supported_preflight();
+    preflight.outcome = EvaluationSandboxPreflightOutcome::Unsupported;
+    preflight.error_code = Some("sandbox_preflight_test_unsupported".to_string());
+    preflight.missing_capabilities = vec!["transactional_workspace".to_string()];
+    preflight.transactional_workspace = EvaluationSandboxPreflightFact::Failed;
+    preflight
 }
 
 fn empty_scope() -> EvaluationScopeEvidence {
@@ -262,12 +301,14 @@ fn trial_evidence(trial: &EvaluationTrialResult, complete: bool) -> EvaluationTr
 fn evidence_for(result: &EvaluationResult, complete: bool) -> EvaluationEvidence {
     let task = &result.tasks[0];
     EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V2,
+        schema_version: EvaluationEvidenceSchemaVersion::V3,
         run_id: result.run_id.clone(),
         manifest_digest: DIGEST.to_string(),
         task_selection_digest: task_selection_digest(std::slice::from_ref(&task.task_id)),
         denominator_task_count: 1,
         trials_per_task: result.summary.trials_per_task,
+        configured_trial_count: result.summary.configured_trial_count,
+        sampled_trial_count: result.summary.sampled_trial_count,
         denominator_trial_count: result.summary.trial_count,
         tasks: vec![EvaluationTaskEvidence {
             task_id: task.task_id.clone(),
@@ -281,6 +322,7 @@ fn evidence_for(result: &EvaluationResult, complete: bool) -> EvaluationEvidence
                 .map(|trial| trial_evidence(trial, complete))
                 .collect(),
         }],
+        sandbox_preflight: result.sandbox_preflight.clone(),
     }
 }
 
@@ -363,7 +405,7 @@ fn command_and_path_trust_boundaries_remain_fail_closed() {
 }
 
 #[test]
-fn result_v7_keeps_blocked_trials_out_of_trial_diagnostics() {
+fn result_v8_keeps_blocked_trials_out_of_trial_diagnostics() {
     let task = task_result(vec![passed_trial(1), blocked_trial(2)]);
     assert_eq!(task.summary.completed_trial_count, 1);
     assert_eq!(task.summary.failed_trial_count, 0);
@@ -394,7 +436,7 @@ fn task_success_gate_differs_from_trial_success_rate() {
         vec![passed_trial(1), passed_trial(2), failed_trial(3)],
     );
     let result = EvaluationResult {
-        schema_version: EvaluationResultSchemaVersion::V7,
+        schema_version: EvaluationResultSchemaVersion::V8,
         run_id: RunId::new("run-1").expect("run id"),
         status: EvaluationStatus::Failed,
         blocker: None,
@@ -402,6 +444,8 @@ fn task_success_gate_differs_from_trial_success_rate() {
         summary: EvaluationRunSummary {
             task_count: 2,
             trials_per_task: 3,
+            configured_trial_count: 6,
+            sampled_trial_count: 6,
             trial_count: 6,
             completed_trial_count: 5,
             failed_trial_count: 1,
@@ -416,6 +460,7 @@ fn task_success_gate_differs_from_trial_success_rate() {
             meets_core_task_success_threshold: false,
         },
         tasks: vec![task_a, task_b],
+        sandbox_preflight: Some(supported_preflight()),
     };
 
     result.validate().expect("task/trial metrics are valid");
@@ -456,7 +501,34 @@ fn single_trial_is_unstable_and_multi_trial_statistics_are_finite() {
 }
 
 #[test]
-fn unsupported_result_v5_and_evidence_v1_fail_closed() {
+fn preflight_blocker_binds_one_zero_sample_summary_to_the_same_error_code() {
+    let preflight = unsupported_preflight();
+    let blocker = EvaluationBlocker {
+        code: preflight.error_code.clone(),
+        kind: BlockerKind::Environment,
+        message: "sandbox preflight unsupported".to_string(),
+    };
+    let result = EvaluationResult::blocked_by_sandbox_preflight(
+        RunId::new("preflight-blocked").expect("run id"),
+        2,
+        5,
+        blocker,
+        preflight,
+    );
+    result.validate().expect("valid zero-sample blocker");
+
+    let mut forged_count = result.clone();
+    forged_count.summary.completed_trial_count = 1;
+    assert!(forged_count.validate().is_err());
+
+    let mut mismatched_code = result;
+    mismatched_code.blocker.as_mut().expect("blocker").code =
+        Some("sandbox_preflight_other".to_string());
+    assert!(mismatched_code.validate().is_err());
+}
+
+#[test]
+fn unsupported_past_and_future_schemas_fail_closed() {
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut value = serde_json::to_value(result).expect("result JSON");
     value["schema_version"] = json!("evaluation.result/v5");
@@ -475,7 +547,7 @@ fn unsupported_result_v5_and_evidence_v1_fail_closed() {
 
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut future = serde_json::to_value(result).expect("result JSON");
-    future["schema_version"] = json!("evaluation.result/v8");
+    future["schema_version"] = json!("evaluation.result/v9");
     assert!(matches!(
         EvaluationResult::from_json_str(&serde_json::to_string(&future).expect("JSON")),
         Err(EvaluationError::UnsupportedSchemaVersion { .. })
@@ -483,7 +555,7 @@ fn unsupported_result_v5_and_evidence_v1_fail_closed() {
 
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut future = serde_json::to_value(evidence_for(&result, false)).expect("evidence JSON");
-    future["schema_version"] = json!("evaluation.evidence/v3");
+    future["schema_version"] = json!("evaluation.evidence/v4");
     assert!(matches!(
         EvaluationEvidence::from_json_str(&serde_json::to_string(&future).expect("JSON")),
         Err(EvaluationError::UnsupportedSchemaVersion { .. })
@@ -491,7 +563,7 @@ fn unsupported_result_v5_and_evidence_v1_fail_closed() {
 }
 
 #[test]
-fn previous_result_is_rejected_and_current_v2_evidence_binds_to_v7_result() {
+fn previous_result_is_rejected_and_current_v3_evidence_binds_to_v8_result() {
     let result = result_for(task_result(vec![passed_trial(1), failed_trial(2)]), 2);
     let mut legacy_result = serde_json::to_value(&result).expect("result JSON");
     legacy_result["schema_version"] = json!("evaluation.result/v6");
@@ -506,18 +578,18 @@ fn previous_result_is_rejected_and_current_v2_evidence_binds_to_v7_result() {
     let parsed_evidence = EvaluationEvidence::from_json_str(
         &serde_json::to_string(&evidence).expect("current evidence JSON"),
     )
-    .expect("current v2 evidence parses directly");
+    .expect("current v3 evidence parses directly");
     parsed_evidence
         .validate_against_result(&result)
-        .expect("current v2 evidence binds to v7 result");
+        .expect("current v3 evidence binds to v8 result");
     assert_eq!(
         serde_json::to_value(parsed_evidence).expect("current evidence JSON")["schema_version"],
-        json!("evaluation.evidence/v2")
+        json!("evaluation.evidence/v3")
     );
 }
 
 #[test]
-fn evidence_v2_binds_every_trial_and_safe_reproducibility_identity() {
+fn evidence_v3_binds_every_trial_and_safe_reproducibility_identity() {
     let result = result_for(task_result(vec![passed_trial(1), passed_trial(2)]), 2);
     let evidence = evidence_for(&result, true);
     evidence

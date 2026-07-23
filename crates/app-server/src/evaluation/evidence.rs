@@ -9,9 +9,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_agent::{AgentLoopResult, terminal_command_scope_digests};
 use singularity_evaluation::{
-    CommandSpec, EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationScopeEvidence,
-    EvaluationTaskEvidence, EvaluationTrialEvidence, EvidenceVerdict, PlannedWorkspaceSource,
-    RunId, WorkspacePlan, task_selection_digest,
+    CommandSpec, EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationSandboxPreflight,
+    EvaluationScopeEvidence, EvaluationTaskEvidence, EvaluationTrialEvidence, EvidenceVerdict,
+    PlannedWorkspaceSource, RunId, WorkspacePlan, task_selection_digest,
 };
 use singularity_tools::ToolResult;
 
@@ -28,6 +28,7 @@ pub(super) fn build_evaluation_evidence(
     plans: &[WorkspacePlan],
     executions: &[TaskEvaluation],
     run_dir: &Path,
+    preflight: EvaluationSandboxPreflight,
 ) -> Result<EvaluationEvidence, String> {
     if plans.len() != executions.len() {
         return Err("evaluation evidence task plan/result count mismatch".to_string());
@@ -41,8 +42,9 @@ pub(super) fn build_evaluation_evidence(
         .iter()
         .map(|plan| plan.task_id.clone())
         .collect::<Vec<_>>();
+    let task_count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
     let evidence = EvaluationEvidence {
-        schema_version: EvaluationEvidenceSchemaVersion::V2,
+        schema_version: EvaluationEvidenceSchemaVersion::V3,
         run_id: run_id.clone(),
         manifest_digest,
         task_selection_digest: task_selection_digest(&task_ids),
@@ -55,10 +57,95 @@ pub(super) fn build_evaluation_evidence(
             .map(|execution| u32::try_from(execution.trials.len()).unwrap_or(u32::MAX))
             .sum(),
         tasks,
+        configured_trial_count: executions
+            .first()
+            .map_or(0, |execution| {
+                u32::try_from(execution.trials.len()).unwrap_or(u32::MAX)
+            })
+            .saturating_mul(task_count),
+        sampled_trial_count: executions
+            .iter()
+            .map(|execution| u32::try_from(execution.trials.len()).unwrap_or(u32::MAX))
+            .sum(),
+        sandbox_preflight: Some(preflight),
     };
     evidence
         .validate()
         .map_err(|error| format!("invalid evaluation evidence: {error}"))?;
+    Ok(evidence)
+}
+
+/// 构造未采样 run 的脱敏 evidence；每个 task 只保留选择身份，不生成 trial 证据。
+pub(super) fn build_preflight_evidence(
+    run_id: &RunId,
+    manifest_digest: String,
+    plans: &[WorkspacePlan],
+    trials_per_task: u32,
+    preflight: EvaluationSandboxPreflight,
+) -> Result<EvaluationEvidence, String> {
+    let task_ids = plans
+        .iter()
+        .map(|plan| plan.task_id.clone())
+        .collect::<Vec<_>>();
+    let tasks = plans
+        .iter()
+        .map(|plan| {
+            let allowed_paths = plan
+                .agent
+                .projection
+                .allowed_paths
+                .iter()
+                .map(|path| path.as_str().to_string())
+                .collect::<Vec<_>>();
+            let required_capabilities = plan
+                .agent
+                .projection
+                .required_tool_capabilities
+                .iter()
+                .map(|requirement| {
+                    format!(
+                        "{}@{}",
+                        requirement.capability.as_str(),
+                        requirement.minimum_version
+                    )
+                })
+                .collect::<Vec<_>>();
+            EvaluationTaskEvidence {
+                task_id: plan.task_id.clone(),
+                source_tree_digest: None,
+                source_commit: match &plan.source {
+                    PlannedWorkspaceSource::RemoteGit { commit, .. } => Some(commit.clone()),
+                    PlannedWorkspaceSource::Local { .. } => None,
+                },
+                allowed_paths_digest: set_strings_digest(
+                    "evaluation.allowed_paths/v2",
+                    &allowed_paths,
+                ),
+                tool_capability_requirements_digest: set_strings_digest(
+                    "evaluation.tool_capability_requirements/v1",
+                    &required_capabilities,
+                ),
+                trials: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let task_count = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
+    let evidence = EvaluationEvidence {
+        schema_version: EvaluationEvidenceSchemaVersion::V3,
+        run_id: run_id.clone(),
+        manifest_digest,
+        task_selection_digest: task_selection_digest(&task_ids),
+        denominator_task_count: u32::try_from(plans.len()).unwrap_or(u32::MAX),
+        trials_per_task,
+        configured_trial_count: task_count.saturating_mul(trials_per_task),
+        sampled_trial_count: 0,
+        denominator_trial_count: 0,
+        tasks,
+        sandbox_preflight: Some(preflight),
+    };
+    evidence
+        .validate()
+        .map_err(|error| format!("invalid evaluation preflight evidence: {error}"))?;
     Ok(evidence)
 }
 

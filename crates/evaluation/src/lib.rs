@@ -23,7 +23,8 @@ pub use manifest::{
 };
 pub use result::{
     BlockerKind, EvaluationBlocker, EvaluationEvidenceSummary, EvaluationResult,
-    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationStabilitySummary,
+    EvaluationResultSchemaVersion, EvaluationRunSummary, EvaluationSandboxPreflight,
+    EvaluationSandboxPreflightFact, EvaluationSandboxPreflightOutcome, EvaluationStabilitySummary,
     EvaluationStageResults, EvaluationStatus, EvaluationTaskResult, EvaluationTaskSummary,
     EvaluationTrialResult, FiniteStatistics, StageResult, StageStatus,
 };
@@ -34,9 +35,9 @@ pub use value::{
 /// 当前 task set schema 版本。
 pub const TASK_SET_SCHEMA_VERSION: &str = "evaluation.task_set/v5";
 /// 当前稳定 result schema 版本。
-pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v7";
+pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v8";
 /// 当前 evidence schema 版本。
-pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v2";
+pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v3";
 /// 核心任务成功率门禁的 basis points 阈值。
 pub const CORE_TASK_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
 

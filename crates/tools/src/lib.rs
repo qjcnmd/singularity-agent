@@ -41,7 +41,8 @@ pub use singularity_sandbox::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, CommandSemanticStatus, DEFAULT_COMMAND_TIMEOUT_SECONDS, SandboxBackend,
     SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    WorkspaceChangeSummary, WorkspaceMutation,
+    SandboxPreflightFact, SandboxPreflightOutcome, SandboxPreflightReport, WorkspaceChangeSummary,
+    WorkspaceMutation,
 };
 
 mod broker;

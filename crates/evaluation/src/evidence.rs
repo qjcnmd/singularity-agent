@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluation evidence 的 schema 版本。
 pub enum EvaluationEvidenceSchemaVersion {
-    #[serde(rename = "evaluation.evidence/v2")]
-    V2,
+    #[serde(rename = "evaluation.evidence/v3")]
+    V3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,7 +239,7 @@ pub struct EvaluationTaskEvidence {
 }
 
 impl EvaluationTaskEvidence {
-    fn validate(&self, trials_per_task: u32) -> Result<()> {
+    fn validate_identity(&self) -> Result<()> {
         let context = format!("evaluation evidence task {}", self.task_id);
         for digest in [
             self.source_tree_digest.as_deref(),
@@ -251,6 +251,12 @@ impl EvaluationTaskEvidence {
         {
             validate_sha256_digest(digest, &context)?;
         }
+        Ok(())
+    }
+
+    fn validate(&self, trials_per_task: u32) -> Result<()> {
+        self.validate_identity()?;
+        let context = format!("evaluation evidence task {}", self.task_id);
         if self.trials.len() != usize::try_from(trials_per_task).unwrap_or(usize::MAX) {
             return Err(validation_error(format!(
                 "{context} trial evidence count must match trials_per_task"
@@ -270,7 +276,7 @@ impl EvaluationTaskEvidence {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 与 EvaluationResult/v7 逐 trial 绑定的脱敏 evidence。
+/// 与 EvaluationResult/v8 逐 trial 或 run-level preflight blocker 绑定的脱敏 evidence。
 pub struct EvaluationEvidence {
     pub schema_version: EvaluationEvidenceSchemaVersion,
     pub run_id: RunId,
@@ -279,7 +285,11 @@ pub struct EvaluationEvidence {
     pub denominator_task_count: u32,
     pub trials_per_task: u32,
     pub denominator_trial_count: u32,
+    pub configured_trial_count: u32,
+    pub sampled_trial_count: u32,
     pub tasks: Vec<EvaluationTaskEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_preflight: Option<crate::EvaluationSandboxPreflight>,
 }
 
 impl EvaluationEvidence {
@@ -296,24 +306,51 @@ impl EvaluationEvidence {
             &self.task_selection_digest,
             "evaluation evidence task selection",
         )?;
-        if self.tasks.is_empty() || self.trials_per_task == 0 {
+        if self.trials_per_task == 0 {
             return Err(validation_error(
                 "evaluation evidence requires tasks and a positive trials_per_task",
             ));
         }
-        if self.denominator_task_count != u32::try_from(self.tasks.len()).unwrap_or(u32::MAX)
-            || self.denominator_trial_count
+        let Some(preflight) = self.sandbox_preflight.as_ref() else {
+            return Err(validation_error(
+                "evaluation evidence requires sandbox preflight evidence",
+            ));
+        };
+        validate_sandbox_preflight(preflight, "evaluation evidence sandbox_preflight")?;
+        let preflight_blocked =
+            preflight.outcome == crate::EvaluationSandboxPreflightOutcome::Unsupported;
+        if self.denominator_task_count == 0
+            || self.configured_trial_count
                 != self
                     .denominator_task_count
                     .saturating_mul(self.trials_per_task)
+            || (preflight_blocked
+                && (self.denominator_trial_count != 0 || self.sampled_trial_count != 0))
+            || (!preflight_blocked
+                && (self.denominator_trial_count != self.configured_trial_count
+                    || self.sampled_trial_count != self.denominator_trial_count))
         {
             return Err(validation_error(
                 "evaluation evidence denominators must match selected tasks and trials",
             ));
         }
+        if self.denominator_task_count != u32::try_from(self.tasks.len()).unwrap_or(u32::MAX) {
+            return Err(validation_error(
+                "evaluation evidence task count must match selected tasks",
+            ));
+        }
         let mut task_ids = BTreeSet::new();
         for task in &self.tasks {
-            task.validate(self.trials_per_task)?;
+            if !preflight_blocked {
+                task.validate(self.trials_per_task)?;
+            } else {
+                task.validate_identity()?;
+                if !task.trials.is_empty() {
+                    return Err(validation_error(
+                        "blocked preflight evidence must not contain sampled trial evidence",
+                    ));
+                }
+            }
             if !task_ids.insert(task.task_id.clone()) {
                 return Err(EvaluationError::DuplicateTaskId(task.task_id.clone()));
             }
@@ -337,15 +374,28 @@ impl EvaluationEvidence {
     pub fn validate_against_result(&self, result: &EvaluationResult) -> Result<()> {
         self.validate()?;
         result.validate()?;
+        let preflight_blocked = result.tasks.is_empty();
         if self.run_id != result.run_id
             || self.denominator_task_count != result.summary.task_count
             || self.trials_per_task != result.summary.trials_per_task
             || self.denominator_trial_count != result.summary.trial_count
-            || self.tasks.len() != result.tasks.len()
+            || (!preflight_blocked && self.tasks.len() != result.tasks.len())
+            || (preflight_blocked
+                && (self.sampled_trial_count != 0
+                    || self.configured_trial_count != result.summary.configured_trial_count))
+            || self.sandbox_preflight != result.sandbox_preflight
         {
             return Err(validation_error(
                 "evaluation evidence task/trial denominators must match the stable result",
             ));
+        }
+        if preflight_blocked {
+            if self.tasks.iter().any(|task| !task.trials.is_empty()) {
+                return Err(validation_error(
+                    "blocked preflight result cannot bind sampled trial evidence",
+                ));
+            }
+            return Ok(());
         }
         for (task_evidence, task_result) in self.tasks.iter().zip(&result.tasks) {
             if task_evidence.task_id != task_result.task_id
@@ -392,6 +442,13 @@ impl EvaluationEvidence {
         }
         Ok(())
     }
+}
+
+fn validate_sandbox_preflight(
+    preflight: &crate::EvaluationSandboxPreflight,
+    context: &str,
+) -> Result<()> {
+    crate::result::validate_sandbox_preflight(preflight, context)
 }
 
 /// 计算固定顺序的任务选择摘要。

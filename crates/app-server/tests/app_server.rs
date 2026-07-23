@@ -2,6 +2,7 @@
 
 use singularity_agent::AgentRecoveryMetrics;
 use singularity_app_server::{AppServer, AppServerError};
+use singularity_core::CancellationToken;
 use singularity_model::{ModelUsage, ProviderAttemptMetadata, ProviderConfigSnapshot};
 use singularity_policy::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, PermissionResource, ToolId,
@@ -12,7 +13,8 @@ use singularity_protocol::ItemKind;
 use singularity_protocol::{ConversationRole, TraceMetricSampleKind};
 use singularity_sandbox::{
     CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend, SandboxBackendEnforcement,
-    SandboxCapabilities, WorkspaceMutation,
+    SandboxCapabilities, SandboxPreflightFact, SandboxPreflightOutcome, SandboxPreflightReport,
+    WorkspaceMutation,
 };
 use singularity_store::{RegisterArtifactRefParams, SessionStore, StoreError};
 #[cfg(windows)]
@@ -63,6 +65,35 @@ impl SandboxBackend for CompletedSandboxBackend {
 
     fn capabilities(&self) -> SandboxCapabilities {
         SandboxCapabilities::strict().with_change_detection()
+    }
+
+    fn preflight(
+        &self,
+        _workspace: &std::path::Path,
+        _cancellation: &CancellationToken,
+    ) -> SandboxPreflightReport {
+        SandboxPreflightReport {
+            outcome: SandboxPreflightOutcome::Supported,
+            error_code: None,
+            profile: "workspace_write_network_denied".to_string(),
+            backend: self.name().to_string(),
+            missing_capabilities: Vec::new(),
+            os: "test".to_string(),
+            arch: "test".to_string(),
+            kernel: None,
+            filesystem: None,
+            overlayfs: SandboxPreflightFact::NotApplicable,
+            user_namespace: SandboxPreflightFact::NotApplicable,
+            mount_namespace: SandboxPreflightFact::NotApplicable,
+            pid_namespace: SandboxPreflightFact::NotApplicable,
+            network_namespace: SandboxPreflightFact::NotApplicable,
+            no_new_privs: SandboxPreflightFact::NotApplicable,
+            seccomp: SandboxPreflightFact::NotApplicable,
+            landlock: SandboxPreflightFact::NotApplicable,
+            transactional_workspace: SandboxPreflightFact::Passed,
+            network_denied: SandboxPreflightFact::Passed,
+            protected_paths: SandboxPreflightFact::Passed,
+        }
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -885,7 +916,7 @@ fn app_server_reports_default_agent_loop_backend_capability() {
 fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallback() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = app_server(store);
+    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(
@@ -962,7 +993,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
-    assert_eq!(payload["schema_version"], "evaluation.result/v7");
+    assert_eq!(payload["schema_version"], "evaluation.result/v8");
     assert_eq!(payload["status"], "blocked");
     assert_eq!(
         payload["tasks"][0]["blocker"]["kind"],
@@ -982,7 +1013,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     assert!(!evidence_json.contains("missing-source"));
     let evidence: serde_json::Value =
         serde_json::from_str(&evidence_json).expect("evidence payload");
-    assert_eq!(evidence["schema_version"], "evaluation.evidence/v2");
+    assert_eq!(evidence["schema_version"], "evaluation.evidence/v3");
     assert_eq!(evidence["denominator_task_count"], 1);
     assert_eq!(evidence["denominator_trial_count"], 1);
     assert_eq!(evidence["tasks"][0]["trials"][0]["allowlist"], "unknown");
@@ -996,7 +1027,7 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
 fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = app_server(store);
+    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(
@@ -1073,7 +1104,7 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
 fn app_server_eval_run_fails_closed_before_agent_on_invalid_workspace() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = app_server(store);
+    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(

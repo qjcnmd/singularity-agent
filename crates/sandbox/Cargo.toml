@@ -22,6 +22,12 @@ singularity_core = { path = "../core" }
 dunce = "1.0"
 singularity_windows_sandbox = { path = "../windows-sandbox" }
 
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52"
+features = [
+    "Win32_Storage_FileSystem",
+]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
