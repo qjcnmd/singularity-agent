@@ -3,6 +3,63 @@
 use super::*;
 
 impl WorkspaceTools {
+    fn cleanup_temporary_file_failure(
+        &self,
+        parent: &CapabilityDir,
+        name: &OsStr,
+        _relative: &str,
+        temporary_file: CapabilityFile,
+        expected_identity: &str,
+        failure: WorkspaceToolError,
+    ) -> WorkspaceToolError {
+        #[cfg(unix)]
+        {
+            let relative = _relative;
+            let _pinned_temporary_file = temporary_file;
+            let mut readable = match open_file_from_parent(parent, name) {
+                Ok(file) => file,
+                Err(CapabilityAccessError::Missing) => return failure,
+                Err(_) => {
+                    return WorkspaceToolError::RollbackFailed(format!(
+                        "{relative}: temporary file ownership could not be established; entry preserved"
+                    ));
+                }
+            };
+            let readable_identity = match file_object_identity_key(&readable) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    return WorkspaceToolError::RollbackFailed(format!(
+                        "{relative}: temporary file ownership could not be established; entry preserved"
+                    ));
+                }
+            };
+            if readable_identity != expected_identity {
+                return WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: temporary file ownership changed; replacement preserved"
+                ));
+            }
+            let expected_revision = match self
+                .read_file_bytes_with_revision(relative, &mut readable)
+            {
+                Ok((_, revision)) => revision,
+                Err(_) => {
+                    return WorkspaceToolError::RollbackFailed(format!(
+                        "{relative}: temporary file ownership could not be established; entry preserved"
+                    ));
+                }
+            };
+            match self.remove_owned_file_revision_unix(parent, name, relative, &expected_revision) {
+                Ok(()) => failure,
+                Err(error) => error,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(temporary_file);
+            cleanup_owned_file(parent, name, expected_identity, failure)
+        }
+    }
+
     /// 以单文件 patch 语义执行受保护的替换。
     pub fn edit(
         &self,
@@ -240,6 +297,7 @@ impl WorkspaceTools {
         let target_was_present = initial_target.is_some();
         #[cfg(unix)]
         let original_revision = initial_target.as_ref().map(|state| state.revision.clone());
+        #[cfg(not(unix))]
         let original_identity = initial_target
             .as_ref()
             .map(|state| state.revision.object_identity.clone());
@@ -257,40 +315,46 @@ impl WorkspaceTools {
             temporary_file.sync_all()
         });
         if let Err(error) = write_result {
-            drop(temporary_file);
-            return Err(cleanup_owned_file(
-                parent.dir(),
-                &temporary_name,
-                &temporary_identity,
-                io_error(error),
-            )
-            .into());
+            return Err(self
+                .cleanup_temporary_file_failure(
+                    parent.dir(),
+                    &temporary_name,
+                    &path.display,
+                    temporary_file,
+                    &temporary_identity,
+                    io_error(error),
+                )
+                .into());
         }
         temporary_identity = match file_object_identity_key(&temporary_file) {
             Ok(identity) => identity,
             Err(error) => {
-                drop(temporary_file);
-                return Err(cleanup_owned_file(
-                    parent.dir(),
-                    &temporary_name,
-                    &temporary_identity,
-                    map_capability_error(error, &path.display),
-                )
-                .into());
+                return Err(self
+                    .cleanup_temporary_file_failure(
+                        parent.dir(),
+                        &temporary_name,
+                        &path.display,
+                        temporary_file,
+                        &temporary_identity,
+                        map_capability_error(error, &path.display),
+                    )
+                    .into());
             }
         };
         let temporary_revision =
             match self.file_revision_metadata(&path.display, &temporary_file) {
                 Ok(revision) => revision,
                 Err(error) => {
-                    drop(temporary_file);
-                    return Err(cleanup_owned_file(
-                        parent.dir(),
-                        &temporary_name,
-                        &temporary_identity,
-                        map_capability_error(error, &path.display),
-                    )
-                    .into());
+                    return Err(self
+                        .cleanup_temporary_file_failure(
+                            parent.dir(),
+                            &temporary_name,
+                            &path.display,
+                            temporary_file,
+                            &temporary_identity,
+                            map_capability_error(error, &path.display),
+                        )
+                        .into());
                 }
             }
             .with_digest(format!("sha256:{:x}", Sha256::digest(content.as_bytes())));
@@ -298,14 +362,16 @@ impl WorkspaceTools {
         let mut source_file = match open_file_from_parent(parent.dir(), &temporary_name) {
             Ok(file) => file,
             Err(error) => {
-                drop(temporary_file);
-                return Err(cleanup_owned_file(
-                    parent.dir(),
-                    &temporary_name,
-                    &temporary_identity,
-                    map_capability_error(error, &path.display),
-                )
-                .into());
+                return Err(self
+                    .cleanup_temporary_file_failure(
+                        parent.dir(),
+                        &temporary_name,
+                        &path.display,
+                        temporary_file,
+                        &temporary_identity,
+                        map_capability_error(error, &path.display),
+                    )
+                    .into());
             }
         };
         let source_revision =
@@ -313,28 +379,33 @@ impl WorkspaceTools {
                 Ok((_, revision)) => revision,
                 Err(error) => {
                     drop(source_file);
-                    drop(temporary_file);
-                    return Err(cleanup_owned_file(
-                        parent.dir(),
-                        &temporary_name,
-                        &temporary_identity,
-                        map_capability_error(error, &path.display),
-                    )
-                    .into());
+                    return Err(self
+                        .cleanup_temporary_file_failure(
+                            parent.dir(),
+                            &temporary_name,
+                            &path.display,
+                            temporary_file,
+                            &temporary_identity,
+                            map_capability_error(error, &path.display),
+                        )
+                        .into());
                 }
             };
         if source_revision != temporary_revision {
             drop(source_file);
-            drop(temporary_file);
             if source_revision.object_identity == temporary_identity {
-                return Err(cleanup_owned_file(
-                    parent.dir(),
-                    &temporary_name,
-                    &temporary_identity,
-                    WorkspaceToolError::ConcurrentMutation(path.display.clone()),
-                )
-                .into());
+                return Err(self
+                    .cleanup_temporary_file_failure(
+                        parent.dir(),
+                        &temporary_name,
+                        &path.display,
+                        temporary_file,
+                        &temporary_identity,
+                        WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                    )
+                    .into());
             }
+            drop(temporary_file);
             return Err(WorkspaceToolError::ConcurrentMutation(path.display.clone()).into());
         }
         let current_target = match self.atomic_target_state(
@@ -346,34 +417,89 @@ impl WorkspaceTools {
             Ok(state) => state,
             Err(error) => {
                 drop(source_file);
-                drop(temporary_file);
-                return Err(cleanup_owned_file(
-                    parent.dir(),
-                    &temporary_name,
-                    &temporary_identity,
-                    map_capability_error(error, &path.display),
-                )
-                .into());
+                return Err(self
+                    .cleanup_temporary_file_failure(
+                        parent.dir(),
+                        &temporary_name,
+                        &path.display,
+                        temporary_file,
+                        &temporary_identity,
+                        map_capability_error(error, &path.display),
+                    )
+                    .into());
             }
         };
         if current_target.as_ref().map(|state| &state.revision) != expected_revision {
-            drop(temporary_file);
-            return Err(cleanup_owned_file(
-                parent.dir(),
-                &temporary_name,
-                &temporary_identity,
-                WorkspaceToolError::ConcurrentMutation(path.display.clone()),
-            )
-            .into());
+            drop(source_file);
+            return Err(self
+                .cleanup_temporary_file_failure(
+                    parent.dir(),
+                    &temporary_name,
+                    &path.display,
+                    temporary_file,
+                    &temporary_identity,
+                    WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                )
+                .into());
         }
-        drop(source_file);
+        #[cfg(unix)]
+        let mut original_file = if let Some(original_revision) = original_revision.as_ref() {
+            let mut file = match open_file_from_parent(parent.dir(), &parent.name) {
+                Ok(file) => file,
+                Err(error) => {
+                    drop(source_file);
+                    return Err(self
+                        .cleanup_temporary_file_failure(
+                            parent.dir(),
+                            &temporary_name,
+                            &path.display,
+                            temporary_file,
+                            &temporary_identity,
+                            map_capability_error(error, &path.display),
+                        )
+                        .into());
+                }
+            };
+            let observed = match self.read_file_bytes_with_revision(&path.display, &mut file) {
+                Ok((_, revision)) => revision,
+                Err(error) => {
+                    drop(source_file);
+                    return Err(self
+                        .cleanup_temporary_file_failure(
+                            parent.dir(),
+                            &temporary_name,
+                            &path.display,
+                            temporary_file,
+                            &temporary_identity,
+                            map_capability_error(error, &path.display),
+                        )
+                        .into());
+                }
+            };
+            if observed != *original_revision {
+                drop(source_file);
+                return Err(self
+                    .cleanup_temporary_file_failure(
+                        parent.dir(),
+                        &temporary_name,
+                        &path.display,
+                        temporary_file,
+                        &temporary_identity,
+                        WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                    )
+                    .into());
+            }
+            Some(file)
+        } else {
+            None
+        };
         if let Err(error) = publish_temporary(
             parent.dir(),
             &temporary_name,
             &parent.name,
             target_was_present,
         ) {
-            drop(temporary_file);
+            drop(source_file);
             let publish_error = match error {
                 CapabilityAccessError::Missing | CapabilityAccessError::ConcurrentMutation => {
                     WorkspaceToolError::ConcurrentMutation(path.display.clone())
@@ -386,92 +512,198 @@ impl WorkspaceTools {
                 ),
                 other => map_capability_error(other, &path.display),
             };
-            return Err(cleanup_owned_file(
-                parent.dir(),
-                &temporary_name,
-                &temporary_identity,
-                publish_error,
-            )
-            .into());
+            return Err(self
+                .cleanup_temporary_file_failure(
+                    parent.dir(),
+                    &temporary_name,
+                    &path.display,
+                    temporary_file,
+                    &temporary_identity,
+                    publish_error,
+                )
+                .into());
         }
+        #[cfg(unix)]
+        let published_revision = {
+            use std::io::Seek as _;
+
+            if source_file.rewind().is_err() {
+                drop(source_file);
+                drop(temporary_file);
+                if target_was_present {
+                    let restore = self.restore_exchanged_entries(
+                        parent.dir(),
+                        &parent.name,
+                        &temporary_name,
+                        &path.display,
+                    );
+                    return Err(restore
+                        .err()
+                        .unwrap_or_else(|| {
+                            WorkspaceToolError::RollbackFailed(format!(
+                                "{}: published entry ownership could not be established; entry preserved",
+                                path.display
+                            ))
+                        })
+                        .into());
+                }
+                return Err(WorkspaceToolError::RollbackFailed(format!(
+                    "{}: published entry ownership could not be established",
+                    path.display
+                ))
+                .into());
+            }
+            match self.read_file_bytes_with_revision(&path.display, &mut source_file) {
+                Ok((_, revision)) => revision,
+                Err(error) => {
+                    drop(source_file);
+                    drop(temporary_file);
+                    if target_was_present {
+                        let restore = self.restore_exchanged_entries(
+                            parent.dir(),
+                            &parent.name,
+                            &temporary_name,
+                            &path.display,
+                        );
+                        return Err(restore
+                            .err()
+                            .unwrap_or_else(|| {
+                                WorkspaceToolError::RollbackFailed(format!(
+                                    "{}: published entry ownership could not be established; entry preserved",
+                                    path.display
+                                ))
+                            })
+                            .into());
+                    }
+                    return Err(map_capability_error(error, &path.display).into());
+                }
+            }
+        };
+        drop(source_file);
         drop(temporary_file);
+        #[cfg(unix)]
+        {
+            let published_state = self.atomic_target_state(
+                parent.dir(),
+                &parent.actual_relative,
+                &parent.name,
+                &path.display,
+            );
+            if !matches!(
+                published_state,
+                Ok(Some(ref state)) if state.revision == published_revision
+            ) {
+                if target_was_present {
+                    return Err(self
+                        .restore_failed_exchange(
+                            parent.dir(),
+                            &parent.name,
+                            &temporary_name,
+                            &published_revision,
+                            &path.display,
+                            WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                        )
+                        .into());
+                }
+                return Err(WorkspaceToolError::RollbackFailed(format!(
+                    "{}: published entry ownership changed",
+                    path.display
+                ))
+                .into());
+            }
+        }
         let after_rename_result = after_rename();
         #[cfg(unix)]
-        if target_was_present {
+        let backup_revision = if target_was_present {
+            use std::io::Seek as _;
+
+            let mut original_file = original_file
+                .take()
+                .expect("present Unix target retains its pinned original handle");
+            if original_file.rewind().is_err() {
+                return Err(self
+                    .restore_failed_exchange(
+                        parent.dir(),
+                        &parent.name,
+                        &temporary_name,
+                        &published_revision,
+                        &path.display,
+                        WorkspaceToolError::RollbackFailed(format!(
+                            "{}: exchanged backup ownership could not be established",
+                            path.display
+                        )),
+                    )
+                    .into());
+            }
+            let pinned_backup_revision =
+                match self.read_file_bytes_with_revision(&path.display, &mut original_file) {
+                    Ok((_, revision)) => revision,
+                    Err(error) => {
+                        return Err(self
+                            .restore_failed_exchange(
+                                parent.dir(),
+                                &parent.name,
+                                &temporary_name,
+                                &published_revision,
+                                &path.display,
+                                map_capability_error(error, &path.display),
+                            )
+                            .into());
+                    }
+                };
             let backup_state = self.atomic_target_state(
                 parent.dir(),
                 &parent.actual_relative,
                 &temporary_name,
                 &path.display,
             );
-            let backup_failure = match backup_state {
-                Ok(Some(state))
-                    if original_revision.as_ref().is_some_and(|revision| {
-                        same_mutation_revision(revision, &state.revision)
-                    }) =>
-                {
-                    None
+            match backup_state {
+                Ok(Some(state)) if state.revision == pinned_backup_revision => Some(state.revision),
+                outcome => {
+                    let backup_failure = match outcome {
+                        Ok(_) => WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                        Err(error) => map_capability_error(error, &path.display),
+                    };
+                    return Err(self
+                        .restore_failed_exchange(
+                            parent.dir(),
+                            &parent.name,
+                            &temporary_name,
+                            &published_revision,
+                            &path.display,
+                            backup_failure,
+                        )
+                        .into());
                 }
-                Ok(_) => Some(WorkspaceToolError::ConcurrentMutation(path.display.clone())),
-                Err(error) => Some(map_capability_error(error, &path.display)),
-            };
-            if let Some(backup_failure) = backup_failure {
-                let restore = self.restore_exchanged_entries(
-                    parent.dir(),
-                    &parent.name,
-                    &temporary_name,
-                    &path.display,
-                );
-                if let Err(error) = restore {
-                    if let Ok(Some(state)) = self.atomic_target_state(
-                        parent.dir(),
-                        &parent.actual_relative,
-                        &parent.name,
-                        &path.display,
-                    ) && state.revision.object_identity == temporary_identity
-                    {
-                        return Err(AtomicWriteFailure::published(error, state.revision));
-                    }
-                    return Err(error.into());
-                }
-                return Err(cleanup_owned_file(
-                    parent.dir(),
-                    &temporary_name,
-                    &temporary_identity,
-                    backup_failure,
-                )
-                .into());
             }
-        }
+        } else {
+            None
+        };
         #[cfg(unix)]
         {
-            let published_before_hook = self.atomic_target_state(
+            let published_after_hook = self.atomic_target_state(
                 parent.dir(),
                 &parent.actual_relative,
                 &parent.name,
                 &path.display,
             );
             let published_is_owned = matches!(
-                published_before_hook,
+                published_after_hook,
                 Ok(Some(ref state))
-                    if state.revision.object_identity == temporary_identity
-                        && state.revision.content_digest == temporary_revision.content_digest
+                    if state.revision == published_revision
             );
             if !published_is_owned {
                 if target_was_present {
-                    self.restore_exchanged_entries(
-                        parent.dir(),
-                        &parent.name,
-                        &temporary_name,
-                        &path.display,
-                    )?;
-                    return Err(cleanup_owned_file(
-                        parent.dir(),
-                        &temporary_name,
-                        &temporary_identity,
-                        WorkspaceToolError::ConcurrentMutation(path.display.clone()),
-                    )
-                    .into());
+                    return Err(self
+                        .restore_failed_exchange(
+                            parent.dir(),
+                            &parent.name,
+                            &temporary_name,
+                            &published_revision,
+                            &path.display,
+                            WorkspaceToolError::ConcurrentMutation(path.display.clone()),
+                        )
+                        .into());
                 }
                 match mutation_rename_noreplace(parent.dir(), &parent.name, &temporary_name) {
                     Ok(()) => {
@@ -494,7 +726,7 @@ impl WorkspaceTools {
                             parent.dir(),
                             &parent.name,
                             &temporary_name,
-                            &temporary_identity,
+                            &published_revision,
                             &path.display,
                             error,
                         )
@@ -506,11 +738,7 @@ impl WorkspaceTools {
                     &parent.name,
                     &path.display,
                 ) {
-                    Ok(Some(state))
-                        if state.revision.object_identity == temporary_identity
-                            && state.revision.content_digest
-                                == temporary_revision.content_digest =>
-                    {
+                    Ok(Some(state)) if state.revision == published_revision => {
                         match self.remove_created_file_unix(path, &state.revision) {
                             Ok(()) => Err(error.into()),
                             Err(cleanup_error) => Err(cleanup_error.into()),
@@ -563,8 +791,17 @@ impl WorkspaceTools {
         );
         let published_state = match published_state_result {
             Ok(Some(state))
-                if state.revision.object_identity == temporary_identity
-                    && state.revision.content_digest == temporary_revision.content_digest =>
+                if {
+                    #[cfg(unix)]
+                    {
+                        state.revision == published_revision
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        state.revision.object_identity == temporary_identity
+                            && state.revision.content_digest == temporary_revision.content_digest
+                    }
+                } =>
             {
                 state
             }
@@ -576,7 +813,7 @@ impl WorkspaceTools {
                             parent.dir(),
                             &parent.name,
                             &temporary_name,
-                            &temporary_identity,
+                            &published_revision,
                             &path.display,
                             WorkspaceToolError::ConcurrentMutation(path.display.clone()),
                         )
@@ -599,6 +836,21 @@ impl WorkspaceTools {
                 };
             }
         };
+        #[cfg(unix)]
+        if let Some(backup_revision) = backup_revision.as_ref()
+            && let Err(cleanup_error) = self.remove_owned_file_revision_unix(
+                parent.dir(),
+                &temporary_name,
+                &path.display,
+                backup_revision,
+            )
+        {
+            return Err(AtomicWriteFailure::published(
+                cleanup_error,
+                published_state.revision,
+            ));
+        }
+        #[cfg(not(unix))]
         if let Some(original_identity) = original_identity.as_deref() {
             let cleanup_error = cleanup_owned_file(
                 parent.dir(),
@@ -627,14 +879,52 @@ impl WorkspaceTools {
         parent: &CapabilityDir,
         target: &OsStr,
         backup: &OsStr,
-        published_identity: &str,
+        published_revision: &WorkspaceContentRevision,
         relative: &str,
         failure: WorkspaceToolError,
     ) -> WorkspaceToolError {
+        use std::io::Seek as _;
+
+        let (mut published_file, target_was_missing) = match open_file_from_parent(parent, target) {
+            Ok(mut file) => (
+                match self.read_file_bytes_with_revision(relative, &mut file) {
+                    Ok((_, revision)) if revision == *published_revision => Some(file),
+                    Ok(_) | Err(_) => None,
+                },
+                false,
+            ),
+            Err(CapabilityAccessError::Missing) => (None, true),
+            Err(_) => (None, false),
+        };
         if let Err(error) = self.restore_exchanged_entries(parent, target, backup, relative) {
             return error;
         }
-        cleanup_owned_file(parent, backup, published_identity, failure)
+        if target_was_missing {
+            return failure;
+        }
+        let Some(mut published_file) = published_file.take() else {
+            return WorkspaceToolError::RollbackFailed(format!(
+                "{relative}: published entry ownership changed; replacement preserved"
+            ));
+        };
+        if published_file.rewind().is_err() {
+            return WorkspaceToolError::RollbackFailed(format!(
+                "{relative}: restored publication ownership could not be verified"
+            ));
+        }
+        let pinned_revision =
+            match self.read_file_bytes_with_revision(relative, &mut published_file) {
+                Ok((_, revision)) => revision,
+                Err(_) => {
+                    return WorkspaceToolError::RollbackFailed(format!(
+                        "{relative}: restored publication ownership could not be verified"
+                    ));
+                }
+            };
+        match self.remove_owned_file_revision_unix(parent, backup, relative, &pinned_revision) {
+            Ok(()) => failure,
+            Err(error) => error,
+        }
     }
 
     #[cfg(unix)]
@@ -697,6 +987,98 @@ impl WorkspaceTools {
             ),
             Err(error) => Err(WorkspaceToolError::RollbackFailed(format!(
                 "{relative}: exchanged source restoration failed: {}",
+                map_capability_error(error, relative)
+            ))),
+        }
+    }
+
+    /// Remove a file only while a complete content revision and a pinned file
+    /// handle both prove that the quarantined entry is still the owned object.
+    #[cfg(unix)]
+    fn remove_owned_file_revision_unix(
+        &self,
+        parent: &CapabilityDir,
+        name: &OsStr,
+        relative: &str,
+        expected_revision: &WorkspaceContentRevision,
+    ) -> Result<(), WorkspaceToolError> {
+        use std::io::Seek as _;
+
+        let mut pinned = match open_file_from_parent(parent, name) {
+            Ok(file) => file,
+            Err(CapabilityAccessError::Missing) => return Ok(()),
+            Err(error) => return Err(map_capability_error(error, relative)),
+        };
+        let initial_revision = self
+            .read_file_bytes_with_revision(relative, &mut pinned)
+            .map_err(|error| map_capability_error(error, relative))?
+            .1;
+        if initial_revision != *expected_revision {
+            return Err(WorkspaceToolError::RollbackFailed(format!(
+                "{relative}: cleanup ownership changed; entry preserved"
+            )));
+        }
+        let quarantine = loop {
+            let quarantine = mutation_quarantine_name(parent, "owned-file")
+                .map_err(|error| map_capability_error(error, relative))?;
+            match mutation_rename_noreplace(parent, name, &quarantine) {
+                Ok(()) => break quarantine,
+                Err(CapabilityAccessError::Missing) => return Ok(()),
+                Err(CapabilityAccessError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(CapabilityAccessError::Unsupported) => {
+                    return Err(WorkspaceToolError::PathIdentityUnsupported(
+                        relative.to_string(),
+                    ));
+                }
+                Err(error) => return Err(map_capability_error(error, relative)),
+            }
+        };
+        if pinned.rewind().is_err() {
+            return Err(WorkspaceToolError::RollbackFailed(format!(
+                "{relative}: quarantined cleanup ownership could not be verified"
+            )));
+        }
+        let pinned_revision = match self.read_file_bytes_with_revision(relative, &mut pinned) {
+            Ok((_, revision)) => revision,
+            Err(_) => {
+                return Err(WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: quarantined cleanup ownership could not be verified"
+                )));
+            }
+        };
+        let mut quarantined = match open_file_from_parent(parent, &quarantine) {
+            Ok(file) => file,
+            Err(_) => {
+                return Err(WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: quarantined cleanup entry could not be verified"
+                )));
+            }
+        };
+        let quarantined_revision =
+            match self.read_file_bytes_with_revision(relative, &mut quarantined) {
+                Ok((_, revision)) => revision,
+                Err(_) => {
+                    return Err(WorkspaceToolError::RollbackFailed(format!(
+                        "{relative}: quarantined cleanup entry could not be verified"
+                    )));
+                }
+            };
+        if quarantined_revision != pinned_revision {
+            return Err(WorkspaceToolError::RollbackFailed(format!(
+                "{relative}: quarantined cleanup ownership changed; entry preserved"
+            )));
+        }
+        match mutation_unlink_file(parent, &quarantine) {
+            Ok(()) | Err(CapabilityAccessError::Missing) => Ok(()),
+            Err(CapabilityAccessError::Unsupported) => Err(
+                WorkspaceToolError::PathIdentityUnsupported(relative.to_string()),
+            ),
+            Err(error) => Err(WorkspaceToolError::RollbackFailed(format!(
+                "{relative}: quarantined cleanup failed: {}",
                 map_capability_error(error, relative)
             ))),
         }
@@ -793,94 +1175,12 @@ impl WorkspaceTools {
             Err(CapabilityAccessError::Missing) => return Ok(()),
             Err(error) => return Err(map_capability_error(error, &path.display)),
         };
-        let quarantine = loop {
-            let quarantine = mutation_quarantine_name(parent.dir(), "created-file")
-                .map_err(|error| map_capability_error(error, &path.display))?;
-            match mutation_rename_noreplace(parent.dir(), &parent.name, &quarantine) {
-                Ok(()) => break quarantine,
-                Err(CapabilityAccessError::Missing) => return Ok(()),
-                Err(CapabilityAccessError::Io(error))
-                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
-                {
-                    continue;
-                }
-                Err(CapabilityAccessError::Unsupported) => {
-                    return Err(WorkspaceToolError::PathIdentityUnsupported(
-                        path.display.clone(),
-                    ));
-                }
-                Err(error) => return Err(map_capability_error(error, &path.display)),
-            }
-        };
-        let quarantined = self.atomic_target_state(
+        self.remove_owned_file_revision_unix(
             parent.dir(),
-            &parent.actual_relative,
-            &quarantine,
+            &parent.name,
             &path.display,
-        );
-        let quarantined_revision = match quarantined {
-            Ok(Some(state)) => state.revision,
-            Ok(None) => {
-                return match restore_quarantined_entry(
-                    parent.dir(),
-                    &quarantine,
-                    &parent.name,
-                    &path.display,
-                ) {
-                    Ok(()) => Err(WorkspaceToolError::RollbackFailed(format!(
-                        "{}: quarantined created file disappeared",
-                        path.display
-                    ))),
-                    Err(error) => Err(error),
-                };
-            }
-            Err(error) => {
-                let state_error = map_capability_error(error, &path.display);
-                return match restore_quarantined_entry(
-                    parent.dir(),
-                    &quarantine,
-                    &parent.name,
-                    &path.display,
-                ) {
-                    Ok(()) => Err(state_error),
-                    Err(restore_error) => Err(restore_error),
-                };
-            }
-        };
-        if !same_mutation_revision(&quarantined_revision, expected_revision) {
-            return match restore_quarantined_entry(
-                parent.dir(),
-                &quarantine,
-                &parent.name,
-                &path.display,
-            ) {
-                Ok(()) => Err(WorkspaceToolError::ConcurrentMutation(path.display.clone())),
-                Err(error) => Err(error),
-            };
-        }
-        match mutation_unlink_file(parent.dir(), &quarantine) {
-            Ok(()) | Err(CapabilityAccessError::Missing) => Ok(()),
-            Err(error) => {
-                let cleanup_error = match error {
-                    CapabilityAccessError::Unsupported => {
-                        WorkspaceToolError::PathIdentityUnsupported(path.display.clone())
-                    }
-                    error => io_error(std::io::Error::other(format!(
-                        "created file quarantine cleanup failed: {}",
-                        map_capability_error(error, &path.display)
-                    ))),
-                };
-                match restore_quarantined_entry(
-                    parent.dir(),
-                    &quarantine,
-                    &parent.name,
-                    &path.display,
-                ) {
-                    Ok(()) => Err(cleanup_error),
-                    Err(restore_error) => Err(restore_error),
-                }
-            }
-        }
+            expected_revision,
+        )
     }
 
     #[cfg(not(unix))]
@@ -1148,19 +1448,6 @@ fn publish_temporary(
             .rename(temporary_name, parent, target_name)
             .map_err(classify_io_error)
     }
-}
-
-/// A rename changes Unix ctime even when the object and bytes are untouched;
-/// rollback ownership therefore compares the stable object identity and
-/// digest, not path-sensitive metadata which the namespace operation itself
-/// is allowed to update.
-#[cfg(unix)]
-fn same_mutation_revision(
-    expected: &WorkspaceContentRevision,
-    observed: &WorkspaceContentRevision,
-) -> bool {
-    expected.object_identity == observed.object_identity
-        && expected.content_digest == observed.content_digest
 }
 
 #[derive(Clone)]

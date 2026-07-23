@@ -430,6 +430,8 @@ mod mutation_tests {
     #[test]
     fn post_publish_replacement_is_not_claimed_or_overwritten_by_rollback() {
         #[cfg(unix)]
+        use std::cell::RefCell;
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
 
         let workspace = test_workspace("post-publish-external-replacement");
@@ -440,16 +442,35 @@ mod mutation_tests {
         let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
         #[cfg(unix)]
         let mut external_identity = None;
+        #[cfg(unix)]
+        let exchanged_backup = RefCell::new(None::<PathBuf>);
 
         let failure = tools
             .atomic_write_with_hooks(
                 &path,
                 "published",
                 original_revision.as_ref(),
-                |_| {},
+                |_temporary_name| {
+                    #[cfg(unix)]
+                    exchanged_backup.replace(Some(workspace.join(_temporary_name)));
+                },
                 || {
-                    std::fs::remove_file(&target).expect("remove published target");
-                    std::fs::write(&target, "external").expect("write external target");
+                    #[cfg(unix)]
+                    {
+                        let external_source = workspace.join("external-source.txt");
+                        std::fs::hard_link(&target, &external_source)
+                            .expect("link published identity for deterministic collision");
+                        std::fs::remove_file(&target).expect("remove published target");
+                        std::fs::write(&external_source, "external")
+                            .expect("write external content");
+                        std::fs::rename(&external_source, &target)
+                            .expect("publish external target");
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::fs::remove_file(&target).expect("remove published target");
+                        std::fs::write(&target, "external").expect("write external target");
+                    }
                     #[cfg(unix)]
                     {
                         let metadata = std::fs::metadata(&target).expect("external metadata");
@@ -478,23 +499,19 @@ mod mutation_tests {
             assert!(failure.published_revision.is_none());
             assert!(matches!(
                 failure.error,
-                WorkspaceToolError::RollbackFailed(_)
+                WorkspaceToolError::RollbackFailed(ref message)
+                    if message.contains("ownership changed")
             ));
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
-            let external_entries = std::fs::read_dir(&workspace)
-                .expect("read workspace")
-                .filter_map(|entry| {
-                    let entry = entry.expect("entry");
-                    (entry.path() != target
-                        && matches!(
-                            std::fs::read_to_string(entry.path()),
-                            Ok(content) if content == "external"
-                        ))
-                    .then_some(entry.path())
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(external_entries.len(), 1);
-            let metadata = std::fs::metadata(&external_entries[0]).expect("preserved metadata");
+            let quarantined_external = exchanged_backup
+                .into_inner()
+                .expect("record exchanged backup path");
+            assert_eq!(
+                std::fs::read_to_string(&quarantined_external).unwrap(),
+                "external"
+            );
+            let metadata =
+                std::fs::metadata(&quarantined_external).expect("preserved external metadata");
             assert_eq!(external_identity, Some((metadata.dev(), metadata.ino())));
         }
         remove_workspace(&workspace);
@@ -607,6 +624,9 @@ mod mutation_tests {
 
     #[test]
     fn post_publish_same_object_content_tampering_is_rolled_back() {
+        #[cfg(unix)]
+        use std::cell::RefCell;
+
         let workspace = test_workspace("post-publish-content-tampering");
         let target = workspace.join("target.txt");
         std::fs::write(&target, "before").expect("write target");
@@ -614,25 +634,44 @@ mod mutation_tests {
         let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
         let (_original, original_revision) =
             tools.existing_text_or_empty(&path).expect("read original");
+        #[cfg(unix)]
+        let exchanged_backup = RefCell::new(None::<PathBuf>);
 
         let failure = tools
             .atomic_write_with_hooks(
                 &path,
                 "published",
                 original_revision.as_ref(),
-                |_| {},
+                |_temporary_name| {
+                    #[cfg(unix)]
+                    exchanged_backup.replace(Some(workspace.join(_temporary_name)));
+                },
                 || {
                     std::fs::write(&target, "tampered").expect("tamper published target");
                     Ok(())
                 },
             )
             .expect_err("tampered published content must fail closed");
+        #[cfg(not(unix))]
         assert!(matches!(
             failure.error,
             WorkspaceToolError::ConcurrentMutation(_)
         ));
         #[cfg(unix)]
-        assert!(failure.published_revision.is_none());
+        {
+            assert!(failure.published_revision.is_none());
+            assert!(matches!(
+                failure.error,
+                WorkspaceToolError::RollbackFailed(_)
+            ));
+            let quarantined_tampering = exchanged_backup
+                .into_inner()
+                .expect("record exchanged backup path");
+            assert_eq!(
+                std::fs::read_to_string(quarantined_tampering).unwrap(),
+                "tampered"
+            );
+        }
         #[cfg(not(unix))]
         {
             let published_revision = *failure
