@@ -247,6 +247,56 @@ mod mutation_tests {
         remove_workspace(&workspace);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pre_publish_cleanup_preserves_an_identity_collision_replacement() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let workspace = test_workspace("temp-identity-collision");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+        let mut replacement_path = None;
+        let mut replacement_identity = None;
+
+        let failure = tools
+            .atomic_write_with_hook(
+                &path,
+                "published",
+                original_revision.as_ref(),
+                |temporary_name| {
+                    let temporary_path = workspace.join(temporary_name);
+                    std::fs::remove_file(&temporary_path).expect("remove owned temp name");
+                    std::fs::write(&temporary_path, "external")
+                        .expect("write external replacement");
+                    let metadata =
+                        std::fs::metadata(&temporary_path).expect("replacement metadata");
+                    replacement_identity = Some((metadata.dev(), metadata.ino()));
+                    replacement_path = Some(temporary_path);
+                    tools.force_next_temporary_cleanup_identity_collision_for_test();
+                },
+            )
+            .expect_err("identity collision replacement must fail closed");
+
+        assert!(failure.published_revision.is_none());
+        assert!(matches!(
+            failure.error,
+            WorkspaceToolError::RollbackFailed(ref message)
+                if message.contains("ownership changed")
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        let replacement_path = replacement_path.expect("record replacement path");
+        assert_eq!(
+            std::fs::read_to_string(&replacement_path).unwrap(),
+            "external"
+        );
+        let metadata = std::fs::metadata(&replacement_path).expect("preserved metadata");
+        assert_eq!(replacement_identity, Some((metadata.dev(), metadata.ino())));
+        remove_workspace(&workspace);
+    }
+
     #[test]
     fn rollback_restores_only_published_mutations() {
         let workspace = test_workspace("published-rollback");

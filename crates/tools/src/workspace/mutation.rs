@@ -2,44 +2,41 @@
 
 use super::*;
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static FORCE_TEMPORARY_CLEANUP_IDENTITY_COLLISION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 impl WorkspaceTools {
+    /// Force only the identity field to collide in the next Unix cleanup proof.
+    #[cfg(all(test, unix))]
+    pub(crate) fn force_next_temporary_cleanup_identity_collision_for_test(&self) {
+        FORCE_TEMPORARY_CLEANUP_IDENTITY_COLLISION.with(|force| force.set(true));
+    }
+
     fn cleanup_temporary_file_failure(
         &self,
         parent: &CapabilityDir,
         name: &OsStr,
         _relative: &str,
         temporary_file: CapabilityFile,
-        expected_identity: &str,
+        _expected_identity: &str,
         failure: WorkspaceToolError,
     ) -> WorkspaceToolError {
         #[cfg(unix)]
         {
+            use std::io::Seek as _;
+
             let relative = _relative;
-            let _pinned_temporary_file = temporary_file;
-            let mut readable = match open_file_from_parent(parent, name) {
-                Ok(file) => file,
-                Err(CapabilityAccessError::Missing) => return failure,
-                Err(_) => {
-                    return WorkspaceToolError::RollbackFailed(format!(
-                        "{relative}: temporary file ownership could not be established; entry preserved"
-                    ));
-                }
-            };
-            let readable_identity = match file_object_identity_key(&readable) {
-                Ok(identity) => identity,
-                Err(_) => {
-                    return WorkspaceToolError::RollbackFailed(format!(
-                        "{relative}: temporary file ownership could not be established; entry preserved"
-                    ));
-                }
-            };
-            if readable_identity != expected_identity {
+            let mut temporary_file = temporary_file;
+            if temporary_file.rewind().is_err() {
                 return WorkspaceToolError::RollbackFailed(format!(
-                    "{relative}: temporary file ownership changed; replacement preserved"
+                    "{relative}: temporary file ownership could not be established; entry preserved"
                 ));
             }
             let expected_revision = match self
-                .read_file_bytes_with_revision(relative, &mut readable)
+                .read_file_bytes_with_revision(relative, &mut temporary_file)
             {
                 Ok((_, revision)) => revision,
                 Err(_) => {
@@ -56,7 +53,7 @@ impl WorkspaceTools {
         #[cfg(not(unix))]
         {
             drop(temporary_file);
-            cleanup_owned_file(parent, name, expected_identity, failure)
+            cleanup_owned_file(parent, name, _expected_identity, failure)
         }
     }
 
@@ -393,7 +390,10 @@ impl WorkspaceTools {
             };
         if source_revision != temporary_revision {
             drop(source_file);
-            if source_revision.object_identity == temporary_identity {
+            if temporary_cleanup_identity_matches(
+                &temporary_identity,
+                &source_revision.object_identity,
+            ) {
                 return Err(self
                     .cleanup_temporary_file_failure(
                         parent.dir(),
@@ -1013,7 +1013,7 @@ impl WorkspaceTools {
             .read_file_bytes_with_revision(relative, &mut pinned)
             .map_err(|error| map_capability_error(error, relative))?
             .1;
-        if initial_revision != *expected_revision {
+        if !same_cleanup_revision(expected_revision, &initial_revision) {
             return Err(WorkspaceToolError::RollbackFailed(format!(
                 "{relative}: cleanup ownership changed; entry preserved"
             )));
@@ -1448,6 +1448,30 @@ fn publish_temporary(
             .rename(temporary_name, parent, target_name)
             .map_err(classify_io_error)
     }
+}
+
+fn temporary_cleanup_identity_matches(expected: &str, observed: &str) -> bool {
+    #[cfg(all(test, unix))]
+    if FORCE_TEMPORARY_CLEANUP_IDENTITY_COLLISION.with(|force| force.get()) {
+        return true;
+    }
+    expected == observed
+}
+
+#[cfg(unix)]
+fn same_cleanup_revision(
+    expected: &WorkspaceContentRevision,
+    observed: &WorkspaceContentRevision,
+) -> bool {
+    #[cfg(test)]
+    if FORCE_TEMPORARY_CLEANUP_IDENTITY_COLLISION.with(|force| force.replace(false)) {
+        let mut observed = observed.clone();
+        observed
+            .object_identity
+            .clone_from(&expected.object_identity);
+        return expected == &observed;
+    }
+    expected == observed
 }
 
 #[derive(Clone)]

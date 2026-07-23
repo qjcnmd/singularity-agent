@@ -1986,7 +1986,9 @@ fn create_unique_temp_file(
             ".singularity-tmp-{}-{sequence}",
             std::process::id()
         ));
-        match parent.open_with(&temp_name, &nofollow_file_options(false, true, true)) {
+        // Read access lets failure cleanup derive its ownership revision from
+        // this pinned handle instead of trusting the current directory entry.
+        match parent.open_with(&temp_name, &nofollow_file_options(true, true, true)) {
             Ok(file) => return Ok((temp_name, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(classify_io_error(error)),
