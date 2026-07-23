@@ -799,12 +799,12 @@ mod linux_tests {
     };
     use std::ffi::OsString;
     use std::fs::{self, hard_link};
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::process::Command;
     use std::sync::{Mutex, MutexGuard};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -901,6 +901,7 @@ if child == 0:
         os._exit(91)
     with open("orphan-ready", "w") as marker:
         marker.write("ready")
+    print("orphan-ready", flush=True)
     time.sleep({delay_seconds})
     with open("orphan-marker", "w") as marker:
         marker.write("late")
@@ -911,17 +912,6 @@ while not os.path.exists("orphan-ready"):
 time.sleep(30)
 "#
         )
-    }
-
-    fn wait_for_file(path: &Path, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if path.is_file() {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        path.is_file()
     }
 
     fn assert_no_delayed_side_effect(workspace: &Path) {
@@ -1077,6 +1067,8 @@ time.sleep(30)
         )
         .expect("Cargo.toml");
         fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+        // Keep this rustup-routing test independent from WSL OverlayFS new-directory behavior.
+        fs::create_dir(workspace.path().join("target")).expect("target directory");
 
         let result = strict_backend().execute(&request(
             "linux_rustup_cargo",
@@ -1133,6 +1125,8 @@ time.sleep(30)
         )
         .expect("Cargo.toml");
         fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+        // Keep this rustup-routing test independent from WSL OverlayFS new-directory behavior.
+        fs::create_dir(workspace.path().join("target")).expect("target directory");
 
         let host_path = std::env::var("PATH").unwrap_or_default();
         let _path = EnvironmentGuard::set("PATH", &format!("{}:{host_path}", path_str(&cargo_bin)));
@@ -1235,6 +1229,266 @@ time.sleep(30)
             fs::read_to_string(workspace.path().join("output.txt")).unwrap(),
             "changed"
         );
+    }
+
+    #[test]
+    fn linux_workspace_write_rejects_new_protected_path_without_real_side_effect() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = strict_backend().execute(&request(
+            "linux_protected_create",
+            &["/bin/sh", "-c", "printf secret > .env"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::PolicyDenied
+        );
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
+        assert!(!workspace.path().join(".env").exists());
+    }
+
+    #[test]
+    fn linux_workspace_transaction_commits_valid_file_and_directory_changes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("update.txt"), "before").expect("update fixture");
+        fs::write(workspace.path().join("rename.txt"), "rename").expect("rename fixture");
+        fs::write(workspace.path().join("delete.txt"), "delete").expect("delete fixture");
+        fs::create_dir(workspace.path().join("data")).expect("data fixture");
+        fs::write(workspace.path().join("data/old.txt"), "old").expect("nested fixture");
+
+        let result = strict_backend().execute(&request(
+            "linux_transaction_commit",
+            &[
+                "/bin/sh",
+                "-c",
+                "set -eu; printf created > created.txt; printf after > update.txt; mv rename.txt renamed.txt; rm delete.txt data/old.txt; mkdir data/new; printf nested > data/new/value.txt",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            result.stderr_preview
+        );
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("created.txt")).unwrap(),
+            "created"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("update.txt")).unwrap(),
+            "after"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("renamed.txt")).unwrap(),
+            "rename"
+        );
+        assert!(!workspace.path().join("rename.txt").exists());
+        assert!(!workspace.path().join("delete.txt").exists());
+        assert!(!workspace.path().join("data/old.txt").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("data/new/value.txt")).unwrap(),
+            "nested"
+        );
+    }
+
+    #[test]
+    fn linux_workspace_transaction_preserves_requested_timestamps() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("file.txt"), "unchanged").expect("file fixture");
+        fs::create_dir(workspace.path().join("directory")).expect("directory fixture");
+
+        let result = strict_backend().execute(&request(
+            "linux_transaction_timestamps",
+            &[
+                "/bin/sh",
+                "-c",
+                "touch -m -d @946684800 file.txt; touch -m -d @946684801 directory",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            result.stderr_preview
+        );
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        for (relative, expected_seconds) in [("file.txt", 946_684_800), ("directory", 946_684_801)]
+        {
+            let modified = fs::symlink_metadata(workspace.path().join(relative))
+                .expect("committed metadata")
+                .modified()
+                .expect("committed modified time")
+                .duration_since(UNIX_EPOCH)
+                .expect("post-epoch timestamp")
+                .as_secs();
+            assert_eq!(modified, expected_seconds, "{relative}");
+        }
+    }
+
+    #[test]
+    fn linux_workspace_transaction_rejects_all_new_protected_representations() {
+        let backend = strict_backend();
+        for (id, script, protected_relative) in [
+            ("env", "printf secret > .env", ".env"),
+            ("env_case", "printf secret > .ENV", ".ENV"),
+            ("git_dir", "mkdir .git", ".git"),
+            (
+                "git_nested",
+                "mkdir .git; printf config > .git/config",
+                ".git",
+            ),
+            ("metadata_dir", "mkdir .singularity", ".singularity"),
+            (
+                "nested_env",
+                "mkdir nested; printf secret > nested/.env",
+                "nested/.env",
+            ),
+            (
+                "backslash_representation",
+                "printf secret > 'nested\\.env'",
+                "nested\\.env",
+            ),
+            (
+                "rename_to_protected",
+                "printf ordinary > source.txt; mv source.txt .env",
+                ".env",
+            ),
+        ] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let result = backend.execute(&request(
+                &format!("linux_protected_{id}"),
+                &["/bin/sh", "-c", script],
+                workspace.path(),
+                SandboxFilesystemMode::WorkspaceWrite,
+                SandboxNetworkMode::Denied,
+            ));
+
+            assert_eq!(
+                result.execution_status,
+                CommandExecutionStatus::PolicyDenied,
+                "{id}: {}",
+                result.stderr_preview
+            );
+            assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
+            assert!(
+                !workspace.path().join(protected_relative).exists(),
+                "{id} changed the real workspace"
+            );
+            assert!(
+                !workspace.path().join("source.txt").exists(),
+                "{id} partially committed an otherwise ordinary file"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_workspace_transaction_preserves_existing_protected_objects() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join(".env"), "original").expect("protected file");
+        fs::create_dir(workspace.path().join(".git")).expect("protected git directory");
+        fs::write(workspace.path().join(".git/config"), "original").expect("git config");
+        fs::create_dir(workspace.path().join(".singularity"))
+            .expect("protected metadata directory");
+        fs::write(workspace.path().join(".singularity/state"), "original").expect("metadata state");
+
+        let result = strict_backend().execute(&request(
+            "linux_existing_protected_changes",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf changed > .env 2>/dev/null || true; rm -rf .git 2>/dev/null || true; mv .singularity moved 2>/dev/null || true",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".env")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".git/config")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".singularity/state")).unwrap(),
+            "original"
+        );
+        assert!(!workspace.path().join("moved").exists());
+    }
+
+    #[test]
+    fn linux_workspace_transaction_detects_real_workspace_drift_before_commit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace_path = workspace.path().to_path_buf();
+        let backend = strict_backend();
+        let worker = thread::spawn(move || {
+            backend.execute(&request(
+                "linux_workspace_drift",
+                &[
+                    "/bin/sh",
+                    "-c",
+                    "sleep 1; printf transaction > transaction.txt",
+                ],
+                &workspace_path,
+                SandboxFilesystemMode::WorkspaceWrite,
+                SandboxNetworkMode::Denied,
+            ))
+        });
+        thread::sleep(Duration::from_millis(200));
+        fs::write(workspace.path().join("external.txt"), "external")
+            .expect("concurrent real workspace change");
+
+        let result = worker.join().expect("sandbox worker");
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::PolicyDenied
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("external.txt")).unwrap(),
+            "external"
+        );
+        assert!(!workspace.path().join("transaction.txt").exists());
+    }
+
+    #[test]
+    fn linux_overlay_filesystem_failure_is_a_typed_capability_blocker() {
+        let _environment = lock_environment();
+        let workspace = tempfile::tempdir().expect("workspace");
+        let _temporary_root = EnvironmentGuard::set("TMPDIR", "/proc");
+        let result = strict_backend().execute(&request(
+            "linux_overlay_capability",
+            &["/bin/sh", "-c", "printf changed > output.txt"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Unsupported);
+        assert!(
+            result
+                .stderr_preview
+                .contains("capability_not_supported:overlay_filesystem")
+        );
+        assert!(!workspace.path().join("output.txt").exists());
     }
 
     #[test]
@@ -1392,6 +1646,10 @@ time.sleep(30)
             fs::read_to_string(workspace.path().join("second.txt")).unwrap(),
             "changed"
         );
+        let first = fs::metadata(workspace.path().join("first.txt")).expect("first metadata");
+        let second = fs::metadata(workspace.path().join("second.txt")).expect("second metadata");
+        assert_eq!(first.ino(), second.ino());
+        assert_eq!(first.nlink(), 2);
     }
 
     #[test]
@@ -1611,10 +1869,8 @@ printf child-contract-ok
             timeout_result.execution_status,
             CommandExecutionStatus::TimedOut
         );
-        assert!(wait_for_file(
-            &timeout_workspace.path().join("orphan-ready"),
-            Duration::from_secs(3)
-        ));
+        assert!(timeout_result.stdout_preview.contains("orphan-ready"));
+        assert!(!timeout_workspace.path().join("orphan-ready").exists());
         assert_no_delayed_side_effect(timeout_workspace.path());
 
         let cancel_workspace = tempfile::tempdir().expect("cancel workspace");
@@ -1632,17 +1888,15 @@ printf child-contract-ok
         let worker = thread::spawn(move || {
             worker_backend.execute_cancellable(&cancel_request, &worker_cancellation)
         });
-        let ready = wait_for_file(
-            &cancel_workspace.path().join("orphan-ready"),
-            Duration::from_secs(1),
-        );
+        thread::sleep(Duration::from_millis(500));
         cancellation.cancel();
         let cancelled = worker.join().expect("cancelled orphan command worker");
-        assert!(ready, "cancelled command did not start its derived child");
         assert_eq!(
             cancelled.execution_status,
             CommandExecutionStatus::Cancelled
         );
+        assert!(cancelled.stdout_preview.contains("orphan-ready"));
+        assert!(!cancel_workspace.path().join("orphan-ready").exists());
         assert_no_delayed_side_effect(cancel_workspace.path());
     }
 

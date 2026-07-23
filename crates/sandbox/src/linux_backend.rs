@@ -10,17 +10,21 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
-use std::os::fd::{FromRawFd, RawFd};
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use cap_fs_ext::DirExt as _;
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use singularity_core::{CancellationToken, is_protected_path};
 
 use super::{
@@ -95,6 +99,10 @@ const AUDIT_ARCH_ARM: u32 = 0x4000_0028;
 
 const CHILD_SETUP_UNAVAILABLE: u8 = 1;
 const CHILD_SETUP_CAPABILITY: u8 = 2;
+const CHILD_SETUP_OVERLAY_FILESYSTEM: u8 = 3;
+const WORKSPACE_TRANSACTION_DENIED: &str = "linux sandbox workspace transaction denied";
+
+static TRANSACTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -149,6 +157,8 @@ pub enum LinuxCapability {
     Seccomp,
     Landlock,
     ProcessTreeCleanup,
+    OverlayFilesystem,
+    WorkspaceTransaction,
 }
 
 impl LinuxCapability {
@@ -162,6 +172,8 @@ impl LinuxCapability {
             Self::Seccomp => "seccomp",
             Self::Landlock => "landlock",
             Self::ProcessTreeCleanup => "process_tree_cleanup",
+            Self::OverlayFilesystem => "overlay_filesystem",
+            Self::WorkspaceTransaction => "workspace_transaction",
         }
     }
 }
@@ -358,7 +370,7 @@ impl LinuxSandboxBackend {
     fn strict_capabilities(&self) -> SandboxCapabilities {
         SandboxCapabilities {
             filesystem_isolation: true,
-            copy_on_write: false,
+            copy_on_write: true,
             readonly_mount: true,
             network_isolation: true,
             env_isolation: true,
@@ -488,7 +500,7 @@ struct ProtectedPath {
     is_dir: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PreparedCommand {
     workspace: PathBuf,
     cwd: PathBuf,
@@ -502,6 +514,7 @@ struct PreparedCommand {
     filesystem: SandboxFilesystemMode,
     protected_paths: Vec<ProtectedPath>,
     before: Option<WorkspaceSnapshot>,
+    transaction: Option<WorkspaceTransaction>,
 }
 
 impl PreparedCommand {
@@ -552,6 +565,13 @@ impl PreparedCommand {
         } else {
             None
         };
+        let transaction = if matches!(filesystem.mode, SandboxFilesystemMode::WorkspaceWrite) {
+            Some(WorkspaceTransaction::new(&workspace).map_err(|_| {
+                LinuxSandboxError::CapabilityNotSupported(LinuxCapability::OverlayFilesystem)
+            })?)
+        } else {
+            None
+        };
         Ok(Self {
             workspace,
             cwd: cwd_path,
@@ -564,7 +584,173 @@ impl PreparedCommand {
             filesystem: filesystem.mode,
             protected_paths,
             before,
+            transaction,
         })
+    }
+}
+
+#[derive(Debug)]
+/// Parent-owned OverlayFS backing storage that never aliases the real workspace.
+struct WorkspaceTransaction {
+    root: PathBuf,
+    upper: PathBuf,
+    work: PathBuf,
+}
+
+impl WorkspaceTransaction {
+    fn new(workspace: &Path) -> Result<Self, std::io::Error> {
+        let temporary_root = std::env::temp_dir();
+        for _ in 0..64 {
+            let sequence = TRANSACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = temporary_root.join(format!(
+                "singularity-workspace-view-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => {
+                    let upper = root.join("upper");
+                    let work = root.join("work");
+                    if let Err(error) =
+                        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                            .and_then(|_| fs::create_dir(&upper))
+                            .and_then(|_| fs::create_dir(&work))
+                            .and_then(|_| seed_internal_hardlinks(workspace, &upper))
+                    {
+                        make_tree_owner_accessible(&root);
+                        let _ = fs::remove_dir_all(&root);
+                        return Err(error);
+                    }
+                    return Ok(Self { root, upper, work });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "workspace transaction namespace exhausted",
+        ))
+    }
+}
+
+/// Copy internal hardlink groups into the upper layer so writes preserve link semantics.
+fn seed_internal_hardlinks(workspace: &Path, upper: &Path) -> Result<(), std::io::Error> {
+    fn visit(
+        directory: &Dir,
+        relative_parent: &Path,
+        groups: &mut BTreeMap<(u64, u64), Vec<PathBuf>>,
+    ) -> Result<(), std::io::Error> {
+        let mut entries = directory.entries()?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let relative = relative_parent.join(&name);
+            let Some(name_text) = name.to_str() else {
+                return Err(std::io::Error::other("non-Unicode hardlink path"));
+            };
+            let Some(relative_text) = relative.to_str() else {
+                return Err(std::io::Error::other("non-Unicode hardlink path"));
+            };
+            if is_protected_path(name_text) || is_protected_path(relative_text) {
+                continue;
+            }
+            let metadata = directory.symlink_metadata(&name)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                let child = directory.open_dir_nofollow(&name)?;
+                visit(&child, &relative, groups)?;
+            } else if metadata.is_file() && cap_fs_ext::MetadataExt::nlink(&metadata) > 1 {
+                groups
+                    .entry((
+                        cap_fs_ext::MetadataExt::dev(&metadata),
+                        cap_fs_ext::MetadataExt::ino(&metadata),
+                    ))
+                    .or_default()
+                    .push(relative);
+            }
+        }
+        Ok(())
+    }
+
+    let mut groups = BTreeMap::new();
+    let workspace_directory = Dir::open_ambient_dir(workspace, ambient_authority())?;
+    visit(&workspace_directory, Path::new(""), &mut groups)?;
+    for paths in groups.into_values().filter(|paths| paths.len() > 1) {
+        let first_upper = upper.join(&paths[0]);
+        if let Some(parent) = first_upper.parent() {
+            create_seed_directory_path(
+                &workspace_directory,
+                upper,
+                parent.strip_prefix(upper).unwrap_or(parent),
+            )?;
+        }
+        let mut first_source = workspace_directory.open(&paths[0])?;
+        if file_has_extended_attributes(&first_source)? {
+            return Err(std::io::Error::other(
+                "hardlinked workspace file has extended attributes",
+            ));
+        }
+        let mut first_destination = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&first_upper)?;
+        io::copy(&mut first_source, &mut first_destination)?;
+        let first_metadata = workspace_directory.symlink_metadata(&paths[0])?;
+        fs::set_permissions(
+            &first_upper,
+            fs::Permissions::from_mode(cap_std::fs::PermissionsExt::mode(
+                &first_metadata.permissions(),
+            )),
+        )?;
+        for relative in paths.iter().skip(1) {
+            let destination = upper.join(relative);
+            if let Some(parent) = destination.parent() {
+                create_seed_directory_path(
+                    &workspace_directory,
+                    upper,
+                    parent.strip_prefix(upper).unwrap_or(parent),
+                )?;
+            }
+            fs::hard_link(&first_upper, destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn file_has_extended_attributes(file: &cap_std::fs::File) -> Result<bool, std::io::Error> {
+    let size = unsafe { libc::flistxattr(file.as_raw_fd(), ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(size != 0)
+}
+
+fn create_seed_directory_path(
+    workspace: &Dir,
+    upper: &Path,
+    relative: &Path,
+) -> Result<(), std::io::Error> {
+    let mut current = PathBuf::new();
+    for component in relative.components() {
+        current.push(component);
+        let destination = upper.join(&current);
+        if !destination.exists() {
+            fs::create_dir(&destination)?;
+            let source = workspace.symlink_metadata(&current)?;
+            fs::set_permissions(
+                &destination,
+                fs::Permissions::from_mode(cap_std::fs::PermissionsExt::mode(
+                    &source.permissions(),
+                )),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl Drop for WorkspaceTransaction {
+    fn drop(&mut self) {
+        make_tree_owner_accessible(&self.root);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -1098,6 +1284,8 @@ struct ChildContext {
     network: SandboxNetworkMode,
     protected_paths: Vec<ProtectedPath>,
     runtime_read_paths: Vec<PathBuf>,
+    overlay_upper: Option<PathBuf>,
+    overlay_work: Option<PathBuf>,
 }
 
 fn run_prepared_command(
@@ -1106,6 +1294,14 @@ fn run_prepared_command(
     cancellation: &CancellationToken,
 ) -> CommandResult {
     let started = Instant::now();
+    let overlay_upper = prepared
+        .transaction
+        .as_ref()
+        .map(|transaction| transaction.upper.clone());
+    let overlay_work = prepared
+        .transaction
+        .as_ref()
+        .map(|transaction| transaction.work.clone());
     let Some((stdout_read, stdout_write)) = pipe_cloexec() else {
         return LinuxSandboxError::Unavailable.into_result(command_id);
     };
@@ -1196,6 +1392,8 @@ fn run_prepared_command(
         network: prepared.network.clone(),
         protected_paths: prepared.protected_paths.clone(),
         runtime_read_paths: prepared.runtime_read_paths.clone(),
+        overlay_upper,
+        overlay_work,
     });
     let mut context = context;
     let mut stack = vec![0u8; 1024 * 1024];
@@ -1267,13 +1465,17 @@ fn run_prepared_command(
         stderr: stderr_thread.join().unwrap_or_default(),
     };
     let child_setup = read_child_setup_status(status_read);
-    let (mutation, summary) = observed_workspace_change(&prepared.before, &prepared.workspace);
     if let Some(kind) = child_setup {
-        let error = if kind == CHILD_SETUP_CAPABILITY {
-            LinuxSandboxError::CapabilityNotSupported(LinuxCapability::Landlock)
-        } else {
-            LinuxSandboxError::Unavailable
+        let error = match kind {
+            CHILD_SETUP_CAPABILITY => {
+                LinuxSandboxError::CapabilityNotSupported(LinuxCapability::Landlock)
+            }
+            CHILD_SETUP_OVERLAY_FILESYSTEM => {
+                LinuxSandboxError::CapabilityNotSupported(LinuxCapability::OverlayFilesystem)
+            }
+            _ => LinuxSandboxError::Unavailable,
         };
+        let (mutation, summary) = observed_workspace_change(&prepared.before, &prepared.workspace);
         let result = error
             .into_result(command_id)
             .with_workspace_mutation(mutation);
@@ -1282,6 +1484,34 @@ fn run_prepared_command(
             None => result,
         };
     }
+    if interrupted == InterruptKind::None
+        && let Some(transaction) = prepared.transaction.as_ref()
+    {
+        let Some(before) = prepared.before.as_ref() else {
+            return LinuxSandboxError::WorkspaceObservationUnavailable.into_result(command_id);
+        };
+        if overlay_contains_protected_change(&transaction.upper) {
+            return CommandResult::policy_denied(command_id, WORKSPACE_TRANSACTION_DENIED)
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Strict);
+        }
+        if let Err(error) =
+            commit_workspace_transaction(&prepared.workspace, before, &transaction.upper)
+        {
+            return match error {
+                WorkspaceTransactionError::PolicyDenied => {
+                    CommandResult::policy_denied(command_id, WORKSPACE_TRANSACTION_DENIED)
+                        .with_workspace_mutation(WorkspaceMutation::Unknown)
+                        .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Strict)
+                }
+                WorkspaceTransactionError::CapabilityNotSupported => {
+                    LinuxSandboxError::CapabilityNotSupported(LinuxCapability::WorkspaceTransaction)
+                        .into_result(command_id)
+                }
+            };
+        }
+    }
+    let (mutation, summary) = observed_workspace_change(&prepared.before, &prepared.workspace);
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     let mut result = if interrupted == InterruptKind::Cancelled {
         interrupted_result(
@@ -1319,6 +1549,771 @@ fn run_prepared_command(
     match summary {
         Some(summary) => result.with_workspace_change_summary(summary),
         None => result,
+    }
+}
+
+fn overlay_contains_protected_change(upper: &Path) -> bool {
+    fn visit(directory: &Path, relative_parent: &Path) -> Result<bool, ()> {
+        let entries = fs::read_dir(directory)
+            .map_err(|_| ())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ())?;
+        for entry in entries {
+            let name = entry.file_name();
+            let relative = relative_parent.join(&name);
+            let name_text = name.to_str().ok_or(())?;
+            let relative_text = relative.to_str().ok_or(())?;
+            if is_protected_path(name_text) || is_protected_path(relative_text) {
+                return Ok(true);
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| ())?;
+            if metadata.is_dir() && visit(&entry.path(), &relative)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    visit(upper, Path::new("")).unwrap_or(true)
+}
+
+const MAX_TRANSACTION_ENTRIES: usize = 100_000;
+const MAX_TRANSACTION_DEPTH: usize = 256;
+
+#[derive(Debug, Clone)]
+/// A fully validated mutation to apply to the real workspace.
+enum WorkspaceOperation {
+    Delete(PathBuf),
+    Replace(PathBuf),
+    SetMetadata {
+        relative: PathBuf,
+        mode: u32,
+        access: cap_std::time::SystemTime,
+        modified: cap_std::time::SystemTime,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceTransactionError {
+    PolicyDenied,
+    CapabilityNotSupported,
+}
+
+/// Same-filesystem staging and backup directories used by the commit phase.
+struct CommitArea {
+    root: PathBuf,
+    stage: PathBuf,
+    backup: PathBuf,
+}
+
+/// Pinned directory identity and timestamps restored after entry-level renames.
+struct DirectoryTimes {
+    directory: Dir,
+    access: cap_std::time::SystemTime,
+    modified: cap_std::time::SystemTime,
+}
+
+/// Capability handles and rollback state retained until post-commit verification succeeds.
+struct AppliedWorkspaceOperations {
+    workspace_directory: Dir,
+    stage_directory: Dir,
+    backup_directory: Dir,
+    moved: Vec<PathBuf>,
+    installed: Vec<PathBuf>,
+    metadata: Vec<DirectoryMetadata>,
+    directory_times: Vec<DirectoryTimes>,
+}
+
+/// Original metadata retained so rollback restores an existing directory exactly.
+struct DirectoryMetadata {
+    relative: PathBuf,
+    mode: u32,
+    access: cap_std::time::SystemTime,
+    modified: cap_std::time::SystemTime,
+}
+
+impl CommitArea {
+    fn new(workspace: &Path) -> Result<Self, WorkspaceTransactionError> {
+        let parent = workspace
+            .parent()
+            .ok_or(WorkspaceTransactionError::CapabilityNotSupported)?;
+        for _ in 0..64 {
+            let sequence = TRANSACTION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = parent.join(format!(
+                ".singularity-workspace-commit-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => {
+                    let stage = root.join("stage");
+                    let backup = root.join("backup");
+                    if fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                        .and_then(|_| fs::create_dir(&stage))
+                        .and_then(|_| fs::create_dir(&backup))
+                        .is_err()
+                    {
+                        make_tree_owner_accessible(&root);
+                        let _ = fs::remove_dir_all(&root);
+                        return Err(WorkspaceTransactionError::CapabilityNotSupported);
+                    }
+                    return Ok(Self {
+                        root,
+                        stage,
+                        backup,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(WorkspaceTransactionError::CapabilityNotSupported),
+            }
+        }
+        Err(WorkspaceTransactionError::CapabilityNotSupported)
+    }
+}
+
+impl Drop for CommitArea {
+    fn drop(&mut self) {
+        make_tree_owner_accessible(&self.root);
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Validate the complete upper representation, detect drift, and atomically install each change.
+fn commit_workspace_transaction(
+    workspace: &Path,
+    before: &WorkspaceSnapshot,
+    upper: &Path,
+) -> Result<(), WorkspaceTransactionError> {
+    let area = CommitArea::new(workspace)?;
+    let mut operations = Vec::new();
+    let mut visited = 0usize;
+    let mut staged_links = BTreeMap::new();
+    plan_overlay_directory(
+        workspace,
+        upper,
+        Path::new(""),
+        &area.stage,
+        0,
+        &mut visited,
+        &mut operations,
+        &mut staged_links,
+    )?;
+    let current = snapshot_workspace(workspace)
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    if &current != before {
+        return Err(WorkspaceTransactionError::PolicyDenied);
+    }
+    let applied = apply_workspace_operations(workspace, &area, &operations)?;
+    snapshot_workspace(workspace)
+        .and_then(|after| before.change_summary(&after))
+        .map_err(|_| {
+            rollback_partial(
+                &applied.workspace_directory,
+                &applied.stage_directory,
+                &applied.backup_directory,
+                &applied.moved,
+                &applied.installed,
+                &applied.metadata,
+                &applied.directory_times,
+            );
+            WorkspaceTransactionError::CapabilityNotSupported
+        })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Convert OverlayFS upper entries into a bounded, no-follow commit plan.
+fn plan_overlay_directory(
+    workspace: &Path,
+    upper_directory: &Path,
+    relative_parent: &Path,
+    stage: &Path,
+    depth: usize,
+    visited: &mut usize,
+    operations: &mut Vec<WorkspaceOperation>,
+    staged_links: &mut BTreeMap<(u64, u64), PathBuf>,
+) -> Result<(), WorkspaceTransactionError> {
+    if depth > MAX_TRANSACTION_DEPTH || has_extended_attributes(upper_directory)? {
+        return Err(WorkspaceTransactionError::PolicyDenied);
+    }
+    let mut entries = fs::read_dir(upper_directory)
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        *visited = visited.saturating_add(1);
+        if *visited > MAX_TRANSACTION_ENTRIES {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        let name = entry.file_name();
+        let relative = relative_parent.join(&name);
+        let name_text = name
+            .to_str()
+            .ok_or(WorkspaceTransactionError::PolicyDenied)?;
+        let relative_text = relative
+            .to_str()
+            .ok_or(WorkspaceTransactionError::PolicyDenied)?;
+        if is_protected_path(name_text) || is_protected_path(relative_text) {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        let source = entry.path();
+        let metadata = fs::symlink_metadata(&source)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        let file_type = metadata.file_type();
+        if file_type.is_char_device() && metadata.rdev() == 0 {
+            operations.push(WorkspaceOperation::Delete(relative));
+            continue;
+        }
+        if has_extended_attributes(&source)? {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        if file_type.is_dir() {
+            let destination_metadata = fs::symlink_metadata(workspace.join(&relative)).ok();
+            if destination_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                plan_overlay_directory(
+                    workspace,
+                    &source,
+                    &relative,
+                    stage,
+                    depth + 1,
+                    visited,
+                    operations,
+                    staged_links,
+                )?;
+                let desired_mode = metadata.permissions().mode();
+                let desired_access = metadata
+                    .accessed()
+                    .map(cap_std::time::SystemTime::from_std)
+                    .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+                let desired_modified = metadata
+                    .modified()
+                    .map(cap_std::time::SystemTime::from_std)
+                    .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+                if destination_metadata.as_ref().is_some_and(|destination| {
+                    destination.permissions().mode() != desired_mode
+                        || destination.modified().ok() != Some(desired_modified.into_std())
+                }) {
+                    operations.push(WorkspaceOperation::SetMetadata {
+                        relative,
+                        mode: desired_mode,
+                        access: desired_access,
+                        modified: desired_modified,
+                    });
+                }
+            } else {
+                copy_upper_tree(
+                    &source,
+                    &stage.join(&relative),
+                    depth + 1,
+                    visited,
+                    staged_links,
+                )?;
+                operations.push(WorkspaceOperation::Replace(relative));
+            }
+            continue;
+        }
+        if file_type.is_file() || file_type.is_symlink() {
+            let destination = workspace.join(&relative);
+            if upper_object_matches_workspace(&source, &destination, &metadata)? {
+                continue;
+            }
+            copy_upper_object(&source, &stage.join(&relative), &metadata, staged_links)?;
+            operations.push(WorkspaceOperation::Replace(relative));
+            continue;
+        }
+        return Err(WorkspaceTransactionError::PolicyDenied);
+    }
+    Ok(())
+}
+
+fn copy_upper_tree(
+    source: &Path,
+    destination: &Path,
+    depth: usize,
+    visited: &mut usize,
+    staged_links: &mut BTreeMap<(u64, u64), PathBuf>,
+) -> Result<(), WorkspaceTransactionError> {
+    if depth > MAX_TRANSACTION_DEPTH || has_extended_attributes(source)? {
+        return Err(WorkspaceTransactionError::PolicyDenied);
+    }
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    }
+    fs::create_dir(destination).map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let mut entries = fs::read_dir(source)
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        *visited = visited.saturating_add(1);
+        if *visited > MAX_TRANSACTION_ENTRIES {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        let name = entry.file_name();
+        let name_text = name
+            .to_str()
+            .ok_or(WorkspaceTransactionError::PolicyDenied)?;
+        if is_protected_path(name_text) {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        let source = entry.path();
+        let destination = destination.join(&name);
+        let child_metadata = fs::symlink_metadata(&source)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        if has_extended_attributes(&source)? {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        let file_type = child_metadata.file_type();
+        if file_type.is_char_device() && child_metadata.rdev() == 0 {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        if file_type.is_dir() {
+            copy_upper_tree(&source, &destination, depth + 1, visited, staged_links)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            copy_upper_object(&source, &destination, &child_metadata, staged_links)?;
+        } else {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+    }
+    fs::set_permissions(
+        destination,
+        fs::Permissions::from_mode(metadata.permissions().mode()),
+    )
+    .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    copy_object_times(destination, &metadata, false)
+}
+
+fn copy_upper_object(
+    source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+    staged_links: &mut BTreeMap<(u64, u64), PathBuf>,
+) -> Result<(), WorkspaceTransactionError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    }
+    if metadata.file_type().is_symlink() {
+        let target =
+            fs::read_link(source).map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        std::os::unix::fs::symlink(target, destination)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        copy_object_times(destination, metadata, true)
+    } else {
+        let identity = (metadata.dev(), metadata.ino());
+        if metadata.nlink() > 1
+            && let Some(first) = staged_links.get(&identity)
+        {
+            fs::hard_link(first, destination)
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        } else {
+            fs::copy(source, destination)
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+            if metadata.nlink() > 1 {
+                staged_links.insert(identity, destination.to_path_buf());
+            }
+        }
+        fs::set_permissions(
+            destination,
+            fs::Permissions::from_mode(metadata.permissions().mode()),
+        )
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        copy_object_times(destination, metadata, false)
+    }
+}
+
+fn copy_object_times(
+    destination: &Path,
+    metadata: &fs::Metadata,
+    symlink: bool,
+) -> Result<(), WorkspaceTransactionError> {
+    let parent = destination
+        .parent()
+        .ok_or(WorkspaceTransactionError::CapabilityNotSupported)?;
+    let name = destination
+        .file_name()
+        .ok_or(WorkspaceTransactionError::CapabilityNotSupported)?;
+    let directory = Dir::open_ambient_dir(parent, ambient_authority())
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let access = metadata
+        .accessed()
+        .map(cap_std::time::SystemTime::from_std)
+        .map(cap_fs_ext::SystemTimeSpec::Absolute)
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let modified = metadata
+        .modified()
+        .map(cap_std::time::SystemTime::from_std)
+        .map(cap_fs_ext::SystemTimeSpec::Absolute)
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let result = if symlink {
+        directory.set_symlink_times(name, Some(access), Some(modified))
+    } else {
+        directory.set_times(name, Some(access), Some(modified))
+    };
+    result.map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)
+}
+
+fn upper_object_matches_workspace(
+    upper: &Path,
+    workspace: &Path,
+    upper_metadata: &fs::Metadata,
+) -> Result<bool, WorkspaceTransactionError> {
+    let Ok(workspace_metadata) = fs::symlink_metadata(workspace) else {
+        return Ok(false);
+    };
+    if upper_metadata.file_type().is_symlink() != workspace_metadata.file_type().is_symlink()
+        || upper_metadata.is_file() != workspace_metadata.is_file()
+        || upper_metadata.permissions().mode() != workspace_metadata.permissions().mode()
+        || upper_metadata.len() != workspace_metadata.len()
+        || upper_metadata.modified().ok() != workspace_metadata.modified().ok()
+    {
+        return Ok(false);
+    }
+    if upper_metadata.file_type().is_symlink() {
+        return Ok(fs::read_link(upper)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?
+            == fs::read_link(workspace)
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?);
+    }
+    if !upper_metadata.is_file() {
+        return Ok(false);
+    }
+    let mut upper_file =
+        File::open(upper).map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let mut workspace_file =
+        File::open(workspace).map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let mut upper_buffer = [0u8; 64 * 1024];
+    let mut workspace_buffer = [0u8; 64 * 1024];
+    loop {
+        let upper_read = upper_file
+            .read(&mut upper_buffer)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        let workspace_read = workspace_file
+            .read(&mut workspace_buffer)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        if upper_read != workspace_read
+            || upper_buffer[..upper_read] != workspace_buffer[..workspace_read]
+        {
+            return Ok(false);
+        }
+        if upper_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn has_extended_attributes(path: &Path) -> Result<bool, WorkspaceTransactionError> {
+    let path = path_cstring(path).map_err(|_| WorkspaceTransactionError::PolicyDenied)?;
+    let size = unsafe { libc::llistxattr(path.as_ptr(), ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(WorkspaceTransactionError::CapabilityNotSupported);
+    }
+    Ok(size != 0)
+}
+
+/// Apply a validated plan through capability-relative renames with reversible backups.
+fn apply_workspace_operations(
+    workspace: &Path,
+    area: &CommitArea,
+    operations: &[WorkspaceOperation],
+) -> Result<AppliedWorkspaceOperations, WorkspaceTransactionError> {
+    let workspace_directory = Dir::open_ambient_dir(workspace, ambient_authority())
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let stage_directory = Dir::open_ambient_dir(&area.stage, ambient_authority())
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let backup_directory = Dir::open_ambient_dir(&area.backup, ambient_authority())
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let directory_times = capture_parent_directory_times(workspace, operations)?;
+    let mut moved = Vec::new();
+    let mut installed = Vec::new();
+    let mut changed_metadata = Vec::new();
+    for operation in operations {
+        let relative = match operation {
+            WorkspaceOperation::Delete(relative) | WorkspaceOperation::Replace(relative) => {
+                relative
+            }
+            WorkspaceOperation::SetMetadata { .. } => continue,
+        };
+        match workspace_directory.symlink_metadata(relative) {
+            Ok(_) => {
+                if let Some(parent) = relative.parent()
+                    && !parent.as_os_str().is_empty()
+                    && backup_directory.create_dir_all(parent).is_err()
+                {
+                    rollback_partial(
+                        &workspace_directory,
+                        &stage_directory,
+                        &backup_directory,
+                        &moved,
+                        &installed,
+                        &changed_metadata,
+                        &directory_times,
+                    );
+                    return Err(WorkspaceTransactionError::CapabilityNotSupported);
+                }
+                if workspace_directory
+                    .rename(relative, &backup_directory, relative)
+                    .is_err()
+                {
+                    rollback_partial(
+                        &workspace_directory,
+                        &stage_directory,
+                        &backup_directory,
+                        &moved,
+                        &installed,
+                        &changed_metadata,
+                        &directory_times,
+                    );
+                    return Err(WorkspaceTransactionError::CapabilityNotSupported);
+                }
+                moved.push(relative.clone());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                rollback_partial(
+                    &workspace_directory,
+                    &stage_directory,
+                    &backup_directory,
+                    &moved,
+                    &installed,
+                    &changed_metadata,
+                    &directory_times,
+                );
+                return Err(WorkspaceTransactionError::CapabilityNotSupported);
+            }
+        }
+    }
+    for operation in operations {
+        match operation {
+            WorkspaceOperation::Replace(relative) => {
+                let Some(parent) = relative.parent() else {
+                    rollback_partial(
+                        &workspace_directory,
+                        &stage_directory,
+                        &backup_directory,
+                        &moved,
+                        &installed,
+                        &changed_metadata,
+                        &directory_times,
+                    );
+                    return Err(WorkspaceTransactionError::CapabilityNotSupported);
+                };
+                if !parent.as_os_str().is_empty()
+                    && workspace_directory
+                        .open_dir(parent)
+                        .and_then(|directory| directory.dir_metadata())
+                        .is_err()
+                {
+                    rollback_partial(
+                        &workspace_directory,
+                        &stage_directory,
+                        &backup_directory,
+                        &moved,
+                        &installed,
+                        &changed_metadata,
+                        &directory_times,
+                    );
+                    return Err(WorkspaceTransactionError::CapabilityNotSupported);
+                }
+                if stage_directory
+                    .rename(relative, &workspace_directory, relative)
+                    .is_err()
+                {
+                    rollback_partial(
+                        &workspace_directory,
+                        &stage_directory,
+                        &backup_directory,
+                        &moved,
+                        &installed,
+                        &changed_metadata,
+                        &directory_times,
+                    );
+                    return Err(WorkspaceTransactionError::CapabilityNotSupported);
+                }
+                installed.push(relative.clone());
+            }
+            WorkspaceOperation::SetMetadata { .. } => {}
+            WorkspaceOperation::Delete(_) => {}
+        }
+    }
+    restore_directory_times(&directory_times);
+    for operation in operations {
+        let WorkspaceOperation::SetMetadata {
+            relative,
+            mode,
+            access,
+            modified,
+        } = operation
+        else {
+            continue;
+        };
+        let old_metadata =
+            match workspace_directory
+                .symlink_metadata(relative)
+                .and_then(|metadata| {
+                    Ok(DirectoryMetadata {
+                        relative: relative.clone(),
+                        mode: cap_std::fs::PermissionsExt::mode(&metadata.permissions()),
+                        access: metadata.accessed()?,
+                        modified: metadata.modified()?,
+                    })
+                }) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    rollback_partial(
+                        &workspace_directory,
+                        &stage_directory,
+                        &backup_directory,
+                        &moved,
+                        &installed,
+                        &changed_metadata,
+                        &directory_times,
+                    );
+                    return Err(WorkspaceTransactionError::CapabilityNotSupported);
+                }
+            };
+        changed_metadata.push(old_metadata);
+        let permissions = cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(*mode));
+        if workspace_directory
+            .set_permissions(relative, permissions)
+            .and_then(|_| {
+                workspace_directory.set_times(
+                    relative,
+                    Some(cap_fs_ext::SystemTimeSpec::Absolute(*access)),
+                    Some(cap_fs_ext::SystemTimeSpec::Absolute(*modified)),
+                )
+            })
+            .is_err()
+        {
+            rollback_partial(
+                &workspace_directory,
+                &stage_directory,
+                &backup_directory,
+                &moved,
+                &installed,
+                &changed_metadata,
+                &directory_times,
+            );
+            return Err(WorkspaceTransactionError::CapabilityNotSupported);
+        }
+    }
+    Ok(AppliedWorkspaceOperations {
+        workspace_directory,
+        stage_directory,
+        backup_directory,
+        moved,
+        installed,
+        metadata: changed_metadata,
+        directory_times,
+    })
+}
+
+fn rollback_partial(
+    workspace_directory: &Dir,
+    stage_directory: &Dir,
+    backup_directory: &Dir,
+    moved: &[PathBuf],
+    installed: &[PathBuf],
+    metadata: &[DirectoryMetadata],
+    directory_times: &[DirectoryTimes],
+) {
+    for entry in metadata.iter().rev() {
+        let permissions =
+            cap_std::fs::Permissions::from_std(fs::Permissions::from_mode(entry.mode));
+        let _ = workspace_directory
+            .set_permissions(&entry.relative, permissions)
+            .and_then(|_| {
+                workspace_directory.set_times(
+                    &entry.relative,
+                    Some(cap_fs_ext::SystemTimeSpec::Absolute(entry.access)),
+                    Some(cap_fs_ext::SystemTimeSpec::Absolute(entry.modified)),
+                )
+            });
+    }
+    for relative in installed.iter().rev() {
+        if let Some(parent) = relative.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = stage_directory.create_dir_all(parent);
+        }
+        let _ = workspace_directory.rename(relative, stage_directory, relative);
+    }
+    for relative in moved.iter().rev() {
+        let _ = backup_directory.rename(relative, workspace_directory, relative);
+    }
+    restore_directory_times(directory_times);
+}
+
+fn capture_parent_directory_times(
+    workspace: &Path,
+    operations: &[WorkspaceOperation],
+) -> Result<Vec<DirectoryTimes>, WorkspaceTransactionError> {
+    let workspace_directory = Dir::open_ambient_dir(workspace, ambient_authority())
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let mut paths = operations
+        .iter()
+        .filter_map(|operation| match operation {
+            WorkspaceOperation::Delete(relative) | WorkspaceOperation::Replace(relative) => {
+                relative.parent().map(Path::to_path_buf)
+            }
+            WorkspaceOperation::SetMetadata { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|path| {
+            let directory = if path.as_os_str().is_empty() {
+                workspace_directory.try_clone()
+            } else {
+                workspace_directory.open_dir(&path)
+            }
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+            let metadata = directory
+                .dir_metadata()
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+            Ok(DirectoryTimes {
+                directory,
+                access: metadata
+                    .accessed()
+                    .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
+                modified: metadata
+                    .modified()
+                    .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
+            })
+        })
+        .collect()
+}
+
+fn restore_directory_times(times: &[DirectoryTimes]) {
+    for entry in times {
+        let _ = entry.directory.set_times(
+            ".",
+            Some(cap_fs_ext::SystemTimeSpec::Absolute(entry.access)),
+            Some(cap_fs_ext::SystemTimeSpec::Absolute(entry.modified)),
+        );
+    }
+}
+
+fn make_tree_owner_accessible(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_tree_owner_accessible(&entry.path());
+            }
+        }
     }
 }
 
@@ -1550,6 +2545,9 @@ unsafe fn child_main_inner(context: &mut ChildContext) -> Result<(), u8> {
     mount_private_root().map_err(|_| CHILD_SETUP_CAPABILITY)?;
     mount_proc().map_err(|_| CHILD_SETUP_CAPABILITY)?;
     mount_private_tmp_and_dev().map_err(|_| CHILD_SETUP_CAPABILITY)?;
+    if context.filesystem == SandboxFilesystemMode::WorkspaceWrite {
+        mount_workspace_overlay(context).map_err(|_| CHILD_SETUP_OVERLAY_FILESYSTEM)?;
+    }
     mount_protected_paths(&context.protected_paths).map_err(|_| CHILD_SETUP_CAPABILITY)?;
     if context.filesystem == SandboxFilesystemMode::ReadOnly {
         mount_readonly_workspace(&context.workspace).map_err(|_| CHILD_SETUP_CAPABILITY)?;
@@ -1587,6 +2585,36 @@ unsafe fn child_main_inner(context: &mut ChildContext) -> Result<(), u8> {
         libc::execve(executable.as_ptr(), argv.as_ptr(), env.as_ptr());
     }
     Err(CHILD_SETUP_UNAVAILABLE)
+}
+
+fn mount_workspace_overlay(context: &ChildContext) -> Result<(), ()> {
+    let upper = context.overlay_upper.as_deref().ok_or(())?;
+    let work = context.overlay_work.as_deref().ok_or(())?;
+    let options = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        overlay_option_path(&context.workspace)?,
+        overlay_option_path(upper)?,
+        overlay_option_path(work)?,
+    );
+    mount(
+        Some("overlay"),
+        &context.workspace,
+        Some("overlay"),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some(&options),
+    )
+}
+
+fn overlay_option_path(path: &Path) -> Result<String, ()> {
+    let value = path.to_str().ok_or(())?;
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | ',' | ':') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    Ok(escaped)
 }
 
 fn wait_for_namespace_map(fd: RawFd) -> bool {
