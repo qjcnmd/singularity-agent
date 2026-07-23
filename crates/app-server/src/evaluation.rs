@@ -3078,7 +3078,7 @@ fn run_sandbox_preflight(
     cancellation: &CancellationToken,
 ) -> Result<SandboxPreflightReport, Box<SandboxPreflightFailure>> {
     if plans.is_empty() {
-        let mut report = sandbox_backend.preflight(run_dir, cancellation);
+        let mut report = SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
         report.outcome = SandboxPreflightOutcome::Unsupported;
         report.error_code = Some("sandbox_preflight_empty_task_set".to_string());
         report.missing_capabilities.push("task_set".to_string());
@@ -3091,7 +3091,7 @@ fn run_sandbox_preflight(
         }));
     }
     if cancellation.is_cancelled() {
-        let mut report = sandbox_backend.preflight(run_dir, cancellation);
+        let mut report = SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
         report.outcome = SandboxPreflightOutcome::Unsupported;
         report.error_code = Some("sandbox_preflight_cancelled".to_string());
         report.missing_capabilities.push("cancellation".to_string());
@@ -3108,7 +3108,7 @@ fn run_sandbox_preflight(
     // touching any task source or starting a provider trial.
     let scratch = run_dir.join(".sandbox-preflight");
     if let Err(error) = fs::create_dir_all(&scratch) {
-        let mut report = sandbox_backend.preflight(run_dir, cancellation);
+        let mut report = SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
         report.outcome = SandboxPreflightOutcome::Unsupported;
         report.error_code = Some("sandbox_preflight_scratch_unavailable".to_string());
         report

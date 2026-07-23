@@ -705,6 +705,11 @@ impl SandboxPreflightReport {
         }
     }
 
+    /// Describe the selected backend without executing any workspace probe.
+    pub fn unverified_for_backend(backend: &(impl SandboxBackend + ?Sized)) -> Self {
+        Self::from_capabilities(backend)
+    }
+
     pub(crate) fn unsupported(&mut self, code: &'static str, missing: &[&str]) {
         self.outcome = SandboxPreflightOutcome::Unsupported;
         self.error_code = Some(code.to_string());
