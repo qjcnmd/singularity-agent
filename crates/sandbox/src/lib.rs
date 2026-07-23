@@ -973,6 +973,7 @@ pub(crate) fn preflight_write_verified(
             })
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn preflight_unchanged_verified(result: &CommandResult) -> bool {
     result.execution_status == CommandExecutionStatus::Completed
         && result.semantic_status == CommandSemanticStatus::Succeeded
