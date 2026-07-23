@@ -2724,6 +2724,60 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
 }
 
 #[test]
+fn approval_checkpoint_roundtrips_after_visible_batch_approval_rejection() {
+    let mut mixed_batch = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    mixed_batch.tool_calls.push(plan_tool_call(
+        "plan_1",
+        serde_json::json!([{"step": "edit the file", "status": "in_progress"}]),
+    ));
+    mixed_batch.tool_calls.push(tool_call(
+        "batched_edit",
+        "edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut single_edit = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    single_edit.tool_calls.push(tool_call(
+        "pending_edit",
+        "edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+
+    let result = agent_loop_with_plan_capabilities(
+        vec![mixed_batch, single_edit],
+        PolicyEngine::new(PermissionProfile::workspace_write()),
+        Arc::new(Mutex::new(Vec::new())),
+        ProviderProtocolContract {
+            supports_parallel_tool_calls: true,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "edit the file"));
+
+    assert_eq!(result.status, AgentStatus::Blocked);
+    assert!(
+        result.tool_results.iter().any(|tool_result| {
+            tool_result.tool_call_id == "batched_edit"
+                && tool_result.failure_kind == Some(ToolFailureKind::Approval)
+                && tool_result.error_code.as_deref() == Some("approval_required")
+        }),
+        "{:?}",
+        result.tool_results
+    );
+    let pending = pending_approval(&result);
+    let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
+    PendingApprovalOccurrence::from_checkpoint_payload(pending.request().clone(), &checkpoint)
+        .expect("visible batch rejection must remain resumable");
+}
+
+#[test]
 fn pending_approval_occurrences_keep_request_tool_checkpoint_order() {
     let response = |call_id: &str, path: &str| {
         let mut response = ModelTurnResponse::completed(

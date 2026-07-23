@@ -497,9 +497,7 @@ impl ToolResultOccurrence {
         workspace_change_summary: Option<WorkspaceChangeSummary>,
     ) -> Result<Self, String> {
         result.result_id = result_id;
-        if result.failure_kind == Some(ToolFailureKind::Approval)
-            && visibility != ToolResultVisibility::Hidden
-        {
+        if result.failure_kind == Some(ToolFailureKind::Approval) && result.ok {
             return Err("approval checkpoint hidden tool result binding is invalid".to_string());
         }
         let reconstructable = result.reconstruct_context_token_count();
