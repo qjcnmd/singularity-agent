@@ -235,6 +235,10 @@ impl CompletionTracker {
         self.unresolved_failures.is_empty() && self.verification_satisfied()
     }
 
+    pub(super) fn has_unresolved_failures(&self) -> bool {
+        !self.unresolved_failures.is_empty()
+    }
+
     pub(super) fn rejection_reason(&self) -> String {
         if !self.unresolved_failures.is_empty() {
             return format!(

@@ -2026,7 +2026,12 @@ fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() 
                 |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
             ))
     );
-    let tool_message = requests[1].messages.last().expect("tool error message");
+    let tool_message = requests[1]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ModelRole::Tool)
+        .expect("tool error message");
     assert_eq!(tool_message.role, ModelRole::Tool);
     assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_1"));
     let payload: serde_json::Value =
@@ -3988,7 +3993,7 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
         result.tool_results[0].failure_kind,
         Some(singularity_tools::ToolFailureKind::Policy)
     );
-    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
     assert!(requests[1].messages.iter().any(|message| {
@@ -4482,7 +4487,12 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
-    let feedback = requests[1].messages.last().expect("tool feedback");
+    let feedback = requests[1]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ModelRole::Tool)
+        .expect("tool feedback");
     assert_eq!(feedback.role, ModelRole::Tool);
     let payload: serde_json::Value =
         serde_json::from_str(&feedback.content).expect("structured tool payload");
@@ -4573,7 +4583,12 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::Auto);
-    let feedback = requests[1].messages.last().expect("tool feedback");
+    let feedback = requests[1]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ModelRole::Tool)
+        .expect("tool feedback");
     assert_eq!(feedback.role, ModelRole::Tool);
     let payload: serde_json::Value =
         serde_json::from_str(&feedback.content).expect("structured tool payload");
@@ -5112,7 +5127,12 @@ fn agent_loop_returns_command_nonzero_to_model_for_repair() {
     assert_eq!(result.final_answer.as_deref(), Some("handled failure"));
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
-    let tool_message = requests[1].messages.last().expect("tool result message");
+    let tool_message = requests[1]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ModelRole::Tool)
+        .expect("tool result message");
     assert_eq!(tool_message.role, ModelRole::Tool);
     assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_1"));
     let payload: serde_json::Value =
@@ -5187,11 +5207,13 @@ fn agent_loop_returns_unavailable_executable_to_model_for_repair() {
     assert_eq!(result.final_answer.as_deref(), Some("recovered"));
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[1].messages.last().unwrap().role, ModelRole::Tool);
-    assert_eq!(
-        requests[1].messages.last().unwrap().tool_call_id.as_deref(),
-        Some("call_1")
-    );
+    let tool_message = requests[1]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == ModelRole::Tool)
+        .expect("tool result message");
+    assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_1"));
 }
 
 #[test]
@@ -8021,6 +8043,154 @@ fn final_review_repair_requires_mutation_replan_and_second_review() {
 }
 
 #[test]
+fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
+    let workspace = tempfile::tempdir().expect("repair context workspace");
+    let fixture_name = "repair_context.txt";
+    std::fs::write(workspace.path().join(fixture_name), "v0").expect("write repair fixture");
+    let command = test_command_script("failure");
+    let mut setup = ModelTurnResponse::completed("model_request_turn_context_0", "response_0", "");
+    setup.tool_calls.push(tool_call(
+        "setup_context",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "v0",
+            "replacement": "v1"
+        }),
+    ));
+    let mut plan = ModelTurnResponse::completed("model_request_turn_context_1", "response_1", "");
+    plan.tool_calls.push(tool_call(
+        "plan_context",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "verify the changed fixture", "status": "completed"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "changed repair_context.txt",
+                "affected_path": fixture_name,
+                "affected_symbol": "repair_context::value",
+                "current_gap": "verification evidence is not yet recorded",
+                "action": {
+                    "command": command,
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    let failed_command = |turn: u32| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_context_{turn}"),
+            format!("response_{turn}"),
+            "",
+        );
+        let call_id = format!("failed_context_{turn}");
+        response.tool_calls.push(tool_call(
+            &call_id,
+            "command",
+            serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+        ));
+        response
+    };
+    let mut unrelated_command =
+        ModelTurnResponse::completed("model_request_turn_context_3", "response_3", "");
+    unrelated_command.tool_calls.push(tool_call(
+        "unrelated_context",
+        "command",
+        serde_json::json!({
+            "command": test_command_script("unrelated"),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let mut read = ModelTurnResponse::completed("model_request_turn_context_5", "response_5", "");
+    read.tool_calls.push(tool_call(
+        "read_context",
+        "read",
+        serde_json::json!({"path": fixture_name}),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy()
+        .with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        )
+        .with_rule(
+            PermissionRule::new(
+                "ask_read",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Ask,
+            )
+            .for_operation(PermissionOperation::Read)
+            .for_resource(workspace_resource(fixture_name)),
+        );
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                setup,
+                plan,
+                failed_command(2),
+                unrelated_command,
+                failed_command(4),
+                read,
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind repair context workspace")
+            .with_sandbox_backend(AgentAlwaysFailBackend),
+    )
+    .run(
+        &AgentLoopInput::new("thread_context", "turn_context", "repair the fixture")
+            .with_max_turns(6),
+    );
+
+    assert_eq!(result.status, AgentStatus::Blocked, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+    let pending = pending_approval(&result);
+    let checkpoint = pending
+        .encode_checkpoint()
+        .expect("repair context checkpoint");
+    assert_eq!(checkpoint["repair_attempts"], 1);
+    assert_eq!(
+        checkpoint["repair_plan"]["plan"]["attempt"], 2,
+        "checkpoint={checkpoint}"
+    );
+    assert_eq!(
+        checkpoint["repair_plan"]["plan"]["reason"], "verification_failed",
+        "unrelated failures must not replace the active repair decision"
+    );
+    let requests = seen_requests.lock().expect("repair context requests");
+    assert!(requests.iter().any(|request| {
+        request.messages.iter().any(|message| {
+            message.role == ModelRole::Developer
+                && message.content.contains("repair_context=")
+                && message.content.contains("failed_requirement")
+                && message.content.contains("affected_path")
+                && message.content.contains("affected_symbol")
+                && message.content.contains("workspace_revision")
+                && message.content.contains("previous_action")
+                && message.content.contains("previous_result")
+                && message.content.contains("different repair strategy")
+        })
+    }));
+    let serialized = serde_json::to_string(&result).expect("serialize repair context result");
+    assert!(!serialized.contains("raw_arguments"));
+}
+
+#[test]
 fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     let workspace = tempfile::tempdir().expect("repair budget workspace");
     let fixture_name = "repair_budget.txt";
@@ -8117,9 +8287,6 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
         edit_response(8, "v2", "v3"),
         plan_response(9),
         command_response(10),
-        edit_response(11, "v3", "v4"),
-        plan_response(12),
-        command_response(13),
     ];
     let policy = allow_read_execute_policy()
         .with_rule(
@@ -8174,7 +8341,7 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
         first_checkpoint["repair_attempts"], 2,
         "checkpoint={first_checkpoint}"
     );
-    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 2);
+    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 3);
     assert_eq!(
         first_checkpoint["recovery_metrics"]["repair_attempt_count"],
         2
@@ -8253,8 +8420,8 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
         &coordinated_reset,
     );
     assert_eq!(
-        coordinated_reset.expect_err("observed failures prevent a coordinated ledger reset"),
-        "approval checkpoint repair attempt ledger is below observed failures"
+        coordinated_reset.expect_err("unresolved failures require a coordinated repair state"),
+        "approval checkpoint repair state is missing for unresolved failure"
     );
 
     let first_resumed_input = input.clone().with_approval_grant(ApprovalGrant::allow(
@@ -8284,7 +8451,7 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
         .encode_checkpoint()
         .expect("second checkpoint");
     assert_eq!(second_checkpoint["repair_attempts"], 2);
-    assert_eq!(second_checkpoint["repair_plan"]["plan"]["attempt"], 2);
+    assert_eq!(second_checkpoint["repair_plan"]["plan"]["attempt"], 3);
 
     let second_resumed_input = first_resumed_input.with_approval_grant(ApprovalGrant::allow(
         second_pending.pending_tool_call().request_id.clone(),
@@ -8317,21 +8484,233 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
             .as_deref()
             .is_some_and(|error| error.contains("repair planning budget exhausted"))
     );
+    assert_eq!(exhausted.recovery_metrics.repair_attempt_count, 3);
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentLoopEvent::Observation(AgentObservation::RepairPlanning(repair))
+            if repair.attempt > 3
+    )));
     assert_eq!(
         std::fs::read_to_string(workspace.path().join(fixture_name)).unwrap(),
-        "v4"
+        "v3"
     );
-    assert_eq!(seen_requests.lock().expect("seen requests").len(), 14);
+    assert_eq!(seen_requests.lock().expect("seen requests").len(), 11);
     assert!(events.iter().any(|event| matches!(
         event,
         AgentLoopEvent::Observation(AgentObservation::RepairPlanning(repair))
             if repair.reason == AgentRepairReason::VerificationFailed
-                && repair.attempt == 4
+                && repair.attempt == 3
                 && matches!(repair.lifecycle, OccurrenceLifecycle::Finished {
                     status: RepairPlanningStatus::Exhausted,
                     ..
                 })
     )));
+    let requests = seen_requests.lock().expect("seen requests");
+    let repair_context = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .find(|message| {
+            message.role == ModelRole::Developer && message.content.contains("repair_context=")
+        })
+        .expect("mutation-bound repair context");
+    assert!(repair_context.content.contains(fixture_name));
+    assert!(repair_context.content.contains("diff_digest"));
+    assert!(
+        !repair_context
+            .content
+            .contains("\"previous_action\":\"command\"")
+    );
+}
+
+#[test]
+fn repair_cycle_requires_matching_scope_and_all_revision_checks() {
+    let workspace = tempfile::tempdir().expect("multi-check workspace");
+    let fixture_name = "repair_multi_check.txt";
+    std::fs::write(workspace.path().join(fixture_name), "v0").expect("write repair fixture");
+    let first_command = test_command_script("failure");
+    let second_command = test_command_script("success_a");
+    let third_command = test_command_script("success_b");
+
+    let edit_response = |turn: u32, expected: &str, replacement: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_multi_check_{turn}"),
+            format!("response_multi_{turn}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            &format!("edit_multi_{turn}"),
+            "edit",
+            serde_json::json!({
+                "path": fixture_name,
+                "expected": expected,
+                "replacement": replacement,
+            }),
+        ));
+        response
+    };
+    let plan_response = |turn: u32, first: &str, second: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_multi_check_{turn}"),
+            format!("response_multi_{turn}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            &format!("plan_multi_{turn}"),
+            "update_plan",
+            serde_json::json!({
+                "steps": [{"step": "repair and run both checks", "status": "completed"}],
+                "verification": [
+                    {
+                        "risk": "general_mutation",
+                        "evidence": format!("changed {fixture_name}"),
+                        "affected_path": fixture_name,
+                        "affected_symbol": "repair_multi_check::first",
+                        "current_gap": "command_exit_nonzero remains unresolved for the first check",
+                        "action": {
+                            "command": first,
+                            "cwd": ".",
+                            "timeout_seconds": 5,
+                            "sandbox_mode": "workspace_write",
+                            "network_access": "denied"
+                        },
+                        "required": 1
+                    },
+                    {
+                        "risk": "general_mutation",
+                        "evidence": format!("changed {fixture_name}"),
+                        "affected_path": fixture_name,
+                        "affected_symbol": "repair_multi_check::second",
+                        "current_gap": "command_exit_nonzero requires rerunning the second check",
+                        "action": {
+                            "command": second,
+                            "cwd": ".",
+                            "timeout_seconds": 5,
+                            "sandbox_mode": "workspace_write",
+                            "network_access": "denied"
+                        },
+                        "required": 1
+                    }
+                ]
+            }),
+        ));
+        response
+    };
+    let command_response = |turn: u32, command: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_multi_check_{turn}"),
+            format!("response_multi_{turn}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            &format!("command_multi_{turn}"),
+            "command",
+            serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+        ));
+        response
+    };
+    let mut read_response =
+        ModelTurnResponse::completed("model_request_turn_multi_check_6", "response_multi_6", "");
+    read_response.tool_calls.push(tool_call(
+        "read_multi",
+        "read",
+        serde_json::json!({"path": fixture_name}),
+    ));
+    let final_response = ModelTurnResponse::completed(
+        "model_request_turn_multi_check_8",
+        "response_multi_8",
+        "done",
+    );
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy()
+        .with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        )
+        .with_rule(
+            PermissionRule::new(
+                "ask_read",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Ask,
+            )
+            .for_operation(PermissionOperation::Read)
+            .for_resource(workspace_resource(fixture_name)),
+        );
+    let agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit_response(0, "v0", "v1"),
+                plan_response(1, &first_command, &third_command),
+                command_response(2, &first_command),
+                edit_response(3, "v1", "v2"),
+                plan_response(4, &second_command, &third_command),
+                command_response(5, &second_command),
+                read_response,
+                command_response(7, &third_command),
+                final_response,
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind multi-check workspace")
+            .with_sandbox_backend(AgentFailThenSucceedBackend {
+                calls: AtomicUsize::new(0),
+            }),
+    );
+    let input = AgentLoopInput::new(
+        "thread_multi_check",
+        "turn_multi_check",
+        "repair and run both checks",
+    )
+    .with_max_turns(9);
+
+    let first_blocked = agent_loop.run(&input);
+    assert_eq!(
+        first_blocked.status,
+        AgentStatus::Blocked,
+        "{first_blocked:?}"
+    );
+    let first_pending = pending_approval(&first_blocked);
+    let first_checkpoint = first_pending
+        .encode_checkpoint()
+        .expect("multi-check checkpoint");
+    assert_eq!(first_checkpoint["repair_attempts"], 1);
+    assert_eq!(
+        first_checkpoint["recovery_metrics"]["repair_attempt_count"],
+        1
+    );
+    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 2);
+    assert_eq!(
+        first_checkpoint["repair_plan"]["plan"]["required_revision"],
+        2
+    );
+    assert_eq!(first_blocked.verification.satisfied_command_count, 1);
+
+    let grant = ApprovalGrant::allow(
+        first_pending.pending_tool_call().request_id.clone(),
+        first_pending.pending_tool_call().tool_name.clone(),
+        first_pending.pending_tool_call().resources.clone(),
+    );
+    let restored = PendingApprovalOccurrence::from_checkpoint_payload(
+        first_pending.request().clone(),
+        &first_checkpoint,
+    )
+    .expect("restore multi-check checkpoint");
+    let result = agent_loop.resume_pending_approval(&input.with_approval_grant(grant), &restored);
+    assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 2);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join(fixture_name)).expect("read result"),
+        "v2"
+    );
 }
 
 #[test]
@@ -8744,7 +9123,7 @@ fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments()
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.recovery_metrics.invalid_tool_call_count, 2);
     assert_eq!(result.recovery_metrics.repeated_tool_call_count, 1);
-    assert_eq!(result.recovery_metrics.repair_attempt_count, 2);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     assert_eq!(result.recovery_metrics.completion_rejection_count, 0);
     let requests = seen_requests.lock().expect("seen requests");
     assert!(requests[2].messages.iter().any(|message| {

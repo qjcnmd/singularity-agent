@@ -117,9 +117,10 @@ const MAX_VERIFICATION_TEXT_CHARS: usize = 512;
 const MAX_VERIFICATION_COMMAND_CHARS: usize = 8_000;
 const MAX_VERIFICATION_TIMEOUT_SECONDS: u64 = 3_600;
 const MAX_REPAIR_PLAN_ATTEMPTS: u32 = 3;
+const MAX_REPAIR_CONTEXT_CHARS: usize = 512;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
-const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan: change the failing action, then rerun the revision-bound verification before final review. Do not claim success without new evidence.";
+const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan: choose a materially different repair strategy that addresses the failed requirement, then rerun the revision-bound verification before final review. Do not repeat the previous repair action or claim success without new evidence.";
 const REVIEW_REPAIR_SIGNATURE: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000017";
 const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call update_plan with all steps marked completed before providing the final answer.";
@@ -368,6 +369,7 @@ pub struct AgentRepairPlan {
     pub reason: AgentRepairReason,
     pub attempt: u32,
     pub max_attempts: u32,
+    /// Revision that must receive the current prospective plan's terminal verification command.
     pub required_revision: Option<WorkspaceRevision>,
     pub required_check_count: u32,
 }
@@ -1283,9 +1285,19 @@ impl AgentLoopState {
             feedback.push(self.completion.feedback());
         }
         if self.repair_plan.is_some() {
-            feedback.push(REPAIR_PLAN_INSTRUCTIONS.to_string());
+            feedback.push(self.repair_feedback());
         }
         feedback.join(" ")
+    }
+
+    fn repair_feedback(&self) -> String {
+        let Some(plan) = self.repair_plan.as_ref() else {
+            return REPAIR_PLAN_INSTRUCTIONS.to_string();
+        };
+        let reason = plan.plan.reason;
+        let context = self.build_repair_context(reason, None);
+        let context = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
+        format!("{REPAIR_PLAN_INSTRUCTIONS} repair_context={context}")
     }
 
     fn final_review_instruction(&self) -> String {
@@ -1395,29 +1407,271 @@ impl AgentLoopState {
         signature: impl Into<String>,
         failed_tool_name: Option<&str>,
     ) -> Result<AgentRepairPlan, AgentRepairPlan> {
+        let signature = signature.into();
+        // A failure observed after a real mutation may be the first point at which the repair
+        // episode exists.  Bind that already-observed revision so its terminal command can commit
+        // the first cycle without granting a second prospective attempt for the same evidence.
+        let required_revision = self
+            .completion
+            .workspace_mutated()
+            .then_some(self.completion.workspace_revision)
+            .flatten();
+        let required_check_count = self.completion.summary().required_command_count;
+        if let Some(active) = self.repair_plan.as_mut() {
+            if self.repair_attempts >= MAX_REPAIR_PLAN_ATTEMPTS
+                && active.plan.required_revision.is_none()
+            {
+                let exhausted = AgentRepairPlan {
+                    reason,
+                    attempt: MAX_REPAIR_PLAN_ATTEMPTS.saturating_add(1),
+                    max_attempts: MAX_REPAIR_PLAN_ATTEMPTS,
+                    required_revision,
+                    required_check_count,
+                };
+                active.plan = exhausted.clone();
+                active.signature = signature;
+                active.failed_tool_name = failed_tool_name.map(str::to_string);
+                return Err(exhausted);
+            }
+            // A repeated failure, read, invalid replan, or approval resume does not replace the
+            // repair decision that owns this episode and does not create another prospective
+            // attempt until a new mutation is observed. The latest bounded tool result remains
+            // available through `build_repair_context` without weakening the active reason.
+            let terminal_cycle_revision = active
+                .plan
+                .required_revision
+                .filter(|revision| Some(*revision) == self.completion.workspace_revision);
+            active.plan.required_revision = terminal_cycle_revision;
+            active.plan.required_check_count = required_check_count;
+            if active.plan.reason == AgentRepairReason::ToolFailure {
+                active.signature = signature;
+                active.failed_tool_name = failed_tool_name.map(str::to_string);
+            }
+            return Ok(active.plan.clone());
+        }
+
         let attempt = self.repair_attempts.saturating_add(1);
-        self.repair_attempts = attempt;
-        self.recovery_metrics.repair_attempt_count =
-            self.recovery_metrics.repair_attempt_count.saturating_add(1);
         let plan = AgentRepairPlan {
             reason,
             attempt,
             max_attempts: MAX_REPAIR_PLAN_ATTEMPTS,
-            required_revision: self
-                .verification_plan
-                .as_ref()
-                .and_then(|plan| plan.revision),
-            required_check_count: self.completion.summary().required_command_count,
+            required_revision,
+            required_check_count,
         };
-        if attempt > MAX_REPAIR_PLAN_ATTEMPTS {
-            return Err(plan);
-        }
+        let exhausted = attempt > MAX_REPAIR_PLAN_ATTEMPTS;
         self.repair_plan = Some(RepairPlanState {
             plan: plan.clone(),
-            signature: signature.into(),
+            signature,
             failed_tool_name: failed_tool_name.map(str::to_string),
         });
-        Ok(plan)
+        if exhausted { Err(plan) } else { Ok(plan) }
+    }
+
+    fn build_repair_context(
+        &self,
+        reason: AgentRepairReason,
+        failure: Option<&ToolResult>,
+    ) -> Value {
+        let summary = self.completion.summary();
+        let evidence_result = failure.or_else(|| {
+            self.tool_result_occurrences
+                .last()
+                .map(|occurrence| occurrence.result())
+        });
+        let matching_entry = evidence_result
+            .and_then(tool_result_command_scope_digest)
+            .and_then(|digest| {
+                self.verification_plan.as_ref().and_then(|plan| {
+                    plan.plan
+                        .checks
+                        .iter()
+                        .position(|check| check.requirement.command_scope_digest == digest)
+                        .and_then(|index| plan.plan.entries.get(index))
+                })
+            });
+        let failed_requirement = matching_entry
+            .map(|entry| entry.current_gap.clone())
+            .or_else(|| summary.unresolved_failures.first().cloned())
+            .or_else(|| self.last_completion_error.clone())
+            .unwrap_or_else(|| repair_reason_text(reason).to_string());
+        let (affected_path, affected_symbol) = matching_entry
+            .map(|entry| (entry.affected_path.clone(), entry.affected_symbol.clone()))
+            .or_else(|| {
+                self.verification_change.as_ref().and_then(|change| {
+                    change.changed_paths.first().cloned().map(|path| {
+                        let symbol = self
+                            .previous_repair_symbol(&path)
+                            .unwrap_or_else(|| "unavailable".to_string());
+                        (path, symbol)
+                    })
+                })
+            })
+            .or_else(|| {
+                self.verification_plan.as_ref().and_then(|plan| {
+                    plan.plan
+                        .entries
+                        .first()
+                        .map(|entry| (entry.affected_path.clone(), entry.affected_symbol.clone()))
+                })
+            })
+            .unwrap_or_else(|| ("unavailable".to_string(), "unavailable".to_string()));
+        let previous_result = failure
+            .map(|result| json!(safe_tool_result_evidence(result)))
+            .or_else(|| {
+                self.tool_result_occurrences
+                    .last()
+                    .map(|occurrence| json!(safe_tool_result_evidence(occurrence.result())))
+            })
+            .or_else(|| {
+                self.last_completion_error
+                    .as_deref()
+                    .map(|error| json!(bounded_repair_text(error)))
+            })
+            .unwrap_or_else(|| json!("repair decision pending execution"));
+        // Prefer the last trusted mutation summary over the terminal command name.  This lets the
+        // model distinguish what it changed from why the corresponding verification still failed;
+        // the summary contains only bounded paths, a digest and the workspace revision.
+        let previous_action = self
+            .verification_change
+            .as_ref()
+            .map(|change| {
+                json!({
+                    "changed_paths": change
+                        .changed_paths
+                        .iter()
+                        .map(|path| bounded_repair_text(path))
+                        .collect::<Vec<_>>(),
+                    "diff_digest": bounded_repair_text(&change.diff_digest),
+                    "workspace_revision": change.revision.value(),
+                })
+            })
+            .or_else(|| failure.map(|result| json!(safe_repair_tool_name(result))))
+            .or_else(|| {
+                self.tool_result_occurrences
+                    .last()
+                    .map(|occurrence| json!(safe_repair_tool_name(occurrence.result())))
+            })
+            .unwrap_or_else(|| json!(repair_reason_text(reason)));
+        json!({
+            "failed_requirement": bounded_repair_text(&failed_requirement),
+            "evidence": failure
+                .map(safe_tool_result_evidence)
+                .unwrap_or_else(|| bounded_repair_text(&previous_result.to_string())),
+            "affected_path": bounded_repair_text(&affected_path),
+            "affected_symbol": bounded_repair_text(&affected_symbol),
+            "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
+            "previous_action": previous_action,
+            "previous_result": previous_result,
+        })
+    }
+
+    fn previous_repair_symbol(&self, path: &str) -> Option<String> {
+        self.tool_result_occurrences
+            .iter()
+            .rev()
+            .find_map(|occurrence| {
+                let result = occurrence.result();
+                if result.tool_name != UPDATE_PLAN_TOOL || !result.ok {
+                    return None;
+                }
+                result
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.get("verification"))
+                    .and_then(Value::as_array)
+                    .and_then(|entries| {
+                        entries.iter().find_map(|entry| {
+                            (entry.get("affected_path").and_then(Value::as_str) == Some(path))
+                                .then(|| {
+                                    entry
+                                        .get("affected_symbol")
+                                        .and_then(Value::as_str)
+                                        .map(bounded_repair_text)
+                                })
+                                .flatten()
+                        })
+                    })
+            })
+    }
+
+    fn note_repair_mutation(&mut self, revision: WorkspaceRevision) {
+        let Some(active) = self.repair_plan.as_mut() else {
+            return;
+        };
+        active.plan.attempt = self.repair_attempts.saturating_add(1);
+        active.plan.required_revision = Some(revision);
+    }
+
+    /// Commit exactly one repair attempt for a new mutation revision followed by its terminal
+    /// command observation.  A failed command remains visible as a consumed cycle and opens the
+    /// next prospective attempt; the third failed cycle terminates before another mutation can
+    /// be requested.
+    fn consume_repair_cycle_if_complete(
+        &mut self,
+        tool_name: &str,
+        result: &ToolResult,
+    ) -> Option<RepairCycleCommit> {
+        if tool_name != TOOL_COMMAND || result.tool_name != TOOL_COMMAND {
+            return None;
+        }
+        let observation = result.workspace_observation()?;
+        if observation.mutation() != singularity_tools::WorkspaceMutation::Unchanged {
+            return None;
+        }
+        let revision = observation.revision()?;
+        let verification_plan = self.verification_plan.as_ref()?;
+        if verification_plan.revision != Some(revision) {
+            return None;
+        }
+        let command_scope_digest = tool_result_command_scope_digest(result)?;
+        if !verification_plan
+            .plan
+            .checks
+            .iter()
+            .any(|check| check.requirement.command_scope_digest == command_scope_digest)
+        {
+            return None;
+        }
+        // A successful command only closes the cycle after every required command for this
+        // revision has been observed.  A matching failure closes the failed cycle immediately.
+        if result.ok && !self.completion.verification_satisfied() {
+            return None;
+        }
+        let active = self.repair_plan.as_mut()?;
+        if active.plan.required_revision != Some(revision) {
+            return None;
+        }
+        self.repair_attempts = self.repair_attempts.saturating_add(1);
+        self.recovery_metrics.repair_attempt_count = self.repair_attempts;
+        active.plan.attempt = self.repair_attempts;
+        let committed_attempt = self.repair_attempts;
+        if result.ok {
+            self.repair_plan = None;
+            self.last_repair_failure = None;
+            return Some(RepairCycleCommit {
+                attempt: committed_attempt,
+                exhausted: false,
+            });
+        }
+        if committed_attempt >= MAX_REPAIR_PLAN_ATTEMPTS {
+            // Keep an internal terminal marker so the current tool batch fails immediately.  The
+            // event projection below uses the committed attempt (3), never this sentinel (4).
+            active.plan.attempt = MAX_REPAIR_PLAN_ATTEMPTS.saturating_add(1);
+            active.plan.required_revision = None;
+            Some(RepairCycleCommit {
+                attempt: committed_attempt,
+                exhausted: true,
+            })
+        } else {
+            // The failed verification is committed, but the next prospective attempt remains
+            // uncommitted until a new mutation revision is observed.
+            active.plan.required_revision = None;
+            active.plan.attempt = self.repair_attempts.saturating_add(1);
+            Some(RepairCycleCommit {
+                attempt: committed_attempt,
+                exhausted: false,
+            })
+        }
     }
 
     fn observe_model_tool_call(
@@ -1454,33 +1708,21 @@ impl AgentLoopState {
     ) -> Option<String> {
         self.completion.observe(tool_result);
         if tool_result.ok {
-            self.last_repair_failure = None;
-            let repair_resolved = self.repair_plan.as_ref().is_some_and(|plan| {
-                let changed = tool_result
-                    .workspace_observation()
-                    .is_some_and(|observation| {
-                        observation.mutation() == singularity_tools::WorkspaceMutation::Changed
-                    });
-                match plan.plan.reason {
-                    AgentRepairReason::ToolFailure => {
-                        tool_result.tool_name != UPDATE_PLAN_TOOL
-                            && plan
-                                .failed_tool_name
-                                .as_deref()
-                                .is_none_or(|failed| failed == tool_result.tool_name)
-                    }
-                    AgentRepairReason::VerificationFailed => {
-                        changed
-                            || (tool_result.tool_name == TOOL_COMMAND
-                                && self.completion.allows_final())
-                    }
-                    AgentRepairReason::RevisionConflict
-                    | AgentRepairReason::FinalReviewRejected => changed,
-                }
+            let tool_failure_resolved = self.repair_plan.as_ref().is_some_and(|plan| {
+                plan.plan.reason == AgentRepairReason::ToolFailure
+                    && tool_result.tool_name != UPDATE_PLAN_TOOL
+                    && plan
+                        .failed_tool_name
+                        .as_deref()
+                        .is_none_or(|failed| failed == tool_result.tool_name)
             });
-            if repair_resolved {
+            if tool_failure_resolved {
+                // A valid execution/read can resolve an input or policy tool failure without
+                // consuming a mutation-bound repair attempt. Verification failures remain owned
+                // by the revision-bound terminal-command reducer below.
                 self.repair_plan = None;
             }
+            self.last_repair_failure = None;
             return None;
         }
         if !is_repairable_tool_result(tool_result) {
@@ -1552,32 +1794,6 @@ impl AgentLoopState {
     fn clear_repair_episode(&mut self) {
         self.repair_plan = None;
         self.last_repair_failure = None;
-    }
-
-    /// Clear a non-tool-failure episode only when the observed operation advances the same
-    /// recovery boundary. A read/list success is deliberately insufficient evidence.
-    fn observe_repair_progress(
-        &mut self,
-        mutation_progress: bool,
-        verification_replan: bool,
-        required_verification_progress: bool,
-    ) {
-        let Some(plan) = self.repair_plan.as_ref() else {
-            return;
-        };
-        let progress = match plan.plan.reason {
-            AgentRepairReason::ToolFailure => false,
-            AgentRepairReason::VerificationFailed => {
-                mutation_progress || verification_replan || required_verification_progress
-            }
-            AgentRepairReason::FinalReviewRejected | AgentRepairReason::RevisionConflict => {
-                mutation_progress
-            }
-        };
-        if progress {
-            self.repair_plan = None;
-            self.last_repair_failure = None;
-        }
     }
 
     fn append_visible_tool_result(
@@ -1730,6 +1946,14 @@ enum ToolBatchControl {
     Blocked,
     Failed(String),
     Cancelled,
+}
+
+/// Result of committing a revision-bound repair cycle.  The committed attempt is kept separate
+/// from the active plan's prospective attempt so exhaustion never leaks an attempt four event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepairCycleCommit {
+    attempt: u32,
+    exhausted: bool,
 }
 
 /// 调用方消费最终化 assistant 文本 delta 的窄 callback 类型。
@@ -2624,7 +2848,7 @@ where
                         state.messages.push(ModelMessage::text(
                             ModelRole::Developer,
                             if repair_requested {
-                                REPAIR_PLAN_INSTRUCTIONS.to_string()
+                                state.repair_feedback()
                             } else {
                                 "Repair planning budget exhausted; do not claim completion."
                                     .to_string()
@@ -3918,15 +4142,9 @@ where
                     .clone()
                     .unwrap_or_else(|| "tool_execution_failed".to_string())
             });
-            let mutation_progress = result.ok
-                && result.workspace_observation().is_some_and(|observation| {
-                    observation.mutation() == singularity_tools::WorkspaceMutation::Changed
-                });
             let verification_identity = (prepared.call.tool_name == TOOL_COMMAND).then(|| {
                 child_occurrence_identity(&occurrence.context.identity, "verification", 0)
             });
-            let previous_plan_update_count = state.plan_update_count;
-            let previous_verification_planning_required = state.verification_planning_required;
             // The occurrence ordinal identifies this verification span; the successful-command
             // total is a mutable metric and cannot be used as a Start/End identity attribute.
             let verification_occurrence_count =
@@ -4016,6 +4234,7 @@ where
                 } else if state.verification_plan.is_none() && verification_planning_available {
                     state.verification_planning_required = true;
                 }
+                state.note_repair_mutation(revision);
             }
             let plan_bound = state.bind_verification_plan(changed);
             let plan_started = (plan_bound
@@ -4067,29 +4286,21 @@ where
                     return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
                 }
             }
-            let verification_replan = prepared.call.tool_name == UPDATE_PLAN_TOOL
-                && result.ok
-                && state.plan_update_count > previous_plan_update_count
-                && (previous_verification_planning_required
-                    || state.repair_plan.as_ref().is_some_and(|plan| {
-                        plan.plan.reason == AgentRepairReason::FinalReviewRejected
-                    }));
-            let required_verification_progress = result.ok
-                && prepared.call.tool_name == TOOL_COMMAND
-                && successful_command_scope_digest(&result).is_some()
-                && state.completion.summary().required
-                && state.completion.allows_final()
-                && state.completion.summary().unresolved_failures.is_empty();
-            state.observe_repair_progress(
-                mutation_progress,
-                verification_replan,
-                required_verification_progress,
-            );
+            let repair_cycle =
+                state.consume_repair_cycle_if_complete(&prepared.call.tool_name, &result);
             if !result.ok
                 && is_repairable_tool_result(&result)
-                && let Some(plan) = state.repair_plan()
+                && let Some(mut plan) = state.repair_plan()
             {
-                let status = if plan.attempt > plan.max_attempts {
+                let exhausted = repair_cycle.is_some_and(|commit| commit.exhausted)
+                    || plan.attempt > plan.max_attempts;
+                if let Some(commit) = repair_cycle {
+                    // The active plan has already advanced to the next prospective attempt (or
+                    // its internal exhaustion sentinel).  Project only the cycle that this
+                    // terminal command actually committed.
+                    plan.attempt = commit.attempt.min(plan.max_attempts);
+                }
+                let status = if exhausted {
                     RepairPlanningStatus::Exhausted
                 } else {
                     RepairPlanningStatus::Planned
@@ -4145,6 +4356,12 @@ where
                 state
                     .messages
                     .push(ModelMessage::text(ModelRole::Developer, feedback));
+            }
+            if state.repair_plan.is_some() {
+                state.messages.push(ModelMessage::text(
+                    ModelRole::Developer,
+                    state.repair_feedback(),
+                ));
             }
             if changed
                 && state.verification_planning_required
@@ -5962,6 +6179,58 @@ fn tool_call_fingerprint(call: &ModelToolCall) -> String {
 fn repair_failure_signature(tool_call_fingerprint: &str, error_code: &str) -> String {
     let encoded = format!("{tool_call_fingerprint}\0{error_code}");
     format!("sha256:{:x}", Sha256::digest(encoded.as_bytes()))
+}
+
+fn repair_reason_text(reason: AgentRepairReason) -> &'static str {
+    match reason {
+        AgentRepairReason::VerificationFailed => "revision-bound verification failed",
+        AgentRepairReason::ToolFailure => "repairable tool failure",
+        AgentRepairReason::RevisionConflict => "workspace revision conflict",
+        AgentRepairReason::FinalReviewRejected => "final review rejected the proposed result",
+    }
+}
+
+fn bounded_repair_text(value: &str) -> String {
+    value.chars().take(MAX_REPAIR_CONTEXT_CHARS).collect()
+}
+
+/// Project only the already-redacted public tool result payload into bounded repair evidence.
+fn safe_tool_result_evidence(result: &ToolResult) -> String {
+    let payload = result.to_message_payload();
+    let value = payload
+        .get("preview")
+        .or_else(|| payload.get("content"))
+        .or_else(|| payload.get("error_code"));
+    let evidence = value
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| if result.ok { "ok" } else { "failed" }.to_string());
+    bounded_repair_text(&evidence)
+}
+
+fn safe_repair_tool_name(result: &ToolResult) -> String {
+    if result.error_code.as_deref() == Some("tool_not_visible") {
+        return PROVIDER_HISTORY_REJECTED_TOOL.to_string();
+    }
+    result
+        .to_message_payload()
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(bounded_repair_text)
+        .unwrap_or_else(|| "tool".to_string())
+}
+
+fn tool_result_command_scope_digest(result: &ToolResult) -> Option<&str> {
+    result
+        .result_id
+        .as_deref()
+        .filter(|digest| is_sha256_fingerprint(digest))
+        .or_else(|| {
+            result
+                .audit_metadata()
+                .and_then(|metadata| metadata.get("command_scope_digest"))
+                .and_then(Value::as_str)
+                .filter(|digest| is_sha256_fingerprint(digest))
+        })
 }
 
 fn is_sha256_fingerprint(value: &str) -> bool {

@@ -475,43 +475,32 @@ impl ApprovalCheckpoint {
             if !repair.signature.is_empty() && !is_sha256_fingerprint(&repair.signature) {
                 return Err("approval checkpoint repair plan signature is invalid".to_string());
             }
-            if repair.plan.required_revision
-                != self
-                    .verification_plan
-                    .as_ref()
-                    .and_then(|plan| plan.revision)
+            if repair
+                .plan
+                .required_revision
+                .is_some_and(|revision| Some(revision) != self.completion.workspace_revision)
                 || repair.plan.required_check_count != self.completion.required_command_count()
             {
                 return Err("approval checkpoint repair plan binding is invalid".to_string());
             }
         }
-        if self.repair_attempts > super::MAX_REPAIR_PLAN_ATTEMPTS.saturating_add(1) {
+        if self.repair_attempts > super::MAX_REPAIR_PLAN_ATTEMPTS {
             return Err("approval checkpoint repair attempt ledger is invalid".to_string());
         }
         if self.repair_attempts != self.recovery_metrics.repair_attempt_count {
             return Err("approval checkpoint repair attempt metrics are inconsistent".to_string());
         }
-        let observed_failed_repairs = u32::try_from(
-            self.tool_result_occurrences
-                .iter()
-                .filter(|occurrence| {
-                    let result = occurrence.result();
-                    !result.ok && super::is_repairable_tool_result(result)
-                })
-                .count(),
-        )
-        .unwrap_or(u32::MAX);
-        if self.repair_attempts < observed_failed_repairs {
-            return Err(
-                "approval checkpoint repair attempt ledger is below observed failures".to_string(),
-            );
-        }
         if self
             .repair_plan
             .as_ref()
-            .is_some_and(|repair| repair.plan.attempt != self.repair_attempts)
+            .is_some_and(|repair| repair.plan.attempt != self.repair_attempts.saturating_add(1))
         {
             return Err("approval checkpoint repair attempt ledger is not monotonic".to_string());
+        }
+        if self.repair_plan.is_none() && self.completion.has_unresolved_failures() {
+            return Err(
+                "approval checkpoint repair state is missing for unresolved failure".to_string(),
+            );
         }
         if self.final_review_verdict == Some(super::FinalReviewVerdict::Accept)
             && (!self.completion.allows_final()
