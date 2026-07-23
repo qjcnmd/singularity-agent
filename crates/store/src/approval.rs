@@ -2,6 +2,7 @@
 
 use super::support::*;
 use super::*;
+use crate::trace_artifact::find_trace_span_start_by_id;
 
 /// approval 决定，以及 `AppServer` 所需的检查点和追踪数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -867,7 +868,7 @@ impl SessionStore {
     }
 }
 
-fn typed_approval_wait_start_trace(
+pub(crate) fn typed_approval_wait_start_trace(
     transaction: &Transaction<'_>,
     request: &ApprovalRequest,
     component: &str,
@@ -913,11 +914,13 @@ fn typed_approval_wait_end_trace(
     component: &str,
     summary: &str,
 ) -> StoreResult<TraceEvent> {
-    let start = find_trace_span_start(
+    let expected_span_id = format!("approval_wait_span_{}", request.request_id);
+    let start = find_trace_span_start_by_id(
         transaction,
         &request.thread_id,
         &request.turn_id,
         TraceSpanKind::ApprovalWait,
+        &expected_span_id,
     )?
     .ok_or_else(|| {
         StoreError::InvalidState(format!(

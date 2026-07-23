@@ -3145,6 +3145,13 @@ fn approval_execution_handoff_atomically_replaces_old_checkpoint_with_next_appro
     let blocked = store.get_turn(&turn.turn_id).expect("blocked turn");
     assert_eq!(blocked.status, TurnStatus::Blocked);
     assert_eq!(blocked.agent_loop_status, "blocked");
+    store
+        .record_approval_decision(
+            &ApprovalDecision::new(next.request_id.clone(), ApprovalOutcome::Allow, "allow"),
+            "approval",
+            "approval decision recorded",
+        )
+        .expect("successor approval has a typed wait span");
 }
 
 // 验证 deny with checkpoint 会终止 turn 并移除 checkpoint。

@@ -2,6 +2,7 @@
 
 use super::support::*;
 use super::*;
+use crate::approval::typed_approval_wait_start_trace;
 
 impl SessionStore {
     /// 原子地用 turn 结果和后续检查点（如有）解决执行中的 approval。
@@ -88,21 +89,12 @@ impl SessionStore {
                     serde_json::to_string(checkpoint)?
                 ],
             )?;
-            let approval_trace = TraceEvent {
-                task_id: Some(request.turn_id.clone()),
-                payload: serde_json::json!({
-                    "request_id": &request.request_id,
-                    "action": &request.action,
-                    "tool_call_id": &request.tool_call_id,
-                }),
-                ..TraceEvent::for_turn(
-                    format!("trace_{}", request.request_id),
-                    request.thread_id.clone(),
-                    request.turn_id.clone(),
-                    "approval",
-                    "approval requested",
-                )
-            };
+            let approval_trace = typed_approval_wait_start_trace(
+                &transaction,
+                request,
+                "approval",
+                "approval requested",
+            )?;
             Self::insert_turn_trace(
                 &transaction,
                 &approval_trace,
