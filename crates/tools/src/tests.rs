@@ -745,6 +745,61 @@ mod mutation_tests {
         remove_workspace(&workspace);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn post_exchange_backup_content_tampering_is_preserved_and_rejected() {
+        use std::cell::RefCell;
+
+        let workspace = test_workspace("post-exchange-backup-tampering");
+        let target = workspace.join("target.txt");
+        std::fs::write(&target, "before").expect("write target");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("target.txt").expect("relative path");
+        let (_, original_revision) = tools.existing_text_or_empty(&path).expect("read original");
+        let exchanged_backup = RefCell::new(None::<PathBuf>);
+
+        let failure = tools
+            .atomic_write_with_hooks(
+                &path,
+                "published",
+                original_revision.as_ref(),
+                |temporary_name| {
+                    exchanged_backup.replace(Some(workspace.join(temporary_name)));
+                },
+                || {
+                    let backup = exchanged_backup
+                        .borrow()
+                        .clone()
+                        .expect("record exchanged backup path");
+                    std::fs::write(backup, "concurrent original mutation")
+                        .expect("mutate exchanged original object");
+                    Ok(())
+                },
+            )
+            .expect_err("changed exchanged backup ownership must fail closed");
+
+        assert!(failure.published_revision.is_none());
+        assert!(matches!(
+            failure.error,
+            WorkspaceToolError::RollbackFailed(ref message)
+                if message.contains("backup ownership changed")
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read preserved concurrent object"),
+            "concurrent original mutation"
+        );
+        assert!(
+            std::fs::read_dir(&workspace)
+                .expect("read workspace")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("singularity"))
+        );
+        remove_workspace(&workspace);
+    }
+
     #[test]
     fn rollback_preserves_a_concurrently_replaced_published_target() {
         let workspace = test_workspace("rollback-concurrent");
@@ -794,6 +849,52 @@ mod mutation_tests {
             .expect("remove created parents");
 
         assert!(!workspace.join("new").exists());
+        remove_workspace(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_batch_cleanup_preserves_a_directory_identity_collision() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = test_workspace("directory-identity-collision");
+        let tools = WorkspaceTools::new(&workspace).expect("bind workspace tools");
+        let path = CapabilityRelativePath::parse("new/nested/file.txt").expect("relative path");
+        let mut created = Vec::new();
+
+        tools
+            .ensure_parent_directories(&path, &mut created)
+            .expect("create parents");
+        tools.force_next_directory_cleanup_identity_collision_for_test();
+        let failure = tools
+            .remove_created_directories(&mut created)
+            .expect_err("identity collision replacement must fail closed");
+
+        assert!(matches!(
+            failure,
+            WorkspaceToolError::RollbackFailed(ref message)
+                if message.contains("new/nested")
+                    && message.contains("changed during mutation")
+        ));
+        let replacement = workspace.join("new/nested");
+        assert!(replacement.is_dir());
+        assert_eq!(
+            std::fs::metadata(&replacement)
+                .expect("preserved replacement metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o711
+        );
+        assert!(
+            std::fs::read_dir(workspace.join("new"))
+                .expect("read parent")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("singularity-quarantine"))
+        );
         remove_workspace(&workspace);
     }
 

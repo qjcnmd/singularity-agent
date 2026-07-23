@@ -6,6 +6,8 @@ use super::*;
 thread_local! {
     static FORCE_TEMPORARY_CLEANUP_IDENTITY_COLLISION: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static FORCE_DIRECTORY_CLEANUP_IDENTITY_COLLISION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 impl WorkspaceTools {
@@ -13,6 +15,12 @@ impl WorkspaceTools {
     #[cfg(all(test, unix))]
     pub(crate) fn force_next_temporary_cleanup_identity_collision_for_test(&self) {
         FORCE_TEMPORARY_CLEANUP_IDENTITY_COLLISION.with(|force| force.set(true));
+    }
+
+    /// Replace the next quarantined created directory while simulating inode reuse.
+    #[cfg(all(test, unix))]
+    pub(crate) fn force_next_directory_cleanup_identity_collision_for_test(&self) {
+        FORCE_DIRECTORY_CLEANUP_IDENTITY_COLLISION.with(|force| force.set(true));
     }
 
     fn cleanup_temporary_file_failure(
@@ -226,6 +234,10 @@ impl WorkspaceTools {
             requested_relative = join_relative_path(&requested_relative, name);
             if was_created {
                 let relative = PathBuf::from(&requested_relative);
+                #[cfg(unix)]
+                let revision = directory_cleanup_revision(&directory)
+                    .map_err(|error| map_capability_error(error, &requested_relative))?;
+                #[cfg(not(unix))]
                 let identity = directory_object_identity_key(&directory)
                     .map_err(|error| map_capability_error(error, &requested_relative))?;
                 let guard = directory.try_clone().map_err(io_error)?;
@@ -235,8 +247,11 @@ impl WorkspaceTools {
                         display: requested_relative.clone(),
                         key: relative_path_key(&relative),
                     },
+                    #[cfg(unix)]
+                    revision,
+                    #[cfg(not(unix))]
                     identity,
-                    _guard: Some(guard),
+                    guard: Some(guard),
                 });
             }
             let actual_relative = self
@@ -493,6 +508,26 @@ impl WorkspaceTools {
         } else {
             None
         };
+        #[cfg(unix)]
+        let original_ownership = match (original_file.as_ref(), original_revision.as_ref()) {
+            (Some(file), Some(revision)) => match unix_file_ownership_revision(file, revision) {
+                Ok(ownership) => Some(ownership),
+                Err(error) => {
+                    drop(source_file);
+                    return Err(self
+                        .cleanup_temporary_file_failure(
+                            parent.dir(),
+                            &temporary_name,
+                            &path.display,
+                            temporary_file,
+                            &temporary_identity,
+                            map_capability_error(error, &path.display),
+                        )
+                        .into());
+                }
+            },
+            _ => None,
+        };
         if let Err(error) = publish_temporary(
             parent.dir(),
             &temporary_name,
@@ -651,6 +686,37 @@ impl WorkspaceTools {
                             .into());
                     }
                 };
+            let pinned_backup_ownership =
+                match unix_file_ownership_revision(&original_file, &pinned_backup_revision) {
+                    Ok(ownership) => ownership,
+                    Err(error) => {
+                        return Err(self
+                            .restore_failed_exchange(
+                                parent.dir(),
+                                &parent.name,
+                                &temporary_name,
+                                &published_revision,
+                                &path.display,
+                                map_capability_error(error, &path.display),
+                            )
+                            .into());
+                    }
+                };
+            if original_ownership.as_ref() != Some(&pinned_backup_ownership) {
+                return Err(self
+                    .restore_failed_exchange(
+                        parent.dir(),
+                        &parent.name,
+                        &temporary_name,
+                        &published_revision,
+                        &path.display,
+                        WorkspaceToolError::RollbackFailed(format!(
+                            "{}: exchanged backup ownership changed; object preserved",
+                            path.display
+                        )),
+                    )
+                    .into());
+            }
             let backup_state = self.atomic_target_state(
                 parent.dir(),
                 &parent.actual_relative,
@@ -1006,7 +1072,11 @@ impl WorkspaceTools {
 
         let mut pinned = match open_file_from_parent(parent, name) {
             Ok(file) => file,
-            Err(CapabilityAccessError::Missing) => return Ok(()),
+            Err(CapabilityAccessError::Missing) => {
+                return Err(WorkspaceToolError::RollbackFailed(format!(
+                    "{relative}: cleanup ownership could not be established; entry is missing"
+                )));
+            }
             Err(error) => return Err(map_capability_error(error, relative)),
         };
         let initial_revision = self
@@ -1023,7 +1093,11 @@ impl WorkspaceTools {
                 .map_err(|error| map_capability_error(error, relative))?;
             match mutation_rename_noreplace(parent, name, &quarantine) {
                 Ok(()) => break quarantine,
-                Err(CapabilityAccessError::Missing) => return Ok(()),
+                Err(CapabilityAccessError::Missing) => {
+                    return Err(WorkspaceToolError::RollbackFailed(format!(
+                        "{relative}: cleanup ownership changed before quarantine"
+                    )));
+                }
                 Err(CapabilityAccessError::Io(error))
                     if error.kind() == std::io::ErrorKind::AlreadyExists =>
                 {
@@ -1073,7 +1147,10 @@ impl WorkspaceTools {
             )));
         }
         match mutation_unlink_file(parent, &quarantine) {
-            Ok(()) | Err(CapabilityAccessError::Missing) => Ok(()),
+            Ok(()) => Ok(()),
+            Err(CapabilityAccessError::Missing) => Err(WorkspaceToolError::RollbackFailed(
+                format!("{relative}: quarantined cleanup ownership changed before unlink"),
+            )),
             Err(CapabilityAccessError::Unsupported) => Err(
                 WorkspaceToolError::PathIdentityUnsupported(relative.to_string()),
             ),
@@ -1236,7 +1313,12 @@ impl WorkspaceTools {
             let result = (|| {
                 let parent = match self.open_parent_directory(&directory.path.relative, false) {
                     Ok(parent) => parent,
-                    Err(CapabilityAccessError::Missing) => return Ok(()),
+                    Err(CapabilityAccessError::Missing) => {
+                        return Err(WorkspaceToolError::RollbackFailed(format!(
+                            "{}: created directory cleanup ownership could not be established",
+                            directory.path.display
+                        )));
+                    }
                     Err(error) => {
                         return Err(map_capability_error(error, &directory.path.display));
                     }
@@ -1246,7 +1328,12 @@ impl WorkspaceTools {
                         .map_err(|error| map_capability_error(error, &directory.path.display))?;
                     match mutation_rename_noreplace(parent.dir(), &parent.name, &quarantine) {
                         Ok(()) => break quarantine,
-                        Err(CapabilityAccessError::Missing) => return Ok(()),
+                        Err(CapabilityAccessError::Missing) => {
+                            return Err(WorkspaceToolError::RollbackFailed(format!(
+                                "{}: created directory ownership changed before quarantine",
+                                directory.path.display
+                            )));
+                        }
                         Err(CapabilityAccessError::Io(error))
                             if error.kind() == std::io::ErrorKind::AlreadyExists =>
                         {
@@ -1262,7 +1349,14 @@ impl WorkspaceTools {
                         }
                     }
                 };
-                drop(directory._guard.take());
+                let _guard = directory.guard.take().ok_or_else(|| {
+                    WorkspaceToolError::RollbackFailed(format!(
+                        "{}: created directory ownership guard is unavailable",
+                        directory.path.display
+                    ))
+                })?;
+                let force_identity_collision =
+                    prepare_directory_identity_collision_for_test(parent.dir(), &quarantine)?;
                 let opened = match open_directory_component(parent.dir(), &quarantine, false) {
                     Ok(opened) => opened,
                     Err(error) => {
@@ -1278,8 +1372,8 @@ impl WorkspaceTools {
                         };
                     }
                 };
-                let identity = match directory_object_identity_key(&opened) {
-                    Ok(identity) => identity,
+                let revision = match directory_cleanup_revision(&opened) {
+                    Ok(revision) => revision,
                     Err(error) => {
                         drop(opened);
                         let identity_error = map_capability_error(error, &directory.path.display);
@@ -1294,8 +1388,11 @@ impl WorkspaceTools {
                         };
                     }
                 };
-                drop(opened);
-                if identity != directory.identity {
+                if !same_directory_cleanup_revision(
+                    &directory.revision,
+                    &revision,
+                    force_identity_collision,
+                ) {
                     return match restore_quarantined_entry(
                         parent.dir(),
                         &quarantine,
@@ -1309,7 +1406,13 @@ impl WorkspaceTools {
                     };
                 }
                 match mutation_unlink_directory(parent.dir(), &quarantine) {
-                    Ok(()) | Err(CapabilityAccessError::Missing) => Ok(()),
+                    Ok(()) => Ok(()),
+                    Err(CapabilityAccessError::Missing) => {
+                        Err(WorkspaceToolError::RollbackFailed(format!(
+                            "{}: quarantined directory ownership changed before unlink",
+                            directory.path.display
+                        )))
+                    }
                     Err(error) => {
                         // A non-empty directory (or another cleanup error) is
                         // recoverable only if its original name is still free.
@@ -1377,7 +1480,7 @@ impl WorkspaceTools {
                     ));
                 }
                 drop(opened);
-                drop(directory._guard.take());
+                drop(directory.guard.take());
                 let reopened = open_directory_component(parent.dir(), &parent.name, false)
                     .map_err(|error| map_capability_error(error, &directory.path.display))?;
                 let reopened_identity = directory_object_identity_key(&reopened)
@@ -1459,6 +1562,117 @@ fn temporary_cleanup_identity_matches(expected: &str, observed: &str) -> bool {
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryCleanupRevision {
+    object_identity: String,
+    stable_metadata: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnixFileOwnershipRevision {
+    object_identity: String,
+    stable_metadata: String,
+    content_digest: String,
+}
+
+#[cfg(unix)]
+fn unix_file_ownership_revision(
+    file: &CapabilityFile,
+    revision: &WorkspaceContentRevision,
+) -> Result<UnixFileOwnershipRevision, CapabilityAccessError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std()
+        .metadata()
+        .map_err(CapabilityAccessError::Io)?;
+    Ok(UnixFileOwnershipRevision {
+        object_identity: revision.object_identity.clone(),
+        stable_metadata: format!(
+            "owned-file-state:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.nlink(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.len()
+        ),
+        content_digest: revision.content_digest.clone(),
+    })
+}
+
+#[cfg(unix)]
+fn directory_cleanup_revision(
+    directory: &CapabilityDir,
+) -> Result<DirectoryCleanupRevision, CapabilityAccessError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = directory
+        .try_clone()
+        .map_err(CapabilityAccessError::Io)?
+        .into_std_file()
+        .metadata()
+        .map_err(CapabilityAccessError::Io)?;
+    Ok(DirectoryCleanupRevision {
+        object_identity: directory_object_identity_key(directory)?,
+        stable_metadata: format!(
+            "directory-state:{:x}:{:x}:{:x}",
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid()
+        ),
+    })
+}
+
+#[cfg(unix)]
+fn same_directory_cleanup_revision(
+    expected: &DirectoryCleanupRevision,
+    observed: &DirectoryCleanupRevision,
+    force_identity_collision: bool,
+) -> bool {
+    if force_identity_collision {
+        let mut observed = observed.clone();
+        observed
+            .object_identity
+            .clone_from(&expected.object_identity);
+        return expected == &observed;
+    }
+    expected == observed
+}
+
+#[cfg(unix)]
+fn prepare_directory_identity_collision_for_test(
+    parent: &CapabilityDir,
+    quarantine: &OsStr,
+) -> Result<bool, WorkspaceToolError> {
+    #[cfg(test)]
+    if FORCE_DIRECTORY_CLEANUP_IDENTITY_COLLISION.with(|force| force.replace(false)) {
+        use cap_std::fs::PermissionsExt as _;
+
+        mutation_unlink_directory(parent, quarantine)
+            .map_err(|error| map_capability_error(error, "created directory collision"))?;
+        parent.create_dir(quarantine).map_err(io_error)?;
+        let mut permissions = parent
+            .symlink_metadata(quarantine)
+            .map_err(io_error)?
+            .permissions();
+        permissions.set_mode(0o711);
+        parent
+            .set_permissions(quarantine, permissions)
+            .map_err(io_error)?;
+        return Ok(true);
+    }
+    let _ = (parent, quarantine);
+    Ok(false)
+}
+
+#[cfg(unix)]
 fn same_cleanup_revision(
     expected: &WorkspaceContentRevision,
     observed: &WorkspaceContentRevision,
@@ -1519,6 +1733,9 @@ struct AtomicTargetState {
 
 pub(crate) struct CreatedDirectory {
     path: CapabilityRelativePath,
+    #[cfg(unix)]
+    revision: DirectoryCleanupRevision,
+    #[cfg(not(unix))]
     identity: String,
-    _guard: Option<CapabilityDir>,
+    guard: Option<CapabilityDir>,
 }
