@@ -8425,10 +8425,21 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                     .contains("\"submit_only_command_tool_input\":true")
                 && message
                     .content
+                    .contains("\"next_action\":\"execute_command_tool_input_exactly\"")
+                && message
+                    .content
+                    .contains("\"replan_or_mutate_before_execution\":false")
+                && message
+                    .content
                     .contains("\"sandbox_mode\":\"workspace_write\"")
                 && message.content.contains("\"network_access\":\"denied\"")
                 && message.content.contains(&expected_scope_digest)
-                && message.content.contains("different repair strategy")
+                && message
+                    .content
+                    .contains("execute its command_tool_input exactly as the next action")
+                && message
+                    .content
+                    .contains("Only when that exact command fails should you choose a materially different repair strategy")
         })
     }));
     assert!(!requests.iter().any(|request| {

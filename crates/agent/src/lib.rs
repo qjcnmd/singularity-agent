@@ -123,7 +123,7 @@ const MAX_REPAIR_CONTEXT_PATH_CHARS: usize = 160;
 const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 65_536;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
-const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan: choose a materially different repair strategy that addresses the failed requirement, then rerun the revision-bound verification before final review. Do not repeat the previous repair action or claim success without new evidence.";
+const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, execute its command_tool_input exactly as the next action; do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. Only when that exact command fails should you choose a materially different repair strategy that addresses its evidence. Do not repeat the previous patch or claim success without new verification evidence.";
 const REVIEW_REPAIR_SIGNATURE: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000017";
 const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call update_plan with all steps marked completed before providing the final answer.";
@@ -1634,6 +1634,8 @@ impl AgentLoopState {
                         "network_access": entry.action.network_access,
                     },
                     "submit_only_command_tool_input": true,
+                    "next_action": "execute_command_tool_input_exactly",
+                    "replan_or_mutate_before_execution": false,
                     "command_scope_digest": command_script_scope_digest_with_policy(
                         &entry.action.command,
                         &entry.action.cwd,
@@ -4551,7 +4553,7 @@ where
                 state.messages.push(ModelMessage::text(
                     ModelRole::Developer,
                     format!(
-                        "A real workspace mutation requires a revision-bound verification entry in the same update_plan call before any command. trusted_change={trusted_change}. Each entry must include affected_path exactly matching one changed_paths value, an affected_symbol, bounded evidence and current_gap, and an exact action command/profile."
+                        "A real workspace mutation requires a revision-bound verification entry in the same update_plan call before any command. trusted_change={trusted_change}. Each entry must include affected_path exactly matching one changed_paths value, an affected_symbol, bounded evidence and current_gap, and an exact action command/profile. When one command proves multiple risks, reuse the identical command, cwd, timeout and profile for those entries; after installing the plan, execute every distinct planned action exactly instead of substituting a semantically equivalent command."
                     ),
                 ));
             }
