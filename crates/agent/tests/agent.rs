@@ -4748,7 +4748,22 @@ fn invalid_verification_command_input_does_not_open_a_mutation_bound_repair_cycl
             "steps": [
                 {"step": "change the fixture", "status": "completed"},
                 {"step": "verify the changed fixture", "status": "completed"}
-            ]
+            ],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "the fixture changed",
+                "affected_path": fixture_name,
+                "affected_symbol": "invalid_verification_input::value",
+                "current_gap": "the changed revision is not verified",
+                "action": {
+                    "command": command,
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
         }),
     ));
     let final_response = ModelTurnResponse::completed(

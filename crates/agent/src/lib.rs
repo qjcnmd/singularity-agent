@@ -4716,13 +4716,31 @@ where
                     );
                 }
             }
-        } else if update.verification.is_some() {
-            return ToolOutput::failure(
-                "invalid_tool_arguments",
-                json!({
-                    "summary": "verification entries are only valid after a real workspace mutation"
-                }),
-            );
+        } else if let Some(entries) = update.verification.as_ref() {
+            let repeated_plan = match self.verification_plan_from_entries(entries, state) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return ToolOutput::failure(
+                        "invalid_tool_arguments",
+                        json!({"summary": error}),
+                    );
+                }
+            };
+            let exact_installed_plan = state.verification_plan.as_ref().is_some_and(|installed| {
+                installed.revision == state.completion.workspace_revision
+                    && installed.plan == repeated_plan
+            });
+            if !exact_installed_plan {
+                return ToolOutput::failure(
+                    "invalid_tool_arguments",
+                    json!({
+                        "summary": "verification entries may only repeat the exact plan already bound to the current workspace revision"
+                    }),
+                );
+            }
+            // Repeating the installed plan while updating ordinary step statuses is idempotent.
+            // The existing revision binding and terminal command evidence remain authoritative.
+            None
         } else {
             None
         };
