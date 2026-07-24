@@ -5,7 +5,7 @@
 //! 并在完成或恢复不变量不满足时拒绝继续执行。
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use schemars::JsonSchema;
@@ -348,9 +348,27 @@ impl AgentVerificationPlan {
 
     /// Return the exact requirements represented by this plan.
     pub fn requirements(&self) -> Vec<AgentVerificationRequirement> {
+        // One successful command observation can prove every risk bound to the same exact
+        // action. Preserve an explicitly requested repeat count by taking the maximum for that
+        // scope instead of summing risk labels into duplicate executions.
         self.checks
             .iter()
-            .map(|check| check.requirement.clone())
+            .fold(BTreeMap::new(), |mut requirements, check| {
+                requirements
+                    .entry(check.requirement.command_scope_digest.clone())
+                    .and_modify(|count: &mut u32| {
+                        *count = (*count).max(check.requirement.required_success_count);
+                    })
+                    .or_insert(check.requirement.required_success_count);
+                requirements
+            })
+            .into_iter()
+            .map(
+                |(command_scope_digest, required_success_count)| AgentVerificationRequirement {
+                    command_scope_digest,
+                    required_success_count,
+                },
+            )
             .collect()
     }
 }

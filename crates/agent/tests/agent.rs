@@ -7,11 +7,12 @@ use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentObservation, AgentPlan, AgentPlanStep,
     AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentRepairReason,
-    AgentRunStatus, AgentStatus, AgentVerificationRequirement, AgentVerificationRisk,
-    ApprovalGrant, FinalReviewStatus, FinalReviewVerdict, OccurrenceLifecycle,
-    PendingApprovalOccurrence, PolicyDecisionCause, PolicyDecisionStatus, PromptAssemblyStatus,
-    RepairPlanningStatus, SandboxExecutionStatus, ToolCallStatus, VerificationPlanStatus,
-    VerificationStatus, agent_control_tool_entries, assemble_context_items,
+    AgentRunStatus, AgentStatus, AgentVerificationCheck, AgentVerificationPlan,
+    AgentVerificationRequirement, AgentVerificationRisk, ApprovalGrant, FinalReviewStatus,
+    FinalReviewVerdict, OccurrenceLifecycle, PendingApprovalOccurrence, PolicyDecisionCause,
+    PolicyDecisionStatus, PromptAssemblyStatus, RepairPlanningStatus, SandboxExecutionStatus,
+    ToolCallStatus, VerificationPlanStatus, VerificationStatus, agent_control_tool_entries,
+    assemble_context_items,
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
@@ -3830,6 +3831,40 @@ fn agent_loop_pairs_duplicate_tool_call_ids_by_result_occurrence_for_compaction(
         1
     );
     assert_eq!(seen_requests.lock().expect("seen requests").len(), 3);
+}
+
+#[test]
+fn verification_plan_shares_one_exact_action_across_multiple_risks() {
+    let scope = command_script_scope_digest_with_policy(
+        &test_command_script("success"),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let plan = AgentVerificationPlan {
+        risks: vec![
+            AgentVerificationRisk::EmptyCollection,
+            AgentVerificationRisk::ZeroValue,
+        ],
+        checks: vec![
+            AgentVerificationCheck::new(
+                AgentVerificationRisk::EmptyCollection,
+                AgentVerificationRequirement::new(&scope, 1),
+            ),
+            AgentVerificationCheck::new(
+                AgentVerificationRisk::ZeroValue,
+                AgentVerificationRequirement::new(&scope, 1),
+            ),
+        ],
+        entries: Vec::new(),
+    };
+
+    plan.validate().expect("shared exact action plan");
+    assert_eq!(
+        plan.requirements(),
+        vec![AgentVerificationRequirement::new(scope, 1)]
+    );
 }
 
 #[test]
