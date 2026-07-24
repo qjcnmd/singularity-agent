@@ -8404,16 +8404,23 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
         "command",
         serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
     ));
-    let mut exact =
+    let mut repeated_mismatch =
         ModelTurnResponse::completed("model_request_turn_exact_repair_5", "response_exact_5", "");
+    repeated_mismatch.tool_calls.push(tool_call(
+        "command_mismatch_again",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let mut exact =
+        ModelTurnResponse::completed("model_request_turn_exact_repair_6", "response_exact_6", "");
     exact.tool_calls.push(tool_call(
         "command_exact",
         "command",
         serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 10}),
     ));
     let final_response = ModelTurnResponse::completed(
-        "model_request_turn_exact_repair_6",
-        "response_exact_6",
+        "model_request_turn_exact_repair_7",
+        "response_exact_7",
         "completed",
     );
 
@@ -8434,6 +8441,7 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
                 pre_repair_mismatch,
                 premature,
                 mismatched,
+                repeated_mismatch,
                 exact,
                 final_response,
             ],
@@ -8454,19 +8462,19 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
             "turn_exact_repair",
             "change and verify the fixture",
         )
-        .with_max_turns(7),
+        .with_max_turns(8),
     );
 
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
-    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 1);
+    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 2);
     let run_status = result.to_run_status();
     assert!(run_status.audit_events.iter().any(|event| {
         event["argument_validation_code"] == "repair_action_mismatch"
             && event["executor_started"] == false
     }));
     let requests = seen_requests.lock().expect("exact repair requests");
-    for request in [&requests[4], &requests[5]] {
+    for request in [&requests[4], &requests[5], &requests[6]] {
         let command_schema = &request
             .tools
             .iter()
@@ -8486,6 +8494,35 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
             serde_json::json!(10)
         );
     }
+    let conflicting_messages = requests[6]
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .content
+                .contains("choose a different next action. Do not repeat the same call")
+        })
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        conflicting_messages.is_empty(),
+        "conflicting_messages={conflicting_messages:?}"
+    );
+    assert!(requests[6].messages.iter().any(|message| {
+        message
+            .content
+            .contains("Do not choose a different action or vary its arguments")
+    }));
+    assert_eq!(
+        requests[6]
+            .messages
+            .iter()
+            .filter(|message| message
+                .content
+                .starts_with("Follow the bounded repair plan."))
+            .count(),
+        1
+    );
 }
 
 #[test]

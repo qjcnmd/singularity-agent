@@ -125,6 +125,7 @@ const MAX_REPAIR_CONTEXT_ACTIONS: usize = 8;
 const MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS: usize = 8_000;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
+const REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS: &str = "The required verification action was not submitted exactly. Do not choose a different action or vary its arguments; submit only repair_context.required_verification_action.command_tool_input exactly as provided.";
 const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, submit only its command_tool_input exactly as the next action. additional_verification_actions are the ordered future actions, not permission to batch exclusive command calls; wait for each ToolResult before submitting the next action. Do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. Only when an exact command executes and fails should you choose a materially different repair strategy that addresses its evidence. Do not repeat the previous patch or claim success without new verification evidence.";
 const REVIEW_REPAIR_SIGNATURE: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000017";
@@ -1951,6 +1952,14 @@ impl AgentLoopState {
             .error_code
             .as_deref()
             .unwrap_or("tool_execution_failed");
+        // The public command error is intentionally coarse; the validated audit code retains the
+        // causal distinction needed to avoid treating different input repairs as one failure.
+        let repair_error_code = tool_result
+            .audit_metadata()
+            .and_then(Value::as_object)
+            .and_then(|audit| audit.get("argument_validation_code"))
+            .and_then(Value::as_str)
+            .unwrap_or(error_code);
         // A command-shaped call is a verification failure only after it crossed the execution
         // boundary and produced a revision observation. Schema/policy rejections and other
         // pre-execution failures are tool-input repairs; a corrected call to the same tool must
@@ -1965,7 +1974,7 @@ impl AgentLoopState {
             self.verification_failure_history
                 .insert(error_code.chars().take(128).collect());
         }
-        let signature = repair_failure_signature(tool_call_fingerprint, error_code);
+        let signature = repair_failure_signature(tool_call_fingerprint, repair_error_code);
         let consecutive_count = if self
             .last_repair_failure
             .as_ref()
@@ -2008,7 +2017,13 @@ impl AgentLoopState {
                 "repair planning budget exhausted; refusing another repair attempt".to_string(),
             );
         }
-        (consecutive_count >= 2).then_some(REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string())
+        (consecutive_count >= 2).then(|| {
+            if repair_error_code == "repair_action_mismatch" {
+                REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS.to_string()
+            } else {
+                REPEATED_FAILURE_RECOVERY_INSTRUCTIONS.to_string()
+            }
+        })
     }
 
     /// Drop only the active plan after a successful workspace/verification operation. Read-only
@@ -4616,6 +4631,14 @@ where
                 .repair_plan
                 .is_some()
                 .then(|| state.repair_feedback_with_failure(Some(&result)));
+            // Repair instructions describe current state, so replace their prior projection while
+            // retaining the immutable Assistant ToolCall and ToolResult transcript.
+            state.messages.retain(|message| {
+                message.role != ModelRole::Developer
+                    || (message.content != REPEATED_FAILURE_RECOVERY_INSTRUCTIONS
+                        && message.content != REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS
+                        && !message.content.starts_with(REPAIR_PLAN_INSTRUCTIONS))
+            });
             state.append_visible_tool_result(result, provider_tool_name);
             if let Some(feedback) = recovery_feedback {
                 state
