@@ -132,7 +132,7 @@ Turn 一旦持久化为 `running`，事件通知、AgentLoop、approval checkpoi
 
 `sg continue` 先调用 `thread/resume`，再创建一个新的 `turn/start`。app-server 从 SQLite 读取最多 64 个已完成历史 turn，只投影成按 turn/item sequence 排序的 user/assistant conversation message。当前 turn 不会重复进入 history。
 
-`turn/input` 接受调用方提供的 `inputId`、`delivery` 和非空 `input`，只允许写入非终态 Turn。`inputId` 是幂等键：同一 Turn、delivery 和内容的重复请求返回既有结果，换绑 Turn、delivery 或内容则 fail closed。每批内容先作为真实 `ItemKind::UserMessage` 按该 Turn 的 item sequence 持久化；`turn_inputs` 只保存 `inputId`、所引用 item、`steer`/`follow_up` 和 pending/consumed 消费关系，不复制消息正文，也不是第二消息事实源。
+`turn/input` 接受调用方提供的 `inputId`、`delivery` 和非空 `input`，只允许向非终态 Turn 写入新消息。`inputId` 是幂等键：同一 Turn、delivery 和内容的重复请求即使在 Turn 随后终态化后也返回既有结果，换绑 Turn、delivery 或内容则 fail closed；终态 Turn 的新 `inputId` 仍被拒绝。每批内容先作为真实 `ItemKind::UserMessage` 按该 Turn 的 item sequence 持久化；`turn_inputs` 只保存 `inputId`、所引用 item、`steer`/`follow_up` 和 pending/consumed 消费关系，不复制消息正文，也不是第二消息事实源。
 
 `steer` 在下一个完整 checkpoint 边界可见，不改变已经发出的 `ModelTurnRequest`；`follow_up` 只在当前响应已经完整提交或即将进入 finalization-only 时可见。多个 eligible input 按 item sequence 稳定消费，并在同一 SQLite 事务中把消费关系改为 consumed、写入已经包含这些 user message 的新 `TurnCheckpoint`；输入使旧 plan、verification、repair 和 final-review 决策失效，下一模型请求必须先重新规划。若 `steer` 在线性化工具执行前到达，`begin_tool_executions_at_checkpoint` 不登记执行 owner，AgentLoop 为每个未执行的结构化调用追加 typed `ToolResult`，其 `error_code` 为 `not_executed_due_to_user_input`，再处理新 user message；若执行 owner 已先登记，输入等待完整 `ToolResult` 的安全边界，不能取消、猜测或重试已经开始的副作用。
 

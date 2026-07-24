@@ -44,11 +44,6 @@ impl SessionStore {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let turn = self.turn_in_transaction(&transaction, turn_id)?;
-        if is_terminal_turn_status(&turn.status) {
-            return Err(StoreError::InvalidState(
-                "terminal turn cannot accept interactive input".to_string(),
-            ));
-        }
         let existing = transaction
             .query_row(
                 "select ti.turn_id, ti.delivery, i.payload
@@ -75,6 +70,11 @@ impl SessionStore {
             }
             transaction.commit()?;
             return Ok(turn);
+        }
+        if is_terminal_turn_status(&turn.status) {
+            return Err(StoreError::InvalidState(
+                "terminal turn cannot accept interactive input".to_string(),
+            ));
         }
 
         let item = Self::new_item(turn_id, ItemKind::UserMessage, input);

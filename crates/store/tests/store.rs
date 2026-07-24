@@ -566,6 +566,120 @@ fn turn_input_is_idempotent_ordered_and_consumed_with_its_checkpoint_once() {
 }
 
 #[test]
+fn accepted_turn_input_remains_idempotent_after_turn_terminalizes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _, _) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "original"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("started turn");
+    let input = serde_json::json!([{"type": "text", "text": "accepted"}]);
+    store
+        .append_turn_input(
+            &turn.turn_id,
+            "accepted-input",
+            TurnInputDelivery::Steer,
+            &input,
+        )
+        .expect("accepted input");
+    store
+        .consume_turn_inputs_with_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &["accepted-input".to_string()],
+            &serde_json::json!({"version": 2, "state": "after-input"}),
+            2,
+            false,
+        )
+        .expect("consume accepted input");
+    store
+        .commit_turn_outcome(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Completed,
+                agent_loop_status: "completed",
+                assistant_item_id: Some(&SessionStore::allocate_assistant_item_id()),
+                assistant_delta: Some("done"),
+                plan: None,
+                trace: &TraceEvent::for_turn(
+                    "trace_terminal_after_accepted_input",
+                    &thread.thread_id,
+                    &turn.turn_id,
+                    "agent_loop",
+                    "terminal result",
+                ),
+            },
+        )
+        .expect("terminal turn after consuming input");
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    let counts_before_retry: (u64, u64) = connection
+        .query_row(
+            "select (select count(*) from items where turn_id = ?1),
+                    (select count(*) from turn_inputs where turn_id = ?1)",
+            [&turn.turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("counts before retry");
+
+    let retried = store
+        .append_turn_input(
+            &turn.turn_id,
+            "accepted-input",
+            TurnInputDelivery::Steer,
+            &input,
+        )
+        .expect("same accepted input remains idempotent");
+    assert_eq!(retried.turn_id, turn.turn_id);
+    assert_eq!(retried.status, TurnStatus::Completed);
+    assert!(matches!(
+        store.append_turn_input(
+            &turn.turn_id,
+            "accepted-input",
+            TurnInputDelivery::Steer,
+            &serde_json::json!([{"type": "text", "text": "different"}]),
+        ),
+        Err(StoreError::InvalidState(message))
+            if message == "turn input idempotency key was reused with different content"
+    ));
+    assert!(matches!(
+        store.append_turn_input(
+            &turn.turn_id,
+            "new-input",
+            TurnInputDelivery::Steer,
+            &input,
+        ),
+        Err(StoreError::InvalidState(message))
+            if message == "terminal turn cannot accept interactive input"
+    ));
+
+    let counts_after_retry: (u64, u64) = connection
+        .query_row(
+            "select (select count(*) from items where turn_id = ?1),
+                    (select count(*) from turn_inputs where turn_id = ?1)",
+            [&turn.turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("counts after retry");
+    assert_eq!(counts_after_retry, counts_before_retry);
+    let delivery_state: String = connection
+        .query_row(
+            "select delivery_state from turn_inputs where input_id = 'accepted-input'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("delivery state");
+    assert_eq!(delivery_state, "consumed");
+}
+
+#[test]
 fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
     let store = SessionStore::open(":memory:").expect("open store");
     let thread = store.create_thread(None, None).expect("thread");
