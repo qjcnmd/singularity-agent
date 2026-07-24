@@ -8297,28 +8297,35 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
             }]
         }),
     ));
+    let mut pre_repair_mismatch =
+        ModelTurnResponse::completed("model_request_turn_exact_repair_2", "response_exact_2", "");
+    pre_repair_mismatch.tool_calls.push(tool_call(
+        "command_pre_repair_mismatch",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
     let premature = ModelTurnResponse::completed(
-        "model_request_turn_exact_repair_2",
-        "response_exact_2",
+        "model_request_turn_exact_repair_3",
+        "response_exact_3",
         "not verified",
     );
     let mut mismatched =
-        ModelTurnResponse::completed("model_request_turn_exact_repair_3", "response_exact_3", "");
+        ModelTurnResponse::completed("model_request_turn_exact_repair_4", "response_exact_4", "");
     mismatched.tool_calls.push(tool_call(
         "command_mismatch",
         "command",
         serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
     ));
     let mut exact =
-        ModelTurnResponse::completed("model_request_turn_exact_repair_4", "response_exact_4", "");
+        ModelTurnResponse::completed("model_request_turn_exact_repair_5", "response_exact_5", "");
     exact.tool_calls.push(tool_call(
         "command_exact",
         "command",
         serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 10}),
     ));
     let final_response = ModelTurnResponse::completed(
-        "model_request_turn_exact_repair_5",
-        "response_exact_5",
+        "model_request_turn_exact_repair_6",
+        "response_exact_6",
         "completed",
     );
 
@@ -8333,7 +8340,15 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
     );
     let result = AgentLoop::new(
         StaticProvider {
-            responses: vec![edit, plan, premature, mismatched, exact, final_response],
+            responses: vec![
+                edit,
+                plan,
+                pre_repair_mismatch,
+                premature,
+                mismatched,
+                exact,
+                final_response,
+            ],
             seen_requests: Arc::clone(&seen_requests),
             capabilities: ProviderProtocolContract::default(),
         },
@@ -8351,7 +8366,7 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
             "turn_exact_repair",
             "change and verify the fixture",
         )
-        .with_max_turns(6),
+        .with_max_turns(7),
     );
 
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
@@ -8363,7 +8378,7 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
             && event["executor_started"] == false
     }));
     let requests = seen_requests.lock().expect("exact repair requests");
-    for request in [&requests[3], &requests[4]] {
+    for request in [&requests[4], &requests[5]] {
         let command_schema = &request
             .tools
             .iter()

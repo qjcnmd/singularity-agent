@@ -1723,6 +1723,14 @@ impl AgentLoopState {
     /// produced failure evidence requiring a different strategy.
     fn required_repair_command_input(&self) -> Option<Value> {
         let repair = self.repair_plan.as_ref()?;
+        let entry = self.unmet_verification_entries(None).first()?.0;
+        let required_digest = command_script_scope_digest_with_policy(
+            &entry.action.command,
+            &entry.action.cwd,
+            entry.action.timeout_seconds,
+            entry.action.sandbox_mode.clone(),
+            entry.action.network_access.clone(),
+        );
         let exact_action_required = match repair.plan.reason {
             AgentRepairReason::VerificationFailed => {
                 repair.plan.required_revision.is_some()
@@ -1732,7 +1740,10 @@ impl AgentLoopState {
                         .rev()
                         .find(|occurrence| occurrence.result().tool_name == TOOL_COMMAND)
                         .is_none_or(|occurrence| {
-                            occurrence.result().workspace_observation().is_none()
+                            let result = occurrence.result();
+                            result.workspace_observation().is_none()
+                                || tool_result_command_scope_digest(result)
+                                    != Some(required_digest.as_str())
                         })
             }
             AgentRepairReason::ToolFailure => {
@@ -1743,9 +1754,7 @@ impl AgentLoopState {
         if !exact_action_required {
             return None;
         }
-        self.unmet_verification_entries(None)
-            .first()
-            .map(|(entry, _, _)| repair_command_tool_input(entry))
+        Some(repair_command_tool_input(entry))
     }
 
     fn previous_repair_symbol(&self, path: &str) -> Option<String> {
