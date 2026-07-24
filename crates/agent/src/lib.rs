@@ -121,9 +121,11 @@ const MAX_REPAIR_CONTEXT_CHARS: usize = 512;
 const MAX_REPAIR_CONTEXT_PATHS: usize = 8;
 const MAX_REPAIR_CONTEXT_PATH_CHARS: usize = 160;
 const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 65_536;
+const MAX_REPAIR_CONTEXT_ACTIONS: usize = 8;
+const MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS: usize = 8_000;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
-const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, execute its command_tool_input exactly as the next action; do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. Only when that exact command fails should you choose a materially different repair strategy that addresses its evidence. Do not repeat the previous patch or claim success without new verification evidence.";
+const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, execute its command_tool_input exactly as the next action; when additional_verification_actions are present, submit their exact command_tool_input calls in listed order in the same response if the tool contract permits multiple calls. Do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. Only when an exact command fails should you choose a materially different repair strategy that addresses its evidence. Do not repeat the previous patch or claim success without new verification evidence.";
 const REVIEW_REPAIR_SIGNATURE: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000017";
 const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call update_plan with all steps marked completed before providing the final answer.";
@@ -1616,37 +1618,34 @@ impl AgentLoopState {
                     .map(|occurrence| json!(safe_repair_tool_name(occurrence.result())))
             })
             .unwrap_or_else(|| json!(repair_reason_text(reason)));
-        let required_verification_action = self
-            .required_verification_entry(failure)
-            .map(|entry| {
-                json!({
-                    // Keep executable tool input separate from policy facts. The command schema
-                    // accepts only the former; copying enforced sandbox/network fields into the
-                    // tool call creates an invalid request instead of a verification attempt.
-                    "command_tool_input": {
-                        // The exact command must not be truncated because that changes its scope.
-                        "command": entry.action.command,
-                        "cwd": bounded_repair_text(&entry.action.cwd),
-                        "timeout_seconds": entry.action.timeout_seconds,
-                    },
-                    "enforced_policy_context": {
-                        "sandbox_mode": entry.action.sandbox_mode,
-                        "network_access": entry.action.network_access,
-                    },
-                    "submit_only_command_tool_input": true,
-                    "next_action": "execute_command_tool_input_exactly",
-                    "replan_or_mutate_before_execution": false,
-                    "command_scope_digest": command_script_scope_digest_with_policy(
-                        &entry.action.command,
-                        &entry.action.cwd,
-                        entry.action.timeout_seconds,
-                        entry.action.sandbox_mode.clone(),
-                        entry.action.network_access.clone(),
-                    ),
-                    "required_success_count": entry.required,
-                })
+        let unmet_actions = self.unmet_verification_entries(failure);
+        let remaining_verification_action_count = unmet_actions.len();
+        let required_verification_action = unmet_actions
+            .first()
+            .map(|(entry, required, remaining)| {
+                repair_verification_action(entry, *required, *remaining)
             })
             .unwrap_or(Value::Null);
+        let mut projected_command_chars = unmet_actions
+            .first()
+            .map_or(0, |(entry, _, _)| entry.action.command.chars().count());
+        let mut additional_verification_actions = Vec::new();
+        for (entry, required, remaining) in unmet_actions.iter().skip(1) {
+            let command_chars = entry.action.command.chars().count();
+            if additional_verification_actions.len() + 1 >= MAX_REPAIR_CONTEXT_ACTIONS
+                || projected_command_chars.saturating_add(command_chars)
+                    > MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS
+            {
+                break;
+            }
+            projected_command_chars = projected_command_chars.saturating_add(command_chars);
+            additional_verification_actions
+                .push(repair_verification_action(entry, *required, *remaining));
+        }
+        let projected_action_count = usize::from(required_verification_action != Value::Null)
+            + additional_verification_actions.len();
+        let verification_actions_truncated =
+            remaining_verification_action_count > projected_action_count;
         json!({
             "failed_requirement": bounded_repair_text(&failed_requirement),
             "evidence": failure
@@ -1658,19 +1657,55 @@ impl AgentLoopState {
             "previous_action": previous_action,
             "previous_result": previous_result,
             "required_verification_action": required_verification_action,
+            "additional_verification_actions": additional_verification_actions,
+            "remaining_verification_action_count": remaining_verification_action_count,
+            "verification_actions_truncated": verification_actions_truncated,
         })
     }
 
-    /// Select the trusted action for the failed or next-unmet revision-bound verification check.
+    /// Select the trusted actions for the failed and remaining revision-bound verification checks.
     ///
     /// A failed command may carry a scope digest that is not present in the plan. In that case the
-    /// completion reducer's terminal evidence identifies the first still-unmet check instead of
-    /// treating the untrusted command as the requested action.
-    fn required_verification_entry(
+    /// completion reducer's terminal evidence identifies still-unmet checks instead of treating
+    /// the untrusted command as a requested action. Each exact scope appears once with its
+    /// remaining required success count.
+    fn unmet_verification_entries(
         &self,
         failure: Option<&ToolResult>,
-    ) -> Option<&AgentVerificationEntry> {
-        let plan = self.verification_plan.as_ref()?;
+    ) -> Vec<(&AgentVerificationEntry, u32, u32)> {
+        let Some(plan) = self.verification_plan.as_ref() else {
+            return Vec::new();
+        };
+        let required_counts = plan
+            .plan
+            .requirements()
+            .into_iter()
+            .map(|requirement| {
+                (
+                    requirement.command_scope_digest,
+                    requirement.required_success_count,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let observed_counts = self.completion.terminal_command_counts();
+        let mut seen = BTreeSet::new();
+        let mut entries = Vec::new();
+        let mut add_entry = |index: usize| {
+            let Some(check) = plan.plan.checks.get(index) else {
+                return;
+            };
+            let digest = &check.requirement.command_scope_digest;
+            if !seen.insert(digest.clone()) {
+                return;
+            }
+            let required = required_counts.get(digest).copied().unwrap_or(0);
+            let observed = observed_counts.get(digest).copied().unwrap_or(0);
+            if let Some(entry) = plan.plan.entries.get(index)
+                && observed < required
+            {
+                entries.push((entry, required, required.saturating_sub(observed)));
+            }
+        };
         if let Some(index) = failure
             .and_then(tool_result_command_scope_digest)
             .and_then(|digest| {
@@ -1680,25 +1715,12 @@ impl AgentLoopState {
                     .position(|check| check.requirement.command_scope_digest == digest)
             })
         {
-            return plan.plan.entries.get(index);
+            add_entry(index);
         }
-
-        let terminal_digests = self.completion.terminal_command_scope_digests();
-        plan.plan
-            .checks
-            .iter()
-            .enumerate()
-            .find_map(|(index, check)| {
-                let observed = terminal_digests
-                    .iter()
-                    .filter(|digest| *digest == &check.requirement.command_scope_digest)
-                    .count();
-                (u32::try_from(observed).unwrap_or(u32::MAX)
-                    < check.requirement.required_success_count)
-                    .then(|| plan.plan.entries.get(index))
-                    .flatten()
-            })
-            .or_else(|| plan.plan.entries.first())
+        for index in 0..plan.plan.checks.len() {
+            add_entry(index);
+        }
+        entries
     }
 
     fn previous_repair_symbol(&self, path: &str) -> Option<String> {
@@ -6376,6 +6398,38 @@ fn repair_reason_text(reason: AgentRepairReason) -> &'static str {
 
 fn bounded_repair_text(value: &str) -> String {
     value.chars().take(MAX_REPAIR_CONTEXT_CHARS).collect()
+}
+
+/// Project one trusted exact verification action without mixing policy facts into tool input.
+fn repair_verification_action(
+    entry: &AgentVerificationEntry,
+    required_success_count: u32,
+    remaining_success_count: u32,
+) -> Value {
+    json!({
+        "command_tool_input": {
+            // The exact command must not be truncated because that changes its scope.
+            "command": entry.action.command,
+            "cwd": bounded_repair_text(&entry.action.cwd),
+            "timeout_seconds": entry.action.timeout_seconds,
+        },
+        "enforced_policy_context": {
+            "sandbox_mode": entry.action.sandbox_mode,
+            "network_access": entry.action.network_access,
+        },
+        "submit_only_command_tool_input": true,
+        "next_action": "execute_command_tool_input_exactly",
+        "replan_or_mutate_before_execution": false,
+        "command_scope_digest": command_script_scope_digest_with_policy(
+            &entry.action.command,
+            &entry.action.cwd,
+            entry.action.timeout_seconds,
+            entry.action.sandbox_mode.clone(),
+            entry.action.network_access.clone(),
+        ),
+        "required_success_count": required_success_count,
+        "remaining_success_count": remaining_success_count,
+    })
 }
 
 /// Project only the already-redacted public tool result payload into bounded repair evidence.

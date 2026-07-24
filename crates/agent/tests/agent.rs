@@ -8260,8 +8260,16 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
     let fixture_name = "repair_context.txt";
     std::fs::write(workspace.path().join(fixture_name), "v0").expect("write repair fixture");
     let command = format!("{}{}", test_command_script("failure"), " ".repeat(600));
+    let additional_command = test_command_script("additional");
     let expected_scope_digest = command_script_scope_digest_with_policy(
         &command,
+        ".",
+        10,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let expected_additional_scope_digest = command_script_scope_digest_with_policy(
+        &additional_command,
         ".",
         10,
         SandboxFilesystemMode::WorkspaceWrite,
@@ -8283,21 +8291,38 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
         "update_plan",
         serde_json::json!({
             "steps": [{"step": "verify the changed fixture", "status": "completed"}],
-            "verification": [{
-                "risk": "general_mutation",
-                "evidence": "changed repair_context.txt",
-                "affected_path": fixture_name,
-                "affected_symbol": "repair_context::value",
-                "current_gap": "verification evidence is not yet recorded",
-                "action": {
-                    "command": command,
-                    "cwd": ".",
-                    "timeout_seconds": 10,
-                    "sandbox_mode": "workspace_write",
-                    "network_access": "denied"
+            "verification": [
+                {
+                    "risk": "general_mutation",
+                    "evidence": "changed repair_context.txt",
+                    "affected_path": fixture_name,
+                    "affected_symbol": "repair_context::value",
+                    "current_gap": "verification evidence is not yet recorded",
+                    "action": {
+                        "command": command,
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
                 },
-                "required": 1
-            }]
+                {
+                    "risk": "optional_null",
+                    "evidence": "the changed value also needs an independent boundary check",
+                    "affected_path": fixture_name,
+                    "affected_symbol": "repair_context::value",
+                    "current_gap": "the additional verification evidence is not yet recorded",
+                    "action": {
+                        "command": additional_command,
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                }
+            ]
         }),
     ));
     let failed_command = |turn: u32| {
@@ -8416,7 +8441,13 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                 && message.content.contains("previous_action")
                 && message.content.contains("previous_result")
                 && message.content.contains("required_verification_action")
+                && message.content.contains("additional_verification_actions")
+                && message
+                    .content
+                    .contains("\"remaining_verification_action_count\":2")
+                && message.content.contains("\"verification_actions_truncated\":false")
                 && message.content.contains(&command)
+                && message.content.contains(&additional_command)
                 && message.content.contains("\"timeout_seconds\":10")
                 && message.content.contains("\"command_tool_input\"")
                 && message.content.contains("\"enforced_policy_context\"")
@@ -8434,14 +8465,45 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                     .contains("\"sandbox_mode\":\"workspace_write\"")
                 && message.content.contains("\"network_access\":\"denied\"")
                 && message.content.contains(&expected_scope_digest)
+                && message.content.contains(&expected_additional_scope_digest)
+                && message.content.contains("\"remaining_success_count\":1")
                 && message
                     .content
                     .contains("execute its command_tool_input exactly as the next action")
                 && message
                     .content
-                    .contains("Only when that exact command fails should you choose a materially different repair strategy")
+                    .contains("same response if the tool contract permits multiple calls")
+                && message
+                    .content
+                    .contains("Only when an exact command fails should you choose a materially different repair strategy")
         })
     }));
+    let repair_message = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .find(|message| {
+            message.role == ModelRole::Developer
+                && message.content.contains("additional_verification_actions")
+                && message.content.contains(&command)
+                && message.content.contains(&additional_command)
+        })
+        .expect("repair context with required and additional actions");
+    let repair_context: serde_json::Value = serde_json::from_str(
+        repair_message
+            .content
+            .split_once(" repair_context=")
+            .expect("repair context marker")
+            .1,
+    )
+    .expect("valid repair context JSON");
+    assert_eq!(
+        repair_context["required_verification_action"]["command_tool_input"]["command"],
+        command
+    );
+    assert_eq!(
+        repair_context["additional_verification_actions"][0]["command_tool_input"]["command"],
+        additional_command
+    );
     assert!(!requests.iter().any(|request| {
         request.messages.iter().any(|message| {
             message
