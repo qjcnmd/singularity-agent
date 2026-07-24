@@ -2192,14 +2192,14 @@ fn write_v12_tables(connection: &Connection, data: &LegacyData) -> StoreResult<(
                 event.span_status.map(TraceSpanStatus::as_storage_text),
                 event
                     .duration_ms
-                    .map(|value| i64::try_from(value))
+                    .map(i64::try_from)
                     .transpose()
                     .map_err(|_| {
                         StoreError::InvalidState("trace duration exceeds SQLite range".to_string())
                     })?,
                 event
                     .time_to_first_token_ms
-                    .map(|value| i64::try_from(value))
+                    .map(i64::try_from)
                     .transpose()
                     .map_err(|_| {
                         StoreError::InvalidState(

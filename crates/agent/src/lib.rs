@@ -154,7 +154,7 @@ impl ApprovalCheckpoint {
         inputs: &[String],
         cancel_pending_tool_call: bool,
     ) -> Result<TurnCheckpoint, String> {
-        if cancel_pending_tool_call != !inputs.is_empty() {
+        if cancel_pending_tool_call == inputs.is_empty() {
             return Err("approval checkpoint input handoff is inconsistent".to_string());
         }
         let mut state = self.state.clone();

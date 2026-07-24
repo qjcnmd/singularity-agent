@@ -751,15 +751,16 @@ fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
         store.get_turn(&turn.turn_id).expect("paused turn").status,
         TurnStatus::Paused
     );
-    assert!(matches!(
-        store.append_turn_input(
-            &turn.turn_id,
-            "paused-input",
-            TurnInputDelivery::Steer,
-            &serde_json::json!([{"type": "text", "text": "after pause"}]),
-        ),
-        Ok(_)
-    ));
+    assert!(
+        store
+            .append_turn_input(
+                &turn.turn_id,
+                "paused-input",
+                TurnInputDelivery::Steer,
+                &serde_json::json!([{"type": "text", "text": "after pause"}]),
+            )
+            .is_ok()
+    );
 }
 
 #[test]

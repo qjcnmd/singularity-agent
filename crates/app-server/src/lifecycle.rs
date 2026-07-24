@@ -10,7 +10,7 @@ fn turn_tool_execution_id(turn_id: &str, tool_call_id: &str) -> String {
 
 enum TurnBoundaryAction {
     Continue,
-    Restart(TurnCheckpoint),
+    Restart(Box<TurnCheckpoint>),
     Paused,
 }
 
@@ -577,7 +577,7 @@ impl AppServer {
         if boundary.pause_requested {
             Ok(TurnBoundaryAction::Paused)
         } else {
-            Ok(TurnBoundaryAction::Restart(updated))
+            Ok(TurnBoundaryAction::Restart(Box::new(updated)))
         }
     }
 
@@ -1779,11 +1779,7 @@ impl AppServer {
                 .project_result(&run_status)
                 .map_err(AppServerError::Store)?;
         }
-        if let Err(error) =
-            self.persist_agent_approval_requests(&result, invocation.monitor_control)
-        {
-            return Err(error);
-        }
+        self.persist_agent_approval_requests(&result, invocation.monitor_control)?;
         Ok(run_status)
     }
 

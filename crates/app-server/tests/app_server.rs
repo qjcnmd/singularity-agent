@@ -3238,11 +3238,13 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
             tool_name: "command".to_string(),
             raw_arguments: serde_json::json!({
                 "command": "type README.md",
+                "cwd": ".",
                 "timeout_seconds": 30
             })
             .to_string(),
             arguments: serde_json::json!({
                 "command": "type README.md",
+                "cwd": ".",
                 "timeout_seconds": 30
             }),
             parse_status: singularity_model::ModelToolParseStatus::Valid,
