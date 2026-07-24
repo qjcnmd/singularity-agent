@@ -8047,7 +8047,14 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
     let workspace = tempfile::tempdir().expect("repair context workspace");
     let fixture_name = "repair_context.txt";
     std::fs::write(workspace.path().join(fixture_name), "v0").expect("write repair fixture");
-    let command = test_command_script("failure");
+    let command = format!("{}{}", test_command_script("failure"), " ".repeat(600));
+    let expected_scope_digest = command_script_scope_digest_with_policy(
+        &command,
+        ".",
+        10,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
     let mut setup = ModelTurnResponse::completed("model_request_turn_context_0", "response_0", "");
     setup.tool_calls.push(tool_call(
         "setup_context",
@@ -8073,7 +8080,7 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                 "action": {
                     "command": command,
                     "cwd": ".",
-                    "timeout_seconds": 5,
+                    "timeout_seconds": 10,
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
@@ -8091,7 +8098,7 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
         response.tool_calls.push(tool_call(
             &call_id,
             "command",
-            serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+            serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 15}),
         ));
         response
     };
@@ -8183,6 +8190,14 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                 && message.content.contains("workspace_revision")
                 && message.content.contains("previous_action")
                 && message.content.contains("previous_result")
+                && message.content.contains("required_verification_action")
+                && message.content.contains(&command)
+                && message.content.contains("\"timeout_seconds\":10")
+                && message
+                    .content
+                    .contains("\"sandbox_mode\":\"workspace_write\"")
+                && message.content.contains("\"network_access\":\"denied\"")
+                && message.content.contains(&expected_scope_digest)
                 && message.content.contains("different repair strategy")
         })
     }));

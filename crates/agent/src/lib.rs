@@ -120,7 +120,7 @@ const MAX_REPAIR_PLAN_ATTEMPTS: u32 = 3;
 const MAX_REPAIR_CONTEXT_CHARS: usize = 512;
 const MAX_REPAIR_CONTEXT_PATHS: usize = 8;
 const MAX_REPAIR_CONTEXT_PATH_CHARS: usize = 160;
-const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 8_192;
+const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 65_536;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
 const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan: choose a materially different repair strategy that addresses the failed requirement, then rerun the revision-bound verification before final review. Do not repeat the previous repair action or claim success without new evidence.";
@@ -1334,6 +1334,7 @@ impl AgentLoopState {
                 "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
                 "previous_action": "bounded repair action unavailable",
                 "previous_result": "bounded repair result unavailable",
+                "required_verification_action": null,
             })
             .to_string()
         };
@@ -1597,6 +1598,29 @@ impl AgentLoopState {
                     .map(|occurrence| json!(safe_repair_tool_name(occurrence.result())))
             })
             .unwrap_or_else(|| json!(repair_reason_text(reason)));
+        let required_verification_action = self
+            .required_verification_entry(failure)
+            .map(|entry| {
+                json!({
+                    // The exact command is part of the trusted verification contract. Truncating
+                    // it would create a different scope and send the next repair cycle back into
+                    // the same mismatch. Its own schema already bounds it to 8,000 characters.
+                    "command": entry.action.command,
+                    "cwd": bounded_repair_text(&entry.action.cwd),
+                    "timeout_seconds": entry.action.timeout_seconds,
+                    "sandbox_mode": entry.action.sandbox_mode,
+                    "network_access": entry.action.network_access,
+                    "command_scope_digest": command_script_scope_digest_with_policy(
+                        &entry.action.command,
+                        &entry.action.cwd,
+                        entry.action.timeout_seconds,
+                        entry.action.sandbox_mode.clone(),
+                        entry.action.network_access.clone(),
+                    ),
+                    "required_success_count": entry.required,
+                })
+            })
+            .unwrap_or(Value::Null);
         json!({
             "failed_requirement": bounded_repair_text(&failed_requirement),
             "evidence": failure
@@ -1607,7 +1631,48 @@ impl AgentLoopState {
             "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
             "previous_action": previous_action,
             "previous_result": previous_result,
+            "required_verification_action": required_verification_action,
         })
+    }
+
+    /// Select the trusted action for the failed or next-unmet revision-bound verification check.
+    ///
+    /// A failed command may carry a scope digest that is not present in the plan. In that case the
+    /// completion reducer's terminal evidence identifies the first still-unmet check instead of
+    /// treating the untrusted command as the requested action.
+    fn required_verification_entry(
+        &self,
+        failure: Option<&ToolResult>,
+    ) -> Option<&AgentVerificationEntry> {
+        let plan = self.verification_plan.as_ref()?;
+        if let Some(index) = failure
+            .and_then(tool_result_command_scope_digest)
+            .and_then(|digest| {
+                plan.plan
+                    .checks
+                    .iter()
+                    .position(|check| check.requirement.command_scope_digest == digest)
+            })
+        {
+            return plan.plan.entries.get(index);
+        }
+
+        let terminal_digests = self.completion.terminal_command_scope_digests();
+        plan.plan
+            .checks
+            .iter()
+            .enumerate()
+            .find_map(|(index, check)| {
+                let observed = terminal_digests
+                    .iter()
+                    .filter(|digest| *digest == &check.requirement.command_scope_digest)
+                    .count();
+                (u32::try_from(observed).unwrap_or(u32::MAX)
+                    < check.requirement.required_success_count)
+                    .then(|| plan.plan.entries.get(index))
+                    .flatten()
+            })
+            .or_else(|| plan.plan.entries.first())
     }
 
     fn previous_repair_symbol(&self, path: &str) -> Option<String> {
