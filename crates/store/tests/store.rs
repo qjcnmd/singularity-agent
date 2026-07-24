@@ -3225,6 +3225,144 @@ fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
 }
 
 #[test]
+fn parallel_tool_result_checkpoint_clears_the_complete_batch_before_owner_recovery() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let pending_checkpoint = serde_json::json!({
+        "checkpoint_version": 1,
+        "boundary": "tool_calls_ready"
+    });
+    let executions = ["call_first", "call_second"].map(|tool_call_id| ToolExecution {
+        execution_id: format!("turn:{}:tool:{tool_call_id}", turn.turn_id),
+        thread_id: thread.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        tool_call_id: tool_call_id.to_string(),
+        state: ToolExecutionState::Running,
+        payload: serde_json::json!({"kind": "tool_call", "tool_name": "read"}),
+    });
+    assert!(
+        store
+            .begin_tool_executions_at_checkpoint(&executions, &pending_checkpoint, 1)
+            .expect("begin parallel read executions")
+    );
+
+    let committed_checkpoint = serde_json::json!({
+        "checkpoint_version": 1,
+        "boundary": "parallel_tool_results_committed",
+        "tool_call_ids": ["call_first", "call_second"]
+    });
+    store
+        .commit_tool_results_checkpoint(
+            &executions
+                .iter()
+                .map(|execution| execution.execution_id.clone())
+                .collect::<Vec<_>>(),
+            &turn.turn_id,
+            &thread.thread_id,
+            &committed_checkpoint,
+            1,
+        )
+        .expect("commit complete parallel result checkpoint");
+    drop(store);
+
+    let reopened = SessionStore::open(&db_path).expect("reopen store");
+    reopened
+        .recover_unowned_workspace_executions()
+        .expect("recover owner loss after complete batch");
+    for execution in &executions {
+        assert!(
+            reopened
+                .get_tool_execution(&execution.execution_id)
+                .expect("execution lookup")
+                .is_none(),
+            "a checkpoint containing the complete batch must clear every execution owner"
+        );
+    }
+    let (claimed, checkpoint) = reopened
+        .claim_suspended_turn(&turn.turn_id)
+        .expect("complete batch checkpoint remains resumable");
+    assert_eq!(claimed.status, TurnStatus::Running);
+    assert_eq!(checkpoint, committed_checkpoint);
+}
+
+#[test]
+fn tool_result_checkpoint_rejects_an_incomplete_or_invalid_batch_without_writes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let pending_checkpoint = serde_json::json!({
+        "checkpoint_version": 1,
+        "boundary": "tool_calls_ready"
+    });
+    let executions = ["call_first", "call_second"].map(|tool_call_id| ToolExecution {
+        execution_id: format!("turn:{}:tool:{tool_call_id}", turn.turn_id),
+        thread_id: thread.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        tool_call_id: tool_call_id.to_string(),
+        state: ToolExecutionState::Running,
+        payload: serde_json::json!({"kind": "tool_call", "tool_name": "read"}),
+    });
+    assert!(
+        store
+            .begin_tool_executions_at_checkpoint(&executions, &pending_checkpoint, 1)
+            .expect("begin parallel read executions")
+    );
+    let committed_checkpoint = serde_json::json!({
+        "checkpoint_version": 1,
+        "boundary": "parallel_tool_results_committed"
+    });
+    let invalid_batches = [
+        vec![executions[0].execution_id.clone()],
+        vec![
+            executions[0].execution_id.clone(),
+            executions[0].execution_id.clone(),
+        ],
+        vec![
+            executions[0].execution_id.clone(),
+            "turn:unknown:tool:call_unknown".to_string(),
+        ],
+    ];
+
+    for invalid_batch in invalid_batches {
+        assert!(matches!(
+            store.commit_tool_results_checkpoint(
+                &invalid_batch,
+                &turn.turn_id,
+                &thread.thread_id,
+                &committed_checkpoint,
+                1,
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert_eq!(
+            store
+                .get_turn_checkpoint(&turn.turn_id)
+                .expect("checkpoint lookup")
+                .expect("pending checkpoint"),
+            pending_checkpoint
+        );
+        for execution in &executions {
+            assert_eq!(
+                store
+                    .get_tool_execution(&execution.execution_id)
+                    .expect("execution lookup")
+                    .expect("running execution")
+                    .state,
+                ToolExecutionState::Running
+            );
+        }
+    }
+}
+
+#[test]
 fn turn_checkpoint_commit_is_atomic_and_unknown_execution_blocks_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");
@@ -3256,8 +3394,8 @@ fn turn_checkpoint_commit_is_atomic_and_unknown_execution_blocks_resume() {
         "boundary": "tool_result_committed"
     });
     store
-        .commit_tool_result_checkpoint(
-            &execution_id,
+        .commit_tool_results_checkpoint(
+            std::slice::from_ref(&execution_id),
             &turn.turn_id,
             &thread.thread_id,
             &committed_checkpoint,

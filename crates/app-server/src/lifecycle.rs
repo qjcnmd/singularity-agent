@@ -469,10 +469,14 @@ impl AppServer {
                 .save_turn_checkpoint(turn_id, thread_id, &checkpoint, checkpoint_version)
                 .map_err(AppServerError::Store)?,
             TurnCheckpointPhase::ToolCallsReady { .. } => {}
-            TurnCheckpointPhase::ToolResultCommitted { tool_call_id, .. } => {
+            TurnCheckpointPhase::ToolResultsCommitted { tool_call_ids } => {
+                let execution_ids = tool_call_ids
+                    .iter()
+                    .map(|tool_call_id| turn_tool_execution_id(turn_id, tool_call_id))
+                    .collect::<Vec<_>>();
                 self.store
-                    .commit_tool_result_checkpoint(
-                        &turn_tool_execution_id(turn_id, &tool_call_id),
+                    .commit_tool_results_checkpoint(
+                        &execution_ids,
                         turn_id,
                         thread_id,
                         &checkpoint,

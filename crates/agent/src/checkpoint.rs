@@ -213,8 +213,8 @@ pub struct TurnCheckpoint {
 }
 
 /// Durable-boundary notifications consumed by the process owner. The callback is invoked only at
-/// complete input, validated-tool-call, or complete ToolResult boundaries; it never receives a
-/// partial streamed assistant response.
+/// complete input, validated-tool-call, or complete ToolResult batch boundaries; it never receives
+/// a partial streamed assistant response.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnCheckpointPhase {
     Initial,
@@ -224,9 +224,8 @@ pub enum TurnCheckpointPhase {
     ToolCallsReady {
         pending_tool_calls: Vec<PendingToolCall>,
     },
-    ToolResultCommitted {
-        tool_call_id: String,
-        tool_name: String,
+    ToolResultsCommitted {
+        tool_call_ids: Vec<String>,
     },
     ModelResponseCommitted,
 }

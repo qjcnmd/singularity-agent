@@ -3,6 +3,7 @@
 use super::support::*;
 use super::*;
 use crate::approval::typed_approval_wait_start_trace;
+use std::collections::BTreeSet;
 
 /// Durable execution ownership state. `Unknown` is intentionally terminal for that execution:
 /// without a tool-specific reconciliation contract it must never be replayed automatically.
@@ -271,50 +272,57 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Atomically publish a complete ToolResult checkpoint and remove its active execution.
-    pub fn commit_tool_result_checkpoint(
+    /// Publish a complete ToolResult checkpoint only for the exact full running execution batch.
+    pub fn commit_tool_results_checkpoint(
         &self,
-        execution_id: &str,
+        execution_ids: &[String],
         turn_id: &str,
         thread_id: &str,
         checkpoint: &Value,
         checkpoint_version: u32,
     ) -> StoreResult<()> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let (stored_turn, stored_thread, state): (String, String, String) = transaction
-            .query_row(
-                "select turn_id, thread_id, execution_state from tool_executions where execution_id = ?1",
-                params![execution_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound(format!("tool execution {execution_id}")),
-                other => StoreError::Sqlite(other),
-            })?;
-        if stored_turn != turn_id || stored_thread != thread_id || state != "running" {
+        let unique_ids = execution_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if execution_ids.is_empty()
+            || unique_ids.len() != execution_ids.len()
+            || execution_ids.iter().any(|id| id.trim().is_empty())
+            || !checkpoint.is_object()
+        {
             return Err(StoreError::InvalidState(
-                "tool result checkpoint requires the active running execution".to_string(),
-            ));
-        }
-        if !checkpoint.is_object() {
-            return Err(StoreError::InvalidState(
-                "tool result checkpoint payload is invalid".to_string(),
+                "tool result checkpoint batch is invalid".to_string(),
             ));
         }
         let payload = serde_json::to_string(checkpoint)?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let mut statement = transaction.prepare(
+            "select execution_id from tool_executions
+             where turn_id = ?1 and thread_id = ?2 and execution_state = 'running'",
+        )?;
+        let running_ids = statement
+            .query_map(params![turn_id, thread_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        drop(statement);
+        if running_ids != unique_ids {
+            return Err(StoreError::InvalidState(
+                "tool result checkpoint must commit the complete running batch for the turn"
+                    .to_string(),
+            ));
+        }
         transaction.execute(
             "insert into turn_checkpoints(turn_id, thread_id, payload, checkpoint_version) values(?1, ?2, ?3, ?4)
              on conflict(turn_id) do update set thread_id=excluded.thread_id, payload=excluded.payload, checkpoint_version=excluded.checkpoint_version, created_at=current_timestamp",
             params![turn_id, thread_id, payload, checkpoint_version],
         )?;
-        let deleted = transaction.execute(
-            "delete from tool_executions where execution_id = ?1 and execution_state = 'running'",
-            params![execution_id],
-        )?;
-        if deleted != 1 {
+        let mut deleted = 0;
+        for execution_id in execution_ids {
+            deleted += transaction.execute(
+                "delete from tool_executions where execution_id = ?1 and execution_state = 'running'",
+                params![execution_id],
+            )?;
+        }
+        if deleted != execution_ids.len() {
             return Err(StoreError::InvalidState(
-                "tool execution was changed before checkpoint commit".to_string(),
+                "tool execution batch changed before checkpoint commit".to_string(),
             ));
         }
         transaction.commit()?;

@@ -4608,19 +4608,19 @@ where
             if !matches!(control, ToolBatchControl::Continue) {
                 return control;
             }
-            for occurrence in occurrences {
-                let phase = TurnCheckpointPhase::ToolResultCommitted {
-                    tool_call_id: occurrence.call.tool_call_id.clone(),
-                    tool_name: occurrence.call.tool_name.clone(),
-                };
-                if !matches!(
-                    self.emit_checkpoint_event(input, state, phase, next_model_turn, on_checkpoint),
-                    ToolBatchControl::Continue
-                ) {
-                    return ToolBatchControl::Failed(
-                        "tool-result checkpoint persistence failed".to_string(),
-                    );
-                }
+            let phase = TurnCheckpointPhase::ToolResultsCommitted {
+                tool_call_ids: occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.call.tool_call_id.clone())
+                    .collect(),
+            };
+            if !matches!(
+                self.emit_checkpoint_event(input, state, phase, next_model_turn, on_checkpoint),
+                ToolBatchControl::Continue
+            ) {
+                return ToolBatchControl::Failed(
+                    "tool-result checkpoint persistence failed".to_string(),
+                );
             }
             return ToolBatchControl::Continue;
         }
@@ -4750,14 +4750,10 @@ where
         self.emit_checkpoint_event(
             input,
             state,
-            TurnCheckpointPhase::ToolResultCommitted {
-                tool_call_id: occurrences
+            TurnCheckpointPhase::ToolResultsCommitted {
+                tool_call_ids: occurrences
                     .first()
-                    .map(|occurrence| occurrence.call.tool_call_id.clone())
-                    .unwrap_or_default(),
-                tool_name: occurrences
-                    .first()
-                    .map(|occurrence| occurrence.call.tool_name.clone())
+                    .map(|occurrence| vec![occurrence.call.tool_call_id.clone()])
                     .unwrap_or_default(),
             },
             next_model_turn,

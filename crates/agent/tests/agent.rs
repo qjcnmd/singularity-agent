@@ -11,8 +11,8 @@ use singularity_agent::{
     AgentVerificationRequirement, AgentVerificationRisk, ApprovalGrant, FinalReviewStatus,
     FinalReviewVerdict, OccurrenceLifecycle, PendingApprovalOccurrence, PolicyDecisionCause,
     PolicyDecisionStatus, PromptAssemblyStatus, RepairPlanningStatus, SandboxExecutionStatus,
-    ToolCallStatus, VerificationPlanStatus, VerificationStatus, agent_control_tool_entries,
-    assemble_context_items,
+    ToolCallStatus, TurnCheckpointPhase, VerificationPlanStatus, VerificationStatus,
+    agent_control_tool_entries, assemble_context_items,
 };
 use singularity_core::{CancellationToken, ProjectInstructions, load_project_instructions};
 use singularity_model::{
@@ -2200,6 +2200,7 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
     ));
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let mut events = Vec::new();
+    let mut checkpoint_events = Vec::new();
     let result = agent_loop_with_capabilities(
         vec![
             response,
@@ -2214,10 +2215,17 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
         },
     )
     .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("bind workspace tools"))
-    .run_with_events(&input, &mut |event| {
-        events.push(event);
-        Ok(())
-    });
+    .run_with_events_and_checkpoints(
+        &input,
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+        &mut |event| {
+            checkpoint_events.push(event);
+            Ok(())
+        },
+    );
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.model_turns, 2);
@@ -2280,6 +2288,15 @@ fn agent_loop_executes_admitted_read_batch_in_response_order() {
         event,
         AgentLoopEvent::Observation(AgentObservation::SandboxExecution(_))
     )));
+    let committed_batches = checkpoint_events
+        .iter()
+        .filter_map(|event| match &event.phase {
+            TurnCheckpointPhase::ToolResultsCommitted { tool_call_ids } => Some(tool_call_ids),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(committed_batches.len(), 1);
+    assert_eq!(committed_batches[0], &["call_1", "call_2", "call_3"]);
 }
 
 #[test]
