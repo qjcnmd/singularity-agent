@@ -25,7 +25,8 @@ use serde_json::{Value, json};
 use singularity_agent::{
     AgentContextItem, AgentLoop, AgentLoopCapability, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentRunStatus, AgentStatus, ApprovalGrant,
-    PendingApprovalOccurrence, agent_control_tool_entries, project_audit_event,
+    PendingApprovalOccurrence, TurnCheckpoint, TurnCheckpointEvent, TurnCheckpointPhase,
+    agent_control_tool_entries, project_audit_event,
 };
 use singularity_core::{
     CancellationToken, ErrorCode, JSON_RPC_INTERNAL_ERROR, ProjectInstructionError,
@@ -46,13 +47,14 @@ use singularity_protocol::{
     ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
     ThreadReadParams, ThreadReadResult, ThreadResult, ThreadStartParams, ThreadStartResult,
-    TraceEvent, TransportCapability, Turn, TurnIdParams, TurnInterruptResult, TurnResult,
-    TurnStartParams, TurnStartResult, TurnStatus,
+    TraceEvent, TransportCapability, Turn, TurnIdParams, TurnInputParams, TurnInterruptResult,
+    TurnResult, TurnStartParams, TurnStartResult, TurnStatus,
 };
 use singularity_sandbox::{PlatformSandboxBackend, SandboxBackend, SandboxBackendEnforcement};
 use singularity_store::{
     AllocatedAssistantItemId, CommitTurnOutcomeParams, CommittedTurnOutcome,
-    CreateStartedTurnParams, SessionStore, StoreError, TurnOutcomeAuthority,
+    CreateStartedTurnParams, SessionStore, StoreError, ToolExecution, ToolExecutionState,
+    TurnOutcomeAuthority,
 };
 use singularity_tools::{
     COMMAND_TOOL as TOOL_COMMAND, EDIT_TOOL as TOOL_EDIT, GREP_TOOL as TOOL_GREP,
@@ -1309,6 +1311,7 @@ fn sanitize_agent_run_status_error(status: &mut AgentRunStatus) {
 fn turn_status_for_agent(status: &AgentStatus) -> TurnStatus {
     match status {
         AgentStatus::Completed => TurnStatus::Completed,
+        AgentStatus::Paused => TurnStatus::Paused,
         AgentStatus::Blocked => TurnStatus::Blocked,
         AgentStatus::CancelRequested | AgentStatus::Cancelled => TurnStatus::Interrupted,
         AgentStatus::Running => TurnStatus::Running,

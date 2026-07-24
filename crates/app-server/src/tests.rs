@@ -1203,11 +1203,13 @@ fn stopped_execution_does_not_consume_a_pending_tool_approval() {
     );
 }
 
+#[derive(Clone)]
 struct StaticProvider {
     responses: Vec<ModelTurnResponse>,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
 }
 
+#[derive(Clone)]
 struct StreamingProvider {
     responses: Vec<(Vec<ProviderStreamEvent>, ModelTurnResponse)>,
     seen_requests: Arc<Mutex<Vec<ModelTurnRequest>>>,
@@ -1423,6 +1425,9 @@ fn agent_loop_loads_bounded_agents_md_from_thread_cwd() {
     let thread = store
         .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
         .expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+        .expect("turn");
     let params = TurnStartParams {
         thread_id: thread.thread_id.clone(),
         input: vec![singularity_protocol::InputItem::Text {
@@ -1445,7 +1450,7 @@ fn agent_loop_loads_bounded_agents_md_from_thread_cwd() {
             provider,
             &thread,
             &params,
-            "turn_1",
+            &turn.turn_id,
             &[],
             &CancellationToken::new(),
         )
@@ -3488,6 +3493,9 @@ fn agent_loop_command_uses_bound_sandbox_backend_without_approval() {
     let thread = store
         .create_thread(Some("gpt-test"), Some(&workspace.to_string_lossy()))
         .expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, AgentStatus::Running.as_str())
+        .expect("turn");
     let params = TurnStartParams {
         thread_id: thread.thread_id.clone(),
         input: vec![singularity_protocol::InputItem::Text {
@@ -3524,7 +3532,7 @@ fn agent_loop_command_uses_bound_sandbox_backend_without_approval() {
             provider,
             &thread,
             &params,
-            "turn_1",
+            &turn.turn_id,
             &[],
             &CancellationToken::new(),
         )

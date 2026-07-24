@@ -3472,6 +3472,158 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
         2,
         "initial and resumed capability-cache observations must both persist"
     );
+
+    // A deny that races with accepted steer records the decision but continues the same turn.
+    let steered_dir = tempfile::tempdir().expect("steered temp dir");
+    let steered_workspace = steered_dir.path().join("workspace");
+    std::fs::create_dir_all(steered_workspace.join(".git")).expect("steered workspace");
+    let steered_file = steered_workspace.join("README.md");
+    std::fs::write(&steered_file, "before").expect("steered readme");
+    let steered_db = steered_dir.path().join("sessions.sqlite3");
+    let steered_store = SessionStore::open(&steered_db).expect("steered store");
+    let mut steered_edit = ModelTurnResponse::completed("steer_req_1", "steer_resp_1", "");
+    steered_edit
+        .tool_calls
+        .push(singularity_model::ModelToolCall {
+            tool_call_id: "steered_edit_call".to_string(),
+            tool_name: "edit".to_string(),
+            raw_arguments: serde_json::json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "must-not-run"
+            })
+            .to_string(),
+            arguments: serde_json::json!({
+                "path": "README.md",
+                "expected": "before",
+                "replacement": "must-not-run"
+            }),
+            parse_status: singularity_model::ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+    let steered_plan_arguments = serde_json::json!({
+        "steps": [{"step": "follow the updated user direction", "status": "completed"}]
+    });
+    let mut steered_plan = ModelTurnResponse::completed("steer_req_2", "steer_resp_2", "");
+    steered_plan
+        .tool_calls
+        .push(singularity_model::ModelToolCall {
+            tool_call_id: "steered_plan_call".to_string(),
+            tool_name: "update_plan".to_string(),
+            raw_arguments: steered_plan_arguments.to_string(),
+            arguments: steered_plan_arguments,
+            parse_status: singularity_model::ModelToolParseStatus::Valid,
+            validation_errors: Vec::new(),
+        });
+    let steered_requests = Arc::new(Mutex::new(Vec::new()));
+    let steered_provider = SequenceProvider {
+        responses: vec![
+            steered_edit,
+            steered_plan,
+            ModelTurnResponse::completed(
+                "steer_req_3",
+                "steer_resp_3",
+                "updated direction accepted",
+            ),
+        ],
+        seen_requests: Arc::clone(&steered_requests),
+        negotiation_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    };
+    let mut steered_server = app_server(steered_store)
+        .with_test_provider(Arc::new(steered_provider))
+        .with_sandbox_backend(CompletedSandboxBackend);
+    steered_server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":101,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
+        .expect("initialize steered server");
+    steered_server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
+        .expect("initialize steered notification");
+    let steered_thread = steered_server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"thread/start","id":102,"params":{{"cwd":{},"sandboxMode":"workspace-write","approvalPolicy":"on-request"}}}}"#,
+            serde_json::to_string(&steered_workspace.to_string_lossy()).expect("steered cwd")
+        ))
+        .expect("steered thread");
+    let steered_thread_id = result_message(&steered_thread)["thread"]["thread_id"]
+        .as_str()
+        .expect("steered thread id")
+        .to_string();
+    steered_server
+        .handle_json(&format!(
+            r#"{{"jsonrpc":"2.0","method":"turn/start","id":103,"params":{{"threadId":"{steered_thread_id}","input":[{{"type":"text","text":"Edit README.md"}}]}}}}"#
+        ))
+        .expect("steered blocked turn");
+    let steered_store = SessionStore::open(&steered_db).expect("reopen steered store");
+    let steered_approval = steered_store
+        .list_pending_approvals()
+        .expect("steered approval")
+        .pop()
+        .expect("pending steered approval");
+    steered_server
+        .handle_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "turn/input",
+                "id": 104,
+                "params": {
+                    "turnId": steered_approval.turn_id.clone(),
+                    "inputId": "approval-steer",
+                    "delivery": "steer",
+                    "input": [{"type": "text", "text": "Do not edit; explain instead"}]
+                }
+            })
+            .to_string(),
+        )
+        .expect("persist approval steer");
+    steered_server
+        .handle_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "approval/decision",
+                "id": 105,
+                "params": ApprovalDecision::new(
+                    steered_approval.request_id,
+                    ApprovalOutcome::Deny,
+                    "operator denied the original call",
+                )
+            })
+            .to_string(),
+        )
+        .expect("approval steer continuation");
+    assert_eq!(
+        std::fs::read_to_string(&steered_file).expect("steered readme"),
+        "before",
+        "the superseded approved call must not execute"
+    );
+    assert_eq!(
+        SessionStore::open(&steered_db)
+            .expect("final steered store")
+            .get_turn(&steered_approval.turn_id)
+            .expect("steered turn")
+            .status,
+        singularity_protocol::TurnStatus::Completed
+    );
+    let steered_requests = steered_requests.lock().expect("steered requests");
+    assert_eq!(steered_requests.len(), 3);
+    assert!(
+        steered_requests[1]
+            .messages
+            .iter()
+            .any(|message| message.role == singularity_model::ModelRole::User
+                && message.content == "Do not edit; explain instead")
+    );
+    let cancelled = steered_requests[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == singularity_model::ModelRole::Tool
+                && message.tool_call_id.as_deref() == Some("steered_edit_call")
+        })
+        .expect("typed cancelled tool result");
+    let cancelled: serde_json::Value =
+        serde_json::from_str(&cancelled.content).expect("cancelled result payload");
+    assert_eq!(cancelled["error_code"], "approval_denied");
+    assert_eq!(cancelled["failure_kind"], "cancelled");
 }
 
 fn result_message(messages: &[serde_json::Value]) -> &serde_json::Value {

@@ -129,8 +129,8 @@ impl PendingApprovalOccurrence {
         if self.request.request_id != pending.request_id {
             return Err("approval occurrence request mismatch".to_string());
         }
-        if self.request.thread_id != self.checkpoint.thread_id
-            || self.request.turn_id != self.checkpoint.turn_id
+        if self.request.thread_id != self.checkpoint.state.thread_id
+            || self.request.turn_id != self.checkpoint.state.turn_id
         {
             return Err("approval occurrence thread or turn mismatch".to_string());
         }
@@ -151,6 +151,16 @@ impl PendingApprovalOccurrence {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalCheckpoint {
     pub(super) pending_tool_call: PendingToolCall,
+    pub(super) state: CheckpointState,
+}
+
+/// The state shared by approval and ordinary turn checkpoints.
+///
+/// Keeping this as one private value is intentional: validation and resume must not drift between
+/// the approval continuation path and a process-restart continuation path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CheckpointState {
     pub(super) checkpoint_version: u32,
     pub(super) thread_id: String,
     pub(super) turn_id: String,
@@ -160,13 +170,26 @@ pub struct ApprovalCheckpoint {
     pub(super) used_approval_grants: Vec<String>,
     pub(super) approval_count: u32,
     pub(super) model_turns: u32,
+    #[serde(default)]
+    pub(super) resume_attempt: u32,
+    /// Monotonic count of persisted user-input deliveries applied after turn/start.
+    #[serde(default)]
+    pub(super) input_revision: u32,
+    #[serde(default)]
+    pub(super) replanned_input_revision: u32,
     pub(super) completion: CompletionTracker,
+    #[serde(default)]
     pub(super) verification_plan: Option<super::VerificationPlanState>,
+    #[serde(default)]
     pub(super) verification_change: Option<super::VerificationChangeSummary>,
+    #[serde(default)]
     pub(super) verification_failure_history: Vec<String>,
+    #[serde(default)]
     pub(super) repair_plan: Option<super::RepairPlanState>,
     pub(super) repair_attempts: u32,
+    #[serde(default)]
     pub(super) repair_cycles: Vec<super::RepairCycleRecord>,
+    #[serde(default)]
     pub(super) final_review_verdict: Option<super::FinalReviewVerdict>,
     pub(super) last_completion_error: Option<String>,
     pub(super) plan: Option<AgentPlan>,
@@ -179,43 +202,56 @@ pub struct ApprovalCheckpoint {
     pub(super) last_repair_failure: Option<RepairFailureState>,
 }
 
+/// A durable boundary for a non-approval turn and its next safe action.
+///
+/// Validated calls are retained only until execution starts. Once the store records `Running`,
+/// owner loss becomes `Unknown` and this checkpoint can no longer authorize automatic execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnCheckpoint {
+    pub(super) state: CheckpointState,
+    pub(super) pending_tool_calls: Vec<PendingToolCall>,
+}
+
+/// Durable-boundary notifications consumed by the process owner. The callback is invoked only at
+/// complete input, validated-tool-call, or complete ToolResult boundaries; it never receives a
+/// partial streamed assistant response.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnCheckpointPhase {
+    Initial,
+    BeforeModelRequest {
+        finalization_only: bool,
+    },
+    ToolCallsReady {
+        pending_tool_calls: Vec<PendingToolCall>,
+    },
+    ToolResultCommitted {
+        tool_call_id: String,
+        tool_name: String,
+    },
+    ModelResponseCommitted,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnCheckpointEvent {
+    pub phase: TurnCheckpointPhase,
+    pub checkpoint: TurnCheckpoint,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovalCheckpointWire {
     #[serde(flatten)]
     pending_tool_call: PendingToolCall,
-    checkpoint_version: u32,
-    thread_id: String,
-    turn_id: String,
-    project_instructions_digest: Option<String>,
-    messages: Vec<ModelMessage>,
-    tool_result_occurrences: Vec<ToolResultOccurrence>,
-    used_approval_grants: Vec<String>,
-    approval_count: u32,
-    model_turns: u32,
-    completion: CompletionTracker,
-    #[serde(default)]
-    verification_plan: Option<super::VerificationPlanState>,
-    #[serde(default)]
-    verification_change: Option<super::VerificationChangeSummary>,
-    #[serde(default)]
-    verification_failure_history: Vec<String>,
-    #[serde(default)]
-    repair_plan: Option<super::RepairPlanState>,
-    repair_attempts: u32,
-    #[serde(default)]
-    repair_cycles: Vec<super::RepairCycleRecord>,
-    #[serde(default)]
-    final_review_verdict: Option<super::FinalReviewVerdict>,
-    last_completion_error: Option<String>,
-    plan: Option<AgentPlan>,
-    plan_update_count: u32,
-    recovery_metrics: AgentRecoveryMetrics,
-    model_usage: ModelUsage,
-    provider_attempts: ProviderAttemptMetadata,
-    context_trace: Option<AgentContextTrace>,
-    seen_tool_call_fingerprints: Vec<String>,
-    last_repair_failure: Option<RepairFailureState>,
+    #[serde(flatten)]
+    state: CheckpointState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnCheckpointWire {
+    pending_tool_calls: Vec<PendingToolCall>,
+    #[serde(flatten)]
+    state: CheckpointState,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,32 +263,7 @@ impl From<&ApprovalCheckpoint> for ApprovalCheckpointWire {
     fn from(checkpoint: &ApprovalCheckpoint) -> Self {
         Self {
             pending_tool_call: checkpoint.pending_tool_call.clone(),
-            checkpoint_version: checkpoint.checkpoint_version,
-            thread_id: checkpoint.thread_id.clone(),
-            turn_id: checkpoint.turn_id.clone(),
-            project_instructions_digest: checkpoint.project_instructions_digest.clone(),
-            messages: checkpoint.messages.clone(),
-            tool_result_occurrences: checkpoint.tool_result_occurrences.clone(),
-            used_approval_grants: checkpoint.used_approval_grants.clone(),
-            approval_count: checkpoint.approval_count,
-            model_turns: checkpoint.model_turns,
-            completion: checkpoint.completion.clone(),
-            verification_plan: checkpoint.verification_plan.clone(),
-            verification_change: checkpoint.verification_change.clone(),
-            verification_failure_history: checkpoint.verification_failure_history.clone(),
-            repair_plan: checkpoint.repair_plan.clone(),
-            repair_attempts: checkpoint.repair_attempts,
-            repair_cycles: checkpoint.repair_cycles.clone(),
-            final_review_verdict: checkpoint.final_review_verdict,
-            last_completion_error: checkpoint.last_completion_error.clone(),
-            plan: checkpoint.plan.clone(),
-            plan_update_count: checkpoint.plan_update_count,
-            recovery_metrics: checkpoint.recovery_metrics.clone(),
-            model_usage: checkpoint.model_usage.clone(),
-            provider_attempts: checkpoint.provider_attempts.clone(),
-            context_trace: checkpoint.context_trace.clone(),
-            seen_tool_call_fingerprints: checkpoint.seen_tool_call_fingerprints.clone(),
-            last_repair_failure: checkpoint.last_repair_failure.clone(),
+            state: checkpoint.state.clone(),
         }
     }
 }
@@ -289,53 +300,129 @@ impl ApprovalCheckpoint {
     fn from_wire(wire: ApprovalCheckpointWire) -> Self {
         Self {
             pending_tool_call: wire.pending_tool_call,
-            checkpoint_version: wire.checkpoint_version,
-            thread_id: wire.thread_id,
-            turn_id: wire.turn_id,
-            project_instructions_digest: wire.project_instructions_digest,
-            messages: wire.messages,
-            tool_result_occurrences: wire.tool_result_occurrences,
-            used_approval_grants: wire.used_approval_grants,
-            approval_count: wire.approval_count,
-            model_turns: wire.model_turns,
-            completion: wire.completion,
-            verification_plan: wire.verification_plan,
-            verification_change: wire.verification_change,
-            verification_failure_history: wire.verification_failure_history,
-            repair_plan: wire.repair_plan,
-            repair_attempts: wire.repair_attempts,
-            repair_cycles: wire.repair_cycles,
-            final_review_verdict: wire.final_review_verdict,
-            last_completion_error: wire.last_completion_error,
-            plan: wire.plan,
-            plan_update_count: wire.plan_update_count,
-            recovery_metrics: wire.recovery_metrics,
-            model_usage: wire.model_usage,
-            provider_attempts: wire.provider_attempts,
-            context_trace: wire.context_trace,
-            seen_tool_call_fingerprints: wire.seen_tool_call_fingerprints,
-            last_repair_failure: wire.last_repair_failure,
+            state: wire.state,
         }
+    }
+}
+
+impl TurnCheckpoint {
+    /// Encode a validated ordinary turn checkpoint at the persistence boundary.
+    pub fn encode(&self) -> Result<Value, String> {
+        self.validate_serialized()?;
+        serde_json::to_value(TurnCheckpointWire {
+            pending_tool_calls: self.pending_tool_calls.clone(),
+            state: self.state.clone(),
+        })
+        .map_err(|error| format!("turn checkpoint serialization failed: {error}"))
+    }
+
+    /// Decode and fail closed on old, future, or unknown checkpoint fields.
+    pub fn decode(payload: &Value) -> Result<Self, String> {
+        let version: CheckpointVersion = serde_json::from_value(payload.clone())
+            .map_err(|error| format!("invalid turn checkpoint version: {error}"))?;
+        if version.checkpoint_version != super::TURN_CHECKPOINT_VERSION {
+            return Err("unsupported turn checkpoint version".to_string());
+        }
+        let wire: TurnCheckpointWire = serde_json::from_value(payload.clone())
+            .map_err(|error| format!("invalid turn checkpoint: {error}"))?;
+        let checkpoint = Self {
+            state: wire.state,
+            pending_tool_calls: wire.pending_tool_calls,
+        };
+        checkpoint.validate_serialized()?;
+        Ok(checkpoint)
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.state.thread_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.state.turn_id
+    }
+
+    pub fn model_turns(&self) -> u32 {
+        self.state.model_turns
+    }
+
+    /// Return the codec version that must be stored beside this payload.
+    pub fn checkpoint_version(&self) -> u32 {
+        self.state.checkpoint_version
+    }
+
+    /// Return the durable occurrence-identity epoch for this continuation.
+    pub fn resume_attempt(&self) -> u32 {
+        self.state.resume_attempt
+    }
+
+    /// Bind a new persisted continuation epoch before issuing provider requests.
+    pub fn with_resume_attempt(mut self, resume_attempt: u32) -> Self {
+        self.state.resume_attempt = resume_attempt;
+        self
+    }
+
+    /// Return how many interactive input batches are already represented by this checkpoint.
+    pub fn input_revision(&self) -> u32 {
+        self.state.input_revision
+    }
+
+    /// Return canonical validated calls that may run only when no execution became `Unknown`.
+    pub fn pending_tool_calls(&self) -> &[PendingToolCall] {
+        &self.pending_tool_calls
     }
 }
 
 impl ApprovalCheckpoint {
     pub(super) fn validate_serialized(&self) -> Result<(), String> {
-        if self.checkpoint_version != APPROVAL_CHECKPOINT_VERSION {
+        self.pending_tool_call.validate()?;
+        self.state
+            .validate_serialized(APPROVAL_CHECKPOINT_VERSION, true)
+    }
+}
+
+impl TurnCheckpoint {
+    fn validate_serialized(&self) -> Result<(), String> {
+        self.state
+            .validate_serialized(super::TURN_CHECKPOINT_VERSION, false)?;
+        let mut ids = BTreeSet::new();
+        for pending in &self.pending_tool_calls {
+            pending.validate()?;
+            if pending.request_id.is_empty() || !ids.insert(&pending.tool_call_id) {
+                return Err("turn checkpoint contains duplicate pending tool calls".to_string());
+            }
+            let bound = self.state.messages.iter().rev().any(|message| {
+                message.tool_calls.iter().any(|call| {
+                    call.tool_call_id == pending.tool_call_id
+                        && call.tool_name == pending.tool_name.as_str()
+                })
+            });
+            if !bound {
+                return Err("turn checkpoint pending tool call binding is invalid".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CheckpointState {
+    fn validate_serialized(&self, expected_version: u32, approval: bool) -> Result<(), String> {
+        if self.checkpoint_version != expected_version {
             return Err("unsupported approval checkpoint version".to_string());
         }
         if self.thread_id.trim().is_empty() || self.turn_id.trim().is_empty() {
             return Err("approval checkpoint thread or turn is missing".to_string());
         }
-        self.pending_tool_call.validate()?;
-        if self.model_turns == 0 {
+        if approval && self.model_turns == 0 {
             return Err("approval checkpoint model-turn offset is invalid".to_string());
         }
-        if self.approval_count == 0 {
+        if approval && self.approval_count == 0 {
             return Err("approval checkpoint approval count is invalid".to_string());
         }
         if self.messages.is_empty() {
             return Err("approval checkpoint messages are missing".to_string());
+        }
+        if self.replanned_input_revision > self.input_revision {
+            return Err("approval checkpoint input revision is invalid".to_string());
         }
         let used_approval_grants = self.used_approval_grants.iter().collect::<BTreeSet<_>>();
         if used_approval_grants.len() != self.used_approval_grants.len() {
@@ -347,7 +434,9 @@ impl ApprovalCheckpoint {
             if self.plan_update_count == 0 {
                 return Err("approval checkpoint plan update count is invalid".to_string());
             }
-        } else if self.plan_update_count != 0 {
+        } else if self.plan_update_count != 0
+            && self.input_revision == self.replanned_input_revision
+        {
             return Err("approval checkpoint plan update count is invalid".to_string());
         }
         let seen_tool_call_fingerprints = self
@@ -528,7 +617,10 @@ impl ApprovalCheckpoint {
         {
             return Err("approval checkpoint repair attempt ledger is not monotonic".to_string());
         }
-        if self.repair_plan.is_none() && self.completion.has_unresolved_failures() {
+        if self.input_revision == self.replanned_input_revision
+            && self.repair_plan.is_none()
+            && self.completion.has_unresolved_failures()
+        {
             return Err(
                 "approval checkpoint repair state is missing for unresolved failure".to_string(),
             );

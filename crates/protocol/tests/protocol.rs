@@ -388,7 +388,7 @@ fn json_rpc_payload_distinguishes_empty_single_and_mixed_batch() {
 
 #[test]
 fn method_registry_is_the_unique_name_and_contract_source() {
-    assert_eq!(METHOD_REGISTRY.len(), 26);
+    assert_eq!(METHOD_REGISTRY.len(), 29);
     for spec in METHOD_REGISTRY {
         assert_eq!(Method::parse(spec.name), Some(spec.method));
         assert_eq!(spec.method.as_str(), spec.name);
@@ -417,6 +417,9 @@ fn protocol_v1_methods_use_codex_names_without_cancel_or_generic_delta() {
         "thread/archive",
         "thread/delete",
         "turn/start",
+        "turn/input",
+        "turn/pause",
+        "turn/resume",
         "turn/interrupt",
         "turn/status",
         "approval/list",

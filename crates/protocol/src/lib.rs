@@ -148,6 +148,9 @@ method_registry! {
     ThreadArchive => ("thread/archive", Request, ThreadIdParams, ThreadResult),
     ThreadDelete => ("thread/delete", Request, ThreadIdParams, ThreadDeleteResult),
     TurnStart => ("turn/start", Request, TurnStartParams, TurnStartResult),
+    TurnInput => ("turn/input", Request, TurnInputParams, TurnResult),
+    TurnPause => ("turn/pause", Request, TurnIdParams, TurnResult),
+    TurnResume => ("turn/resume", Request, TurnIdParams, TurnResult),
     EvalRun => ("eval/run", Request, EvalRunParams, EvalRunResult),
     AgentCapability => ("agent/capability", Request, EmptyParams, AgentCapabilityResult),
     TurnInterrupt => ("turn/interrupt", Request, TurnIdParams, TurnInterruptResult),
@@ -704,6 +707,45 @@ pub enum InputItem {
     Text { text: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// 运行中用户输入的投递时机。
+pub enum TurnInputDelivery {
+    /// 在下一个安全边界改变当前执行方向。
+    Steer,
+    /// 在当前工作准备最终化时继续同一个 turn。
+    FollowUp,
+}
+
+impl TurnInputDelivery {
+    /// 返回 SQLite 和 JSON 投影共用的稳定文本。
+    pub const fn as_storage_text(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::FollowUp => "follow_up",
+        }
+    }
+
+    /// 从稳定文本恢复投递语义。
+    pub fn from_storage_text(value: &str) -> Option<Self> {
+        match value {
+            "steer" => Some(Self::Steer),
+            "follow_up" => Some(Self::FollowUp),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// 向非终态 turn 持久化追加真实用户输入。
+pub struct TurnInputParams {
+    pub turn_id: String,
+    pub input_id: String,
+    pub delivery: TurnInputDelivery,
+    pub input: Vec<InputItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 /// 持久化 turn 的公开摘要。
 pub struct Turn {
@@ -718,6 +760,11 @@ pub struct Turn {
 /// turn 的生命周期状态。
 pub enum TurnStatus {
     Running,
+    /// 用户显式暂停；保留 checkpoint、释放执行 owner，并可通过 turn/resume 继续。
+    Paused,
+    /// The owner exited while a safe checkpoint was available. This is resumable only through
+    /// an explicit turn/resume request and is not a terminal outcome.
+    Suspended,
     Completed,
     Blocked,
     Failed,
@@ -729,6 +776,8 @@ impl TurnStatus {
     pub const fn as_storage_text(&self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Suspended => "suspended",
             Self::Completed => "completed",
             Self::Blocked => "blocked",
             Self::Failed => "failed",
@@ -740,6 +789,8 @@ impl TurnStatus {
     pub fn from_storage_text(value: &str) -> Option<Self> {
         match value {
             "running" => Some(Self::Running),
+            "paused" => Some(Self::Paused),
+            "suspended" => Some(Self::Suspended),
             "completed" => Some(Self::Completed),
             "blocked" => Some(Self::Blocked),
             "failed" => Some(Self::Failed),

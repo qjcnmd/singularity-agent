@@ -14,11 +14,11 @@ use singularity_protocol::{
     TraceProviderOperationPhase, TraceProviderProtocol, TraceSandboxEnforcement,
     TraceSandboxProjection, TraceSandboxStatus, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
     TraceSpanStatus, TraceToolProjection, TraceToolStatus, TraceUsage, TraceVerificationProjection,
-    TraceVerificationStatus, TraceWorkspaceMutation, TurnStatus,
+    TraceVerificationStatus, TraceWorkspaceMutation, TurnInputDelivery, TurnStatus,
 };
 use singularity_store::{
     CommitTurnOutcomeParams, ConversationRole, RegisterArtifactRefParams, SessionStore,
-    SessionStoreDescriptor, StoreError, TurnOutcomeAuthority,
+    SessionStoreDescriptor, StoreError, ToolExecution, ToolExecutionState, TurnOutcomeAuthority,
 };
 use std::sync::{Arc, Barrier};
 
@@ -208,7 +208,7 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
     let descriptor = store.descriptor();
 
     assert_eq!(descriptor.backend, "sqlite");
-    assert_eq!(descriptor.schema_version, 12);
+    assert_eq!(descriptor.schema_version, 13);
     assert_eq!(
         store.applied_migrations().expect("migrations"),
         vec![
@@ -222,7 +222,8 @@ fn sqlite_store_persists_threads_turns_items_trace_and_approval() {
             "0009_thread_policy_snapshot".to_string(),
             "0010_stable_enum_text".to_string(),
             "0011_typed_permission_resources".to_string(),
-            "0012_typed_trace_spans".to_string()
+            "0012_typed_trace_spans".to_string(),
+            "0013_turn_resume_checkpoints".to_string()
         ]
     );
     assert_eq!(
@@ -310,7 +311,7 @@ fn sqlite_store_writes_schema_meta_and_uses_wal_journal() {
         .query_row("pragma journal_mode", [], |row| row.get(0))
         .expect("journal mode");
 
-    assert_eq!(schema_version, 12);
+    assert_eq!(schema_version, 13);
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
 }
 
@@ -334,7 +335,7 @@ fn sqlite_store_rejects_future_schema_version() {
         SessionStore::open(&db_path),
         Err(StoreError::UnsupportedSchema {
             found: 999,
-            supported: 12
+            supported: 13
         })
     ));
 }
@@ -373,7 +374,7 @@ fn v10_approval_resources_migrate_to_typed_v11_payloads() {
     drop(connection);
 
     let migrated = SessionStore::open(&db_path).expect("migrate v10 store");
-    assert_eq!(migrated.descriptor().schema_version, 12);
+    assert_eq!(migrated.descriptor().schema_version, 13);
     assert_eq!(
         migrated
             .get_pending_approval("approval_v10")
@@ -383,8 +384,443 @@ fn v10_approval_resources_migrate_to_typed_v11_payloads() {
     );
 }
 
+// 现行 v12（typed trace、但尚无 turn resume 表）必须原子升级到 v13，且不丢失既有行。
+#[test]
+fn v12_to_v13_migration_adds_recovery_tables_and_preserves_rows() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("v12.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open v13 store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let trace = TraceEvent::for_turn(
+        "v12_preserved_trace",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        "test",
+        "preserved",
+    );
+    store.append_trace(&trace).expect("trace");
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open v13 sqlite");
+    connection
+        .execute_batch(
+            r#"
+pragma foreign_keys = off;
+drop table turn_inputs;
+drop table turn_checkpoints;
+drop table tool_executions;
+create table turns_v12(
+    turn_id text primary key,
+    thread_id text not null,
+    turn_sequence integer not null check(turn_sequence > 0),
+    status text not null
+        check(status in ('running', 'completed', 'blocked', 'failed', 'interrupted')),
+    agent_loop_status text not null,
+    foreign key(thread_id) references threads(thread_id)
+);
+insert into turns_v12(turn_id, thread_id, turn_sequence, status, agent_loop_status)
+select turn_id, thread_id, turn_sequence, status, agent_loop_status from turns;
+drop table turns;
+alter table turns_v12 rename to turns;
+create unique index turns_thread_sequence_unique on turns(thread_id, turn_sequence);
+create index turns_history_lookup on turns(thread_id, status, turn_sequence);
+create table schema_meta_v12(
+    schema_version integer not null check(schema_version = 12)
+);
+insert into schema_meta_v12(schema_version) values(12);
+drop table schema_meta;
+alter table schema_meta_v12 rename to schema_meta;
+delete from schema_migrations where migration_id = '0013_turn_resume_checkpoints';
+pragma foreign_keys = on;
+"#,
+        )
+        .expect("downgrade to released v12 shape");
+    drop(connection);
+
+    let migrated = SessionStore::open(&db_path).expect("migrate v12 store");
+    assert_eq!(migrated.descriptor().schema_version, 13);
+    assert_eq!(
+        migrated
+            .get_thread(&thread.thread_id)
+            .expect("thread")
+            .thread_id,
+        thread.thread_id
+    );
+    assert_eq!(
+        migrated.get_turn(&turn.turn_id).expect("turn").status,
+        TurnStatus::Running
+    );
+    assert!(
+        migrated
+            .list_trace(&thread.thread_id)
+            .expect("trace list")
+            .iter()
+            .any(|event| event.event_id == trace.event_id)
+    );
+    let connection = rusqlite::Connection::open(&db_path).expect("open migrated sqlite");
+    for table in ["turn_checkpoints", "tool_executions"] {
+        let exists: bool = connection
+            .query_row(
+                "select exists(select 1 from sqlite_schema where type = 'table' and name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("recovery table lookup");
+        assert!(exists, "missing migrated table {table}");
+    }
+}
+
+#[test]
+fn turn_input_is_idempotent_ordered_and_consumed_with_its_checkpoint_once() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _, _) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "original"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("started turn");
+    let first = serde_json::json!([{"type": "text", "text": "first"}]);
+    let second = serde_json::json!([{"type": "text", "text": "second"}]);
+
+    store
+        .append_turn_input(&turn.turn_id, "input-1", TurnInputDelivery::Steer, &first)
+        .expect("first input");
+    store
+        .append_turn_input(&turn.turn_id, "input-1", TurnInputDelivery::Steer, &first)
+        .expect("same idempotent input");
+    assert!(matches!(
+        store.append_turn_input(&turn.turn_id, "input-1", TurnInputDelivery::Steer, &second,),
+        Err(StoreError::InvalidState(_))
+    ));
+    store
+        .append_turn_input(
+            &turn.turn_id,
+            "input-2",
+            TurnInputDelivery::FollowUp,
+            &second,
+        )
+        .expect("second input");
+
+    let steer_boundary = store
+        .turn_boundary_state(&turn.turn_id, false)
+        .expect("steer boundary");
+    assert_eq!(
+        steer_boundary
+            .inputs
+            .iter()
+            .map(|input| input.input_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["input-1"]
+    );
+    let finalization_boundary = store
+        .turn_boundary_state(&turn.turn_id, true)
+        .expect("finalization boundary");
+    assert_eq!(
+        finalization_boundary
+            .inputs
+            .iter()
+            .map(|input| input.input_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["input-1", "input-2"]
+    );
+    let input_ids = finalization_boundary
+        .inputs
+        .iter()
+        .map(|input| input.input_id.clone())
+        .collect::<Vec<_>>();
+    store
+        .consume_turn_inputs_with_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &input_ids,
+            &serde_json::json!({"version": 2, "state": "after-input"}),
+            2,
+            false,
+        )
+        .expect("consume input and checkpoint");
+    assert!(
+        store
+            .turn_boundary_state(&turn.turn_id, true)
+            .expect("consumed boundary")
+            .inputs
+            .is_empty()
+    );
+    assert!(matches!(
+        store.consume_turn_inputs_with_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &input_ids,
+            &serde_json::json!({"version": 2, "state": "duplicate"}),
+            2,
+            false,
+        ),
+        Err(StoreError::InvalidState(_))
+    ));
+}
+
+#[test]
+fn pending_input_blocks_terminal_commit_and_pause_remains_resumable() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _, _) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "original"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("started turn");
+    store
+        .append_turn_input(
+            &turn.turn_id,
+            "follow-up",
+            TurnInputDelivery::FollowUp,
+            &serde_json::json!([{"type": "text", "text": "more work"}]),
+        )
+        .expect("follow-up");
+    let terminal = TraceEvent::for_turn(
+        "trace_terminal_with_pending_input",
+        &thread.thread_id,
+        &turn.turn_id,
+        "agent_loop",
+        "terminal result",
+    );
+    assert!(matches!(
+        store.commit_turn_outcome(
+            &turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Failed,
+                agent_loop_status: "failed",
+                assistant_item_id: None,
+                assistant_delta: None,
+                plan: None,
+                trace: &terminal,
+            },
+        ),
+        Err(StoreError::TurnBoundaryPending { .. })
+    ));
+    assert_eq!(
+        store.get_turn(&turn.turn_id).expect("running turn").status,
+        TurnStatus::Running
+    );
+
+    store
+        .request_turn_pause(&turn.turn_id)
+        .expect("pause requested");
+    let boundary = store
+        .turn_boundary_state(&turn.turn_id, true)
+        .expect("pause boundary");
+    let input_ids = boundary
+        .inputs
+        .iter()
+        .map(|input| input.input_id.clone())
+        .collect::<Vec<_>>();
+    store
+        .consume_turn_inputs_with_checkpoint(
+            &turn.turn_id,
+            &thread.thread_id,
+            &input_ids,
+            &serde_json::json!({"version": 2, "state": "paused"}),
+            2,
+            true,
+        )
+        .expect("consume and pause");
+    assert_eq!(
+        store.get_turn(&turn.turn_id).expect("paused turn").status,
+        TurnStatus::Paused
+    );
+    assert!(matches!(
+        store.append_turn_input(
+            &turn.turn_id,
+            "paused-input",
+            TurnInputDelivery::Steer,
+            &serde_json::json!([{"type": "text", "text": "after pause"}]),
+        ),
+        Ok(_)
+    ));
+}
+
+#[test]
+fn approval_allow_hands_steer_to_one_turn_checkpoint_atomically() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_input_handoff",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_input_handoff");
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(serde_json::json!({"approval_checkpoint": "opaque"})),
+            "approval",
+            "approval requested",
+        )
+        .expect("blocked approval");
+    store
+        .append_turn_input(
+            &turn.turn_id,
+            "approval-steer",
+            TurnInputDelivery::Steer,
+            &serde_json::json!([{"type": "text", "text": "change direction"}]),
+        )
+        .expect("steer");
+    let checkpoint = serde_json::json!({"version": 2, "state": "steered"});
+    let decision = ApprovalDecision::new(
+        request.request_id.clone(),
+        ApprovalOutcome::Allow,
+        "approved",
+    );
+    assert!(matches!(
+        store.record_approval_decision(
+            &decision,
+            "approval",
+            "approval decision recorded without boundary"
+        ),
+        Err(StoreError::TurnBoundaryPending { .. })
+    ));
+    assert!(
+        store
+            .has_pending_tool_call(&request.request_id)
+            .expect("pending execution")
+    );
+
+    let recorded = store
+        .record_approval_decision_with_turn_checkpoint(
+            &decision,
+            "approval",
+            "approval decision recorded",
+            &["approval-steer".to_string()],
+            &checkpoint,
+            2,
+            false,
+        )
+        .expect("atomic approval input handoff");
+    assert_eq!(recorded.turn.status, TurnStatus::Running);
+    assert_eq!(
+        store
+            .get_turn_checkpoint(&turn.turn_id)
+            .expect("checkpoint"),
+        Some(checkpoint)
+    );
+    assert!(
+        store
+            .turn_boundary_state(&turn.turn_id, true)
+            .expect("boundary")
+            .inputs
+            .is_empty()
+    );
+    assert!(
+        !store
+            .has_pending_tool_call(&request.request_id)
+            .expect("pending execution")
+    );
+    assert_eq!(
+        store
+            .get_approval_decision(&decision.decision_id)
+            .expect("decision"),
+        decision
+    );
+}
+
+#[test]
+fn approval_deny_hands_pending_input_to_same_turn_without_terminalizing() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_deny_handoff",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_deny_handoff");
+    store
+        .create_approval_with_pending_tool_call_and_trace(
+            &request,
+            Some(serde_json::json!({"approval_checkpoint": "opaque"})),
+            "approval",
+            "approval requested",
+        )
+        .expect("blocked approval");
+    store
+        .append_turn_input(
+            &turn.turn_id,
+            "deny-follow-up",
+            TurnInputDelivery::FollowUp,
+            &serde_json::json!([{"type": "text", "text": "use a different approach"}]),
+        )
+        .expect("follow-up");
+    let decision = ApprovalDecision::new(
+        request.request_id.clone(),
+        ApprovalOutcome::Deny,
+        "operator denied edit",
+    );
+    assert!(matches!(
+        store.record_approval_decision(
+            &decision,
+            "approval",
+            "approval decision recorded without boundary"
+        ),
+        Err(StoreError::TurnBoundaryPending { .. })
+    ));
+
+    let checkpoint = serde_json::json!({"version": 2, "state": "denied"});
+    let recorded = store
+        .record_approval_decision_with_turn_checkpoint(
+            &decision,
+            "approval",
+            "approval decision recorded",
+            &["deny-follow-up".to_string()],
+            &checkpoint,
+            2,
+            false,
+        )
+        .expect("deny handoff");
+    assert_eq!(recorded.turn.status, TurnStatus::Running);
+    assert_eq!(
+        store
+            .get_turn_checkpoint(&turn.turn_id)
+            .expect("checkpoint"),
+        Some(checkpoint)
+    );
+    assert!(
+        store
+            .turn_boundary_state(&turn.turn_id, true)
+            .expect("boundary")
+            .inputs
+            .is_empty()
+    );
+    assert!(
+        !store
+            .has_pending_tool_call(&request.request_id)
+            .expect("pending execution")
+    );
+    assert_eq!(
+        store
+            .get_approval_decision(&decision.decision_id)
+            .expect("decision"),
+        decision
+    );
+}
+
 // Build the released v10 schema directly so v10 migration tests do not
-// relabel a current v12 database as an older version.
+// relabel a current v13 database as an older version.
 fn create_v10_database(path: &std::path::Path) {
     let connection = rusqlite::Connection::open(path).expect("open v10 sqlite");
     connection
@@ -683,7 +1119,7 @@ fn v8_threads_migrate_to_policy_snapshot_defaults() {
     remove_legacy_pending_approval(&db_path, 8);
 
     let migrated = SessionStore::open(&db_path).expect("migrate v8 store");
-    assert_eq!(migrated.descriptor().schema_version, 12);
+    assert_eq!(migrated.descriptor().schema_version, 13);
     let thread_id = migrated
         .list_threads()
         .expect("migrated threads")
@@ -713,7 +1149,7 @@ fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
         remove_legacy_pending_approval(&db_path, schema_version);
 
         let store = SessionStore::open(&db_path).expect("migrate legacy schema");
-        assert_eq!(store.descriptor().schema_version, 12);
+        assert_eq!(store.descriptor().schema_version, 13);
         assert_eq!(
             store.applied_migrations().expect("migration markers"),
             vec![
@@ -728,6 +1164,7 @@ fn every_supported_legacy_schema_migrates_with_trace_and_approval_data() {
                 "0010_stable_enum_text".to_string(),
                 "0011_typed_permission_resources".to_string(),
                 "0012_typed_trace_spans".to_string(),
+                "0013_turn_resume_checkpoints".to_string(),
             ]
         );
         let connection = rusqlite::Connection::open(&db_path).expect("reopen migrated db");
@@ -857,7 +1294,7 @@ fn released_legacy_schema_variants_migrate() {
             .expect("migrate upgraded v2")
             .descriptor()
             .schema_version,
-        12
+        13
     );
 
     let v5_path = dir.path().join("v5-retired-sidecar.sqlite3");
@@ -886,7 +1323,7 @@ fn released_legacy_schema_variants_migrate() {
             .expect("migrate upgraded v5")
             .descriptor()
             .schema_version,
-        12
+        13
     );
 
     let v6_path = dir.path().join("v6-initial-indexes.sqlite3");
@@ -905,7 +1342,7 @@ fn released_legacy_schema_variants_migrate() {
             .expect("migrate initial v6")
             .descriptor()
             .schema_version,
-        12
+        13
     );
 
     let v7_path = dir.path().join("v7-appended-state.sqlite3");
@@ -939,7 +1376,7 @@ fn released_legacy_schema_variants_migrate() {
             .expect("migrate upgraded v7")
             .descriptor()
             .schema_version,
-        12
+        13
     );
 }
 
@@ -1456,7 +1893,7 @@ fn partial_thread_policy_migration_fails_closed() {
     assert!(matches!(
         SessionStore::open(&db_path),
         Err(StoreError::InvalidState(message))
-            if message.contains("v12 schema fingerprint is not canonical")
+            if message.contains("current schema fingerprint is not canonical")
     ));
 }
 
@@ -2670,6 +3107,184 @@ fn executing_approval_is_interrupted_on_process_recovery_without_replay() {
     assert_eq!(
         recovery_trace.payload["recovery_reason"],
         "approval_execution_outcome_unknown"
+    );
+}
+
+#[test]
+fn turn_checkpoint_commit_is_atomic_and_unknown_execution_blocks_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let initial_checkpoint = serde_json::json!({
+        "checkpoint_version": 1,
+        "boundary": "initial"
+    });
+    store
+        .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &initial_checkpoint, 1)
+        .expect("initial checkpoint");
+    let execution_id = format!("turn:{}:tool:call_completed", turn.turn_id);
+    store
+        .begin_tool_execution(&ToolExecution {
+            execution_id: execution_id.clone(),
+            thread_id: thread.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            tool_call_id: "call_completed".to_string(),
+            state: ToolExecutionState::Running,
+            payload: serde_json::json!({"kind": "tool_call", "tool_name": "update_plan"}),
+        })
+        .expect("running execution");
+    let committed_checkpoint = serde_json::json!({
+        "checkpoint_version": 1,
+        "boundary": "tool_result_committed"
+    });
+    store
+        .commit_tool_result_checkpoint(
+            &execution_id,
+            &turn.turn_id,
+            &thread.thread_id,
+            &committed_checkpoint,
+            1,
+        )
+        .expect("atomic tool result checkpoint");
+    assert_eq!(
+        store
+            .get_turn_checkpoint(&turn.turn_id)
+            .expect("checkpoint")
+            .expect("checkpoint row"),
+        committed_checkpoint
+    );
+    assert!(
+        store
+            .get_tool_execution(&execution_id)
+            .expect("execution lookup")
+            .is_none()
+    );
+
+    // A safe checkpoint with no active or unknown external execution is resumable and recovery is
+    // idempotent; it must not require a synthetic owner sentinel.
+    store
+        .recover_unowned_workspace_executions()
+        .expect("safe checkpoint recovery");
+    let suspended = store.get_turn(&turn.turn_id).expect("suspended turn");
+    assert_eq!(suspended.status, TurnStatus::Suspended);
+    assert_eq!(suspended.agent_loop_status, "suspended");
+    let (claimed, claimed_checkpoint) = store
+        .claim_suspended_turn(&turn.turn_id)
+        .expect("safe resume claim");
+    assert_eq!(claimed.status, TurnStatus::Running);
+    assert_eq!(claimed_checkpoint, committed_checkpoint);
+    let suspended_after_failure = store
+        .suspend_claimed_turn_after_failure(&turn.turn_id)
+        .expect("release failed resume claim");
+    assert_eq!(suspended_after_failure.status, TurnStatus::Suspended);
+    let (reclaimed, reclaimed_checkpoint) = store
+        .claim_suspended_turn(&turn.turn_id)
+        .expect("retry released resume claim");
+    assert_eq!(reclaimed.status, TurnStatus::Running);
+    assert_eq!(reclaimed_checkpoint, committed_checkpoint);
+
+    // An owner lost while a real tool is in flight remains terminally Unknown and cannot be
+    // retried by an explicit resume.
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Failed, "failed")
+        .expect("finish first turn");
+    let unknown_turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("unknown turn");
+    store
+        .save_turn_checkpoint(
+            &unknown_turn.turn_id,
+            &thread.thread_id,
+            &initial_checkpoint,
+            1,
+        )
+        .expect("unknown checkpoint");
+    let unknown_execution_id = format!("turn:{}:tool:call_unknown", unknown_turn.turn_id);
+    store
+        .begin_tool_execution(&ToolExecution {
+            execution_id: unknown_execution_id.clone(),
+            thread_id: thread.thread_id.clone(),
+            turn_id: unknown_turn.turn_id.clone(),
+            tool_call_id: "call_unknown".to_string(),
+            state: ToolExecutionState::Running,
+            payload: serde_json::json!({"kind": "tool_call", "tool_name": "edit"}),
+        })
+        .expect("unknown running execution");
+    drop(store);
+
+    let reopened = SessionStore::open(&db_path).expect("reopen store");
+    reopened
+        .recover_unowned_workspace_executions()
+        .expect("unknown execution recovery");
+    assert_eq!(
+        reopened
+            .get_tool_execution(&unknown_execution_id)
+            .expect("unknown lookup")
+            .expect("unknown execution")
+            .state,
+        ToolExecutionState::Unknown
+    );
+    assert!(matches!(
+        reopened.claim_suspended_turn(&unknown_turn.turn_id),
+        Err(StoreError::InvalidState(message))
+            if message == "turn has unknown tool execution and cannot be resumed"
+    ));
+}
+
+// 两个独立连接并发恢复同一安全 checkpoint 时，Store CAS 只能交给一个 owner。
+#[test]
+fn suspended_turn_claim_allows_only_one_owner() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let checkpoint = serde_json::json!({
+        "checkpoint_version": 1,
+        "boundary": "safe"
+    });
+    store
+        .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &checkpoint, 1)
+        .expect("checkpoint");
+    store
+        .recover_unowned_workspace_executions()
+        .expect("suspend turn");
+    assert_eq!(
+        store.get_turn(&turn.turn_id).expect("suspended").status,
+        TurnStatus::Suspended
+    );
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let path = db_path.clone();
+        let turn_id = turn.turn_id.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            let store = SessionStore::open(path).expect("open concurrent store");
+            barrier.wait();
+            store.claim_suspended_turn(&turn_id)
+        }));
+    }
+
+    let outcomes = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("claim thread"))
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(StoreError::InvalidState(_))))
+            .count(),
+        1
     );
 }
 
@@ -5625,7 +6240,7 @@ fn trace_envelope_and_projection_tampering_fail_closed() {
 }
 
 #[test]
-fn v11_to_v12_migration_rehashes_legacy_trace_without_fabricating_spans() {
+fn v11_to_v13_migration_rehashes_legacy_trace_without_fabricating_spans() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("v11.sqlite3");
     create_v11_database(&db_path);
@@ -5656,7 +6271,7 @@ fn v11_to_v12_migration_rehashes_legacy_trace_without_fabricating_spans() {
     let stored = migrated
         .show_trace("v11_legacy_trace")
         .expect("read migrated trace");
-    assert_eq!(migrated.descriptor().schema_version, 12);
+    assert_eq!(migrated.descriptor().schema_version, 13);
     assert_eq!(stored.span_id, None);
     assert_eq!(stored.parent_span_id, None);
     assert_eq!(stored.span_kind, None);

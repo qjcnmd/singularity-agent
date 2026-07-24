@@ -232,6 +232,7 @@ enum ProviderAttemptIdentityScope {
         thread_id: String,
         turn_id: String,
         model_turn_ordinal: u32,
+        resume_attempt: u32,
     },
 }
 
@@ -271,6 +272,7 @@ impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callb
                 thread_id: input.thread_id.clone(),
                 turn_id: input.turn_id.clone(),
                 model_turn_ordinal,
+                resume_attempt: input.resume_attempt,
             },
             on_event,
             streamed_text: String::new(),
@@ -325,12 +327,14 @@ impl<'a, 'callback_ref, 'callback> ProviderEventBridge<'a, 'callback_ref, 'callb
                 thread_id,
                 turn_id,
                 model_turn_ordinal,
+                resume_attempt,
             } => root_occurrence_identity(
                 thread_id,
                 turn_id,
                 "provider_attempt",
                 *model_turn_ordinal,
                 self.next_attempt_ordinal,
+                *resume_attempt,
             ),
         };
         let observation = ProviderAttemptObservation {
@@ -463,6 +467,7 @@ pub(super) fn occurrence_identity(
         kind,
         model_turn_ordinal,
         ordinal,
+        input.resume_attempt,
     );
     identity.parent_occurrence_id = parent_occurrence_id;
     identity
@@ -474,11 +479,19 @@ pub(super) fn root_occurrence_identity(
     kind: &str,
     model_turn_ordinal: u32,
     ordinal: u32,
+    resume_attempt: u32,
 ) -> OccurrenceIdentity {
-    let encoded = format!(
-        "{}\u{0}{}\u{0}{kind}\u{0}{model_turn_ordinal}\u{0}{ordinal}",
-        thread_id, turn_id
-    );
+    let encoded = if resume_attempt == 0 {
+        format!(
+            "{}\u{0}{}\u{0}{kind}\u{0}{model_turn_ordinal}\u{0}{ordinal}",
+            thread_id, turn_id
+        )
+    } else {
+        format!(
+            "{}\u{0}{}\u{0}{kind}\u{0}{model_turn_ordinal}\u{0}{ordinal}\u{0}{resume_attempt}",
+            thread_id, turn_id
+        )
+    };
     OccurrenceIdentity {
         occurrence_id: format!("sha256:{:x}", Sha256::digest(encoded.as_bytes())),
         parent_occurrence_id: None,

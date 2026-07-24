@@ -586,6 +586,21 @@ impl SessionStore {
             })?;
         validate_turn_status_update(&current, &status, Some(agent_loop_status), authority)?;
         validate_turn_trace_binding(trace, &current.thread_id, &current.turn_id)?;
+        if is_terminal_turn_status(&status) {
+            let boundary_pending: bool = transaction.query_row(
+                "select pause_requested = 1 or exists(
+                    select 1 from turn_inputs
+                    where turn_id = ?1 and delivery_state = 'pending'
+                 ) from turns where turn_id = ?1",
+                params![turn_id],
+                |row| row.get(0),
+            )?;
+            if boundary_pending {
+                return Err(StoreError::TurnBoundaryPending {
+                    turn_id: turn_id.to_string(),
+                });
+            }
+        }
         match (&status, assistant_item_id, assistant_delta) {
             (TurnStatus::Completed, Some(item_id), Some(delta))
                 if !item_id.as_str().trim().is_empty() && !delta.trim().is_empty() => {}
@@ -1437,7 +1452,7 @@ pub(crate) fn typed_turn_end_trace(
         TurnStatus::Completed => TraceSpanStatus::Ok,
         TurnStatus::Failed => TraceSpanStatus::Error,
         TurnStatus::Interrupted => TraceSpanStatus::Cancelled,
-        TurnStatus::Running | TurnStatus::Blocked => {
+        TurnStatus::Running | TurnStatus::Paused | TurnStatus::Suspended | TurnStatus::Blocked => {
             return Err(StoreError::InvalidState(
                 "non-terminal turn cannot produce a typed end".to_string(),
             ));

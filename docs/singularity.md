@@ -75,7 +75,7 @@ sg run <goal>
      -> AppEvent::turn_started
      -> AppServer::run_agent_loop
         -> load_project_instructions(thread.cwd, thread.cwd)
-        -> AgentLoop::run_with_events
+        -> AgentLoop::run_with_events_and_checkpoints
            -> assemble context
            -> OpenAiProvider completion / Responses streaming
            -> ToolBroker admission
@@ -86,9 +86,16 @@ sg run <goal>
      -> terminal item events
      -> AppEvent::turn_completed
      -> turn/start response
+
+turn/resume <turn-id>
+  -> SessionStore::claim_suspended_turn (claim a paused or suspended turn)
+  -> decode and advance the typed TurnCheckpoint resume-attempt epoch
+  -> AgentLoop::resume_turn_with_events_and_checkpoints
+     -> continue the same turn from the last safe boundary without rerunning an unknown tool call
+  -> the same checkpoint/event and terminal-outcome path as turn/start
 ```
 
-当 AgentLoop 返回 blocked approval 时，`AgentLoopResult.pending_approvals` 中每个 `PendingApprovalOccurrence` 同时拥有 request 与 opaque typed checkpoint；AppServer 只在写入 Store 前通过 `ApprovalCheckpoint::encode` 投影 serialized payload 和显式 tool-call binding。`approval/decision` 从 Store 取回 opaque payload 后，在 claim/resume 前通过同一 occurrence codec 解码；恢复调用使用 `AgentLoop::resume_pending_approval_with_events`，Store 不读取 checkpoint 字段。
+当 AgentLoop 返回 blocked approval 时，`AgentLoopResult.pending_approvals` 中每个 `PendingApprovalOccurrence` 同时拥有 request 与 opaque typed checkpoint；AppServer 只在写入 Store 前通过 `ApprovalCheckpoint::encode` 投影 serialized payload 和显式 tool-call binding。`approval/decision` 从 Store 取回 opaque payload 后，在 claim/resume 前通过同一 occurrence codec 解码；恢复调用使用 `AgentLoop::resume_pending_approval_with_events`，Store 不读取 checkpoint 字段。该 `ApprovalCheckpoint` 是 approval continuation 的独立 fail-closed 合同，不与普通 turn 的 `TurnCheckpoint` 或 `turn_checkpoints` 表合并。
 
 `singularity_app_server` 的 Tokio stdin owner 继续处理 protocol 请求；单请求中的 `turn/start` 和可能继续运行 AgentLoop 的 `approval/decision` 由独立 blocking request worker 使用新的 SQLite connection 执行，因此同一进程可以在 turn 或 approval continuation 运行时接收 `turn/interrupt` 和 `server/shutdown`。batch 始终在 stdin owner 按项串行处理。不同 workspace 可以并发，同一 workspace 由 Store execution guard 串行。进程最多同时接纳 16 个 request worker；stdout 使用容量 64 的控制响应队列和容量 256 的事件通知队列，由单独异步 writer 按全局 reserve order 合并两条队列写出。只有 typed `Progress` + `BestEffort` 事件在 event queue 满时可以丢弃，并以 `event/gap` 显式声明丢弃的 cursor 范围；其非阻塞 `try_send`、order reservation 与 gap commit 在同一短临界区完成，SQLite 写入不在该锁内执行。`State` 和 `Gap` 事件走可靠背压，不静默丢失，并在可能阻塞的发送前释放全局排序锁。Turn 创建与 approval checkpoint 提供显式 `TransportTraceBinding`，transport 不解析公共 JSON 推断 thread/turn；Full 成功登记 drop 后写 `EventQueueDrop`，gap 成功进入可靠队列后写 `EventGap`，frame 的 JSON、换行和 flush 全部成功后由 `spawn_blocking` 写 `WriterVisible`。这些 sample 使用同一 trusted-reopen SQLite Trace；Store/projector/writer 失败会锁存全局 execution stop 并终止 transport。worker 超限和控制队列过载遵守各自的错误或背压合同；真实 transport 断开或 write/flush 失败同样 fail closed。worker 复用同一个 active-turn cancellation registry；stdout 仍由唯一 writer 串行输出 JSONL。
 
@@ -107,6 +114,8 @@ sg run <goal>
 | Agent 状态 | Turn 状态 | 含义 |
 | --- | --- | --- |
 | `running` | `running` | worker 正在执行 |
+| `paused` | `paused` | 用户请求已在安全边界生效，保留 `TurnCheckpoint` 并释放执行 owner；可显式 `turn/resume`，不是终态 |
+| `suspended` | `suspended` | owner 已退出但存在安全 `TurnCheckpoint`；可显式 `turn/resume`，不是终态 |
 | `completed` | `completed` | completion gate 已接受 final answer |
 | `blocked` | `blocked` | 等待 approval 或外部条件 |
 | `failed` | `failed` | provider、context、tool 或 runtime 终止失败 |
@@ -119,9 +128,21 @@ Turn 一旦持久化为 `running`，事件通知、AgentLoop、approval checkpoi
 
 `turn/start` 在创建 Turn 前取得基于 Store 文件和 canonical workspace 的跨进程 `WorkspaceExecutionGuard`，并持有到 AgentLoop outcome 提交完成；SQLite 的同一 `BEGIN IMMEDIATE` 事务还会拒绝该 workspace 已存在任何非终态 Turn。OS 文件锁区分仍存活的 owner，SQLite 约束保留持久状态，因此同一 Store 中共享一个 workspace 的不同 logical thread 也不会并发修改同一文件树；不同 workspace 不被全局串行化。`thread/archive` 和 `thread/delete` 仍只拒绝目标 thread 自身存在非终态 Turn。
 
-### Continue
+### Continue 与交互式 Turn
 
 `sg continue` 先调用 `thread/resume`，再创建一个新的 `turn/start`。app-server 从 SQLite 读取最多 64 个已完成历史 turn，只投影成按 turn/item sequence 排序的 user/assistant conversation message。当前 turn 不会重复进入 history。
+
+`turn/input` 接受调用方提供的 `inputId`、`delivery` 和非空 `input`，只允许写入非终态 Turn。`inputId` 是幂等键：同一 Turn、delivery 和内容的重复请求返回既有结果，换绑 Turn、delivery 或内容则 fail closed。每批内容先作为真实 `ItemKind::UserMessage` 按该 Turn 的 item sequence 持久化；`turn_inputs` 只保存 `inputId`、所引用 item、`steer`/`follow_up` 和 pending/consumed 消费关系，不复制消息正文，也不是第二消息事实源。
+
+`steer` 在下一个完整 checkpoint 边界可见，不改变已经发出的 `ModelTurnRequest`；`follow_up` 只在当前响应已经完整提交或即将进入 finalization-only 时可见。多个 eligible input 按 item sequence 稳定消费，并在同一 SQLite 事务中把消费关系改为 consumed、写入已经包含这些 user message 的新 `TurnCheckpoint`；输入使旧 plan、verification、repair 和 final-review 决策失效，下一模型请求必须先重新规划。若 `steer` 在线性化工具执行前到达，`begin_tool_executions_at_checkpoint` 不登记执行 owner，AgentLoop 为每个未执行的结构化调用追加 typed `ToolResult`，其 `error_code` 为 `not_executed_due_to_user_input`，再处理新 user message；若执行 owner 已先登记，输入等待完整 `ToolResult` 的安全边界，不能取消、猜测或重试已经开始的副作用。
+
+`turn/pause` 与取消及 owner 丢失不同：终态 Turn 拒绝该请求，已经 `paused` 的 Turn 幂等保持；`suspended` Turn 因没有活动 owner，可立即转为 `paused`；其他非终态 Turn 只持久化 pause request。存在活动 AgentLoop 时，它到下一个安全 checkpoint 边界后才在同一事务中保存 checkpoint、清除请求并转为 `paused`。若同一边界也有 eligible input，Store 原子提交其消费、新 checkpoint 和 `paused` 状态。`Paused` 保留用户意图且不生成 `Interrupted`；`Suspended` 表示进程 owner 丢失后存在安全恢复边界；`Interrupted` 是取消已经收敛或没有安全恢复边界的终态。
+
+`turn/resume` 只接受 `paused` 或 `suspended` Turn。取得同 workspace execution guard 后，Store 在一个 `BEGIN IMMEDIATE` 事务中完成单 owner claim并把同一 Turn 改回 `running`；AppServer 随后解码并校验持久化的 typed `TurnCheckpoint`，递增、保存 `resume_attempt` epoch，再从 checkpoint 的完整 message/tool-result 状态继续，不创建新 Turn，也不合成“continue”用户消息。claim 后任一失败都会释放该 claim：尚无在途副作用时回到 `suspended`，已登记为 `running` 的工具则先归约为 `unknown` 再悬挂，避免留下无 owner 的 `running` Turn。若该 Turn 存在 `unknown` tool execution，claim 直接拒绝，既不调用 provider，也不消费排队输入；系统不能猜测外部副作用结果或自动重新执行该工具。
+
+AgentLoop 在完整 model response、工具执行前后和 model request 前发布 typed checkpoint 边界；Store 的终态提交在同一个写事务中重新检查 `pause_requested` 和所有 pending `turn_inputs`。只要任一项存在，`Completed`、`Failed` 或 `Interrupted` 提交就返回 `TurnBoundaryPending` 且不产生终态副作用；AppServer 随即从最后一个 durable checkpoint 原子消费该边界并继续同一 Turn。因而晚到 input/pause 与 finalization 的先后由 SQLite 写事务决定，不会把已接受但未消费的用户输入静默越过，也不会把该竞争误归约成失败终态。
+
+Approval decision 使用同一 boundary gate。Allow 只有在同一事务确认没有更早的 steer/pause 时才可把待执行工具标记为 executing；边界已经存在或在事务前竞争到达时，AppServer 重新读取并把 ApprovalCheckpoint 原子移交为普通 TurnCheckpoint。Deny 在没有 interactive boundary 时保持既有 failed 终态；若已有 steer、follow_up 或 pause，则记录 deny decision 但不 terminalize，追加 model-visible `approval_denied`/cancelled ToolResult，删除旧 pending execution，按 item sequence 消费真实 UserMessage，并把同一 Turn 置为 `running` 或 `paused`。旧工具在两种 handoff 中都不会执行。
 
 ## 5. 项目指令与上下文
 
@@ -151,6 +172,8 @@ Turn 一旦持久化为 `running`，事件通知、AgentLoop、approval checkpoi
 7. 单个 ask 生成绑定 request/thread/turn/tool call 及项目指令 aggregate digest 的内部 checkpoint；checkpoint 与 pending approval 在 store 的同一事务中写入，包含继续运行所需的 messages、既有 tool results、按真实追加顺序绑定的 tool-result occurrence、安全数值 accounting、已消费 grants、approval count、completion tracker 和 model-turn offset。
 8. 执行允许的 Direct 工具，把 `ToolResult::to_message_payload()` 按原顺序作为 tool message 送回下一模型回合；provider-facing assistant/tool history 保持 canonical tool name、call id 和本地验证后的参数，payload、内部 `ToolResult`、Policy、Approval、pending call 和执行状态使用同一真实工具名称。pending Approval checkpoint 会从保存的 provider-facing call 重新经过同一真实 `ToolSpec` 和 profile binding，再与 canonical pending call 比较，拒绝名称或参数篡改。typed repairable failure 由 completion tracker 和下一回合反馈处理；结构完整但名称不在当前模型工具视图中的 native 调用在 Policy 和 executor 前归为 `Visibility/tool_not_visible`，以原 call id 返回下一模型回合。这类 fail-closed 拒绝在 provider-facing assistant/tool history 中固定使用 `tool_rejected` 和 `{}`，保留原 `call_id`/`tool_call_id` 配对；内部 `ToolResult`、原始 tool name、原始错误和 typed audit 诊断保持不变。`tool_rejected` 只是历史占位，不注册为 `ToolSpec`，不进入 `ToolBroker`、Policy、Approval、sandbox 或 executor。该 `tool_selection` 失败只有后续一个合法可见工具成功时才解除，模型不能直接用文本跳过。宿主 PATH 中不存在或绝对路径不可用的可执行文件归为 `command_executable_unavailable` capability，当前 adapter 无法安全表达的 batch 调用归为 typed unsupported，这些路径都在零执行后把安全原因返回下一模型回合。真正的 sandbox backend/infrastructure/timeout/cancelled 仍终止当前 run，不伪装成普通输入修复。
 9. 没有 tool call 时应用 completion gate，接受或拒绝终态候选；repairable failure 或 completion/plan/verification 状态仍不可 final 时，下一 `ModelTurnRequest` 携带 typed tool result 或固定 developer feedback并继续使用 `Auto`。required verification 已通过，且存在的显式 plan 也已完成后，run 与 approval resume 共用的下一请求进入 finalization-only：`tools=[]`、`tool_choice=None`、本地 tool-call 上限为 0，并提供当前 changed paths、diff digest、plan 风险证据和已通过 verification digests。若该 readiness 恰好在最后一个普通工作回合响应后才成立，则允许一次超出普通回合预算的同一终态请求。provider 返回结构化 tool call、非 JSON、错绑 revision/digest/evidence 或缺少 verdict 必需字段时 fail closed，不进入 Policy 或执行器；只有 typed `Accept` 的非空 `final_answer` 才能完成，`Reject`/`Repair` 必须重新进入同一 bounded repair/verification 循环。反馈同时列出全部未满足的 plan 与 verification 不变量，不以其中一个遮蔽另一个；普通文本不能绕过本地 completion gate。
+
+普通 turn 的 durable checkpoint 事件按真实副作用边界提交：`Initial` 在开始运行前保存安全状态；`BeforeModelRequest` 固化即将发出新请求前的完整状态；`ModelResponseCommitted` 只在完整响应已经进入 AgentLoop 状态后发布；`ToolCallsReady` 在一个事务中先保存 checkpoint，再在没有已接受 steer/pause 时登记 `tool_executions` 的 `running` owner；`ToolResultCommitted` 在同一 SQLite 事务中写入包含该结果的新 checkpoint并删除对应 `running` execution。进程或 owner 丢失时，仍在途的 execution 只转换为 `unknown`，永不自动重新执行；有安全 checkpoint 且没有 unknown execution 的 Turn 归约为 `suspended`，没有可恢复边界的 Turn 则按既有中断/失败合同终止。approval continuation 仍使用独立的 opaque typed `ApprovalCheckpoint` 与 `pending_tool_calls`，不把两种 checkpoint schema 混为 Store 的动态语义。
 
 checkpoint、pending tool call、原始 prompt、provider payload 和内部 audit metadata 不序列化到 `AgentLoopResult`、CLI response 或普通 trace payload。checkpoint 保存 model usage、provider attempts、completion/plan、revision-bound verification plan、bounded repair state、最后的 typed review verdict、context compaction、recovery metrics 和 tool-call fingerprints，但不作为 provider capability 真值。allow-resume 只接受当前 active blocked turn 的一次性 decision，校验 checkpoint 的完整绑定及项目指令 aggregate digest 后恢复原 messages、tool results、已消费 grants、approval count 和 model-turn offset；digest 不匹配时在重新协商或执行 pending tool 前失败。通过校验后再重新协商当前 effective model 的 capabilities，执行 pending tool 并继续模型循环；恢复时再次验证 plan/revision、repair budget 与 completion evidence 的一致性；取消、失败和 max-turn 返回都保留恢复前的回合计数。
 
@@ -235,7 +258,9 @@ edit/patch 只有在目标字节实际变化时才返回成功；no-op 在整批
 
 当策略返回 ask 时，AgentLoop 生成与 thread、turn、tool call 和类型化资源绑定的 `ApprovalRequest`，同时持久化只供 runtime 使用的 `PendingToolCall` checkpoint；pending 保存已经过 model admission、exact registry binding、workspace binding 和 profile 约束的 execution input，而不是重新暴露模型输入。resume 先用当前 workspace capability 重新绑定调用，再匹配和消费 Approval；execution validator、typed executor、exact resource set 与当前 profile 任一不一致都 fail closed。Turn Blocked、request、checkpoint 和 approval trace 在同一事务提交。Allow/Deny 是单次消费并写入 approval decision history；Defer 只写脱敏 trace event，不写最终 decision history、不消费 request，也不删除 checkpoint。只有 Allow 需要 active thread 和当前可用的 workspace：workspace 在 claim 前检查，thread active 状态还会在 Store claim 事务内重检，条件不满足时不消费 request。Deny 不执行工具，不依赖 thread 是否 archived 或 workspace 是否仍存在；它在 decision 同一事务终结 Turn 并删除 checkpoint。Defer 同样不依赖这两个执行条件，保留 Blocked Turn、request 和 checkpoint。客户端不能通过 `approval/request` 自行注入内部 approval request。
 
-Allow 在 decision history 写入与执行认领的同一事务内把 `pending` 直接认领为 `executing`。tool continuation 的 Allow 在 claim 前取得同一 workspace execution guard、登记 cancellation token，并由 Store 的 `BEGIN IMMEDIATE` 事务原子确认该 workspace 不存在其他非终态 Turn；跨进程 interrupt 若先提交则 claim 不成立，claim 若先提交则后续 interrupt 进入已登记 token 的可取消执行区。该 guard 与 token 持有到 AgentLoop outcome、terminal trace、checkpoint 删除或下一 checkpoint handoff 提交完成；Deny、Defer 和 generic approval 不启动 AgentLoop，也不占用该 guard。`approval/decision` 的 continuation 在独立 request worker 中恢复，主 stdin loop 不同步等待 AgentLoop。claim 之后的普通 AppServer continuation 错误会在当前进程归约为 Failed Turn 并原子删除 executing checkpoint；进程中断留下的 executing checkpoint 由后续安全恢复归约为 Interrupted 或 successor handoff，Store 持续不可写时则可能延迟终态提交。
+Allow 在 decision history 写入与执行认领的同一事务内把 `pending` 直接认领为 `executing`。若 Blocked Turn 已接受 `steer`，该事务改为原子删除尚未开始的 pending execution、消费有序 input、写入由同一私有 `CheckpointState` 转换出的普通 `TurnCheckpoint` 并把 Turn 恢复为 `running`；转换先为旧 Assistant ToolCall 追加 `not_executed_due_to_user_input` 的 typed ToolResult，再追加真实 UserMessage，因此允许原调用不等于执行已经被新要求废止的副作用。只有 pause control 时，事务保留 canonical pending call 于普通 checkpoint 并把 Turn 置为 `paused`；显式 resume 后仍需重新协商 capability、Policy、workspace revision 和 ToolSpec。该转换不会让 ApprovalCheckpoint 与 TurnCheckpoint 同时成为恢复权威。
+
+没有 input/pause handoff 时，tool continuation 的 Allow 在 claim 前取得同一 workspace execution guard、登记 cancellation token，并由 Store 的 `BEGIN IMMEDIATE` 事务原子确认该 workspace 不存在其他非终态 Turn；跨进程 interrupt 若先提交则 claim 不成立，claim 若先提交则后续 interrupt 进入已登记 token 的可取消执行区。该 guard 与 token 持有到 AgentLoop outcome、terminal trace、checkpoint 删除或下一 checkpoint handoff 提交完成；Deny、Defer 和 generic approval 不启动 AgentLoop，也不占用该 guard。`approval/decision` 的 continuation 在独立 request worker 中恢复，主 stdin loop 不同步等待 AgentLoop。claim 之后的普通 AppServer continuation 错误会在当前进程归约为 Failed Turn 并原子删除 executing checkpoint；进程中断留下的 executing checkpoint 由后续安全恢复归约为 Interrupted 或 successor handoff，Store 持续不可写时则可能延迟终态提交。
 
 启动恢复和非终态 `turn/status` 只在成功取得对应 workspace execution guard 后修改状态；锁被其他进程持有时视为 live owner 并跳过。取得 guard 后会检查该 execution scope 内的所有 logical thread，因此同 workspace 的另一个 thread 也能在 owner 丢失后清理 stale Turn。每个 logical thread 都在独立事务内先验证 Approval、checkpoint、Turn 和 decision binding，再执行该 thread 的恢复：合法的 Blocked + pending checkpoint 保持可恢复；无 owner 的 Running、CancelRequested 或非法 Blocked 归约为 Interrupted 并记录 `execution_owner_lost`。没有 successor 的遗留 `executing` 归约为 `Interrupted` 和 `approval_execution_outcome_unknown`；较早 `executing` 加一个较晚且合法的 `pending` 视为半交接，只删除旧 execution并保留下一 Approval。某个 thread 存在歧义拓扑或损坏 checkpoint 时，该 thread 的恢复事务失败且不修改其数据库状态；此前已安全恢复的 sibling thread 不回滚。所有恢复路径记录 `tool_replayed=false`，当前保证是 at-most-once execution attempt，不宣称 exactly-once。
 
@@ -324,7 +349,7 @@ provider HTTP wait、AgentLoop 回合边界和 sandbox command 都检查同一�
 
 ## 11. Store、Trace 与 Artifact
 
-`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/rust-app-server.sqlite3`。同一 Store namespace 中每个 canonical workspace 另有一个稳定、空内容、不会删除或重建的相邻 sidecar lock file；`WorkspaceExecutionGuard` 只持有标准库 `File` 锁，不把平台句柄或 sandbox 语义泄漏到 Agent、Protocol 或 Evaluation。锁文件名只包含带命名空间的 workspace identity 的 SHA-256，不保存原始路径、prompt、工具参数或用户内容；文件锁随进程/handle 关闭释放。缺少 workspace 的遗留 thread 使用 thread-scoped identity 仅供安全恢复，不能启动 AgentLoop；`:memory:` Store 不提供跨进程执行所有权并 fail closed。当前 schema 为 v12：除 v11 的稳定 Thread/Turn/Item/Approval plain-text enum、tagged `PermissionResource` 与 decision/checkpoint 合同外，`trace_events` 还持久化并交叉验证 `span_id`、`parent_span_id`、`span_kind`、`span_phase`、`span_status`、`duration_ms`、`time_to_first_token_ms`、`span_projection` 与 `metric_samples`。数据库约束只接受稳定 enum/phase/status 值，Start 不允许 terminal status/duration/metric，End 必须带 terminal status/duration，standalone metric event 不伪造 span。v1-v10 打开时先将完整 schema fingerprint 与已发布合同匹配，再在首个写入前只读解码 enum、approval、trace 和关系字段；pending AgentLoop checkpoint 保持 opaque，不由 Store 解析。旧 schema 只要仍含未完成 AgentLoop checkpoint，就在首次 schema 写入前拒绝迁移并保持原库不变，不伪造或长期读取旧 checkpoint。没有 pending checkpoint 时，v10 的字符串 approval resource 只按已发布工具合同迁移：workspace tools 接受 canonical relative path，command 只接受完整 historical scope-digest envelope，`update_plan` 只接受自身 tool id；未知、歧义或非法非空资源在写入前拒绝。v11 基线转换、默认值、约束、索引、foreign key 与历史关系校验在一个 `BEGIN IMMEDIATE` 事务中完成；随后 v11→v12 把可判定的历史 trace 投影为规范列并验证 parent/lifecycle/metric，不可判定或冲突数据会回滚。已标记的 v12 数据库每次 open 仍校验 schema marker/default/index、approval JSON 绑定、trace 列与 payload 的完整一致性；`0002_durable_ledger` 仅作为历史 migration id 保留，当前语义是 decision/event history，不是防篡改账本。`pending_tool_calls.execution_state` 只允许 `pending` 和 `executing`；`payload` 只由 Store 作为 opaque serialized checkpoint 保存，并与显式 request/thread/turn/tool-call 列绑定。AppServer 在 persistence seam 通过 AgentLoop 的 typed `PendingApprovalOccurrence`/`ApprovalCheckpoint` codec 只解码当前版本并校验结构和 resource；旧版、未来版或错绑 checkpoint 在进入 approval decision/resume 前 fail closed。file-backed open 从文件系统 root 逐级持有 directory capability，所有父目录和最终文件均 no-follow；canonical path、held handle、唯一 link count 与平台 file identity 一致后，SQLite 才以 `NOFOLLOW` 打开已经创建的文件，并在任何会创建 WAL 状态的 pragma 前再次验证 namespace identity。trusted reopen 只能由已初始化的 Store 派生，复用相同 canonical identity 和 retained parent capability并执行结构快速校验，不重复全库 preflight。Windows capability/guard 句柄禁止 delete/rename 并拒绝 reparse point；Store 在实际行/事务边界继续校验显式关系绑定，不解析 checkpoint 字段。
+`SessionStore` 使用 rusqlite bundled SQLite，开启 foreign keys、WAL、secure delete 和 busy timeout。默认路径为启动目录下 `.singularity/rust-app-server.sqlite3`。同一 Store namespace 中每个 canonical workspace 另有一个稳定、空内容、不会删除或重建的相邻 sidecar lock file；`WorkspaceExecutionGuard` 只持有标准库 `File` 锁，不把平台句柄或 sandbox 语义泄漏到 Agent、Protocol 或 Evaluation。锁文件名只包含带命名空间的 workspace identity 的 SHA-256，不保存原始路径、prompt、工具参数或用户内容；文件锁随进程/handle 关闭释放。缺少 workspace 的遗留 thread 使用 thread-scoped identity 仅供安全恢复，不能启动 AgentLoop；`:memory:` Store 不提供跨进程执行所有权并 fail closed。当前且唯一写入 schema 为 v13：除 v11 的稳定 Thread/Turn/Item/Approval plain-text enum、tagged `PermissionResource` 与 decision/checkpoint 合同外，`trace_events` 还持久化并交叉验证 `span_id`、`parent_span_id`、`span_kind`、`span_phase`、`span_status`、`duration_ms`、`time_to_first_token_ms`、`span_projection` 与 `metric_samples`。数据库约束只接受稳定 enum/phase/status 值，Start 不允许 terminal status/duration/metric，End 必须带 terminal status/duration，standalone metric event 不伪造 span；v13 另外加入每个 Turn 唯一的 `turn_checkpoints`、按 execution id 唯一的 `tool_executions`、引用 `ItemKind::UserMessage` 的 `turn_inputs`、`turns.pause_requested`，并把 `paused`/`suspended` 纳入 Turn 状态约束。v1-v10 打开时先将完整 schema fingerprint 与已发布合同匹配，再在首个写入前只读解码 enum、approval、trace 和关系字段；pending AgentLoop checkpoint 保持 opaque，不由 Store 解析。旧 schema 只要仍含未完成 AgentLoop checkpoint，就在首次 schema 写入前拒绝迁移并保持原库不变，不伪造或长期读取旧 checkpoint。没有 pending checkpoint 时，v10 的字符串 approval resource 只按已发布工具合同迁移：workspace tools 接受 canonical relative path，command 只接受完整 historical scope-digest envelope，`update_plan` 只接受自身 tool id；未知、歧义或非法非空资源在写入前拒绝。v11 基线转换、默认值、约束、索引、foreign key 与历史关系校验在一个 `BEGIN IMMEDIATE` 事务中完成；随后迁移到 v13 时把可判定的历史 trace 投影为规范列并验证 parent/lifecycle/metric，创建 checkpoint、execution、interactive-input 表和状态约束，不可判定或冲突数据会回滚。已标记的 v13 数据库每次 open 仍校验 schema marker/default/index、approval JSON 绑定、trace 列与 payload 的完整一致性；`0002_durable_ledger` 仅作为历史 migration id 保留，当前语义是 decision/event history，不是防篡改账本。`pending_tool_calls.execution_state` 只允许 `pending` 和 `executing`；`turn_checkpoints` 只接受 JSON object 和正数 checkpoint version；`tool_executions` 只允许 `running`/`unknown`；`turn_inputs` 只允许 `steer`/`follow_up` 与一致的 pending/consumed 时间状态。Store 把 checkpoint payload 作为 opaque serialized metadata，并在显式 request/thread/turn/tool-call/item 关系边界校验绑定。AppServer 在 persistence seam 通过 AgentLoop 的 typed `PendingApprovalOccurrence`/`ApprovalCheckpoint` 与 `TurnCheckpoint` codec 只解码当前版本并校验结构和 resource；旧版、未来版或错绑 checkpoint 在 approval decision 或 turn resume 前 fail closed。file-backed open 从文件系统 root 逐级持有 directory capability，所有父目录和最终文件均 no-follow；canonical path、held handle、唯一 link count 与平台 file identity 一致后，SQLite 才以 `NOFOLLOW` 打开已经创建的文件，并在任何会创建 WAL 状态的 pragma 前再次验证 namespace identity。trusted reopen 只能由已初始化的 Store 派生，复用相同 canonical identity 和 retained parent capability并执行结构快速校验，不重复全库 preflight。Windows capability/guard 句柄禁止 delete/rename 并拒绝 reparse point；Store 在实际行/事务边界继续校验显式关系绑定，不解析 checkpoint 字段。
 
 主要表：
 
@@ -336,6 +361,9 @@ trace_events
 approvals
 approval_decisions
 pending_tool_calls
+turn_checkpoints
+tool_executions
+turn_inputs
 artifact_refs
 schema_meta / schema_migrations
 ```
@@ -348,7 +376,7 @@ Store 只持久化上游已经完成的 audit projection，再对 trace payload 
 
 Trace span 的生命周期由 Store 的 typed API 负责：Turn/Approval/PromptAssembly/ProviderAttempt/ToolCall/PolicyDecision/SandboxExecution/Verification/FinalReview 等 span 只能由明确的 Start、状态变更和 End 事件组成；Start、End、metric sample 与对应 Turn 状态在同一 SQLite 事务中提交，重复 Start 只有在 identity 完全相同时幂等，identity 冲突、非法 parent、缺少 terminal duration 或未知状态均 fail closed。SQLite `trace_events` 是运行时唯一事实源，CLI、transport metrics 和后续导出只能查询或投影它，不得创建并行 collector、队列或内存 registry。
 
-Provider capability-cache metric 的 trace identity 来自同一个 typed lookup observation：绑定后的 Prompt parent、model-turn ordinal、protocol、Hit/Miss、真实 lookup 时间和 occurrence index 共同构成稳定身份。Blocked Turn 恢复时新的 model turn/parent 产生新的 identity，不会因每段局部 vector index 从 0 重启而与暂停前的 metric 冲突；同一 observation 被重复投影仍保持同一 ID 并由 Store 拒绝重复写入。
+Provider capability-cache metric 的 trace identity 来自同一个 typed lookup observation：绑定后的 Prompt parent、model-turn ordinal、protocol、Hit/Miss、真实 lookup 时间和 occurrence index 共同构成稳定身份。Blocked Turn 恢复时新的 model turn/parent 产生新的 identity，不会因每段局部 vector index 从 0 重启而与暂停前的 metric 冲突；同一 observation 被重复投影仍保持同一 ID 并由 Store 拒绝重复写入。`turn/resume` 在解码安全 `TurnCheckpoint` 后先持久递增 `resume_attempt` epoch；该 epoch 参与恢复段的 tool/provider occurrence identity，epoch 0 保留初始运行的兼容 identity，后续进程恢复不会覆盖旧 trace。
 
 ## 12. Evaluation
 
@@ -393,6 +421,9 @@ Agent workspace 的 before/after 快照保留完整 materialized tree；仅在�
 - protected path、workspace 越界、非法 tool arguments 和扩大 sandbox/network 权限在执行前拒绝。
 - approval 必须显式绑定 thread、turn 和 tool call，不能重放。
 - approval checkpoint 缺失、版本未知、身份错绑、消息/tool-call 顺序不合法或重复消费 grant 时 fail closed。
+- `tool_executions` 的 owner 丢失只将 `running` 归约为持久 `unknown`；unknown execution 会阻止 `turn/resume`，不得自动重放外部工具副作用。
+- 只有包含完整安全 `TurnCheckpoint` 且不存在 unknown execution 的 `paused`/`suspended` turn 才可由单 owner `turn/resume` 认领；resume attempt epoch 递增后才生成新的 trace occurrence identity。
+- `turn_inputs` 只记录 `ItemKind::UserMessage` 的消费关系；终态提交与 pending input/pause 检查在同一事务内，不能跳过已接受的用户输入。
 - cancelled turn 的晚到结果不能恢复为 completed。
 - evaluation 的 fake/mock 测试只用于确定性回归，不能替代真实 provider + AgentLoop 证明。
 

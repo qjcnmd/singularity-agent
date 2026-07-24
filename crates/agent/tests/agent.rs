@@ -974,6 +974,34 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
     assert_eq!(blocked.status, AgentStatus::Blocked);
     assert_eq!(negotiation_calls.load(Ordering::SeqCst), 1);
     let pending = pending_approval(&blocked);
+    let steered_checkpoint = pending
+        .checkpoint()
+        .into_turn_checkpoint(&["use a different implementation".to_string()], true)
+        .expect("approval steer handoff")
+        .encode()
+        .expect("turn checkpoint");
+    assert_eq!(
+        steered_checkpoint["pending_tool_calls"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        steered_checkpoint["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("user message")["role"],
+        "user"
+    );
+    assert!(
+        steered_checkpoint["tool_result_occurrences"]
+            .as_array()
+            .expect("tool results")
+            .iter()
+            .any(|occurrence| {
+                occurrence["result"]["error_code"] == "not_executed_due_to_user_input"
+                    && occurrence["result"]["failure_kind"] == "cancelled"
+            })
+    );
 
     let resumed_input = input.with_approval_grant(ApprovalGrant::allow(
         pending.pending_tool_call().request_id.clone(),

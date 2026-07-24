@@ -41,6 +41,9 @@ pub enum StoreError {
     /// workspace 已有另一个非终态 turn。
     #[error("workspace already has non-terminal turn {turn_id} in thread {thread_id}")]
     WorkspaceHasNonterminalTurn { thread_id: String, turn_id: String },
+    /// 终态提交与已接受输入或暂停请求在线性化点发生竞争。
+    #[error("turn {turn_id} has pending interactive input or pause control")]
+    TurnBoundaryPending { turn_id: String },
 }
 
 impl StoreError {

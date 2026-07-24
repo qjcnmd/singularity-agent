@@ -557,6 +557,38 @@ impl SessionStore {
         component: &str,
         summary: &str,
     ) -> StoreResult<RecordedApprovalDecision> {
+        self.record_approval_decision_with_optional_turn_checkpoint(
+            decision, component, summary, None,
+        )
+    }
+
+    /// Atomically resolve an allowed approval into an ordinary turn checkpoint at a user boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_approval_decision_with_turn_checkpoint(
+        &self,
+        decision: &ApprovalDecision,
+        component: &str,
+        summary: &str,
+        input_ids: &[String],
+        checkpoint: &Value,
+        checkpoint_version: u32,
+        pause: bool,
+    ) -> StoreResult<RecordedApprovalDecision> {
+        self.record_approval_decision_with_optional_turn_checkpoint(
+            decision,
+            component,
+            summary,
+            Some((input_ids, checkpoint, checkpoint_version, pause)),
+        )
+    }
+
+    fn record_approval_decision_with_optional_turn_checkpoint(
+        &self,
+        decision: &ApprovalDecision,
+        component: &str,
+        summary: &str,
+        turn_checkpoint: Option<(&[String], &Value, u32, bool)>,
+    ) -> StoreResult<RecordedApprovalDecision> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         // 读取尚未决定的 approval，并恢复其持久化绑定。
@@ -671,7 +703,64 @@ impl SessionStore {
                 ));
             }
         }
-        if pending_tool_call.is_some() && decision.outcome == ApprovalOutcome::Allow {
+        let include_follow_up = decision.outcome == ApprovalOutcome::Deny;
+        let (pause_requested, pending_input_count): (bool, u64) = transaction.query_row(
+            "select pause_requested = 1,
+                    (select count(*) from turn_inputs
+                     where turn_id = ?1 and delivery_state = 'pending'
+                       and (delivery = 'steer' or ?2))
+             from turns where turn_id = ?1",
+            params![request.turn_id, include_follow_up],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let boundary_pending = pause_requested || pending_input_count != 0;
+        match turn_checkpoint {
+            Some((input_ids, _, _, pause))
+                if pause != pause_requested || input_ids.len() as u64 != pending_input_count =>
+            {
+                return Err(StoreError::TurnBoundaryPending {
+                    turn_id: request.turn_id.clone(),
+                });
+            }
+            None if boundary_pending && decision.outcome != ApprovalOutcome::Defer => {
+                return Err(StoreError::TurnBoundaryPending {
+                    turn_id: request.turn_id.clone(),
+                });
+            }
+            _ => {}
+        }
+        if let Some((input_ids, checkpoint, _, pause)) = turn_checkpoint {
+            if !matches!(
+                decision.outcome,
+                ApprovalOutcome::Allow | ApprovalOutcome::Deny
+            ) || pending_tool_call.is_none()
+                || (!pause && input_ids.is_empty())
+                || !checkpoint.is_object()
+            {
+                return Err(StoreError::InvalidState(
+                    "approval turn checkpoint handoff is invalid".to_string(),
+                ));
+            }
+            for input_id in input_ids {
+                let pending: bool = transaction.query_row(
+                    "select exists(
+                        select 1 from turn_inputs
+                        where input_id = ?1 and turn_id = ?2 and delivery_state = 'pending'
+                           and (delivery = 'steer' or ?3)
+                     )",
+                    params![input_id, request.turn_id, include_follow_up],
+                    |row| row.get(0),
+                )?;
+                if !pending {
+                    return Err(StoreError::InvalidState(format!(
+                        "approval turn input {input_id} is not pending steer"
+                    )));
+                }
+            }
+        }
+        if pending_tool_call.is_some()
+            && (decision.outcome == ApprovalOutcome::Allow || turn_checkpoint.is_some())
+        {
             let thread_status: String = transaction.query_row(
                 "select status from threads where thread_id = ?1",
                 params![request.thread_id],
@@ -746,11 +835,65 @@ impl SessionStore {
                 serde_json::to_string(decision)?
             ],
         )?;
-        if decision.outcome == ApprovalOutcome::Allow {
-            let changed = transaction.execute(
-                "update pending_tool_calls set execution_state = 'executing' where request_id = ?1 and execution_state = 'pending'",
+        if let Some((input_ids, checkpoint, checkpoint_version, pause)) = turn_checkpoint {
+            let deleted = transaction.execute(
+                "delete from pending_tool_calls
+                     where request_id = ?1 and execution_state = 'pending'",
                 params![decision.request_id],
             )?;
+            if deleted != 1 {
+                return Err(StoreError::InvalidState(format!(
+                    "pending execution {} is not in pending state",
+                    decision.request_id
+                )));
+            }
+            for input_id in input_ids {
+                let changed = transaction.execute(
+                    "update turn_inputs
+                         set delivery_state = 'consumed', consumed_at = current_timestamp
+                         where input_id = ?1 and turn_id = ?2 and delivery_state = 'pending'
+                            and (delivery = 'steer' or ?3)",
+                    params![input_id, request.turn_id, include_follow_up],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::InvalidState(format!(
+                        "approval turn input {input_id} is not pending steer"
+                    )));
+                }
+            }
+            Self::upsert_turn_checkpoint(
+                &transaction,
+                &request.turn_id,
+                &request.thread_id,
+                checkpoint,
+                checkpoint_version,
+            )?;
+            let (status, agent_loop_status) = if pause {
+                (TurnStatus::Paused.to_db_text(), "paused")
+            } else {
+                (TurnStatus::Running.to_db_text(), "running")
+            };
+            let changed = transaction.execute(
+                "update turns
+                     set status = ?1, agent_loop_status = ?2, pause_requested = 0
+                     where turn_id = ?3 and status = ?4 and agent_loop_status = 'blocked'",
+                params![
+                    status,
+                    agent_loop_status,
+                    request.turn_id,
+                    TurnStatus::Blocked.to_db_text()
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidState(
+                    "pending approval is not bound to a blocked turn".to_string(),
+                ));
+            }
+        } else if decision.outcome == ApprovalOutcome::Allow {
+            let changed = transaction.execute(
+                    "update pending_tool_calls set execution_state = 'executing' where request_id = ?1 and execution_state = 'pending'",
+                    params![decision.request_id],
+                )?;
             if pending_tool_call.is_some() && changed != 1 {
                 return Err(StoreError::InvalidState(format!(
                     "pending execution {} is not in pending state",

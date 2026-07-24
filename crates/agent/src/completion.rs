@@ -203,6 +203,11 @@ impl CompletionTracker {
             .insert(format!("workspace_revision:{reason}"));
     }
 
+    pub(super) fn clear_user_input_invalidation(&mut self) {
+        self.unresolved_failures
+            .remove("workspace_revision:user_input_revision");
+    }
+
     pub(super) fn clear_terminal_command_observations(&mut self) {
         self.terminal_command_scope_digests.clear();
         self.terminal_command_revisions.clear();

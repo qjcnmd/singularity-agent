@@ -48,7 +48,158 @@ mod observation;
 mod planning;
 mod tool_occurrence;
 
-pub use checkpoint::{ApprovalCheckpoint, PendingApprovalOccurrence, PendingToolCall};
+pub use checkpoint::{
+    ApprovalCheckpoint, PendingApprovalOccurrence, PendingToolCall, TurnCheckpoint,
+    TurnCheckpointEvent, TurnCheckpointPhase,
+};
+
+impl TurnCheckpoint {
+    /// Append accepted user messages and conservatively invalidate decisions made before them.
+    ///
+    /// When a validated tool call has not started, `cancelled_tool_call` closes the structured
+    /// assistant call with a typed, model-visible failure before the new user message is added.
+    pub fn with_user_inputs(
+        mut self,
+        inputs: &[String],
+        cancel_pending_tool_calls: bool,
+    ) -> Result<Self, String> {
+        if inputs.is_empty() || inputs.iter().any(|input| input.trim().is_empty()) {
+            return Err("turn checkpoint user input is empty".to_string());
+        }
+        if cancel_pending_tool_calls {
+            self = self.with_pending_tool_failure(
+                "not_executed_due_to_user_input",
+                "tool was not executed because newer user input changed the task",
+                false,
+            )?;
+        }
+        self.append_user_inputs(inputs)
+    }
+
+    fn with_pending_tool_failure(
+        mut self,
+        error_code: &str,
+        summary: &str,
+        observe_completion: bool,
+    ) -> Result<Self, String> {
+        if self.pending_tool_calls.is_empty() {
+            return Err("turn checkpoint pending tool call is missing".to_string());
+        }
+        for pending in &self.pending_tool_calls {
+            let tool_call_id = pending.tool_call_id.as_str();
+            let tool_name = pending.tool_name.as_str();
+            let call_is_present = self.state.messages.iter().rev().any(|message| {
+                message.role == ModelRole::Assistant
+                    && message.tool_calls.iter().any(|call| {
+                        call.tool_call_id == tool_call_id && call.tool_name == tool_name
+                    })
+            });
+            if !call_is_present {
+                return Err("turn checkpoint pending tool call is missing".to_string());
+            }
+            let mut result = ToolResult::summary(tool_call_id, tool_name, false, summary);
+            result.error_code = Some(error_code.to_string());
+            result.failure_kind = Some(ToolFailureKind::Cancelled);
+            if observe_completion {
+                self.state.completion.observe(&result);
+            }
+            self.state
+                .messages
+                .push(tool_result_message(&result, Some(tool_name)));
+            self.state
+                .tool_result_occurrences
+                .push(ToolResultOccurrence::new(
+                    result.clone(),
+                    ToolResultVisibility::Visible,
+                ));
+        }
+        self.pending_tool_calls.clear();
+        Ok(self)
+    }
+
+    fn append_user_inputs(mut self, inputs: &[String]) -> Result<Self, String> {
+        self.state.messages.extend(
+            inputs
+                .iter()
+                .map(|input| ModelMessage::text(ModelRole::User, input.clone())),
+        );
+        self.state.input_revision = self
+            .state
+            .input_revision
+            .checked_add(1)
+            .ok_or_else(|| "turn checkpoint input revision is exhausted".to_string())?;
+        self.state
+            .completion
+            .mark_workspace_revision_invalid("user_input_revision");
+        self.state.completion.replace_requirements(&[])?;
+        self.state.plan = None;
+        self.state.verification_plan = None;
+        self.state.verification_change = None;
+        self.state.verification_failure_history.clear();
+        self.state.repair_plan = None;
+        self.state.final_review_verdict = None;
+        self.state.last_completion_error = None;
+        self.state.last_repair_failure = None;
+        self.encode().map(|_| self)
+    }
+}
+
+impl ApprovalCheckpoint {
+    /// Convert a superseded approval boundary into the ordinary turn continuation authority.
+    ///
+    /// A steer closes the approved-but-not-started call with a typed ToolResult. A pause keeps the
+    /// canonical pending call so resume can revalidate it against current capabilities and policy.
+    pub fn into_turn_checkpoint(
+        &self,
+        inputs: &[String],
+        cancel_pending_tool_call: bool,
+    ) -> Result<TurnCheckpoint, String> {
+        if cancel_pending_tool_call != !inputs.is_empty() {
+            return Err("approval checkpoint input handoff is inconsistent".to_string());
+        }
+        let mut state = self.state.clone();
+        state.checkpoint_version = TURN_CHECKPOINT_VERSION;
+        let checkpoint = TurnCheckpoint {
+            state,
+            pending_tool_calls: vec![self.pending_tool_call.clone()],
+        };
+        if cancel_pending_tool_call {
+            checkpoint.with_user_inputs(inputs, true)
+        } else {
+            checkpoint.encode().map(|_| checkpoint)
+        }
+    }
+
+    /// Convert a denied, not-yet-started approval into an ordinary continuation boundary.
+    pub fn into_turn_checkpoint_after_denial(
+        &self,
+        inputs: &[String],
+    ) -> Result<TurnCheckpoint, String> {
+        if inputs.iter().any(|input| input.trim().is_empty()) {
+            return Err("approval checkpoint input handoff is inconsistent".to_string());
+        }
+        let mut state = self.state.clone();
+        state.checkpoint_version = TURN_CHECKPOINT_VERSION;
+        let checkpoint = TurnCheckpoint {
+            state,
+            pending_tool_calls: vec![self.pending_tool_call.clone()],
+        }
+        .with_pending_tool_failure(
+            "approval_denied",
+            "tool was not executed because approval was denied",
+            true,
+        )?;
+        if inputs.is_empty() {
+            checkpoint.encode().map(|_| checkpoint)
+        } else {
+            checkpoint.append_user_inputs(inputs)
+        }
+    }
+}
+
+/// Consumer callback for durable turn-boundary persistence.
+pub type AgentLoopCheckpointCallback<'a> =
+    dyn FnMut(TurnCheckpointEvent) -> Result<(), AgentLoopEventSinkError> + 'a;
 use completion::{
     CompletionTracker, RepairFailureState, ToolResultOccurrence, ToolResultVisibility,
 };
@@ -80,6 +231,8 @@ use singularity_tools::{ToolCallRequest, WorkspaceObservation};
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
 const APPROVAL_CHECKPOINT_VERSION: u32 = 3;
+/// Version for ordinary turn checkpoints. Approval wire compatibility remains at v3.
+const TURN_CHECKPOINT_VERSION: u32 = 2;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise update_plan plan; revise it when evidence or failure changes the approach, and complete it before the final answer. Skip plans for simple read-only or single-step work. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -139,6 +292,7 @@ const EVENT_SINK_FAILURE_ERROR: &str = "agent event sink failed";
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Running,
+    Paused,
     CancelRequested,
     Completed,
     Blocked,
@@ -151,6 +305,7 @@ impl AgentStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::CancelRequested => "cancel_requested",
             Self::Completed => "completed",
             Self::Blocked => "blocked",
@@ -164,6 +319,7 @@ impl From<&str> for AgentStatus {
     fn from(value: &str) -> Self {
         match value {
             "running" => Self::Running,
+            "paused" => Self::Paused,
             "cancel_requested" => Self::CancelRequested,
             "completed" => Self::Completed,
             "blocked" => Self::Blocked,
@@ -634,6 +790,14 @@ pub struct AgentRunStatus {
 }
 
 impl AgentRunStatus {
+    /// Construct a non-terminal pause result; the durable checkpoint remains authoritative.
+    pub fn paused() -> Self {
+        let mut status = Self::failed("turn paused at a durable boundary");
+        status.status = AgentStatus::Paused;
+        status.error = None;
+        status
+    }
+
     /// 构造普通失败状态。
     pub fn failed(message: impl Into<String>) -> Self {
         Self {
@@ -727,6 +891,9 @@ pub struct AgentLoopInput {
     pub approval_grants: Vec<ApprovalGrant>,
     #[serde(skip)]
     #[schemars(skip)]
+    resume_attempt: u32,
+    #[serde(skip)]
+    #[schemars(skip)]
     pub verification_requirements: Vec<AgentVerificationRequirement>,
 }
 
@@ -748,8 +915,15 @@ impl AgentLoopInput {
             interrupted: false,
             max_turns: DEFAULT_MAX_AGENT_LOOP_TURNS,
             approval_grants: Vec::new(),
+            resume_attempt: 0,
             verification_requirements: Vec::new(),
         }
+    }
+
+    /// Bind the durable continuation epoch used by runtime occurrence identities.
+    pub fn with_resume_attempt(mut self, resume_attempt: u32) -> Self {
+        self.resume_attempt = resume_attempt;
+        self
     }
 
     /// 设置本轮模型名称。
@@ -948,6 +1122,8 @@ struct AgentLoopState {
     provider_attempts: ProviderAttemptMetadata,
     seen_tool_call_fingerprints: BTreeSet<String>,
     last_repair_failure: Option<RepairFailureState>,
+    input_revision: u32,
+    replanned_input_revision: u32,
     model_turn_limit: u32,
     context_trace: Option<AgentContextTrace>,
     provider_protocol_contract: Option<ProviderProtocolContract>,
@@ -1034,6 +1210,8 @@ impl AgentLoopState {
             provider_attempts: ProviderAttemptMetadata::default(),
             seen_tool_call_fingerprints: BTreeSet::new(),
             last_repair_failure: None,
+            input_revision: 0,
+            replanned_input_revision: 0,
             model_turn_limit,
             context_trace,
             provider_protocol_contract: None,
@@ -1243,21 +1421,55 @@ impl AgentLoopState {
         pending_tool_call: &PendingToolCall,
         model_turns: u32,
     ) -> Result<ApprovalCheckpoint, String> {
+        let checkpoint = ApprovalCheckpoint {
+            pending_tool_call: pending_tool_call.clone(),
+            state: self.checkpoint_state(input, model_turns, APPROVAL_CHECKPOINT_VERSION, true),
+        };
+        checkpoint.validate_serialized()?;
+        Ok(checkpoint)
+    }
+
+    fn turn_checkpoint(
+        &self,
+        input: &AgentLoopInput,
+        model_turns: u32,
+        pending_tool_calls: Vec<PendingToolCall>,
+    ) -> Result<TurnCheckpoint, String> {
+        let checkpoint = TurnCheckpoint {
+            state: self.checkpoint_state(input, model_turns, TURN_CHECKPOINT_VERSION, false),
+            pending_tool_calls,
+        };
+        checkpoint.encode().map(|_| checkpoint)
+    }
+
+    fn checkpoint_state(
+        &self,
+        input: &AgentLoopInput,
+        model_turns: u32,
+        checkpoint_version: u32,
+        approval: bool,
+    ) -> checkpoint::CheckpointState {
         // Runtime provider occurrences are delivery-scoped; checkpoint only carries the
         // aggregate counters so a decoded resume emits new observations exactly once.
         let mut provider_attempts = self.provider_attempts.clone();
         provider_attempts.occurrences.clear();
-        let checkpoint = ApprovalCheckpoint {
-            pending_tool_call: pending_tool_call.clone(),
-            checkpoint_version: APPROVAL_CHECKPOINT_VERSION,
+        checkpoint::CheckpointState {
+            checkpoint_version,
             thread_id: input.thread_id.clone(),
             turn_id: input.turn_id.clone(),
             project_instructions_digest: input.project_instructions_digest.clone(),
             messages: self.messages.clone(),
             tool_result_occurrences: self.tool_result_occurrences.clone(),
             used_approval_grants: self.used_approval_grants.iter().cloned().collect(),
-            approval_count: self.approval_count().saturating_add(1),
+            approval_count: if approval {
+                self.approval_count().saturating_add(1)
+            } else {
+                0
+            },
             model_turns,
+            resume_attempt: input.resume_attempt,
+            input_revision: self.input_revision,
+            replanned_input_revision: self.replanned_input_revision,
             completion: self.completion.clone(),
             verification_plan: self.verification_plan.clone(),
             verification_change: self.verification_change.clone(),
@@ -1279,9 +1491,7 @@ impl AgentLoopState {
             context_trace: self.context_trace.clone(),
             seen_tool_call_fingerprints: self.seen_tool_call_fingerprints.iter().cloned().collect(),
             last_repair_failure: self.last_repair_failure.clone(),
-        };
-        checkpoint.validate_serialized()?;
-        Ok(checkpoint)
+        }
     }
 
     fn allows_final(&self) -> bool {
@@ -2247,6 +2457,16 @@ where
         self.run_internal(input, Some(on_event))
     }
 
+    /// Run while notifying the owner at durable input/tool-result boundaries.
+    pub fn run_with_events_and_checkpoints(
+        &self,
+        input: &AgentLoopInput,
+        on_event: &mut AgentLoopEventCallback<'_>,
+        on_checkpoint: &mut AgentLoopCheckpointCallback<'_>,
+    ) -> AgentLoopResult {
+        self.run_internal_with_checkpoints(input, Some(on_event), Some(on_checkpoint))
+    }
+
     /// 运行一个新 turn，并只向调用方投影最终化 assistant 回合的有序文本 delta。
     pub fn run_with_text_deltas(
         &self,
@@ -2264,10 +2484,207 @@ where
         )
     }
 
+    /// Build the first durable boundary for a turn before any model request or tool side effect.
+    /// The snapshot contains only the complete, public input context and no partial provider
+    /// response; callers persist it before entering the execution owner.
+    pub fn initial_turn_checkpoint(
+        &self,
+        input: &AgentLoopInput,
+    ) -> Result<TurnCheckpoint, String> {
+        let context = assemble_context_items(&input.input, u32::MAX);
+        if current_turn_excluded(input, &context) {
+            return Err(CURRENT_TURN_CONTEXT_OVERFLOW_ERROR.to_string());
+        }
+        let messages = model_messages_from_input(input, &context, 1);
+        let mut state = AgentLoopState::new(messages, input.max_turns.max(1), None);
+        state.completion = verification_requirements(input)
+            .and_then(|requirements| CompletionTracker::from_requirements(&requirements))?;
+        state.verification_plan =
+            (!input.verification_requirements.is_empty()).then(|| VerificationPlanState {
+                plan: AgentVerificationPlan::from_requirements(
+                    input.verification_requirements.clone(),
+                ),
+                revision: None,
+            });
+        state.context_trace = Some(AgentContextTrace::from(&context));
+        state
+            .turn_checkpoint(input, 0, Vec::new())
+            .map_err(|error| format!("initial turn checkpoint invalid: {error}"))
+    }
+
+    /// Resume a non-approval turn from a validated durable boundary. No tool call is replayed;
+    /// the next provider request is built from the checkpoint's exact message/state snapshot.
+    pub fn resume_turn(
+        &self,
+        input: &AgentLoopInput,
+        checkpoint: &TurnCheckpoint,
+    ) -> AgentLoopResult {
+        self.resume_turn_internal(input, checkpoint, None, None)
+    }
+
+    /// Resume a non-approval turn and project the same observable events as a fresh run.
+    pub fn resume_turn_with_events(
+        &self,
+        input: &AgentLoopInput,
+        checkpoint: &TurnCheckpoint,
+        on_event: &mut AgentLoopEventCallback<'_>,
+    ) -> AgentLoopResult {
+        self.resume_turn_internal(input, checkpoint, Some(on_event), None)
+    }
+
+    /// Resume a non-approval turn while notifying the owner at durable tool boundaries.
+    pub fn resume_turn_with_events_and_checkpoints(
+        &self,
+        input: &AgentLoopInput,
+        checkpoint: &TurnCheckpoint,
+        on_event: &mut AgentLoopEventCallback<'_>,
+        on_checkpoint: &mut AgentLoopCheckpointCallback<'_>,
+    ) -> AgentLoopResult {
+        self.resume_turn_internal(input, checkpoint, Some(on_event), Some(on_checkpoint))
+    }
+
+    fn resume_turn_internal(
+        &self,
+        input: &AgentLoopInput,
+        checkpoint: &TurnCheckpoint,
+        mut on_event: Option<&mut AgentLoopEventCallback<'_>>,
+        mut on_checkpoint: Option<&mut AgentLoopCheckpointCallback<'_>>,
+    ) -> AgentLoopResult {
+        let (state, model_turn_offset) = match restore_turn_checkpoint(input, checkpoint) {
+            Ok(restored) => restored,
+            Err(error) => return failed_result(error),
+        };
+        if self.is_cancelled(input) {
+            return state.finish(AgentStatus::Cancelled, false, None, model_turn_offset, None);
+        }
+        if let Some(workspace_tools) = &self.workspace_tools
+            && let Err(error) = workspace_tools
+                .bind_checkpoint_workspace_revision(state.completion.workspace_revision)
+        {
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some(format!(
+                    "turn checkpoint workspace revision binding failed: {error}"
+                )),
+            );
+        }
+        let (capabilities, mut state) = match self.negotiate_tool_capabilities(
+            input,
+            state,
+            model_turn_offset,
+            &mut on_event,
+        ) {
+            ControlFlow::Continue(result) => result,
+            ControlFlow::Break(result) => return result,
+        };
+        let max_tool_calls = effective_max_tool_calls(&capabilities);
+        let budget = match context_budget(input, &self.tool_broker, &capabilities, max_tool_calls) {
+            Ok(budget) => budget,
+            Err(error) => {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    model_turn_offset,
+                    Some(error),
+                );
+            }
+        };
+        if !checkpoint.pending_tool_calls().is_empty() {
+            let mut occurrences = Vec::with_capacity(checkpoint.pending_tool_calls().len());
+            for (ordinal, pending) in checkpoint.pending_tool_calls().iter().enumerate() {
+                let call = match pending.to_model_tool_call() {
+                    Ok(call) => call,
+                    Err(error) => {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            model_turn_offset,
+                            Some(format!(
+                                "turn checkpoint pending tool call is invalid: {error}"
+                            )),
+                        );
+                    }
+                };
+                occurrences.push(ModelToolOccurrence {
+                    fingerprint: tool_call_fingerprint(&call),
+                    invalid_was_observed: false,
+                    context: tool_occurrence_context(
+                        input,
+                        &call,
+                        model_turn_offset,
+                        u32::try_from(ordinal).unwrap_or(u32::MAX),
+                    ),
+                    call,
+                });
+            }
+            match self.process_tool_calls(
+                input,
+                &occurrences,
+                &mut state,
+                model_turn_offset,
+                &mut on_event,
+                &mut on_checkpoint,
+            ) {
+                ToolBatchControl::Continue => {}
+                ToolBatchControl::Blocked => {
+                    return state.finish(
+                        AgentStatus::Blocked,
+                        false,
+                        None,
+                        model_turn_offset,
+                        None,
+                    );
+                }
+                ToolBatchControl::Cancelled => {
+                    return state.finish(
+                        AgentStatus::Cancelled,
+                        false,
+                        None,
+                        model_turn_offset,
+                        None,
+                    );
+                }
+                ToolBatchControl::Failed(error) => {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        model_turn_offset,
+                        Some(error),
+                    );
+                }
+            }
+        }
+        self.continue_run(
+            input,
+            &budget,
+            &capabilities,
+            max_tool_calls,
+            state,
+            model_turn_offset,
+            on_event,
+            on_checkpoint,
+        )
+    }
+
     fn run_internal(
         &self,
         input: &AgentLoopInput,
+        on_event: Option<&mut AgentLoopEventCallback<'_>>,
+    ) -> AgentLoopResult {
+        self.run_internal_with_checkpoints(input, on_event, None)
+    }
+
+    fn run_internal_with_checkpoints(
+        &self,
+        input: &AgentLoopInput,
         mut on_event: Option<&mut AgentLoopEventCallback<'_>>,
+        mut on_checkpoint: Option<&mut AgentLoopCheckpointCallback<'_>>,
     ) -> AgentLoopResult {
         let mut state = AgentLoopState::new(Vec::new(), input.max_turns.max(1), None);
         if self.is_cancelled(input) {
@@ -2313,6 +2730,34 @@ where
         }
         state.messages = model_messages_from_input(input, &context, max_tool_calls);
         state.context_trace = Some(AgentContextTrace::from(&context));
+        if let Some(callback) = on_checkpoint.as_deref_mut() {
+            let checkpoint = match state.turn_checkpoint(input, 0, Vec::new()) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    return state.finish(
+                        AgentStatus::Failed,
+                        false,
+                        None,
+                        0,
+                        Some(format!("turn checkpoint failed: {error}")),
+                    );
+                }
+            };
+            if callback(TurnCheckpointEvent {
+                phase: TurnCheckpointPhase::Initial,
+                checkpoint,
+            })
+            .is_err()
+            {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    0,
+                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                );
+            }
+        }
         self.continue_run(
             input,
             &budget,
@@ -2321,6 +2766,7 @@ where
             state,
             0,
             on_event,
+            on_checkpoint,
         )
     }
 
@@ -2335,6 +2781,7 @@ where
         mut state: AgentLoopState,
         model_turn_offset: u32,
         on_event: Option<&mut AgentLoopEventCallback<'_>>,
+        on_checkpoint: Option<&mut AgentLoopCheckpointCallback<'_>>,
     ) -> AgentLoopResult {
         let max_turns = input.max_turns.max(1);
         if model_turn_offset > max_turns
@@ -2350,6 +2797,7 @@ where
             );
         }
         let mut on_event = on_event;
+        let mut on_checkpoint = on_checkpoint;
         let mut actual_model_turns = model_turn_offset;
         // 包含端点只保留给终态；没有 readiness 时仍维持普通工作回合上限及其失败语义。
         for turn_index in model_turn_offset..=max_turns {
@@ -2372,6 +2820,24 @@ where
             }
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
+            }
+            if !matches!(
+                self.emit_checkpoint_event(
+                    input,
+                    &state,
+                    TurnCheckpointPhase::BeforeModelRequest { finalization_only },
+                    turn_index,
+                    &mut on_checkpoint,
+                ),
+                ToolBatchControl::Continue
+            ) {
+                return state.finish(
+                    AgentStatus::Failed,
+                    false,
+                    None,
+                    turn_index,
+                    Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                );
             }
             if finalization_only {
                 let gate_timer = OccurrenceTimer::start();
@@ -3147,6 +3613,28 @@ where
                             Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                         );
                     }
+                    state.messages.push(ModelMessage::text(
+                        ModelRole::Assistant,
+                        review.final_answer.clone(),
+                    ));
+                    if !matches!(
+                        self.emit_checkpoint_event(
+                            input,
+                            &state,
+                            TurnCheckpointPhase::ModelResponseCommitted,
+                            actual_model_turns,
+                            &mut on_checkpoint,
+                        ),
+                        ToolBatchControl::Continue
+                    ) {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            actual_model_turns,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
+                    }
                     return state.finish(
                         AgentStatus::Completed,
                         true,
@@ -3177,6 +3665,28 @@ where
                     )
                     .is_err()
                     {
+                        return state.finish(
+                            AgentStatus::Failed,
+                            false,
+                            None,
+                            actual_model_turns,
+                            Some(EVENT_SINK_FAILURE_ERROR.to_string()),
+                        );
+                    }
+                    state.messages.push(ModelMessage::text(
+                        ModelRole::Assistant,
+                        final_answer.clone(),
+                    ));
+                    if !matches!(
+                        self.emit_checkpoint_event(
+                            input,
+                            &state,
+                            TurnCheckpointPhase::ModelResponseCommitted,
+                            actual_model_turns,
+                            &mut on_checkpoint,
+                        ),
+                        ToolBatchControl::Continue
+                    ) {
                         return state.finish(
                             AgentStatus::Failed,
                             false,
@@ -3368,6 +3878,7 @@ where
                 &mut state,
                 actual_model_turns,
                 &mut on_event,
+                &mut on_checkpoint,
             ) {
                 ToolBatchControl::Continue => {}
                 ToolBatchControl::Blocked => {
@@ -3692,6 +4203,7 @@ where
             state,
             model_turn_offset,
             on_event,
+            None,
         )
     }
 
@@ -3887,6 +4399,7 @@ where
         state: &mut AgentLoopState,
         next_model_turn: u32,
         on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+        on_checkpoint: &mut Option<&mut AgentLoopCheckpointCallback<'_>>,
     ) -> ToolBatchControl {
         if self.is_cancelled(input) {
             return ToolBatchControl::Cancelled;
@@ -3993,11 +4506,54 @@ where
 
         if prepared.len() > 1 {
             state.used_approval_grants = staged_approval_grants;
+            let pending_tool_calls = prepared
+                .iter()
+                .map(|call| {
+                    PendingToolCall::new(
+                        input,
+                        &call.call,
+                        call.bound.as_ref().expect("prepared read call is bound"),
+                    )
+                })
+                .collect();
+            if !matches!(
+                self.emit_checkpoint_event(
+                    input,
+                    state,
+                    TurnCheckpointPhase::ToolCallsReady { pending_tool_calls },
+                    next_model_turn,
+                    on_checkpoint,
+                ),
+                ToolBatchControl::Continue
+            ) {
+                return ToolBatchControl::Failed(
+                    "tool-call checkpoint persistence failed".to_string(),
+                );
+            }
             let results = self.execute_parallel_reads(prepared);
             if self.is_cancelled(input) {
                 return ToolBatchControl::Cancelled;
             }
-            return self.record_tool_results(input, state, results, occurrences, false, on_event);
+            let control =
+                self.record_tool_results(input, state, results, occurrences, false, on_event);
+            if !matches!(control, ToolBatchControl::Continue) {
+                return control;
+            }
+            for occurrence in occurrences {
+                let phase = TurnCheckpointPhase::ToolResultCommitted {
+                    tool_call_id: occurrence.call.tool_call_id.clone(),
+                    tool_name: occurrence.call.tool_name.clone(),
+                };
+                if !matches!(
+                    self.emit_checkpoint_event(input, state, phase, next_model_turn, on_checkpoint),
+                    ToolBatchControl::Continue
+                ) {
+                    return ToolBatchControl::Failed(
+                        "tool-result checkpoint persistence failed".to_string(),
+                    );
+                }
+            }
+            return ToolBatchControl::Continue;
         }
 
         let Some(prepared) = prepared.pop() else {
@@ -4080,6 +4636,27 @@ where
             return ToolBatchControl::Blocked;
         }
         state.used_approval_grants = staged_approval_grants;
+        if !matches!(
+            self.emit_checkpoint_event(
+                input,
+                state,
+                TurnCheckpointPhase::ToolCallsReady {
+                    pending_tool_calls: vec![PendingToolCall::new(
+                        input,
+                        &prepared.call,
+                        prepared
+                            .bound
+                            .as_ref()
+                            .expect("prepared tool call is bound"),
+                    )],
+                },
+                next_model_turn,
+                on_checkpoint,
+            ),
+            ToolBatchControl::Continue
+        ) {
+            return ToolBatchControl::Failed("tool-call checkpoint persistence failed".to_string());
+        }
         let result = self.execute_tool(
             &prepared,
             decision,
@@ -4090,14 +4667,61 @@ where
                 .context,
             on_event,
         );
-        self.record_tool_results(
+        let control = self.record_tool_results(
             input,
             state,
             vec![(prepared, result)],
             occurrences,
             false,
             on_event,
+        );
+        if !matches!(control, ToolBatchControl::Continue) {
+            return control;
+        }
+        self.emit_checkpoint_event(
+            input,
+            state,
+            TurnCheckpointPhase::ToolResultCommitted {
+                tool_call_id: occurrences
+                    .first()
+                    .map(|occurrence| occurrence.call.tool_call_id.clone())
+                    .unwrap_or_default(),
+                tool_name: occurrences
+                    .first()
+                    .map(|occurrence| occurrence.call.tool_name.clone())
+                    .unwrap_or_default(),
+            },
+            next_model_turn,
+            on_checkpoint,
         )
+    }
+
+    fn emit_checkpoint_event(
+        &self,
+        input: &AgentLoopInput,
+        state: &AgentLoopState,
+        phase: TurnCheckpointPhase,
+        model_turns: u32,
+        on_checkpoint: &mut Option<&mut AgentLoopCheckpointCallback<'_>>,
+    ) -> ToolBatchControl {
+        let Some(callback) = on_checkpoint.as_deref_mut() else {
+            return ToolBatchControl::Continue;
+        };
+        let pending_tool_calls = match &phase {
+            TurnCheckpointPhase::ToolCallsReady { pending_tool_calls } => {
+                pending_tool_calls.clone()
+            }
+            _ => Vec::new(),
+        };
+        let checkpoint = match state.turn_checkpoint(input, model_turns, pending_tool_calls) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return ToolBatchControl::Failed(error),
+        };
+        if callback(TurnCheckpointEvent { phase, checkpoint }).is_err() {
+            ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string())
+        } else {
+            ToolBatchControl::Continue
+        }
     }
 
     /// 在策略评估前规范化一个模型调用，并校验其可执行输入。
@@ -4874,6 +5498,10 @@ where
         }
         state.plan_update_count = state.plan_update_count.saturating_add(1);
         state.plan = Some(update.plan.clone());
+        if state.input_revision > state.replanned_input_revision {
+            state.replanned_input_revision = state.input_revision;
+            state.completion.clear_user_input_invalidation();
+        }
         ToolOutput::success(json!({
             "plan": safe_plan_summary(&update.plan),
             "verification": update.verification.as_ref().map(|entries| {
@@ -5657,14 +6285,15 @@ fn restore_checkpoint(
 ) -> Result<(AgentLoopState, u32), String> {
     pending.validate_binding()?;
     let checkpoint = pending.checkpoint().clone();
+    let checkpoint_state = checkpoint.state.clone();
     let pending_tool_call = pending.pending_tool_call();
-    if checkpoint.thread_id != input.thread_id {
+    if checkpoint_state.thread_id != input.thread_id {
         return Err("approval checkpoint thread mismatch".to_string());
     }
-    if checkpoint.turn_id != input.turn_id {
+    if checkpoint_state.turn_id != input.turn_id {
         return Err("approval checkpoint turn mismatch".to_string());
     }
-    if checkpoint.project_instructions_digest != input.project_instructions_digest {
+    if checkpoint_state.project_instructions_digest != input.project_instructions_digest {
         return Err("approval checkpoint project instructions digest mismatch".to_string());
     }
     if checkpoint.pending_tool_call != *pending_tool_call {
@@ -5677,7 +6306,7 @@ fn restore_checkpoint(
     {
         return Err("approval checkpoint request mismatch".to_string());
     }
-    let last_message = checkpoint
+    let last_message = checkpoint_state
         .messages
         .last()
         .ok_or_else(|| "approval checkpoint messages are missing".to_string())?;
@@ -5716,7 +6345,7 @@ fn restore_checkpoint(
                 .to_string(),
         );
     }
-    let used_approval_grants = checkpoint
+    let used_approval_grants = checkpoint_state
         .used_approval_grants
         .iter()
         .cloned()
@@ -5724,34 +6353,41 @@ fn restore_checkpoint(
     if used_approval_grants.contains(&pending_tool_call.request_id) {
         return Err("approval checkpoint consumed the pending grant".to_string());
     }
-    let tool_result_occurrences = checkpoint.tool_result_occurrences;
-    let checkpoint_history_messages = &checkpoint.messages[..checkpoint.messages.len() - 1];
+    let tool_result_occurrences = checkpoint_state.tool_result_occurrences.clone();
+    let checkpoint_history_messages =
+        &checkpoint_state.messages[..checkpoint_state.messages.len() - 1];
     if tool_result_message_occurrences(checkpoint_history_messages, &tool_result_occurrences)
         .is_none()
     {
         return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let requirements = checkpoint.verification_plan.as_ref().map_or_else(
+    let requirements = checkpoint_state.verification_plan.as_ref().map_or_else(
         || verification_requirements(input),
         |plan| Ok(plan.plan.requirements()),
     )?;
     let mut derived_completion = CompletionTracker::from_requirements(&requirements)?;
     for occurrence in &tool_result_occurrences {
-        derived_completion.observe(occurrence.result());
+        if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
+            derived_completion.observe(occurrence.result());
+        }
+    }
+    if checkpoint_state.input_revision > checkpoint_state.replanned_input_revision {
+        derived_completion.mark_workspace_revision_invalid("user_input_revision");
+        derived_completion.replace_requirements(&[])?;
     }
     if !derived_completion.is_consistent() {
         return Err("approval checkpoint derived workspace revision state is invalid".to_string());
     }
-    if derived_completion != checkpoint.completion {
+    if derived_completion != checkpoint_state.completion {
         return Err("approval checkpoint completion state mismatch".to_string());
     }
-    if let Some(checkpoint_plan) = &checkpoint.verification_plan {
+    if let Some(checkpoint_plan) = &checkpoint_state.verification_plan {
         checkpoint_plan
             .plan
             .validate()
             .map_err(|error| format!("approval checkpoint verification plan mismatch: {error}"))?;
     }
-    if let Some(plan) = &checkpoint.verification_plan
+    if let Some(plan) = &checkpoint_state.verification_plan
         && let Some(revision) = plan.revision
         && Some(revision) != derived_completion.workspace_revision
     {
@@ -5763,41 +6399,146 @@ fn restore_checkpoint(
             occurrence.result().tool_name == UPDATE_PLAN_TOOL && occurrence.result().ok
         })
         .count() as u32;
-    if derived_plan_update_count != checkpoint.plan_update_count {
+    if derived_plan_update_count != checkpoint_state.plan_update_count {
         return Err("approval checkpoint plan update count mismatch".to_string());
     }
-    let seen_tool_call_fingerprints = checkpoint
+    let seen_tool_call_fingerprints = checkpoint_state
         .seen_tool_call_fingerprints
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut state = AgentLoopState::new(checkpoint.messages, input.max_turns.max(1), None);
+    let mut state = AgentLoopState::new(checkpoint_state.messages, input.max_turns.max(1), None);
     state.tool_result_occurrences = tool_result_occurrences;
     state.used_approval_grants = used_approval_grants;
-    state.prior_approval_count = checkpoint.approval_count;
+    state.prior_approval_count = checkpoint_state.approval_count;
     state.completion = derived_completion;
-    state.verification_plan = checkpoint.verification_plan;
-    state.verification_change = checkpoint.verification_change;
-    state.verification_failure_history = checkpoint
+    state.verification_plan = checkpoint_state.verification_plan;
+    state.verification_change = checkpoint_state.verification_change;
+    state.verification_failure_history = checkpoint_state
         .verification_failure_history
         .into_iter()
         .collect();
     state.verification_planning_required =
         state.verification_plan.is_none() && state.completion.workspace_mutated();
-    state.repair_plan = checkpoint.repair_plan;
-    state.repair_attempts = checkpoint.repair_attempts;
-    state.repair_cycles = checkpoint.repair_cycles;
-    state.final_review_verdict = checkpoint.final_review_verdict;
-    state.last_completion_error = checkpoint.last_completion_error;
-    state.plan = checkpoint.plan;
-    state.plan_update_count = checkpoint.plan_update_count;
-    state.recovery_metrics = checkpoint.recovery_metrics;
-    state.model_usage = checkpoint.model_usage;
-    state.provider_attempts = checkpoint.provider_attempts;
-    state.context_trace = checkpoint.context_trace;
+    state.repair_plan = checkpoint_state.repair_plan;
+    state.repair_attempts = checkpoint_state.repair_attempts;
+    state.repair_cycles = checkpoint_state.repair_cycles;
+    state.final_review_verdict = checkpoint_state.final_review_verdict;
+    state.last_completion_error = checkpoint_state.last_completion_error;
+    state.plan = checkpoint_state.plan;
+    state.plan_update_count = checkpoint_state.plan_update_count;
+    state.recovery_metrics = checkpoint_state.recovery_metrics;
+    state.model_usage = checkpoint_state.model_usage;
+    state.provider_attempts = checkpoint_state.provider_attempts;
+    state.context_trace = checkpoint_state.context_trace;
     state.seen_tool_call_fingerprints = seen_tool_call_fingerprints;
-    state.last_repair_failure = checkpoint.last_repair_failure;
-    Ok((state, checkpoint.model_turns))
+    state.last_repair_failure = checkpoint_state.last_repair_failure;
+    state.input_revision = checkpoint_state.input_revision;
+    state.replanned_input_revision = checkpoint_state.replanned_input_revision;
+    Ok((state, checkpoint_state.model_turns))
+}
+
+/// Restore the shared state of an ordinary turn checkpoint. Unlike approval restore, this path
+/// intentionally has no pending tool call and therefore cannot replay an interrupted side effect.
+fn restore_turn_checkpoint(
+    input: &AgentLoopInput,
+    checkpoint: &TurnCheckpoint,
+) -> Result<(AgentLoopState, u32), String> {
+    let checkpoint_state = checkpoint.state.clone();
+    if checkpoint_state.thread_id != input.thread_id {
+        return Err("turn checkpoint thread mismatch".to_string());
+    }
+
+    if checkpoint_state.turn_id != input.turn_id {
+        return Err("turn checkpoint turn mismatch".to_string());
+    }
+    if checkpoint_state.resume_attempt != input.resume_attempt {
+        return Err("turn checkpoint resume attempt mismatch".to_string());
+    }
+    if checkpoint_state.project_instructions_digest != input.project_instructions_digest {
+        return Err("turn checkpoint project instructions digest mismatch".to_string());
+    }
+    if checkpoint_state.messages.is_empty() {
+        return Err("turn checkpoint messages are missing".to_string());
+    }
+    if tool_result_message_occurrences(
+        &checkpoint_state.messages,
+        &checkpoint_state.tool_result_occurrences,
+    )
+    .is_none()
+    {
+        return Err("turn checkpoint tool result occurrence bindings are invalid".to_string());
+    }
+    let requirements = checkpoint_state.verification_plan.as_ref().map_or_else(
+        || verification_requirements(input),
+        |plan| Ok(plan.plan.requirements()),
+    )?;
+    let mut derived_completion = CompletionTracker::from_requirements(&requirements)?;
+    for occurrence in &checkpoint_state.tool_result_occurrences {
+        if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
+            derived_completion.observe(occurrence.result());
+        }
+    }
+    if checkpoint_state.input_revision > checkpoint_state.replanned_input_revision {
+        derived_completion.mark_workspace_revision_invalid("user_input_revision");
+        derived_completion.replace_requirements(&[])?;
+    }
+    if !derived_completion.is_consistent() || derived_completion != checkpoint_state.completion {
+        return Err("turn checkpoint completion state mismatch".to_string());
+    }
+    if let Some(plan) = &checkpoint_state.verification_plan {
+        plan.plan
+            .validate()
+            .map_err(|error| format!("turn checkpoint verification plan mismatch: {error}"))?;
+        if plan
+            .revision
+            .is_some_and(|revision| Some(revision) != derived_completion.workspace_revision)
+        {
+            return Err("turn checkpoint verification plan revision mismatch".to_string());
+        }
+    }
+    let derived_plan_update_count = checkpoint_state
+        .tool_result_occurrences
+        .iter()
+        .filter(|occurrence| {
+            occurrence.result().tool_name == UPDATE_PLAN_TOOL && occurrence.result().ok
+        })
+        .count() as u32;
+    if derived_plan_update_count != checkpoint_state.plan_update_count {
+        return Err("turn checkpoint plan update count mismatch".to_string());
+    }
+    let mut state = AgentLoopState::new(checkpoint_state.messages, input.max_turns.max(1), None);
+    state.tool_result_occurrences = checkpoint_state.tool_result_occurrences;
+    state.used_approval_grants = checkpoint_state.used_approval_grants.into_iter().collect();
+    state.prior_approval_count = checkpoint_state.approval_count;
+    state.completion = derived_completion;
+    state.verification_plan = checkpoint_state.verification_plan;
+    state.verification_change = checkpoint_state.verification_change;
+    state.verification_failure_history = checkpoint_state
+        .verification_failure_history
+        .into_iter()
+        .collect();
+    state.verification_planning_required =
+        state.verification_plan.is_none() && state.completion.workspace_mutated();
+    state.repair_plan = checkpoint_state.repair_plan;
+    state.repair_attempts = checkpoint_state.repair_attempts;
+    state.repair_cycles = checkpoint_state.repair_cycles;
+    state.final_review_verdict = checkpoint_state.final_review_verdict;
+    state.last_completion_error = checkpoint_state.last_completion_error;
+    state.plan = checkpoint_state.plan;
+    state.plan_update_count = checkpoint_state.plan_update_count;
+    state.recovery_metrics = checkpoint_state.recovery_metrics;
+    state.model_usage = checkpoint_state.model_usage;
+    state.provider_attempts = checkpoint_state.provider_attempts;
+    state.context_trace = checkpoint_state.context_trace;
+    state.seen_tool_call_fingerprints = checkpoint_state
+        .seen_tool_call_fingerprints
+        .into_iter()
+        .collect();
+    state.last_repair_failure = checkpoint_state.last_repair_failure;
+    state.input_revision = checkpoint_state.input_revision;
+    state.replanned_input_revision = checkpoint_state.replanned_input_revision;
+    Ok((state, checkpoint_state.model_turns))
 }
 
 fn model_response_validation_error(validation_errors: Vec<String>) -> ModelError {

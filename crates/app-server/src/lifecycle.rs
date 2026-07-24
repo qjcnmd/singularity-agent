@@ -4,6 +4,16 @@ use super::*;
 #[cfg(test)]
 use singularity_agent::AgentTextDeltaCallback;
 
+fn turn_tool_execution_id(turn_id: &str, tool_call_id: &str) -> String {
+    format!("turn:{turn_id}:tool:{tool_call_id}")
+}
+
+enum TurnBoundaryAction {
+    Continue,
+    Restart(TurnCheckpoint),
+    Paused,
+}
+
 impl AppServer {
     /// 使用平台沙箱和已捕获的模型提供方配置快照创建未初始化的服务。
     pub fn new(store: SessionStore, provider_snapshot: ProviderConfigSnapshot) -> Self {
@@ -166,6 +176,405 @@ impl AppServer {
         self.pending_transport_trace_binding = trace_binding.into_inner();
         result?;
         Ok(messages)
+    }
+
+    /// Persist interactive user input independently of workspace execution ownership.
+    pub(super) fn turn_input(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TurnInputParams = parse_params(&message)?;
+        let input = serde_json::to_value(&params.input)?;
+        let turn = match self.store.append_turn_input(
+            &params.turn_id,
+            &params.input_id,
+            params.delivery,
+            &input,
+        ) {
+            Ok(turn) => turn,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.required_id(), TURN_NOT_FOUND);
+            }
+            Err(StoreError::InvalidState(error)) => {
+                return invalid_state_response(message.required_id(), error);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        json_response(message.required_id(), TurnResult { turn })
+    }
+
+    /// Request a durable pause without conflating it with cancellation.
+    pub(super) fn turn_pause(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TurnIdParams = parse_params(&message)?;
+        let turn = match self.store.request_turn_pause(&params.turn_id) {
+            Ok(turn) => turn,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.required_id(), TURN_NOT_FOUND);
+            }
+            Err(StoreError::InvalidState(error)) => {
+                return invalid_state_response(message.required_id(), error);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        json_response(message.required_id(), TurnResult { turn })
+    }
+
+    /// Explicitly claim and resume a non-approval suspended turn. The store CAS prevents two
+    /// callers from issuing a duplicate first `ModelTurnRequest`.
+    pub(super) fn turn_resume(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let params: TurnIdParams = parse_params(&message)?;
+        let current = match self.store.get_turn(&params.turn_id) {
+            Ok(turn) => turn,
+            Err(StoreError::NotFound(_)) => {
+                return not_found_response(message.required_id(), TURN_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !matches!(current.status, TurnStatus::Paused | TurnStatus::Suspended) {
+            return invalid_state_response(
+                message.required_id(),
+                "turn is not paused or suspended",
+            );
+        }
+        let thread = self.store.get_thread(&current.thread_id)?;
+        if thread.status != singularity_protocol::ThreadStatus::Active {
+            return invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION);
+        }
+        let Some(_execution_guard) = self
+            .store
+            .try_begin_workspace_execution(&thread.thread_id)?
+        else {
+            return invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE);
+        };
+        let (turn, checkpoint_payload) = match self.store.claim_suspended_turn(&params.turn_id) {
+            Ok(claimed) => claimed,
+            Err(StoreError::InvalidState(error)) => {
+                return invalid_state_response(message.required_id(), error);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let checkpoint = match TurnCheckpoint::decode(&checkpoint_payload) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) => {
+                let _ = self.store.update_turn_state(
+                    &turn.turn_id,
+                    TurnStatus::Failed,
+                    AgentStatus::Failed.as_str(),
+                );
+                return invalid_state_response(
+                    message.required_id(),
+                    "turn checkpoint unavailable",
+                );
+            }
+        };
+        let resumed = (|| -> AppServerResult<Vec<Value>> {
+            let resume_attempt = match checkpoint.resume_attempt().checked_add(1) {
+                Some(resume_attempt) => resume_attempt,
+                None => {
+                    return Err(AppServerError::TurnExecution {
+                        stage: TurnFailureStage::ApprovalCheckpoint,
+                        cause: TurnFailureCause::Serialization,
+                    });
+                }
+            };
+            let checkpoint = checkpoint.with_resume_attempt(resume_attempt);
+            let encoded_checkpoint =
+                checkpoint
+                    .encode()
+                    .map_err(|_| AppServerError::TurnExecution {
+                        stage: TurnFailureStage::ApprovalCheckpoint,
+                        cause: TurnFailureCause::Serialization,
+                    })?;
+            self.store
+                .save_turn_checkpoint(
+                    &turn.turn_id,
+                    &thread.thread_id,
+                    &encoded_checkpoint,
+                    checkpoint.checkpoint_version(),
+                )
+                .map_err(AppServerError::Store)?;
+            let user_input = self.store.get_turn_user_input(&turn.turn_id)?;
+            let params_for_agent = TurnStartParams {
+                thread_id: thread.thread_id.clone(),
+                input: serde_json::from_value(user_input)?,
+            };
+            let history = self.store.read_thread_history_before_turn(
+                &thread.thread_id,
+                &turn.turn_id,
+                DEFAULT_THREAD_HISTORY_TURN_LIMIT,
+            )?;
+            let workspace_tools =
+                workspace_tools_for_thread(&thread, Arc::clone(&self.sandbox_backend))
+                    .map_err(AppServerError::Workspace)?;
+            let (cancellation, mut active_turn) = self.activate_turn(&turn.turn_id)?;
+            let mut assistant_events =
+                AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
+            let mut emit = Vec::new();
+            let mut status = {
+                let mut on_event = |event: AgentLoopEvent| match event {
+                    AgentLoopEvent::FinalTextDelta { delta } => {
+                        emit.extend(self.project_assistant_delta(&mut assistant_events, &delta)?);
+                        Ok(())
+                    }
+                    AgentLoopEvent::Observation(_) => Ok(()),
+                };
+                let invocation = AgentLoopInvocation {
+                    thread: &thread,
+                    params: &params_for_agent,
+                    turn_id: &turn.turn_id,
+                    history: &history.messages,
+                    cancellation: &cancellation,
+                    monitor_control: active_turn.monitor_control(),
+                };
+                let result = if let Some(provider) = &self.test_provider_override {
+                    self.run_resumed_agent_loop_with_provider_and_tools(
+                        Arc::clone(provider),
+                        invocation,
+                        workspace_tools,
+                        &checkpoint,
+                        &mut on_event,
+                        true,
+                    )
+                } else {
+                    let provider = self.provider_snapshot.provider().map_err(|_| {
+                        AppServerError::TurnExecution {
+                            stage: TurnFailureStage::AgentLoop,
+                            cause: TurnFailureCause::Internal,
+                        }
+                    })?;
+                    self.run_resumed_agent_loop_with_provider_and_tools(
+                        provider,
+                        invocation,
+                        workspace_tools,
+                        &checkpoint,
+                        &mut on_event,
+                        true,
+                    )
+                };
+                result?
+            };
+            let monitor_outcome = active_turn.stabilize_monitor(&cancellation);
+            let committed = loop {
+                match self.commit_turn_run_status(
+                    turn.clone(),
+                    &status,
+                    Some(&assistant_events.item_id),
+                    &cancellation,
+                    monitor_outcome,
+                ) {
+                    Ok(committed) => break committed,
+                    Err(AppServerError::Store(StoreError::TurnBoundaryPending { .. })) => {
+                        status =
+                            self.resume_pending_terminal_boundary(
+                                AgentLoopInvocation {
+                                    thread: &thread,
+                                    params: &params_for_agent,
+                                    turn_id: &turn.turn_id,
+                                    history: &history.messages,
+                                    cancellation: &cancellation,
+                                    monitor_control: active_turn.monitor_control(),
+                                },
+                                &mut |event| match event {
+                                    AgentLoopEvent::FinalTextDelta { delta } => {
+                                        emit.extend(self.project_assistant_delta(
+                                            &mut assistant_events,
+                                            &delta,
+                                        )?);
+                                        Ok(())
+                                    }
+                                    AgentLoopEvent::Observation(_) => Ok(()),
+                                },
+                                true,
+                            )?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let mut outputs = emit;
+            outputs.extend(self.committed_turn_events(&committed, Some(&assistant_events))?);
+            outputs.push(
+                JsonRpcMessage::response(
+                    message.required_id(),
+                    serde_json::to_value(TurnResult {
+                        turn: committed.turn,
+                    })?,
+                )
+                .to_wire_value(),
+            );
+            Ok(outputs)
+        })();
+        match resumed {
+            Ok(outputs) => Ok(outputs),
+            Err(error) => {
+                let failure = turn_failure_from_error(&error, TurnFailureStage::AgentLoop);
+                match self.store.suspend_claimed_turn_after_failure(&turn.turn_id) {
+                    Ok(_) => Err(error),
+                    Err(_) => Err(AppServerError::TurnTerminalization {
+                        stage: failure.stage,
+                        cause: failure.cause,
+                        failure: TurnTerminalizationFailure::Store,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Persist one typed AgentLoop boundary and, for tool calls, its execution owner.
+    fn persist_turn_checkpoint_event(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        event: TurnCheckpointEvent,
+    ) -> AppServerResult<TurnBoundaryAction> {
+        let checkpoint_version = event.checkpoint.checkpoint_version();
+        let checkpoint = event
+            .checkpoint
+            .encode()
+            .map_err(|_| AppServerError::TurnExecution {
+                stage: TurnFailureStage::ApprovalCheckpoint,
+                cause: TurnFailureCause::Serialization,
+            })?;
+        let tool_boundary_claimed = match &event.phase {
+            TurnCheckpointPhase::ToolCallsReady { .. } => {
+                let executions = event
+                    .checkpoint
+                    .pending_tool_calls()
+                    .iter()
+                    .map(|pending| ToolExecution {
+                        execution_id: turn_tool_execution_id(turn_id, &pending.tool_call_id),
+                        thread_id: thread_id.to_string(),
+                        turn_id: turn_id.to_string(),
+                        tool_call_id: pending.tool_call_id.clone(),
+                        state: ToolExecutionState::Running,
+                        payload: json!({
+                            "kind": "tool_call",
+                            "tool_name": pending.tool_name.as_str(),
+                        }),
+                    })
+                    .collect::<Vec<_>>();
+                Some(
+                    self.store
+                        .begin_tool_executions_at_checkpoint(
+                            &executions,
+                            &checkpoint,
+                            checkpoint_version,
+                        )
+                        .map_err(AppServerError::Store)?,
+                )
+            }
+            _ => None,
+        };
+        match &event.phase {
+            TurnCheckpointPhase::Initial
+            | TurnCheckpointPhase::BeforeModelRequest { .. }
+            | TurnCheckpointPhase::ModelResponseCommitted => self
+                .store
+                .save_turn_checkpoint(turn_id, thread_id, &checkpoint, checkpoint_version)
+                .map_err(AppServerError::Store)?,
+            TurnCheckpointPhase::ToolCallsReady { .. } => {}
+            TurnCheckpointPhase::ToolResultCommitted { tool_call_id, .. } => {
+                self.store
+                    .commit_tool_result_checkpoint(
+                        &turn_tool_execution_id(turn_id, &tool_call_id),
+                        turn_id,
+                        thread_id,
+                        &checkpoint,
+                        checkpoint_version,
+                    )
+                    .map_err(AppServerError::Store)?;
+            }
+        }
+
+        let include_follow_up = matches!(
+            &event.phase,
+            TurnCheckpointPhase::BeforeModelRequest {
+                finalization_only: true
+            } | TurnCheckpointPhase::ModelResponseCommitted
+        );
+        let boundary = self
+            .store
+            .turn_boundary_state(turn_id, include_follow_up)
+            .map_err(AppServerError::Store)?;
+        if boundary.inputs.is_empty() && !boundary.pause_requested {
+            return Ok(TurnBoundaryAction::Continue);
+        }
+        if matches!(tool_boundary_claimed, Some(true)) {
+            // Input accepted after the tool execution transaction linearized is handled only
+            // after the tool reaches a durable result or Unknown.
+            return Ok(TurnBoundaryAction::Continue);
+        }
+
+        let mut messages = Vec::with_capacity(boundary.inputs.len());
+        let mut input_ids = Vec::with_capacity(boundary.inputs.len());
+        for pending in &boundary.inputs {
+            let input: Vec<singularity_protocol::InputItem> =
+                serde_json::from_value(pending.input.clone())?;
+            let message = input
+                .into_iter()
+                .map(|item| match item {
+                    singularity_protocol::InputItem::Text { text } => text,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if message.trim().is_empty() {
+                return Err(AppServerError::Workspace(
+                    "persisted turn input is empty".to_string(),
+                ));
+            }
+            messages.push(message);
+            input_ids.push(pending.input_id.clone());
+        }
+        let cancel_pending_tools =
+            matches!(&event.phase, TurnCheckpointPhase::ToolCallsReady { .. })
+                && !messages.is_empty();
+        let updated =
+            if messages.is_empty() {
+                event.checkpoint
+            } else {
+                let updated = event
+                    .checkpoint
+                    .with_user_inputs(&messages, cancel_pending_tools)
+                    .map_err(|_| AppServerError::TurnExecution {
+                        stage: TurnFailureStage::ApprovalCheckpoint,
+                        cause: TurnFailureCause::Serialization,
+                    })?;
+                let resume_attempt = updated.resume_attempt().checked_add(1).ok_or(
+                    AppServerError::TurnExecution {
+                        stage: TurnFailureStage::ApprovalCheckpoint,
+                        cause: TurnFailureCause::Serialization,
+                    },
+                )?;
+                updated.with_resume_attempt(resume_attempt)
+            };
+        let updated_payload = updated
+            .encode()
+            .map_err(|_| AppServerError::TurnExecution {
+                stage: TurnFailureStage::ApprovalCheckpoint,
+                cause: TurnFailureCause::Serialization,
+            })?;
+        if input_ids.is_empty() {
+            self.store
+                .pause_turn_with_checkpoint(
+                    turn_id,
+                    thread_id,
+                    &updated_payload,
+                    updated.checkpoint_version(),
+                )
+                .map_err(AppServerError::Store)?;
+        } else {
+            self.store
+                .consume_turn_inputs_with_checkpoint(
+                    turn_id,
+                    thread_id,
+                    &input_ids,
+                    &updated_payload,
+                    updated.checkpoint_version(),
+                    boundary.pause_requested,
+                )
+                .map_err(AppServerError::Store)?;
+        }
+        if boundary.pause_requested {
+            Ok(TurnBoundaryAction::Paused)
+        } else {
+            Ok(TurnBoundaryAction::Restart(updated))
+        }
     }
 
     /// 执行 `turn/start`，并在每个阶段完成时返回已预留顺序的输出。
@@ -349,7 +758,7 @@ impl AppServer {
                 );
             }
         }
-        let status = match self.run_agent_loop(
+        let mut status = match self.run_agent_loop(
             AgentLoopInvocation {
                 thread: &thread,
                 params: &params,
@@ -416,29 +825,53 @@ impl AppServer {
                 },
             );
         }
-        let committed = match self.commit_turn_run_status(
-            turn.clone(),
-            &status,
-            Some(&assistant_events.item_id),
-            &cancellation,
-            monitor_outcome,
-        ) {
-            Ok(committed) => committed,
-            Err(error) => {
-                return self.finish_turn_failure(
-                    &mut emit,
-                    &turn,
-                    Some(&assistant_events),
-                    &cancellation,
-                    monitor_outcome,
-                    monitor_failure_or(
-                        monitor_outcome,
-                        TurnFailure {
-                            stage: TurnFailureStage::TerminalOutcome,
-                            cause: turn_failure_cause(&error),
+        let committed = loop {
+            match self.commit_turn_run_status(
+                turn.clone(),
+                &status,
+                Some(&assistant_events.item_id),
+                &cancellation,
+                monitor_outcome,
+            ) {
+                Ok(committed) => break committed,
+                Err(AppServerError::Store(StoreError::TurnBoundaryPending { .. })) => {
+                    status = self.resume_pending_terminal_boundary(
+                        AgentLoopInvocation {
+                            thread: &thread,
+                            params: &params,
+                            turn_id: &turn.turn_id,
+                            history: &started.history.messages,
+                            cancellation: &cancellation,
+                            monitor_control: active_turn.monitor_control(),
                         },
-                    ),
-                );
+                        &mut |event| match event {
+                            AgentLoopEvent::FinalTextDelta { delta } => {
+                                let messages =
+                                    self.project_assistant_delta(&mut assistant_events, &delta)?;
+                                emit_messages(&mut emit, messages);
+                                Ok(())
+                            }
+                            AgentLoopEvent::Observation(_) => Ok(()),
+                        },
+                        true,
+                    )?;
+                }
+                Err(error) => {
+                    return self.finish_turn_failure(
+                        &mut emit,
+                        &turn,
+                        Some(&assistant_events),
+                        &cancellation,
+                        monitor_outcome,
+                        monitor_failure_or(
+                            monitor_outcome,
+                            TurnFailure {
+                                stage: TurnFailureStage::TerminalOutcome,
+                                cause: turn_failure_cause(&error),
+                            },
+                        ),
+                    );
+                }
             }
         };
         let terminal_events = self.committed_turn_events(&committed, Some(&assistant_events))?;
@@ -769,7 +1202,7 @@ impl AppServer {
         prepared_workspace_tools: Option<WorkspaceTools>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
     where
-        P: Provider,
+        P: Provider + Clone,
     {
         self.resume_agent_loop_after_gate_with_text_deltas(
             request,
@@ -795,7 +1228,7 @@ impl AppServer {
         on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
     where
-        P: Provider,
+        P: Provider + Clone,
     {
         let turn = self.store.get_turn(&request.turn_id)?;
         let thread = self.store.get_thread(&turn.thread_id)?;
@@ -1020,7 +1453,7 @@ impl AppServer {
         cancellation: &CancellationToken,
     ) -> AppServerResult<AgentRunStatus>
     where
-        P: Provider,
+        P: Provider + Clone,
     {
         self.run_agent_loop_with_provider_and_text_deltas(
             provider,
@@ -1046,7 +1479,7 @@ impl AppServer {
         on_text_delta: &mut AgentTextDeltaCallback<'_>,
     ) -> AppServerResult<AgentRunStatus>
     where
-        P: Provider,
+        P: Provider + Clone,
     {
         let workspace_tools = workspace_tools_for_thread(thread, Arc::clone(&self.sandbox_backend))
             .map_err(AppServerError::Workspace)?;
@@ -1083,7 +1516,7 @@ impl AppServer {
         project_observability: bool,
     ) -> AppServerResult<AgentRunStatus>
     where
-        P: Provider,
+        P: Provider + Clone,
     {
         let registry = workspace_tool_registry();
         let workspace_root = workspace_tools.workspace_root().to_path_buf();
@@ -1107,31 +1540,75 @@ impl AppServer {
         } else {
             None
         };
-        let mut callback_error = None;
+        let callback_error = RefCell::new(None);
+        let boundary_action = RefCell::new(None);
+        let agent_loop = AgentLoop::new(provider.clone(), ToolBroker::new(registry), policy)
+            .with_workspace_tools(workspace_tools)
+            .with_cancellation_token(invocation.cancellation.clone());
         let result = {
             let mut callback = |event: AgentLoopEvent| -> Result<(), AgentLoopEventSinkError> {
-                if callback_error.is_some() {
+                if callback_error.borrow().is_some() {
                     return Err(AgentLoopEventSinkError);
                 }
                 if let Some(projector) = projector.as_mut()
                     && let Err(error) = projector.project_event(event.clone())
                 {
-                    callback_error = Some(AppServerError::Store(error));
+                    *callback_error.borrow_mut() = Some(AppServerError::Store(error));
                     return Err(AgentLoopEventSinkError);
                 }
                 if let Err(error) = on_event(event) {
-                    callback_error = Some(error);
+                    *callback_error.borrow_mut() = Some(error);
                     return Err(AgentLoopEventSinkError);
                 }
                 Ok(())
             };
-            AgentLoop::new(provider, ToolBroker::new(registry), policy)
-                .with_workspace_tools(workspace_tools)
-                .with_cancellation_token(invocation.cancellation.clone())
-                .run_with_events(&loop_input, &mut callback)
+            let mut on_checkpoint = |event: TurnCheckpointEvent| {
+                if callback_error.borrow().is_some() {
+                    return Err(AgentLoopEventSinkError);
+                }
+                match self.persist_turn_checkpoint_event(
+                    &invocation.thread.thread_id,
+                    invocation.turn_id,
+                    event,
+                ) {
+                    Ok(TurnBoundaryAction::Continue) => Ok(()),
+                    Ok(action) => {
+                        *boundary_action.borrow_mut() = Some(action);
+                        Err(AgentLoopEventSinkError)
+                    }
+                    Err(error) => {
+                        *callback_error.borrow_mut() = Some(error);
+                        Err(AgentLoopEventSinkError)
+                    }
+                }
+            };
+            agent_loop.run_with_events_and_checkpoints(
+                &loop_input,
+                &mut callback,
+                &mut on_checkpoint,
+            )
         };
-        if let Some(error) = callback_error {
+        if let Some(error) = callback_error.into_inner() {
             return Err(error);
+        }
+        match boundary_action.into_inner() {
+            Some(TurnBoundaryAction::Restart(checkpoint)) => {
+                let workspace_tools = workspace_tools_for_thread(
+                    invocation.thread,
+                    Arc::clone(&self.sandbox_backend),
+                )
+                .map_err(AppServerError::Workspace)?;
+                return self.run_resumed_agent_loop_with_provider_and_tools(
+                    provider,
+                    invocation,
+                    workspace_tools,
+                    &checkpoint,
+                    on_event,
+                    project_observability,
+                );
+            }
+            Some(TurnBoundaryAction::Paused) => return Ok(AgentRunStatus::paused()),
+            Some(TurnBoundaryAction::Continue) | None => {}
         }
         let mut run_status = result.to_run_status();
         sanitize_agent_run_status_error(&mut run_status);
@@ -1181,6 +1658,196 @@ impl AppServer {
                 }
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Continue one suspended turn from its validated checkpoint without replaying a tool call.
+    pub(super) fn run_resumed_agent_loop_with_provider_and_tools<P>(
+        &self,
+        provider: P,
+        invocation: AgentLoopInvocation<'_>,
+        workspace_tools: WorkspaceTools,
+        checkpoint: &TurnCheckpoint,
+        on_event: &mut dyn FnMut(AgentLoopEvent) -> AppServerResult<()>,
+        project_observability: bool,
+    ) -> AppServerResult<AgentRunStatus>
+    where
+        P: Provider + Clone,
+    {
+        let registry = workspace_tool_registry();
+        let workspace_root = workspace_tools.workspace_root().to_path_buf();
+        let policy = workspace_policy(
+            invocation.thread.sandbox_mode,
+            invocation.thread.approval_policy,
+        );
+        let loop_input = agent_loop_input(
+            invocation.thread,
+            invocation.params,
+            invocation.turn_id,
+            &workspace_root,
+            invocation.history,
+        )?
+        .with_resume_attempt(checkpoint.resume_attempt());
+        let mut projector = if project_observability {
+            Some(observability::TraceProjector::new(
+                &self.store,
+                &invocation.thread.thread_id,
+                invocation.turn_id,
+            )?)
+        } else {
+            None
+        };
+        let callback_error = RefCell::new(None);
+        let boundary_action = RefCell::new(None);
+        let agent_loop = AgentLoop::new(provider.clone(), ToolBroker::new(registry), policy)
+            .with_workspace_tools(workspace_tools)
+            .with_cancellation_token(invocation.cancellation.clone());
+        let result = {
+            let mut callback = |event: AgentLoopEvent| -> Result<(), AgentLoopEventSinkError> {
+                if callback_error.borrow().is_some() {
+                    return Err(AgentLoopEventSinkError);
+                }
+                if let Some(projector) = projector.as_mut()
+                    && let Err(error) = projector.project_event(event.clone())
+                {
+                    *callback_error.borrow_mut() = Some(AppServerError::Store(error));
+                    return Err(AgentLoopEventSinkError);
+                }
+                if let Err(error) = on_event(event) {
+                    *callback_error.borrow_mut() = Some(error);
+                    return Err(AgentLoopEventSinkError);
+                }
+                Ok(())
+            };
+            let mut on_checkpoint = |event: TurnCheckpointEvent| {
+                if callback_error.borrow().is_some() {
+                    return Err(AgentLoopEventSinkError);
+                }
+                match self.persist_turn_checkpoint_event(
+                    &invocation.thread.thread_id,
+                    invocation.turn_id,
+                    event,
+                ) {
+                    Ok(TurnBoundaryAction::Continue) => Ok(()),
+                    Ok(action) => {
+                        *boundary_action.borrow_mut() = Some(action);
+                        Err(AgentLoopEventSinkError)
+                    }
+                    Err(error) => {
+                        *callback_error.borrow_mut() = Some(error);
+                        Err(AgentLoopEventSinkError)
+                    }
+                }
+            };
+            agent_loop.resume_turn_with_events_and_checkpoints(
+                &loop_input,
+                checkpoint,
+                &mut callback,
+                &mut on_checkpoint,
+            )
+        };
+        if let Some(error) = callback_error.into_inner() {
+            return Err(error);
+        }
+        match boundary_action.into_inner() {
+            Some(TurnBoundaryAction::Restart(checkpoint)) => {
+                let workspace_tools = workspace_tools_for_thread(
+                    invocation.thread,
+                    Arc::clone(&self.sandbox_backend),
+                )
+                .map_err(AppServerError::Workspace)?;
+                return self.run_resumed_agent_loop_with_provider_and_tools(
+                    provider,
+                    invocation,
+                    workspace_tools,
+                    &checkpoint,
+                    on_event,
+                    project_observability,
+                );
+            }
+            Some(TurnBoundaryAction::Paused) => return Ok(AgentRunStatus::paused()),
+            Some(TurnBoundaryAction::Continue) | None => {}
+        }
+        let mut run_status = result.to_run_status();
+        sanitize_agent_run_status_error(&mut run_status);
+        if let Some(projector) = projector.as_mut() {
+            projector
+                .project_result(&run_status)
+                .map_err(AppServerError::Store)?;
+        }
+        if let Err(error) =
+            self.persist_agent_approval_requests(&result, invocation.monitor_control)
+        {
+            return Err(error);
+        }
+        Ok(run_status)
+    }
+
+    /// Resolve a follow-up that linearized after the last boundary check but before terminal commit.
+    pub(super) fn resume_pending_terminal_boundary(
+        &self,
+        invocation: AgentLoopInvocation<'_>,
+        on_event: &mut dyn FnMut(AgentLoopEvent) -> AppServerResult<()>,
+        project_observability: bool,
+    ) -> AppServerResult<AgentRunStatus> {
+        let payload = self
+            .store
+            .get_turn_checkpoint(invocation.turn_id)?
+            .ok_or_else(|| {
+                StoreError::InvalidState(
+                    "turn boundary is pending without a durable checkpoint".to_string(),
+                )
+            })?;
+        let checkpoint =
+            TurnCheckpoint::decode(&payload).map_err(|_| AppServerError::TurnExecution {
+                stage: TurnFailureStage::ApprovalCheckpoint,
+                cause: TurnFailureCause::Serialization,
+            })?;
+        let checkpoint = match self.persist_turn_checkpoint_event(
+            &invocation.thread.thread_id,
+            invocation.turn_id,
+            TurnCheckpointEvent {
+                phase: TurnCheckpointPhase::ModelResponseCommitted,
+                checkpoint,
+            },
+        )? {
+            TurnBoundaryAction::Restart(checkpoint) => checkpoint,
+            TurnBoundaryAction::Paused => return Ok(AgentRunStatus::paused()),
+            TurnBoundaryAction::Continue => {
+                return Err(StoreError::InvalidState(
+                    "turn boundary disappeared before it could be consumed".to_string(),
+                )
+                .into());
+            }
+        };
+        let workspace_tools =
+            workspace_tools_for_thread(invocation.thread, Arc::clone(&self.sandbox_backend))
+                .map_err(AppServerError::Workspace)?;
+        if let Some(provider) = &self.test_provider_override {
+            self.run_resumed_agent_loop_with_provider_and_tools(
+                Arc::clone(provider),
+                invocation,
+                workspace_tools,
+                &checkpoint,
+                on_event,
+                project_observability,
+            )
+        } else {
+            let provider =
+                self.provider_snapshot
+                    .provider()
+                    .map_err(|_| AppServerError::TurnExecution {
+                        stage: TurnFailureStage::AgentLoop,
+                        cause: TurnFailureCause::Internal,
+                    })?;
+            self.run_resumed_agent_loop_with_provider_and_tools(
+                provider,
+                invocation,
+                workspace_tools,
+                &checkpoint,
+                on_event,
+                project_observability,
+            )
         }
     }
 

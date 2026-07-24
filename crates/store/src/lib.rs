@@ -33,14 +33,14 @@ use singularity_protocol::{
     TraceMetric, TraceMetricAvailability, TraceMetricDistribution, TraceMetricName,
     TraceMetricSample, TraceMetricSampleKind, TraceMetricUnavailableReason, TraceMetrics,
     TraceProviderProtocol, TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
-    TraceToolStatus, TraceUsage, Turn, TurnStatus,
+    TraceToolStatus, TraceUsage, Turn, TurnInputDelivery, TurnStatus,
 };
 /// 供上层重建 conversation history 的 protocol 类型。
 pub use singularity_protocol::{ConversationMessage, ConversationRole};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 const THREAD_POLICY_SCHEMA_VERSION: u32 = 9;
 const INITIAL_SCHEMA_MIGRATION: &str = "0001_initial_session_store";
 // 保留历史 migration id；当前代码表达 approval/trace event history，不表达密码学 ledger。
@@ -54,6 +54,7 @@ const THREAD_POLICY_SNAPSHOT_SCHEMA_MIGRATION: &str = "0009_thread_policy_snapsh
 const STABLE_ENUM_TEXT_SCHEMA_MIGRATION: &str = "0010_stable_enum_text";
 const TYPED_PERMISSION_RESOURCE_SCHEMA_MIGRATION: &str = "0011_typed_permission_resources";
 const TYPED_TRACE_SPAN_SCHEMA_MIGRATION: &str = "0012_typed_trace_spans";
+const TURN_RESUME_CHECKPOINT_SCHEMA_MIGRATION: &str = "0013_turn_resume_checkpoints";
 // This migration existed only while the removed sidecar-run runtime was live.
 // It is accepted while reading old databases and deliberately not retained in the current schema.
 const RETIRED_ACTIVE_SIDECAR_RUN_SCHEMA_MIGRATION: &str = "0003_active_sidecar_runs";
@@ -97,8 +98,10 @@ mod migration;
 mod support;
 mod thread_turn;
 mod trace_artifact;
+mod turn_input;
 
 pub use approval::RecordedApprovalDecision;
+pub use checkpoint_recovery::{ToolExecution, ToolExecutionState};
 pub use connection::{SessionStore, SessionStoreDescriptor, WorkspaceExecutionGuard};
 pub use error::{StoreError, StoreResult};
 pub(crate) use thread_turn::typed_turn_end_trace;
@@ -107,6 +110,7 @@ pub use thread_turn::{
     CreateStartedTurnParams, StartedTurn, ThreadHistoryPage, TurnOutcomeAuthority,
 };
 pub use trace_artifact::RegisterArtifactRefParams;
+pub use turn_input::{PendingTurnInput, TurnBoundaryState};
 
 pub(crate) use approval::{
     decode_final_approval_outcome, decode_stored_approval_request_row,
