@@ -1852,10 +1852,12 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
         tool_name: "command".to_string(),
         arguments: json!({
             "command": "test-program verify",
+            "cwd": ".",
             "timeout_seconds": 5
         }),
         raw_arguments: json!({
             "command": "test-program verify",
+            "cwd": ".",
             "timeout_seconds": 5
         })
         .to_string(),
@@ -2930,10 +2932,12 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
         tool_name: TOOL_COMMAND.to_string(),
         arguments: json!({
             "command": "cmd.exe /C \"echo verified\"",
+            "cwd": ".",
             "timeout_seconds": 5
         }),
         raw_arguments: json!({
             "command": "cmd.exe /C \"echo verified\"",
+            "cwd": ".",
             "timeout_seconds": 5
         })
         .to_string(),
