@@ -9185,6 +9185,226 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
 }
 
 #[test]
+fn pre_plan_command_failure_commits_after_mutation_bound_verification() {
+    let workspace = tempfile::tempdir().expect("repair workspace");
+    let fixture_name = "pre_plan_command_repair.txt";
+    std::fs::write(workspace.path().join(fixture_name), "before").expect("write repair fixture");
+    let command = test_command_script("repair verification");
+
+    let mut failed_command = ModelTurnResponse::completed(
+        "model_request_turn_pre_plan_repair_0",
+        "response_pre_plan_0",
+        "",
+    );
+    failed_command.tool_calls.push(tool_call(
+        "command_pre_plan_failure",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let mut mutation = ModelTurnResponse::completed(
+        "model_request_turn_pre_plan_repair_1",
+        "response_pre_plan_1",
+        "",
+    );
+    mutation.tool_calls.push(tool_call(
+        "edit_pre_plan_repair",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut plan = ModelTurnResponse::completed(
+        "model_request_turn_pre_plan_repair_2",
+        "response_pre_plan_2",
+        "",
+    );
+    plan.tool_calls.push(tool_call(
+        "plan_pre_plan_repair",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "repair and verify", "status": "completed"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": format!("changed {fixture_name}"),
+                "affected_path": fixture_name,
+                "affected_symbol": fixture_name,
+                "current_gap": "the repair has not been revision-bound verified",
+                "action": {
+                    "command": command,
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    let mut verification = ModelTurnResponse::completed(
+        "model_request_turn_pre_plan_repair_3",
+        "response_pre_plan_3",
+        "",
+    );
+    verification.tool_calls.push(tool_call(
+        "command_pre_plan_pass",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let final_response = ModelTurnResponse::completed(
+        "model_request_turn_pre_plan_repair_4",
+        "response_pre_plan_4",
+        "done",
+    );
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![failed_command, mutation, plan, verification, final_response],
+            seen_requests,
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind repair workspace")
+            .with_sandbox_backend(AgentFailThenSucceedBackend {
+                calls: AtomicUsize::new(0),
+            }),
+    )
+    .run(&AgentLoopInput::new(
+        "thread_pre_plan_repair",
+        "turn_pre_plan_repair",
+        "repair after the failed command",
+    ));
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+}
+
+#[test]
+fn changed_same_tool_retry_commits_after_revision_bound_verification() {
+    let workspace = tempfile::tempdir().expect("same-tool repair workspace");
+    let fixture_name = "same_tool_repair.txt";
+    std::fs::write(workspace.path().join(fixture_name), "before").expect("write repair fixture");
+    let command = test_command_script("same tool repair verification");
+
+    let edit_response = |request: &str, response: &str, call: &str, expected: &str| {
+        let mut model_response = ModelTurnResponse::completed(request, response, "");
+        model_response.tool_calls.push(tool_call(
+            call,
+            "edit",
+            serde_json::json!({
+                "path": fixture_name,
+                "expected": expected,
+                "replacement": "after"
+            }),
+        ));
+        model_response
+    };
+    let mut plan = ModelTurnResponse::completed(
+        "model_request_turn_same_tool_repair_2",
+        "response_same_tool_2",
+        "",
+    );
+    plan.tool_calls.push(tool_call(
+        "plan_same_tool_repair",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "retry edit and verify", "status": "completed"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": format!("changed {fixture_name}"),
+                "affected_path": fixture_name,
+                "affected_symbol": fixture_name,
+                "current_gap": "the successful edit retry has not been verified",
+                "action": {
+                    "command": command,
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    let mut verification = ModelTurnResponse::completed(
+        "model_request_turn_same_tool_repair_3",
+        "response_same_tool_3",
+        "",
+    );
+    verification.tool_calls.push(tool_call(
+        "command_same_tool_pass",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let final_response = ModelTurnResponse::completed(
+        "model_request_turn_same_tool_repair_4",
+        "response_same_tool_4",
+        "done",
+    );
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit_response(
+                    "model_request_turn_same_tool_repair_0",
+                    "response_same_tool_0",
+                    "edit_same_tool_failure",
+                    "missing",
+                ),
+                edit_response(
+                    "model_request_turn_same_tool_repair_1",
+                    "response_same_tool_1",
+                    "edit_same_tool_success",
+                    "before",
+                ),
+                plan,
+                verification,
+                final_response,
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind same-tool repair workspace")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(&AgentLoopInput::new(
+        "thread_same_tool_repair",
+        "turn_same_tool_repair",
+        "retry the edit and verify it",
+    ));
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+}
+
+#[test]
 fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     let workspace = tempfile::tempdir().expect("repair budget workspace");
     let fixture_name = "repair_budget.txt";

@@ -1713,16 +1713,20 @@ impl AgentLoopState {
                 return Err(exhausted);
             }
             // A repeated failure, read, invalid replan, or approval resume does not replace the
-            // repair decision that owns this episode and does not create another prospective
-            // attempt until a new mutation is observed. The latest bounded tool result remains
-            // available through `build_repair_context` without weakening the active reason.
+            // repair decision or create another prospective attempt. A real verification failure
+            // on the bound mutation may upgrade the causal reason without consuming an attempt.
             let terminal_cycle_revision = active
                 .plan
                 .required_revision
                 .filter(|revision| Some(*revision) == self.completion.workspace_revision);
             active.plan.required_revision = terminal_cycle_revision;
             active.plan.required_check_count = required_check_count;
-            if active.plan.reason == AgentRepairReason::ToolFailure {
+            if reason == AgentRepairReason::VerificationFailed && terminal_cycle_revision.is_some()
+            {
+                active.plan.reason = reason;
+                active.signature = signature;
+                active.failed_tool_name = None;
+            } else if active.plan.reason == AgentRepairReason::ToolFailure {
                 active.signature = signature;
                 active.failed_tool_name = failed_tool_name.map(str::to_string);
             }
@@ -2177,11 +2181,21 @@ impl AgentLoopState {
         &mut self,
         tool_result: &ToolResult,
         tool_call_fingerprint: &str,
+        verification_planning_available: bool,
     ) -> Option<String> {
         self.completion.observe(tool_result);
         if tool_result.ok {
+            let changed_with_verification_planning = verification_planning_available
+                && tool_result
+                    .workspace_observation()
+                    .is_some_and(|observation| {
+                        observation.mutation() == singularity_tools::WorkspaceMutation::Changed
+                    });
             let tool_failure_resolved = self.repair_plan.as_ref().is_some_and(|plan| {
-                if plan.plan.reason != AgentRepairReason::ToolFailure {
+                if plan.plan.reason != AgentRepairReason::ToolFailure
+                    || plan.plan.required_revision.is_some()
+                    || changed_with_verification_planning
+                {
                     return false;
                 }
                 match plan.failed_tool_name.as_deref() {
@@ -5131,7 +5145,11 @@ where
                     return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
                 }
             }
-            let recovery_feedback = state.observe_tool_result(&result, &prepared.fingerprint);
+            let recovery_feedback = state.observe_tool_result(
+                &result,
+                &prepared.fingerprint,
+                verification_planning_available,
+            );
             if prepared.call.tool_name == TOOL_COMMAND
                 && !result.ok
                 && let Some(plan) = state.verification_plan.as_ref()
