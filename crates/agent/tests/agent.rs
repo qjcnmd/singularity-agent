@@ -8051,6 +8051,7 @@ fn final_review_repair_requires_mutation_replan_and_second_review() {
 
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert_eq!(result.final_answer.as_deref(), Some("completed"));
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
     assert_eq!(
         result.verification.final_review_verdict,
         Some(FinalReviewVerdict::Accept)
@@ -9156,6 +9157,8 @@ fn agent_loop_reports_all_unsatisfied_completion_invariants() {
 
 #[test]
 fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("evidence.txt"), "trusted").expect("write evidence");
     let invalid_arguments = serde_json::json!({
         "command": 17,
         "timeout_seconds": 5
@@ -9170,21 +9173,28 @@ fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments()
     second_invalid
         .tool_calls
         .push(tool_call("call_2", "command", invalid_arguments));
+    let mut successful_read =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_read", "");
+    successful_read.tool_calls.push(tool_call(
+        "call_read",
+        "read",
+        serde_json::json!({"path": "evidence.txt"}),
+    ));
     let mut successful_command =
-        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_3", "");
     successful_command.tool_calls.push(tool_call(
         "call_3",
         "command",
         serde_json::json!({"command": test_command_script("success"), "timeout_seconds": 5}),
     ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+        ModelTurnResponse::completed("model_request_turn_1_4", "response_4", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
-    let workspace = tempfile::tempdir().expect("workspace");
     let result = agent_loop_with_capabilities(
         vec![
             first_invalid,
             second_invalid,
+            successful_read,
             successful_command,
             final_response,
         ],
@@ -9197,7 +9207,7 @@ fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments()
             .expect("bind workspace tools")
             .with_sandbox_backend(AgentStrictBackend),
     )
-    .run(&AgentLoopInput::new("thread_1", "turn_1", "verify").with_max_turns(4));
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "verify").with_max_turns(5));
 
     assert_eq!(result.status, AgentStatus::Completed);
     assert_eq!(result.recovery_metrics.invalid_tool_call_count, 2);
@@ -9210,6 +9220,9 @@ fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments()
             && message
                 .content
                 .contains("same repairable tool failure recurred")
+    }));
+    assert!(requests[3].messages.iter().any(|message| {
+        message.role == ModelRole::Developer && message.content.contains("repair_context=")
     }));
     let serialized = serde_json::to_string(&result).expect("serialize public result");
     assert!(!serialized.contains("raw_arguments"));

@@ -1856,16 +1856,13 @@ impl AgentLoopState {
         if tool_result.ok {
             let tool_failure_resolved = self.repair_plan.as_ref().is_some_and(|plan| {
                 plan.plan.reason == AgentRepairReason::ToolFailure
-                    && tool_result.tool_name != UPDATE_PLAN_TOOL
-                    && plan
-                        .failed_tool_name
-                        .as_deref()
-                        .is_none_or(|failed| failed == tool_result.tool_name)
+                    && plan.failed_tool_name.as_deref() == Some(tool_result.tool_name.as_str())
             });
             if tool_failure_resolved {
-                // A valid execution/read can resolve an input or policy tool failure without
-                // consuming a mutation-bound repair attempt. Verification failures remain owned
-                // by the revision-bound terminal-command reducer below.
+                // Only a successful call to the same tool can resolve an input, policy, or
+                // execution failure without consuming a mutation-bound repair attempt. An
+                // unrelated read, mutation, or bookkeeping result must not erase the decision
+                // that owns the repair episode.
                 self.repair_plan = None;
             }
             self.last_repair_failure = None;
@@ -1914,18 +1911,16 @@ impl AgentLoopState {
         } else {
             AgentRepairReason::ToolFailure
         };
-        let failed_tool_name = (repair_reason == AgentRepairReason::ToolFailure
-            && tool_result.failure_kind == Some(ToolFailureKind::Execution))
-        .then_some(tool_result.tool_name.as_str());
+        let failed_tool_name = (repair_reason == AgentRepairReason::ToolFailure)
+            .then_some(tool_result.tool_name.as_str());
         if let Err(exhausted) =
             self.schedule_repair(repair_reason, repair_signature, failed_tool_name)
         {
             self.repair_plan = Some(RepairPlanState {
                 plan: exhausted,
                 signature: String::new(),
-                failed_tool_name: (repair_reason == AgentRepairReason::ToolFailure
-                    && tool_result.failure_kind == Some(ToolFailureKind::Execution))
-                .then(|| tool_result.tool_name.clone()),
+                failed_tool_name: (repair_reason == AgentRepairReason::ToolFailure)
+                    .then(|| tool_result.tool_name.clone()),
             });
             return Some(
                 "repair planning budget exhausted; refusing another repair attempt".to_string(),
