@@ -1741,11 +1741,20 @@ impl AgentLoopState {
         failure: Option<&ToolResult>,
     ) -> Value {
         let summary = self.completion.summary();
-        let evidence_result = failure.or_else(|| {
-            self.tool_result_occurrences
-                .last()
-                .map(|occurrence| occurrence.result())
-        });
+        // A later diagnostic command is useful transcript evidence, but it must not replace the
+        // exact failed verification that made a strategy change legal for this revision.
+        let evidence_result = failure
+            .filter(|result| !result.ok)
+            .or_else(|| {
+                (reason == AgentRepairReason::VerificationFailed)
+                    .then(|| self.failed_planned_verification_result())
+                    .flatten()
+            })
+            .or_else(|| {
+                self.tool_result_occurrences
+                    .last()
+                    .map(|occurrence| occurrence.result())
+            });
         let matching_entry = evidence_result
             .and_then(tool_result_command_scope_digest)
             .and_then(|digest| {
@@ -1783,7 +1792,7 @@ impl AgentLoopState {
                 })
             })
             .unwrap_or_else(|| ("unavailable".to_string(), "unavailable".to_string()));
-        let previous_result = failure
+        let previous_result = evidence_result
             .map(|result| json!(safe_tool_result_evidence(result)))
             .or_else(|| {
                 self.tool_result_occurrences
@@ -1825,37 +1834,46 @@ impl AgentLoopState {
                     .map(|occurrence| json!(safe_repair_tool_name(occurrence.result())))
             })
             .unwrap_or_else(|| json!(repair_reason_text(reason)));
-        let unmet_actions = self.unmet_verification_entries(failure);
+        let unmet_actions = self.unmet_verification_entries(evidence_result);
         let remaining_verification_action_count = unmet_actions.len();
-        let required_verification_action = unmet_actions
-            .first()
-            .map(|(entry, required, remaining)| {
-                repair_verification_action(entry, *required, *remaining)
+        let require_exact_action = !evidence_result
+            .is_some_and(|result| self.is_failed_planned_verification_result(result))
+            && self.required_repair_command_input().is_some();
+        let required_verification_action = require_exact_action
+            .then(|| {
+                unmet_actions.first().map(|(entry, required, remaining)| {
+                    repair_verification_action(entry, *required, *remaining)
+                })
             })
+            .flatten()
             .unwrap_or(Value::Null);
         let mut projected_command_chars = unmet_actions
             .first()
             .map_or(0, |(entry, _, _)| entry.action.command.chars().count());
         let mut additional_verification_actions = Vec::new();
-        for (entry, required, remaining) in unmet_actions.iter().skip(1) {
-            let command_chars = entry.action.command.chars().count();
-            if additional_verification_actions.len() + 1 >= MAX_REPAIR_CONTEXT_ACTIONS
-                || projected_command_chars.saturating_add(command_chars)
-                    > MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS
-            {
-                break;
+        if require_exact_action {
+            for (entry, required, remaining) in unmet_actions.iter().skip(1) {
+                let command_chars = entry.action.command.chars().count();
+                if additional_verification_actions.len() + 1 >= MAX_REPAIR_CONTEXT_ACTIONS
+                    || projected_command_chars.saturating_add(command_chars)
+                        > MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS
+                {
+                    break;
+                }
+                projected_command_chars = projected_command_chars.saturating_add(command_chars);
+                additional_verification_actions
+                    .push(repair_verification_action(entry, *required, *remaining));
             }
-            projected_command_chars = projected_command_chars.saturating_add(command_chars);
-            additional_verification_actions
-                .push(repair_verification_action(entry, *required, *remaining));
         }
         let projected_action_count = usize::from(required_verification_action != Value::Null)
             + additional_verification_actions.len();
         let verification_actions_truncated =
-            remaining_verification_action_count > projected_action_count;
+            require_exact_action && remaining_verification_action_count > projected_action_count;
+        let repair_strategy_change_required =
+            !require_exact_action && remaining_verification_action_count > 0;
         json!({
             "failed_requirement": bounded_repair_text(&failed_requirement),
-            "evidence": failure
+            "evidence": evidence_result
                 .map(safe_tool_result_evidence)
                 .unwrap_or_else(|| bounded_repair_text(&previous_result.to_string())),
             "affected_path": bounded_repair_text(&affected_path),
@@ -1867,6 +1885,7 @@ impl AgentLoopState {
             "additional_verification_actions": additional_verification_actions,
             "remaining_verification_action_count": remaining_verification_action_count,
             "verification_actions_truncated": verification_actions_truncated,
+            "repair_strategy_change_required": repair_strategy_change_required,
         })
     }
 
@@ -1945,16 +1964,11 @@ impl AgentLoopState {
         let exact_action_required = match repair.plan.reason {
             AgentRepairReason::VerificationFailed => {
                 repair.plan.required_revision.is_some()
-                    || self
-                        .tool_result_occurrences
-                        .iter()
-                        .rev()
-                        .find(|occurrence| occurrence.result().tool_name == TOOL_COMMAND)
-                        .is_none_or(|occurrence| {
-                            let result = occurrence.result();
-                            result.workspace_observation().is_none()
-                                || tool_result_command_scope_digest(result)
-                                    != Some(required_digest.as_str())
+                    || !self
+                        .failed_planned_verification_result()
+                        .is_some_and(|result| {
+                            tool_result_command_scope_digest(result)
+                                == Some(required_digest.as_str())
                         })
             }
             AgentRepairReason::ToolFailure => {
@@ -1966,6 +1980,36 @@ impl AgentLoopState {
             return None;
         }
         Some(repair_command_tool_input(entry))
+    }
+
+    /// Return the latest executed failure for an exact action in the current verification plan.
+    fn failed_planned_verification_result(&self) -> Option<&ToolResult> {
+        self.tool_result_occurrences
+            .iter()
+            .rev()
+            .map(ToolResultOccurrence::result)
+            .find(|result| self.is_failed_planned_verification_result(result))
+    }
+
+    fn is_failed_planned_verification_result(&self, result: &ToolResult) -> bool {
+        let Some(plan) = self.verification_plan.as_ref() else {
+            return false;
+        };
+        let Some(revision) = plan.revision else {
+            return false;
+        };
+        result.tool_name == TOOL_COMMAND
+            && !result.ok
+            && result.workspace_observation().is_some_and(|observation| {
+                observation.mutation() == singularity_tools::WorkspaceMutation::Unchanged
+                    && observation.revision() == Some(revision)
+            })
+            && tool_result_command_scope_digest(result).is_some_and(|digest| {
+                plan.plan
+                    .checks
+                    .iter()
+                    .any(|check| check.requirement.command_scope_digest == digest)
+            })
     }
 
     fn previous_repair_symbol(&self, path: &str) -> Option<String> {

@@ -8554,6 +8554,172 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
 }
 
 #[test]
+fn failed_exact_verification_remains_strategy_change_evidence_after_other_command() {
+    let workspace = tempfile::tempdir().expect("failed exact action workspace");
+    let fixture_name = "failed_exact_action.txt";
+    std::fs::write(workspace.path().join(fixture_name), "before")
+        .expect("write failed exact action fixture");
+    let exact_command = test_command_script("exact");
+    let diagnostic_command = test_command_script("diagnostic");
+
+    let mut edit = ModelTurnResponse::completed(
+        "model_request_turn_failed_exact_0",
+        "response_failed_exact_0",
+        "",
+    );
+    edit.tool_calls.push(tool_call(
+        "edit_failed_exact",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut plan = ModelTurnResponse::completed(
+        "model_request_turn_failed_exact_1",
+        "response_failed_exact_1",
+        "",
+    );
+    plan.tool_calls.push(tool_call(
+        "plan_failed_exact",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "repair the failed verification", "status": "in_progress"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "changed failed_exact_action.txt",
+                "affected_path": fixture_name,
+                "affected_symbol": "failed_exact_action::value",
+                "current_gap": "the exact verification still fails",
+                "action": {
+                    "command": exact_command,
+                    "cwd": ".",
+                    "timeout_seconds": 10,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    let mut exact = ModelTurnResponse::completed(
+        "model_request_turn_failed_exact_2",
+        "response_failed_exact_2",
+        "",
+    );
+    exact.tool_calls.push(tool_call(
+        "command_failed_exact",
+        "command",
+        serde_json::json!({
+            "command": exact_command,
+            "cwd": ".",
+            "timeout_seconds": 10
+        }),
+    ));
+    let mut diagnostic = ModelTurnResponse::completed(
+        "model_request_turn_failed_exact_3",
+        "response_failed_exact_3",
+        "",
+    );
+    diagnostic.tool_calls.push(tool_call(
+        "command_diagnostic_after_failure",
+        "command",
+        serde_json::json!({
+            "command": diagnostic_command,
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let stop = ModelTurnResponse::completed(
+        "model_request_turn_failed_exact_4",
+        "response_failed_exact_4",
+        "repair still required",
+    );
+
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![edit, plan, exact, diagnostic, stop],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind failed exact action workspace")
+            .with_sandbox_backend(AgentFailThenSucceedBackend {
+                calls: AtomicUsize::new(0),
+            }),
+    )
+    .run(
+        &AgentLoopInput::new(
+            "thread_failed_exact",
+            "turn_failed_exact",
+            "repair the failed verification",
+        )
+        .with_max_turns(5),
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+    let requests = seen_requests.lock().expect("failed exact requests");
+    for repair_request in [&requests[3], &requests[4]] {
+        let command_schema = &repair_request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "command")
+            .expect("command remains visible")
+            .parameters_schema;
+        assert!(
+            command_schema["properties"]["command"]
+                .get("const")
+                .is_none(),
+            "a later diagnostic must not erase the failed exact action's strategy-change evidence: {command_schema}"
+        );
+        let repair_messages = repair_request
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .starts_with("Follow the bounded repair plan.")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repair_messages.len(),
+            1,
+            "repair_messages={repair_messages:?}"
+        );
+        assert!(
+            repair_messages[0]
+                .content
+                .contains("\"required_verification_action\":null"),
+            "repair context must permit a materially different strategy after the exact action failed: {}",
+            repair_messages[0].content
+        );
+        assert!(
+            repair_messages[0].content.contains("exit_nonzero")
+                && repair_messages[0]
+                    .content
+                    .contains("\"repair_strategy_change_required\":true"),
+            "the exact failure must remain the causal evidence: {}",
+            repair_messages[0].content
+        );
+    }
+}
+
+#[test]
 fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
     let workspace = tempfile::tempdir().expect("repair context workspace");
     let fixture_name = "repair_context.txt";
