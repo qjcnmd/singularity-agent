@@ -4265,7 +4265,7 @@ where
                 }
                 _ => ToolResult::failed_with_kind(
                     &envelope,
-                    ToolFailureKind::Capability,
+                    ToolFailureKind::Visibility,
                     "tool_batch_rejected",
                     "the tool batch was rejected before execution",
                 ),

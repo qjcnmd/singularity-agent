@@ -2784,6 +2784,94 @@ fn approval_checkpoint_roundtrips_after_visible_batch_approval_rejection() {
 }
 
 #[test]
+fn recovered_batch_sibling_does_not_invalidate_later_approval_checkpoint() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("README.md"), "before").expect("fixture");
+    let mut mixed_batch = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    mixed_batch.tool_calls.push(tool_call(
+        "list_sibling",
+        "list",
+        serde_json::json!({"path": "."}),
+    ));
+    mixed_batch.tool_calls.push(tool_call(
+        "invalid_command",
+        "command",
+        serde_json::json!({
+            "command": test_command_script("success"),
+            "timeout_seconds": 5,
+            "unexpected": true
+        }),
+    ));
+    let mut corrected_command =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    corrected_command.tool_calls.push(tool_call(
+        "corrected_command",
+        "command",
+        serde_json::json!({
+            "command": test_command_script("success"),
+            "timeout_seconds": 5
+        }),
+    ));
+    let mut pending_edit = ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    pending_edit.tool_calls.push(tool_call(
+        "pending_edit",
+        "edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+
+    let mut registry = ToolRegistry::default();
+    for entry in workspace_tool_entries().into_iter().filter(|entry| {
+        ["read", "list", "edit", "patch", "command"].contains(&entry.spec.name.as_str())
+    }) {
+        registry.register(entry).expect("register workspace tool");
+    }
+    for entry in agent_control_tool_entries() {
+        registry
+            .register(entry)
+            .expect("register agent control tool");
+    }
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![mixed_batch, corrected_command, pending_edit],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract {
+                supports_parallel_tool_calls: true,
+                ..ProviderProtocolContract::default()
+            },
+        },
+        ToolBroker::new(registry),
+        PolicyEngine::new(PermissionProfile::workspace_write()),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new("thread_1", "turn_1", "edit the file after inspection")
+            .with_max_turns(3),
+    );
+
+    assert_eq!(result.status, AgentStatus::Blocked, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+    let sibling = result
+        .tool_results
+        .iter()
+        .find(|tool_result| tool_result.tool_call_id == "list_sibling")
+        .expect("batch sibling result");
+    assert_eq!(sibling.error_code.as_deref(), Some("tool_batch_rejected"));
+    assert_eq!(sibling.failure_kind, Some(ToolFailureKind::Visibility));
+    let pending = pending_approval(&result);
+    let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
+    PendingApprovalOccurrence::from_checkpoint_payload(pending.request().clone(), &checkpoint)
+        .expect("recovered batch sibling must not poison approval checkpoint");
+}
+
+#[test]
 fn pending_approval_occurrences_keep_request_tool_checkpoint_order() {
     let response = |call_id: &str, path: &str| {
         let mut response = ModelTurnResponse::completed(
