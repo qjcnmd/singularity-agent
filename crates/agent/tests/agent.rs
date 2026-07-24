@@ -8495,7 +8495,7 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
 
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
-    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 2);
+    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 3);
     let run_status = result.to_run_status();
     assert!(run_status.audit_events.iter().any(|event| {
         event["argument_validation_code"] == "repair_action_mismatch"
@@ -8551,6 +8551,199 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
             .count(),
         1
     );
+}
+
+#[test]
+fn installed_exact_actions_constrain_each_pre_gate_request_in_order() {
+    let workspace = tempfile::tempdir().expect("exact action convergence workspace");
+    let fixture_name = "exact_action_convergence.txt";
+    std::fs::write(workspace.path().join(fixture_name), "before")
+        .expect("write convergence fixture");
+    let first_command = test_command_script("first");
+    let second_command = test_command_script("second");
+
+    let mut edit = ModelTurnResponse::completed(
+        "model_request_turn_exact_action_convergence_0",
+        "response_0",
+        "",
+    );
+    edit.tool_calls.push(tool_call(
+        "edit_convergence",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut plan = ModelTurnResponse::completed(
+        "model_request_turn_exact_action_convergence_1",
+        "response_1",
+        "",
+    );
+    plan.tool_calls.push(tool_call(
+        "plan_convergence",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "run both exact checks", "status": "completed"}],
+            "verification": [
+                {
+                    "risk": "general_mutation",
+                    "evidence": "the changed fixture passes its first exact check",
+                    "affected_path": fixture_name,
+                    "affected_symbol": "exact_action_convergence::first",
+                    "current_gap": "the first exact check has not run",
+                    "action": {
+                        "command": first_command,
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                },
+                {
+                    "risk": "optional_null",
+                    "evidence": "the changed fixture passes its second exact check",
+                    "affected_path": fixture_name,
+                    "affected_symbol": "exact_action_convergence::second",
+                    "current_gap": "the second exact check has not run",
+                    "action": {
+                        "command": second_command,
+                        "cwd": ".",
+                        "timeout_seconds": 10,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                }
+            ]
+        }),
+    ));
+    let mut first = ModelTurnResponse::completed(
+        "model_request_turn_exact_action_convergence_2",
+        "response_2",
+        "",
+    );
+    first.tool_calls.push(tool_call(
+        "command_convergence_first",
+        "command",
+        serde_json::json!({
+            "command": first_command,
+            "cwd": ".",
+            "timeout_seconds": 10
+        }),
+    ));
+    let premature = ModelTurnResponse::completed(
+        "model_request_turn_exact_action_convergence_3",
+        "response_3",
+        "completed too early",
+    );
+    let mut second = ModelTurnResponse::completed(
+        "model_request_turn_exact_action_convergence_4",
+        "response_4",
+        "",
+    );
+    second.tool_calls.push(tool_call(
+        "command_convergence_second",
+        "command",
+        serde_json::json!({
+            "command": second_command,
+            "cwd": ".",
+            "timeout_seconds": 10
+        }),
+    ));
+    let final_response = ModelTurnResponse::completed(
+        "model_request_turn_exact_action_convergence_5",
+        "response_5",
+        "completed",
+    );
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![edit, plan, first, premature, second, final_response],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind convergence workspace")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new(
+            "thread_exact_action_convergence",
+            "turn_exact_action_convergence",
+            "change and verify the fixture",
+        )
+        .with_max_turns(5),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.final_answer.as_deref(), Some("completed"));
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
+    let requests = seen_requests.lock().expect("convergence requests");
+    let assert_constrained = |request: &ModelTurnRequest, command: &str| {
+        assert_eq!(request.tool_choice.mode, ToolChoiceMode::Auto);
+        assert_eq!(request.tool_choice.max_tool_calls, 1);
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "command");
+        let pending_messages = request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == ModelRole::Developer
+                    && message
+                        .content
+                        .starts_with("Trusted exact verification remains pending.")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pending_messages.len(), 1, "request={request:?}");
+        assert!(
+            pending_messages[0]
+                .content
+                .contains("submit only the exact command input below as the next action")
+        );
+        assert!(pending_messages[0].content.contains(command));
+        assert_eq!(
+            request.tools[0].parameters_schema["properties"]["command"]["const"],
+            serde_json::json!(command)
+        );
+        assert_eq!(
+            request.tools[0].parameters_schema["properties"]["cwd"]["const"],
+            serde_json::json!(".")
+        );
+        assert_eq!(
+            request.tools[0].parameters_schema["properties"]["timeout_seconds"]["const"],
+            serde_json::json!(10)
+        );
+    };
+    assert_constrained(&requests[2], &first_command);
+    assert_constrained(&requests[3], &second_command);
+    assert_constrained(&requests[4], &second_command);
+    assert!(!requests[3].messages.iter().any(|message| {
+        message
+            .content
+            .starts_with("Trusted exact verification remains pending.")
+            && message.content.contains(&first_command)
+    }));
+    assert!(!requests[5].messages.iter().any(|message| {
+        message
+            .content
+            .starts_with("Trusted exact verification remains pending.")
+    }));
 }
 
 #[test]
@@ -8675,6 +8868,11 @@ fn failed_exact_verification_remains_strategy_change_evidence_after_other_comman
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     let requests = seen_requests.lock().expect("failed exact requests");
     for repair_request in [&requests[3], &requests[4]] {
+        assert!(!repair_request.messages.iter().any(|message| {
+            message
+                .content
+                .starts_with("Trusted exact verification remains pending.")
+        }));
         let command_schema = &repair_request
             .tools
             .iter()
@@ -8866,7 +9064,9 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
             .with_max_turns(6),
     );
 
-    assert_eq!(result.status, AgentStatus::Blocked, "result={result:?}");
+    assert_eq!(result.status, AgentStatus::Failed, "result={result:?}");
+    assert_eq!(result.error.as_deref(), Some("max turns exceeded"));
+    assert!(result.pending_approvals.is_empty());
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     let plan_result = result
         .tool_results
@@ -8881,19 +9081,6 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
     assert_eq!(verification["action"]["sandbox_mode"], "workspace_write");
     assert_eq!(verification["action"]["network_access"], "denied");
     assert_eq!(verification["action_scope_digest"], expected_scope_digest);
-    let pending = pending_approval(&result);
-    let checkpoint = pending
-        .encode_checkpoint()
-        .expect("repair context checkpoint");
-    assert_eq!(checkpoint["repair_attempts"], 0);
-    assert_eq!(
-        checkpoint["repair_plan"]["plan"]["attempt"], 1,
-        "checkpoint={checkpoint}"
-    );
-    assert_eq!(
-        checkpoint["repair_plan"]["plan"]["reason"], "verification_failed",
-        "unrelated failures must not replace the active repair decision"
-    );
     let requests = seen_requests.lock().expect("repair context requests");
     assert!(requests.iter().any(|request| {
         request.messages.iter().any(|message| {
@@ -9478,41 +9665,16 @@ fn repair_cycle_requires_matching_scope_and_all_revision_checks() {
     )
     .with_max_turns(9);
 
-    let first_blocked = agent_loop.run(&input);
-    assert_eq!(
-        first_blocked.status,
-        AgentStatus::Blocked,
-        "{first_blocked:?}"
-    );
-    let first_pending = pending_approval(&first_blocked);
-    let first_checkpoint = first_pending
-        .encode_checkpoint()
-        .expect("multi-check checkpoint");
-    assert_eq!(first_checkpoint["repair_attempts"], 0);
-    assert_eq!(
-        first_checkpoint["recovery_metrics"]["repair_attempt_count"],
-        0
-    );
-    assert_eq!(first_checkpoint["repair_plan"]["plan"]["attempt"], 1);
-    assert_eq!(
-        first_checkpoint["repair_plan"]["plan"]["required_revision"],
-        2
-    );
-    assert_eq!(first_blocked.verification.satisfied_command_count, 1);
-
-    let grant = ApprovalGrant::allow(
-        first_pending.pending_tool_call().request_id.clone(),
-        first_pending.pending_tool_call().tool_name.clone(),
-        first_pending.pending_tool_call().resources.clone(),
-    );
-    let restored = PendingApprovalOccurrence::from_checkpoint_payload(
-        first_pending.request().clone(),
-        &first_checkpoint,
-    )
-    .expect("restore multi-check checkpoint");
-    let result = agent_loop.resume_pending_approval(&input.with_approval_grant(grant), &restored);
+    let result = agent_loop.run(&input);
     assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
     assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 1);
+    assert_eq!(result.verification.satisfied_command_count, 2);
+    assert!(result.pending_approvals.is_empty());
+    assert!(result.tool_results.iter().any(|tool_result| {
+        tool_result.tool_call_id == "read_multi"
+            && tool_result.error_code.as_deref() == Some("tool_not_visible")
+    }));
     assert_eq!(
         std::fs::read_to_string(workspace.path().join(fixture_name)).expect("read result"),
         "v2"

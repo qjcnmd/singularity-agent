@@ -280,6 +280,8 @@ const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
 const REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS: &str = "The required verification action was not submitted exactly. Do not choose a different action or vary its arguments; submit only repair_context.required_verification_action.command_tool_input exactly as provided.";
 const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, submit only its command_tool_input exactly as the next action. additional_verification_actions are the ordered future actions, not permission to batch exclusive command calls; wait for each ToolResult before submitting the next action. Do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. Only when an exact command executes and fails should you choose a materially different repair strategy that addresses its evidence. Do not repeat the previous patch or claim success without new verification evidence.";
+const PENDING_EXACT_VERIFICATION_INSTRUCTION_PREFIX: &str =
+    "Trusted exact verification remains pending.";
 const REVIEW_REPAIR_SIGNATURE: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000017";
 const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call update_plan with all steps marked completed before providing the final answer.";
@@ -1541,6 +1543,15 @@ impl AgentLoopState {
         feedback.join(" ")
     }
 
+    fn clear_pending_exact_verification_instruction(&mut self) {
+        self.messages.retain(|message| {
+            message.role != ModelRole::Developer
+                || !message
+                    .content
+                    .starts_with(PENDING_EXACT_VERIFICATION_INSTRUCTION_PREFIX)
+        });
+    }
+
     fn repair_feedback(&self) -> String {
         self.repair_feedback_with_failure(None)
     }
@@ -1838,7 +1849,7 @@ impl AgentLoopState {
         let remaining_verification_action_count = unmet_actions.len();
         let require_exact_action = !evidence_result
             .is_some_and(|result| self.is_failed_planned_verification_result(result))
-            && self.required_repair_command_input().is_some();
+            && self.required_verification_command_input().is_some();
         let required_verification_action = require_exact_action
             .then(|| {
                 unmet_actions.first().map(|(entry, required, remaining)| {
@@ -1949,10 +1960,16 @@ impl AgentLoopState {
         entries
     }
 
-    /// Return the exact command input that owns the next repair turn, when execution has not yet
-    /// produced failure evidence requiring a different strategy.
-    fn required_repair_command_input(&self) -> Option<Value> {
-        let repair = self.repair_plan.as_ref()?;
+    /// Return the next installed exact command while no executed failure requires a new strategy.
+    fn required_verification_command_input(&self) -> Option<Value> {
+        if self.repair_plan.as_ref().is_some_and(|repair| {
+            matches!(
+                repair.plan.reason,
+                AgentRepairReason::RevisionConflict | AgentRepairReason::FinalReviewRejected
+            )
+        }) {
+            return None;
+        }
         let entry = self.unmet_verification_entries(None).first()?.0;
         let required_digest = command_script_scope_digest_with_policy(
             &entry.action.command,
@@ -1961,22 +1978,12 @@ impl AgentLoopState {
             entry.action.sandbox_mode.clone(),
             entry.action.network_access.clone(),
         );
-        let exact_action_required = match repair.plan.reason {
-            AgentRepairReason::VerificationFailed => {
-                repair.plan.required_revision.is_some()
-                    || !self
-                        .failed_planned_verification_result()
-                        .is_some_and(|result| {
-                            tool_result_command_scope_digest(result)
-                                == Some(required_digest.as_str())
-                        })
-            }
-            AgentRepairReason::ToolFailure => {
-                repair.failed_tool_name.as_deref() == Some(TOOL_COMMAND)
-            }
-            AgentRepairReason::RevisionConflict | AgentRepairReason::FinalReviewRejected => false,
-        };
-        if !exact_action_required {
+        if self
+            .failed_planned_verification_result()
+            .is_some_and(|result| {
+                tool_result_command_scope_digest(result) == Some(required_digest.as_str())
+            })
+        {
             return None;
         }
         Some(repair_command_tool_input(entry))
@@ -2865,6 +2872,16 @@ where
             if self.is_cancelled(input) {
                 return state.finish(AgentStatus::Cancelled, false, None, turn_index, None);
             }
+            state.clear_pending_exact_verification_instruction();
+            let required_verification_input = (!finalization_only)
+                .then(|| state.required_verification_command_input())
+                .flatten();
+            if let Some(command_input) = &required_verification_input {
+                state.messages.push(ModelMessage::text(
+                    ModelRole::Developer,
+                    pending_exact_verification_instruction(command_input),
+                ));
+            }
             if !matches!(
                 self.emit_checkpoint_event(
                     input,
@@ -2960,16 +2977,21 @@ where
             } else {
                 match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
                     Ok(mut tool_view) => {
-                        if let Some(command_input) = state.required_repair_command_input()
-                            && let Err(error) = tool_view.restrict_command_input(&command_input)
-                        {
-                            return state.finish(
-                                AgentStatus::Failed,
-                                false,
-                                None,
-                                turn_index,
-                                Some(error),
-                            );
+                        if let Some(command_input) = &required_verification_input {
+                            if let Err(error) = tool_view.restrict_command_input(command_input) {
+                                return state.finish(
+                                    AgentStatus::Failed,
+                                    false,
+                                    None,
+                                    turn_index,
+                                    Some(error),
+                                );
+                            }
+                            tool_view.tools.retain(|tool| tool.name == TOOL_COMMAND);
+                            tool_view
+                                .visible_tool_names
+                                .retain(|tool_name| tool_name == TOOL_COMMAND);
+                            tool_view.max_tool_calls = 1;
                         }
                         tool_view
                     }
@@ -3078,6 +3100,9 @@ where
                 capabilities,
                 finalization_only,
             );
+            // The projection is request-scoped. Tool-result and later checkpoints must derive the
+            // next action from trusted state instead of persisting a now-stale command instruction.
+            state.clear_pending_exact_verification_instruction();
             let request_validation =
                 validate_model_request_with_capabilities(&request, Some(capabilities));
             if !request_validation.valid {
@@ -4801,9 +4826,9 @@ where
                 )),
             };
         }
-        if execution_call.tool_name == TOOL_COMMAND
-            && let Some(required_input) = state.required_repair_command_input()
-            && execution_call.arguments != required_input
+        if let Some(required_input) = state.required_verification_command_input()
+            && (execution_call.tool_name != TOOL_COMMAND
+                || execution_call.arguments != required_input)
         {
             if !invalid_was_observed {
                 state.recovery_metrics.invalid_tool_call_count = state
@@ -7318,6 +7343,15 @@ fn repair_command_tool_input(entry: &AgentVerificationEntry) -> Value {
         "cwd": bounded_repair_text(&entry.action.cwd),
         "timeout_seconds": entry.action.timeout_seconds,
     })
+}
+
+/// Project the installed next action as trusted request guidance without claiming provider support
+/// for required tool choice.
+fn pending_exact_verification_instruction(command_input: &Value) -> String {
+    let command_input = serde_json::to_string(command_input).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "{PENDING_EXACT_VERIFICATION_INSTRUCTION_PREFIX} Do not finalize, replan, mutate, or choose another tool; submit only the exact command input below as the next action, then wait for its ToolResult before deciding what follows. exact_command_input={command_input}"
+    )
 }
 
 /// Project only the already-redacted public tool result payload into bounded repair evidence.
