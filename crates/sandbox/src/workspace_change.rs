@@ -73,18 +73,31 @@ impl WorkspaceSnapshot {
         if (self.root.device, self.root.inode) != (after.root.device, after.root.inode) {
             return Err("workspace root identity changed between trusted observations".to_string());
         }
-        if self.protected_entries != after.protected_entries {
+        if !protected_entries_match(&self.protected_entries, &after.protected_entries) {
             return Err(
                 "protected workspace state changed between trusted observations".to_string(),
             );
         }
+        let protected_paths = self
+            .protected_entries
+            .keys()
+            .chain(after.protected_entries.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let mut changed_files = self
             .entries
             .keys()
             .chain(after.entries.keys())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter(|path| self.entries.get(*path) != after.entries.get(*path))
+            .filter(|path| {
+                !snapshot_entry_matches(
+                    self.entries.get(*path),
+                    after.entries.get(*path),
+                    path,
+                    &protected_paths,
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         if root_behavior_changed(&self.root, &after.root) {
@@ -110,6 +123,87 @@ impl WorkspaceSnapshot {
             changed_files,
             format!("sha256:{:x}", Sha256::digest(encoded)),
         )))
+    }
+
+    /// Compare the workspace baseline while ignoring trusted metadata churn on protected
+    /// directories. Protected object existence, type, identity and permissions remain
+    /// authoritative; volatile directory contents, length and timestamps stay outside the
+    /// agent-visible revision.
+    #[cfg(unix)]
+    pub(super) fn transaction_baseline_matches(&self, after: &Self) -> bool {
+        (self.root.device, self.root.inode) == (after.root.device, after.root.inode)
+            && !root_behavior_changed(&self.root, &after.root)
+            && workspace_entries_match(
+                &self.entries,
+                &after.entries,
+                &self.protected_entries,
+                &after.protected_entries,
+            )
+            && protected_entries_match(&self.protected_entries, &after.protected_entries)
+    }
+}
+
+#[cfg(unix)]
+fn workspace_entries_match(
+    before: &BTreeMap<String, SnapshotEntry>,
+    after: &BTreeMap<String, SnapshotEntry>,
+    before_protected: &BTreeMap<String, EntryMetadata>,
+    after_protected: &BTreeMap<String, EntryMetadata>,
+) -> bool {
+    if before.keys().ne(after.keys()) {
+        return false;
+    }
+    let protected_paths = before_protected
+        .keys()
+        .chain(after_protected.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    before.iter().all(|(path, entry)| {
+        snapshot_entry_matches(Some(entry), after.get(path), path, &protected_paths)
+    })
+}
+
+fn snapshot_entry_matches(
+    before: Option<&SnapshotEntry>,
+    after: Option<&SnapshotEntry>,
+    path: &str,
+    protected_paths: &BTreeSet<String>,
+) -> bool {
+    match (before, after) {
+        (
+            Some(SnapshotEntry::Directory { metadata: before }),
+            Some(SnapshotEntry::Directory { metadata: after }),
+        ) if protected_paths
+            .iter()
+            .any(|protected| protected.starts_with(&format!("{path}/"))) =>
+        {
+            protected_metadata_matches(before, after)
+        }
+        _ => before == after,
+    }
+}
+
+fn protected_entries_match(
+    before: &BTreeMap<String, EntryMetadata>,
+    after: &BTreeMap<String, EntryMetadata>,
+) -> bool {
+    before.len() == after.len()
+        && before.iter().all(|(path, metadata)| {
+            after
+                .get(path)
+                .is_some_and(|other| protected_metadata_matches(metadata, other))
+        })
+}
+
+fn protected_metadata_matches(before: &EntryMetadata, after: &EntryMetadata) -> bool {
+    if before.object_kind == 2 && after.object_kind == 2 {
+        before.object_kind == after.object_kind
+            && before.readonly == after.readonly
+            && before.platform_permissions == after.platform_permissions
+            && before.device == after.device
+            && before.inode == after.inode
+    } else {
+        before == after
     }
 }
 
@@ -442,6 +536,39 @@ mod tests {
 
         assert_eq!(
             before.change_summary(&after).expect_err("must fail closed"),
+            "protected workspace state changed between trusted observations"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn trusted_protected_directory_metadata_wave_is_ignored_but_replacement_fails_closed() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let protected = workspace.path().join(".singularity");
+        std::fs::create_dir(&protected).expect("protected directory");
+        let runtime_state = protected.join("runtime.sqlite");
+        std::fs::write(&runtime_state, b"before").expect("runtime state");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+
+        std::fs::write(&runtime_state, b"trusted runtime state grew").expect("trusted update");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+        assert_eq!(
+            before
+                .change_summary(&after)
+                .expect("trusted metadata wave"),
+            None
+        );
+
+        let displaced = workspace.path().join(".singularity.displaced");
+        std::fs::rename(&protected, &displaced).expect("displace protected directory");
+        std::fs::create_dir(&protected).expect("replacement protected directory");
+        std::fs::write(protected.join("runtime.sqlite"), b"replacement")
+            .expect("replacement runtime state");
+        let replaced = snapshot_workspace(workspace.path()).expect("replacement snapshot");
+        assert_eq!(
+            before
+                .change_summary(&replaced)
+                .expect_err("protected replacement must fail closed"),
             "protected workspace state changed between trusted observations"
         );
     }

@@ -2188,23 +2188,98 @@ impl TransactionTreeState {
         expected: &Self,
         volatile_directories: &std::collections::BTreeSet<PathBuf>,
     ) -> bool {
-        if self.entries.keys().ne(expected.entries.keys()) {
+        let mut actual_entries = self
+            .entries
+            .iter()
+            .filter(|(path, _)| transaction_path_is_comparable(path));
+        let expected_entries = expected
+            .entries
+            .iter()
+            .filter(|(path, _)| transaction_path_is_comparable(path));
+        if actual_entries
+            .clone()
+            .map(|(path, _)| path)
+            .ne(expected_entries.clone().map(|(path, _)| path))
+        {
             return false;
         }
-        self.entries.iter().all(|(path, actual)| {
+        actual_entries.all(|(path, actual)| {
             let Some(expected) = expected.entries.get(path) else {
                 return false;
             };
-            transaction_object_matches(actual, expected, volatile_directories.contains(path))
+            transaction_object_matches(
+                actual,
+                expected,
+                volatile_directories.contains(path),
+                transaction_path_is_protected_root(path),
+            )
         })
     }
+}
+
+fn transaction_path_is_protected_root(path: &Path) -> bool {
+    let mut protected_seen = false;
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return false;
+        };
+        if is_protected_path(&component.to_string_lossy()) {
+            protected_seen = true;
+        } else if protected_seen {
+            return false;
+        }
+    }
+    protected_seen
+}
+
+fn transaction_path_is_comparable(path: &Path) -> bool {
+    let mut protected_seen = false;
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return false;
+        };
+        if protected_seen {
+            return false;
+        }
+        protected_seen = is_protected_path(&component.to_string_lossy());
+    }
+    true
 }
 
 fn transaction_object_matches(
     actual: &TransactionObjectState,
     expected: &TransactionObjectState,
     ignore_directory_modified: bool,
+    protected_root: bool,
 ) -> bool {
+    if protected_root {
+        let same_kind = matches!(
+            (&actual.kind, &expected.kind),
+            (
+                TransactionObjectKind::Directory,
+                TransactionObjectKind::Directory
+            ) | (
+                TransactionObjectKind::File(_),
+                TransactionObjectKind::File(_)
+            ) | (
+                TransactionObjectKind::Symlink(_),
+                TransactionObjectKind::Symlink(_)
+            )
+        );
+        if !same_kind || actual.mode != expected.mode || actual.device != expected.device {
+            return false;
+        }
+        if actual.inode != expected.inode {
+            return false;
+        }
+        return matches!(
+            (&actual.kind, &expected.kind),
+            (
+                TransactionObjectKind::Directory,
+                TransactionObjectKind::Directory
+            )
+        ) || actual == expected;
+    }
     if matches!(actual.kind, TransactionObjectKind::Directory)
         && matches!(expected.kind, TransactionObjectKind::Directory)
     {
@@ -2477,7 +2552,7 @@ fn commit_workspace_transaction(
     let before_state = TransactionTreeState::capture(workspace)?;
     let current = snapshot_workspace(workspace)
         .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-    if &current != before {
+    if !before.transaction_baseline_matches(&current) {
         return Err(WorkspaceTransactionError::Drift);
     }
     let stage_state = TransactionTreeState::capture(&area.stage)?;
@@ -4512,6 +4587,63 @@ mod tests {
         assert_eq!(result.execution_status, CommandExecutionStatus::Cancelled);
         assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
         assert!(!workspace.path().join("output.txt").exists());
+    }
+
+    #[test]
+    fn trusted_protected_child_write_does_not_make_failed_command_unknown() {
+        let _serial = TRANSACTION_TEST_SERIAL
+            .lock()
+            .expect("transaction test serial");
+        let owner = tempfile::tempdir().expect("owner");
+        let workspace = owner.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let protected = workspace.join(".singularity");
+        fs::create_dir(&protected).expect("protected directory");
+        let runtime_state = protected.join("runtime.sqlite");
+        fs::write(&runtime_state, b"before").expect("runtime state");
+        arm_transaction_test(TransactionTestPoint::FinalVerification, false);
+        let workspace_path = workspace.clone();
+        let worker = thread::spawn(move || {
+            strict_backend().execute(&request(
+                "trusted_protected_child_write",
+                "exit 1",
+                &workspace_path,
+            ))
+        });
+
+        wait_for_transaction_test_point();
+        fs::write(&runtime_state, b"trusted runtime update").expect("trusted child write");
+        release_transaction_test_point();
+        let result = worker.join().expect("transaction worker");
+        clear_transaction_test();
+
+        assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+        assert_eq!(result.semantic_status, CommandSemanticStatus::ExitNonzero);
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
+        assert_eq!(
+            result.sandbox.enforcement,
+            SandboxBackendEnforcement::Strict
+        );
+        assert!(!result.sandbox.local_process_fallback);
+        assert_eq!(
+            fs::read_to_string(&runtime_state).unwrap(),
+            "trusted runtime update"
+        );
+        assert!(
+            fs::read_dir(&workspace)
+                .expect("workspace entries")
+                .filter_map(Result::ok)
+                .all(|entry| entry.file_name() == ".singularity")
+        );
+        assert!(
+            fs::read_dir(owner.path())
+                .expect("owner entries")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".singularity-workspace-commit-"))
+        );
     }
 
     #[test]
