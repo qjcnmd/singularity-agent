@@ -17,8 +17,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,9 @@ const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
 const SANDBOX_CHILD_CANCELLED: &str = "linux sandbox command cancelled";
 const SANDBOX_CHILD_TIMED_OUT: &str = "linux sandbox command timed out";
 const SANDBOX_HOME: &str = "/run/singularity-home";
+
+// Serialize only clone through the child's inherited-FD cleanup ack; command execution stays parallel.
+static CHILD_LAUNCH_GATE: Mutex<()> = Mutex::new(());
 
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 const LANDLOCK_RULE_TYPE_PATH_BENEATH: u32 = 1;
@@ -1780,6 +1783,23 @@ fn run_prepared_command(
     argv_pointers.push(ptr::null());
     let mut env_pointers = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
     env_pointers.push(ptr::null());
+    let launch_gate = match acquire_child_launch_gate(started, prepared.timeout, cancellation) {
+        Ok(guard) => guard,
+        Err(LaunchGateError::Unavailable) => {
+            return LinuxSandboxError::Unavailable.into_result(command_id);
+        }
+        Err(interrupted) => {
+            let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+            let result = match interrupted {
+                LaunchGateError::Cancelled => CommandResult::cancelled(command_id, duration_ms),
+                LaunchGateError::TimedOut => CommandResult::timed_out(command_id, duration_ms),
+                LaunchGateError::Unavailable => unreachable!(),
+            };
+            return result
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Strict);
+        }
+    };
     let Some((stdout_read, stdout_write)) = pipe_cloexec() else {
         return LinuxSandboxError::Unavailable.into_result(command_id);
     };
@@ -1856,7 +1876,6 @@ fn run_prepared_command(
     let flags = libc::CLONE_NEWUSER
         | libc::CLONE_NEWNS
         | libc::CLONE_NEWPID
-        | libc::CLONE_FILES
         | if prepared.network == SandboxNetworkMode::Denied {
             libc::CLONE_NEWNET
         } else {
@@ -1934,6 +1953,7 @@ fn run_prepared_command(
     ] {
         close_fd(fd);
     }
+    drop(launch_gate);
     unsafe {
         libc::setpgid(child, child);
     }
@@ -3921,6 +3941,32 @@ enum FdTableReady {
     Failed,
 }
 
+enum LaunchGateError {
+    Cancelled,
+    TimedOut,
+    Unavailable,
+}
+
+fn acquire_child_launch_gate(
+    started: Instant,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<MutexGuard<'static, ()>, LaunchGateError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(LaunchGateError::Cancelled);
+        }
+        if started.elapsed() >= timeout {
+            return Err(LaunchGateError::TimedOut);
+        }
+        match CHILD_LAUNCH_GATE.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => return Err(LaunchGateError::Unavailable),
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 fn wait_for_fd_table_ready(
     pid: libc::pid_t,
     fd: RawFd,
@@ -4068,18 +4114,7 @@ fn write_user_namespace_maps(pid: libc::pid_t) -> Result<(), ()> {
 
 extern "C" fn child_main(argument: *mut libc::c_void) -> libc::c_int {
     let context = unsafe { &mut *(argument.cast::<ChildContext>()) };
-    if unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_FILES) } != 0 {
-        let failed = [0u8; 1];
-        unsafe {
-            libc::write(
-                context.fd_table_ready_write,
-                failed.as_ptr().cast(),
-                failed.len(),
-            );
-        }
-        return 126;
-    }
-    // Unshare first so closing a sibling invocation's inherited FD cannot affect the host.
+    // Close inherited host FDs before another sandbox invocation is allowed to clone.
     close_all_extra_fds_except(&context.preserved_fds, context.fd_fallback_limit);
     let ready = [1u8; 1];
     if unsafe {

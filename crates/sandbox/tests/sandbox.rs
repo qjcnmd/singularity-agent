@@ -799,6 +799,8 @@ mod linux_tests {
     };
     use std::ffi::OsString;
     use std::fs::{self, hard_link};
+    use std::io::{ErrorKind, Write};
+    use std::net::TcpListener;
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::process::Command;
@@ -984,6 +986,77 @@ time.sleep(30)
 
         for worker in workers {
             let result = worker.join().expect("parallel sandbox worker");
+            assert_eq!(
+                result.execution_status,
+                CommandExecutionStatus::Completed,
+                "{}",
+                result.stderr_preview
+            );
+            assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        }
+    }
+
+    #[test]
+    fn linux_launch_hygiene_does_not_serialize_command_execution() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind coordination listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set coordination listener nonblocking");
+        let port = listener.local_addr().expect("coordination address").port();
+        let coordinator = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut clients = Vec::new();
+            while clients.len() < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((client, _)) => clients.push(client),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept coordination client: {error}"),
+                }
+            }
+            let connected = clients.len();
+            for mut client in clients {
+                client.write_all(b"1").expect("release sandbox command");
+            }
+            connected
+        });
+        let barrier = Arc::new(Barrier::new(2));
+        let workers = (0..2)
+            .map(|index| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let workspace = tempfile::tempdir().expect("workspace");
+                    let mut command = request(
+                        &format!("linux_parallel_execution_{index}"),
+                        &[
+                            "/usr/bin/python3",
+                            "-c",
+                            &format!(
+                                "import socket; s=socket.create_connection(('127.0.0.1',{port}),timeout=5); assert s.recv(1)==b'1'"
+                            ),
+                        ],
+                        workspace.path(),
+                        SandboxFilesystemMode::ReadOnly,
+                        SandboxNetworkMode::Allowed,
+                    );
+                    command.timeout_seconds = 7;
+                    barrier.wait();
+                    strict_backend().execute(&command)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let connected = coordinator.join().expect("coordination server");
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("parallel sandbox worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            connected, 2,
+            "sandbox commands did not execute concurrently"
+        );
+        for result in results {
             assert_eq!(
                 result.execution_status,
                 CommandExecutionStatus::Completed,
