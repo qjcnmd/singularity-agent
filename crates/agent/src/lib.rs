@@ -1855,14 +1855,18 @@ impl AgentLoopState {
         self.completion.observe(tool_result);
         if tool_result.ok {
             let tool_failure_resolved = self.repair_plan.as_ref().is_some_and(|plan| {
-                plan.plan.reason == AgentRepairReason::ToolFailure
-                    && plan.failed_tool_name.as_deref() == Some(tool_result.tool_name.as_str())
+                if plan.plan.reason != AgentRepairReason::ToolFailure {
+                    return false;
+                }
+                match plan.failed_tool_name.as_deref() {
+                    Some(failed_tool_name) => failed_tool_name == tool_result.tool_name,
+                    None => tool_result.tool_name != UPDATE_PLAN_TOOL,
+                }
             });
             if tool_failure_resolved {
-                // Only a successful call to the same tool can resolve an input, policy, or
-                // execution failure without consuming a mutation-bound repair attempt. An
-                // unrelated read, mutation, or bookkeeping result must not erase the decision
-                // that owns the repair episode.
+                // Input, policy and execution failures require a successful call to the same
+                // tool. A visibility failure names no executable tool, so a successful visible
+                // replacement resolves it; bookkeeping alone never does.
                 self.repair_plan = None;
             }
             self.last_repair_failure = None;
@@ -1876,7 +1880,12 @@ impl AgentLoopState {
             .error_code
             .as_deref()
             .unwrap_or("tool_execution_failed");
+        // A command-shaped call is a verification failure only after it crossed the execution
+        // boundary and produced a revision observation. Schema/policy rejections and other
+        // pre-execution failures are tool-input repairs; a corrected call to the same tool must
+        // resolve them without consuming a mutation-bound repair attempt.
         let verification_failure = tool_result.tool_name == TOOL_COMMAND
+            && tool_result.workspace_observation().is_some()
             && self
                 .verification_plan
                 .as_ref()
@@ -1911,16 +1920,18 @@ impl AgentLoopState {
         } else {
             AgentRepairReason::ToolFailure
         };
-        let failed_tool_name = (repair_reason == AgentRepairReason::ToolFailure)
-            .then_some(tool_result.tool_name.as_str());
+        let failed_tool_name = (repair_reason == AgentRepairReason::ToolFailure
+            && tool_result.failure_kind != Some(ToolFailureKind::Visibility))
+        .then_some(tool_result.tool_name.as_str());
         if let Err(exhausted) =
             self.schedule_repair(repair_reason, repair_signature, failed_tool_name)
         {
             self.repair_plan = Some(RepairPlanState {
                 plan: exhausted,
                 signature: String::new(),
-                failed_tool_name: (repair_reason == AgentRepairReason::ToolFailure)
-                    .then(|| tool_result.tool_name.clone()),
+                failed_tool_name: (repair_reason == AgentRepairReason::ToolFailure
+                    && tool_result.failure_kind != Some(ToolFailureKind::Visibility))
+                .then(|| tool_result.tool_name.clone()),
             });
             return Some(
                 "repair planning budget exhausted; refusing another repair attempt".to_string(),

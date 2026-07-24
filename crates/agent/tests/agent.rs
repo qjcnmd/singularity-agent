@@ -4656,6 +4656,167 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
 }
 
 #[test]
+fn invalid_verification_command_input_does_not_open_a_mutation_bound_repair_cycle() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fixture_name = "invalid_verification_input.txt";
+    std::fs::write(dir.path().join(fixture_name), "before").expect("write fixture");
+    let command = test_command_script("success");
+
+    let mut edit = ModelTurnResponse::completed(
+        "model_request_turn_1_0",
+        "response_invalid_verification_0",
+        "",
+    );
+    edit.tool_calls.push(tool_call(
+        "edit_invalid_verification",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut plan = ModelTurnResponse::completed(
+        "model_request_turn_1_1",
+        "response_invalid_verification_1",
+        "",
+    );
+    plan.tool_calls.push(tool_call(
+        "plan_invalid_verification",
+        "update_plan",
+        serde_json::json!({
+            "steps": [
+                {"step": "change the fixture", "status": "completed"},
+                {"step": "verify the changed fixture", "status": "in_progress"}
+            ],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "the fixture changed",
+                "affected_path": fixture_name,
+                "affected_symbol": "invalid_verification_input::value",
+                "current_gap": "the changed revision is not verified",
+                "action": {
+                    "command": command,
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    let mut invalid_command = ModelTurnResponse::completed(
+        "model_request_turn_1_2",
+        "response_invalid_verification_2",
+        "",
+    );
+    invalid_command.tool_calls.push(tool_call(
+        "invalid_verification_command",
+        "command",
+        serde_json::json!({
+            "command": command,
+            "cwd": ".",
+            "timeout_seconds": 5,
+            "sandbox_mode": "workspace_write",
+            "network_access": "denied"
+        }),
+    ));
+    let mut valid_command = ModelTurnResponse::completed(
+        "model_request_turn_1_3",
+        "response_invalid_verification_3",
+        "",
+    );
+    valid_command.tool_calls.push(tool_call(
+        "valid_verification_command",
+        "command",
+        serde_json::json!({
+            "command": command,
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let mut completed_plan = ModelTurnResponse::completed(
+        "model_request_turn_1_4",
+        "response_invalid_verification_4",
+        "",
+    );
+    completed_plan.tool_calls.push(tool_call(
+        "complete_invalid_verification_plan",
+        "update_plan",
+        serde_json::json!({
+            "steps": [
+                {"step": "change the fixture", "status": "completed"},
+                {"step": "verify the changed fixture", "status": "completed"}
+            ]
+        }),
+    ));
+    let final_response = ModelTurnResponse::completed(
+        "model_request_turn_1_5",
+        "response_invalid_verification_5",
+        "done",
+    );
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit,
+                plan,
+                invalid_command,
+                valid_command,
+                completed_plan,
+                final_response,
+            ],
+            seen_requests,
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new(
+            "thread_invalid_verification",
+            "turn_1",
+            "change and verify the fixture",
+        )
+        .with_max_turns(6),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert!(result.verification.passed);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+    assert_eq!(
+        result.tool_results[2].error_code.as_deref(),
+        Some("invalid_tool_arguments")
+    );
+    assert_eq!(
+        result.tool_results[2]
+            .audit_metadata()
+            .expect("invalid command audit")["executor_started"],
+        false
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(fixture_name)).expect("read fixture"),
+        "after"
+    );
+}
+
+#[test]
 fn agent_loop_validates_patch_arguments_before_policy() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "content").expect("write file");
