@@ -8403,12 +8403,24 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                 && message.content.contains("required_verification_action")
                 && message.content.contains(&command)
                 && message.content.contains("\"timeout_seconds\":10")
+                && message.content.contains("\"command_tool_input\"")
+                && message.content.contains("\"enforced_policy_context\"")
+                && message
+                    .content
+                    .contains("\"submit_only_command_tool_input\":true")
                 && message
                     .content
                     .contains("\"sandbox_mode\":\"workspace_write\"")
                 && message.content.contains("\"network_access\":\"denied\"")
                 && message.content.contains(&expected_scope_digest)
                 && message.content.contains("different repair strategy")
+        })
+    }));
+    assert!(!requests.iter().any(|request| {
+        request.messages.iter().any(|message| {
+            message
+                .content
+                .contains("\"required_verification_action\":{\"command\":")
         })
     }));
     let serialized = serde_json::to_string(&result).expect("serialize repair context result");

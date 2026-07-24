@@ -1620,14 +1620,20 @@ impl AgentLoopState {
             .required_verification_entry(failure)
             .map(|entry| {
                 json!({
-                    // The exact command is part of the trusted verification contract. Truncating
-                    // it would create a different scope and send the next repair cycle back into
-                    // the same mismatch. Its own schema already bounds it to 8,000 characters.
-                    "command": entry.action.command,
-                    "cwd": bounded_repair_text(&entry.action.cwd),
-                    "timeout_seconds": entry.action.timeout_seconds,
-                    "sandbox_mode": entry.action.sandbox_mode,
-                    "network_access": entry.action.network_access,
+                    // Keep executable tool input separate from policy facts. The command schema
+                    // accepts only the former; copying enforced sandbox/network fields into the
+                    // tool call creates an invalid request instead of a verification attempt.
+                    "command_tool_input": {
+                        // The exact command must not be truncated because that changes its scope.
+                        "command": entry.action.command,
+                        "cwd": bounded_repair_text(&entry.action.cwd),
+                        "timeout_seconds": entry.action.timeout_seconds,
+                    },
+                    "enforced_policy_context": {
+                        "sandbox_mode": entry.action.sandbox_mode,
+                        "network_access": entry.action.network_access,
+                    },
+                    "submit_only_command_tool_input": true,
                     "command_scope_digest": command_script_scope_digest_with_policy(
                         &entry.action.command,
                         &entry.action.cwd,
