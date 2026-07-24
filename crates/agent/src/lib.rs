@@ -125,7 +125,7 @@ const MAX_REPAIR_CONTEXT_ACTIONS: usize = 8;
 const MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS: usize = 8_000;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
-const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, execute its command_tool_input exactly as the next action; when additional_verification_actions are present, submit their exact command_tool_input calls in listed order in the same response if the tool contract permits multiple calls. Do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. Only when an exact command fails should you choose a materially different repair strategy that addresses its evidence. Do not repeat the previous patch or claim success without new verification evidence.";
+const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, submit only its command_tool_input exactly as the next action. additional_verification_actions are the ordered future actions, not permission to batch exclusive command calls; wait for each ToolResult before submitting the next action. Do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. Only when an exact command executes and fails should you choose a materially different repair strategy that addresses its evidence. Do not repeat the previous patch or claim success without new verification evidence.";
 const REVIEW_REPAIR_SIGNATURE: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000017";
 const PLAN_COMPLETION_REQUIRED: &str = "Do not finalize yet. Complete every plan step, then call update_plan with all steps marked completed before providing the final answer.";
@@ -1469,14 +1469,10 @@ impl AgentLoopState {
         failed_tool_name: Option<&str>,
     ) -> Result<AgentRepairPlan, AgentRepairPlan> {
         let signature = signature.into();
-        // Bind the current changed revision so the verification cycle that proves this repair
-        // decision is revision-bound, while the attempt is still consumed only by its terminal
-        // verification command.
-        let required_revision = self
-            .last_repair_failure
-            .is_none()
-            .then_some(self.completion.workspace_revision)
-            .flatten();
+        // A prospective repair decision does not own the already-failing revision. Only a later
+        // mutation can bind the decision to a revision and make its verification cycle consume
+        // one repair attempt.
+        let required_revision = None;
         let required_check_count = self.completion.summary().required_command_count;
         if let Some(active) = self.repair_plan.as_mut() {
             if self.repair_attempts >= MAX_REPAIR_PLAN_ATTEMPTS
@@ -1723,6 +1719,35 @@ impl AgentLoopState {
         entries
     }
 
+    /// Return the exact command input that owns the next repair turn, when execution has not yet
+    /// produced failure evidence requiring a different strategy.
+    fn required_repair_command_input(&self) -> Option<Value> {
+        let repair = self.repair_plan.as_ref()?;
+        let exact_action_required = match repair.plan.reason {
+            AgentRepairReason::VerificationFailed => {
+                repair.plan.required_revision.is_some()
+                    || self
+                        .tool_result_occurrences
+                        .iter()
+                        .rev()
+                        .find(|occurrence| occurrence.result().tool_name == TOOL_COMMAND)
+                        .is_none_or(|occurrence| {
+                            occurrence.result().workspace_observation().is_none()
+                        })
+            }
+            AgentRepairReason::ToolFailure => {
+                repair.failed_tool_name.as_deref() == Some(TOOL_COMMAND)
+            }
+            AgentRepairReason::RevisionConflict | AgentRepairReason::FinalReviewRejected => false,
+        };
+        if !exact_action_required {
+            return None;
+        }
+        self.unmet_verification_entries(None)
+            .first()
+            .map(|(entry, _, _)| repair_command_tool_input(entry))
+    }
+
     fn previous_repair_symbol(&self, path: &str) -> Option<String> {
         self.tool_result_occurrences
             .iter()
@@ -1893,10 +1918,17 @@ impl AgentLoopState {
                     None => tool_result.tool_name != UPDATE_PLAN_TOOL,
                 }
             });
-            if tool_failure_resolved {
+            let verification_gap_resolved = tool_result.tool_name == TOOL_COMMAND
+                && self.completion.verification_satisfied()
+                && self.repair_plan.as_ref().is_some_and(|plan| {
+                    plan.plan.reason == AgentRepairReason::VerificationFailed
+                        && plan.plan.required_revision.is_none()
+                });
+            if tool_failure_resolved || verification_gap_resolved {
                 // Input, policy and execution failures require a successful call to the same
                 // tool. A visibility failure names no executable tool, so a successful visible
-                // replacement resolves it; bookkeeping alone never does.
+                // replacement resolves it. A missing verification action also resolves without
+                // consuming a mutation-bound attempt once its exact evidence is observed.
                 self.repair_plan = None;
             }
             self.last_repair_failure = None;
@@ -2393,7 +2425,20 @@ where
                 ModelToolView::finalization()
             } else {
                 match model_tool_view(&self.tool_broker, capabilities, max_tool_calls) {
-                    Ok(tool_view) => tool_view,
+                    Ok(mut tool_view) => {
+                        if let Some(command_input) = state.required_repair_command_input()
+                            && let Err(error) = tool_view.restrict_command_input(&command_input)
+                        {
+                            return state.finish(
+                                AgentStatus::Failed,
+                                false,
+                                None,
+                                turn_index,
+                                Some(error),
+                            );
+                        }
+                        tool_view
+                    }
                     Err(error) => {
                         if emit_prompt_assembly_finished(
                             &mut on_event,
@@ -4060,6 +4105,28 @@ where
                 rejection: Some(invalid_tool_arguments_result(
                     execution_call,
                     ToolInputValidationError::new(validation_code),
+                    self.tool_broker.get(&execution_call.tool_name),
+                )),
+            };
+        }
+        if execution_call.tool_name == TOOL_COMMAND
+            && let Some(required_input) = state.required_repair_command_input()
+            && execution_call.arguments != required_input
+        {
+            if !invalid_was_observed {
+                state.recovery_metrics.invalid_tool_call_count = state
+                    .recovery_metrics
+                    .invalid_tool_call_count
+                    .saturating_add(1);
+            }
+            return PreparedToolCall {
+                call: execution_call.clone(),
+                fingerprint: fingerprint.to_string(),
+                bound: None,
+                decision: None,
+                rejection: Some(invalid_tool_arguments_result(
+                    execution_call,
+                    ToolInputValidationError::new("repair_action_mismatch"),
                     self.tool_broker.get(&execution_call.tool_name),
                 )),
             };
@@ -6407,12 +6474,7 @@ fn repair_verification_action(
     remaining_success_count: u32,
 ) -> Value {
     json!({
-        "command_tool_input": {
-            // The exact command must not be truncated because that changes its scope.
-            "command": entry.action.command,
-            "cwd": bounded_repair_text(&entry.action.cwd),
-            "timeout_seconds": entry.action.timeout_seconds,
-        },
+        "command_tool_input": repair_command_tool_input(entry),
         "enforced_policy_context": {
             "sandbox_mode": entry.action.sandbox_mode,
             "network_access": entry.action.network_access,
@@ -6429,6 +6491,15 @@ fn repair_verification_action(
         ),
         "required_success_count": required_success_count,
         "remaining_success_count": remaining_success_count,
+    })
+}
+
+fn repair_command_tool_input(entry: &AgentVerificationEntry) -> Value {
+    json!({
+        // The exact command must not be truncated because that changes its scope.
+        "command": entry.action.command,
+        "cwd": bounded_repair_text(&entry.action.cwd),
+        "timeout_seconds": entry.action.timeout_seconds,
     })
 }
 

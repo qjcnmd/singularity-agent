@@ -8255,6 +8255,137 @@ fn final_review_repair_requires_mutation_replan_and_second_review() {
 }
 
 #[test]
+fn missing_verification_repair_constrains_the_next_command_to_the_exact_action() {
+    let workspace = tempfile::tempdir().expect("exact repair action workspace");
+    let fixture_name = "exact_repair.txt";
+    std::fs::write(workspace.path().join(fixture_name), "before")
+        .expect("write exact repair fixture");
+    let command = test_command_script("success");
+
+    let mut edit =
+        ModelTurnResponse::completed("model_request_turn_exact_repair_0", "response_exact_0", "");
+    edit.tool_calls.push(tool_call(
+        "edit_exact",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut plan =
+        ModelTurnResponse::completed("model_request_turn_exact_repair_1", "response_exact_1", "");
+    plan.tool_calls.push(tool_call(
+        "plan_exact",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "verify the exact repair fixture", "status": "completed"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "changed exact_repair.txt",
+                "affected_path": fixture_name,
+                "affected_symbol": "exact_repair::value",
+                "current_gap": "the exact command has not run",
+                "action": {
+                    "command": command,
+                    "cwd": ".",
+                    "timeout_seconds": 10,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    let premature = ModelTurnResponse::completed(
+        "model_request_turn_exact_repair_2",
+        "response_exact_2",
+        "not verified",
+    );
+    let mut mismatched =
+        ModelTurnResponse::completed("model_request_turn_exact_repair_3", "response_exact_3", "");
+    mismatched.tool_calls.push(tool_call(
+        "command_mismatch",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let mut exact =
+        ModelTurnResponse::completed("model_request_turn_exact_repair_4", "response_exact_4", "");
+    exact.tool_calls.push(tool_call(
+        "command_exact",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 10}),
+    ));
+    let final_response = ModelTurnResponse::completed(
+        "model_request_turn_exact_repair_5",
+        "response_exact_5",
+        "completed",
+    );
+
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![edit, plan, premature, mismatched, exact, final_response],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind exact repair workspace")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new(
+            "thread_exact_repair",
+            "turn_exact_repair",
+            "change and verify the fixture",
+        )
+        .with_max_turns(6),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+    assert_eq!(result.recovery_metrics.invalid_tool_call_count, 1);
+    let run_status = result.to_run_status();
+    assert!(run_status.audit_events.iter().any(|event| {
+        event["argument_validation_code"] == "repair_action_mismatch"
+            && event["executor_started"] == false
+    }));
+    let requests = seen_requests.lock().expect("exact repair requests");
+    for request in [&requests[3], &requests[4]] {
+        let command_schema = &request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "command")
+            .expect("constrained command tool")
+            .parameters_schema;
+        assert_eq!(
+            command_schema["properties"]["command"]["const"],
+            serde_json::json!(command)
+        );
+        assert_eq!(
+            command_schema["properties"]["cwd"]["const"],
+            serde_json::json!(".")
+        );
+        assert_eq!(
+            command_schema["properties"]["timeout_seconds"]["const"],
+            serde_json::json!(10)
+        );
+    }
+}
+
+#[test]
 fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
     let workspace = tempfile::tempdir().expect("repair context workspace");
     let fixture_name = "repair_context.txt";
@@ -8469,13 +8600,13 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                 && message.content.contains("\"remaining_success_count\":1")
                 && message
                     .content
-                    .contains("execute its command_tool_input exactly as the next action")
+                    .contains("submit only its command_tool_input exactly as the next action")
                 && message
                     .content
-                    .contains("same response if the tool contract permits multiple calls")
+                    .contains("ordered future actions, not permission to batch exclusive command calls")
                 && message
                     .content
-                    .contains("Only when an exact command fails should you choose a materially different repair strategy")
+                    .contains("Only when an exact command executes and fails should you choose a materially different repair strategy")
         })
     }));
     let repair_message = requests
