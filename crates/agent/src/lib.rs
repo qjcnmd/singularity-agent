@@ -6189,6 +6189,16 @@ fn safe_verification_entry_summary(entry: &AgentVerificationEntry) -> Value {
         "affected_path": entry.affected_path,
         "affected_symbol": entry.affected_symbol.chars().take(MAX_VERIFICATION_TEXT_CHARS).collect::<String>(),
         "required": entry.required,
+        "action": {
+            // The action is already bounded and validated as the model-declared verification
+            // contract. Echo it so the next model turn can reproduce the exact scope instead of
+            // guessing from the digest.
+            "command": entry.action.command,
+            "cwd": entry.action.cwd,
+            "timeout_seconds": entry.action.timeout_seconds,
+            "sandbox_mode": entry.action.sandbox_mode,
+            "network_access": entry.action.network_access,
+        },
         "action_scope_digest": command_script_scope_digest_with_policy(
             &entry.action.command,
             &entry.action.cwd,

@@ -8201,6 +8201,19 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
 
     assert_eq!(result.status, AgentStatus::Blocked, "result={result:?}");
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+    let plan_result = result
+        .tool_results
+        .iter()
+        .find(|tool_result| tool_result.tool_name == "update_plan")
+        .expect("verification plan result");
+    let plan_payload = plan_result.to_message_payload();
+    let verification = &plan_payload["content"]["verification"][0];
+    assert_eq!(verification["action"]["command"], command);
+    assert_eq!(verification["action"]["cwd"], ".");
+    assert_eq!(verification["action"]["timeout_seconds"], 10);
+    assert_eq!(verification["action"]["sandbox_mode"], "workspace_write");
+    assert_eq!(verification["action"]["network_access"], "denied");
+    assert_eq!(verification["action_scope_digest"], expected_scope_digest);
     let pending = pending_approval(&result);
     let checkpoint = pending
         .encode_checkpoint()
