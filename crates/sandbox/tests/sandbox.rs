@@ -802,11 +802,11 @@ mod linux_tests {
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
-    static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+    const ISOLATED_ENVIRONMENT_TEST: &str = "SINGULARITY_SANDBOX_ISOLATED_ENVIRONMENT_TEST";
 
     fn path_str(path: &Path) -> &str {
         path.to_str().expect("utf8 path")
@@ -853,10 +853,22 @@ mod linux_tests {
         previous: Option<OsString>,
     }
 
-    fn lock_environment() -> MutexGuard<'static, ()> {
-        ENVIRONMENT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn run_environment_test_in_subprocess(test_name: &str) -> bool {
+        if std::env::var_os(ISOLATED_ENVIRONMENT_TEST).is_some() {
+            return false;
+        }
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(ISOLATED_ENVIRONMENT_TEST, "1")
+            .output()
+            .expect("isolated environment test process");
+        assert!(
+            output.status.success(),
+            "isolated environment test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
     }
 
     impl EnvironmentGuard {
@@ -944,6 +956,45 @@ time.sleep(30)
     }
 
     #[test]
+    fn linux_parallel_copied_executables_complete_independently() {
+        const COMMANDS: usize = 16;
+        let barrier = Arc::new(Barrier::new(COMMANDS));
+        let workers = (0..COMMANDS)
+            .map(|index| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let workspace = tempfile::tempdir().expect("workspace");
+                    let runtime = tempfile::tempdir().expect("runtime");
+                    let executable = runtime.path().join("python");
+                    let backend = strict_backend();
+                    // Overlap copies with sibling clone calls so inherited write FDs surface.
+                    barrier.wait();
+                    fs::copy("/usr/bin/python3", &executable).expect("copy Python");
+                    make_executable(&executable);
+                    backend.execute(&request(
+                        &format!("linux_parallel_{index}"),
+                        &[path_str(&executable), "-c", "pass"],
+                        workspace.path(),
+                        SandboxFilesystemMode::ReadOnly,
+                        SandboxNetworkMode::Denied,
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            let result = worker.join().expect("parallel sandbox worker");
+            assert_eq!(
+                result.execution_status,
+                CommandExecutionStatus::Completed,
+                "{}",
+                result.stderr_preview
+            );
+            assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        }
+    }
+
+    #[test]
     fn linux_strict_mode_requires_pid_namespace_capability() {
         let mut probe = probe_linux_capabilities();
         probe.pid_namespace = false;
@@ -1020,7 +1071,11 @@ time.sleep(30)
 
     #[test]
     fn linux_env_shebang_resolves_nonstandard_interpreter_from_path() {
-        let _environment = lock_environment();
+        if run_environment_test_in_subprocess(
+            "linux_tests::linux_env_shebang_resolves_nonstandard_interpreter_from_path",
+        ) {
+            return;
+        }
         let workspace = tempfile::tempdir().expect("workspace");
         let interpreter_home = tempfile::tempdir().expect("interpreter home");
         let interpreter_bin = interpreter_home.path().join("bin");
@@ -1057,7 +1112,11 @@ time.sleep(30)
 
     #[test]
     fn linux_rustup_proxy_runs_real_cargo_toolchain() {
-        let _environment = lock_environment();
+        if run_environment_test_in_subprocess(
+            "linux_tests::linux_rustup_proxy_runs_real_cargo_toolchain",
+        ) {
+            return;
+        }
         let workspace = tempfile::tempdir().expect("workspace");
         let _target_dir = EnvironmentGuard::remove("CARGO_TARGET_DIR");
         fs::create_dir(workspace.path().join("src")).expect("src");
@@ -1085,7 +1144,11 @@ time.sleep(30)
         use std::os::unix::fs::symlink;
         use std::path::PathBuf;
 
-        let _environment = lock_environment();
+        if run_environment_test_in_subprocess(
+            "linux_tests::linux_rustup_proxy_honors_custom_toolchain_homes",
+        ) {
+            return;
+        }
         let workspace = tempfile::tempdir().expect("workspace");
         let toolchain_layout = tempfile::tempdir().expect("toolchain layout");
         let cargo_home = toolchain_layout.path().join("cargo-home");
@@ -1377,7 +1440,11 @@ time.sleep(30)
 
     #[test]
     fn linux_workspace_transaction_rejects_tmpdir_resolving_inside_workspace() {
-        let _environment = lock_environment();
+        if run_environment_test_in_subprocess(
+            "linux_tests::linux_workspace_transaction_rejects_tmpdir_resolving_inside_workspace",
+        ) {
+            return;
+        }
         let workspace = tempfile::tempdir().expect("workspace");
         let transaction_root = workspace.path().join("transaction-temp");
         fs::create_dir(&transaction_root).expect("transaction temp");
@@ -1582,7 +1649,11 @@ time.sleep(30)
 
     #[test]
     fn linux_overlay_filesystem_failure_is_a_typed_capability_blocker() {
-        let _environment = lock_environment();
+        if run_environment_test_in_subprocess(
+            "linux_tests::linux_overlay_filesystem_failure_is_a_typed_capability_blocker",
+        ) {
+            return;
+        }
         let workspace = tempfile::tempdir().expect("workspace");
         let _temporary_root = EnvironmentGuard::set("TMPDIR", "/proc");
         let result = strict_backend().execute(&request(
@@ -1895,7 +1966,11 @@ time.sleep(30)
 
     #[test]
     fn linux_child_inherits_secret_isolation_and_kernel_restrictions() {
-        let _environment = lock_environment();
+        if run_environment_test_in_subprocess(
+            "linux_tests::linux_child_inherits_secret_isolation_and_kernel_restrictions",
+        ) {
+            return;
+        }
         let python = Path::new("/usr/bin/python3");
         assert!(python.is_file(), "WSL test requires /usr/bin/python3");
         assert!(

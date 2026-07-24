@@ -387,7 +387,7 @@ pub fn probe_linux_capabilities() -> LinuxSandboxProbe {
             mount_namespace: probe_child(unshare_mount_namespace),
             network_namespace: probe_child(unshare_network_namespace),
             no_new_privs: probe_child(probe_no_new_privs),
-            seccomp: probe_child(probe_seccomp),
+            seccomp: probe_seccomp(),
             landlock_abi: probe_landlock_abi(),
             process_tree_cleanup: probe_child(probe_process_group),
             cgroup_v2: Path::new("/sys/fs/cgroup/cgroup.controllers").is_file(),
@@ -431,10 +431,18 @@ fn probe_no_new_privs() -> bool {
 }
 
 fn probe_seccomp() -> bool {
-    if !probe_no_new_privs() {
+    let filter = prepare_seccomp_filter(false);
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        let success = probe_no_new_privs() && install_seccomp_filter(&filter).is_ok();
+        unsafe { libc::_exit(i32::from(!success)) };
+    }
+    if pid < 0 {
         return false;
     }
-    install_seccomp_filter(false).is_ok()
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
 fn probe_process_group() -> bool {
@@ -1677,18 +1685,50 @@ struct ChildContext {
     status_write: RawFd,
     stdout_write: RawFd,
     stderr_write: RawFd,
-    parent_fds: Vec<RawFd>,
-    workspace: PathBuf,
-    cwd: PathBuf,
-    executable: PathBuf,
-    argv: Vec<CString>,
-    env: Vec<CString>,
-    filesystem: SandboxFilesystemMode,
-    network: SandboxNetworkMode,
-    protected_paths: Vec<ProtectedPath>,
-    runtime_read_paths: Vec<PathBuf>,
-    overlay_upper: Option<PathBuf>,
-    overlay_work: Option<PathBuf>,
+    fd_table_ready_write: RawFd,
+    preserved_fds: [RawFd; 5],
+    fd_fallback_limit: RawFd,
+    filesystem_operations: Vec<ChildFilesystemOperation>,
+    landlock_rules: Vec<LandlockRule>,
+    seccomp_filter: Vec<SockFilter>,
+    cwd: CString,
+    executable: CString,
+    _argv: Vec<CString>,
+    argv_pointers: Vec<*const libc::c_char>,
+    _env: Vec<CString>,
+    env_pointers: Vec<*const libc::c_char>,
+}
+
+struct LandlockRule {
+    path: CString,
+    allowed_access: u64,
+}
+
+enum ChildFilesystemOperation {
+    Mount {
+        source: Option<CString>,
+        target: CString,
+        filesystem: Option<CString>,
+        flags: libc::c_ulong,
+        data: Option<CString>,
+        error: u8,
+    },
+    CreateDirectory {
+        path: CString,
+        mode: libc::mode_t,
+        allow_existing: bool,
+        error: u8,
+    },
+    CreateFile {
+        path: CString,
+        mode: libc::mode_t,
+        error: u8,
+    },
+    SetMode {
+        path: CString,
+        mode: libc::mode_t,
+        error: u8,
+    },
 }
 
 fn run_prepared_command(
@@ -1697,14 +1737,49 @@ fn run_prepared_command(
     cancellation: &CancellationToken,
 ) -> CommandResult {
     let started = Instant::now();
-    let overlay_upper = prepared
-        .transaction
-        .as_ref()
-        .map(|transaction| transaction.upper.clone());
-    let overlay_work = prepared
-        .transaction
-        .as_ref()
-        .map(|transaction| transaction.work.clone());
+    let argv = match prepared
+        .argv
+        .iter()
+        .map(|value| CString::new(value.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(argv) => argv,
+        Err(_) => {
+            return LinuxSandboxError::PolicyDenied(SANDBOX_POLICY_DENIED).into_result(command_id);
+        }
+    };
+    let env = match prepared
+        .env
+        .iter()
+        .map(|(key, value)| CString::new(format!("{key}={value}")))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(env) => env,
+        Err(_) => {
+            return LinuxSandboxError::PolicyDenied(SANDBOX_POLICY_DENIED).into_result(command_id);
+        }
+    };
+    let filesystem_operations = match prepare_child_filesystem(&prepared) {
+        Ok(operations) => operations,
+        Err(error) => return error.into_result(command_id),
+    };
+    let landlock_rules = match prepare_landlock_rules(&prepared) {
+        Ok(rules) => rules,
+        Err(error) => return error.into_result(command_id),
+    };
+    let seccomp_filter = prepare_seccomp_filter(prepared.network == SandboxNetworkMode::Denied);
+    let cwd = match path_cstring(&prepared.cwd) {
+        Ok(cwd) => cwd,
+        Err(()) => return LinuxSandboxError::Unavailable.into_result(command_id),
+    };
+    let executable = match path_cstring(&prepared.executable) {
+        Ok(executable) => executable,
+        Err(()) => return LinuxSandboxError::Unavailable.into_result(command_id),
+    };
+    let mut argv_pointers = argv.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+    argv_pointers.push(ptr::null());
+    let mut env_pointers = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
+    env_pointers.push(ptr::null());
     let Some((stdout_read, stdout_write)) = pipe_cloexec() else {
         return LinuxSandboxError::Unavailable.into_result(command_id);
     };
@@ -1733,70 +1808,47 @@ fn run_prepared_command(
         }
         return LinuxSandboxError::Unavailable.into_result(command_id);
     };
-
-    let argv = match prepared
-        .argv
-        .iter()
-        .map(|value| CString::new(value.as_bytes()))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(argv) => argv,
-        Err(_) => {
-            for fd in [
-                stdout_read,
-                stdout_write,
-                stderr_read,
-                stderr_write,
-                status_read,
-                status_write,
-                ready_read,
-                ready_write,
-            ] {
-                close_fd(fd);
-            }
-            return LinuxSandboxError::PolicyDenied(SANDBOX_POLICY_DENIED).into_result(command_id);
+    let Some((fd_table_ready_read, fd_table_ready_write)) = pipe_cloexec() else {
+        for fd in [
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+            status_read,
+            status_write,
+            ready_read,
+            ready_write,
+        ] {
+            close_fd(fd);
         }
+        return LinuxSandboxError::Unavailable.into_result(command_id);
     };
-    let env = match prepared
-        .env
-        .iter()
-        .map(|(key, value)| CString::new(format!("{key}={value}")))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(env) => env,
-        Err(_) => {
-            for fd in [
-                stdout_read,
-                stdout_write,
-                stderr_read,
-                stderr_write,
-                status_read,
-                status_write,
-                ready_read,
-                ready_write,
-            ] {
-                close_fd(fd);
-            }
-            return LinuxSandboxError::PolicyDenied(SANDBOX_POLICY_DENIED).into_result(command_id);
-        }
-    };
+    let mut preserved_fds = [
+        ready_read,
+        status_write,
+        stdout_write,
+        stderr_write,
+        fd_table_ready_write,
+    ];
+    preserved_fds.sort_unstable();
+    let fd_fallback_limit = open_file_limit();
     let context = Box::new(ChildContext {
         ready_read,
         status_write,
         stdout_write,
         stderr_write,
-        parent_fds: vec![stdout_read, stderr_read, status_read, ready_write],
-        workspace: prepared.workspace.clone(),
-        cwd: prepared.cwd.clone(),
-        executable: prepared.executable.clone(),
-        argv,
-        env,
-        filesystem: prepared.filesystem.clone(),
-        network: prepared.network.clone(),
-        protected_paths: prepared.protected_paths.clone(),
-        runtime_read_paths: prepared.runtime_read_paths.clone(),
-        overlay_upper,
-        overlay_work,
+        fd_table_ready_write,
+        preserved_fds,
+        fd_fallback_limit,
+        filesystem_operations,
+        landlock_rules,
+        seccomp_filter,
+        cwd,
+        executable,
+        _argv: argv,
+        argv_pointers,
+        _env: env,
+        env_pointers,
     });
     let mut context = context;
     let mut stack = vec![0u8; 1024 * 1024];
@@ -1804,6 +1856,7 @@ fn run_prepared_command(
     let flags = libc::CLONE_NEWUSER
         | libc::CLONE_NEWNS
         | libc::CLONE_NEWPID
+        | libc::CLONE_FILES
         | if prepared.network == SandboxNetworkMode::Denied {
             libc::CLONE_NEWNET
         } else {
@@ -1828,12 +1881,57 @@ fn run_prepared_command(
             status_write,
             ready_read,
             ready_write,
+            fd_table_ready_read,
+            fd_table_ready_write,
         ] {
             close_fd(fd);
         }
         return LinuxSandboxError::Unavailable.into_result(command_id);
     }
-    for fd in [stdout_write, stderr_write, status_write, ready_read] {
+    let fd_table_ready = wait_for_fd_table_ready(
+        child,
+        fd_table_ready_read,
+        started,
+        prepared.timeout,
+        cancellation,
+    );
+    if fd_table_ready != FdTableReady::Ready {
+        for fd in [
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+            status_read,
+            status_write,
+            ready_read,
+            ready_write,
+            fd_table_ready_read,
+            fd_table_ready_write,
+        ] {
+            close_fd(fd);
+        }
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        return match fd_table_ready {
+            FdTableReady::Cancelled => CommandResult::cancelled(command_id, duration_ms)
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Strict),
+            FdTableReady::TimedOut => CommandResult::timed_out(command_id, duration_ms)
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Strict),
+            FdTableReady::Exited | FdTableReady::Failed => {
+                LinuxSandboxError::Unavailable.into_result(command_id)
+            }
+            FdTableReady::Ready => unreachable!(),
+        };
+    }
+    for fd in [
+        stdout_write,
+        stderr_write,
+        status_write,
+        ready_read,
+        fd_table_ready_read,
+        fd_table_ready_write,
+    ] {
         close_fd(fd);
     }
     unsafe {
@@ -3814,6 +3912,69 @@ fn interrupted_result(
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FdTableReady {
+    Ready,
+    Exited,
+    Cancelled,
+    TimedOut,
+    Failed,
+}
+
+fn wait_for_fd_table_ready(
+    pid: libc::pid_t,
+    fd: RawFd,
+    started: Instant,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> FdTableReady {
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            return FdTableReady::Exited;
+        }
+        if waited < 0 && unsafe { *libc::__errno_location() } != libc::EINTR {
+            return FdTableReady::Failed;
+        }
+        if cancellation.is_cancelled() {
+            kill_process_group(pid);
+            wait_for_exit(pid);
+            return FdTableReady::Cancelled;
+        }
+        if started.elapsed() >= timeout {
+            kill_process_group(pid);
+            wait_for_exit(pid);
+            return FdTableReady::TimedOut;
+        }
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut poll_fd, 1, 10) };
+        if polled < 0 {
+            if unsafe { *libc::__errno_location() } == libc::EINTR {
+                continue;
+            }
+            kill_process_group(pid);
+            wait_for_exit(pid);
+            return FdTableReady::Failed;
+        }
+        if polled == 0 || poll_fd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+        let mut value = [0u8; 1];
+        let read = unsafe { libc::read(fd, value.as_mut_ptr().cast(), value.len()) };
+        if read == 1 && value[0] == 1 {
+            return FdTableReady::Ready;
+        }
+        kill_process_group(pid);
+        wait_for_exit(pid);
+        return FdTableReady::Failed;
+    }
+}
+
 fn wait_for_child(
     pid: libc::pid_t,
     timeout: Duration,
@@ -3906,34 +4067,51 @@ fn write_user_namespace_maps(pid: libc::pid_t) -> Result<(), ()> {
 }
 
 extern "C" fn child_main(argument: *mut libc::c_void) -> libc::c_int {
-    let result = std::panic::catch_unwind(|| unsafe { child_main_inner(&mut *(argument.cast())) });
-    match result {
-        Ok(Ok(())) => 126,
-        Ok(Err(kind)) => {
-            let context = unsafe { &mut *(argument.cast::<ChildContext>()) };
-            child_fail(context.status_write, kind);
-            126
+    let context = unsafe { &mut *(argument.cast::<ChildContext>()) };
+    if unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_FILES) } != 0 {
+        let failed = [0u8; 1];
+        unsafe {
+            libc::write(
+                context.fd_table_ready_write,
+                failed.as_ptr().cast(),
+                failed.len(),
+            );
         }
-        Err(_) => {
-            let context = unsafe { &mut *(argument.cast::<ChildContext>()) };
-            child_fail(context.status_write, CHILD_SETUP_UNAVAILABLE);
-            126
-        }
+        return 126;
     }
+    // Unshare first so closing a sibling invocation's inherited FD cannot affect the host.
+    close_all_extra_fds_except(&context.preserved_fds, context.fd_fallback_limit);
+    let ready = [1u8; 1];
+    if unsafe {
+        libc::write(
+            context.fd_table_ready_write,
+            ready.as_ptr().cast(),
+            ready.len(),
+        )
+    } != 1
+    {
+        return 126;
+    }
+    close_fd(context.fd_table_ready_write);
+    let failure = unsafe { child_main_inner(context) };
+    if failure != 0 {
+        child_fail(context.status_write, failure);
+    }
+    126
 }
 
-unsafe fn child_main_inner(context: &mut ChildContext) -> Result<(), u8> {
-    for fd in context.parent_fds.iter().copied() {
-        close_fd(fd);
-    }
+// After cloning a multithreaded host, this path must not allocate, acquire process-wide locks,
+// or call glibc setxid wrappers. The parent precomputes dynamic data; the child only issues raw
+// syscalls and traverses immutable memory until execve or fixed-size failure reporting.
+unsafe fn child_main_inner(context: &ChildContext) -> u8 {
     if !wait_for_namespace_map(context.ready_read) {
-        return Err(CHILD_SETUP_CAPABILITY);
+        return CHILD_SETUP_CAPABILITY;
     }
     close_fd(context.ready_read);
     if unsafe { libc::dup2(context.stdout_write, libc::STDOUT_FILENO) } < 0
         || unsafe { libc::dup2(context.stderr_write, libc::STDERR_FILENO) } < 0
     {
-        return Err(CHILD_SETUP_UNAVAILABLE);
+        return CHILD_SETUP_UNAVAILABLE;
     }
     if context.stdout_write != libc::STDOUT_FILENO {
         close_fd(context.stdout_write);
@@ -3942,72 +4120,174 @@ unsafe fn child_main_inner(context: &mut ChildContext) -> Result<(), u8> {
         close_fd(context.stderr_write);
     }
     if unsafe { libc::setpgid(0, 0) } != 0 {
-        return Err(CHILD_SETUP_UNAVAILABLE);
+        return CHILD_SETUP_UNAVAILABLE;
     }
-    if unsafe { libc::setresgid(0, 0, 0) } != 0 || unsafe { libc::setresuid(0, 0, 0) } != 0 {
-        return Err(CHILD_SETUP_CAPABILITY);
-    }
-    mount_private_root().map_err(|_| CHILD_SETUP_CAPABILITY)?;
-    mount_proc().map_err(|_| CHILD_SETUP_CAPABILITY)?;
-    mount_private_tmp_and_dev().map_err(|_| CHILD_SETUP_CAPABILITY)?;
-    if context.filesystem == SandboxFilesystemMode::WorkspaceWrite {
-        mount_workspace_overlay(context).map_err(|_| CHILD_SETUP_OVERLAY_FILESYSTEM)?;
-    }
-    mount_protected_paths(&context.protected_paths).map_err(|_| CHILD_SETUP_CAPABILITY)?;
-    if context.filesystem == SandboxFilesystemMode::ReadOnly {
-        mount_readonly_workspace(&context.workspace).map_err(|_| CHILD_SETUP_CAPABILITY)?;
-    }
-    fs::create_dir_all(SANDBOX_HOME).map_err(|_| CHILD_SETUP_UNAVAILABLE)?;
-    if unsafe {
-        libc::chdir(
-            path_cstring(&context.cwd)
-                .map_err(|_| CHILD_SETUP_UNAVAILABLE)?
-                .as_ptr(),
-        )
-    } != 0
+    if unsafe { libc::syscall(libc::SYS_setresgid, 0, 0, 0) } != 0
+        || unsafe { libc::syscall(libc::SYS_setresuid, 0, 0, 0) } != 0
     {
-        return Err(CHILD_SETUP_UNAVAILABLE);
+        return CHILD_SETUP_CAPABILITY;
     }
-    drop_linux_capabilities().map_err(|_| CHILD_SETUP_CAPABILITY)?;
-    install_landlock(context).map_err(|_| CHILD_SETUP_CAPABILITY)?;
-    install_seccomp_filter(context.network == SandboxNetworkMode::Denied)
-        .map_err(|_| CHILD_SETUP_CAPABILITY)?;
-    close_all_extra_fds();
-    let mut argv = context
-        .argv
-        .iter()
-        .map(|value| value.as_ptr())
-        .collect::<Vec<_>>();
-    argv.push(ptr::null());
-    let mut env = context
-        .env
-        .iter()
-        .map(|value| value.as_ptr())
-        .collect::<Vec<_>>();
-    env.push(ptr::null());
-    let executable = path_cstring(&context.executable).map_err(|_| CHILD_SETUP_UNAVAILABLE)?;
+    for operation in &context.filesystem_operations {
+        if let Err(error) = execute_child_filesystem_operation(operation) {
+            return error;
+        }
+    }
+    if unsafe { libc::chdir(context.cwd.as_ptr()) } != 0 {
+        return CHILD_SETUP_UNAVAILABLE;
+    }
+    if drop_linux_capabilities().is_err()
+        || install_landlock(&context.landlock_rules).is_err()
+        || install_seccomp_filter(&context.seccomp_filter).is_err()
+    {
+        return CHILD_SETUP_CAPABILITY;
+    }
+    close_all_extra_fds(context.fd_fallback_limit);
     unsafe {
-        libc::execve(executable.as_ptr(), argv.as_ptr(), env.as_ptr());
+        libc::execve(
+            context.executable.as_ptr(),
+            context.argv_pointers.as_ptr(),
+            context.env_pointers.as_ptr(),
+        );
     }
-    Err(CHILD_SETUP_UNAVAILABLE)
+    CHILD_SETUP_UNAVAILABLE
 }
 
-fn mount_workspace_overlay(context: &ChildContext) -> Result<(), ()> {
-    let upper = context.overlay_upper.as_deref().ok_or(())?;
-    let work = context.overlay_work.as_deref().ok_or(())?;
-    let options = format!(
-        "lowerdir={},upperdir={},workdir={},userxattr",
-        overlay_option_path(&context.workspace)?,
-        overlay_option_path(upper)?,
-        overlay_option_path(work)?,
-    );
-    mount(
-        Some("overlay"),
-        &context.workspace,
-        Some("overlay"),
-        libc::MS_NOSUID | libc::MS_NODEV,
-        Some(&options),
-    )
+fn prepare_child_filesystem(
+    prepared: &PreparedCommand,
+) -> Result<Vec<ChildFilesystemOperation>, LinuxSandboxError> {
+    let mut operations = vec![mount_operation(
+        None,
+        Path::new("/"),
+        None,
+        libc::MS_REC | libc::MS_PRIVATE,
+        None,
+        CHILD_SETUP_CAPABILITY,
+    )?];
+    operations.push(mount_operation(
+        Some("proc"),
+        Path::new("/proc"),
+        Some("proc"),
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        None,
+        CHILD_SETUP_CAPABILITY,
+    )?);
+    for (target, data, flags) in [
+        (
+            "/run",
+            "size=64m,mode=1777",
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        ),
+        ("/dev", "size=4m,mode=755", libc::MS_NOSUID | libc::MS_NODEV),
+    ] {
+        operations.push(mount_operation(
+            Some("tmpfs"),
+            Path::new(target),
+            Some("tmpfs"),
+            flags,
+            Some(data),
+            CHILD_SETUP_CAPABILITY,
+        )?);
+    }
+    for path in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"] {
+        operations.push(ChildFilesystemOperation::CreateFile {
+            path: CString::new(path).map_err(|_| LinuxSandboxError::Unavailable)?,
+            mode: 0o666,
+            error: CHILD_SETUP_CAPABILITY,
+        });
+    }
+    if prepared.filesystem == SandboxFilesystemMode::WorkspaceWrite {
+        let overlay_error =
+            || LinuxSandboxError::CapabilityNotSupported(LinuxCapability::OverlayFilesystem);
+        let transaction = prepared.transaction.as_ref().ok_or({
+            LinuxSandboxError::CapabilityNotSupported(LinuxCapability::OverlayFilesystem)
+        })?;
+        let options = format!(
+            "lowerdir={},upperdir={},workdir={},userxattr",
+            overlay_option_path(&prepared.workspace).map_err(|_| overlay_error())?,
+            overlay_option_path(&transaction.upper).map_err(|_| overlay_error())?,
+            overlay_option_path(&transaction.work).map_err(|_| overlay_error())?,
+        );
+        operations.push(
+            mount_operation(
+                Some("overlay"),
+                &prepared.workspace,
+                Some("overlay"),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                Some(&options),
+                CHILD_SETUP_OVERLAY_FILESYSTEM,
+            )
+            .map_err(|_| overlay_error())?,
+        );
+    }
+    for (index, protected) in prepared.protected_paths.iter().enumerate() {
+        let placeholder = CString::new(format!(
+            "/run/.protected-{}-{index}",
+            if protected.is_dir { "dir" } else { "file" }
+        ))
+        .map_err(|_| LinuxSandboxError::Unavailable)?;
+        if protected.is_dir {
+            operations.push(ChildFilesystemOperation::CreateDirectory {
+                path: placeholder.clone(),
+                mode: 0o700,
+                allow_existing: false,
+                error: CHILD_SETUP_CAPABILITY,
+            });
+        } else {
+            operations.push(ChildFilesystemOperation::CreateFile {
+                path: placeholder.clone(),
+                mode: 0o600,
+                error: CHILD_SETUP_CAPABILITY,
+            });
+        }
+        operations.push(ChildFilesystemOperation::SetMode {
+            path: placeholder.clone(),
+            mode: 0,
+            error: CHILD_SETUP_CAPABILITY,
+        });
+        operations.push(mount_operation_cstring_source(
+            Some(placeholder),
+            &protected.path,
+            None,
+            libc::MS_BIND | if protected.is_dir { libc::MS_REC } else { 0 },
+            None,
+            CHILD_SETUP_CAPABILITY,
+        )?);
+        operations.push(mount_operation(
+            None,
+            &protected.path,
+            None,
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            None,
+            CHILD_SETUP_CAPABILITY,
+        )?);
+    }
+    if prepared.filesystem == SandboxFilesystemMode::ReadOnly {
+        let source =
+            path_cstring(&prepared.workspace).map_err(|_| LinuxSandboxError::Unavailable)?;
+        operations.push(mount_operation_cstring_source(
+            Some(source),
+            &prepared.workspace,
+            None,
+            libc::MS_BIND | libc::MS_REC,
+            None,
+            CHILD_SETUP_CAPABILITY,
+        )?);
+        operations.push(mount_operation(
+            None,
+            &prepared.workspace,
+            None,
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
+            None,
+            CHILD_SETUP_CAPABILITY,
+        )?);
+    }
+    operations.push(ChildFilesystemOperation::CreateDirectory {
+        path: CString::new(SANDBOX_HOME).map_err(|_| LinuxSandboxError::Unavailable)?,
+        mode: 0o700,
+        allow_existing: true,
+        error: CHILD_SETUP_UNAVAILABLE,
+    });
+    Ok(operations)
 }
 
 fn overlay_option_path(path: &Path) -> Result<String, ()> {
@@ -4039,131 +4319,6 @@ fn path_cstring(path: &Path) -> Result<CString, ()> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| ())
 }
 
-fn mount_private_root() -> Result<(), ()> {
-    mount(
-        None,
-        Path::new("/"),
-        None,
-        libc::MS_REC | libc::MS_PRIVATE,
-        None,
-    )
-}
-
-fn mount_proc() -> Result<(), ()> {
-    mount(
-        Some("proc"),
-        Path::new("/proc"),
-        Some("proc"),
-        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-        None,
-    )
-}
-
-fn mount_private_tmp_and_dev() -> Result<(), ()> {
-    mount(
-        Some("tmpfs"),
-        Path::new("/run"),
-        Some("tmpfs"),
-        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-        Some("size=64m,mode=1777"),
-    )?;
-    mount(
-        Some("tmpfs"),
-        Path::new("/dev"),
-        Some("tmpfs"),
-        libc::MS_NOSUID | libc::MS_NODEV,
-        Some("size=4m,mode=755"),
-    )?;
-    for name in ["null", "zero", "random", "urandom"] {
-        let path = Path::new("/dev").join(name);
-        OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)
-            .map_err(|_| ())?;
-    }
-    Ok(())
-}
-
-fn mount_protected_paths(paths: &[ProtectedPath]) -> Result<(), ()> {
-    for (index, protected) in paths.iter().enumerate() {
-        let placeholder = if protected.is_dir {
-            let path = Path::new("/run").join(format!(".protected-dir-{index}"));
-            fs::create_dir(&path).map_err(|_| ())?;
-            path
-        } else {
-            let path = Path::new("/run").join(format!(".protected-file-{index}"));
-            OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&path)
-                .map_err(|_| ())?;
-            path
-        };
-        fs::set_permissions(&placeholder, fs::Permissions::from_mode(0o000)).map_err(|_| ())?;
-        mount(
-            Some(placeholder.to_string_lossy().as_ref()),
-            &protected.path,
-            None,
-            libc::MS_BIND | if protected.is_dir { libc::MS_REC } else { 0 },
-            None,
-        )?;
-        mount(
-            None,
-            &protected.path,
-            None,
-            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-            None,
-        )?;
-    }
-    Ok(())
-}
-
-fn mount_readonly_workspace(workspace: &Path) -> Result<(), ()> {
-    mount(
-        Some(workspace.to_string_lossy().as_ref()),
-        workspace,
-        None,
-        libc::MS_BIND | libc::MS_REC,
-        None,
-    )?;
-    mount(
-        None,
-        workspace,
-        None,
-        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
-        None,
-    )
-}
-
-fn mount(
-    source: Option<&str>,
-    target: &Path,
-    filesystem: Option<&str>,
-    flags: libc::c_ulong,
-    data: Option<&str>,
-) -> Result<(), ()> {
-    let source = source.map(CString::new).transpose().map_err(|_| ())?;
-    let target = path_cstring(target)?;
-    let filesystem = filesystem.map(CString::new).transpose().map_err(|_| ())?;
-    let data = data.map(CString::new).transpose().map_err(|_| ())?;
-    let result = unsafe {
-        libc::mount(
-            source.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
-            target.as_ptr(),
-            filesystem
-                .as_ref()
-                .map_or(ptr::null(), |value| value.as_ptr()),
-            flags,
-            data.as_ref()
-                .map_or(ptr::null_mut(), |value| value.as_ptr().cast_mut().cast()),
-        )
-    };
-    (result == 0).then_some(()).ok_or(())
-}
-
 fn drop_linux_capabilities() -> Result<(), ()> {
     let mut header = CapabilityHeader {
         version: LINUX_CAPABILITY_VERSION_3,
@@ -4185,7 +4340,60 @@ fn drop_linux_capabilities() -> Result<(), ()> {
     (result == 0).then_some(()).ok_or(())
 }
 
-fn install_landlock(context: &ChildContext) -> Result<(), ()> {
+fn prepare_landlock_rules(
+    prepared: &PreparedCommand,
+) -> Result<Vec<LandlockRule>, LinuxSandboxError> {
+    let workspace_access = match prepared.filesystem {
+        SandboxFilesystemMode::ReadOnly => LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_EXECUTE,
+        SandboxFilesystemMode::WorkspaceWrite => {
+            LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE
+        }
+    };
+    let runtime_read = LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_EXECUTE;
+    let mut rules = vec![LandlockRule {
+        path: path_cstring(&prepared.workspace).map_err(|_| LinuxSandboxError::Unavailable)?,
+        allowed_access: workspace_access,
+    }];
+    for root in [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/share/nodejs",
+        "/proc",
+    ] {
+        if Path::new(root).is_dir() {
+            rules.push(LandlockRule {
+                path: CString::new(root).map_err(|_| LinuxSandboxError::Unavailable)?,
+                allowed_access: runtime_read,
+            });
+        }
+    }
+    for path in &prepared.runtime_read_paths {
+        rules.push(LandlockRule {
+            path: path_cstring(path).map_err(|_| LinuxSandboxError::Unavailable)?,
+            allowed_access: runtime_read_access(path).ok_or(
+                LinuxSandboxError::CapabilityNotSupported(LinuxCapability::Landlock),
+            )?,
+        });
+    }
+    for root in ["/run", "/dev"] {
+        if Path::new(root).is_dir() {
+            rules.push(LandlockRule {
+                path: CString::new(root).map_err(|_| LinuxSandboxError::Unavailable)?,
+                allowed_access: LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_WRITE,
+            });
+        }
+    }
+    Ok(rules)
+}
+
+fn install_landlock(rules: &[LandlockRule]) -> Result<(), ()> {
     let attributes = LandlockRulesetAttr {
         handled_access_fs: LANDLOCK_ACCESS_FS_ALL,
     };
@@ -4202,85 +4410,41 @@ fn install_landlock(context: &ChildContext) -> Result<(), ()> {
         return Err(());
     }
     let ruleset = ruleset as RawFd;
-    let workspace_access = match context.filesystem {
-        SandboxFilesystemMode::ReadOnly => LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_EXECUTE,
-        SandboxFilesystemMode::WorkspaceWrite => {
-            LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE
+    for rule in rules {
+        let fd = unsafe { libc::open(rule.path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            close_fd(ruleset);
+            return Err(());
         }
-    };
-    let runtime_read = LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_EXECUTE;
-    add_landlock_rule(ruleset, &context.workspace, workspace_access)?;
-    for root in [
-        "/bin",
-        "/sbin",
-        "/usr/bin",
-        "/usr/sbin",
-        "/usr/local/bin",
-        "/lib",
-        "/lib64",
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/share/nodejs",
-        "/proc",
-    ] {
-        let root = Path::new(root);
-        if root.is_dir() {
-            add_landlock_rule(ruleset, root, runtime_read)?;
+        let attributes = LandlockPathBeneathAttr {
+            allowed_access: rule.allowed_access,
+            parent_fd: fd,
+        };
+        let added = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_ADD_RULE,
+                ruleset,
+                LANDLOCK_RULE_TYPE_PATH_BENEATH,
+                &attributes,
+                0usize,
+            )
+        };
+        close_fd(fd);
+        if added != 0 {
+            close_fd(ruleset);
+            return Err(());
         }
     }
-    for path in &context.runtime_read_paths {
-        let access = runtime_read_access(path).ok_or(())?;
-        add_landlock_rule(ruleset, path, access)?;
-    }
-    if Path::new("/run").is_dir() {
-        add_landlock_rule(
-            ruleset,
-            Path::new("/run"),
-            LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_WRITE,
-        )?;
-    }
-    if Path::new("/dev").is_dir() {
-        add_landlock_rule(
-            ruleset,
-            Path::new("/dev"),
-            LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_WRITE,
-        )?;
-    }
-    unsafe {
-        libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        close_fd(ruleset);
+        return Err(());
     }
     let restricted = unsafe { libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0usize) };
     close_fd(ruleset);
     (restricted == 0).then_some(()).ok_or(())
 }
 
-fn add_landlock_rule(ruleset: RawFd, path: &Path, allowed_access: u64) -> Result<(), ()> {
-    let path = path_cstring(path)?;
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(());
-    }
-    let rule = LandlockPathBeneathAttr {
-        allowed_access,
-        parent_fd: fd,
-    };
-    let result = unsafe {
-        libc::syscall(
-            SYS_LANDLOCK_ADD_RULE,
-            ruleset,
-            LANDLOCK_RULE_TYPE_PATH_BENEATH,
-            &rule,
-            0usize,
-        )
-    };
-    close_fd(fd);
-    (result == 0).then_some(()).ok_or(())
-}
-
-fn install_seccomp_filter(network_denied: bool) -> Result<(), ()> {
-    if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(());
-    }
+fn prepare_seccomp_filter(network_denied: bool) -> Vec<SockFilter> {
     let mut filter = vec![
         SockFilter {
             code: BPF_LD_W_ABS,
@@ -4374,6 +4538,13 @@ fn install_seccomp_filter(network_denied: bool) -> Result<(), ()> {
         jf: 0,
         k: SECCOMP_RET_ALLOW,
     });
+    filter
+}
+
+fn install_seccomp_filter(filter: &[SockFilter]) -> Result<(), ()> {
+    if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(());
+    }
     let program = SockFprog {
         len: filter.len().try_into().map_err(|_| ())?,
         filter: filter.as_ptr(),
@@ -4402,21 +4573,168 @@ const fn audit_arch() -> u32 {
     }
 }
 
-fn close_all_extra_fds() {
-    let closed = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
-    if closed == 0 {
+fn open_file_limit() -> RawFd {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 65_536;
+    }
+    limit.rlim_cur.min(RawFd::MAX as libc::rlim_t) as RawFd
+}
+
+fn close_all_extra_fds(limit: RawFd) {
+    close_all_extra_fds_except(&[], limit);
+}
+
+fn mount_operation(
+    source: Option<&str>,
+    target: &Path,
+    filesystem: Option<&str>,
+    flags: libc::c_ulong,
+    data: Option<&str>,
+    error: u8,
+) -> Result<ChildFilesystemOperation, LinuxSandboxError> {
+    let source = source
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| LinuxSandboxError::Unavailable)?;
+    mount_operation_cstring_source(source, target, filesystem, flags, data, error)
+}
+
+fn mount_operation_cstring_source(
+    source: Option<CString>,
+    target: &Path,
+    filesystem: Option<&str>,
+    flags: libc::c_ulong,
+    data: Option<&str>,
+    error: u8,
+) -> Result<ChildFilesystemOperation, LinuxSandboxError> {
+    Ok(ChildFilesystemOperation::Mount {
+        source,
+        target: path_cstring(target).map_err(|_| LinuxSandboxError::Unavailable)?,
+        filesystem: filesystem
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| LinuxSandboxError::Unavailable)?,
+        flags,
+        data: data
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| LinuxSandboxError::Unavailable)?,
+        error,
+    })
+}
+
+fn execute_child_filesystem_operation(operation: &ChildFilesystemOperation) -> Result<(), u8> {
+    match operation {
+        ChildFilesystemOperation::Mount {
+            source,
+            target,
+            filesystem,
+            flags,
+            data,
+            error,
+        } => {
+            let result = unsafe {
+                libc::mount(
+                    source.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
+                    target.as_ptr(),
+                    filesystem
+                        .as_ref()
+                        .map_or(ptr::null(), |value| value.as_ptr()),
+                    *flags,
+                    data.as_ref()
+                        .map_or(ptr::null_mut(), |value| value.as_ptr().cast_mut().cast()),
+                )
+            };
+            (result == 0).then_some(()).ok_or(*error)
+        }
+        ChildFilesystemOperation::CreateDirectory {
+            path,
+            mode,
+            allow_existing,
+            error,
+        } => {
+            let result = unsafe { libc::mkdir(path.as_ptr(), *mode) };
+            if result == 0
+                || *allow_existing && unsafe { *libc::__errno_location() } == libc::EEXIST
+            {
+                Ok(())
+            } else {
+                Err(*error)
+            }
+        }
+        ChildFilesystemOperation::CreateFile { path, mode, error } => {
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY | libc::O_CLOEXEC,
+                    *mode,
+                )
+            };
+            if fd < 0 {
+                Err(*error)
+            } else {
+                close_fd(fd);
+                Ok(())
+            }
+        }
+        ChildFilesystemOperation::SetMode { path, mode, error } => {
+            (unsafe { libc::chmod(path.as_ptr(), *mode) } == 0)
+                .then_some(())
+                .ok_or(*error)
+        }
+    }
+}
+
+fn close_all_extra_fds_except(preserved: &[RawFd], limit: RawFd) {
+    let mut first = 3u32;
+    let mut close_range_supported = true;
+    for fd in preserved.iter().copied().filter(|fd| *fd >= 3) {
+        let fd = fd as u32;
+        if first < fd && unsafe { libc::syscall(libc::SYS_close_range, first, fd - 1, 0u32) } != 0 {
+            close_range_supported = false;
+            break;
+        }
+        first = fd.saturating_add(1);
+    }
+    if close_range_supported
+        && unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, 0u32) } == 0
+    {
         return;
     }
-    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    let limit = if limit > 0 { limit as RawFd } else { 65_536 };
     for fd in 3..limit {
-        close_fd(fd);
+        if !preserved.contains(&fd) {
+            close_fd(fd);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fd_table_ready_wait_observes_child_exit_while_parent_holds_writer() {
+        let (read_fd, write_fd) = pipe_cloexec().expect("fd table ready pipe");
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let result = wait_for_fd_table_ready(
+            child,
+            read_fd,
+            Instant::now(),
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        );
+        close_fd(read_fd);
+        close_fd(write_fd);
+        assert_eq!(result, FdTableReady::Exited);
+    }
 
     #[test]
     fn filesystem_fact_uses_the_longest_mountpoint_for_workspace() {
