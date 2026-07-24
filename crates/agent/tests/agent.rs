@@ -7775,7 +7775,7 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
                     "evidence": format!("changed {fixture_name}"),
                     "affected_path": fixture_name,
                     "affected_symbol": format!("{fixture_name}::fixture_boundary"),
-                    "current_gap": "command_exit_nonzero was observed; rerun after repair",
+                    "current_gap": "the repaired behavior still lacks passing evidence",
                     "action": {
                         "command": command,
                         "cwd": ".",

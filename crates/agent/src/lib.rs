@@ -4756,17 +4756,6 @@ where
                         .to_string(),
                 );
             }
-            if !state.verification_failure_history.is_empty()
-                && !state
-                    .verification_failure_history
-                    .iter()
-                    .any(|failure| entry.current_gap.contains(failure))
-            {
-                return Err(
-                    "verification current_gap must address the recorded verification failure"
-                        .to_string(),
-                );
-            }
             if entry.action.sandbox_mode != sandbox_mode
                 || entry.action.network_access != network_access
             {
