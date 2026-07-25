@@ -279,7 +279,7 @@ const MAX_REPAIR_CONTEXT_ACTION_COMMAND_CHARS: usize = 8_000;
 const MAX_COMPACTION_PLAN_STEP_CHARS: usize = 160;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
 const REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS: &str = "The required verification action was not submitted exactly. Do not choose a different action or vary its arguments; submit only repair_context.required_verification_action.command_tool_input exactly as provided.";
-const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, submit only its command_tool_input exactly as the next action. additional_verification_actions are the ordered future actions, not permission to batch exclusive command calls; wait for each ToolResult before submitting the next action. Do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. Only when an exact command executes and fails should you choose a materially different repair strategy that addresses its evidence. Do not repeat the previous patch or claim success without new verification evidence.";
+const REPAIR_PLAN_INSTRUCTIONS: &str = "Follow the bounded repair plan. When repair_context.required_verification_action is present, submit only its command_tool_input exactly as the next action. additional_verification_actions are the ordered future actions, not permission to batch exclusive command calls; wait for each ToolResult before submitting the next action. Do not change the installed plan or workspace first, because a semantically equivalent command does not satisfy the exact revision-bound requirement. When repair_context.repair_strategy_change_required is true, treat it as a separate trusted strategy-change boundary: make a materially different workspace mutation that addresses failed_requirement before replanning and verification, and do not repeat the previous patch or final answer. Only when an exact command executes and fails should you choose a materially different repair strategy that addresses its evidence. Do not claim success without new verification evidence.";
 const PENDING_EXACT_VERIFICATION_INSTRUCTION_PREFIX: &str =
     "Trusted exact verification remains pending.";
 const REVIEW_REPAIR_SIGNATURE: &str =
@@ -1756,6 +1756,10 @@ impl AgentLoopState {
         failure: Option<&ToolResult>,
     ) -> Value {
         let summary = self.completion.summary();
+        let requires_strategy_change = matches!(
+            reason,
+            AgentRepairReason::RevisionConflict | AgentRepairReason::FinalReviewRejected
+        );
         // A later diagnostic command is useful transcript evidence, but it must not replace the
         // exact failed verification that made a strategy change legal for this revision.
         let evidence_result = failure
@@ -1766,9 +1770,13 @@ impl AgentLoopState {
                     .flatten()
             })
             .or_else(|| {
-                self.tool_result_occurrences
-                    .last()
-                    .map(|occurrence| occurrence.result())
+                (!requires_strategy_change)
+                    .then(|| {
+                        self.tool_result_occurrences
+                            .last()
+                            .map(|occurrence| occurrence.result())
+                    })
+                    .flatten()
             });
         let matching_entry = evidence_result
             .and_then(tool_result_command_scope_digest)
@@ -1781,8 +1789,10 @@ impl AgentLoopState {
                         .and_then(|index| plan.plan.entries.get(index))
                 })
             });
-        let failed_requirement = matching_entry
-            .map(|entry| entry.current_gap.clone())
+        let failed_requirement = requires_strategy_change
+            .then(|| self.last_completion_error.clone())
+            .flatten()
+            .or_else(|| matching_entry.map(|entry| entry.current_gap.clone()))
             .or_else(|| summary.unresolved_failures.first().cloned())
             .or_else(|| self.last_completion_error.clone())
             .unwrap_or_else(|| repair_reason_text(reason).to_string());
@@ -1807,8 +1817,14 @@ impl AgentLoopState {
                 })
             })
             .unwrap_or_else(|| ("unavailable".to_string(), "unavailable".to_string()));
-        let previous_result = evidence_result
-            .map(|result| json!(safe_tool_result_evidence(result)))
+        let previous_result = requires_strategy_change
+            .then(|| {
+                self.last_completion_error
+                    .as_deref()
+                    .map(|error| json!(bounded_repair_text(error)))
+            })
+            .flatten()
+            .or_else(|| evidence_result.map(|result| json!(safe_tool_result_evidence(result))))
             .or_else(|| {
                 self.tool_result_occurrences
                     .last()
@@ -1884,13 +1900,18 @@ impl AgentLoopState {
             + additional_verification_actions.len();
         let verification_actions_truncated =
             require_exact_action && remaining_verification_action_count > projected_action_count;
-        let repair_strategy_change_required =
-            !require_exact_action && remaining_verification_action_count > 0;
+        let repair_strategy_change_required = requires_strategy_change
+            || !require_exact_action && remaining_verification_action_count > 0;
         json!({
             "failed_requirement": bounded_repair_text(&failed_requirement),
             "evidence": evidence_result
                 .map(safe_tool_result_evidence)
-                .unwrap_or_else(|| bounded_repair_text(&previous_result.to_string())),
+                .unwrap_or_else(|| {
+                    previous_result
+                        .as_str()
+                        .map(bounded_repair_text)
+                        .unwrap_or_else(|| bounded_repair_text(&previous_result.to_string()))
+                }),
             "affected_path": bounded_repair_text(&affected_path),
             "affected_symbol": bounded_repair_text(&affected_symbol),
             "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),

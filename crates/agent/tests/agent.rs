@@ -8369,7 +8369,42 @@ fn final_review_repair_requires_mutation_replan_and_second_review() {
         std::fs::read_to_string(workspace.path().join(fixture_name)).unwrap(),
         original
     );
-    assert_eq!(seen_requests.lock().expect("seen review requests").len(), 8);
+    let requests = seen_requests.lock().expect("seen review requests");
+    assert_eq!(requests.len(), 8);
+    let repair_feedback = requests[4]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == ModelRole::Developer && message.content.contains("repair_context=")
+        })
+        .expect("final review repair context");
+    assert!(
+        repair_feedback
+            .content
+            .contains("\"repair_strategy_change_required\":true")
+    );
+    assert!(repair_feedback.content.contains(
+        "\"failed_requirement\":\"final review rejected: semantic contract remains incomplete\""
+    ));
+    assert!(repair_feedback.content.contains(
+        "\"previous_result\":\"final review rejected: semantic contract remains incomplete\""
+    ));
+    assert!(
+        repair_feedback
+            .content
+            .contains("\"affected_path\":\"review_contract.rs\"")
+    );
+    assert!(
+        repair_feedback
+            .content
+            .contains("\"affected_symbol\":\"review_contract.rs::value\"")
+    );
+    assert!(
+        !repair_feedback
+            .content
+            .contains("the value contract has not been reviewed")
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         AgentLoopEvent::Observation(AgentObservation::FinalReview(review))
