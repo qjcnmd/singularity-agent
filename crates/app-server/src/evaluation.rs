@@ -3123,6 +3123,35 @@ fn run_sandbox_preflight(
         }));
     }
     let mut report = sandbox_backend.preflight(&scratch, cancellation);
+    let trusted_git_required = plans.iter().any(|plan| {
+        matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. })
+            || plan.baseline.test_patch.is_some()
+            || plan.public.test_patch.is_some()
+            || plan.hidden.test_patch.is_some()
+    });
+    if report.outcome == SandboxPreflightOutcome::Supported && trusted_git_required {
+        let preparation = run_workspace_preparation_command(
+            &scratch,
+            &scratch,
+            vec![
+                "git".to_string(),
+                "init".to_string(),
+                "--quiet".to_string(),
+                SOURCE_DIR.to_string(),
+            ],
+            GIT_TIMEOUT_SECONDS,
+            SandboxNetworkMode::Denied,
+            Arc::clone(sandbox_backend),
+        );
+        if !command_succeeded(&preparation) {
+            report.outcome = SandboxPreflightOutcome::Unsupported;
+            report.error_code =
+                Some("sandbox_preflight_trusted_preparation_unverified".to_string());
+            report
+                .missing_capabilities
+                .push("trusted_workspace_preparation".to_string());
+        }
+    }
     if let Err(error) = fs::remove_dir_all(&scratch) {
         report.outcome = SandboxPreflightOutcome::Unsupported;
         report.error_code = Some("sandbox_preflight_scratch_cleanup".to_string());
@@ -4423,6 +4452,11 @@ mod tests {
                 .with_workspace_mutation(WorkspaceMutation::Unknown)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
+            if request.argv.get(1).map(String::as_str) == Some("init") {
+                return CommandResult::completed(&request.command_id, "prepared")
+                    .with_workspace_mutation(WorkspaceMutation::Changed)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
             if request.argv.get(1).map(String::as_str) == Some("clone") {
                 let source = Path::new(&request.cwd).join(SOURCE_DIR);
                 fs::create_dir(&source).expect("source directory");
@@ -4474,6 +4508,36 @@ mod tests {
             )
             .with_workspace_mutation(WorkspaceMutation::Unknown)
             .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    struct UnknownPreparationBackend {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl SandboxBackend for UnknownPreparationBackend {
+        fn name(&self) -> &'static str {
+            "unknown_preparation_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn preflight(
+            &self,
+            _workspace: &Path,
+            _cancellation: &CancellationToken,
+        ) -> SandboxPreflightReport {
+            supported_sandbox_preflight(self.name())
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            assert!(request.is_trusted_workspace_preparation());
+            CommandResult::completed(&request.command_id, "unverified")
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
 
@@ -4777,6 +4841,44 @@ mod tests {
         }
     }
 
+    fn write_preflight_manifest(
+        root: &Path,
+        task_id: &str,
+        description: &str,
+        trial_count: u32,
+        source: Value,
+    ) -> PathBuf {
+        let manifest_path = root.join(format!("{task_id}.json"));
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "evaluation.task_set/v5",
+                "trial_count": trial_count,
+                "tasks": [{
+                    "task_id": task_id,
+                    "description": description,
+                    "capabilities": ["repository_context"],
+                    "workspace": {"source": source},
+                    "agent": {
+                        "instructions": "inspect README.md",
+                        "allowed_paths": ["README.md"],
+                        "required_tool_capabilities": [
+                            {"capability": "workspace_read", "minimum_version": 1}
+                        ]
+                    },
+                    "evaluator": {
+                        "baseline": {"commands": [{"argv": ["verify-baseline"]}]},
+                        "public": {"commands": [{"argv": ["verify-public"]}]},
+                        "hidden": {"commands": [{"argv": ["verify-hidden"]}]}
+                    }
+                }]
+            }))
+            .expect("manifest JSON"),
+        )
+        .expect("manifest file");
+        manifest_path
+    }
+
     #[test]
     fn supported_preflight_reaches_agent_loop_and_calls_provider() {
         use std::io::{Read, Write};
@@ -4826,34 +4928,13 @@ mod tests {
         let output_root = temp.path().join("output");
         fs::create_dir(&fixture).expect("fixture");
         fs::write(fixture.join("README.md"), "seed").expect("fixture file");
-        let manifest_path = temp.path().join("manifest.json");
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&json!({
-                "schema_version": "evaluation.task_set/v5",
-                "trial_count": 1,
-                "tasks": [{
-                    "task_id": "preflight-supported",
-                    "description": "supported preflight reaches AgentLoop",
-                    "capabilities": ["repository_context"],
-                    "workspace": {"source": {"type": "local", "path": "fixture"}},
-                    "agent": {
-                        "instructions": "inspect README.md",
-                        "allowed_paths": ["README.md"],
-                        "required_tool_capabilities": [
-                            {"capability": "workspace_read", "minimum_version": 1}
-                        ]
-                    },
-                    "evaluator": {
-                        "baseline": {"commands": [{"argv": ["verify-baseline"]}]},
-                        "public": {"commands": [{"argv": ["verify-public"]}]},
-                        "hidden": {"commands": [{"argv": ["verify-hidden"]}]}
-                    }
-                }]
-            }))
-            .expect("manifest JSON"),
-        )
-        .expect("manifest file");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "preflight-supported",
+            "supported preflight reaches AgentLoop",
+            1,
+            json!({"type": "local", "path": "fixture"}),
+        );
         let params = EvalRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "preflight-supported-run".to_string(),
@@ -4894,10 +4975,13 @@ mod tests {
         assert_eq!(result.tasks[0].trials.len(), 1);
         let agent = &result.tasks[0].trials[0].stages.agent;
         assert_eq!(agent.status, StageStatus::Blocked);
-        assert!(agent.blocker.as_ref().is_some_and(|blocker| matches!(
-            blocker.kind,
-            BlockerKind::ProviderAuthentication | BlockerKind::ProviderResponse
-        )));
+        assert!(
+            agent.blocker.as_ref().is_some_and(|blocker| matches!(
+                blocker.kind,
+                BlockerKind::ProviderAuthentication | BlockerKind::ProviderResponse
+            )),
+            "agent={agent:?}"
+        );
         assert!(
             output_root
                 .join("preflight-supported-run")
@@ -4914,34 +4998,13 @@ mod tests {
         let output_root = temp.path().join("output");
         fs::create_dir(&fixture).expect("fixture");
         fs::write(fixture.join("README.md"), "seed").expect("fixture file");
-        let manifest_path = temp.path().join("manifest.json");
-        fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&json!({
-                "schema_version": "evaluation.task_set/v5",
-                "trial_count": 2,
-                "tasks": [{
-                    "task_id": "preflight-blocked",
-                    "description": "preflight must fail before sampling",
-                    "capabilities": ["repository_context"],
-                    "workspace": {"source": {"type": "local", "path": "fixture"}},
-                    "agent": {
-                        "instructions": "inspect",
-                        "allowed_paths": ["README.md"],
-                        "required_tool_capabilities": [
-                            {"capability": "workspace_read", "minimum_version": 1}
-                        ]
-                    },
-                    "evaluator": {
-                        "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
-                        "public": {"commands": [{"argv": ["cargo", "test"]}]},
-                        "hidden": {"commands": [{"argv": ["cargo", "check"]}]}
-                    }
-                }]
-            }))
-            .expect("manifest JSON"),
-        )
-        .expect("manifest file");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "preflight-blocked",
+            "preflight must fail before sampling",
+            2,
+            json!({"type": "local", "path": "fixture"}),
+        );
         let params = EvalRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "preflight-blocked-run".to_string(),
@@ -4984,6 +5047,73 @@ mod tests {
         let run_dir = output_root.join("preflight-blocked-run");
         assert!(!run_dir.join("preflight-blocked").exists());
         assert!(run_dir.join(PUBLICATION_DIR).is_dir());
+    }
+
+    #[test]
+    fn unverified_trusted_preparation_blocks_before_trials_or_provider() {
+        let temp = tempfile::tempdir().expect("temp");
+        let output_root = temp.path().join("output");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "preparation-blocked",
+            "trusted preparation must be verified before sampling",
+            2,
+            json!({
+                "type": "remote_git",
+                "repository": "https://example.invalid/preflight.git",
+                "commit": "0000000000000000000000000000000000000000"
+            }),
+        );
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "preparation-blocked-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let executions = Arc::new(AtomicUsize::new(0));
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+
+        let response = run_evaluation(
+            &params,
+            Arc::new(UnknownPreparationBackend {
+                executions: Arc::clone(&executions),
+            }),
+            &ProviderConfigSnapshot::capture(|_| None),
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("trusted preparation blocker publishes typed artifacts");
+
+        assert_eq!(response.status, "blocked");
+        assert!(response.tasks.is_empty());
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result path"))
+                .expect("result artifact"),
+        )
+        .expect("result v8");
+        assert!(result.tasks.is_empty());
+        assert_eq!(result.summary.configured_trial_count, 2);
+        assert_eq!(result.summary.sampled_trial_count, 0);
+        assert_eq!(result.summary.trial_count, 0);
+        assert_eq!(
+            result
+                .blocker
+                .as_ref()
+                .and_then(|blocker| blocker.code.as_deref()),
+            Some("sandbox_preflight_trusted_preparation_unverified")
+        );
+        assert_eq!(
+            result
+                .sandbox_preflight
+                .as_ref()
+                .map(|preflight| preflight.missing_capabilities.as_slice()),
+            Some(["trusted_workspace_preparation".to_string()].as_slice())
+        );
+        assert!(
+            !output_root
+                .join("preparation-blocked-run/preparation-blocked")
+                .exists()
+        );
     }
 
     #[test]
