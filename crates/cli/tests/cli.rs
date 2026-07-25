@@ -1957,11 +1957,13 @@ fn stderr(output: &std::process::Output) -> String {
 fn app_server_bin() -> String {
     std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
         ensure_app_server_binary();
-        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| workspace_root().join("target"));
-        target_dir
-            .join("debug")
+        let profile_dir = std::env::current_exe()
+            .expect("current test binary")
+            .parent()
+            .and_then(Path::parent)
+            .expect("Cargo test profile directory")
+            .to_path_buf();
+        profile_dir
             .join(format!(
                 "singularity_app_server{}",
                 std::env::consts::EXE_SUFFIX
