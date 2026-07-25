@@ -4881,7 +4881,7 @@ mod tests {
 
     #[test]
     fn supported_preflight_reaches_agent_loop_and_calls_provider() {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
         use std::thread;
         use std::time::{Duration, Instant};
@@ -4899,8 +4899,33 @@ mod tests {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .expect("provider read timeout");
-                        let mut request = [0u8; 8192];
-                        let _ = stream.read(&mut request);
+                        let mut reader = BufReader::new(
+                            stream.try_clone().expect("clone provider fixture stream"),
+                        );
+                        let mut request_line = String::new();
+                        reader
+                            .read_line(&mut request_line)
+                            .expect("provider request line");
+                        let mut content_length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            reader
+                                .read_line(&mut line)
+                                .expect("provider request header");
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            if let Some((name, value)) = line.split_once(':')
+                                && name.eq_ignore_ascii_case("content-length")
+                            {
+                                content_length =
+                                    value.trim().parse().expect("provider content length");
+                            }
+                        }
+                        let mut request_body = vec![0; content_length];
+                        reader
+                            .read_exact(&mut request_body)
+                            .expect("provider request body");
                         let body = br#"{"error":{"message":"fixture authentication rejected","type":"authentication_error"}}"#;
                         let response = format!(
                             "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

@@ -3380,16 +3380,23 @@ fn turn_checkpoint_commit_is_atomic_and_unknown_execution_blocks_resume() {
         .save_turn_checkpoint(&turn.turn_id, &thread.thread_id, &initial_checkpoint, 1)
         .expect("initial checkpoint");
     let execution_id = format!("turn:{}:tool:call_completed", turn.turn_id);
-    store
-        .begin_tool_execution(&ToolExecution {
-            execution_id: execution_id.clone(),
-            thread_id: thread.thread_id.clone(),
-            turn_id: turn.turn_id.clone(),
-            tool_call_id: "call_completed".to_string(),
-            state: ToolExecutionState::Running,
-            payload: serde_json::json!({"kind": "tool_call", "tool_name": "update_plan"}),
-        })
-        .expect("running execution");
+    let execution = ToolExecution {
+        execution_id: execution_id.clone(),
+        thread_id: thread.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        tool_call_id: "call_completed".to_string(),
+        state: ToolExecutionState::Running,
+        payload: serde_json::json!({"kind": "tool_call", "tool_name": "update_plan"}),
+    };
+    assert!(
+        store
+            .begin_tool_executions_at_checkpoint(
+                std::slice::from_ref(&execution),
+                &initial_checkpoint,
+                1,
+            )
+            .expect("running execution")
+    );
     let committed_checkpoint = serde_json::json!({
         "checkpoint_version": 1,
         "boundary": "tool_result_committed"
@@ -3457,16 +3464,23 @@ fn turn_checkpoint_commit_is_atomic_and_unknown_execution_blocks_resume() {
         )
         .expect("unknown checkpoint");
     let unknown_execution_id = format!("turn:{}:tool:call_unknown", unknown_turn.turn_id);
-    store
-        .begin_tool_execution(&ToolExecution {
-            execution_id: unknown_execution_id.clone(),
-            thread_id: thread.thread_id.clone(),
-            turn_id: unknown_turn.turn_id.clone(),
-            tool_call_id: "call_unknown".to_string(),
-            state: ToolExecutionState::Running,
-            payload: serde_json::json!({"kind": "tool_call", "tool_name": "edit"}),
-        })
-        .expect("unknown running execution");
+    let unknown_execution = ToolExecution {
+        execution_id: unknown_execution_id.clone(),
+        thread_id: thread.thread_id.clone(),
+        turn_id: unknown_turn.turn_id.clone(),
+        tool_call_id: "call_unknown".to_string(),
+        state: ToolExecutionState::Running,
+        payload: serde_json::json!({"kind": "tool_call", "tool_name": "edit"}),
+    };
+    assert!(
+        store
+            .begin_tool_executions_at_checkpoint(
+                std::slice::from_ref(&unknown_execution),
+                &initial_checkpoint,
+                1,
+            )
+            .expect("unknown running execution")
+    );
     drop(store);
 
     let reopened = SessionStore::open(&db_path).expect("reopen store");

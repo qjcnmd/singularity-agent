@@ -116,47 +116,6 @@ impl SessionStore {
             .map_err(StoreError::from)
     }
 
-    /// Register an execution before any external side effect starts.
-    pub fn begin_tool_execution(&self, execution: &ToolExecution) -> StoreResult<()> {
-        if execution.execution_id.trim().is_empty()
-            || execution.thread_id.trim().is_empty()
-            || execution.turn_id.trim().is_empty()
-            || execution.tool_call_id.trim().is_empty()
-            || execution.state != ToolExecutionState::Running
-            || !execution.payload.is_object()
-        {
-            return Err(StoreError::InvalidState(
-                "tool execution durable running record is invalid".to_string(),
-            ));
-        }
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let bound_thread: String = transaction
-            .query_row(
-                "select thread_id from turns where turn_id = ?1",
-                params![execution.turn_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    StoreError::NotFound(format!("turn {}", execution.turn_id))
-                }
-                other => StoreError::Sqlite(other),
-            })?;
-        if bound_thread != execution.thread_id {
-            return Err(StoreError::InvalidState(
-                "tool execution thread binding mismatch".to_string(),
-            ));
-        }
-        let payload = serde_json::to_string(&execution.payload)?;
-        transaction.execute(
-            "insert into tool_executions(execution_id, thread_id, turn_id, tool_call_id, execution_state, payload) values(?1, ?2, ?3, ?4, 'running', ?5)",
-            params![execution.execution_id, execution.thread_id, execution.turn_id, execution.tool_call_id, payload],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     /// Publish the pending-action checkpoint and claim every tool execution unless a steer or
     /// pause was already accepted at the same SQLite linearization point.
     pub fn begin_tool_executions_at_checkpoint(
