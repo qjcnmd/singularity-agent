@@ -39,6 +39,7 @@ pub fn is_toolchain_artifact_path(path: &str) -> bool {
         || path
             .split('/')
             .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        || path.split('/').any(|segment| segment.contains(':'))
     {
         return false;
     }
@@ -172,9 +173,8 @@ impl WorkspaceSnapshot {
             .collect::<Vec<_>>();
         let encoded = serde_json::to_vec(&(self.root.clone(), after.root.clone(), changed_entries))
             .map_err(|error| format!("workspace change summary encoding failed: {error}"))?;
-        let verification_relevant = !changed_files
-            .iter()
-            .all(|path| is_toolchain_artifact_path(path) && !self.entries.contains_key(path));
+        let verification_relevant =
+            workspace_change_is_verification_relevant(self, after, &changed_files);
         Ok(Some(
             WorkspaceChangeSummary::new(
                 changed_files,
@@ -200,6 +200,59 @@ impl WorkspaceSnapshot {
             )
             && protected_entries_match(&self.protected_entries, &after.protected_entries)
     }
+}
+
+fn workspace_change_is_verification_relevant(
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+    changed_files: &[String],
+) -> bool {
+    changed_files.iter().any(|path| {
+        if is_toolchain_artifact_path(path) {
+            return before.entries.contains_key(path);
+        }
+        !is_incidental_artifact_ancestor_change(before, after, changed_files, path)
+    })
+}
+
+fn is_incidental_artifact_ancestor_change(
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+    changed_files: &[String],
+    path: &str,
+) -> bool {
+    let (
+        Some(SnapshotEntry::Directory {
+            metadata: before_metadata,
+        }),
+        Some(SnapshotEntry::Directory {
+            metadata: after_metadata,
+        }),
+    ) = (before.entries.get(path), after.entries.get(path))
+    else {
+        return false;
+    };
+    if !directory_behavior_matches(before_metadata, after_metadata) {
+        return false;
+    }
+    let prefix = format!("{path}/");
+    let mut descendants = changed_files
+        .iter()
+        .filter(|changed| changed.starts_with(&prefix));
+    descendants.next().is_some()
+        && descendants.all(|changed| {
+            is_toolchain_artifact_path(changed) && !before.entries.contains_key(changed)
+        })
+}
+
+/// Compare directory identity and security behavior while allowing filesystem bookkeeping churn
+/// caused by the newly-created artifact descendants (length, timestamps and link count).
+fn directory_behavior_matches(before: &EntryMetadata, after: &EntryMetadata) -> bool {
+    before.object_kind == after.object_kind
+        && before.readonly == after.readonly
+        && before.platform_permissions == after.platform_permissions
+        && before.device == after.device
+        && before.inode == after.inode
 }
 
 #[cfg(unix)]
@@ -618,6 +671,7 @@ mod tests {
         assert!(!is_toolchain_artifact_path("/target/debug/app"));
         assert!(!is_toolchain_artifact_path("target//debug/app"));
         assert!(!is_toolchain_artifact_path("target/../src/lib.rs"));
+        assert!(!is_toolchain_artifact_path("C:/target/debug/app"));
     }
 
     #[test]
@@ -682,6 +736,67 @@ mod tests {
                 .expect("unknown change")
                 .verification_relevant
         );
+    }
+
+    #[test]
+    fn nested_new_artifact_under_existing_source_directory_is_incidental_when_safe() {
+        use cap_fs_ext::DirExt as _;
+        use cap_std::ambient_authority;
+        use cap_std::fs::Dir;
+        use std::time::{Duration, SystemTime};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        std::fs::create_dir(workspace.path().join("src/__pycache__")).expect("cache directory");
+        std::fs::write(workspace.path().join("src/__pycache__/x.pyc"), b"bytecode")
+            .expect("cache artifact");
+        let source_directory =
+            Dir::open_ambient_dir(workspace.path().join("src"), ambient_authority())
+                .expect("open source directory");
+        source_directory
+            .set_times(
+                ".",
+                None,
+                Some(cap_fs_ext::SystemTimeSpec::Absolute(
+                    cap_std::time::SystemTime::from_std(
+                        SystemTime::now() + Duration::from_secs(10),
+                    ),
+                )),
+            )
+            .expect("touch source directory");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+        let summary = before
+            .change_summary(&after)
+            .expect("summary")
+            .expect("nested artifact change");
+
+        assert!(summary.changed_files.iter().any(|path| path == "src"));
+        assert!(!summary.verification_relevant);
+    }
+
+    #[test]
+    fn source_directory_behavior_change_with_artifact_remains_relevant() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let source = workspace.path().join("src");
+        std::fs::create_dir(&source).expect("source directory");
+        let before_permissions = std::fs::metadata(&source)
+            .expect("source metadata")
+            .permissions();
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        std::fs::create_dir(source.join("__pycache__")).expect("cache directory");
+        std::fs::write(source.join("__pycache__/x.pyc"), b"bytecode").expect("cache artifact");
+        let mut changed_permissions = before_permissions.clone();
+        changed_permissions.set_readonly(!before_permissions.readonly());
+        std::fs::set_permissions(&source, changed_permissions).expect("change source permissions");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+        std::fs::set_permissions(&source, before_permissions).expect("restore source permissions");
+
+        let summary = before
+            .change_summary(&after)
+            .expect("summary")
+            .expect("source behavior change");
+        assert!(summary.verification_relevant);
     }
 
     #[test]

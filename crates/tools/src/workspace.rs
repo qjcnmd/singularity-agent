@@ -65,6 +65,24 @@ impl fmt::Display for WorkspaceToolError {
 
 impl std::error::Error for WorkspaceToolError {}
 
+fn artifact_summary_is_trusted(summary: &WorkspaceChangeSummary) -> bool {
+    if summary.changed_files.is_empty() || !is_sha256_digest(&summary.diff_digest) {
+        return false;
+    }
+    let mut paths = BTreeSet::new();
+    summary
+        .changed_files
+        .iter()
+        .all(|path| paths.insert(path) && is_toolchain_artifact_path(path))
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// 工作区 tool 接受的有界文件读取请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -858,15 +876,10 @@ impl WorkspaceTools {
             output.error_code = Some("sandbox_command_id_mismatch".to_string());
         }
         // A producer may mark a physical diff as verification-irrelevant only for a fully
-        // classified, newly-created toolchain artifact set. Missing or malformed summaries,
-        // and a false flag attached to an unknown path, remain verification-relevant.
+        // classified, newly-created toolchain artifact set with a bound digest. Missing or
+        // malformed summaries, and a false flag attached to an unknown path, remain relevant.
         let verification_relevant = workspace_change_summary.as_ref().is_none_or(|summary| {
-            summary.verification_relevant
-                || summary.changed_files.is_empty()
-                || !summary
-                    .changed_files
-                    .iter()
-                    .all(|path| is_toolchain_artifact_path(path))
+            summary.verification_relevant || !artifact_summary_is_trusted(summary)
         });
         let observation = match (&requested_filesystem, mutation, verification_relevant) {
             (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unchanged, _) => {

@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const VALID_TEST_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
 fn test_tool_spec(
     name: impl Into<String>,
     description: impl Into<String>,
@@ -2311,7 +2314,7 @@ fn workspace_mutation_summary_hashes_published_before_and_after_bytes() {
 fn workspace_change_summary_defaults_to_relevant_when_field_is_missing() {
     let summary: WorkspaceChangeSummary = serde_json::from_value(serde_json::json!({
         "changed_files": ["target/debug/app"],
-        "diff_digest": "sha256:artifact"
+        "diff_digest": VALID_TEST_DIGEST
     }))
     .expect("missing relevance field still deserializes fail-closed");
     assert!(summary.verification_relevant);
@@ -2833,159 +2836,106 @@ fn workspace_write_command_binds_backend_revision_observation_without_public_lea
 }
 
 #[test]
-fn workspace_write_artifact_summary_keeps_physical_event_but_not_revision() {
-    let workspace = test_workspace("command-artifact-summary");
-    let tools = WorkspaceTools::new(&workspace)
-        .expect("bind workspace tools")
-        .with_sandbox_backend(SummaryReportingBackend {
-            summary: WorkspaceChangeSummary {
-                changed_files: vec!["target/debug/app".to_string()],
-                diff_digest: "sha256:artifact".to_string(),
-                verification_relevant: false,
-            },
-        });
-    let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
-        "verify",
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    ))
-    .expect("command scope digest");
-
-    let execution = tools
-        .command_cancellable_with_policy_observed(
-            CommandToolInput {
-                command: "verify".to_string(),
-                cwd: None,
-                timeout_seconds: Some(5),
-            },
+fn workspace_write_summary_controls_revision_fail_closed() {
+    let cases = [
+        (
+            "artifact",
+            vec!["target/debug/app"],
+            VALID_TEST_DIGEST,
+            false,
+            0,
+        ),
+        (
+            "mixed",
+            vec!["src/lib.rs", "target/debug/app"],
+            VALID_TEST_DIGEST,
+            true,
+            1,
+        ),
+        (
+            "invalid_digest",
+            vec!["target/debug/app"],
+            "sha256:not-a-digest",
+            false,
+            1,
+        ),
+        (
+            "unknown_path",
+            vec!["generated/cache.bin"],
+            VALID_TEST_DIGEST,
+            false,
+            1,
+        ),
+    ];
+    for (name, changed_files, diff_digest, verification_relevant, revision) in cases {
+        let workspace = test_workspace(&format!("command-summary-{name}"));
+        let tools = WorkspaceTools::new(&workspace)
+            .expect("bind workspace tools")
+            .with_sandbox_backend(SummaryReportingBackend {
+                summary: WorkspaceChangeSummary {
+                    changed_files: changed_files
+                        .iter()
+                        .map(|path| (*path).to_string())
+                        .collect(),
+                    diff_digest: diff_digest.to_string(),
+                    verification_relevant,
+                },
+            });
+        let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
+            "verify",
+            ".",
+            5,
             SandboxFilesystemMode::WorkspaceWrite,
             SandboxNetworkMode::Denied,
-            &scope,
-            &CancellationToken::new(),
-        )
-        .expect("artifact-only command");
+        ))
+        .expect("command scope digest");
+        let execution = tools
+            .command_cancellable_with_policy_observed(
+                CommandToolInput {
+                    command: "verify".to_string(),
+                    cwd: None,
+                    timeout_seconds: Some(5),
+                },
+                SandboxFilesystemMode::WorkspaceWrite,
+                SandboxNetworkMode::Denied,
+                &scope,
+                &CancellationToken::new(),
+            )
+            .expect("summary command");
 
-    assert!(execution.output.ok);
-    assert_eq!(
-        execution.sandbox_execution.workspace_mutation,
-        WorkspaceMutation::Changed
-    );
-    assert_eq!(
-        execution.output.metadata["workspace_observation"],
-        serde_json::json!({"revision": 0, "mutation": "unchanged"})
-    );
-    assert_eq!(
-        execution.output.metadata["workspace_change_summary"]["changed_files"],
-        serde_json::json!(["target/debug/app"])
-    );
-    assert_eq!(
-        execution.output.metadata["workspace_change_summary"]["diff_digest"],
-        serde_json::json!("sha256:artifact")
-    );
-    assert_eq!(
-        execution.output.metadata["workspace_change_summary"]["verification_relevant"],
-        serde_json::json!(false)
-    );
-    remove_workspace(&workspace);
+        assert!(execution.output.ok);
+        assert_eq!(
+            execution.sandbox_execution.workspace_mutation,
+            WorkspaceMutation::Changed
+        );
+        assert_eq!(
+            execution.output.metadata["workspace_observation"],
+            serde_json::json!({
+                "revision": revision,
+                "mutation": if revision == 0 { "unchanged" } else { "changed" }
+            })
+        );
+        assert_eq!(
+            execution.output.metadata["workspace_change_summary"]["changed_files"],
+            serde_json::json!(changed_files)
+        );
+        assert_eq!(
+            execution.output.metadata["workspace_change_summary"]["diff_digest"],
+            serde_json::json!(diff_digest)
+        );
+        remove_workspace(&workspace);
+    }
 }
 
 #[test]
-fn workspace_write_mixed_cache_and_source_summary_advances_revision() {
-    let workspace = test_workspace("command-mixed-summary");
-    let tools = WorkspaceTools::new(&workspace)
-        .expect("bind workspace tools")
-        .with_sandbox_backend(SummaryReportingBackend {
-            summary: WorkspaceChangeSummary {
-                changed_files: vec!["src/lib.rs".to_string(), "target/debug/app".to_string()],
-                diff_digest: "sha256:mixed".to_string(),
-                verification_relevant: true,
-            },
-        });
-    let scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
-        "verify",
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    ))
-    .expect("command scope digest");
-
-    let execution = tools
-        .command_cancellable_with_policy_observed(
-            CommandToolInput {
-                command: "verify".to_string(),
-                cwd: None,
-                timeout_seconds: Some(5),
-            },
-            SandboxFilesystemMode::WorkspaceWrite,
-            SandboxNetworkMode::Denied,
-            &scope,
-            &CancellationToken::new(),
-        )
-        .expect("mixed cache and source command");
-
-    assert_eq!(
-        execution.sandbox_execution.workspace_mutation,
-        WorkspaceMutation::Changed
-    );
-    assert_eq!(
-        execution.output.metadata["workspace_observation"],
-        serde_json::json!({"revision": 1, "mutation": "changed"})
-    );
-    assert_eq!(
-        execution.output.metadata["workspace_change_summary"]["changed_files"],
-        serde_json::json!(["src/lib.rs", "target/debug/app"])
-    );
-    remove_workspace(&workspace);
-}
-
-#[test]
-fn workspace_write_unknown_summary_and_read_only_change_remain_fail_closed() {
-    let workspace = test_workspace("command-unknown-summary");
-    let tools = WorkspaceTools::new(&workspace)
-        .expect("bind workspace tools")
-        .with_sandbox_backend(SummaryReportingBackend {
-            summary: WorkspaceChangeSummary {
-                changed_files: vec!["generated/cache.bin".to_string()],
-                diff_digest: "sha256:unknown".to_string(),
-                verification_relevant: false,
-            },
-        });
-    let write_scope = CommandScopeDigest::new(command_script_scope_digest_with_policy(
-        "verify",
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    ))
-    .expect("write scope digest");
-    let write = tools
-        .command_cancellable_with_policy_observed(
-            CommandToolInput {
-                command: "verify".to_string(),
-                cwd: None,
-                timeout_seconds: Some(5),
-            },
-            SandboxFilesystemMode::WorkspaceWrite,
-            SandboxNetworkMode::Denied,
-            &write_scope,
-            &CancellationToken::new(),
-        )
-        .expect("unknown summary command");
-    assert_eq!(
-        write.output.metadata["workspace_observation"],
-        serde_json::json!({"revision": 1, "mutation": "changed"})
-    );
-
+fn workspace_write_read_only_changed_stays_fail_closed() {
     let read_only_workspace = test_workspace("command-read-only-summary");
     let read_only_tools = WorkspaceTools::new(&read_only_workspace)
         .expect("bind read-only workspace tools")
         .with_sandbox_backend(SummaryReportingBackend {
             summary: WorkspaceChangeSummary {
                 changed_files: vec!["target/debug/app".to_string()],
-                diff_digest: "sha256:artifact".to_string(),
+                diff_digest: VALID_TEST_DIGEST.to_string(),
                 verification_relevant: false,
             },
         });
@@ -3024,7 +2974,6 @@ fn workspace_write_unknown_summary_and_read_only_change_remain_fail_closed() {
         serde_json::json!({"revision": 1, "mutation": "changed"})
     );
 
-    remove_workspace(&workspace);
     remove_workspace(&read_only_workspace);
 }
 
