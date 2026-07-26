@@ -93,9 +93,11 @@ const EVALUATOR_GIT_DIR: &str = ".singularity-evaluator-git";
 const RESULT_FILE: &str = "result.json";
 const REPORT_FILE: &str = "report.json";
 const EVIDENCE_FILE: &str = "evidence.json";
+const FAILURE_FILE: &str = "failure.json";
 const PUBLICATION_DIR: &str = "publication";
 const PUBLICATION_MANIFEST_FILE: &str = "publication.json";
 const PUBLICATION_SCHEMA_VERSION: &str = "evaluation.publication/v1";
+const FAILURE_SCHEMA_VERSION: &str = "evaluation.failure/v1";
 const AGENT_TRACE_FILE: &str = "agent-trace.json";
 const PATCH_EVIDENCE_FILE: &str = "patch-evidence.json";
 const ARTIFACT_TEMP_FILE_ATTEMPTS: usize = 64;
@@ -553,6 +555,17 @@ pub(crate) enum EvaluationRunErrorKind {
     Cancelled,
 }
 
+impl EvaluationRunErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Publication => "publication",
+            Self::Infrastructure => "infrastructure",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EvaluationRunError {
     kind: EvaluationRunErrorKind,
@@ -609,6 +622,13 @@ impl std::fmt::Display for EvaluationRunError {
 }
 
 impl std::error::Error for EvaluationRunError {}
+
+#[derive(Serialize)]
+struct EvaluationFailureEvidence<'a> {
+    schema_version: &'static str,
+    kind: &'static str,
+    message: &'a str,
+}
 
 pub(crate) fn run_evaluation(
     params: &EvalRunParams,
@@ -724,7 +744,7 @@ pub(crate) fn run_evaluation(
     for (plan, prepared_source) in plans.iter().zip(&prepared_sources) {
         if cancellation.is_cancelled() {
             let partial = partial_evaluation_result(params, &run_id, &task_executions);
-            return Err(cleanup_incomplete_run(
+            return Err(preserve_incomplete_run(
                 &run_dir,
                 EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
             ));
@@ -737,7 +757,7 @@ pub(crate) fn run_evaluation(
         ));
         if cancellation.is_cancelled() {
             let partial = partial_evaluation_result(params, &run_id, &task_executions);
-            return Err(cleanup_incomplete_run(
+            return Err(preserve_incomplete_run(
                 &run_dir,
                 EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
             ));
@@ -746,7 +766,7 @@ pub(crate) fn run_evaluation(
 
     if cancellation.is_cancelled() {
         let partial = partial_evaluation_result(params, &run_id, &task_executions);
-        return Err(cleanup_incomplete_run(
+        return Err(preserve_incomplete_run(
             &run_dir,
             EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
         ));
@@ -755,7 +775,7 @@ pub(crate) fn run_evaluation(
     if let Ok(failures) = run_context.trace_failures.lock()
         && !failures.is_empty()
     {
-        return Err(cleanup_incomplete_run(
+        return Err(preserve_incomplete_run(
             &run_dir,
             EvaluationRunError::infrastructure(format!(
                 "evaluation SQLite trace projection failed: {}",
@@ -771,7 +791,7 @@ pub(crate) fn run_evaluation(
     let mut result = EvaluationResult::from_tasks(run_id.clone(), trials_per_task, tasks);
     result.sandbox_preflight = Some(sandbox_preflight_evidence(&preflight));
     if let Err(error) = result.validate() {
-        return Err(cleanup_incomplete_run(
+        return Err(preserve_incomplete_run(
             &run_dir,
             EvaluationRunError::infrastructure(format!("invalid evaluation result: {error}")),
         ));
@@ -791,14 +811,14 @@ pub(crate) fn run_evaluation(
     ) {
         Ok(evidence) => evidence,
         Err(error) => {
-            return Err(cleanup_incomplete_run(
+            return Err(preserve_incomplete_run(
                 &run_dir,
                 EvaluationRunError::infrastructure(error),
             ));
         }
     };
     if let Err(error) = evidence.validate_against_result(&result) {
-        return Err(cleanup_incomplete_run(
+        return Err(preserve_incomplete_run(
             &run_dir,
             EvaluationRunError::infrastructure(format!(
                 "evaluation evidence/result mismatch: {error}"
@@ -808,7 +828,7 @@ pub(crate) fn run_evaluation(
     let status_string = match enum_string(result.status) {
         Ok(status) => status,
         Err(error) => {
-            return Err(cleanup_incomplete_run(
+            return Err(preserve_incomplete_run(
                 &run_dir,
                 EvaluationRunError::infrastructure(error),
             ));
@@ -817,7 +837,7 @@ pub(crate) fn run_evaluation(
     let blocker = match result.blocker.as_ref().map(blocker_code).transpose() {
         Ok(blocker) => blocker,
         Err(error) => {
-            return Err(cleanup_incomplete_run(
+            return Err(preserve_incomplete_run(
                 &run_dir,
                 EvaluationRunError::infrastructure(error),
             ));
@@ -838,7 +858,7 @@ pub(crate) fn run_evaluation(
         match publish_evaluation_artifacts(&run_dir, &run_id, &result, &report, &evidence) {
             Ok(published) => published,
             Err(error) => {
-                return Err(cleanup_incomplete_run(
+                return Err(preserve_incomplete_run(
                     &run_dir,
                     EvaluationRunError::publication(error),
                 ));
@@ -891,18 +911,21 @@ fn partial_evaluation_result(
     }
 }
 
-fn cleanup_incomplete_run(run_dir: &Path, mut error: EvaluationRunError) -> EvaluationRunError {
-    match fs::remove_dir_all(run_dir) {
-        Ok(()) => error,
-        Err(cleanup_error) => {
-            error.message = format!(
-                "{}; failed to clean incomplete evaluation run {}: {cleanup_error}",
-                error.message,
-                run_dir.display()
-            );
-            error
-        }
+fn preserve_incomplete_run(run_dir: &Path, mut error: EvaluationRunError) -> EvaluationRunError {
+    let safe_message = safe_text(&error.message);
+    let failure = EvaluationFailureEvidence {
+        schema_version: FAILURE_SCHEMA_VERSION,
+        kind: error.kind.as_str(),
+        message: &safe_message,
+    };
+    if let Err(write_error) = write_json_atomic(&run_dir.join(FAILURE_FILE), &failure) {
+        error.message = format!(
+            "{}; failed to preserve incomplete evaluation evidence in {}: {write_error}",
+            error.message,
+            run_dir.display()
+        );
     }
+    error
 }
 
 fn task_report(execution: &TaskEvaluation) -> Value {
@@ -970,7 +993,7 @@ fn publish_preflight_blocked_run(
 ) -> Result<EvalRunResult, EvaluationRunError> {
     let run_id = &result.run_id;
     if let Err(error) = result.validate() {
-        return Err(cleanup_incomplete_run(
+        return Err(preserve_incomplete_run(
             run_dir,
             EvaluationRunError::infrastructure(format!(
                 "invalid sandbox-preflight-blocked evaluation result: {error}"
@@ -986,14 +1009,14 @@ fn publish_preflight_blocked_run(
     ) {
         Ok(evidence) => evidence,
         Err(error) => {
-            return Err(cleanup_incomplete_run(
+            return Err(preserve_incomplete_run(
                 run_dir,
                 EvaluationRunError::infrastructure(error),
             ));
         }
     };
     if let Err(error) = evidence.validate_against_result(&result) {
-        return Err(cleanup_incomplete_run(
+        return Err(preserve_incomplete_run(
             run_dir,
             EvaluationRunError::infrastructure(format!(
                 "sandbox preflight evidence/result mismatch: {error}"
@@ -1005,7 +1028,7 @@ fn publish_preflight_blocked_run(
     let report_path = publication_dir.join(REPORT_FILE);
     let evidence_path = publication_dir.join(EVIDENCE_FILE);
     let status = enum_string(result.status).map_err(|error| {
-        cleanup_incomplete_run(run_dir, EvaluationRunError::infrastructure(error))
+        preserve_incomplete_run(run_dir, EvaluationRunError::infrastructure(error))
     })?;
     let blocker = result
         .blocker
@@ -1013,7 +1036,7 @@ fn publish_preflight_blocked_run(
         .map(blocker_code)
         .transpose()
         .map_err(|error| {
-            cleanup_incomplete_run(run_dir, EvaluationRunError::infrastructure(error))
+            preserve_incomplete_run(run_dir, EvaluationRunError::infrastructure(error))
         })?;
     let report = json!({
         "manifest": params.manifest,
@@ -1026,7 +1049,9 @@ fn publish_preflight_blocked_run(
         "evidence_path": evidence_path.to_string_lossy(),
     });
     let published = publish_evaluation_artifacts(run_dir, run_id, &result, &report, &evidence)
-        .map_err(|error| cleanup_incomplete_run(run_dir, EvaluationRunError::publication(error)))?;
+        .map_err(|error| {
+            preserve_incomplete_run(run_dir, EvaluationRunError::publication(error))
+        })?;
     Ok(EvalRunResult {
         run_id: run_id.as_str().to_string(),
         manifest: params.manifest.clone(),
@@ -4247,6 +4272,35 @@ mod tests {
         assert_eq!(partial.status, "blocked");
         assert_eq!(partial.blocker.as_deref(), Some("evaluation_cancelled"));
         assert!(partial.tasks.is_empty());
+    }
+
+    #[test]
+    fn incomplete_run_preserves_trial_artifacts_and_bounded_failure_evidence() {
+        let temp = tempfile::tempdir().expect("temp");
+        let run_dir = temp.path().join("failed-run");
+        let trial_dir = run_dir.join("task").join("trial-0001");
+        fs::create_dir_all(&trial_dir).expect("trial directory");
+        let trace_path = trial_dir.join(AGENT_TRACE_FILE);
+        fs::write(&trace_path, b"preserved trace").expect("trial trace");
+
+        let error = preserve_incomplete_run(
+            &run_dir,
+            EvaluationRunError::infrastructure("invalid evaluation evidence"),
+        );
+
+        assert_eq!(error.kind(), EvaluationRunErrorKind::Infrastructure);
+        assert!(trace_path.is_file(), "sampled trial evidence must survive");
+        let failure: Value = serde_json::from_slice(
+            &fs::read(run_dir.join(FAILURE_FILE)).expect("failure evidence"),
+        )
+        .expect("valid failure evidence");
+        assert_eq!(failure["schema_version"], FAILURE_SCHEMA_VERSION);
+        assert_eq!(failure["kind"], "infrastructure");
+        assert_eq!(failure["message"], "invalid evaluation evidence");
+        assert!(
+            !run_dir.join(PUBLICATION_DIR).is_dir(),
+            "a failed run must not masquerade as an atomic publication"
+        );
     }
 
     #[derive(Default)]

@@ -415,7 +415,7 @@ Evaluation runner 通过 AppServer 传入同一 file-backed `SessionStore`，每
 Smoke observed scope 直接来自同一份最后 mutation 后的 terminal successful-command suffix；失败 command 即使携带相同 digest 也不会进入 `observed_scope_digests`，成功但缺失/非法 digest 的 command 会清空旧后缀，其他合法成功 command 会占据后缀位置，因此 smoke 后的潜在写命令不能沿用旧验证。顺序与重复 command 保持为有序多重集合，Evaluation 不通过 set 去重或另行重算 gate 事实。
 Agent workspace 的 before/after 快照保留完整 materialized tree；仅在生成 agent 变更与 patch evidence 时，Evaluation 才按闭集规则忽略非 source-owned 且由常见工具链生成的派生路径。未知路径以及 pristine source 已存在的路径仍进入 manifest allowlist 判定并 fail closed；该归因过滤不改变 source tree digest、`evaluation.evidence/v3`、`evaluation.result/v8` 或任何 gate 语义。
 
-默认产物目录为 `work/evaluations/<run-id>`。result/report/evidence 与 `publication.json` 先完整序列化并 fsync 到同一 staging directory，再以一次 directory rename 固化为不可变 `publication/`。manifest 保存三项相对路径、逐文件 SHA-256 和 artifact-set SHA-256；消费者只把 `publication/publication.json` 视为发布入口。崩溃发生在 directory rename 前时只留下 staging，rename 后四项同时可见，因而不会暴露混合版本或半发布三元组。
+默认产物目录为 `work/evaluations/<run-id>`。result/report/evidence 与 `publication.json` 先完整序列化并 fsync 到同一 staging directory，再以一次 directory rename 固化为不可变 `publication/`。manifest 保存三项相对路径、逐文件 SHA-256 和 artifact-set SHA-256；消费者只把 `publication/publication.json` 视为发布入口。崩溃发生在 directory rename 前时只留下 staging，rename 后四项同时可见，因而不会暴露混合版本或半发布三元组。采样开始后的 infrastructure、publication 或 cancellation failure 不删除已经提交的 task/trial 目录；runner 在 run 根目录原子写入 `evaluation.failure/v1` 的 `failure.json`，只保存稳定 failure kind 和经敏感文本检查、长度受限的错误摘要。该文件用于诊断未发布 run，不能替代 `publication/publication.json`，也不改变 Evaluation 评分。
 
 ## 13. 失败与安全不变量
 
