@@ -10578,6 +10578,171 @@ fn repair_cycle_requires_matching_scope_and_all_revision_checks() {
 }
 
 #[test]
+fn malformed_final_review_retries_within_the_model_turn_budget() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let command = test_command_script("verify");
+    let verification_digest = command_script_scope_digest_with_policy(
+        &command,
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let mut verification =
+        ModelTurnResponse::completed("model_request_turn_review_retry_0", "response_verify", "");
+    verification.tool_calls.push(tool_call(
+        "verify_call",
+        "command",
+        serde_json::json!({
+            "command": command,
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let malformed = ModelTurnResponse::completed(
+        "model_request_turn_review_retry_1",
+        "response_malformed_review",
+        r#"{"verdict":"accept"}"#,
+    );
+    let valid = ModelTurnResponse::completed(
+        "model_request_turn_review_retry_2",
+        "response_valid_review",
+        "done",
+    );
+    let exhausted_responses = vec![verification.clone(), malformed.clone()];
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let mut events = Vec::new();
+    let mut checkpoints = Vec::new();
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![verification, malformed, valid],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run_with_events_and_checkpoints(
+        &AgentLoopInput::new("thread_review_retry", "turn_review_retry", "verify")
+            .with_max_turns(3)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                verification_digest,
+                1,
+            )]),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+        &mut |checkpoint| {
+            checkpoints.push(checkpoint);
+            Ok(())
+        },
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(result.model_turns, 3);
+    assert_eq!(result.tool_results.len(), 1);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
+    let final_review_statuses = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::FinalReview(value)) => {
+                match value.lifecycle {
+                    OccurrenceLifecycle::Finished { status, .. } => Some(status),
+                    OccurrenceLifecycle::Started { .. } | OccurrenceLifecycle::Suspended { .. } => {
+                        None
+                    }
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        final_review_statuses,
+        [FinalReviewStatus::Failed, FinalReviewStatus::Succeeded]
+    );
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::None);
+    assert_eq!(requests[2].tool_choice.mode, ToolChoiceMode::None);
+    assert!(requests[2].messages.iter().any(|message| {
+        message.role == ModelRole::Developer
+            && message
+                .content
+                .contains("previous final review response was invalid")
+    }));
+    drop(requests);
+    checkpoints
+        .iter()
+        .find(|event| {
+            matches!(
+                event.phase,
+                TurnCheckpointPhase::BeforeModelRequest {
+                    finalization_only: true
+                }
+            ) && event.checkpoint.encode().is_ok_and(|payload| {
+                payload["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "assistant"
+                            && message["content"] == r#"{"verdict":"accept"}"#
+                    }) && messages.iter().any(|message| {
+                        message["role"] == "developer"
+                            && message["content"].as_str().is_some_and(|content| {
+                                content.contains("previous final review response was invalid")
+                            })
+                    })
+                })
+            })
+        })
+        .expect("retry checkpoint preserves malformed assistant and correction");
+
+    let exhausted = AgentLoop::new(
+        StaticProvider {
+            responses: exhausted_responses,
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(false),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("rebind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new("thread_review_retry", "turn_review_retry", "verify")
+            .with_max_turns(1)
+            .with_verification_requirements([AgentVerificationRequirement::new(
+                command_script_scope_digest_with_policy(
+                    &command,
+                    ".",
+                    5,
+                    SandboxFilesystemMode::WorkspaceWrite,
+                    SandboxNetworkMode::Denied,
+                ),
+                1,
+            )]),
+    );
+    assert_eq!(exhausted.status, AgentStatus::Failed, "{exhausted:?}");
+    assert_eq!(
+        exhausted.error.as_deref(),
+        Some("final review response is not a strict typed JSON object")
+    );
+    assert_eq!(exhausted.model_turns, 2);
+    assert_eq!(exhausted.tool_results.len(), 1);
+    assert_eq!(exhausted.recovery_metrics.repair_attempt_count, 0);
+}
+
+#[test]
 fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
     #[derive(Clone, Copy)]
     enum FinalizationCase {

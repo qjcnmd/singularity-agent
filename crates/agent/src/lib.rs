@@ -3640,7 +3640,6 @@ where
                     let review = match parse_final_review_response(&response, &state) {
                         Ok(review) => review,
                         Err(error) => {
-                            state.final_review_verdict = Some(FinalReviewVerdict::Reject);
                             if emit_final_review_finished(
                                 &mut on_event,
                                 &final_review,
@@ -3657,13 +3656,31 @@ where
                                     Some(EVENT_SINK_FAILURE_ERROR.to_string()),
                                 );
                             }
-                            return state.finish(
-                                AgentStatus::Failed,
-                                false,
-                                None,
-                                actual_model_turns,
-                                Some(error),
-                            );
+                            if turn_index == max_turns {
+                                state.final_review_verdict = Some(FinalReviewVerdict::Reject);
+                                return state.finish(
+                                    AgentStatus::Failed,
+                                    false,
+                                    None,
+                                    actual_model_turns,
+                                    Some(error),
+                                );
+                            }
+                            state.recovery_metrics.completion_rejection_count = state
+                                .recovery_metrics
+                                .completion_rejection_count
+                                .saturating_add(1);
+                            state.last_completion_error = Some(error);
+                            state
+                                .messages
+                                .push(response.assistant_message.unwrap_or_else(|| {
+                                    ModelMessage::text(ModelRole::Assistant, final_answer)
+                                }));
+                            state.messages.push(ModelMessage::text(
+                                ModelRole::Developer,
+                                "The previous final review response was invalid. Return exactly one strict JSON object matching the current terminal-review schema and evidence; do not use markdown, prose, or tools.",
+                            ));
+                            continue;
                         }
                     };
                     if review.verdict != FinalReviewVerdict::Accept {
