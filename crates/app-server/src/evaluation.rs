@@ -4879,6 +4879,48 @@ mod tests {
         manifest_path
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_linux_preflight_verifies_trusted_workspace_preparation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let run_dir = temp.path().join("run");
+        fs::create_dir(&run_dir).expect("run directory");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "native-linux-preflight",
+            "native preflight verifies trusted Git preparation",
+            1,
+            json!({
+                "type": "remote_git",
+                "repository": "https://example.invalid/preflight.git",
+                "commit": "0000000000000000000000000000000000000000"
+            }),
+        );
+        let manifest_json = fs::read_to_string(&manifest_path).expect("manifest");
+        let manifest = EvaluationManifest::from_json_str(&manifest_json, temp.path())
+            .expect("evaluation manifest");
+        let plans = manifest
+            .task_set()
+            .tasks
+            .iter()
+            .map(|task| {
+                manifest
+                    .workspace_plan(&task.task_id)
+                    .expect("workspace plan")
+            })
+            .collect::<Vec<_>>();
+        let backend: SharedSandboxBackend =
+            Arc::new(singularity_sandbox::LinuxSandboxBackend::new());
+
+        let report = run_sandbox_preflight(&run_dir, &plans, &backend, &CancellationToken::new())
+            .unwrap_or_else(|failure| panic!("native preflight failed: {:?}", failure.report));
+
+        assert_eq!(report.outcome, SandboxPreflightOutcome::Supported);
+        assert!(report.missing_capabilities.is_empty());
+        assert!(report.proves_supported_contract_for(backend.name()));
+        assert!(!run_dir.join(".sandbox-preflight").exists());
+    }
+
     #[test]
     fn supported_preflight_reaches_agent_loop_and_calls_provider() {
         use std::io::{BufRead, BufReader, Read, Write};

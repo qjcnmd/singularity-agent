@@ -16,7 +16,7 @@ use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
 
 mod workspace_change;
-use workspace_change::{WorkspaceSnapshot, snapshot_workspace};
+use workspace_change::{WorkspaceSnapshot, snapshot_trusted_workspace, snapshot_workspace};
 
 /// command tool 未指定超时时使用的秒数。
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;

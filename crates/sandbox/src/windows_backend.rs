@@ -14,7 +14,7 @@ use super::{
     SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightReport,
     WorkspaceChangeSummary, WorkspaceMutation, WorkspaceSnapshot, command_request_denial,
     command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
-    snapshot_workspace,
+    snapshot_trusted_workspace, snapshot_workspace,
 };
 use singularity_core::{
     PROTECTED_METADATA_PATH_NAMES, PROTECTED_PATH_CONTAINS_MARKERS, PROTECTED_PATH_EXACT_MARKERS,
@@ -476,6 +476,7 @@ fn execute_prepared_command(
 ) -> CommandResult {
     let workspace = prepared.workspace_roots[0].as_path().to_path_buf();
     let before = prepared.before.clone();
+    let protect_workspace_metadata = prepared.protect_workspace_metadata;
     let mut monitor = None;
     let result = match execute_windows_sandbox(
         command_id,
@@ -491,10 +492,19 @@ fn execute_prepared_command(
         }
     };
     let observation = monitor.map(|monitor| monitor.finish().map_err(|_| ()));
-    let snapshot_change = before.map(|before| {
-        snapshot_workspace(&workspace).and_then(|after| before.change_summary(&after))
-    });
-    let (mutation, summary) = reconcile_workspace_change(observation, snapshot_change);
+    let (mutation, summary) = if protect_workspace_metadata {
+        let snapshot_change = before.map(|before| {
+            snapshot_workspace(&workspace).and_then(|after| before.change_summary(&after))
+        });
+        reconcile_workspace_change(observation, snapshot_change)
+    } else {
+        let mutation = match (before, snapshot_trusted_workspace(&workspace)) {
+            (Some(before), Ok(after)) if before == after => WorkspaceMutation::Unchanged,
+            (Some(_), Ok(_)) => WorkspaceMutation::Changed,
+            _ => WorkspaceMutation::Unknown,
+        };
+        (mutation, None)
+    };
     let result = result.with_workspace_mutation(mutation);
     match summary {
         Some(summary) => result.with_workspace_change_summary(summary),
@@ -608,11 +618,18 @@ impl PreparedCommand {
     fn from_request(request: &CommandRequest) -> Result<Self, PrepareCommandError> {
         let workspace_root = canonical_directory(Path::new(&request.filesystem.workspace_root))
             .map_err(PrepareCommandError::Backend)?;
+        let protect_workspace_metadata = !request.is_trusted_workspace_preparation();
         let before = matches!(
             request.filesystem.mode,
             SandboxFilesystemMode::WorkspaceWrite
         )
-        .then(|| snapshot_workspace(&workspace_root))
+        .then(|| {
+            if protect_workspace_metadata {
+                snapshot_workspace(&workspace_root)
+            } else {
+                snapshot_trusted_workspace(&workspace_root)
+            }
+        })
         .transpose()
         .map_err(|_| PrepareCommandError::WorkspaceObservation)?;
         let cwd =
@@ -624,7 +641,6 @@ impl PreparedCommand {
             AbsolutePathBuf::from_absolute_path_checked(&workspace_root).map_err(|error| {
                 PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
             })?;
-        let protect_workspace_metadata = !request.is_trusted_workspace_preparation();
         let protected_deny_read_paths = if protect_workspace_metadata {
             resolve_existing_protected_paths(&workspace_root)
                 .map_err(PrepareCommandError::ProtectedPaths)?

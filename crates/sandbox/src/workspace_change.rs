@@ -209,6 +209,18 @@ fn protected_metadata_matches(before: &EntryMetadata, after: &EntryMetadata) -> 
 
 /// Snapshot the workspace through a directory capability without following links.
 pub(super) fn snapshot_workspace(workspace: &Path) -> Result<WorkspaceSnapshot, String> {
+    snapshot_workspace_with_protected_paths(workspace, true)
+}
+
+/// Snapshot controller-owned workspace metadata as ordinary transactional content.
+pub(super) fn snapshot_trusted_workspace(workspace: &Path) -> Result<WorkspaceSnapshot, String> {
+    snapshot_workspace_with_protected_paths(workspace, false)
+}
+
+fn snapshot_workspace_with_protected_paths(
+    workspace: &Path,
+    protect_paths: bool,
+) -> Result<WorkspaceSnapshot, String> {
     let root = Dir::open_ambient_dir(workspace, ambient_authority())
         .map_err(|error| format!("workspace change snapshot is unavailable: {error}"))?;
     let root_before = root
@@ -221,7 +233,7 @@ pub(super) fn snapshot_workspace(workspace: &Path) -> Result<WorkspaceSnapshot, 
         visited_entries: 0,
         total_file_bytes: 0,
     };
-    visit_directory(&root, Path::new(""), 0, &mut state)?;
+    visit_directory(&root, Path::new(""), 0, protect_paths, &mut state)?;
     let root_after = root
         .dir_metadata()
         .and_then(|metadata| entry_metadata(&metadata))
@@ -247,6 +259,7 @@ fn visit_directory(
     directory: &Dir,
     relative_parent: &Path,
     depth: usize,
+    protect_paths: bool,
     state: &mut SnapshotState,
 ) -> Result<(), String> {
     if depth > MAX_SNAPSHOT_DEPTH {
@@ -274,7 +287,7 @@ fn visit_directory(
             .ok_or_else(|| "workspace change snapshot contains a non-Unicode path".to_string())?;
         let relative = relative_parent.join(&name);
         let relative_text = workspace_relative_path(&relative)?;
-        if is_protected_path(name_text) || is_protected_path(&relative_text) {
+        if protect_paths && (is_protected_path(name_text) || is_protected_path(&relative_text)) {
             #[cfg(not(windows))]
             {
                 let metadata = directory
@@ -309,7 +322,7 @@ fn visit_directory(
                 .dir_metadata()
                 .and_then(|metadata| entry_metadata(&metadata))
                 .map_err(|error| format!("workspace change directory metadata failed: {error}"))?;
-            visit_directory(&child, &relative, depth + 1, state)?;
+            visit_directory(&child, &relative, depth + 1, protect_paths, state)?;
             let after = child
                 .dir_metadata()
                 .and_then(|metadata| entry_metadata(&metadata))
@@ -487,7 +500,7 @@ fn hash_os_str(value: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::snapshot_workspace;
+    use super::{snapshot_trusted_workspace, snapshot_workspace};
 
     #[test]
     fn summary_binds_changed_path_and_before_after_content() {
@@ -524,6 +537,25 @@ mod tests {
         let after = snapshot_workspace(workspace.path()).expect("after snapshot");
 
         assert_eq!(before.change_summary(&after).expect("summary"), None);
+    }
+
+    #[test]
+    fn trusted_snapshot_observes_controller_owned_git_metadata() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let git = workspace.path().join(".git");
+        std::fs::create_dir(&git).expect("git directory");
+        let config = git.join("config");
+        std::fs::write(&config, b"before").expect("git config before");
+        let before = snapshot_trusted_workspace(workspace.path()).expect("before snapshot");
+        std::fs::write(&config, b"after").expect("git config after");
+        let after = snapshot_trusted_workspace(workspace.path()).expect("after snapshot");
+
+        let summary = before
+            .change_summary(&after)
+            .expect("trusted change summary")
+            .expect("trusted metadata changed");
+
+        assert_eq!(summary.changed_files, [".git/config"]);
     }
 
     #[cfg(not(windows))]
