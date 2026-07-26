@@ -3350,6 +3350,23 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
     );
     assert_eq!(completed_turn.agent_loop_status, "completed");
 
+    let checkpoint = store
+        .get_turn_checkpoint(&turn_id)
+        .expect("turn checkpoint")
+        .expect("approval continuation checkpoint");
+    assert_eq!(
+        checkpoint["completion"]["workspace_mutated"], true,
+        "approval resume must persist mutation evidence after the approved tool result"
+    );
+    assert!(
+        checkpoint["tool_result_occurrences"]
+            .as_array()
+            .expect("tool result occurrences")
+            .iter()
+            .any(|occurrence| occurrence["result"]["tool_call_id"] == "call_edit_1"),
+        "approval resume checkpoint must retain the approved tool result"
+    );
+
     // 验证 workspace 文件已被修改
     assert_eq!(
         std::fs::read_to_string(&file_path).expect("read readme"),

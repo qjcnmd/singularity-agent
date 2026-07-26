@@ -1275,7 +1275,7 @@ impl AppServer {
         project_observability: bool,
     ) -> AppServerResult<Option<(Turn, AgentRunStatus, Vec<PendingApprovalOccurrence>)>>
     where
-        P: Provider,
+        P: Provider + Clone,
     {
         let ApprovalResumeInput {
             request,
@@ -1381,31 +1381,81 @@ impl AppServer {
         } else {
             None
         };
-        let mut callback_error = None;
+        let callback_error = RefCell::new(None);
+        let boundary_action = RefCell::new(None);
         let result = {
             let mut callback = |event: AgentLoopEvent| -> Result<(), AgentLoopEventSinkError> {
-                if callback_error.is_some() {
+                if callback_error.borrow().is_some() {
                     return Err(AgentLoopEventSinkError);
                 }
                 if let Some(projector) = projector.as_mut()
                     && let Err(error) = projector.project_event(event.clone())
                 {
-                    callback_error = Some(AppServerError::Store(error));
+                    *callback_error.borrow_mut() = Some(AppServerError::Store(error));
                     return Err(AgentLoopEventSinkError);
                 }
                 if let Err(error) = on_event(event) {
-                    callback_error = Some(error);
+                    *callback_error.borrow_mut() = Some(error);
                     return Err(AgentLoopEventSinkError);
                 }
                 Ok(())
             };
-            AgentLoop::new(provider, ToolBroker::new(registry), policy)
+            let mut on_checkpoint = |event: TurnCheckpointEvent| {
+                if callback_error.borrow().is_some() {
+                    return Err(AgentLoopEventSinkError);
+                }
+                match self.persist_turn_checkpoint_event(&thread.thread_id, &turn.turn_id, event) {
+                    Ok(TurnBoundaryAction::Continue) => Ok(()),
+                    Ok(action) => {
+                        *boundary_action.borrow_mut() = Some(action);
+                        Err(AgentLoopEventSinkError)
+                    }
+                    Err(error) => {
+                        *callback_error.borrow_mut() = Some(error);
+                        Err(AgentLoopEventSinkError)
+                    }
+                }
+            };
+            AgentLoop::new(provider.clone(), ToolBroker::new(registry), policy)
                 .with_workspace_tools(workspace_tools)
                 .with_cancellation_token(context.cancellation.clone())
-                .resume_pending_approval_with_events(&loop_input, &pending_approval, &mut callback)
+                .resume_pending_approval_with_events_and_checkpoints(
+                    &loop_input,
+                    &pending_approval,
+                    &mut callback,
+                    &mut on_checkpoint,
+                )
         };
-        if let Some(error) = callback_error {
+        if let Some(error) = callback_error.into_inner() {
             return Err(error);
+        }
+        match boundary_action.into_inner() {
+            Some(TurnBoundaryAction::Restart(checkpoint)) => {
+                let workspace_tools =
+                    workspace_tools_for_thread(thread, Arc::clone(&self.sandbox_backend))
+                        .map_err(AppServerError::Workspace)?;
+                return self
+                    .run_resumed_agent_loop_with_provider_and_tools(
+                        provider,
+                        AgentLoopInvocation {
+                            thread,
+                            params: &params,
+                            turn_id: &turn.turn_id,
+                            history: &history.messages,
+                            cancellation: context.cancellation,
+                            monitor_control: context.monitor_control,
+                        },
+                        workspace_tools,
+                        &checkpoint,
+                        on_event,
+                        project_observability,
+                    )
+                    .map(|run_status| Some((turn.clone(), run_status, Vec::new())));
+            }
+            Some(TurnBoundaryAction::Paused) => {
+                return Ok(Some((turn.clone(), AgentRunStatus::paused(), Vec::new())));
+            }
+            Some(TurnBoundaryAction::Continue) | None => {}
         }
         if monitor_infrastructure_failure(context.monitor_control) {
             return Err(AppServerError::TurnExecution {

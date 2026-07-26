@@ -1,12 +1,13 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
-use singularity_agent::{AgentRecoveryMetrics, PendingToolCall};
+use singularity_agent::{AgentRecoveryMetrics, AgentRunStatus, PendingToolCall};
 use singularity_model::{
     ModelError, ModelErrorCategory, ModelErrorKind, ModelMessage, ModelRole, ModelToolCall,
     ModelToolParseStatus, ModelTurnRequest, ModelTurnResponse, ModelTurnStatus, ModelUsage,
-    Provider, ProviderAttemptMetadata, ProviderError, ProviderProtocolContract,
-    ProviderStreamEvent,
+    Provider, ProviderApiProtocol, ProviderAttemptMetadata, ProviderCapabilityCacheLookupResult,
+    ProviderCapabilityCacheObservation, ProviderCapabilityMetadata, ProviderCapabilityProfile,
+    ProviderError, ProviderProtocolContract, ProviderStreamEvent,
 };
 use singularity_policy::{ToolId, WorkspaceRelativePath};
 use singularity_protocol::ItemKind;
@@ -3663,6 +3664,63 @@ fn verification_spans_are_paired_by_occurrence_id() {
         assert_eq!(starts, 1, "span {span_id} must have exactly one Start");
         assert_eq!(ends, 1, "span {span_id} must have exactly one End");
     }
+}
+
+#[test]
+fn provider_capability_cache_observation_projection_is_idempotent() {
+    use singularity_protocol::TraceMetricSampleKind;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _item, _trace) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "cache"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("turn");
+    let mut projector =
+        observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
+            .expect("projector");
+
+    let mut status = AgentRunStatus::failed("resume projection test");
+    status.provider_capability_metadata = Some(ProviderCapabilityMetadata {
+        api_protocol: ProviderApiProtocol::Declared,
+        profile: ProviderCapabilityProfile::Declared,
+        cache_hit: false,
+        profile_attempts: 0,
+        fallback_count: 0,
+        probe_usage: ModelUsage::default(),
+        probe_attempt_metadata: ProviderAttemptMetadata::default(),
+        cache_observations: vec![ProviderCapabilityCacheObservation {
+            api_protocol: ProviderApiProtocol::Declared,
+            outcome: ProviderCapabilityCacheLookupResult::Miss,
+            observed_at_unix_ms: 1_700_000_000_000,
+            model_turn_ordinal: Some(2),
+            parent_occurrence_id: Some("occurrence_parent".to_string()),
+        }],
+    });
+
+    projector.project_result(&status).expect("first projection");
+    projector
+        .project_result(&status)
+        .expect("replayed projection is idempotent");
+
+    let trace = store.list_trace(&thread.thread_id).expect("trace");
+    let samples = trace
+        .iter()
+        .flat_map(|event| event.metric_samples.iter())
+        .filter(|sample| sample.kind == TraceMetricSampleKind::ProviderCapabilityCacheMiss)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        samples.len(),
+        1,
+        "replayed cache observation must not duplicate"
+    );
+    assert_eq!(samples[0].count, 1);
 }
 
 #[test]

@@ -549,7 +549,7 @@ impl<'a> TraceProjector<'a> {
         event.timestamp = Some(timestamp.to_string());
         event.payload = json!({"observation": "provider_capability_cache"});
         event.metric_samples = vec![TraceMetricSample { kind, count: 1 }];
-        self.store.append_trace(&event)
+        self.store.append_trace_idempotent(&event).map(|_| ())
     }
 
     fn new_trace_event(&self, event_id: String, summary: &str) -> TraceEvent {

@@ -4094,7 +4094,7 @@ where
         input: &AgentLoopInput,
         pending: &PendingApprovalOccurrence,
     ) -> AgentLoopResult {
-        self.resume_pending_approval_internal(input, pending, None)
+        self.resume_pending_approval_internal(input, pending, None, None)
     }
 
     /// 恢复 approval，并在真实边界向调用方投影有序 typed 事件。
@@ -4104,7 +4104,18 @@ where
         pending: &PendingApprovalOccurrence,
         on_event: &mut AgentLoopEventCallback<'_>,
     ) -> AgentLoopResult {
-        self.resume_pending_approval_internal(input, pending, Some(on_event))
+        self.resume_pending_approval_internal(input, pending, Some(on_event), None)
+    }
+
+    /// Resume an approved tool call while notifying the owner at durable tool-result boundaries.
+    pub fn resume_pending_approval_with_events_and_checkpoints(
+        &self,
+        input: &AgentLoopInput,
+        pending: &PendingApprovalOccurrence,
+        on_event: &mut AgentLoopEventCallback<'_>,
+        on_checkpoint: &mut AgentLoopCheckpointCallback<'_>,
+    ) -> AgentLoopResult {
+        self.resume_pending_approval_internal(input, pending, Some(on_event), Some(on_checkpoint))
     }
 
     /// 恢复 approval，并只向调用方投影恢复后最终化 assistant 回合的有序文本 delta。
@@ -4123,6 +4134,7 @@ where
                 }
                 Ok(())
             }),
+            None,
         )
     }
 
@@ -4131,6 +4143,7 @@ where
         input: &AgentLoopInput,
         pending: &PendingApprovalOccurrence,
         mut on_event: Option<&mut AgentLoopEventCallback<'_>>,
+        mut on_checkpoint: Option<&mut AgentLoopCheckpointCallback<'_>>,
     ) -> AgentLoopResult {
         if self.is_cancelled(input) {
             return AgentLoopState::new(Vec::new(), input.max_turns.max(1), None).finish(
@@ -4330,6 +4343,27 @@ where
                 Some("pending tool call approval did not match".to_string()),
             );
         }
+        if !matches!(
+            self.emit_checkpoint_event(
+                input,
+                &state,
+                TurnCheckpointPhase::ToolCallsReady {
+                    pending_tool_calls: vec![pending.pending_tool_call().clone()],
+                },
+                model_turn_offset,
+                &mut on_checkpoint,
+            ),
+            ToolBatchControl::Continue
+        ) {
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some("tool-call checkpoint persistence failed".to_string()),
+            );
+        }
+        let tool_call_id = occurrence.call.tool_call_id.clone();
         let runtime = self.execute_tool(
             &prepared,
             observed_decision.decision,
@@ -4360,6 +4394,26 @@ where
             }
             ToolBatchControl::Blocked => unreachable!("resumed tool cannot block in execution"),
         }
+        if !matches!(
+            self.emit_checkpoint_event(
+                input,
+                &state,
+                TurnCheckpointPhase::ToolResultsCommitted {
+                    tool_call_ids: vec![tool_call_id],
+                },
+                model_turn_offset,
+                &mut on_checkpoint,
+            ),
+            ToolBatchControl::Continue
+        ) {
+            return state.finish(
+                AgentStatus::Failed,
+                false,
+                None,
+                model_turn_offset,
+                Some("tool-result checkpoint persistence failed".to_string()),
+            );
+        }
         self.continue_run(
             input,
             &budget,
@@ -4368,7 +4422,7 @@ where
             state,
             model_turn_offset,
             on_event,
-            None,
+            on_checkpoint,
         )
     }
 
