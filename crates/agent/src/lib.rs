@@ -1107,6 +1107,10 @@ struct AgentLoopState {
     prior_approval_count: u32,
     completion: CompletionTracker,
     verification_plan: Option<VerificationPlanState>,
+    /// Monotonic occurrence ordinal for verification-plan lifecycle events in this execution
+    /// epoch. The input resume attempt supplies the durable epoch identity, so this counter is
+    /// intentionally recreated from zero when a checkpoint is resumed.
+    verification_plan_occurrence_ordinal: u32,
     verification_change: Option<VerificationChangeSummary>,
     verification_planning_required: bool,
     verification_failure_history: BTreeSet<String>,
@@ -1197,6 +1201,7 @@ impl AgentLoopState {
             prior_approval_count: 0,
             completion: CompletionTracker::default(),
             verification_plan: None,
+            verification_plan_occurrence_ordinal: 0,
             verification_change: None,
             verification_planning_required: false,
             verification_failure_history: BTreeSet::new(),
@@ -1219,6 +1224,12 @@ impl AgentLoopState {
             provider_protocol_contract: None,
             provider_capability_metadata: None,
         }
+    }
+
+    fn next_verification_plan_occurrence_ordinal(&mut self) -> u32 {
+        let ordinal = self.verification_plan_occurrence_ordinal;
+        self.verification_plan_occurrence_ordinal = ordinal.saturating_add(1);
+        ordinal
     }
 
     fn finish(
@@ -3892,13 +3903,18 @@ where
                         None,
                     );
                 }
-                if let Some(plan) = state.verification_plan.as_ref() {
+                if state.verification_plan.is_some() {
+                    let occurrence_ordinal = state.next_verification_plan_occurrence_ordinal();
+                    let plan = state
+                        .verification_plan
+                        .as_ref()
+                        .expect("verification plan present");
                     let summary = state.completion.summary();
                     if emit_verification_plan_occurrence(
                         &mut on_event,
                         input,
                         turn_index,
-                        state.recovery_metrics.completion_rejection_count,
+                        occurrence_ordinal,
                         plan.revision,
                         u32::try_from(plan.plan.risks.len()).unwrap_or(u32::MAX),
                         u32::try_from(plan.plan.checks.len()).unwrap_or(u32::MAX),
@@ -5315,14 +5331,19 @@ where
             );
             if prepared.call.tool_name == TOOL_COMMAND
                 && !result.ok
-                && let Some(plan) = state.verification_plan.as_ref()
+                && state.verification_plan.is_some()
             {
+                let occurrence_ordinal = state.next_verification_plan_occurrence_ordinal();
+                let plan = state
+                    .verification_plan
+                    .as_ref()
+                    .expect("verification plan present");
                 let summary = state.completion.summary();
                 if emit_verification_plan_occurrence(
                     on_event,
                     input,
                     occurrence.context.model_turn_ordinal,
-                    occurrence.context.tool_call_ordinal,
+                    occurrence_ordinal,
                     plan.revision,
                     u32::try_from(plan.plan.risks.len()).unwrap_or(u32::MAX),
                     u32::try_from(plan.plan.checks.len()).unwrap_or(u32::MAX),
@@ -5413,11 +5434,12 @@ where
                     .plan
                     .clone();
                 let summary = state.completion.summary();
+                let occurrence_ordinal = state.next_verification_plan_occurrence_ordinal();
                 if emit_verification_plan_occurrence(
                     on_event,
                     input,
                     occurrence.context.model_turn_ordinal,
-                    occurrence.context.tool_call_ordinal,
+                    occurrence_ordinal,
                     state
                         .verification_plan
                         .as_ref()

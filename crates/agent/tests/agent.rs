@@ -6179,6 +6179,108 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
 }
 
 #[test]
+fn verification_plan_occurrences_keep_distinct_identity_after_failed_initial_check() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let command = test_command_script("verification_identity");
+    let requirement = AgentVerificationRequirement::new(
+        command_script_scope_digest_with_policy(
+            &command,
+            ".",
+            5,
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ),
+        1,
+    );
+    let mut failed_command = ModelTurnResponse::completed(
+        "model_request_turn_verification_identity_0",
+        "response_identity",
+        "",
+    );
+    failed_command.tool_calls.push(tool_call(
+        "failed_verification_identity",
+        "command",
+        serde_json::json!({
+            "command": command,
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let mut events = Vec::new();
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![failed_command],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        allow_read_execute_policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentAlwaysFailBackend),
+    )
+    .run_with_events(
+        &AgentLoopInput::new(
+            "thread_verification_identity",
+            "turn_verification_identity",
+            "run the verification",
+        )
+        .with_max_turns(1)
+        .with_verification_requirements([requirement]),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed, "result={result:?}");
+    let plan_events = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::VerificationPlan(value)) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(plan_events.len(), 4, "result={result:?}");
+    assert!(matches!(
+        plan_events[0].lifecycle,
+        OccurrenceLifecycle::Started { .. }
+    ));
+    assert!(matches!(
+        plan_events[1].lifecycle,
+        OccurrenceLifecycle::Finished {
+            status: VerificationPlanStatus::Rejected,
+            ..
+        }
+    ));
+    assert!(matches!(
+        plan_events[2].lifecycle,
+        OccurrenceLifecycle::Started { .. }
+    ));
+    assert!(matches!(
+        plan_events[3].lifecycle,
+        OccurrenceLifecycle::Finished {
+            status: VerificationPlanStatus::Planned,
+            ..
+        }
+    ));
+    assert_eq!(
+        plan_events[0].identity.occurrence_id,
+        plan_events[1].identity.occurrence_id
+    );
+    assert_eq!(
+        plan_events[2].identity.occurrence_id,
+        plan_events[3].identity.occurrence_id
+    );
+    assert_ne!(
+        plan_events[0].identity.occurrence_id,
+        plan_events[2].identity.occurrence_id
+    );
+}
+
+#[test]
 fn command_mutation_keeps_verification_span_identity_after_plan_invalidation() {
     let workspace = tempfile::tempdir().expect("workspace");
     let fixture_name = "README.md";
