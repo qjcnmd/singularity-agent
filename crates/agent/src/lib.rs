@@ -2140,6 +2140,10 @@ impl AgentLoopState {
         };
         active.plan.attempt = self.repair_attempts.saturating_add(1);
         active.plan.required_revision = Some(revision);
+        // A mutation invalidates the previous revision's verification requirements before the
+        // next plan is installed. Bind the prospective repair to that cleared requirement set so
+        // the durable mutation checkpoint remains internally consistent until replanning.
+        active.plan.required_check_count = self.completion.required_command_count();
     }
 
     fn note_repair_verification_binding(&mut self) {

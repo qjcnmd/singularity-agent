@@ -9747,6 +9747,164 @@ fn changed_same_tool_retry_commits_after_revision_bound_verification() {
 }
 
 #[test]
+fn repair_mutation_checkpoint_commits_the_new_revision_before_replanning() {
+    let workspace = tempfile::tempdir().expect("repair checkpoint workspace");
+    let fixture_name = "repair_checkpoint.txt";
+    std::fs::write(workspace.path().join(fixture_name), "v0")
+        .expect("write repair checkpoint fixture");
+    let command = test_command_script("repair checkpoint verification");
+
+    let edit_response = |turn: u32, call_id: &str, expected: &str, replacement: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_repair_checkpoint_{turn}"),
+            format!("response_checkpoint_{turn}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "edit",
+            serde_json::json!({
+                "path": fixture_name,
+                "expected": expected,
+                "replacement": replacement,
+            }),
+        ));
+        response
+    };
+    let plan_response = |turn: u32, call_id: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_repair_checkpoint_{turn}"),
+            format!("response_checkpoint_{turn}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "update_plan",
+            serde_json::json!({
+                "steps": [{"step": "repair and verify the fixture", "status": "completed"}],
+                "verification": [{
+                    "risk": "general_mutation",
+                    "evidence": format!("changed {fixture_name}"),
+                    "affected_path": fixture_name,
+                    "affected_symbol": fixture_name,
+                    "current_gap": "the current revision still needs verification",
+                    "action": {
+                        "command": command,
+                        "cwd": ".",
+                        "timeout_seconds": 5,
+                        "sandbox_mode": "workspace_write",
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                }]
+            }),
+        ));
+        response
+    };
+    let command_response = |turn: u32, call_id: &str| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_repair_checkpoint_{turn}"),
+            format!("response_checkpoint_{turn}"),
+            "",
+        );
+        response.tool_calls.push(tool_call(
+            call_id,
+            "command",
+            serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+        ));
+        response
+    };
+    let final_response = ModelTurnResponse::completed(
+        "model_request_turn_repair_checkpoint_6",
+        "response_checkpoint_6",
+        "done",
+    );
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit_response(0, "edit_revision_1", "v0", "v1"),
+                plan_response(1, "plan_revision_1"),
+                command_response(2, "command_revision_1"),
+                edit_response(3, "edit_revision_2", "v1", "v2"),
+                plan_response(4, "plan_revision_2"),
+                command_response(5, "command_revision_2"),
+                final_response,
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind repair checkpoint workspace")
+            .with_sandbox_backend(AgentFailThenSucceedBackend {
+                calls: AtomicUsize::new(0),
+            }),
+    );
+    let input = AgentLoopInput::new(
+        "thread_repair_checkpoint",
+        "turn_repair_checkpoint",
+        "repair and verify the fixture",
+    )
+    .with_max_turns(7);
+    let mut checkpoint_events = Vec::new();
+    let result =
+        agent_loop.run_with_events_and_checkpoints(&input, &mut |_event| Ok(()), &mut |event| {
+            checkpoint_events.push(event);
+            Ok(())
+        });
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    let second_mutation = checkpoint_events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.phase,
+                TurnCheckpointPhase::ToolResultsCommitted { tool_call_ids }
+                    if tool_call_ids == &["edit_revision_2".to_string()]
+            )
+        })
+        .expect("second mutation checkpoint");
+    let checkpoint = second_mutation
+        .checkpoint
+        .encode()
+        .expect("second mutation checkpoint encodes");
+    assert_eq!(checkpoint["completion"]["workspace_revision"], 2);
+    assert_eq!(checkpoint["repair_plan"]["plan"]["required_revision"], 2);
+    assert_eq!(checkpoint["repair_plan"]["plan"]["required_check_count"], 0);
+    let edit_result = checkpoint["tool_result_occurrences"]
+        .as_array()
+        .expect("checkpoint tool results")
+        .iter()
+        .find(|occurrence| occurrence["result"]["tool_call_id"] == "edit_revision_2")
+        .expect("second edit tool result");
+    assert_eq!(
+        edit_result["workspace_observation"],
+        serde_json::json!({"revision": 2, "mutation": "changed"})
+    );
+    assert!(!checkpoint_events.iter().any(|event| {
+        matches!(
+            event.phase,
+            TurnCheckpointPhase::ToolResultsCommitted { .. }
+        ) && event.checkpoint.encode().is_err()
+    }));
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join(fixture_name)).expect("read fixture"),
+        "v2"
+    );
+}
+
+#[test]
 fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
     let workspace = tempfile::tempdir().expect("repair budget workspace");
     let fixture_name = "repair_budget.txt";
