@@ -128,12 +128,18 @@ pub(super) fn run_raw_command(
         cwd.to_string_lossy().into_owned(),
         workspace.to_string_lossy().into_owned(),
     );
-    execute_command_request(request, timeout_seconds, network, sandbox_backend)
+    execute_command_request(
+        request,
+        timeout_seconds,
+        network,
+        SandboxFilesystemMode::WorkspaceWrite,
+        sandbox_backend,
+    )
 }
 
 /// 执行产品控制面固定的工作区准备操作。
 ///
-/// 该边界仅用于 clone/checkout/init 等 Evaluation 内部步骤；manifest 命令和模型脚本仍走
+/// 该边界仅用于 remote source probe、clone/checkout/init 等 Evaluation 内部步骤；manifest 命令和模型脚本仍走
 /// protected-path enforcement 完整开启的普通路径。
 pub(super) fn run_workspace_preparation_command(
     workspace: &Path,
@@ -151,18 +157,54 @@ pub(super) fn run_workspace_preparation_command(
         cwd.to_string_lossy().into_owned(),
         workspace.to_string_lossy().into_owned(),
     );
-    execute_command_request(request, timeout_seconds, network, sandbox_backend)
+    execute_command_request(
+        request,
+        timeout_seconds,
+        network,
+        SandboxFilesystemMode::WorkspaceWrite,
+        sandbox_backend,
+    )
+}
+
+/// 执行只读的 Evaluation 远程 source 可达性探针。
+///
+/// 请求仍使用 trusted workspace-preparation 来源以复用同一严格 adapter，但只允许读取，
+/// 因而不会把 `git ls-remote` 的网络探针变成 workspace 写入操作。
+pub(super) fn run_workspace_preparation_read_only_command(
+    workspace: &Path,
+    cwd: &Path,
+    argv: Vec<String>,
+    timeout_seconds: u64,
+    network: SandboxNetworkMode,
+    sandbox_backend: SharedSandboxBackend,
+) -> CommandResult {
+    let workspace = canonical_or_original(workspace);
+    let cwd = canonical_or_original(cwd);
+    let request = CommandRequest::trusted_workspace_preparation(
+        next_command_id(),
+        argv,
+        cwd.to_string_lossy().into_owned(),
+        workspace.to_string_lossy().into_owned(),
+    );
+    execute_command_request(
+        request,
+        timeout_seconds,
+        network,
+        SandboxFilesystemMode::ReadOnly,
+        sandbox_backend,
+    )
 }
 
 fn execute_command_request(
     mut request: CommandRequest,
     timeout_seconds: u64,
     network: SandboxNetworkMode,
+    filesystem: SandboxFilesystemMode,
     sandbox_backend: SharedSandboxBackend,
 ) -> CommandResult {
     request.timeout_seconds = timeout_seconds;
     request.network.mode = network;
-    request.filesystem.mode = SandboxFilesystemMode::WorkspaceWrite;
+    request.filesystem.mode = filesystem;
     request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
     sandbox_backend.execute(&request)
 }
@@ -220,7 +262,8 @@ pub(super) fn infrastructure_blocker(
     }
     match result.execution_status {
         CommandExecutionStatus::Completed
-            if result.workspace_mutation == singularity_tools::WorkspaceMutation::Unknown =>
+            if result.semantic_status == CommandSemanticStatus::Succeeded
+                && result.workspace_mutation == singularity_tools::WorkspaceMutation::Unknown =>
         {
             Some(evaluation_blocker(
                 BlockerKind::Sandbox,
@@ -389,17 +432,19 @@ mod tests {
 
     #[test]
     fn completed_nonzero_errors_are_semantic_failures() {
-        for (stdout, stderr) in [
-            ("", "Filename too long"),
-            ("THE FILENAME OR EXTENSION IS TOO LONG", ""),
-            ("os error 206", ""),
-            ("", "fatal error LNK1104: cannot open file 'missing.obj'"),
-        ] {
-            let result = CommandResult::executed("path_error", 101, 0, stdout, stderr, false)
-                .with_workspace_mutation(WorkspaceMutation::Unchanged)
-                .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict);
+        for mutation in [WorkspaceMutation::Unchanged, WorkspaceMutation::Unknown] {
+            for (stdout, stderr) in [
+                ("", "Filename too long"),
+                ("THE FILENAME OR EXTENSION IS TOO LONG", ""),
+                ("os error 206", ""),
+                ("", "fatal error LNK1104: cannot open file 'missing.obj'"),
+            ] {
+                let result = CommandResult::executed("path_error", 101, 0, stdout, stderr, false)
+                    .with_workspace_mutation(mutation)
+                    .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict);
 
-            assert!(infrastructure_blocker(&result, "verification command failed").is_none());
+                assert!(infrastructure_blocker(&result, "verification command failed").is_none());
+            }
         }
     }
 

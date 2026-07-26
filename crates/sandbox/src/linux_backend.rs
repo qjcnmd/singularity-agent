@@ -49,6 +49,26 @@ const SANDBOX_CHILD_CANCELLED: &str = "linux sandbox command cancelled";
 const SANDBOX_CHILD_TIMED_OUT: &str = "linux sandbox command timed out";
 const SANDBOX_HOME: &str = "/run/singularity-home";
 
+/// Read-only system roots needed by dynamically dispatched executables.
+///
+/// `/usr/libexec` is intentionally an execute/read-only root rather than a
+/// tool-specific exception: compiler drivers commonly dispatch helpers from
+/// this standard system location (for example, `collect2`).
+const STANDARD_RUNTIME_ROOTS: [&str; 12] = [
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/local/bin",
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/libexec",
+    "/usr/share/nodejs",
+    "/proc",
+];
+
 // Serialize only clone through the child's inherited-FD cleanup ack; command execution stays parallel.
 static CHILD_LAUNCH_GATE: Mutex<()> = Mutex::new(());
 
@@ -1460,21 +1480,9 @@ fn runtime_environment(
 }
 
 fn is_standard_runtime_path(path: &Path) -> bool {
-    [
-        "/bin",
-        "/sbin",
-        "/usr/bin",
-        "/usr/sbin",
-        "/usr/local/bin",
-        "/lib",
-        "/lib64",
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/share/nodejs",
-        "/proc",
-    ]
-    .into_iter()
-    .any(|root| path.starts_with(Path::new(root)))
+    STANDARD_RUNTIME_ROOTS
+        .into_iter()
+        .any(|root| path.starts_with(Path::new(root)))
 }
 
 fn python_venv_root(invocation: &Path) -> Option<PathBuf> {
@@ -4546,19 +4554,7 @@ fn prepare_landlock_rules(
         path: path_cstring(&prepared.workspace).map_err(|_| LinuxSandboxError::Unavailable)?,
         allowed_access: workspace_access,
     }];
-    for root in [
-        "/bin",
-        "/sbin",
-        "/usr/bin",
-        "/usr/sbin",
-        "/usr/local/bin",
-        "/lib",
-        "/lib64",
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/share/nodejs",
-        "/proc",
-    ] {
+    for root in STANDARD_RUNTIME_ROOTS {
         if Path::new(root).is_dir() {
             rules.push(LandlockRule {
                 path: CString::new(root).map_err(|_| LinuxSandboxError::Unavailable)?,

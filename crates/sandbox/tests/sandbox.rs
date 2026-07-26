@@ -1201,7 +1201,7 @@ time.sleep(30)
         fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
         let result = strict_backend().execute(&request(
             "linux_rustup_cargo",
-            &["cargo", "check", "--offline", "--quiet"],
+            &["cargo", "test", "--offline", "--quiet"],
             workspace.path(),
             SandboxFilesystemMode::WorkspaceWrite,
             SandboxNetworkMode::Denied,

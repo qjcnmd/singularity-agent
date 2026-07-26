@@ -60,7 +60,8 @@ mod workspace;
 
 use command::{
     CommandDiagnostic, command_blocker, command_succeeded, infrastructure_blocker,
-    run_command_spec, run_workspace_preparation_command, sandbox_network_mode,
+    run_command_spec, run_workspace_preparation_command,
+    run_workspace_preparation_read_only_command, sandbox_network_mode,
 };
 use evidence::{
     agent_command_observation, build_evaluation_evidence, build_preflight_evidence,
@@ -367,6 +368,7 @@ struct EvaluationRunContext<'a> {
     sandbox_preflight: &'a SandboxPreflightReport,
 }
 
+#[derive(Debug)]
 struct SandboxPreflightFailure {
     report: SandboxPreflightReport,
     blocker: EvaluationBlocker,
@@ -3071,6 +3073,58 @@ fn sandbox_preflight_fact(fact: SandboxPreflightFact) -> EvaluationSandboxPrefli
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteSourcePreflightFailure {
+    Cancelled,
+    Probe,
+}
+
+fn remote_git_repositories(plans: &[WorkspacePlan]) -> Vec<String> {
+    let mut repositories = Vec::new();
+    for plan in plans {
+        let PlannedWorkspaceSource::RemoteGit { repository, .. } = &plan.source else {
+            continue;
+        };
+        let repository = repository.as_str().to_string();
+        if !repositories.contains(&repository) {
+            repositories.push(repository);
+        }
+    }
+    repositories
+}
+
+/// Verify each remote repository transport before sampling; `ls-remote` has no workspace side effect.
+fn preflight_remote_sources(
+    scratch: &Path,
+    plans: &[WorkspacePlan],
+    sandbox_backend: &SharedSandboxBackend,
+    cancellation: &CancellationToken,
+) -> Result<(), RemoteSourcePreflightFailure> {
+    for repository in remote_git_repositories(plans) {
+        if cancellation.is_cancelled() {
+            return Err(RemoteSourcePreflightFailure::Cancelled);
+        }
+        let result = run_workspace_preparation_read_only_command(
+            scratch,
+            scratch,
+            vec![
+                "git".to_string(),
+                "ls-remote".to_string(),
+                "--exit-code".to_string(),
+                "--no-tags".to_string(),
+                repository,
+            ],
+            GIT_TIMEOUT_SECONDS,
+            SandboxNetworkMode::Allowed,
+            Arc::clone(sandbox_backend),
+        );
+        if !command_succeeded(&result) {
+            return Err(RemoteSourcePreflightFailure::Probe);
+        }
+    }
+    Ok(())
+}
+
 fn run_sandbox_preflight(
     run_dir: &Path,
     plans: &[WorkspacePlan],
@@ -3123,6 +3177,23 @@ fn run_sandbox_preflight(
         }));
     }
     let mut report = sandbox_backend.preflight(&scratch, cancellation);
+    if report.outcome == SandboxPreflightOutcome::Supported {
+        match preflight_remote_sources(&scratch, plans, sandbox_backend, cancellation) {
+            Ok(()) => {}
+            Err(RemoteSourcePreflightFailure::Cancelled) => {
+                report.outcome = SandboxPreflightOutcome::Unsupported;
+                report.error_code = Some("sandbox_preflight_cancelled".to_string());
+                report.missing_capabilities.push("cancellation".to_string());
+            }
+            Err(RemoteSourcePreflightFailure::Probe) => {
+                report.outcome = SandboxPreflightOutcome::Unsupported;
+                report.error_code = Some("sandbox_preflight_remote_source_unavailable".to_string());
+                report
+                    .missing_capabilities
+                    .push("remote_git_source".to_string());
+            }
+        }
+    }
     let trusted_git_required = plans.iter().any(|plan| {
         matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. })
             || plan.baseline.test_patch.is_some()
@@ -4511,6 +4582,59 @@ mod tests {
         }
     }
 
+    struct RemoteSourceProbeBackend {
+        calls: AtomicUsize,
+        fail_probe: bool,
+    }
+
+    impl SandboxBackend for RemoteSourceProbeBackend {
+        fn name(&self) -> &'static str {
+            "remote_source_probe_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn preflight(
+            &self,
+            _workspace: &Path,
+            _cancellation: &CancellationToken,
+        ) -> SandboxPreflightReport {
+            supported_sandbox_preflight(self.name())
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if request.argv.get(1).map(String::as_str) == Some("ls-remote") {
+                assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
+                assert!(request.is_trusted_workspace_preparation());
+                assert_eq!(request.filesystem.mode, SandboxFilesystemMode::ReadOnly);
+                assert_eq!(request.argv.len(), 5);
+                assert_eq!(request.argv[4], "https://example.invalid/preflight.git");
+                let result = if self.fail_probe {
+                    CommandResult::executed(
+                        &request.command_id,
+                        2,
+                        0,
+                        "",
+                        "remote source unavailable",
+                        false,
+                    )
+                } else {
+                    CommandResult::completed(&request.command_id, "remote source reachable")
+                };
+                return result
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
+            assert!(request.is_trusted_workspace_preparation());
+            CommandResult::completed(&request.command_id, "prepared")
+                .with_workspace_mutation(WorkspaceMutation::Changed)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
     struct UnknownPreparationBackend {
         executions: Arc<AtomicUsize>,
     }
@@ -4534,6 +4658,15 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             self.executions.fetch_add(1, Ordering::SeqCst);
+            if request.argv.get(1).map(String::as_str) == Some("ls-remote") {
+                assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
+                assert!(request.is_trusted_workspace_preparation());
+                assert_eq!(request.filesystem.mode, SandboxFilesystemMode::ReadOnly);
+                assert_eq!(request.argv.len(), 5);
+                return CommandResult::completed(&request.command_id, "remote source reachable")
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
             assert!(request.is_trusted_workspace_preparation());
             CommandResult::completed(&request.command_id, "unverified")
                 .with_workspace_mutation(WorkspaceMutation::Unknown)
@@ -4885,17 +5018,28 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         let run_dir = temp.path().join("run");
         fs::create_dir(&run_dir).expect("run directory");
+        let fixture = temp.path().join("fixture");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed\n").expect("fixture README");
         let manifest_path = write_preflight_manifest(
             temp.path(),
             "native-linux-preflight",
             "native preflight verifies trusted Git preparation",
             1,
-            json!({
-                "type": "remote_git",
-                "repository": "https://example.invalid/preflight.git",
-                "commit": "0000000000000000000000000000000000000000"
-            }),
+            json!({"type": "local", "path": "fixture"}),
         );
+        let mut manifest_value: Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).expect("manifest"))
+                .expect("manifest JSON");
+        manifest_value["tasks"][0]["evaluator"]["public_test_patch"] = json!({
+            "format": "unified_diff",
+            "content": "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-seed\n+patched\n"
+        });
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest_value).expect("manifest JSON"),
+        )
+        .expect("write trusted-preparation manifest");
         let manifest_json = fs::read_to_string(&manifest_path).expect("manifest");
         let manifest = EvaluationManifest::from_json_str(&manifest_json, temp.path())
             .expect("evaluation manifest");
@@ -5117,6 +5261,101 @@ mod tests {
     }
 
     #[test]
+    fn remote_source_preflight_probes_repository_before_trusted_setup() {
+        let temp = tempfile::tempdir().expect("temp");
+        let run_dir = temp.path().join("run");
+        fs::create_dir(&run_dir).expect("run directory");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "remote-source-preflight",
+            "remote source preflight probes repository transport",
+            1,
+            json!({
+                "type": "remote_git",
+                "repository": "https://example.invalid/preflight.git",
+                "commit": "0000000000000000000000000000000000000000"
+            }),
+        );
+        let manifest_json = fs::read_to_string(&manifest_path).expect("manifest");
+        let manifest = EvaluationManifest::from_json_str(&manifest_json, temp.path())
+            .expect("evaluation manifest");
+        let plans = manifest
+            .task_set()
+            .tasks
+            .iter()
+            .map(|task| {
+                manifest
+                    .workspace_plan(&task.task_id)
+                    .expect("workspace plan")
+            })
+            .collect::<Vec<_>>();
+        let backend = Arc::new(RemoteSourceProbeBackend {
+            calls: AtomicUsize::new(0),
+            fail_probe: false,
+        });
+        let shared: SharedSandboxBackend = backend.clone();
+        let report = run_sandbox_preflight(&run_dir, &plans, &shared, &CancellationToken::new())
+            .expect("reachable remote source must pass preflight");
+
+        assert_eq!(report.outcome, SandboxPreflightOutcome::Supported);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        assert!(!run_dir.join(".sandbox-preflight").exists());
+    }
+
+    #[test]
+    fn unreachable_remote_repository_blocks_before_provider_sampling() {
+        let temp = tempfile::tempdir().expect("temp");
+        let output_root = temp.path().join("output");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "remote-source-blocked",
+            "remote source preflight blocks unavailable source",
+            2,
+            json!({
+                "type": "remote_git",
+                "repository": "https://example.invalid/preflight.git",
+                "commit": "0000000000000000000000000000000000000000"
+            }),
+        );
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "remote-source-blocked-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let backend = Arc::new(RemoteSourceProbeBackend {
+            calls: AtomicUsize::new(0),
+            fail_probe: true,
+        });
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let response = run_evaluation(
+            &params,
+            backend.clone(),
+            &ProviderConfigSnapshot::capture(|_| None),
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("remote source blocker publishes typed artifacts");
+
+        assert_eq!(response.status, "blocked");
+        assert!(response.tasks.is_empty());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result path"))
+                .expect("result artifact"),
+        )
+        .expect("result v8");
+        assert_eq!(result.summary.configured_trial_count, 2);
+        assert_eq!(result.summary.sampled_trial_count, 0);
+        assert_eq!(
+            result
+                .blocker
+                .as_ref()
+                .and_then(|blocker| blocker.code.as_deref()),
+            Some("sandbox_preflight_remote_source_unavailable")
+        );
+    }
+
+    #[test]
     fn unverified_trusted_preparation_blocks_before_trials_or_provider() {
         let temp = tempfile::tempdir().expect("temp");
         let output_root = temp.path().join("output");
@@ -5152,7 +5391,7 @@ mod tests {
 
         assert_eq!(response.status, "blocked");
         assert!(response.tasks.is_empty());
-        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
         let result = EvaluationResult::from_json_str(
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
