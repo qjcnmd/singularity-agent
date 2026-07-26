@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::iter::once;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -41,6 +40,8 @@ const RESTRICTED_FAILURE_PREFIX: &str = "restricted-token Windows sandbox failed
 const PROTECTED_PATH_ENFORCEMENT_FAILED: &str = "protected workspace path enforcement failed";
 const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
     "capability_not_supported:workspace_change_summary";
+const TRUSTED_PREPARATION_UNSUPPORTED_CODE: &str =
+    "sandbox_preflight_trusted_preparation_unsupported";
 
 #[derive(Debug)]
 struct ResolvedExecutable {
@@ -112,93 +113,10 @@ impl SandboxBackend for WindowsSandboxBackend {
             report.unsupported("sandbox_preflight_cancelled", &["cancellation"]);
             return report;
         }
-        const PROBE_FILE: &str = "singularity-preflight.txt";
-        let result = super::preflight_command(
-            self,
-            workspace,
-            vec![
-                "cmd.exe".to_string(),
-                "/C".to_string(),
-                format!("echo preflight>{PROBE_FILE}"),
-            ],
-            SandboxNetworkMode::Denied,
-            cancellation,
-            "write",
-        );
-        if super::preflight_write_verified(&result, PROBE_FILE) {
-            report.transactional_workspace = SandboxPreflightFact::Passed;
-            let network_denied = TcpListener::bind("127.0.0.1:0")
-                .ok()
-                .and_then(|listener| {
-                    listener.set_nonblocking(true).ok()?;
-                    let port = listener.local_addr().ok()?.port();
-                    let result = super::preflight_command(
-                        self,
-                        workspace,
-                        vec![
-                            "powershell.exe".to_string(),
-                            "-NoProfile".to_string(),
-                            "-NonInteractive".to_string(),
-                            "-Command".to_string(),
-                            format!(
-                                "$c=[Net.Sockets.TcpClient]::new();try{{$c.Connect('127.0.0.1',{port});$c.Dispose();exit 0}}catch{{$c.Dispose();exit 42}}"
-                            ),
-                        ],
-                        SandboxNetworkMode::Denied,
-                        cancellation,
-                        "network_denied",
-                    );
-                    let no_connection = listener.accept().is_err_and(|error| {
-                        error.kind() == std::io::ErrorKind::WouldBlock
-                    });
-                    Some(
-                        result.execution_status == CommandExecutionStatus::Completed
-                            && result.exit_code == Some(42)
-                            && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
-                            && !result.sandbox.local_process_fallback
-                            && no_connection,
-                    )
-                })
-                .unwrap_or(false);
-            let protected_denied = preflight_protected_write_denied(self, workspace, cancellation);
-            report.network_denied = fact(network_denied);
-            report.protected_paths = fact(protected_denied);
-            if network_denied && protected_denied {
-                report.outcome = super::SandboxPreflightOutcome::Supported;
-                report.error_code = None;
-            } else {
-                let mut missing = Vec::new();
-                if !network_denied {
-                    missing.push("network_denied");
-                }
-                if !protected_denied {
-                    missing.push("protected_metadata_admission");
-                }
-                report.unsupported("sandbox_preflight_policy_probe_failed", &missing);
-            }
-        } else {
-            report.transactional_workspace = SandboxPreflightFact::Failed;
-            report.network_denied = SandboxPreflightFact::Failed;
-            report.protected_paths = SandboxPreflightFact::Failed;
-            if result
-                .stderr_preview
-                .contains("unsupported_nested_git_marker:")
-            {
-                report.unsupported(
-                    "sandbox_preflight_workspace_layout",
-                    &["workspace_layout", "protected_metadata_admission"],
-                );
-            } else {
-                report.unsupported(
-                    "sandbox_preflight_write_unverified",
-                    &[
-                        "transactional_workspace",
-                        "network_denied",
-                        "protected_metadata_admission",
-                    ],
-                );
-            }
-        }
+        // Windows trusted preparation currently has no isolated staging, drift ownership,
+        // or failure/cancellation rollback. Do not write a probe into the real workspace or
+        // advertise transactional capability until that contract is implemented.
+        mark_trusted_preparation_unsupported(&mut report);
         report
     }
 
@@ -312,75 +230,13 @@ impl SandboxBackend for WindowsSandboxBackend {
     }
 }
 
-fn fact(available: bool) -> SandboxPreflightFact {
-    if available {
-        SandboxPreflightFact::Passed
-    } else {
-        SandboxPreflightFact::Failed
-    }
-}
-
-fn preflight_protected_write_denied(
-    backend: &WindowsSandboxBackend,
-    workspace: &Path,
-    cancellation: &CancellationToken,
-) -> bool {
-    const SENTINEL: &str = "protected-sentinel";
-    let protected_dir = workspace.join(".git");
-    let protected_file = protected_dir.join("singularity-preflight-protected.txt");
-    if std::fs::create_dir(&protected_dir).is_err()
-        || std::fs::write(&protected_file, SENTINEL).is_err()
-    {
-        let _ = std::fs::remove_dir_all(&protected_dir);
-        return false;
-    }
-    let read_result = super::preflight_command(
-        backend,
-        workspace,
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "type .git\\singularity-preflight-protected.txt".to_string(),
-        ],
-        SandboxNetworkMode::Denied,
-        cancellation,
-        "protected_read",
+/// Mark Windows Evaluation preflight unsupported until trusted preparation is transactional.
+fn mark_trusted_preparation_unsupported(report: &mut SandboxPreflightReport) {
+    report.transactional_workspace = SandboxPreflightFact::Failed;
+    report.unsupported(
+        TRUSTED_PREPARATION_UNSUPPORTED_CODE,
+        &["transactional_workspace", "trusted_workspace_preparation"],
     );
-    let write_result = super::preflight_command(
-        backend,
-        workspace,
-        vec![
-            "cmd.exe".to_string(),
-            "/C".to_string(),
-            "echo tampered>.git\\singularity-preflight-protected.txt".to_string(),
-        ],
-        SandboxNetworkMode::Denied,
-        cancellation,
-        "protected_write",
-    );
-    let preserved = std::fs::read_to_string(&protected_file).ok().as_deref() == Some(SENTINEL);
-    let cleanup_succeeded = std::fs::remove_dir_all(&protected_dir).is_ok();
-    preserved
-        && cleanup_succeeded
-        && protected_probe_denied(&read_result)
-        && !read_result.stdout_preview.contains(SENTINEL)
-        && protected_probe_denied(&write_result)
-}
-
-fn protected_probe_denied(result: &CommandResult) -> bool {
-    let classified = match result.execution_status {
-        CommandExecutionStatus::PolicyDenied => {
-            result.semantic_status == CommandSemanticStatus::PolicyBlocked
-        }
-        CommandExecutionStatus::Completed => {
-            result.semantic_status != CommandSemanticStatus::Succeeded
-                && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
-        }
-        _ => false,
-    };
-    classified
-        && result.workspace_mutation != WorkspaceMutation::Changed
-        && !result.sandbox.local_process_fallback
 }
 
 #[cfg(windows)]
@@ -1258,6 +1114,7 @@ fn is_evaluation_host_environment(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::CommandExecutionStatus;
+    use crate::SandboxPreflightOutcome;
     use std::fs;
     use std::io::Write;
 
@@ -1265,6 +1122,33 @@ mod tests {
         let mut file = fs::File::create(path).expect("create test file");
         file.write_all(contents.as_bytes())
             .expect("write test file");
+    }
+
+    #[test]
+    fn preflight_rejects_untransactional_trusted_preparation_without_writing_probe() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let report =
+            WindowsSandboxBackend::new().preflight(workspace.path(), &CancellationToken::new());
+
+        assert_eq!(report.outcome, SandboxPreflightOutcome::Unsupported);
+        assert_eq!(report.transactional_workspace, SandboxPreflightFact::Failed);
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some(TRUSTED_PREPARATION_UNSUPPORTED_CODE)
+        );
+        assert!(
+            report
+                .missing_capabilities
+                .iter()
+                .any(|capability| capability == "trusted_workspace_preparation")
+        );
+        assert!(!workspace.path().join("singularity-preflight.txt").exists());
+        assert!(
+            fs::read_dir(workspace.path())
+                .expect("read workspace")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

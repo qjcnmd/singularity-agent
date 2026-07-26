@@ -939,6 +939,7 @@ pub(crate) fn default_sandbox_preflight(
     report
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn preflight_command(
     backend: &(impl SandboxBackend + ?Sized),
     workspace: &Path,
@@ -959,6 +960,7 @@ pub(crate) fn preflight_command(
     backend.execute_cancellable(&request, cancellation)
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn preflight_write_verified(
     result: &CommandResult,
     expected_relative_path: &str,
