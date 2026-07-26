@@ -1496,6 +1496,94 @@ fn provider_config_snapshot_preserves_the_original_configuration_error() {
 }
 
 #[test]
+fn process_env_provider_values_fail_before_adapter_attempt_and_redact_input() {
+    for (name, malformed) in [
+        ("SINGULARITY_MODEL", "gpt-test\r"),
+        ("SINGULARITY_BASE_URL", "https://provider.example/v1\r"),
+        ("SINGULARITY_API_KEY", "sk-secret-value\r"),
+        ("SINGULARITY_MODEL", "gpt\n-test"),
+        ("SINGULARITY_BASE_URL", "https://provider.example/v1\0"),
+    ] {
+        let snapshot = ProviderConfigSnapshot::capture(|candidate| match candidate {
+            "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
+                malformed.to_string()
+            } else {
+                "gpt-test".to_string()
+            }),
+            "SINGULARITY_BASE_URL" => Some(if name == "SINGULARITY_BASE_URL" {
+                malformed.to_string()
+            } else {
+                "https://provider.example/v1".to_string()
+            }),
+            "SINGULARITY_API_KEY" => Some(if name == "SINGULARITY_API_KEY" {
+                malformed.to_string()
+            } else {
+                "sk-secret-value".to_string()
+            }),
+            _ => None,
+        });
+
+        assert!(!snapshot.configuration().configured);
+        let error = snapshot
+            .provider()
+            .expect_err("malformed process environment must fail before provider creation");
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_configuration_invalid")
+        );
+        assert_eq!(
+            error.error.stage,
+            Some(ProviderErrorStage::ClientInitialization)
+        );
+        assert!(
+            error.provider_attempt_metadata.is_none(),
+            "configuration rejection must not create provider attempts"
+        );
+        assert!(!error.message.contains(malformed));
+        assert!(
+            !serde_json::to_string(&error.error)
+                .expect("serialize configuration error")
+                .contains(malformed)
+        );
+    }
+}
+
+#[test]
+fn process_env_provider_values_reject_boundary_whitespace() {
+    for (name, malformed) in [
+        ("SINGULARITY_MODEL", " gpt-test"),
+        ("SINGULARITY_BASE_URL", "https://provider.example/v1 "),
+        ("SINGULARITY_API_KEY", "sk-secret-value\t"),
+    ] {
+        let error = OpenAiProviderConfig::from_env(|candidate| match candidate {
+            "SINGULARITY_MODEL" => Some(if name == "SINGULARITY_MODEL" {
+                malformed.to_string()
+            } else {
+                "gpt-test".to_string()
+            }),
+            "SINGULARITY_BASE_URL" => Some(if name == "SINGULARITY_BASE_URL" {
+                malformed.to_string()
+            } else {
+                "https://provider.example/v1".to_string()
+            }),
+            "SINGULARITY_API_KEY" => Some(if name == "SINGULARITY_API_KEY" {
+                malformed.to_string()
+            } else {
+                "sk-secret-value".to_string()
+            }),
+            _ => None,
+        })
+        .expect_err("boundary whitespace must be rejected");
+
+        assert_eq!(
+            error.error.code.as_deref(),
+            Some("provider_configuration_invalid")
+        );
+        assert!(!error.message.contains(malformed));
+    }
+}
+
+#[test]
 fn provider_response_decode_and_envelope_failures_have_stable_safe_diagnostics() {
     let malformed_url = single_response_server("HTTP/1.1 200 OK", "not-json");
     let malformed =
@@ -1648,6 +1736,60 @@ fn complete_project_env_configuration_has_project_file_provenance() {
     assert_eq!(config.source, ProviderConfigSource::ProjectEnvFile);
     assert_eq!(config.provider_name, "openai_compatible");
     assert_eq!(config.model_name, "project-model");
+}
+
+#[test]
+fn project_env_crlf_line_endings_are_parsed_without_control_characters() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        temp.path().join(".env"),
+        concat!(
+            "SINGULARITY_MODEL_PROVIDER=openai_compatible\r\n",
+            "SINGULARITY_MODEL=project-model\r\n",
+            "SINGULARITY_BASE_URL=https://project-provider.example/v1\r\n",
+            "SINGULARITY_API_KEY=project-secret\r\n",
+        ),
+    )
+    .expect("write CRLF project env");
+
+    let config = in_current_dir(temp.path(), || {
+        OpenAiProviderConfig::from_env(|_| None).expect("CRLF dotenv should parse")
+    });
+
+    assert_eq!(config.source, ProviderConfigSource::ProjectEnvFile);
+    assert_eq!(config.model_name, "project-model");
+    assert_eq!(config.base_url, "https://project-provider.example/v1");
+}
+
+#[test]
+fn project_env_provider_values_reject_boundary_whitespace() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        temp.path().join(".env"),
+        concat!(
+            "SINGULARITY_MODEL= project-model\r\n",
+            "SINGULARITY_BASE_URL=https://project-provider.example/v1\r\n",
+            "SINGULARITY_API_KEY=project-secret\r\n",
+        ),
+    )
+    .expect("write invalid project env");
+
+    let error = in_current_dir(temp.path(), || {
+        OpenAiProviderConfig::from_env(|_| None).expect_err("dotenv boundary whitespace")
+    });
+
+    assert_eq!(
+        error.error.code.as_deref(),
+        Some("provider_configuration_invalid")
+    );
+    assert_eq!(
+        error.error.stage,
+        Some(ProviderErrorStage::ClientInitialization)
+    );
+    assert!(error.message.contains("SINGULARITY_MODEL"));
+    assert!(!error.message.contains("project-model"));
+    assert!(!error.message.contains("project-provider.example"));
+    assert!(!error.message.contains("project-secret"));
 }
 
 #[test]
@@ -2680,7 +2822,7 @@ fn provider_limits_default_and_configured_capabilities_are_explicit() {
         "SINGULARITY_MODEL" => Some("gpt-test".to_string()),
         "SINGULARITY_BASE_URL" => Some("https://provider.example/v1".to_string()),
         "SINGULARITY_API_KEY" => Some("sk-secret-value".to_string()),
-        "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some(" 131072 ".to_string()),
+        "SINGULARITY_MODEL_CONTEXT_TOKENS" => Some("131072".to_string()),
         "SINGULARITY_MODEL_MAX_OUTPUT_TOKENS" => Some("8192".to_string()),
         _ => None,
     })

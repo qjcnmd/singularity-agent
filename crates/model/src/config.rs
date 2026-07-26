@@ -197,6 +197,20 @@ impl OpenAiProviderConfig {
     }
 
     fn from_resolved_values(values: ResolvedProviderValues) -> Result<Self, ProviderError> {
+        validate_provider_value(values.provider_name.as_deref(), ENV_PROVIDER, values.source)?;
+        validate_provider_value(values.model_name.as_deref(), ENV_MODEL, values.source)?;
+        validate_provider_value(values.base_url.as_deref(), ENV_BASE_URL, values.source)?;
+        validate_provider_value(values.api_key.as_deref(), ENV_API_KEY, values.source)?;
+        validate_provider_value(
+            values.context_tokens.as_deref(),
+            ENV_CONTEXT_TOKENS,
+            values.source,
+        )?;
+        validate_provider_value(
+            values.max_output_tokens.as_deref(),
+            ENV_MAX_OUTPUT_TOKENS,
+            values.source,
+        )?;
         let source = values.source;
         let max_context_tokens = parse_provider_limit(
             values.context_tokens.as_deref(),
@@ -373,7 +387,7 @@ fn parse_provider_limit(
     let Some(value) = value else {
         return Ok(fallback);
     };
-    let parsed = value.trim().parse::<u32>().ok().filter(|value| *value > 0);
+    let parsed = value.parse::<u32>().ok().filter(|value| *value > 0);
     match parsed {
         Some(value) if value <= upper_bound => Ok(value),
         _ => {
@@ -392,6 +406,44 @@ fn parse_provider_limit(
             ))
         }
     }
+}
+
+fn validate_provider_value(
+    value: Option<&str>,
+    name: &str,
+    source: Option<ProviderConfigSource>,
+) -> Result<(), ProviderError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let invalid_boundary_whitespace = value
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_whitespace())
+        || value
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_whitespace());
+    if value
+        .chars()
+        .any(|character| matches!(character, '\r' | '\n' | '\0'))
+        || invalid_boundary_whitespace
+    {
+        let source = source.map_or("unconfigured", ProviderConfigSource::as_str);
+        return Err(ProviderError::from_model_error(
+            ModelError::new(
+                ModelErrorKind::InvalidRequest,
+                format!(
+                    "invalid model configuration: {name} contains forbidden control characters or boundary whitespace (source={source})"
+                ),
+            )
+            .with_provider_diagnostic(
+                "provider_configuration_invalid",
+                ProviderErrorStage::ClientInitialization,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -490,7 +542,7 @@ where
 }
 
 fn normalized_provider_value(value: Option<String>) -> Option<String> {
-    value.filter(|value| !value.trim().is_empty())
+    value.filter(|value| !value.is_empty())
 }
 
 fn project_env_layer(project_dir: &Path) -> ProviderConfigLayer {
@@ -536,7 +588,7 @@ fn read_project_env_layer(path: &Path) -> ProviderConfigLayer {
 }
 
 fn parse_env_line(line: &str) -> Option<(String, String)> {
-    let mut text = line.trim();
+    let mut text = line.trim_start();
     if text.is_empty() || text.starts_with('#') {
         return None;
     }
@@ -553,7 +605,7 @@ fn parse_env_line(line: &str) -> Option<(String, String)> {
     {
         return None;
     }
-    let mut value = value.trim();
+    let mut value = value;
     if value.len() >= 2 {
         let bytes = value.as_bytes();
         if (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')

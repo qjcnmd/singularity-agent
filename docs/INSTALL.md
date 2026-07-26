@@ -63,6 +63,8 @@ Singularity 在 app-server 启动时捕获一次配置快照：
 
 可选的 `SINGULARITY_MODEL_CONTEXT_TOKENS` 和 `SINGULARITY_MODEL_MAX_OUTPUT_TOKENS` 分别覆盖 context window 和最大输出 token 数；默认值为 `128000` 和 `4096`。前者必须为 `1..=2000000`，后者必须为 `1..=256000`，且最大输出必须严格小于 context window。
 
+Provider 配置值不会被静默 trim 或纠正。进程环境和 `.env` 中的模型、地址、密钥、provider 名称及 token limit 值如果含 `CR`、`LF`、`NUL` 或首尾空白，会在启动时以 `provider_configuration_invalid` fail closed，且不会产生任何 provider attempt；`.env` 的标准 `CRLF` 行尾仍会正常解析。
+
 工具能力由运行时自动协商，不是用户配置项；协议选择、能力缓存、工具 schema 与 fail-closed 边界以 [架构事实文档](singularity.md#7-model-与-provider) 为准。
 
 修改配置后，新启动一次 `sg` 命令即可取得新快照。不要把 `.env` 提交到 Git。
