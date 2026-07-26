@@ -8606,6 +8606,234 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
 }
 
 #[test]
+fn pre_execution_protected_exact_action_releases_pin_for_bounded_replan() {
+    let workspace = tempfile::tempdir().expect("pre-execution exact action workspace");
+    let fixture_name = "pre_execution_replan.txt";
+    std::fs::write(workspace.path().join(fixture_name), "before")
+        .expect("write pre-execution fixture");
+    let blocked_command = test_command_script("blocked");
+    let repaired_command = test_command_script("repaired");
+
+    let mut edit = ModelTurnResponse::completed(
+        "model_request_turn_pre_execution_replan_0",
+        "response_pre_execution_replan_0",
+        "",
+    );
+    edit.tool_calls.push(tool_call(
+        "edit_pre_execution_replan",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut blocked_plan = ModelTurnResponse::completed(
+        "model_request_turn_pre_execution_replan_1",
+        "response_pre_execution_replan_1",
+        "",
+    );
+    blocked_plan.tool_calls.push(tool_call(
+        "plan_pre_execution_blocked",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "verify the changed fixture", "status": "completed"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "changed pre_execution_replan.txt",
+                "affected_path": fixture_name,
+                "affected_symbol": "pre_execution_replan::value",
+                "current_gap": "the verification command has not run",
+                "action": {
+                    "command": blocked_command,
+                    "cwd": ".git",
+                    "timeout_seconds": 10,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    let mut blocked = ModelTurnResponse::completed(
+        "model_request_turn_pre_execution_replan_2",
+        "response_pre_execution_replan_2",
+        "",
+    );
+    blocked.tool_calls.push(tool_call(
+        "command_pre_execution_blocked",
+        "command",
+        serde_json::json!({
+            "command": blocked_command,
+            "cwd": ".git",
+            "timeout_seconds": 10
+        }),
+    ));
+    let mut replan_edit = ModelTurnResponse::completed(
+        "model_request_turn_pre_execution_replan_3",
+        "response_pre_execution_replan_3",
+        "",
+    );
+    replan_edit.tool_calls.push(tool_call(
+        "edit_pre_execution_replan_again",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "after",
+            "replacement": "repaired"
+        }),
+    ));
+    let mut repaired_plan = ModelTurnResponse::completed(
+        "model_request_turn_pre_execution_replan_4",
+        "response_pre_execution_replan_4",
+        "",
+    );
+    repaired_plan.tool_calls.push(tool_call(
+        "plan_pre_execution_repaired",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "verify the repaired fixture", "status": "completed"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "changed pre_execution_replan.txt",
+                "affected_path": fixture_name,
+                "affected_symbol": "pre_execution_replan::value",
+                "current_gap": "the repaired verification command has not run",
+                "action": {
+                    "command": repaired_command,
+                    "cwd": ".",
+                    "timeout_seconds": 10,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    let mut repaired = ModelTurnResponse::completed(
+        "model_request_turn_pre_execution_replan_5",
+        "response_pre_execution_replan_5",
+        "",
+    );
+    repaired.tool_calls.push(tool_call(
+        "command_pre_execution_repaired",
+        "command",
+        serde_json::json!({
+            "command": repaired_command,
+            "cwd": ".",
+            "timeout_seconds": 10
+        }),
+    ));
+    let final_response = ModelTurnResponse::completed(
+        "model_request_turn_pre_execution_replan_6",
+        "response_pre_execution_replan_6",
+        "completed",
+    );
+
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let backend_calls = Arc::new(AtomicUsize::new(0));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit,
+                blocked_plan,
+                blocked,
+                replan_edit,
+                repaired_plan,
+                repaired,
+                final_response,
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind pre-execution workspace")
+            .with_sandbox_backend(ExecutionCountingBackend {
+                calls: Arc::clone(&backend_calls),
+            }),
+    )
+    .run(
+        &AgentLoopInput::new(
+            "thread_pre_execution_replan",
+            "turn_pre_execution_replan",
+            "change and verify the fixture",
+        )
+        .with_max_turns(7),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+    assert_eq!(backend_calls.load(Ordering::SeqCst), 1);
+    assert!(result.tool_results.iter().any(|tool_result| {
+        tool_result.error_code.as_deref() == Some("protected_path")
+            && tool_result.failure_kind == Some(ToolFailureKind::ProtectedPath)
+    }));
+    assert!(
+        !result
+            .tool_results
+            .iter()
+            .any(|tool_result| tool_result.error_code.as_deref() == Some("repair_action_mismatch"))
+    );
+
+    let requests = seen_requests.lock().expect("pre-execution replan requests");
+    let blocked_request = &requests[2];
+    let blocked_schema = &blocked_request
+        .tools
+        .iter()
+        .find(|tool| tool.name == "command")
+        .expect("blocked exact command tool")
+        .parameters_schema;
+    assert_eq!(
+        blocked_schema["properties"]["cwd"]["const"],
+        serde_json::json!(".git")
+    );
+
+    let replan_request = &requests[3];
+    assert!(
+        replan_request.tools.iter().any(|tool| tool.name == "edit"),
+        "pre-execution boundary must allow a new mutation"
+    );
+    let command_schema = &replan_request
+        .tools
+        .iter()
+        .find(|tool| tool.name == "command")
+        .expect("command remains visible during replan")
+        .parameters_schema;
+    assert!(
+        command_schema["properties"]["cwd"].get("const").is_none(),
+        "pre-execution boundary must release the impossible exact action: {command_schema}"
+    );
+    let repair_feedback = replan_request
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .content
+                .starts_with("Follow the bounded repair plan.")
+        })
+        .expect("bounded replan feedback");
+    assert!(
+        repair_feedback
+            .content
+            .contains("\"repair_strategy_change_required\":true"),
+        "repair_feedback={}",
+        repair_feedback.content
+    );
+}
+
+#[test]
 fn installed_exact_actions_constrain_each_pre_gate_request_in_order() {
     let workspace = tempfile::tempdir().expect("exact action convergence workspace");
     let fixture_name = "exact_action_convergence.txt";

@@ -1995,6 +1995,13 @@ impl AgentLoopState {
         }) {
             return None;
         }
+        // A revision-bound action that is rejected before execution by a stable capability or
+        // policy boundary cannot become valid by submitting the same input again.  Release the
+        // exact pin for this repair episode so the model can make the required strategy change;
+        // input/validation and approval failures intentionally keep the pin.
+        if self.has_pre_execution_replan_failure() {
+            return None;
+        }
         let entry = self.unmet_verification_entries(None).first()?.0;
         let required_digest = command_script_scope_digest_with_policy(
             &entry.action.command,
@@ -2012,6 +2019,42 @@ impl AgentLoopState {
             return None;
         }
         Some(repair_command_tool_input(entry))
+    }
+
+    /// Return whether the current exact action hit a stable pre-execution boundary.
+    ///
+    /// The scan stops at the latest real mutation.  This keeps a failure from an older revision
+    /// from releasing the exact action installed for a later plan, without adding a second
+    /// persisted repair-state flag.  A newer invalid input or diagnostic call does not erase the
+    /// boundary: once the installed action is known to be impossible, retrying it must not be
+    /// forced through `repair_action_mismatch` again.
+    fn has_pre_execution_replan_failure(&self) -> bool {
+        let Some(plan) = self.verification_plan.as_ref() else {
+            return false;
+        };
+        for occurrence in self.tool_result_occurrences.iter().rev() {
+            let result = occurrence.result();
+            if result.workspace_observation().is_some_and(|observation| {
+                observation.mutation() == singularity_tools::WorkspaceMutation::Changed
+            }) {
+                break;
+            }
+            if !is_pre_execution_replan_failure(result) || result.tool_name != TOOL_COMMAND {
+                continue;
+            }
+            let Some(digest) = tool_result_command_scope_digest(result) else {
+                continue;
+            };
+            if plan
+                .plan
+                .checks
+                .iter()
+                .any(|check| check.requirement.command_scope_digest == digest)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Return the latest executed failure for an exact action in the current verification plan.
@@ -5355,10 +5398,6 @@ where
             }
             let provider_tool_name = (prepared.call.parse_status != ModelToolParseStatus::Valid)
                 .then_some(PROVIDER_HISTORY_REJECTED_TOOL);
-            let repair_feedback = state
-                .repair_plan
-                .is_some()
-                .then(|| state.repair_feedback_with_failure(Some(&result)));
             // Repair instructions describe current state, so replace their prior projection while
             // retaining the immutable Assistant ToolCall and ToolResult transcript.
             state.messages.retain(|message| {
@@ -5367,7 +5406,13 @@ where
                         && message.content != REPEATED_REPAIR_ACTION_MISMATCH_INSTRUCTIONS
                         && !message.content.starts_with(REPAIR_PLAN_INSTRUCTIONS))
             });
-            state.append_visible_tool_result(result, provider_tool_name);
+            // Append before projecting repair context so the current typed pre-execution failure
+            // participates in the exact-action recovery decision.
+            state.append_visible_tool_result(result.clone(), provider_tool_name);
+            let repair_feedback = state
+                .repair_plan
+                .is_some()
+                .then(|| state.repair_feedback_with_failure(Some(&result)));
             if let Some(feedback) = recovery_feedback {
                 state
                     .messages
@@ -7102,6 +7147,25 @@ fn is_repairable_tool_result(tool_result: &ToolResult) -> bool {
             .is_some_and(|error_code| REPAIRABLE_TOOL_ERROR_CODES.contains(&error_code)),
         _ => false,
     }
+}
+
+/// Stable pre-execution boundaries that make an installed exact command impossible to submit.
+///
+/// These categories are deliberately narrower than all repairable failures: malformed input and
+/// approval-sensitive calls still require the trusted exact action, while capability/policy/path
+/// boundaries must release it for a bounded strategy change.
+fn is_pre_execution_replan_failure(tool_result: &ToolResult) -> bool {
+    !tool_result.ok
+        && tool_result.workspace_observation().is_none()
+        && matches!(
+            tool_result.failure_kind,
+            Some(
+                ToolFailureKind::Capability
+                    | ToolFailureKind::Policy
+                    | ToolFailureKind::PermissionProfile
+                    | ToolFailureKind::ProtectedPath
+            )
+        )
 }
 
 /// Binding may materialize absent optional object fields as `null`; those two JSON forms have the
