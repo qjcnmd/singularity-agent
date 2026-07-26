@@ -9,9 +9,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use singularity_agent::{AgentLoopResult, terminal_command_scope_digests};
 use singularity_evaluation::{
-    CommandSpec, EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationSandboxPreflight,
-    EvaluationScopeEvidence, EvaluationTaskEvidence, EvaluationTrialEvidence, EvidenceVerdict,
-    PlannedWorkspaceSource, RunId, WorkspacePlan, task_selection_digest,
+    CommandSpec, EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationResult,
+    EvaluationSandboxPreflight, EvaluationScopeEvidence, EvaluationTaskEvidence,
+    EvaluationTrialEvidence, EvidenceVerdict, PlannedWorkspaceSource, RunId, WorkspacePlan,
+    task_selection_digest,
 };
 use singularity_tools::ToolResult;
 
@@ -76,12 +77,13 @@ pub(super) fn build_evaluation_evidence(
 }
 
 /// 构造未采样 run 的脱敏 evidence；每个 task 只保留选择身份，不生成 trial 证据。
-pub(super) fn build_preflight_evidence(
+pub(super) fn build_zero_sampling_evidence(
     run_id: &RunId,
     manifest_digest: String,
     plans: &[WorkspacePlan],
     trials_per_task: u32,
     preflight: EvaluationSandboxPreflight,
+    result: &EvaluationResult,
 ) -> Result<EvaluationEvidence, String> {
     let task_ids = plans
         .iter()
@@ -144,8 +146,8 @@ pub(super) fn build_preflight_evidence(
         sandbox_preflight: Some(preflight),
     };
     evidence
-        .validate()
-        .map_err(|error| format!("invalid evaluation preflight evidence: {error}"))?;
+        .validate_against_result(result)
+        .map_err(|error| format!("invalid evaluation zero-sampling evidence: {error}"))?;
     Ok(evidence)
 }
 

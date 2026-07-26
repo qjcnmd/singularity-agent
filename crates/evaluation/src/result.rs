@@ -645,7 +645,7 @@ impl EvaluationRunSummary {
         }
     }
 
-    /// Construct a run summary for a preflight blocker with no sampled trials.
+    /// Construct a run summary for a blocker observed before trial sampling.
     pub fn for_preflight_blocker(task_count: u32, trials_per_task: u32) -> Self {
         Self {
             task_count,
@@ -725,6 +725,26 @@ impl EvaluationResult {
         blocker: EvaluationBlocker,
         sandbox_preflight: EvaluationSandboxPreflight,
     ) -> Self {
+        Self::blocked_before_sampling(
+            run_id,
+            task_count,
+            trials_per_task,
+            blocker,
+            sandbox_preflight,
+        )
+    }
+
+    /// Construct a run-level blocker observed before any trial enters AgentLoop.
+    ///
+    /// The selected task identities remain in the manifest/evidence projection, while the stable
+    /// result intentionally keeps `tasks` empty because no task or trial was sampled.
+    pub fn blocked_before_sampling(
+        run_id: RunId,
+        task_count: u32,
+        trials_per_task: u32,
+        blocker: EvaluationBlocker,
+        sandbox_preflight: EvaluationSandboxPreflight,
+    ) -> Self {
         Self {
             schema_version: EvaluationResultSchemaVersion::V8,
             run_id,
@@ -735,6 +755,22 @@ impl EvaluationResult {
             tasks: Vec::new(),
             sandbox_preflight: Some(sandbox_preflight),
         }
+    }
+
+    /// Whether this result is a validated run-level zero-sampling projection.
+    pub(crate) fn is_blocked_before_sampling(&self) -> bool {
+        self.tasks.is_empty()
+            && self.status == EvaluationStatus::Blocked
+            && !self.evaluation_passed
+            && self.summary.task_count > 0
+            && self.summary.trials_per_task > 0
+            && self.summary.configured_trial_count > 0
+            && self.summary.sampled_trial_count == 0
+            && self.summary.trial_count == 0
+            && self
+                .blocker
+                .as_ref()
+                .is_some_and(|blocker| is_pre_sampling_blocker_kind(blocker.kind))
     }
 
     pub fn from_json_str(json: &str) -> Result<Self> {
@@ -761,28 +797,22 @@ impl EvaluationResult {
                 self.summary.task_count,
                 self.summary.trials_per_task,
             );
-            if self.status != EvaluationStatus::Blocked
+            let Some(blocker) = self.blocker.as_ref() else {
+                return Err(validation_error(
+                    "empty evaluation result requires one pre-sampling blocker with zero sampled trials",
+                ));
+            };
+            if self.summary != expected_summary
+                || self.status != EvaluationStatus::Blocked
                 || self.evaluation_passed
                 || self.summary.task_count == 0
-                || self.summary != expected_summary
-                || self.blocker.as_ref().is_none_or(|blocker| {
-                    blocker.kind != BlockerKind::Environment
-                        || !blocker
-                            .code
-                            .as_deref()
-                            .is_some_and(|code| code.starts_with("sandbox_preflight_"))
-                })
-                || preflight.outcome != EvaluationSandboxPreflightOutcome::Unsupported
-                || self
-                    .blocker
-                    .as_ref()
-                    .and_then(|blocker| blocker.code.as_deref())
-                    != preflight.error_code.as_deref()
+                || !is_pre_sampling_blocker_kind(blocker.kind)
             {
                 return Err(validation_error(
-                    "empty evaluation result must be one sandbox preflight blocker with zero sampled trials",
+                    "empty evaluation result must be one pre-sampling blocker with zero sampled trials",
                 ));
             }
+            validate_pre_sampling_blocker(blocker, preflight)?;
             return Ok(());
         }
         if preflight.outcome != EvaluationSandboxPreflightOutcome::Supported {
@@ -824,6 +854,46 @@ impl EvaluationResult {
         }
         Ok(())
     }
+}
+
+fn is_pre_sampling_blocker_kind(kind: BlockerKind) -> bool {
+    matches!(
+        kind,
+        BlockerKind::Environment
+            | BlockerKind::WorkspacePreparation
+            | BlockerKind::ProviderConfiguration
+            | BlockerKind::Network
+            | BlockerKind::Sandbox
+    )
+}
+
+fn validate_pre_sampling_blocker(
+    blocker: &EvaluationBlocker,
+    preflight: &EvaluationSandboxPreflight,
+) -> Result<()> {
+    blocker.validate("evaluation run")?;
+    if blocker
+        .code
+        .as_deref()
+        .is_none_or(|code| code.trim().is_empty())
+    {
+        return Err(validation_error(
+            "evaluation run pre-sampling blocker requires a non-empty code",
+        ));
+    }
+    if preflight.outcome == EvaluationSandboxPreflightOutcome::Unsupported
+        && (blocker.kind != BlockerKind::Environment
+            || !blocker
+                .code
+                .as_deref()
+                .is_some_and(|code| code.starts_with("sandbox_preflight_"))
+            || blocker.code.as_deref() != preflight.error_code.as_deref())
+    {
+        return Err(validation_error(
+            "unsupported sandbox preflight must be the run-level blocker",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_sandbox_preflight(

@@ -319,14 +319,16 @@ impl EvaluationEvidence {
         validate_sandbox_preflight(preflight, "evaluation evidence sandbox_preflight")?;
         let preflight_blocked =
             preflight.outcome == crate::EvaluationSandboxPreflightOutcome::Unsupported;
+        let zero_sampling = self.denominator_trial_count == 0 && self.sampled_trial_count == 0;
+        let zero_sampling_allowed = preflight_blocked || zero_sampling;
         if self.denominator_task_count == 0
             || self.configured_trial_count
                 != self
                     .denominator_task_count
                     .saturating_mul(self.trials_per_task)
-            || (preflight_blocked
+            || (zero_sampling_allowed
                 && (self.denominator_trial_count != 0 || self.sampled_trial_count != 0))
-            || (!preflight_blocked
+            || (!zero_sampling_allowed
                 && (self.denominator_trial_count != self.configured_trial_count
                     || self.sampled_trial_count != self.denominator_trial_count))
         {
@@ -341,13 +343,13 @@ impl EvaluationEvidence {
         }
         let mut task_ids = BTreeSet::new();
         for task in &self.tasks {
-            if !preflight_blocked {
+            if !zero_sampling_allowed {
                 task.validate(self.trials_per_task)?;
             } else {
                 task.validate_identity()?;
                 if !task.trials.is_empty() {
                     return Err(validation_error(
-                        "blocked preflight evidence must not contain sampled trial evidence",
+                        "zero-sampling evidence must not contain sampled trial evidence",
                     ));
                 }
             }
@@ -372,15 +374,15 @@ impl EvaluationEvidence {
     }
 
     pub fn validate_against_result(&self, result: &EvaluationResult) -> Result<()> {
-        self.validate()?;
         result.validate()?;
-        let preflight_blocked = result.tasks.is_empty();
+        let zero_sampling = result.is_blocked_before_sampling();
+        self.validate()?;
         if self.run_id != result.run_id
             || self.denominator_task_count != result.summary.task_count
             || self.trials_per_task != result.summary.trials_per_task
             || self.denominator_trial_count != result.summary.trial_count
-            || (!preflight_blocked && self.tasks.len() != result.tasks.len())
-            || (preflight_blocked
+            || (!zero_sampling && self.tasks.len() != result.tasks.len())
+            || (zero_sampling
                 && (self.sampled_trial_count != 0
                     || self.configured_trial_count != result.summary.configured_trial_count))
             || self.sandbox_preflight != result.sandbox_preflight
@@ -389,10 +391,10 @@ impl EvaluationEvidence {
                 "evaluation evidence task/trial denominators must match the stable result",
             ));
         }
-        if preflight_blocked {
+        if zero_sampling {
             if self.tasks.iter().any(|task| !task.trials.is_empty()) {
                 return Err(validation_error(
-                    "blocked preflight result cannot bind sampled trial evidence",
+                    "zero-sampling result cannot bind trial evidence",
                 ));
             }
             return Ok(());

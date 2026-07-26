@@ -528,6 +528,94 @@ fn preflight_blocker_binds_one_zero_sample_summary_to_the_same_error_code() {
 }
 
 #[test]
+fn source_preparation_blocker_binds_zero_sampling_with_supported_preflight() {
+    let task_ids = [
+        TaskId::new("source-ok").expect("task id"),
+        TaskId::new("source-blocked").expect("task id"),
+    ];
+    let blocker = EvaluationBlocker {
+        code: Some("workspace_preparation_failed".to_string()),
+        kind: BlockerKind::WorkspacePreparation,
+        message: "source could not be materialized".to_string(),
+    };
+    let result = EvaluationResult::blocked_before_sampling(
+        RunId::new("source-blocked-run").expect("run id"),
+        2,
+        3,
+        blocker,
+        supported_preflight(),
+    );
+    result
+        .validate()
+        .expect("source blocker is valid before sampling");
+
+    let evidence = EvaluationEvidence {
+        schema_version: EvaluationEvidenceSchemaVersion::V3,
+        run_id: result.run_id.clone(),
+        manifest_digest: DIGEST.to_string(),
+        task_selection_digest: task_selection_digest(&task_ids),
+        denominator_task_count: 2,
+        trials_per_task: 3,
+        denominator_trial_count: 0,
+        configured_trial_count: 6,
+        sampled_trial_count: 0,
+        tasks: task_ids
+            .iter()
+            .cloned()
+            .map(|task_id| EvaluationTaskEvidence {
+                task_id,
+                source_tree_digest: None,
+                source_commit: None,
+                allowed_paths_digest: DIGEST.to_string(),
+                tool_capability_requirements_digest: DIGEST.to_string(),
+                trials: Vec::new(),
+            })
+            .collect(),
+        sandbox_preflight: Some(supported_preflight()),
+    };
+    evidence
+        .validate()
+        .expect("zero-sampling evidence has a valid structural projection");
+    evidence
+        .validate_against_result(&result)
+        .expect("zero-sampling evidence binds to source blocker");
+}
+
+#[test]
+fn zero_sampling_result_rejects_post_sampling_blocker_categories_and_missing_code() {
+    for kind in [
+        BlockerKind::ProviderResponse,
+        BlockerKind::ProviderAuthentication,
+        BlockerKind::AgentRuntime,
+    ] {
+        let result = EvaluationResult::blocked_before_sampling(
+            RunId::new("invalid-zero-sampling").expect("run id"),
+            1,
+            1,
+            EvaluationBlocker {
+                code: Some("provider_response_invalid".to_string()),
+                kind,
+                message: "post-sampling blocker".to_string(),
+            },
+            supported_preflight(),
+        );
+        assert!(result.validate().is_err(), "{kind:?} must not be run-level");
+    }
+    let missing_code = EvaluationResult::blocked_before_sampling(
+        RunId::new("missing-zero-sampling-code").expect("run id"),
+        1,
+        1,
+        EvaluationBlocker {
+            code: None,
+            kind: BlockerKind::WorkspacePreparation,
+            message: "source preparation failed".to_string(),
+        },
+        supported_preflight(),
+    );
+    assert!(missing_code.validate().is_err());
+}
+
+#[test]
 fn unsupported_past_and_future_schemas_fail_closed() {
     let result = result_for(task_result(vec![failed_trial(1)]), 1);
     let mut value = serde_json::to_value(result).expect("result JSON");

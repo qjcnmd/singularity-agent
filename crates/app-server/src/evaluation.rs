@@ -65,7 +65,7 @@ use command::{
     run_workspace_preparation_read_only_command, sandbox_network_mode,
 };
 use evidence::{
-    agent_command_observation, build_evaluation_evidence, build_preflight_evidence,
+    agent_command_observation, build_evaluation_evidence, build_zero_sampling_evidence,
     canonical_json_digest, content_digest,
 };
 use workspace::{
@@ -721,7 +721,7 @@ pub(crate) fn run_evaluation(
                     failure.blocker,
                     preflight.clone(),
                 );
-                return publish_preflight_blocked_run(
+                return publish_zero_sampling_blocked_run(
                     params,
                     &run_dir,
                     manifest_digest,
@@ -743,13 +743,67 @@ pub(crate) fn run_evaluation(
         trace_failures: Arc::new(Mutex::new(Vec::new())),
         sandbox_preflight: &preflight,
     };
+    if cancellation.is_cancelled() {
+        let partial = partial_evaluation_result(params, &run_id, &[]);
+        return Err(preserve_incomplete_run(
+            &run_dir,
+            EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
+        ));
+    }
+    if let Err(error) = provider_snapshot.provider() {
+        let blocker = run_level_blocker(provider_configuration_blocker(&error));
+        let result = EvaluationResult::blocked_before_sampling(
+            run_id.clone(),
+            u32::try_from(plans.len()).unwrap_or(u32::MAX),
+            trials_per_task,
+            blocker,
+            sandbox_preflight_evidence(&preflight),
+        );
+        return publish_zero_sampling_blocked_run(
+            params,
+            &run_dir,
+            manifest_digest,
+            &plans,
+            trials_per_task,
+            result,
+            sandbox_preflight_evidence(&preflight),
+        );
+    }
     // Materialize every task source before entering the first provider trial. This keeps
-    // source preparation failures deterministic and prevents a later task from being
-    // prepared after an earlier task has already sampled the provider.
+    // source preparation failures deterministic and lets the run-level barrier reject the
+    // entire run before any task can sample the provider.
     let prepared_sources = plans
         .iter()
         .map(|plan| prepare_task_source(&run_context, plan))
         .collect::<Vec<_>>();
+    if cancellation.is_cancelled() {
+        let partial = partial_evaluation_result(params, &run_id, &[]);
+        return Err(preserve_incomplete_run(
+            &run_dir,
+            EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
+        ));
+    }
+    if let Some(blocker) = prepared_sources
+        .iter()
+        .find_map(|prepared_source| prepared_source.blocker.clone())
+    {
+        let result = EvaluationResult::blocked_before_sampling(
+            run_id.clone(),
+            u32::try_from(plans.len()).unwrap_or(u32::MAX),
+            trials_per_task,
+            run_level_blocker(blocker),
+            sandbox_preflight_evidence(&preflight),
+        );
+        return publish_zero_sampling_blocked_run(
+            params,
+            &run_dir,
+            manifest_digest,
+            &plans,
+            trials_per_task,
+            result,
+            sandbox_preflight_evidence(&preflight),
+        );
+    }
     let mut task_executions = Vec::new();
     for (plan, prepared_source) in plans.iter().zip(&prepared_sources) {
         if cancellation.is_cancelled() {
@@ -992,7 +1046,7 @@ fn run_task_trials(
     evaluation
 }
 
-fn publish_preflight_blocked_run(
+fn publish_zero_sampling_blocked_run(
     params: &EvalRunParams,
     run_dir: &Path,
     manifest_digest: String,
@@ -1006,16 +1060,17 @@ fn publish_preflight_blocked_run(
         return Err(preserve_incomplete_run(
             run_dir,
             EvaluationRunError::infrastructure(format!(
-                "invalid sandbox-preflight-blocked evaluation result: {error}"
+                "invalid zero-sampling blocked evaluation result: {error}"
             )),
         ));
     }
-    let evidence = match build_preflight_evidence(
+    let evidence = match build_zero_sampling_evidence(
         run_id,
         manifest_digest,
         plans,
         trials_per_task,
         preflight.clone(),
+        &result,
     ) {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -1029,7 +1084,7 @@ fn publish_preflight_blocked_run(
         return Err(preserve_incomplete_run(
             run_dir,
             EvaluationRunError::infrastructure(format!(
-                "sandbox preflight evidence/result mismatch: {error}"
+                "zero-sampling evidence/result mismatch: {error}"
             )),
         ));
     }
@@ -1150,12 +1205,6 @@ fn prepare_task_source(
                 .unwrap_or_else(|| "sandbox_preflight_unavailable".to_string()),
             "validated sandbox preflight contract is not supported",
         ));
-        return prepared;
-    }
-    if matches!(plan.source, PlannedWorkspaceSource::RemoteGit { .. })
-        && let Err(error) = context.provider_snapshot.provider()
-    {
-        prepared.blocker = Some(provider_blocker(&error));
         return prepared;
     }
     match prepare_source(
@@ -3033,6 +3082,41 @@ fn provider_blocker(error: &ProviderError) -> EvaluationBlocker {
         _ => BlockerKind::AgentRuntime,
     };
     evaluation_blocker(kind, error.message.clone())
+}
+
+fn provider_configuration_blocker(error: &ProviderError) -> EvaluationBlocker {
+    let diagnostic = error.error.provider_diagnostic();
+    EvaluationBlocker {
+        code: diagnostic
+            .code
+            .filter(|code| !code.trim().is_empty())
+            .or_else(|| Some("provider_configuration_invalid".to_string())),
+        kind: BlockerKind::ProviderConfiguration,
+        message: safe_text(&error.message),
+    }
+}
+
+fn run_level_blocker(mut blocker: EvaluationBlocker) -> EvaluationBlocker {
+    if blocker
+        .code
+        .as_deref()
+        .is_none_or(|code| code.trim().is_empty())
+    {
+        blocker.code = Some(
+            match blocker.kind {
+                BlockerKind::Environment => "environment_preparation_failed",
+                BlockerKind::WorkspacePreparation => "workspace_preparation_failed",
+                BlockerKind::ProviderConfiguration => "provider_configuration_invalid",
+                BlockerKind::Network => "network_unavailable",
+                BlockerKind::Sandbox => "sandbox_unavailable",
+                BlockerKind::ProviderResponse
+                | BlockerKind::ProviderAuthentication
+                | BlockerKind::AgentRuntime => "evaluation_blocked_before_sampling",
+            }
+            .to_string(),
+        );
+    }
+    blocker
 }
 
 fn agent_blocker_kind(
@@ -5476,6 +5560,234 @@ mod tests {
                 .join("preflight-supported")
                 .join("trial-0001")
                 .is_dir()
+        );
+    }
+
+    #[test]
+    fn source_preparation_batch_barrier_blocks_before_sampling_any_task() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking provider fixture");
+        let provider_address = listener.local_addr().expect("provider address");
+        let provider = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut requests = 0usize;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        requests += 1;
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("provider read timeout");
+                        let mut reader = BufReader::new(
+                            stream.try_clone().expect("clone provider fixture stream"),
+                        );
+                        let mut request_line = String::new();
+                        reader
+                            .read_line(&mut request_line)
+                            .expect("provider request line");
+                        let mut content_length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            reader
+                                .read_line(&mut line)
+                                .expect("provider request header");
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            if let Some((name, value)) = line.split_once(':')
+                                && name.eq_ignore_ascii_case("content-length")
+                            {
+                                content_length = value.trim().parse().expect("content length");
+                            }
+                        }
+                        let mut request_body = vec![0; content_length];
+                        reader
+                            .read_exact(&mut request_body)
+                            .expect("provider request body");
+                        let body = br#"{"error":{"message":"fixture authentication rejected","type":"authentication_error"}}"#;
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("provider response headers");
+                        stream.write_all(body).expect("provider response body");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return requests;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("provider fixture accept failed: {error}"),
+                }
+            }
+        });
+
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let output_root = temp.path().join("output");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let task = |task_id: &str, source: &str| {
+            json!({
+                "task_id": task_id,
+                "description": "source preparation batch barrier",
+                "capabilities": ["repository_context"],
+                "workspace": {"source": {"type": "local", "path": source}},
+                "agent": {
+                    "instructions": "inspect README.md",
+                    "allowed_paths": ["README.md"],
+                    "required_tool_capabilities": [
+                        {"capability": "workspace_read", "minimum_version": 1}
+                    ]
+                },
+                "evaluator": {
+                    "baseline": {"commands": [{"argv": ["verify-baseline"]}]},
+                    "public": {"commands": [{"argv": ["verify-public"]}]},
+                    "hidden": {"commands": [{"argv": ["verify-hidden"]}]}
+                }
+            })
+        };
+        let manifest_path = temp.path().join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "evaluation.task_set/v5",
+                "trial_count": 1,
+                "tasks": [task("source-ok", "fixture"), task("source-blocked", "missing-source")]
+            }))
+            .expect("manifest JSON"),
+        )
+        .expect("manifest file");
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "source-batch-barrier-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let base_url = format!("http://{provider_address}/v1");
+        let provider_snapshot = ProviderConfigSnapshot::capture(|name| match name {
+            "SINGULARITY_API_KEY" => Some("fixture-key".to_string()),
+            "SINGULARITY_BASE_URL" => Some(base_url.clone()),
+            "SINGULARITY_MODEL" => Some("fixture-model".to_string()),
+            _ => None,
+        });
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+
+        let response = run_evaluation(
+            &params,
+            Arc::new(AgentLoopReachBackend),
+            &provider_snapshot,
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("source blocker publishes a zero-sampling run");
+        let requests = provider.join().expect("provider fixture join");
+        assert_eq!(response.status, "blocked");
+        assert!(response.tasks.is_empty());
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result path"))
+                .expect("result artifact"),
+        )
+        .expect("result v8");
+        assert!(result.tasks.is_empty());
+        assert_eq!(result.summary.task_count, 2);
+        assert_eq!(result.summary.trials_per_task, 1);
+        assert_eq!(result.summary.configured_trial_count, 2);
+        assert_eq!(result.summary.sampled_trial_count, 0);
+        assert_eq!(result.summary.trial_count, 0);
+        assert_eq!(
+            result.blocker.as_ref().map(|blocker| blocker.kind),
+            Some(BlockerKind::WorkspacePreparation)
+        );
+        assert_eq!(
+            result
+                .blocker
+                .as_ref()
+                .and_then(|blocker| blocker.code.as_deref()),
+            Some("workspace_preparation_failed")
+        );
+        assert_eq!(
+            requests, 0,
+            "source preparation barrier must prevent provider requests"
+        );
+        let no_provider_attempt = match trace_store.list_trace("source-batch-barrier-run") {
+            Ok(events) => events
+                .iter()
+                .all(|event| event.span_kind != Some(TraceSpanKind::ProviderAttempt)),
+            Err(singularity_store::StoreError::NotFound(_)) => true,
+            Err(error) => panic!("source barrier trace: {error}"),
+        };
+        assert!(
+            no_provider_attempt,
+            "source barrier must not create provider attempts"
+        );
+    }
+
+    #[test]
+    fn provider_configuration_blocker_is_run_level_and_not_a_sandbox_blocker() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let output_root = temp.path().join("output");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "provider-config-blocked",
+            "provider configuration must block before source preparation",
+            1,
+            json!({"type": "local", "path": "fixture"}),
+        );
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "provider-config-blocked-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let provider_snapshot = ProviderConfigSnapshot::capture(|name| match name {
+            "SINGULARITY_API_KEY" => Some("fixture-key".to_string()),
+            _ => None,
+        });
+
+        let response = run_evaluation(
+            &params,
+            Arc::new(SourceSandboxBackend),
+            &provider_snapshot,
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("provider configuration blocker publishes a run-level result");
+        assert_eq!(response.status, "blocked");
+        assert!(response.tasks.is_empty());
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result path"))
+                .expect("result artifact"),
+        )
+        .expect("result v8");
+        assert_eq!(
+            result.blocker.as_ref().map(|blocker| blocker.kind),
+            Some(BlockerKind::ProviderConfiguration)
+        );
+        assert_ne!(
+            result.blocker.as_ref().map(|blocker| blocker.kind),
+            Some(BlockerKind::Sandbox)
+        );
+        assert_eq!(result.summary.configured_trial_count, 1);
+        assert_eq!(result.summary.sampled_trial_count, 0);
+        assert_eq!(result.summary.trial_count, 0);
+        assert!(
+            !output_root
+                .join("provider-config-blocked-run/provider-config-blocked")
+                .exists(),
+            "provider configuration must be checked before source materialization"
         );
     }
 
