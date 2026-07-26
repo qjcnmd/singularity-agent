@@ -5783,6 +5783,14 @@ mod tests {
         assert_eq!(result.summary.configured_trial_count, 1);
         assert_eq!(result.summary.sampled_trial_count, 0);
         assert_eq!(result.summary.trial_count, 0);
+        let no_provider_attempt = match trace_store.list_trace("provider-config-blocked-run") {
+            Ok(events) => events
+                .iter()
+                .all(|event| event.span_kind != Some(TraceSpanKind::ProviderAttempt)),
+            Err(singularity_store::StoreError::NotFound(_)) => true,
+            Err(error) => panic!("provider configuration trace: {error}"),
+        };
+        assert!(no_provider_attempt);
         assert!(
             !output_root
                 .join("provider-config-blocked-run/provider-config-blocked")
