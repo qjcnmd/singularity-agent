@@ -1713,7 +1713,9 @@ impl AgentLoopState {
         // mutation can bind the decision to a revision and make its verification cycle consume
         // one repair attempt.
         let required_revision = None;
-        let required_check_count = self.completion.summary().required_command_count;
+        // The public summary reports one generic post-mutation check before a plan exists.
+        // Repair checkpoint state must bind the actual installed requirement set instead.
+        let required_check_count = self.completion.required_command_count();
         if let Some(active) = self.repair_plan.as_mut() {
             if self.repair_attempts >= MAX_REPAIR_PLAN_ATTEMPTS
                 && active.plan.required_revision.is_none()
@@ -2150,9 +2152,10 @@ impl AgentLoopState {
         let Some(active) = self.repair_plan.as_mut() else {
             return;
         };
-        if active.plan.required_revision == self.completion.workspace_revision {
-            active.plan.required_check_count = self.completion.required_command_count();
-        }
+        // This is called only after a plan is bound to the current workspace revision. A
+        // prospective pre-plan tool repair has no required_revision yet, but its durable state
+        // must still follow the newly installed exact requirement set.
+        active.plan.required_check_count = self.completion.required_command_count();
     }
 
     /// Commit exactly one repair attempt for a new mutation revision followed by its terminal

@@ -9815,8 +9815,8 @@ fn repair_mutation_checkpoint_commits_the_new_revision_before_replanning() {
         response
     };
     let final_response = ModelTurnResponse::completed(
-        "model_request_turn_repair_checkpoint_6",
-        "response_checkpoint_6",
+        "model_request_turn_repair_checkpoint_7",
+        "response_checkpoint_7",
         "done",
     );
     let policy = allow_read_execute_policy().with_rule(
@@ -9831,11 +9831,12 @@ fn repair_mutation_checkpoint_commits_the_new_revision_before_replanning() {
         StaticProvider {
             responses: vec![
                 edit_response(0, "edit_revision_1", "v0", "v1"),
-                plan_response(1, "plan_revision_1"),
-                command_response(2, "command_revision_1"),
-                edit_response(3, "edit_revision_2", "v1", "v2"),
-                plan_response(4, "plan_revision_2"),
-                command_response(5, "command_revision_2"),
+                command_response(1, "command_before_plan"),
+                plan_response(2, "plan_revision_1"),
+                command_response(3, "command_revision_1"),
+                edit_response(4, "edit_revision_2", "v1", "v2"),
+                plan_response(5, "plan_revision_2"),
+                command_response(6, "command_revision_2"),
                 final_response,
             ],
             seen_requests: Arc::new(Mutex::new(Vec::new())),
@@ -9856,7 +9857,7 @@ fn repair_mutation_checkpoint_commits_the_new_revision_before_replanning() {
         "turn_repair_checkpoint",
         "repair and verify the fixture",
     )
-    .with_max_turns(7);
+    .with_max_turns(8);
     let mut checkpoint_events = Vec::new();
     let result =
         agent_loop.run_with_events_and_checkpoints(&input, &mut |_event| Ok(()), &mut |event| {
@@ -9865,6 +9866,30 @@ fn repair_mutation_checkpoint_commits_the_new_revision_before_replanning() {
         });
 
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    let pre_plan_rejection = checkpoint_events
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.phase,
+                TurnCheckpointPhase::ToolResultsCommitted { tool_call_ids }
+                    if tool_call_ids == &["command_before_plan".to_string()]
+            )
+        })
+        .expect("pre-plan rejection checkpoint");
+    let pre_plan_checkpoint = pre_plan_rejection
+        .checkpoint
+        .encode()
+        .expect("pre-plan rejection checkpoint encodes");
+    assert_eq!(pre_plan_checkpoint["repair_attempts"], 0);
+    assert_eq!(
+        pre_plan_checkpoint["tool_result_occurrences"]
+            .as_array()
+            .expect("checkpoint tool results")
+            .iter()
+            .find(|occurrence| { occurrence["result"]["tool_call_id"] == "command_before_plan" })
+            .expect("pre-plan command result")["result"]["ok"],
+        false
+    );
     let second_mutation = checkpoint_events
         .iter()
         .find(|event| {
