@@ -786,6 +786,85 @@ fn capability_negotiation_failure_and_typed_cancel_skip_model_and_tool_execution
 }
 
 #[test]
+fn capability_negotiation_failure_preserves_provider_attempt_evidence_without_model_call() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let attempts = (1..=3)
+        .map(|attempt_index| {
+            let mut occurrence = provider_attempt_occurrence(
+                attempt_index,
+                &format!("capability-probe-{attempt_index}"),
+                ProviderAttemptStatus::Error,
+            );
+            occurrence.operation_phase = ProviderAttemptOperationPhase::CapabilityProbe;
+            occurrence.error_category = Some(ModelErrorCategory::UnsupportedCapability);
+            occurrence.error_stage = Some(ProviderErrorStage::ResponseValidation);
+            occurrence.diagnostic_code = Some("capability_negotiation_failed".to_string());
+            occurrence.retry_scheduled = attempt_index < 3;
+            occurrence.retry_backoff_ms = (attempt_index < 3).then_some(u64::from(attempt_index));
+            occurrence
+        })
+        .collect();
+    let metadata = ProviderAttemptMetadata {
+        attempt_count: 3,
+        retry_count: 2,
+        latency_ms: 12,
+        occurrences: attempts,
+    };
+    let error = ProviderError::from_model_error(
+        ModelError::new(
+            ModelErrorKind::UnsupportedCapability,
+            "capability negotiation failed",
+        )
+        .with_provider_diagnostic(
+            "capability_negotiation_failed",
+            ProviderErrorStage::ResponseValidation,
+        ),
+    )
+    .with_provider_attempt_metadata(metadata);
+    let agent_loop = AgentLoop::new(
+        NegotiatingProvider {
+            responses: vec![ModelTurnResponse::completed(
+                "request_1",
+                "response_1",
+                "must not be used",
+            )],
+            seen_requests: Arc::clone(&seen_requests),
+            negotiation_calls: Arc::new(AtomicUsize::new(0)),
+            static_capabilities: ProviderProtocolContract::default(),
+            negotiated_capabilities: Err(error),
+        },
+        workspace_tool_broker_for_test(),
+        allow_read_policy(),
+    );
+
+    let result = agent_loop.run(&AgentLoopInput::new("thread_1", "turn_1", "inspect"));
+
+    assert_eq!(result.status, AgentStatus::Failed);
+    assert!(seen_requests.lock().expect("seen requests").is_empty());
+    assert_eq!(result.model_turns, 0);
+    assert_eq!(result.tool_calls, 0);
+    assert_eq!(result.provider_attempts.attempt_count, 3);
+    assert_eq!(result.provider_attempts.retry_count, 2);
+    assert_eq!(result.provider_attempts.latency_ms, 12);
+    assert_eq!(result.provider_attempts.occurrences.len(), 3);
+    assert!(
+        result
+            .provider_attempts
+            .occurrences
+            .iter()
+            .all(|occurrence| {
+                occurrence.operation_phase == ProviderAttemptOperationPhase::CapabilityProbe
+                    && occurrence.model_turn_ordinal == Some(0)
+                    && occurrence.parent_occurrence_id.is_none()
+            })
+    );
+    assert_eq!(
+        result.to_run_status().provider_attempts,
+        result.provider_attempts
+    );
+}
+
+#[test]
 fn capability_negotiation_error_does_not_bind_an_unemitted_prompt_parent() {
     let metadata = runtime_negotiation_metadata();
     let error = ProviderError::from_model_error(

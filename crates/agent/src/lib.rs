@@ -1293,6 +1293,9 @@ impl AgentLoopState {
         error: &ProviderError,
     ) {
         self.provider_protocol_contract = None;
+        if let Some(metadata) = &error.provider_attempt_metadata {
+            self.record_provider_attempts(metadata, model_turn_ordinal, None);
+        }
         if let Some(metadata) = error.capability_metadata.as_deref() {
             self.record_provider_capability_metadata(metadata, model_turn_ordinal, None);
         }
@@ -1334,33 +1337,7 @@ impl AgentLoopState {
                 Some(self.model_usage.cost_estimate.unwrap_or_default().max(0.0) + cost.max(0.0));
         }
         if let Some(metadata) = &response.provider_attempt_metadata {
-            let first_attempt_index = self.provider_attempts.attempt_count.saturating_add(1);
-            self.provider_attempts.attempt_count = self
-                .provider_attempts
-                .attempt_count
-                .saturating_add(metadata.attempt_count);
-            self.provider_attempts.retry_count = self
-                .provider_attempts
-                .retry_count
-                .saturating_add(metadata.retry_count);
-            self.provider_attempts.latency_ms = self
-                .provider_attempts
-                .latency_ms
-                .saturating_add(metadata.latency_ms);
-            self.provider_attempts.occurrences.extend(
-                metadata
-                    .occurrences
-                    .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(offset, mut occurrence)| {
-                        occurrence.attempt_index = first_attempt_index
-                            .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
-                        occurrence.model_turn_ordinal = Some(model_turn_ordinal);
-                        occurrence.parent_occurrence_id = Some(parent_occurrence_id.to_string());
-                        occurrence
-                    }),
-            );
+            self.record_provider_attempts(metadata, model_turn_ordinal, Some(parent_occurrence_id));
         }
         if let Some(metadata) = &response.provider_capability_metadata {
             self.record_provider_capability_metadata(
@@ -1369,6 +1346,47 @@ impl AgentLoopState {
                 Some(parent_occurrence_id),
             );
         }
+    }
+
+    /// Accumulate one provider-owned attempt aggregate at its AgentLoop ownership boundary.
+    ///
+    /// Negotiation failures have no PromptAssembly parent, while model responses bind attempts
+    /// to the emitted prompt occurrence. The same metadata is consumed exactly once by the
+    /// caller; trace occurrences remain the independent occurrence fact source.
+    fn record_provider_attempts(
+        &mut self,
+        metadata: &ProviderAttemptMetadata,
+        model_turn_ordinal: u32,
+        parent_occurrence_id: Option<&str>,
+    ) {
+        let first_attempt_index = self.provider_attempts.attempt_count.saturating_add(1);
+        self.provider_attempts.attempt_count = self
+            .provider_attempts
+            .attempt_count
+            .saturating_add(metadata.attempt_count);
+        self.provider_attempts.retry_count = self
+            .provider_attempts
+            .retry_count
+            .saturating_add(metadata.retry_count);
+        self.provider_attempts.latency_ms = self
+            .provider_attempts
+            .latency_ms
+            .saturating_add(metadata.latency_ms);
+        let parent_occurrence_id = parent_occurrence_id.map(str::to_string);
+        self.provider_attempts.occurrences.extend(
+            metadata
+                .occurrences
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(offset, mut occurrence)| {
+                    occurrence.attempt_index = first_attempt_index
+                        .saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+                    occurrence.model_turn_ordinal = Some(model_turn_ordinal);
+                    occurrence.parent_occurrence_id = parent_occurrence_id.clone();
+                    occurrence
+                }),
+        );
     }
 
     fn record_provider_capability_metadata(
