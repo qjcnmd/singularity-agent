@@ -1,9 +1,9 @@
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use singularity_agent::{
-    AgentLoopEvent, AgentObservation, AgentRunStatus, FinalReviewStatus, OccurrenceIdentity,
-    OccurrenceLifecycle, PolicyDecisionCause, PolicyDecisionObservation, PolicyDecisionStatus,
-    PromptAssemblyStatus, ProviderAttemptObservation,
+    AgentLoopEvent, AgentObservation, AgentRepairReason, AgentRunStatus, FinalReviewStatus,
+    OccurrenceIdentity, OccurrenceLifecycle, PolicyDecisionCause, PolicyDecisionObservation,
+    PolicyDecisionStatus, PromptAssemblyStatus, ProviderAttemptObservation,
     ProviderAttemptStatus as AgentProviderAttemptStatus, ProviderAttemptUsageObservation,
     RepairPlanningObservation, RepairPlanningStatus, SandboxExecutionOccurrence,
     SandboxExecutionStatus, ToolCallStatus, VerificationPlanObservation, VerificationPlanStatus,
@@ -18,10 +18,10 @@ use singularity_protocol::{
     TraceErrorCategory, TraceErrorProjection, TraceErrorStage, TraceEvent,
     TraceFinalReviewProjection, TraceFinalReviewStatus, TraceMetricSample, TraceMetricSampleKind,
     TracePolicyCause, TracePolicyDecision, TracePolicyProjection, TraceProviderOperationPhase,
-    TraceProviderProtocol, TraceSandboxEnforcement, TraceSandboxProjection, TraceSandboxStatus,
-    TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus, TraceToolProjection,
-    TraceToolStatus, TraceUsage, TraceVerificationProjection, TraceVerificationStatus,
-    TraceWorkspaceMutation,
+    TraceProviderProtocol, TraceRepairReason, TraceSandboxEnforcement, TraceSandboxProjection,
+    TraceSandboxStatus, TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
+    TraceToolProjection, TraceToolStatus, TraceUsage, TraceVerificationProjection,
+    TraceVerificationStatus, TraceWorkspaceMutation,
 };
 use singularity_store::{SessionStore, StoreError};
 use singularity_tools::{SandboxBackendEnforcement, WorkspaceMutation};
@@ -341,6 +341,7 @@ impl<'a> TraceProjector<'a> {
         observation: VerificationPlanObservation,
     ) -> Result<(), StoreError> {
         let start = TraceVerificationProjection {
+            revision: observation.revision.map(|revision| revision.value()),
             required_command_count: Some(u64::from(observation.requirement_count)),
             satisfied_command_count: Some(u64::from(observation.satisfied_requirement_count)),
             occurrence_count: Some(u64::from(observation.risk_count)),
@@ -374,9 +375,12 @@ impl<'a> TraceProjector<'a> {
         observation: RepairPlanningObservation,
     ) -> Result<(), StoreError> {
         let start = TraceVerificationProjection {
-            required_command_count: Some(u64::from(observation.max_attempts)),
-            satisfied_command_count: Some(u64::from(observation.attempt)),
-            occurrence_count: Some(u64::from(observation.attempt)),
+            repair_reason: Some(repair_reason(observation.reason)),
+            attempt: Some(u64::from(observation.attempt)),
+            max_attempts: Some(u64::from(observation.max_attempts)),
+            required_revision: observation
+                .required_revision
+                .map(|revision| revision.value()),
             ..TraceVerificationProjection::default()
         };
         self.append_lifecycle(
@@ -633,6 +637,15 @@ fn verification_status(status: VerificationStatus) -> TraceVerificationStatus {
         VerificationStatus::GatePassed => TraceVerificationStatus::GatePassed,
         VerificationStatus::GateRejected => TraceVerificationStatus::GateRejected,
         VerificationStatus::RepairRequested => TraceVerificationStatus::RepairRequested,
+    }
+}
+
+fn repair_reason(reason: AgentRepairReason) -> TraceRepairReason {
+    match reason {
+        AgentRepairReason::VerificationFailed => TraceRepairReason::VerificationFailed,
+        AgentRepairReason::ToolFailure => TraceRepairReason::ToolFailure,
+        AgentRepairReason::RevisionConflict => TraceRepairReason::RevisionConflict,
+        AgentRepairReason::FinalReviewRejected => TraceRepairReason::FinalReviewRejected,
     }
 }
 

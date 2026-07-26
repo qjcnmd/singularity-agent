@@ -1256,12 +1256,25 @@ pub enum TraceVerificationStatus {
     RepairRequested,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+/// bounded repair planning 的稳定原因。
+pub enum TraceRepairReason {
+    VerificationFailed,
+    ToolFailure,
+    RevisionConflict,
+    FinalReviewRejected,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-/// verification 的安全计数投影。
+/// verification plan 与 bounded repair planning 的安全投影。
 pub struct TraceVerificationProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<TraceVerificationStatus>,
+    /// Workspace revision bound to a verification plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_command_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1270,6 +1283,16 @@ pub struct TraceVerificationProjection {
     pub occurrence_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_duration_ms: Option<u64>,
+    /// Why this bounded repair was requested; raw error text is never projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_reason: Option<TraceRepairReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u64>,
+    /// Workspace revision that the repair plan must verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1595,13 +1618,27 @@ impl TraceSpanProjection {
                 })
             }
             TraceSpanKind::Verification => {
-                self.verification
-                    .as_ref()
-                    .map(|value| (value.required_command_count, value.occurrence_count))
-                    == other
-                        .verification
-                        .as_ref()
-                        .map(|value| (value.required_command_count, value.occurrence_count))
+                self.verification.as_ref().map(|value| {
+                    (
+                        value.revision,
+                        value.required_command_count,
+                        value.occurrence_count,
+                        value.repair_reason,
+                        value.attempt,
+                        value.max_attempts,
+                        value.required_revision,
+                    )
+                }) == other.verification.as_ref().map(|value| {
+                    (
+                        value.revision,
+                        value.required_command_count,
+                        value.occurrence_count,
+                        value.repair_reason,
+                        value.attempt,
+                        value.max_attempts,
+                        value.required_revision,
+                    )
+                })
             }
             TraceSpanKind::FinalReview => {
                 self.final_review

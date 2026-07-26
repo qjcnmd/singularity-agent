@@ -1065,6 +1065,7 @@ fn trace_span_identity_is_kind_aware_and_excludes_terminal_results() {
         occurrence_count: Some(1),
         status: Some(TraceVerificationStatus::CommandPassed),
         command_duration_ms: Some(7),
+        ..TraceVerificationProjection::default()
     });
     assert!(
         verification_start.same_identity_attributes(TraceSpanKind::Verification, &verification_end)

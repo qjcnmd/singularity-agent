@@ -6507,6 +6507,55 @@ fn trace_envelope_and_projection_tampering_fail_closed() {
 }
 
 #[test]
+fn verification_projection_corruption_and_unknown_repair_reason_fail_closed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    for (event_id, projection) in [
+        (
+            "projection_malformed",
+            r#"{"verification":{"bogus":true}}"#.to_string(),
+        ),
+        (
+            "projection_unknown_repair_reason",
+            r#"{"verification":{"repair_reason":"unknown"}}"#.to_string(),
+        ),
+    ] {
+        let db_path = dir.path().join(format!("{event_id}.sqlite3"));
+        let store = SessionStore::open(&db_path).expect("open store");
+        let mut event = TraceEvent::new(
+            event_id,
+            "run_projection_corruption",
+            "session_projection_corruption",
+            "test",
+            "projection",
+        );
+        event.span_id = Some(format!("{event_id}_span"));
+        event.span_kind = Some(TraceSpanKind::Verification);
+        event.span_phase = Some(TraceSpanPhase::Start);
+        event.span_projection = Some(TraceSpanProjection {
+            verification: Some(TraceVerificationProjection::default()),
+            ..TraceSpanProjection::default()
+        });
+        store.append_trace(&event).expect("append projection");
+
+        let connection = rusqlite::Connection::open(&db_path).expect("open tamper connection");
+        connection
+            .execute(
+                "update trace_events set span_projection = ?1 where event_id = ?2",
+                rusqlite::params![projection, event_id],
+            )
+            .expect("tamper projection");
+        drop(connection);
+
+        assert!(matches!(
+            store.show_trace(event_id),
+            Err(StoreError::InvalidState(message))
+                if message.contains("trace span projection is invalid")
+        ));
+    }
+}
+
+#[test]
 fn v11_to_v13_migration_rehashes_legacy_trace_without_fabricating_spans() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("v11.sqlite3");

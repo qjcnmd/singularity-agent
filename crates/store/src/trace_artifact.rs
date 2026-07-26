@@ -416,6 +416,7 @@ fn validate_projection_storage_values(projection: &TraceSpanProjection) -> Store
         validate_trace_u64(approval.request_count, "trace approval request count")?;
     }
     if let Some(verification) = &projection.verification {
+        validate_trace_u64(verification.revision, "trace verification revision")?;
         validate_trace_u64(
             verification.required_command_count,
             "trace required command count",
@@ -426,6 +427,12 @@ fn validate_projection_storage_values(projection: &TraceSpanProjection) -> Store
         )?;
         validate_trace_u64(verification.occurrence_count, "trace occurrence count")?;
         validate_trace_u64(verification.command_duration_ms, "trace command duration")?;
+        validate_trace_u64(verification.attempt, "trace repair attempt")?;
+        validate_trace_u64(verification.max_attempts, "trace repair max attempts")?;
+        validate_trace_u64(
+            verification.required_revision,
+            "trace repair required revision",
+        )?;
     }
     if let Some(review) = &projection.final_review {
         validate_trace_u64(review.model_turn_ordinal, "trace model turn ordinal")?;

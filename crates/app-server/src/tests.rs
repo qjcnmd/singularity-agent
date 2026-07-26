@@ -3664,3 +3664,144 @@ fn verification_spans_are_paired_by_occurrence_id() {
         assert_eq!(ends, 1, "span {span_id} must have exactly one End");
     }
 }
+
+#[test]
+fn verification_plan_and_repair_projection_roundtrip_preserves_revision_metadata() {
+    use singularity_agent::{
+        AgentLoopEvent, AgentObservation, AgentRepairReason, OccurrenceIdentity,
+        OccurrenceLifecycle, RepairPlanningObservation, RepairPlanningStatus,
+        VerificationPlanObservation, VerificationPlanStatus,
+    };
+    use singularity_protocol::{TraceRepairReason, TraceSpanKind, TraceSpanPhase};
+    use singularity_tools::WorkspaceRevision;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let (turn, _item, _trace) = store
+        .create_turn_with_input_and_trace(
+            &thread.thread_id,
+            "running",
+            serde_json::json!([{"type": "text", "text": "repair"}]),
+            "app_server",
+            "turn started",
+        )
+        .expect("turn");
+    let mut projector =
+        observability::TraceProjector::new(&store, &thread.thread_id, &turn.turn_id)
+            .expect("projector");
+
+    let revision = WorkspaceRevision::initial().next().expect("revision");
+    let plan_identity = OccurrenceIdentity {
+        occurrence_id: format!("sha256:{}", "ab".repeat(32)),
+        parent_occurrence_id: None,
+        ordinal: 0,
+    };
+    projector
+        .project_event(AgentLoopEvent::Observation(
+            AgentObservation::VerificationPlan(VerificationPlanObservation {
+                identity: plan_identity.clone(),
+                lifecycle: OccurrenceLifecycle::Started {
+                    queued_at_unix_ms: 100,
+                    started_at_unix_ms: 101,
+                },
+                revision: Some(revision),
+                risk_count: 2,
+                requirement_count: 3,
+                satisfied_requirement_count: 1,
+            }),
+        ))
+        .expect("project plan start");
+    projector
+        .project_event(AgentLoopEvent::Observation(
+            AgentObservation::VerificationPlan(VerificationPlanObservation {
+                identity: plan_identity,
+                lifecycle: OccurrenceLifecycle::Finished {
+                    queued_at_unix_ms: 100,
+                    started_at_unix_ms: 101,
+                    ended_at_unix_ms: 201,
+                    duration_ms: 100,
+                    status: VerificationPlanStatus::Planned,
+                },
+                revision: Some(revision),
+                risk_count: 2,
+                requirement_count: 3,
+                satisfied_requirement_count: 1,
+            }),
+        ))
+        .expect("project plan end");
+
+    let repair_identity = OccurrenceIdentity {
+        occurrence_id: format!("sha256:{}", "cd".repeat(32)),
+        parent_occurrence_id: None,
+        ordinal: 1,
+    };
+    projector
+        .project_event(AgentLoopEvent::Observation(
+            AgentObservation::RepairPlanning(RepairPlanningObservation {
+                identity: repair_identity.clone(),
+                lifecycle: OccurrenceLifecycle::Started {
+                    queued_at_unix_ms: 200,
+                    started_at_unix_ms: 201,
+                },
+                reason: AgentRepairReason::RevisionConflict,
+                attempt: 2,
+                max_attempts: 3,
+                required_revision: Some(revision),
+            }),
+        ))
+        .expect("project repair start");
+    projector
+        .project_event(AgentLoopEvent::Observation(
+            AgentObservation::RepairPlanning(RepairPlanningObservation {
+                identity: repair_identity,
+                lifecycle: OccurrenceLifecycle::Finished {
+                    queued_at_unix_ms: 200,
+                    started_at_unix_ms: 201,
+                    ended_at_unix_ms: 301,
+                    duration_ms: 100,
+                    status: RepairPlanningStatus::Planned,
+                },
+                reason: AgentRepairReason::RevisionConflict,
+                attempt: 2,
+                max_attempts: 3,
+                required_revision: Some(revision),
+            }),
+        ))
+        .expect("project repair end");
+
+    let trace = store.list_trace(&thread.thread_id).expect("trace");
+    let event_projection = |summary: &str, phase: TraceSpanPhase| {
+        trace
+            .iter()
+            .find(|event| {
+                event.summary == summary
+                    && event.span_kind == Some(TraceSpanKind::Verification)
+                    && event.span_phase == Some(phase)
+            })
+            .and_then(|event| event.span_projection.as_ref())
+            .and_then(|projection| projection.verification.as_ref())
+            .cloned()
+            .unwrap_or_else(|| panic!("missing {summary} {phase:?} projection"))
+    };
+
+    for phase in [TraceSpanPhase::Start, TraceSpanPhase::End] {
+        let plan = event_projection("verification plan", phase);
+        assert_eq!(plan.revision, Some(revision.value()));
+        assert_eq!(plan.required_command_count, Some(3));
+        assert_eq!(plan.satisfied_command_count, Some(1));
+        assert_eq!(plan.occurrence_count, Some(2));
+
+        let repair = event_projection("repair planning", phase);
+        assert_eq!(
+            repair.repair_reason,
+            Some(TraceRepairReason::RevisionConflict)
+        );
+        assert_eq!(repair.attempt, Some(2));
+        assert_eq!(repair.max_attempts, Some(3));
+        assert_eq!(repair.required_revision, Some(revision.value()));
+        assert_eq!(repair.required_command_count, None);
+        assert_eq!(repair.satisfied_command_count, None);
+        assert_eq!(repair.occurrence_count, None);
+    }
+}
