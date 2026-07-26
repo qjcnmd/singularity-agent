@@ -1,6 +1,7 @@
 //! 工作区 capability、读写搜索、命令接入及 verification 观察。
 
 use super::*;
+use singularity_sandbox::is_toolchain_artifact_path;
 
 mod mutation;
 mod read;
@@ -856,20 +857,34 @@ impl WorkspaceTools {
             output.failure_kind = Some(ToolFailureKind::Infrastructure);
             output.error_code = Some("sandbox_command_id_mismatch".to_string());
         }
-        let observation = match (&requested_filesystem, mutation) {
-            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unchanged) => {
+        // A producer may mark a physical diff as verification-irrelevant only for a fully
+        // classified, newly-created toolchain artifact set. Missing or malformed summaries,
+        // and a false flag attached to an unknown path, remain verification-relevant.
+        let verification_relevant = workspace_change_summary.as_ref().is_none_or(|summary| {
+            summary.verification_relevant
+                || summary.changed_files.is_empty()
+                || !summary
+                    .changed_files
+                    .iter()
+                    .all(|path| is_toolchain_artifact_path(path))
+        });
+        let observation = match (&requested_filesystem, mutation, verification_relevant) {
+            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unchanged, _) => {
                 WorkspaceObservation::unchanged(self.current_workspace_revision())
             }
-            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Changed) => {
+            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Changed, false) => {
+                WorkspaceObservation::unchanged(self.current_workspace_revision())
+            }
+            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Changed, true) => {
                 WorkspaceObservation::changed(self.advance_workspace_revision()?)
             }
-            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unknown) => {
+            (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unknown, _) => {
                 output.ok = false;
                 output.failure_kind = Some(ToolFailureKind::Backend);
                 output.error_code = Some("workspace_change_unknown".to_string());
                 WorkspaceObservation::unknown()
             }
-            (SandboxFilesystemMode::ReadOnly, WorkspaceMutation::Changed) => {
+            (SandboxFilesystemMode::ReadOnly, WorkspaceMutation::Changed, _) => {
                 output.ok = false;
                 output.failure_kind = Some(ToolFailureKind::Backend);
                 output.error_code = Some("workspace_changed_in_read_only_command".to_string());
@@ -878,6 +893,7 @@ impl WorkspaceTools {
             (
                 SandboxFilesystemMode::ReadOnly,
                 WorkspaceMutation::Unchanged | WorkspaceMutation::Unknown,
+                _,
             ) => WorkspaceObservation::unchanged(self.current_workspace_revision()),
         };
         Self::attach_workspace_observation(&mut output, &observation)?;

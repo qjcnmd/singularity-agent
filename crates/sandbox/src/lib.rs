@@ -16,6 +16,7 @@ use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
 
 mod workspace_change;
+pub use workspace_change::is_toolchain_artifact_path;
 use workspace_change::{WorkspaceSnapshot, snapshot_trusted_workspace, snapshot_workspace};
 
 /// command tool 未指定超时时使用的秒数。
@@ -107,6 +108,12 @@ pub enum WorkspaceMutation {
 pub struct WorkspaceChangeSummary {
     pub changed_files: Vec<String>,
     pub diff_digest: String,
+    /// Whether this physical diff is relevant to the agent-visible workspace revision.
+    ///
+    /// Missing values from older checkpoint or metadata payloads default to `true` so that
+    /// an untrusted or incomplete producer cannot hide a real workspace mutation.
+    #[serde(default = "verification_relevant_default")]
+    pub verification_relevant: bool,
 }
 
 impl WorkspaceChangeSummary {
@@ -115,8 +122,18 @@ impl WorkspaceChangeSummary {
         Self {
             changed_files,
             diff_digest: diff_digest.into(),
+            verification_relevant: true,
         }
     }
+
+    pub(crate) fn with_verification_relevant(mut self, verification_relevant: bool) -> Self {
+        self.verification_relevant = verification_relevant;
+        self
+    }
+}
+
+fn verification_relevant_default() -> bool {
+    true
 }
 
 /// 与命令请求使用的工作区根目录配对的文件系统策略。

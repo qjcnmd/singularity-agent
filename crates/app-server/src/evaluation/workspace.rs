@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use singularity_sandbox::is_toolchain_artifact_path;
 const REPARSE_POINT_ATTRIBUTE: u32 = 0x0400;
 type WorkspaceSnapshot = BTreeMap<String, String>;
 
@@ -315,7 +316,7 @@ pub(super) fn evaluation_changed_paths(
     changed_paths(before, after)
         .into_iter()
         .filter(|path| {
-            pristine_source.contains_key(path.as_str()) || !is_evaluation_artifact_path(path)
+            pristine_source.contains_key(path.as_str()) || !is_toolchain_artifact_path(path)
         })
         .collect()
 }
@@ -342,50 +343,6 @@ pub(super) fn workspace_change_evidence(
             path,
         })
         .collect()
-}
-
-fn is_evaluation_artifact_path(path: &str) -> bool {
-    // 该分类保持闭集：只忽略稳定的工具链产物，未知路径仍交给 allowlist。
-    let segments = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.iter().any(|segment| {
-        matches!(
-            *segment,
-            "target"
-                | "__pycache__"
-                | ".pytest_cache"
-                | ".mypy_cache"
-                | ".ruff_cache"
-                | ".hypothesis"
-                | ".tox"
-                | ".nox"
-                | ".cache"
-                | ".next"
-                | ".nuxt"
-                | ".svelte-kit"
-                | ".parcel-cache"
-                | ".turbo"
-                | ".vite"
-                | "coverage"
-                | "htmlcov"
-        )
-    }) {
-        return true;
-    }
-
-    segments
-        .iter()
-        .any(|segment| segment.ends_with(".egg-info"))
-        || segments.last().is_some_and(|file| {
-            file.ends_with(".pyc")
-                || file.ends_with(".pyo")
-                || *file == ".coverage"
-                || file.starts_with(".coverage.")
-                || *file == ".eslintcache"
-                || *file == ".stylelintcache"
-        })
 }
 
 /// 计算工作区变更 evidence 的稳定摘要。

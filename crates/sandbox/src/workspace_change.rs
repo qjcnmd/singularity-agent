@@ -28,6 +28,59 @@ const MAX_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CHANGED_FILES: usize = 64;
 const MAX_CHANGED_PATH_CHARS: usize = 512;
 
+/// Return whether a relative workspace path belongs to the closed toolchain artifact set.
+///
+/// This classifier is intentionally conservative: paths outside the known set return `false`
+/// and therefore remain verification-relevant. Callers must only treat a diff as artifact-only
+/// when every path is classified here and was absent from the before snapshot.
+pub fn is_toolchain_artifact_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return false;
+    }
+    let segments = path.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| {
+        matches!(
+            *segment,
+            "target"
+                | "__pycache__"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+                | ".hypothesis"
+                | ".tox"
+                | ".nox"
+                | ".cache"
+                | ".next"
+                | ".nuxt"
+                | ".svelte-kit"
+                | ".parcel-cache"
+                | ".turbo"
+                | ".vite"
+                | "coverage"
+                | "htmlcov"
+        )
+    }) {
+        return true;
+    }
+
+    segments
+        .iter()
+        .any(|segment| segment.ends_with(".egg-info"))
+        || segments.last().is_some_and(|file| {
+            file.ends_with(".pyc")
+                || file.ends_with(".pyo")
+                || *file == ".coverage"
+                || file.starts_with(".coverage.")
+                || *file == ".eslintcache"
+                || *file == ".stylelintcache"
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 enum SnapshotEntry {
     Directory {
@@ -119,10 +172,16 @@ impl WorkspaceSnapshot {
             .collect::<Vec<_>>();
         let encoded = serde_json::to_vec(&(self.root.clone(), after.root.clone(), changed_entries))
             .map_err(|error| format!("workspace change summary encoding failed: {error}"))?;
-        Ok(Some(WorkspaceChangeSummary::new(
-            changed_files,
-            format!("sha256:{:x}", Sha256::digest(encoded)),
-        )))
+        let verification_relevant = !changed_files
+            .iter()
+            .all(|path| is_toolchain_artifact_path(path) && !self.entries.contains_key(path));
+        Ok(Some(
+            WorkspaceChangeSummary::new(
+                changed_files,
+                format!("sha256:{:x}", Sha256::digest(encoded)),
+            )
+            .with_verification_relevant(verification_relevant),
+        ))
     }
 
     /// Compare the workspace baseline while ignoring trusted metadata churn on protected
@@ -500,7 +559,7 @@ fn hash_os_str(value: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{snapshot_trusted_workspace, snapshot_workspace};
+    use super::{is_toolchain_artifact_path, snapshot_trusted_workspace, snapshot_workspace};
 
     #[test]
     fn summary_binds_changed_path_and_before_after_content() {
@@ -517,6 +576,7 @@ mod tests {
             .expect("changed");
 
         assert_eq!(summary.changed_files, ["value.txt"]);
+        assert!(summary.verification_relevant);
         assert!(summary.diff_digest.starts_with("sha256:"));
         assert_eq!(summary.diff_digest.len(), "sha256:".len() + 64);
 
@@ -527,6 +587,125 @@ mod tests {
             .expect("alternate summary")
             .expect("alternate changed");
         assert_ne!(summary.diff_digest, alternate.diff_digest);
+    }
+
+    #[test]
+    fn new_toolchain_artifacts_are_not_verification_relevant() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        std::fs::create_dir_all(workspace.path().join("target/debug")).expect("target dirs");
+        std::fs::write(workspace.path().join("target/debug/app"), b"artifact")
+            .expect("target artifact");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+
+        let summary = before
+            .change_summary(&after)
+            .expect("summary")
+            .expect("artifact change");
+
+        assert!(!summary.verification_relevant);
+        assert!(
+            summary
+                .changed_files
+                .iter()
+                .all(|path| is_toolchain_artifact_path(path))
+        );
+    }
+
+    #[test]
+    fn artifact_classifier_rejects_noncanonical_paths() {
+        assert!(!is_toolchain_artifact_path("\\target\\debug\\app"));
+        assert!(!is_toolchain_artifact_path("/target/debug/app"));
+        assert!(!is_toolchain_artifact_path("target//debug/app"));
+        assert!(!is_toolchain_artifact_path("target/../src/lib.rs"));
+    }
+
+    #[test]
+    fn source_or_preexisting_or_unknown_changes_remain_verification_relevant() {
+        let source_workspace = tempfile::tempdir().expect("source workspace");
+        let source_before = snapshot_workspace(source_workspace.path()).expect("source before");
+        std::fs::create_dir_all(source_workspace.path().join("target/debug")).expect("target dirs");
+        std::fs::write(
+            source_workspace.path().join("target/debug/app"),
+            b"artifact",
+        )
+        .expect("target artifact");
+        std::fs::create_dir_all(source_workspace.path().join("src")).expect("src dir");
+        std::fs::write(source_workspace.path().join("src/lib.rs"), b"source").expect("source file");
+        let source_after = snapshot_workspace(source_workspace.path()).expect("source after");
+        assert!(
+            source_before
+                .change_summary(&source_after)
+                .expect("source summary")
+                .expect("source change")
+                .verification_relevant
+        );
+
+        let preexisting_workspace = tempfile::tempdir().expect("preexisting workspace");
+        std::fs::create_dir_all(preexisting_workspace.path().join("target/debug"))
+            .expect("target dirs");
+        std::fs::write(
+            preexisting_workspace.path().join("target/debug/app"),
+            b"before",
+        )
+        .expect("target artifact");
+        let preexisting_before =
+            snapshot_workspace(preexisting_workspace.path()).expect("preexisting before");
+        std::fs::write(
+            preexisting_workspace.path().join("target/debug/app"),
+            b"after",
+        )
+        .expect("modified artifact");
+        let preexisting_after =
+            snapshot_workspace(preexisting_workspace.path()).expect("preexisting after");
+        assert!(
+            preexisting_before
+                .change_summary(&preexisting_after)
+                .expect("preexisting summary")
+                .expect("preexisting change")
+                .verification_relevant
+        );
+
+        let unknown_workspace = tempfile::tempdir().expect("unknown workspace");
+        let unknown_before = snapshot_workspace(unknown_workspace.path()).expect("unknown before");
+        std::fs::create_dir_all(unknown_workspace.path().join("generated")).expect("generated");
+        std::fs::write(
+            unknown_workspace.path().join("generated/cache.bin"),
+            b"unknown",
+        )
+        .expect("unknown file");
+        let unknown_after = snapshot_workspace(unknown_workspace.path()).expect("unknown after");
+        assert!(
+            unknown_before
+                .change_summary(&unknown_after)
+                .expect("unknown summary")
+                .expect("unknown change")
+                .verification_relevant
+        );
+    }
+
+    #[test]
+    fn root_metadata_change_is_verification_relevant() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let before_permissions = std::fs::metadata(workspace.path())
+            .expect("root metadata")
+            .permissions();
+        let mut changed_permissions = before_permissions.clone();
+        changed_permissions.set_readonly(!before_permissions.readonly());
+        std::fs::set_permissions(workspace.path(), changed_permissions)
+            .expect("change root permissions");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+
+        std::fs::set_permissions(workspace.path(), before_permissions)
+            .expect("restore root permissions");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+
+        let summary = before
+            .change_summary(&after)
+            .expect("summary")
+            .expect("root metadata change");
+        assert_eq!(summary.changed_files, ["."]);
+        assert!(summary.verification_relevant);
     }
 
     #[test]
@@ -736,13 +915,11 @@ mod tests {
         std::fs::set_permissions(workspace.path(), permissions).expect("chmod root");
         let after = snapshot_workspace(workspace.path()).expect("after snapshot");
 
-        assert_eq!(
-            before
-                .change_summary(&after)
-                .expect("summary")
-                .expect("root changed")
-                .changed_files,
-            ["."]
-        );
+        let summary = before
+            .change_summary(&after)
+            .expect("summary")
+            .expect("root changed");
+        assert_eq!(summary.changed_files, ["."]);
+        assert!(summary.verification_relevant);
     }
 }
