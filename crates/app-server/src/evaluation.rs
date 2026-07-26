@@ -44,10 +44,11 @@ use singularity_protocol::{
     TraceSpanStatus,
 };
 use singularity_tools::{
-    CommandEnvironmentPolicy, CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend,
-    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact,
-    SandboxPreflightOutcome, SandboxPreflightReport, ToolAuthorization, ToolBroker, ToolCapability,
-    ToolExecutor, ToolRegistry, WorkspaceToolExecutor, WorkspaceTools,
+    CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
+    CommandScriptRequest, CommandSemanticStatus, SandboxBackend, SandboxCapabilities,
+    SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightOutcome,
+    SandboxPreflightReport, ToolAuthorization, ToolBroker, ToolCapability, ToolExecutor,
+    ToolRegistry, WorkspaceMutation, WorkspaceToolExecutor, WorkspaceTools,
     command_script_scope_digest_with_policy, workspace_tool_entries,
 };
 
@@ -1846,6 +1847,22 @@ fn run_verification_after_setup(
         ));
         if let Some(blocker) = infrastructure_blocker(&result, "verification command failed") {
             return StageExecution::blocked(blocker, diagnostics);
+        }
+        // A nonzero result is ordinary verification evidence when success was expected, but it
+        // becomes the baseline's accepted outcome when failure was expected.  Accepting that
+        // outcome still requires a proven workspace observation.
+        if expectation == CommandExpectation::Failure
+            && result.execution_status == CommandExecutionStatus::Completed
+            && result.semantic_status != CommandSemanticStatus::Succeeded
+            && result.workspace_mutation == WorkspaceMutation::Unknown
+        {
+            return StageExecution::blocked(
+                evaluation_blocker(
+                    BlockerKind::Sandbox,
+                    "verification command failed: workspace mutation could not be verified",
+                ),
+                diagnostics,
+            );
         }
         if command_succeeded(&result) {
             successes += 1;
@@ -4848,6 +4865,23 @@ mod tests {
             execution.result.blocker.expect("sandbox blocker").kind,
             BlockerKind::Sandbox
         );
+        assert_eq!(execution.diagnostics.commands.len(), 1);
+    }
+
+    #[test]
+    fn verification_expected_success_preserves_nonzero_as_task_failure() {
+        let temp = tempfile::tempdir().expect("temp");
+        let execution = run_verification_after_setup(
+            temp.path(),
+            None,
+            &[command(&["cargo", "test"])],
+            CommandExpectation::Success,
+            Arc::new(PathBudgetSandboxBackend),
+            Vec::new(),
+        );
+
+        assert_eq!(execution.result.status, StageStatus::Failed);
+        assert!(execution.result.blocker.is_none());
         assert_eq!(execution.diagnostics.commands.len(), 1);
     }
 
