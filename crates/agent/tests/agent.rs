@@ -6166,11 +6166,145 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
     assert!(verification_events.len() >= 4);
     for pair in verification_events.chunks_exact(2) {
         assert_eq!(pair[0].identity, pair[1].identity);
+        assert_eq!(
+            pair[0].required_command_count,
+            pair[1].required_command_count
+        );
         assert_eq!(pair[0].occurrence_count, pair[1].occurrence_count);
     }
     assert_eq!(
         std::fs::read_to_string(file_path).expect("read file"),
         "command mutation"
+    );
+}
+
+#[test]
+fn command_mutation_keeps_verification_span_identity_after_plan_invalidation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let fixture_name = "README.md";
+    std::fs::write(workspace.path().join(fixture_name), "before").expect("write fixture");
+    let command = test_command_script("mutating_verification");
+
+    let mut edit = ModelTurnResponse::completed(
+        "model_request_turn_verification_span_0",
+        "response_span_edit",
+        "",
+    );
+    edit.tool_calls.push(tool_call(
+        "span_edit",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut plan = ModelTurnResponse::completed(
+        "model_request_turn_verification_span_1",
+        "response_span_plan",
+        "",
+    );
+    plan.tool_calls.push(tool_call(
+        "span_plan",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "verify the mutation", "status": "in_progress"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "the fixture changed",
+                "affected_path": fixture_name,
+                "affected_symbol": "README::content",
+                "current_gap": "the changed revision is not verified",
+                "action": {
+                    "command": command,
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 2
+            }]
+        }),
+    ));
+    let mut verification = ModelTurnResponse::completed(
+        "model_request_turn_verification_span_2",
+        "response_span_command",
+        "",
+    );
+    verification.tool_calls.push(tool_call(
+        "span_command",
+        "command",
+        serde_json::json!({
+            "command": command,
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let mut events = Vec::new();
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![edit, plan, verification],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(CommandMutatingBackend {
+                workspace: workspace.path().to_path_buf(),
+                calls: AtomicUsize::new(0),
+                include_summary: true,
+            }),
+    )
+    .run_with_events(
+        &AgentLoopInput::new(
+            "thread_verification_span",
+            "turn_verification_span",
+            "change and verify the fixture",
+        )
+        .with_max_turns(3),
+        &mut |event| {
+            events.push(event);
+            Ok(())
+        },
+    );
+
+    assert_eq!(result.status, AgentStatus::Failed, "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join(fixture_name)).expect("read fixture"),
+        "command mutation"
+    );
+    let verification_events = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Observation(AgentObservation::Verification(value)) => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(verification_events.len(), 2, "{result:?}");
+    assert_eq!(
+        verification_events[0].identity,
+        verification_events[1].identity
+    );
+    assert_eq!(
+        verification_events[0].required_command_count,
+        verification_events[1].required_command_count
+    );
+    assert_eq!(
+        verification_events[0].occurrence_count,
+        verification_events[1].occurrence_count
     );
 }
 

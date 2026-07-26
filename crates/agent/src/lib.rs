@@ -5261,14 +5261,17 @@ where
                     .clone()
                     .unwrap_or_else(|| "tool_execution_failed".to_string())
             });
-            let verification_identity = (prepared.call.tool_name == TOOL_COMMAND).then(|| {
-                child_occurrence_identity(&occurrence.context.identity, "verification", 0)
+            let verification_occurrence = (prepared.call.tool_name == TOOL_COMMAND).then(|| {
+                let summary = state.completion.summary();
+                (
+                    child_occurrence_identity(&occurrence.context.identity, "verification", 0),
+                    summary.required_command_count,
+                    occurrence.context.tool_call_ordinal.saturating_add(1),
+                )
             });
-            // The occurrence ordinal identifies this verification span; the successful-command
-            // total is a mutable metric and cannot be used as a Start/End identity attribute.
-            let verification_occurrence_count =
-                occurrence.context.tool_call_ordinal.saturating_add(1);
-            if let Some(identity) = &verification_identity {
+            if let Some((identity, required_command_count, occurrence_count)) =
+                &verification_occurrence
+            {
                 let summary = state.completion.summary();
                 if emit_event(
                     on_event,
@@ -5276,9 +5279,9 @@ where
                         VerificationObservation {
                             identity: identity.clone(),
                             lifecycle: occurrence.context.timer.started(),
-                            required_command_count: summary.required_command_count,
+                            required_command_count: *required_command_count,
                             satisfied_command_count: summary.satisfied_command_count,
-                            occurrence_count: verification_occurrence_count,
+                            occurrence_count: *occurrence_count,
                             command_duration_ms: Some(tool_duration_ms),
                         },
                     )),
@@ -5444,7 +5447,9 @@ where
                     return ToolBatchControl::Failed(EVENT_SINK_FAILURE_ERROR.to_string());
                 }
             }
-            if let Some(identity) = verification_identity {
+            if let Some((identity, required_command_count, occurrence_count)) =
+                verification_occurrence
+            {
                 let summary = state.completion.summary();
                 let status = if result.ok {
                     VerificationStatus::CommandPassed
@@ -5460,9 +5465,9 @@ where
                                 .context
                                 .timer
                                 .finished_with_duration(tool_duration_ms, status),
-                            required_command_count: summary.required_command_count,
+                            required_command_count,
                             satisfied_command_count: summary.satisfied_command_count,
-                            occurrence_count: verification_occurrence_count,
+                            occurrence_count,
                             command_duration_ms: Some(tool_duration_ms),
                         },
                     )),
