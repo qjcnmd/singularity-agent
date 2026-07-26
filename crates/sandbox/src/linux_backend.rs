@@ -69,6 +69,17 @@ const STANDARD_RUNTIME_ROOTS: [&str; 12] = [
     "/proc",
 ];
 
+/// Host name resolution and TLS trust inputs required by network-enabled processes.
+const NETWORK_RUNTIME_READ_PATHS: [&str; 7] = [
+    "/etc/resolv.conf",
+    "/etc/nsswitch.conf",
+    "/etc/hosts",
+    "/etc/host.conf",
+    "/etc/gai.conf",
+    "/etc/ssl/openssl.cnf",
+    "/etc/ssl/certs",
+];
+
 // Serialize only clone through the child's inherited-FD cleanup ack; command execution stays parallel.
 static CHILD_LAUNCH_GATE: Mutex<()> = Mutex::new(());
 
@@ -945,9 +956,15 @@ impl PreparedCommand {
         }
         let mut env = sanitized_environment(&environment);
         let resolved = resolve_executable(&argv[0], &cwd_path, &env)?;
+        let mut runtime_read_paths = resolved.runtime_read_paths;
+        if network == SandboxNetworkMode::Allowed {
+            for candidate in NETWORK_RUNTIME_READ_PATHS {
+                push_existing_canonical_path(&mut runtime_read_paths, Path::new(candidate));
+            }
+        }
         if std::iter::once(&resolved.executable)
             .chain(std::iter::once(&resolved.invocation))
-            .chain(resolved.runtime_read_paths.iter())
+            .chain(runtime_read_paths.iter())
             .any(|path| is_protected_path(&path.to_string_lossy()))
         {
             return Err(LinuxSandboxError::PolicyDenied(
@@ -996,7 +1013,7 @@ impl PreparedCommand {
             workspace,
             cwd: cwd_path,
             executable: resolved.executable,
-            runtime_read_paths: resolved.runtime_read_paths,
+            runtime_read_paths,
             argv,
             env,
             timeout: Duration::from_secs(timeout_seconds),

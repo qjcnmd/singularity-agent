@@ -3135,11 +3135,27 @@ fn preflight_remote_sources(
             SandboxNetworkMode::Allowed,
             Arc::clone(sandbox_backend),
         );
-        if !command_succeeded(&result) {
+        if !remote_source_probe_succeeded(&result) {
             return Err(RemoteSourcePreflightFailure::Probe);
         }
     }
     Ok(())
+}
+
+/// A read-only remote source probe has no workspace mutation to observe.
+///
+/// Mutation-capable commands keep using `command_succeeded`; this narrower predicate only accepts
+/// the fixed `git ls-remote` contract when completion and strict sandbox enforcement are proven.
+fn remote_source_probe_succeeded(result: &CommandResult) -> bool {
+    result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::Succeeded
+        && result.exit_code == Some(0)
+        && matches!(
+            result.workspace_mutation,
+            WorkspaceMutation::Unknown | WorkspaceMutation::Unchanged
+        )
+        && !result.sandbox.local_process_fallback
+        && result.sandbox.enforcement == singularity_tools::SandboxBackendEnforcement::Strict
 }
 
 fn run_sandbox_preflight(
@@ -4642,7 +4658,7 @@ mod tests {
                     CommandResult::completed(&request.command_id, "remote source reachable")
                 };
                 return result
-                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
             assert!(request.is_trusted_workspace_preparation());

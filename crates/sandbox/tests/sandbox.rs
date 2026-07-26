@@ -2038,6 +2038,74 @@ time.sleep(30)
     }
 
     #[test]
+    fn linux_network_configuration_is_readable_only_when_network_is_allowed() {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return;
+        }
+        for path in [
+            "/etc/resolv.conf",
+            "/etc/nsswitch.conf",
+            "/etc/hosts",
+            "/etc/ssl/certs",
+        ] {
+            assert!(
+                Path::new(path).exists(),
+                "missing network runtime path: {path}"
+            );
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = strict_backend();
+        let script = concat!(
+            "import sys; from pathlib import Path; path = Path(sys.argv[1]); ",
+            "path.read_bytes() if path.is_file() else list(path.iterdir())"
+        );
+        for path in [
+            "/etc/resolv.conf",
+            "/etc/nsswitch.conf",
+            "/etc/hosts",
+            "/etc/ssl/certs",
+        ] {
+            let denied = request(
+                "linux_network_configuration_denied",
+                &[path_str(python), "-c", script, path],
+                workspace.path(),
+                SandboxFilesystemMode::ReadOnly,
+                SandboxNetworkMode::Denied,
+            );
+            let denied_result = backend.execute(&denied);
+            assert_eq!(
+                denied_result.execution_status,
+                CommandExecutionStatus::Completed
+            );
+            assert_ne!(
+                denied_result.exit_code,
+                Some(0),
+                "network-denied command read {path}"
+            );
+
+            let allowed = request(
+                "linux_network_configuration_allowed",
+                &[path_str(python), "-c", script, path],
+                workspace.path(),
+                SandboxFilesystemMode::ReadOnly,
+                SandboxNetworkMode::Allowed,
+            );
+            let allowed_result = backend.execute(&allowed);
+            assert_eq!(
+                allowed_result.execution_status,
+                CommandExecutionStatus::Completed
+            );
+            assert_eq!(
+                allowed_result.exit_code,
+                Some(0),
+                "failed to read {path}: {}",
+                allowed_result.stderr_preview
+            );
+        }
+    }
+
+    #[test]
     fn linux_child_inherits_secret_isolation_and_kernel_restrictions() {
         if run_environment_test_in_subprocess(
             "linux_tests::linux_child_inherits_secret_isolation_and_kernel_restrictions",
