@@ -160,6 +160,14 @@ pub enum CommandSemanticStatus {
     Cancelled,
 }
 
+/// Whether the selected backend can resolve an executable without starting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutableAvailability {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
 /// 控制哪些宿主环境变量可以传入子命令。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -256,6 +264,8 @@ impl CommandRequest {
 pub struct CommandScriptRequest {
     pub command_id: String,
     pub script: String,
+    /// 由产品控制面声明、供 backend 解析只读运行时闭包的 executable。
+    pub runtime_executables: Vec<String>,
     pub cwd: String,
     pub timeout_seconds: u64,
     pub network: SandboxNetworkPolicy,
@@ -274,6 +284,7 @@ impl CommandScriptRequest {
         Self {
             command_id: command_id.into(),
             script: script.into(),
+            runtime_executables: Vec::new(),
             cwd: cwd.into(),
             timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
             network: SandboxNetworkPolicy {
@@ -299,6 +310,7 @@ impl CommandScriptRequest {
         Self {
             command_id: command_id.into(),
             script: script.into(),
+            runtime_executables: Vec::new(),
             cwd: cwd.into(),
             timeout_seconds: DEFAULT_COMMAND_TIMEOUT_SECONDS,
             network: SandboxNetworkPolicy { mode: network },
@@ -882,6 +894,15 @@ pub trait SandboxBackend {
         cancellation: &CancellationToken,
     ) -> SandboxPreflightReport {
         default_sandbox_preflight(self, workspace, cancellation)
+    }
+    /// Resolve one executable through the backend's real command environment without running it.
+    fn probe_executable(
+        &self,
+        _workspace: &Path,
+        _executable: &str,
+        _environment: &CommandEnvironmentPolicy,
+    ) -> ExecutableAvailability {
+        ExecutableAvailability::Unknown
     }
     /// 执行一个请求；不可用或不支持的 backend 必须返回阻塞结果。
     fn execute(&self, request: &CommandRequest) -> CommandResult;

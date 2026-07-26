@@ -12,9 +12,9 @@ use singularity_protocol::ItemKind;
 #[cfg(windows)]
 use singularity_protocol::{ConversationRole, TraceMetricSampleKind};
 use singularity_sandbox::{
-    CommandRequest, CommandResult, CommandScriptRequest, SandboxBackend, SandboxBackendEnforcement,
-    SandboxCapabilities, SandboxPreflightFact, SandboxPreflightOutcome, SandboxPreflightReport,
-    WorkspaceMutation,
+    CommandEnvironmentPolicy, CommandRequest, CommandResult, CommandScriptRequest,
+    ExecutableAvailability, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
+    SandboxPreflightFact, SandboxPreflightOutcome, SandboxPreflightReport, WorkspaceMutation,
 };
 use singularity_store::{RegisterArtifactRefParams, SessionStore, StoreError};
 #[cfg(windows)]
@@ -94,6 +94,15 @@ impl SandboxBackend for CompletedSandboxBackend {
             network_denied: SandboxPreflightFact::Passed,
             protected_paths: SandboxPreflightFact::Passed,
         }
+    }
+
+    fn probe_executable(
+        &self,
+        _workspace: &std::path::Path,
+        _executable: &str,
+        _environment: &CommandEnvironmentPolicy,
+    ) -> ExecutableAvailability {
+        ExecutableAvailability::Available
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {

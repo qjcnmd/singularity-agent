@@ -2633,7 +2633,8 @@ fn workspace_command_tool_propagates_evaluation_environment_policy() {
     let tools = WorkspaceTools::new(&workspace)
         .expect("bind workspace tools")
         .with_sandbox_backend(EvaluationEnvironmentBackend)
-        .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated);
+        .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated)
+        .with_command_runtime_executables(vec!["node".to_string()]);
 
     let result = tools
         .command(CommandToolInput {
@@ -3257,6 +3258,7 @@ impl SandboxBackend for EvaluationEnvironmentBackend {
             request.environment,
             CommandEnvironmentPolicy::EvaluationIsolated
         );
+        assert_eq!(request.runtime_executables, ["node"]);
         CommandResult::completed(&request.command_id, "command ok")
             .with_workspace_mutation(WorkspaceMutation::Unchanged)
             .with_sandbox_execution(

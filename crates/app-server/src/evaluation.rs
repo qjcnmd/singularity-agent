@@ -45,10 +45,10 @@ use singularity_protocol::{
 };
 use singularity_tools::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
-    CommandScriptRequest, CommandSemanticStatus, SandboxBackend, SandboxCapabilities,
-    SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightOutcome,
-    SandboxPreflightReport, ToolAuthorization, ToolBroker, ToolCapability, ToolExecutor,
-    ToolRegistry, WorkspaceMutation, WorkspaceToolExecutor, WorkspaceTools,
+    CommandScriptRequest, CommandSemanticStatus, ExecutableAvailability, SandboxBackend,
+    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact,
+    SandboxPreflightOutcome, SandboxPreflightReport, ToolAuthorization, ToolBroker, ToolCapability,
+    ToolExecutor, ToolRegistry, WorkspaceMutation, WorkspaceToolExecutor, WorkspaceTools,
     command_script_scope_digest_with_policy, workspace_tool_entries,
 };
 
@@ -161,6 +161,16 @@ impl SandboxBackend for CancellationAwareSandboxBackend {
         cancellation: &CancellationToken,
     ) -> SandboxPreflightReport {
         self.backend.preflight(workspace, cancellation)
+    }
+
+    fn probe_executable(
+        &self,
+        workspace: &Path,
+        executable: &str,
+        environment: &CommandEnvironmentPolicy,
+    ) -> ExecutableAvailability {
+        self.backend
+            .probe_executable(workspace, executable, environment)
     }
 }
 
@@ -2247,10 +2257,18 @@ fn run_agent_stage(
     if let Some(instructions) = project_instructions {
         input = input.with_project_instructions(instructions);
     }
+    let command_runtime_executables = projection
+        .smoke_commands
+        .iter()
+        .filter_map(|command| command.argv.as_slice().first().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let workspace_tools = match WorkspaceTools::new(&agent_dir) {
         Ok(tools) => tools
             .with_shared_sandbox_backend(Arc::clone(prepared.sandbox_backend))
-            .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated),
+            .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated)
+            .with_command_runtime_executables(command_runtime_executables),
         Err(error) => {
             return blocked_agent_stage(
                 evaluation_blocker(BlockerKind::WorkspacePreparation, error.to_string()),
@@ -3167,6 +3185,72 @@ fn preflight_remote_sources(
     Ok(())
 }
 
+fn required_host_executables(plans: &[WorkspacePlan]) -> std::collections::BTreeSet<String> {
+    let mut executables = std::collections::BTreeSet::new();
+    for plan in plans {
+        let commands = plan
+            .agent
+            .setup_commands
+            .iter()
+            .chain(&plan.baseline.setup_commands)
+            .chain(&plan.public.setup_commands)
+            .chain(&plan.hidden.setup_commands)
+            .chain(&plan.agent.projection.smoke_commands)
+            .chain(&plan.baseline.commands)
+            .chain(&plan.public.commands)
+            .chain(&plan.hidden.commands);
+        for command in commands {
+            let Some(executable) = command.argv.as_slice().first() else {
+                continue;
+            };
+            let path = Path::new(executable);
+            if path.is_absolute() || (!executable.contains('/') && !executable.contains('\\')) {
+                executables.insert(executable.clone());
+            }
+        }
+    }
+    executables
+}
+
+fn preflight_task_executables(
+    scratch: &Path,
+    plans: &[WorkspacePlan],
+    sandbox_backend: &SharedSandboxBackend,
+    cancellation: &CancellationToken,
+) -> Result<(), (&'static str, Vec<String>)> {
+    let mut unavailable = Vec::new();
+    let mut unknown = false;
+    for executable in required_host_executables(plans) {
+        if cancellation.is_cancelled() {
+            return Err((
+                "sandbox_preflight_cancelled",
+                vec!["cancellation".to_string()],
+            ));
+        }
+        match sandbox_backend.probe_executable(
+            scratch,
+            &executable,
+            &CommandEnvironmentPolicy::EvaluationIsolated,
+        ) {
+            ExecutableAvailability::Available => {}
+            ExecutableAvailability::Unavailable => {
+                unavailable.push(format!("task_executable:{executable}"));
+            }
+            ExecutableAvailability::Unknown => unknown = true,
+        }
+    }
+    if !unavailable.is_empty() {
+        return Err(("sandbox_preflight_task_executable_unavailable", unavailable));
+    }
+    if unknown {
+        return Err((
+            "sandbox_preflight_task_executable_unverified",
+            vec!["task_executable_probe".to_string()],
+        ));
+    }
+    Ok(())
+}
+
 /// A read-only remote source probe has no workspace mutation to observe.
 ///
 /// Mutation-capable commands keep using `command_succeeded`; this narrower predicate only accepts
@@ -3235,6 +3319,14 @@ fn run_sandbox_preflight(
         }));
     }
     let mut report = sandbox_backend.preflight(&scratch, cancellation);
+    if report.outcome == SandboxPreflightOutcome::Supported
+        && let Err((code, missing)) =
+            preflight_task_executables(&scratch, plans, sandbox_backend, cancellation)
+    {
+        report.outcome = SandboxPreflightOutcome::Unsupported;
+        report.error_code = Some(code.to_string());
+        report.missing_capabilities.extend(missing);
+    }
     if report.outcome == SandboxPreflightOutcome::Supported {
         match preflight_remote_sources(&scratch, plans, sandbox_backend, cancellation) {
             Ok(()) => {}
@@ -4601,6 +4693,15 @@ mod tests {
             supported_sandbox_preflight(self.name())
         }
 
+        fn probe_executable(
+            &self,
+            _workspace: &Path,
+            _executable: &str,
+            _environment: &CommandEnvironmentPolicy,
+        ) -> ExecutableAvailability {
+            ExecutableAvailability::Available
+        }
+
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             if !request.is_trusted_workspace_preparation() {
                 return CommandResult::backend_error(
@@ -4669,6 +4770,47 @@ mod tests {
         }
     }
 
+    struct UnavailableExecutableBackend {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl SandboxBackend for UnavailableExecutableBackend {
+        fn name(&self) -> &'static str {
+            "unavailable_executable_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn preflight(
+            &self,
+            _workspace: &Path,
+            _cancellation: &CancellationToken,
+        ) -> SandboxPreflightReport {
+            supported_sandbox_preflight(self.name())
+        }
+
+        fn probe_executable(
+            &self,
+            _workspace: &Path,
+            _executable: &str,
+            _environment: &CommandEnvironmentPolicy,
+        ) -> ExecutableAvailability {
+            ExecutableAvailability::Unavailable
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            CommandResult::backend_error(
+                &request.command_id,
+                "executable preflight must prevent command execution",
+            )
+            .with_workspace_mutation(WorkspaceMutation::Unknown)
+            .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
     struct RemoteSourceProbeBackend {
         calls: AtomicUsize,
         fail_probe: bool,
@@ -4689,6 +4831,15 @@ mod tests {
             _cancellation: &CancellationToken,
         ) -> SandboxPreflightReport {
             supported_sandbox_preflight(self.name())
+        }
+
+        fn probe_executable(
+            &self,
+            _workspace: &Path,
+            _executable: &str,
+            _environment: &CommandEnvironmentPolicy,
+        ) -> ExecutableAvailability {
+            ExecutableAvailability::Available
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -4743,6 +4894,15 @@ mod tests {
             supported_sandbox_preflight(self.name())
         }
 
+        fn probe_executable(
+            &self,
+            _workspace: &Path,
+            _executable: &str,
+            _environment: &CommandEnvironmentPolicy,
+        ) -> ExecutableAvailability {
+            ExecutableAvailability::Available
+        }
+
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             self.executions.fetch_add(1, Ordering::SeqCst);
             if request.argv.get(1).map(String::as_str) == Some("ls-remote") {
@@ -4778,6 +4938,15 @@ mod tests {
             _cancellation: &CancellationToken,
         ) -> SandboxPreflightReport {
             supported_sandbox_preflight(self.name())
+        }
+
+        fn probe_executable(
+            &self,
+            _workspace: &Path,
+            _executable: &str,
+            _environment: &CommandEnvironmentPolicy,
+        ) -> ExecutableAvailability {
+            ExecutableAvailability::Available
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -5135,6 +5304,10 @@ mod tests {
         let mut manifest_value: Value =
             serde_json::from_str(&fs::read_to_string(&manifest_path).expect("manifest"))
                 .expect("manifest JSON");
+        for stage in ["baseline", "public", "hidden"] {
+            manifest_value["tasks"][0]["evaluator"][stage]["commands"][0]["argv"] =
+                json!(["git", "--version"]);
+        }
         manifest_value["tasks"][0]["evaluator"]["public_test_patch"] = json!({
             "format": "unified_diff",
             "content": "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-seed\n+patched\n"
@@ -5362,6 +5535,90 @@ mod tests {
         let run_dir = output_root.join("preflight-blocked-run");
         assert!(!run_dir.join("preflight-blocked").exists());
         assert!(run_dir.join(PUBLICATION_DIR).is_dir());
+    }
+
+    #[test]
+    fn unavailable_task_executable_blocks_before_trials_provider_or_commands() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let output_root = temp.path().join("output");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "executable-blocked",
+            "task executables must be available before sampling",
+            2,
+            json!({"type": "local", "path": "fixture"}),
+        );
+        let params = EvalRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "executable-blocked-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let executions = Arc::new(AtomicUsize::new(0));
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+
+        let response = run_evaluation(
+            &params,
+            Arc::new(UnavailableExecutableBackend {
+                executions: Arc::clone(&executions),
+            }),
+            &ProviderConfigSnapshot::capture(|_| None),
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("executable blocker publishes typed artifacts");
+
+        assert_eq!(response.status, "blocked");
+        assert!(response.tasks.is_empty());
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let no_provider_attempt = match trace_store.list_trace("executable-blocked-run") {
+            Ok(events) => events
+                .iter()
+                .all(|event| event.span_kind != Some(TraceSpanKind::ProviderAttempt)),
+            Err(singularity_store::StoreError::NotFound(_)) => true,
+            Err(error) => panic!("preflight trace: {error}"),
+        };
+        assert!(
+            no_provider_attempt,
+            "unsupported executable preflight must make zero Provider calls"
+        );
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result path"))
+                .expect("result artifact"),
+        )
+        .expect("result v8");
+        assert_eq!(result.summary.configured_trial_count, 2);
+        assert_eq!(result.summary.sampled_trial_count, 0);
+        assert_eq!(result.summary.trial_count, 0);
+        assert!(result.tasks.is_empty());
+        assert_eq!(
+            result
+                .blocker
+                .as_ref()
+                .and_then(|blocker| blocker.code.as_deref()),
+            Some("sandbox_preflight_task_executable_unavailable")
+        );
+        assert_eq!(
+            result
+                .sandbox_preflight
+                .as_ref()
+                .map(|preflight| preflight.missing_capabilities.as_slice()),
+            Some(
+                [
+                    "task_executable:verify-baseline".to_string(),
+                    "task_executable:verify-hidden".to_string(),
+                    "task_executable:verify-public".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        assert!(
+            !output_root
+                .join("executable-blocked-run/executable-blocked")
+                .exists()
+        );
     }
 
     #[test]

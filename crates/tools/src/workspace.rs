@@ -322,6 +322,7 @@ pub struct WorkspaceTools {
     workspace_namespace_guards: Arc<Vec<std::fs::File>>,
     sandbox_backend: Option<Arc<dyn SandboxBackend + Send + Sync>>,
     command_environment: CommandEnvironmentPolicy,
+    command_runtime_executables: Vec<String>,
     workspace_revision: Arc<AtomicU64>,
 }
 
@@ -385,6 +386,7 @@ impl WorkspaceTools {
             workspace_namespace_guards: Arc::new(workspace_namespace_guards),
             sandbox_backend: None,
             command_environment: CommandEnvironmentPolicy::default(),
+            command_runtime_executables: Vec::new(),
             workspace_revision: Arc::new(AtomicU64::new(WorkspaceRevision::initial().0)),
         })
     }
@@ -414,6 +416,12 @@ impl WorkspaceTools {
     /// 设置命令子进程环境策略。
     pub fn with_command_environment(mut self, environment: CommandEnvironmentPolicy) -> Self {
         self.command_environment = environment;
+        self
+    }
+
+    /// 绑定由产品控制面声明、不会进入模型输入的 command runtime executable。
+    pub fn with_command_runtime_executables(mut self, executables: Vec<String>) -> Self {
+        self.command_runtime_executables = executables;
         self
     }
 
@@ -795,6 +803,7 @@ impl WorkspaceTools {
             network,
         );
         request.environment = self.command_environment.clone();
+        request.runtime_executables = self.command_runtime_executables.clone();
         if let Some(timeout_seconds) = input.timeout_seconds {
             request.timeout_seconds = timeout_seconds;
         }

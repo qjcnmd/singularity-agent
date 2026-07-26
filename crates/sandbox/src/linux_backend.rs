@@ -30,10 +30,10 @@ use singularity_core::{CancellationToken, is_protected_path};
 
 use super::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
-    CommandScriptRequest, CommandSemanticStatus, DEFAULT_MAX_OUTPUT_CHARS, SandboxBackend,
-    SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
-    SandboxPreflightFact, SandboxPreflightReport, WorkspaceChangeSummary, WorkspaceMutation,
-    WorkspaceSnapshot, snapshot_trusted_workspace, snapshot_workspace,
+    CommandScriptRequest, CommandSemanticStatus, DEFAULT_MAX_OUTPUT_CHARS, ExecutableAvailability,
+    SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode,
+    SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightReport, WorkspaceChangeSummary,
+    WorkspaceMutation, WorkspaceSnapshot, snapshot_trusted_workspace, snapshot_workspace,
 };
 
 const BACKEND_NAME: &str = "linux";
@@ -600,6 +600,7 @@ impl LinuxSandboxBackend {
 struct LinuxExecutionInput {
     command_id: String,
     argv: Vec<String>,
+    runtime_executables: Vec<String>,
     cwd: String,
     timeout_seconds: u64,
     network: SandboxNetworkMode,
@@ -736,6 +737,23 @@ impl SandboxBackend for LinuxSandboxBackend {
         report
     }
 
+    fn probe_executable(
+        &self,
+        workspace: &Path,
+        executable: &str,
+        environment: &CommandEnvironmentPolicy,
+    ) -> ExecutableAvailability {
+        let Ok(cwd) = canonical_directory(workspace) else {
+            return ExecutableAvailability::Unknown;
+        };
+        let env = sanitized_environment(environment);
+        match resolve_executable(executable, &cwd, &env) {
+            Ok(_) => ExecutableAvailability::Available,
+            Err(LinuxSandboxError::ExecutableUnavailable) => ExecutableAvailability::Unavailable,
+            Err(_) => ExecutableAvailability::Unknown,
+        }
+    }
+
     fn execute(&self, request: &CommandRequest) -> CommandResult {
         self.execute_cancellable(request, &CancellationToken::new())
     }
@@ -749,6 +767,7 @@ impl SandboxBackend for LinuxSandboxBackend {
             LinuxExecutionInput {
                 command_id: request.command_id.clone(),
                 argv: request.argv.clone(),
+                runtime_executables: Vec::new(),
                 cwd: request.cwd.clone(),
                 timeout_seconds: request.timeout_seconds,
                 network: request.network.mode.clone(),
@@ -782,6 +801,7 @@ impl SandboxBackend for LinuxSandboxBackend {
                     "-c".to_string(),
                     request.script.clone(),
                 ],
+                runtime_executables: request.runtime_executables.clone(),
                 cwd: request.cwd.clone(),
                 timeout_seconds: request.timeout_seconds,
                 network: request.network.mode.clone(),
@@ -936,6 +956,7 @@ impl PreparedCommand {
         let LinuxExecutionInput {
             command_id: _,
             mut argv,
+            runtime_executables,
             cwd,
             timeout_seconds,
             network,
@@ -957,6 +978,32 @@ impl PreparedCommand {
         let mut env = sanitized_environment(&environment);
         let resolved = resolve_executable(&argv[0], &cwd_path, &env)?;
         let mut runtime_read_paths = resolved.runtime_read_paths;
+        let mut runtime_environment = resolved.environment;
+        let mut declared_executable_paths = Vec::new();
+        for executable in runtime_executables {
+            let declared = resolve_executable(&executable, &cwd_path, &env)?;
+            push_unique_path(&mut declared_executable_paths, declared.executable.clone());
+            push_unique_path(&mut declared_executable_paths, declared.invocation.clone());
+            for path in declared.runtime_read_paths {
+                push_unique_path(&mut runtime_read_paths, path);
+            }
+            for (name, value) in declared.environment {
+                if runtime_environment
+                    .iter()
+                    .any(|(existing_name, existing_value)| {
+                        existing_name == &name && existing_value != &value
+                    })
+                {
+                    return Err(LinuxSandboxError::ExecutableUnavailable);
+                }
+                if !runtime_environment
+                    .iter()
+                    .any(|(existing_name, _)| existing_name == &name)
+                {
+                    runtime_environment.push((name, value));
+                }
+            }
+        }
         if network == SandboxNetworkMode::Allowed {
             for candidate in NETWORK_RUNTIME_READ_PATHS {
                 push_existing_canonical_path(&mut runtime_read_paths, Path::new(candidate));
@@ -964,6 +1011,7 @@ impl PreparedCommand {
         }
         if std::iter::once(&resolved.executable)
             .chain(std::iter::once(&resolved.invocation))
+            .chain(declared_executable_paths.iter())
             .chain(runtime_read_paths.iter())
             .any(|path| is_protected_path(&path.to_string_lossy()))
         {
@@ -971,7 +1019,7 @@ impl PreparedCommand {
                 SANDBOX_PROTECTED_PATH_DENIED,
             ));
         }
-        for (name, value) in &resolved.environment {
+        for (name, value) in &runtime_environment {
             set_environment_value(&mut env, name, value);
         }
         argv[0] = resolved.invocation.to_string_lossy().into_owned();
@@ -4920,6 +4968,123 @@ fn close_all_extra_fds_except(preserved: &[RawFd], limit: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_probe_uses_the_real_isolated_command_environment() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = LinuxSandboxBackend::new();
+
+        assert_eq!(
+            backend.probe_executable(
+                workspace.path(),
+                "/bin/sh",
+                &CommandEnvironmentPolicy::EvaluationIsolated,
+            ),
+            ExecutableAvailability::Available
+        );
+        assert_eq!(
+            backend.probe_executable(
+                workspace.path(),
+                "/definitely-missing/singularity-evaluation-executable",
+                &CommandEnvironmentPolicy::EvaluationIsolated,
+            ),
+            ExecutableAvailability::Unavailable
+        );
+    }
+
+    #[test]
+    fn declared_runtime_closure_applies_to_a_model_script_without_enabling_network() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = LinuxSandboxBackend::new();
+        if backend.probe_executable(
+            workspace.path(),
+            "node",
+            &CommandEnvironmentPolicy::EvaluationIsolated,
+        ) != ExecutableAvailability::Available
+        {
+            return;
+        }
+        fs::write(
+            workspace.path().join("inventory.mjs"),
+            "export const total = 24;\n",
+        )
+        .expect("module");
+        fs::write(
+            workspace.path().join("smoke_test.mjs"),
+            "import assert from 'node:assert/strict';\n\
+             import { total } from './inventory.mjs';\n\
+             assert.equal(total, 24);\n",
+        )
+        .expect("smoke test");
+        let mut request = CommandScriptRequest::agent_requested(
+            "node_smoke",
+            "node smoke_test.mjs",
+            workspace.path().to_string_lossy(),
+            workspace.path().to_string_lossy(),
+        );
+        request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+        request.runtime_executables = vec!["node".to_string()];
+
+        let result = backend.execute_script(&request);
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{result:?}"
+        );
+        assert_eq!(
+            result.semantic_status,
+            CommandSemanticStatus::Succeeded,
+            "{result:?}"
+        );
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(
+            result.sandbox.enforcement,
+            SandboxBackendEnforcement::Strict
+        );
+        assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
+    }
+
+    #[test]
+    fn declared_rustup_environment_applies_to_a_model_script() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = LinuxSandboxBackend::new();
+        if backend.probe_executable(
+            workspace.path(),
+            "cargo",
+            &CommandEnvironmentPolicy::EvaluationIsolated,
+        ) != ExecutableAvailability::Available
+        {
+            return;
+        }
+        let mut request = CommandScriptRequest::agent_requested(
+            "cargo_version",
+            "cargo --version",
+            workspace.path().to_string_lossy(),
+            workspace.path().to_string_lossy(),
+        );
+        request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+        request.runtime_executables = vec!["cargo".to_string()];
+
+        let result = backend.execute_script(&request);
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{result:?}"
+        );
+        assert_eq!(
+            result.semantic_status,
+            CommandSemanticStatus::Succeeded,
+            "{result:?}"
+        );
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(
+            result.sandbox.enforcement,
+            SandboxBackendEnforcement::Strict
+        );
+        assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
+    }
 
     #[test]
     fn fd_table_ready_wait_observes_child_exit_while_parent_holds_writer() {
