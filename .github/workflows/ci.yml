@@ -6,8 +6,8 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      run_hosted_linux:
-        description: Also run the manually requested GitHub-hosted Linux gates
+      run_self_hosted_windows:
+        description: Also run the manually requested self-hosted Windows native gates
         required: false
         default: false
         type: boolean
@@ -24,23 +24,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  windows:
-    name: Windows self-hosted gates
+  hosted:
+    name: GitHub-hosted Linux and Windows gates
+    uses: ./.github/workflows/rust-gates.yml
+    permissions:
+      contents: read
+
+  self-hosted-windows:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_self_hosted_windows }}
+    name: Manual Windows self-hosted native gates
     uses: ./.github/workflows/rust-gates.yml
     permissions:
       contents: read
     with:
       rust_runner_matrix: >-
         {"include":[{"name":"Windows self-hosted","runs_on":"[\"self-hosted\",\"windows\",\"x64\",\"singularity\"]"}]}
-      supply_chain_runner: '["self-hosted","windows","x64","singularity"]'
-
-  hosted-linux:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_hosted_linux }}
-    name: Manual GitHub-hosted Linux gates
-    uses: ./.github/workflows/rust-gates.yml
-    permissions:
-      contents: read
-    with:
-      rust_runner_matrix: >-
-        {"include":[{"name":"Linux hosted","runs_on":"\"ubuntu-latest\""}]}
       run_supply_chain: false
