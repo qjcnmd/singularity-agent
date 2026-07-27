@@ -91,7 +91,8 @@ fn long_path_name(path: &Path) -> std::io::Result<PathBuf> {
         let written = written as usize;
         if written < output.len() {
             output.truncate(written);
-            let expanded = PathBuf::from(OsString::from_wide(&output));
+            let expanded =
+                expand_remaining_short_components(&PathBuf::from(OsString::from_wide(&output)))?;
             let original = path.to_string_lossy();
             let expanded = expanded.to_string_lossy();
             if original.starts_with(r"\\?\UNC\") {
@@ -107,10 +108,73 @@ fn long_path_name(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+#[cfg(windows)]
+fn expand_remaining_short_components(path: &Path) -> std::io::Result<PathBuf> {
+    let mut probe = PathBuf::new();
+    let mut expanded = PathBuf::new();
+    for component in path.components() {
+        probe.push(component.as_os_str());
+        if let std::path::Component::Normal(name) = component {
+            if is_short_name_alias(name) {
+                expanded.push(long_entry_name(&probe)?);
+            } else {
+                expanded.push(name);
+            }
+        } else {
+            expanded.push(component.as_os_str());
+        }
+    }
+    Ok(expanded)
+}
+
+#[cfg(windows)]
+fn is_short_name_alias(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_uppercase();
+    let stem = name.split('.').next().unwrap_or_default();
+    stem.rsplit_once('~').is_some_and(|(prefix, suffix)| {
+        !prefix.is_empty()
+            && !suffix.is_empty()
+            && suffix.len() <= 6
+            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+#[cfg(windows)]
+fn long_entry_name(path: &Path) -> std::io::Result<std::ffi::OsString> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+
+    let mut input = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    input.push(0);
+    let mut data = MaybeUninit::<WIN32_FIND_DATAW>::uninit();
+    // SAFETY: `input` is NUL-terminated and immutable for the call. `data`
+    // points to writable storage for the documented output structure.
+    let handle = unsafe { FindFirstFileW(input.as_ptr(), data.as_mut_ptr()) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a valid search handle means `FindFirstFileW` initialized `data`.
+    let data = unsafe { data.assume_init() };
+    // SAFETY: `handle` is the live search handle returned above and is closed once.
+    if unsafe { FindClose(handle) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let length = data
+        .cFileName
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(data.cFileName.len());
+    Ok(std::ffi::OsString::from_wide(&data.cFileName[..length]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::canonical_path_key;
     use super::canonicalize_path_allow_missing;
+    #[cfg(windows)]
+    use super::expand_remaining_short_components;
     use super::lexical_path_key;
     #[cfg(windows)]
     use super::long_path_name;
@@ -195,6 +259,23 @@ mod tests {
         assert!(expanded.to_string_lossy().starts_with(r"\\?\"));
         assert_eq!(
             lexical_path_key(&expanded),
+            lexical_path_key(Path::new(r"C:\Program Files"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remaining_short_component_uses_the_entry_long_name() {
+        let short_program_files = Path::new(r"C:\PROGRA~1");
+        if !short_program_files.exists() {
+            return;
+        }
+
+        assert_eq!(
+            lexical_path_key(
+                &expand_remaining_short_components(short_program_files)
+                    .expect("expand remaining short component")
+            ),
             lexical_path_key(Path::new(r"C:\Program Files"))
         );
     }
