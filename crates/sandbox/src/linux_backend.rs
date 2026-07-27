@@ -1079,6 +1079,7 @@ impl PreparedCommand {
 /// Parent-owned OverlayFS backing storage that never aliases the real workspace.
 struct WorkspaceTransaction {
     root: PathBuf,
+    lower: PathBuf,
     upper: PathBuf,
     work: PathBuf,
 }
@@ -1099,21 +1100,33 @@ impl WorkspaceTransaction {
             ));
             match fs::create_dir(&root) {
                 Ok(()) => {
+                    let lower = root.join("lower");
                     let upper = root.join("upper");
                     let work = root.join("work");
                     if let Err(error) =
                         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                            .and_then(|_| fs::create_dir(&lower))
                             .and_then(|_| fs::create_dir(&upper))
                             .and_then(|_| fs::create_dir(&work))
                             .and_then(|_| {
-                                seed_workspace_view(workspace, &upper, protect_workspace_metadata)
+                                snapshot_workspace_view(
+                                    workspace,
+                                    &lower,
+                                    &upper,
+                                    protect_workspace_metadata,
+                                )
                             })
                     {
                         make_tree_owner_accessible(&root);
                         let _ = fs::remove_dir_all(&root);
                         return Err(error);
                     }
-                    return Ok(Self { root, upper, work });
+                    return Ok(Self {
+                        root,
+                        lower,
+                        upper,
+                        work,
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
@@ -1126,22 +1139,28 @@ impl WorkspaceTransaction {
     }
 }
 
-/// Materialize ordinary workspace objects into the upper layer with exact hardlink metadata.
-fn seed_workspace_view(
+/// Materialize a transaction view with an immutable lower snapshot and upper
+/// hardlink seeds that restore merged POSIX link identity.
+///
+/// Protected roots are represented by an empty object of the same type so the
+/// child can bind-mount the real protected path over the snapshot target. Their
+/// contents stay out of the snapshot because the bind mount supplies the
+/// read-only view and avoids copying private metadata into transaction storage.
+fn snapshot_workspace_view(
     workspace: &Path,
+    lower: &Path,
     upper: &Path,
     protect_workspace_metadata: bool,
 ) -> Result<(), std::io::Error> {
     fn visit(
         directory: &Dir,
-        upper: &Path,
+        lower: &Path,
         relative_parent: &Path,
         protect_workspace_metadata: bool,
-        links: &mut BTreeMap<(u64, u64), PathBuf>,
-    ) -> Result<bool, std::io::Error> {
+        hardlink_groups: &mut BTreeMap<(u64, u64), Vec<PathBuf>>,
+    ) -> Result<(), std::io::Error> {
         let mut entries = directory.entries()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
-        let mut contains_protected = false;
         for entry in entries {
             let name = entry.file_name();
             let relative = relative_parent.join(&name);
@@ -1154,47 +1173,51 @@ fn seed_workspace_view(
             if protect_workspace_metadata
                 && (is_protected_path(name_text) || is_protected_path(relative_text))
             {
-                contains_protected = true;
+                materialize_protected_snapshot_root(
+                    &directory.symlink_metadata(&name)?,
+                    &lower.join(&relative),
+                )?;
                 continue;
             }
             let metadata = directory.symlink_metadata(&name)?;
-            let destination = upper.join(&relative);
+            let destination = lower.join(&relative);
             if metadata.is_dir() && !metadata.file_type().is_symlink() {
                 let child = directory.open_dir_nofollow(&name)?;
                 fs::create_dir(&destination)?;
-                let child_contains_protected =
-                    visit(&child, upper, &relative, protect_workspace_metadata, links)?;
-                if !child_contains_protected {
-                    set_user_overlay_opaque(&destination)?;
-                }
-                contains_protected |= child_contains_protected;
+                visit(
+                    &child,
+                    lower,
+                    &relative,
+                    protect_workspace_metadata,
+                    hardlink_groups,
+                )?;
                 fs::set_permissions(
                     &destination,
                     fs::Permissions::from_mode(cap_std::fs::PermissionsExt::mode(
                         &metadata.permissions(),
                     )),
                 )?;
-                copy_seed_times(&destination, &metadata, false)?;
+                copy_snapshot_times(&destination, &metadata, false)?;
             } else if metadata.is_file() {
-                let identity = (
-                    cap_fs_ext::MetadataExt::dev(&metadata),
-                    cap_fs_ext::MetadataExt::ino(&metadata),
-                );
-                if let Some(first) = links.get(&identity) {
-                    fs::hard_link(first, &destination)?;
-                } else {
-                    let mut source = directory.open(&name)?;
-                    if file_has_extended_attributes(&source)? {
-                        return Err(std::io::Error::other(
-                            "workspace file has extended attributes",
-                        ));
-                    }
-                    let mut destination_file = OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .open(&destination)?;
-                    io::copy(&mut source, &mut destination_file)?;
-                    links.insert(identity, destination.clone());
+                let mut source = directory.open(&name)?;
+                if file_has_extended_attributes(&source)? {
+                    return Err(std::io::Error::other(
+                        "workspace file has extended attributes",
+                    ));
+                }
+                let mut destination_file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&destination)?;
+                io::copy(&mut source, &mut destination_file)?;
+                if cap_fs_ext::MetadataExt::nlink(&metadata) > 1 {
+                    hardlink_groups
+                        .entry((
+                            cap_fs_ext::MetadataExt::dev(&metadata),
+                            cap_fs_ext::MetadataExt::ino(&metadata),
+                        ))
+                        .or_default()
+                        .push(relative.clone());
                 }
                 fs::set_permissions(
                     &destination,
@@ -1202,30 +1225,137 @@ fn seed_workspace_view(
                         &metadata.permissions(),
                     )),
                 )?;
-                copy_seed_times(&destination, &metadata, false)?;
+                copy_snapshot_times(&destination, &metadata, false)?;
             } else if metadata.file_type().is_symlink() {
                 let target = directory.read_link(&name)?;
                 std::os::unix::fs::symlink(target, &destination)?;
-                copy_seed_times(&destination, &metadata, true)?;
+                copy_snapshot_times(&destination, &metadata, true)?;
             } else {
                 return Err(std::io::Error::other(
                     "workspace contains an unsupported object",
                 ));
             }
         }
-        Ok(contains_protected)
+        Ok(())
     }
 
-    let mut links = BTreeMap::new();
+    let mut hardlink_groups = BTreeMap::new();
     let workspace_directory = Dir::open_ambient_dir(workspace, ambient_authority())?;
     visit(
         &workspace_directory,
-        upper,
+        lower,
         Path::new(""),
         protect_workspace_metadata,
-        &mut links,
+        &mut hardlink_groups,
     )?;
+    seed_internal_hardlink_groups(lower, upper, hardlink_groups)?;
     Ok(())
+}
+
+/// Seed each internal hardlink group into the private upper layer.
+///
+/// OverlayFS without the optional index feature copies up one lower alias at
+/// a time. Keeping the aliases together in the upper layer preserves POSIX
+/// link identity while leaving the immutable lower snapshot unaliased.
+fn seed_internal_hardlink_groups(
+    lower: &Path,
+    upper: &Path,
+    hardlink_groups: BTreeMap<(u64, u64), Vec<PathBuf>>,
+) -> Result<(), std::io::Error> {
+    for paths in hardlink_groups
+        .into_values()
+        .filter(|paths| paths.len() > 1)
+    {
+        let first = &paths[0];
+        let first_upper = upper.join(first);
+        if let Some(parent) = first_upper.parent() {
+            let relative_parent = parent
+                .strip_prefix(upper)
+                .map_err(|_| std::io::Error::other("upper hardlink parent escaped root"))?;
+            create_upper_parent_path(lower, upper, relative_parent)?;
+        }
+        let first_lower = lower.join(first);
+        let mut source = File::open(&first_lower)?;
+        let mut destination = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&first_upper)?;
+        io::copy(&mut source, &mut destination)?;
+        let first_metadata = fs::symlink_metadata(&first_lower)?;
+        fs::set_permissions(
+            &first_upper,
+            fs::Permissions::from_mode(first_metadata.permissions().mode()),
+        )?;
+        copy_snapshot_times_from_std(&first_upper, &first_metadata)?;
+        for relative in paths.iter().skip(1) {
+            let destination = upper.join(relative);
+            if let Some(parent) = destination.parent() {
+                let relative_parent = parent
+                    .strip_prefix(upper)
+                    .map_err(|_| std::io::Error::other("upper hardlink parent escaped root"))?;
+                create_upper_parent_path(lower, upper, relative_parent)?;
+            }
+            fs::hard_link(&first_upper, &destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_upper_parent_path(
+    lower: &Path,
+    upper: &Path,
+    relative: &Path,
+) -> Result<(), std::io::Error> {
+    let mut current = PathBuf::new();
+    for component in relative.components() {
+        current.push(component);
+        let destination = upper.join(&current);
+        if destination.exists() {
+            if !fs::symlink_metadata(&destination)?.is_dir() {
+                return Err(std::io::Error::other(
+                    "upper hardlink parent is not a directory",
+                ));
+            }
+            continue;
+        }
+        fs::create_dir(&destination)?;
+        let source = lower.join(&current);
+        let metadata = fs::symlink_metadata(source)?;
+        fs::set_permissions(
+            &destination,
+            fs::Permissions::from_mode(metadata.permissions().mode()),
+        )?;
+        copy_snapshot_times_from_std(&destination, &metadata)?;
+    }
+    Ok(())
+}
+
+fn materialize_protected_snapshot_root(
+    metadata: &cap_std::fs::Metadata,
+    destination: &Path,
+) -> Result<(), std::io::Error> {
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::create_dir(destination)?;
+        fs::set_permissions(
+            destination,
+            fs::Permissions::from_mode(cap_std::fs::PermissionsExt::mode(&metadata.permissions())),
+        )?;
+        copy_snapshot_times(destination, metadata, false)
+    } else if metadata.is_file() {
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(destination)?;
+        fs::set_permissions(
+            destination,
+            fs::Permissions::from_mode(cap_std::fs::PermissionsExt::mode(&metadata.permissions())),
+        )?;
+        copy_snapshot_times(destination, metadata, false)
+    } else {
+        Err(std::io::Error::other(
+            "workspace contains an unsupported protected object",
+        ))
+    }
 }
 
 fn file_has_extended_attributes(file: &cap_std::fs::File) -> Result<bool, std::io::Error> {
@@ -1236,17 +1366,17 @@ fn file_has_extended_attributes(file: &cap_std::fs::File) -> Result<bool, std::i
     Ok(size != 0)
 }
 
-fn copy_seed_times(
+fn copy_snapshot_times(
     destination: &Path,
     metadata: &cap_std::fs::Metadata,
     symlink: bool,
 ) -> Result<(), std::io::Error> {
     let parent = destination
         .parent()
-        .ok_or_else(|| std::io::Error::other("seed destination has no parent"))?;
+        .ok_or_else(|| std::io::Error::other("snapshot destination has no parent"))?;
     let name = destination
         .file_name()
-        .ok_or_else(|| std::io::Error::other("seed destination has no name"))?;
+        .ok_or_else(|| std::io::Error::other("snapshot destination has no name"))?;
     let directory = Dir::open_ambient_dir(parent, ambient_authority())?;
     let access = cap_fs_ext::SystemTimeSpec::Absolute(metadata.accessed()?);
     let modified = cap_fs_ext::SystemTimeSpec::Absolute(metadata.modified()?);
@@ -1257,24 +1387,24 @@ fn copy_seed_times(
     }
 }
 
-fn set_user_overlay_opaque(path: &Path) -> Result<(), std::io::Error> {
-    let path = path_cstring(path).map_err(|_| std::io::Error::other("invalid overlay path"))?;
-    let name = c"user.overlay.opaque";
-    let value = b"y";
-    let result = unsafe {
-        libc::lsetxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+fn copy_snapshot_times_from_std(
+    destination: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), std::io::Error> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("snapshot destination has no parent"))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("snapshot destination has no name"))?;
+    let directory = Dir::open_ambient_dir(parent, ambient_authority())?;
+    let access = cap_fs_ext::SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(
+        metadata.accessed()?,
+    ));
+    let modified = cap_fs_ext::SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(
+        metadata.modified()?,
+    ));
+    directory.set_times(name, Some(access), Some(modified))
 }
 
 impl Drop for WorkspaceTransaction {
@@ -1750,9 +1880,13 @@ fn collect_protected_paths(workspace: &Path) -> Result<Vec<ProtectedPath>, std::
     Ok(top_level)
 }
 
-/// Reject regular files whose filesystem link count is not fully visible in the workspace.
+/// Reject regular files whose links escape the workspace or cross a protected-path boundary.
 fn validate_workspace_hardlinks(workspace: &Path) -> Result<(), ()> {
-    fn visit(current: &Path, identities: &mut BTreeMap<(u64, u64), (u64, u64)>) -> Result<(), ()> {
+    fn visit(
+        workspace: &Path,
+        current: &Path,
+        identities: &mut BTreeMap<(u64, u64), (u64, u64, bool)>,
+    ) -> Result<(), ()> {
         let mut entries = fs::read_dir(current)
             .map_err(|_| ())?
             .collect::<Result<Vec<_>, _>>()
@@ -1765,11 +1899,14 @@ fn validate_workspace_hardlinks(workspace: &Path) -> Result<(), ()> {
                 continue;
             }
             if metadata.is_dir() {
-                visit(&path, identities)?;
+                visit(workspace, &path, identities)?;
             } else if metadata.is_file() {
                 let identity = (metadata.dev(), metadata.ino());
-                let links = identities.entry(identity).or_insert((0, metadata.nlink()));
-                if links.1 != metadata.nlink() {
+                let protected = is_protected_relative(workspace, &path);
+                let links = identities
+                    .entry(identity)
+                    .or_insert((0, metadata.nlink(), protected));
+                if links.1 != metadata.nlink() || links.2 != protected {
                     return Err(());
                 }
                 links.0 = links.0.checked_add(1).ok_or(())?;
@@ -1779,10 +1916,10 @@ fn validate_workspace_hardlinks(workspace: &Path) -> Result<(), ()> {
     }
 
     let mut identities = BTreeMap::new();
-    visit(workspace, &mut identities)?;
+    visit(workspace, workspace, &mut identities)?;
     identities
         .values()
-        .all(|(visible_links, filesystem_links)| visible_links == filesystem_links)
+        .all(|(visible_links, filesystem_links, _)| visible_links == filesystem_links)
         .then_some(())
         .ok_or(())
 }
@@ -3260,6 +3397,10 @@ fn validate_overlay_attributes(
     directory: bool,
 ) -> Result<bool, WorkspaceTransactionError> {
     let is_upper_root = path == upper_root;
+    let regular_file = !directory
+        && fs::symlink_metadata(path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false);
     let path = path_cstring(path).map_err(|_| WorkspaceTransactionError::PolicyDenied)?;
     let size = unsafe { libc::llistxattr(path.as_ptr(), ptr::null_mut(), 0) };
     if size < 0 {
@@ -3281,6 +3422,10 @@ fn validate_overlay_attributes(
         let allowed = if directory && name == b"user.overlay.opaque" {
             opaque = overlay_attribute_value(path.as_ptr(), name)? == b"y";
             opaque
+        } else if directory && name == b"user.overlay.impure" {
+            overlay_attribute_value(path.as_ptr(), name)? == b"y"
+        } else if name == b"user.overlay.origin" {
+            (directory || regular_file) && overlay_attribute_value(path.as_ptr(), name)?.is_empty()
         } else if is_upper_root && name == b"user.overlay.uuid" {
             overlay_attribute_value(path.as_ptr(), name)?.len() == 16
         } else {
@@ -4468,7 +4613,7 @@ fn prepare_child_filesystem(
         })?;
         let options = format!(
             "lowerdir={},upperdir={},workdir={},userxattr",
-            overlay_option_path(&prepared.workspace).map_err(|_| overlay_error())?,
+            overlay_option_path(&transaction.lower).map_err(|_| overlay_error())?,
             overlay_option_path(&transaction.upper).map_err(|_| overlay_error())?,
             overlay_option_path(&transaction.work).map_err(|_| overlay_error())?,
         );

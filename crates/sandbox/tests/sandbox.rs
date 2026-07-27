@@ -1872,6 +1872,45 @@ time.sleep(30)
     }
 
     #[test]
+    fn linux_protected_hardlink_alias_is_rejected_before_execution() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join(".env"), "protected").expect("protected file");
+        hard_link(
+            workspace.path().join(".env"),
+            workspace.path().join("visible.txt"),
+        )
+        .expect("protected hardlink alias");
+        let result = strict_backend().execute(&request(
+            "linux_protected_hardlink_alias",
+            &[
+                "/bin/sh",
+                "-c",
+                "printf changed > visible.txt; printf ran > executed.txt",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::PolicyDenied
+        );
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Unknown);
+        assert!(
+            result
+                .stderr_preview
+                .contains("workspace hardlink safety check failed")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".env")).unwrap(),
+            "protected"
+        );
+        assert!(!workspace.path().join("executed.txt").exists());
+    }
+
+    #[test]
     fn linux_internal_hardlinks_are_allowed() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(workspace.path().join("first.txt"), "original").expect("first file");
@@ -1905,6 +1944,57 @@ time.sleep(30)
         let second = fs::metadata(workspace.path().join("second.txt")).expect("second metadata");
         assert_eq!(first.ino(), second.ino());
         assert_eq!(first.nlink(), 2);
+    }
+
+    #[test]
+    fn linux_workspace_write_runs_tiny_git_index_pack() {
+        let source = tempfile::tempdir().expect("source repository");
+        let run_git = |arguments: &[&str]| {
+            let output = Command::new("/usr/bin/git")
+                .args(arguments)
+                .current_dir(source.path())
+                .output()
+                .expect("run git fixture command");
+            assert!(
+                output.status.success(),
+                "git fixture command failed: {}\n{}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "--quiet"]);
+        run_git(&["config", "user.email", "sandbox@example.invalid"]);
+        run_git(&["config", "user.name", "sandbox"]);
+        fs::write(source.path().join("file.txt"), "tiny pack fixture").expect("fixture file");
+        run_git(&["add", "file.txt"]);
+        run_git(&["commit", "--quiet", "-m", "fixture"]);
+        run_git(&["repack", "-ad"]);
+        let pack = fs::read_dir(source.path().join(".git/objects/pack"))
+            .expect("pack directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("pack"))
+            .expect("generated pack");
+
+        let workspace = tempfile::tempdir().expect("sandbox workspace");
+        fs::copy(&pack, workspace.path().join("tiny.pack")).expect("copy pack fixture");
+        let result = strict_backend().execute(&request(
+            "linux_tiny_git_index_pack",
+            &["/usr/bin/git", "index-pack", "tiny.pack"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            result.stderr_preview
+        );
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        assert!(workspace.path().join("tiny.idx").is_file());
     }
 
     #[test]
