@@ -2919,19 +2919,34 @@ fn smoke_command_execution_input(command: &CommandSpec) -> Value {
 fn command_script_from_argv(argv: &[String]) -> String {
     argv.iter()
         .map(|argument| {
-            if !argument.is_empty()
-                && argument.chars().all(|character| {
-                    character.is_ascii_alphanumeric()
-                        || matches!(character, '-' | '_' | '.' | '/' | '\\' | ':')
-                })
-            {
+            if !argument.is_empty() && argument.chars().all(shell_unquoted_character_is_safe) {
                 argument.clone()
             } else {
-                format!("'{}'", argument.replace('\'', "''"))
+                quote_shell_argument(argument)
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(unix)]
+fn shell_unquoted_character_is_safe(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | ':')
+}
+
+#[cfg(windows)]
+fn shell_unquoted_character_is_safe(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | '\\' | ':')
+}
+
+#[cfg(unix)]
+fn quote_shell_argument(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn quote_shell_argument(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "''"))
 }
 
 fn evaluation_agent_trace(
@@ -3943,10 +3958,39 @@ mod tests {
             "python".to_string(),
             "script with spaces.py".to_string(),
             "it's-safe".to_string(),
+            "back\\slash".to_string(),
         ];
+        #[cfg(unix)]
         assert_eq!(
             command_script_from_argv(&argv),
-            "python 'script with spaces.py' 'it''s-safe'"
+            "python 'script with spaces.py' 'it'\\''s-safe' 'back\\slash'"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            command_script_from_argv(&argv),
+            "python 'script with spaces.py' 'it''s-safe' back\\slash"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_script_projection_executes_with_exact_posix_arguments() {
+        let argv = vec![
+            "printf".to_string(),
+            "<%s>\\n".to_string(),
+            "script with spaces.py".to_string(),
+            "it's-safe".to_string(),
+            "back\\slash".to_string(),
+        ];
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &command_script_from_argv(&argv)])
+            .output()
+            .expect("POSIX shell");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf8 output"),
+            "<script with spaces.py>\n<it's-safe>\n<back\\slash>\n"
         );
     }
 
