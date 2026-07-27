@@ -184,7 +184,10 @@ jobs:
       - name: Test sandbox (hosted Linux contracts)
         if: ${{ matrix.test_scope == 'hosted_linux' }}
         run: |
-          cargo test -p singularity_sandbox --all-targets --locked --no-fail-fast -- --skip linux_tests::
+          cargo test -p singularity_sandbox --all-targets --locked --no-fail-fast -- --skip linux_tests:: --skip linux_backend::tests::
+          cargo test -p singularity_sandbox --lib --locked linux_backend::tests::executable_probe_uses_the_real_isolated_command_environment -- --exact
+          cargo test -p singularity_sandbox --lib --locked linux_backend::tests::fd_table_ready_wait_observes_child_exit_while_parent_holds_writer -- --exact
+          cargo test -p singularity_sandbox --lib --locked linux_backend::tests::filesystem_fact_uses_the_longest_mountpoint_for_workspace -- --exact
 
       - name: Build workspace binaries
         run: cargo build --workspace --bins --locked
