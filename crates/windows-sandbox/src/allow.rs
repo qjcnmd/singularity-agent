@@ -1,5 +1,5 @@
+use crate::path_normalization::canonicalize_path_allow_missing;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
-use dunce::canonicalize;
 use singularity_core::PROTECTED_METADATA_PATH_NAMES;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -26,9 +26,10 @@ pub(crate) fn compute_allow_paths_for_permissions(
         }
     };
     for writable_root in permissions.writable_roots_for_cwd(command_cwd, env_map) {
-        let canonical = canonicalize(&writable_root.root).unwrap_or(writable_root.root);
+        let canonical = canonicalize_path_allow_missing(&writable_root.root);
         add_allow_path(canonical);
         for read_only_subpath in writable_root.read_only_subpaths {
+            let read_only_subpath = canonicalize_path_allow_missing(&read_only_subpath);
             let missing_metadata_sentinel = read_only_subpath
                 .file_name()
                 .and_then(|name| name.to_str())

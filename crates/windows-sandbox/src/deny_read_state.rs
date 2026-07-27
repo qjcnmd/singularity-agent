@@ -3,7 +3,7 @@ use crate::acl::revoke_deny_read_ace_with_fingerprint;
 use crate::deny_read_acl::ManagedDenyReadAcl;
 use crate::deny_read_acl::apply_deny_read_acls_with_ownership_before_set;
 use crate::deny_read_acl::plan_deny_read_acl_paths;
-use crate::path_normalization::lexical_path_key;
+use crate::path_normalization::canonical_path_key;
 use crate::path_safety::canonicalize_case_insensitive_state_path;
 use crate::path_safety::ensure_case_insensitive_acl_path;
 use crate::setup::sandbox_dir;
@@ -139,7 +139,7 @@ impl Drop for StateMutex {
 
 fn mutex_name(prefix: &str, path: &Path) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in lexical_path_key(path).as_bytes() {
+    for byte in canonical_path_key(path).as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -449,17 +449,17 @@ unsafe fn recover_pending_principal(
     if managed.is_empty() {
         state.principals.remove(principal_sid);
     } else {
-        managed.sort_by_key(|entry| lexical_path_key(&entry.path));
+        managed.sort_by_key(|entry| canonical_path_key(&entry.path));
         state.principals.insert(principal_sid.to_string(), managed);
     }
     Ok(true)
 }
 
 fn upsert_managed_path(entries: &mut Vec<ManagedDenyReadAcl>, candidate: ManagedDenyReadAcl) {
-    let key = lexical_path_key(&candidate.path);
+    let key = canonical_path_key(&candidate.path);
     if let Some(existing) = entries
         .iter_mut()
-        .find(|entry| lexical_path_key(&entry.path) == key)
+        .find(|entry| canonical_path_key(&entry.path) == key)
     {
         *existing = candidate;
     } else {
@@ -616,20 +616,20 @@ pub unsafe fn sync_persistent_deny_read_acls(
     let desired_keys = application
         .enforced_paths
         .iter()
-        .map(|path| lexical_path_key(path))
+        .map(|path| canonical_path_key(path))
         .collect::<BTreeSet<_>>();
     let mut previous_by_key = previous_managed
         .into_iter()
-        .map(|managed| (lexical_path_key(&managed.path), managed))
+        .map(|managed| (canonical_path_key(&managed.path), managed))
         .collect::<BTreeMap<_, _>>();
     let mut newly_managed_by_key = application
         .newly_managed_paths
         .into_iter()
-        .map(|managed| (lexical_path_key(&managed.path), managed))
+        .map(|managed| (canonical_path_key(&managed.path), managed))
         .collect::<BTreeMap<_, _>>();
     let mut current_managed = Vec::new();
     for path in &application.enforced_paths {
-        let key = lexical_path_key(path);
+        let key = canonical_path_key(path);
         if let Some(mut managed) = newly_managed_by_key.remove(&key) {
             managed.path = path.clone();
             current_managed.push(managed);
@@ -642,7 +642,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
     let mut revoke_error_count = 0usize;
     let mut preferred_revoke_error = None;
     for (_, managed) in previous_by_key {
-        if desired_keys.contains(&lexical_path_key(&managed.path)) {
+        if desired_keys.contains(&canonical_path_key(&managed.path)) {
             continue;
         }
         match std::fs::symlink_metadata(&managed.path) {
@@ -724,7 +724,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
         .get(principal_sid)
         .into_iter()
         .flatten()
-        .map(|managed| lexical_path_key(&managed.path))
+        .map(|managed| canonical_path_key(&managed.path))
         .collect::<BTreeSet<_>>();
     let retained_legacy = state
         .legacy_unmanaged_principals
@@ -732,7 +732,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
         .unwrap_or_default()
         .into_iter()
         .filter(|path| {
-            let key = lexical_path_key(path);
+            let key = canonical_path_key(path);
             if managed_keys.contains(&key) {
                 return false;
             }
@@ -781,11 +781,11 @@ fn merge_tracked_paths(
     let mut keys = BTreeSet::new();
     let mut merged = Vec::new();
     for managed in current.iter().chain(retained_stale) {
-        if keys.insert(lexical_path_key(&managed.path)) {
+        if keys.insert(canonical_path_key(&managed.path)) {
             merged.push(managed.clone());
         }
     }
-    merged.sort_by_key(|managed| lexical_path_key(&managed.path));
+    merged.sort_by_key(|managed| canonical_path_key(&managed.path));
     merged
 }
 
@@ -950,7 +950,7 @@ fn validate_state(state: &PersistentDenyReadAclState) -> Result<()> {
         for managed in entries {
             if !managed.path.is_absolute()
                 || managed.fingerprint.is_empty()
-                || !keys.insert(lexical_path_key(&managed.path))
+                || !keys.insert(canonical_path_key(&managed.path))
             {
                 anyhow::bail!("invalid managed deny-read ACL state entry");
             }
@@ -995,7 +995,8 @@ mod tests {
     use crate::acl::deny_read_acl_fingerprint;
     use crate::acl::fetch_dacl_handle;
     use crate::acl::revoke_deny_read_ace;
-    use crate::path_normalization::lexical_path_key;
+    use crate::path_normalization::canonical_path_key;
+    use crate::path_normalization::canonicalize_path_allow_missing;
     use crate::path_safety::CaseSensitivityTestOutcome;
     use crate::path_safety::ProtectedMetadataError;
     use crate::path_safety::override_case_sensitivity_for_test;
@@ -1078,7 +1079,7 @@ mod tests {
         assert_eq!(
             error.downcast_ref::<ProtectedMetadataError>(),
             Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
-                path: tmp.path().to_path_buf(),
+                path: canonicalize_path_allow_missing(tmp.path()),
             })
         );
     }
@@ -1776,8 +1777,10 @@ mod tests {
             .get("S-1-5-21-1-2-3-4")
             .expect("reconciled principal state");
         assert_eq!(paths.len(), 1);
-        let active_key = lexical_path_key(&paths[0].path);
-        assert!(active_key == lexical_path_key(&first) || active_key == lexical_path_key(&second));
+        let active_key = canonical_path_key(&paths[0].path);
+        assert!(
+            active_key == canonical_path_key(&first) || active_key == canonical_path_key(&second)
+        );
 
         for path in [&first, &second] {
             let (dacl, security_descriptor) =
@@ -1788,7 +1791,7 @@ mod tests {
             }
             assert_eq!(
                 has_deny,
-                lexical_path_key(path) == active_key,
+                canonical_path_key(path) == active_key,
                 "ACL state disagreed for {}",
                 path.display()
             );

@@ -1119,7 +1119,7 @@ mod windows_impl {
             assert_eq!(
                 error.downcast_ref::<ProtectedMetadataError>(),
                 Some(&ProtectedMetadataError::CaseSensitivityQueryFailed {
-                    path: sandbox_home.clone(),
+                    path: crate::path_normalization::canonicalize_path_allow_missing(&sandbox_home),
                     code: 5,
                 })
             );

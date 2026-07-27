@@ -1,4 +1,5 @@
 use crate::absolute_path::AbsolutePathBuf;
+use crate::path_normalization::canonicalize_path_allow_missing;
 use serde::Deserialize;
 use serde::Serialize;
 use singularity_core::PROTECTED_METADATA_PATH_NAMES;
@@ -583,7 +584,7 @@ fn canonical_or_lexical(path: &Path) -> AbsolutePathBuf {
 }
 
 fn canonical_or_path_buf(path: &Path) -> PathBuf {
-    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    canonicalize_path_allow_missing(path)
 }
 
 fn dedup_paths(mut paths: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {

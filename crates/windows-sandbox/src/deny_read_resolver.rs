@@ -1,4 +1,5 @@
 use crate::absolute_path::AbsolutePathBuf;
+use crate::path_normalization::canonicalize_path_allow_missing;
 use crate::path_normalization::lexical_path_key;
 use crate::path_safety::ProtectedMetadataError;
 use crate::path_safety::ensure_case_insensitive_directory_path;
@@ -216,7 +217,13 @@ fn push_absolute_path(
     seen: &mut HashSet<PathBuf>,
     path: PathBuf,
 ) -> Result<(), String> {
-    let absolute_path = AbsolutePathBuf::from_absolute_path(dunce::simplified(&path))
+    let identity = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            canonicalize_path_allow_missing(&path)
+        }
+        _ => dunce::simplified(&path).to_path_buf(),
+    };
+    let absolute_path = AbsolutePathBuf::from_absolute_path(identity)
         .map_err(|_| "deny_read_resolution_invalid_path".to_string())?;
     if seen.insert(absolute_path.to_path_buf()) {
         paths.push(absolute_path);

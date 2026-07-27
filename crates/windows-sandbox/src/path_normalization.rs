@@ -29,7 +29,7 @@ pub fn lexical_path_key(path: &Path) -> String {
 }
 
 pub fn canonical_path_key(path: &Path) -> String {
-    lexical_path_key(&canonicalize_path(path))
+    lexical_path_key(&canonicalize_path_allow_missing(path))
 }
 
 /// Resolves the nearest existing ancestor while preserving any missing final components.
@@ -102,6 +102,27 @@ mod tests {
         assert_eq!(
             lexical_path_key(&canonicalize_path_allow_missing(&ordinary)),
             lexical_path_key(&canonicalize_path_allow_missing(&verbatim))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_tail_uses_the_long_identity_of_an_existing_short_name_ancestor() {
+        let short_program_files = Path::new(r"C:\PROGRA~1");
+        if !short_program_files.exists() {
+            return;
+        }
+
+        let short = short_program_files
+            .join("SingularityMissing")
+            .join("state.json");
+        let long = Path::new(r"C:\Program Files")
+            .join("SingularityMissing")
+            .join("state.json");
+
+        assert_eq!(
+            lexical_path_key(&canonicalize_path_allow_missing(&short)),
+            lexical_path_key(&canonicalize_path_allow_missing(&long))
         );
     }
 }

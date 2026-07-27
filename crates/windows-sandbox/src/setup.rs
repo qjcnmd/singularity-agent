@@ -24,7 +24,7 @@ use crate::identity::sandbox_setup_is_complete;
 use crate::logging::current_log_file_path;
 use crate::logging::log_note;
 use crate::path_normalization::canonical_path_key;
-use crate::path_normalization::canonicalize_path;
+use crate::path_normalization::canonicalize_path_allow_missing;
 use crate::permissions::PermissionProfile;
 use crate::product_identity::{
     NETWORK_ALLOW_LOCAL_BINDING_ENV, OFFLINE_ACCOUNT_NAME, ONLINE_ACCOUNT_NAME,
@@ -1190,7 +1190,7 @@ fn build_payload_deny_write_paths(
     let mut deny_write_paths: Vec<PathBuf> = explicit_deny_write_paths
         .unwrap_or_default()
         .into_iter()
-        .map(|path| canonicalize_path(&path))
+        .map(|path| canonicalize_path_allow_missing(&path))
         .collect();
     deny_write_paths.extend(allow_deny_paths.deny);
     deny_write_paths
@@ -1341,6 +1341,7 @@ mod tests {
     use crate::helper_materialization::BIN_DIRNAME;
     use crate::helper_materialization::RESOURCES_DIRNAME;
     use crate::helper_materialization::helper_bin_dir;
+    use crate::path_normalization::canonicalize_path_allow_missing;
     use crate::permissions::NetworkSandboxPolicy;
     use crate::permissions::PermissionProfile;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
@@ -2180,15 +2181,16 @@ mod tests {
 
         assert_eq!(
             [
-                dunce::canonicalize(&command_git).expect("canonical command .git"),
+                canonicalize_path_allow_missing(&command_git),
                 command_cwd.join(".agents"),
                 command_cwd.join(".singularity"),
                 extra_write_root.join(".git"),
                 extra_write_root.join(".agents"),
-                dunce::canonicalize(&extra_singularity).expect("canonical extra .singularity"),
+                extra_singularity,
                 explicit_deny,
             ]
             .into_iter()
+            .map(|path| canonicalize_path_allow_missing(&path))
             .collect::<HashSet<PathBuf>>(),
             deny_write_paths.into_iter().collect()
         );
