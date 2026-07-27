@@ -1243,7 +1243,7 @@ fn snapshot_workspace_view(
                 )?;
                 copy_snapshot_times(&destination, &metadata, false)?;
             } else if metadata.file_type().is_symlink() {
-                let target = directory.read_link(&name)?;
+                let target = directory.read_link_contents(&name)?;
                 std::os::unix::fs::symlink(target, &destination)?;
                 copy_snapshot_times(&destination, &metadata, true)?;
             } else {
@@ -2923,7 +2923,7 @@ fn capture_transaction_entry(
         TransactionObjectKind::File(hasher.finalize().into())
     } else if metadata.file_type().is_symlink() {
         let target = directory
-            .read_link(name)
+            .read_link_contents(name)
             .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
         TransactionObjectKind::Symlink(target.as_os_str().as_bytes().to_vec())
     } else {

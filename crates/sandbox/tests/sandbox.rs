@@ -2153,6 +2153,49 @@ time.sleep(30)
     }
 
     #[test]
+    fn linux_workspace_write_commits_venv_absolute_symlinks() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let backend = strict_backend();
+        let create = backend.execute(&request(
+            "linux_python_venv_create",
+            &["/usr/bin/python3", "-m", "venv", "--without-pip", ".venv"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            create.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            create.stderr_preview
+        );
+        assert_eq!(create.exit_code, Some(0), "{}", create.stderr_preview);
+        assert_eq!(create.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            fs::read_link(workspace.path().join(".venv/bin/python3"))
+                .expect("absolute interpreter symlink"),
+            Path::new("/usr/bin/python3")
+        );
+
+        let invoke = backend.execute(&request(
+            "linux_python_venv_invoke",
+            &[".venv/bin/python", "-c", "print('venv-ok')"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+        assert_eq!(
+            invoke.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            invoke.stderr_preview
+        );
+        assert_eq!(invoke.exit_code, Some(0), "{}", invoke.stderr_preview);
+        assert_eq!(invoke.stdout_preview.trim(), "venv-ok");
+    }
+
+    #[test]
     fn linux_read_only_and_protected_mounts_reject_writes() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(workspace.path().join("existing.txt"), "original").expect("existing file");

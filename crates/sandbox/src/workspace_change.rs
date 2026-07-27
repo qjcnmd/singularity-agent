@@ -478,10 +478,10 @@ fn snapshot_symlink(directory: &Dir, name: &Path) -> Result<SnapshotEntry, Strin
         .and_then(|metadata| entry_metadata(&metadata))
         .map_err(|error| format!("workspace change link metadata failed: {error}"))?;
     let first = directory
-        .read_link(name)
+        .read_link_contents(name)
         .map_err(|error| format!("workspace change link read failed: {error}"))?;
     let second = directory
-        .read_link(name)
+        .read_link_contents(name)
         .map_err(|error| format!("workspace change link revalidation failed: {error}"))?;
     if first != second {
         return Err("workspace changed while its link snapshot was being captured".to_string());
@@ -973,6 +973,29 @@ mod tests {
                 .expect("target changed")
                 .changed_files
                 .contains(&"link".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_symlink_snapshot_preserves_absolute_target_without_resolving_it() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let link = workspace.path().join("link");
+        symlink("/path/that/does/not/exist", &link).expect("first absolute link");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+        std::fs::remove_file(&link).expect("remove first link");
+        symlink("/another/missing/target", &link).expect("second absolute link");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+
+        assert_eq!(
+            before
+                .change_summary(&after)
+                .expect("summary")
+                .expect("target changed")
+                .changed_files,
+            ["link"]
         );
     }
 
