@@ -8259,6 +8259,81 @@ mod audit_projection_tests {
     }
 
     #[test]
+    fn exact_verification_supersedes_side_effect_free_mutation_input_failure() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut tracker =
+            CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(digest, 1)])
+                .expect("completion tracker");
+        let revision = WorkspaceRevision::initial().next().expect("revision");
+        tracker.observe(
+            &ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision)),
+        );
+        let mut rejected = ToolResult::summary("patch", TOOL_PATCH, false, "invalid input");
+        rejected.failure_kind = Some(ToolFailureKind::Input);
+        rejected.error_code = Some("invalid_tool_input".to_string());
+        tracker.observe(&rejected);
+        assert_eq!(
+            tracker.summary().unresolved_failures,
+            vec!["workspace_mutation:invalid_tool_input".to_string()]
+        );
+
+        let mut verified = ToolResult::summary("verified", TOOL_COMMAND, true, "ok");
+        verified.result_id = Some(digest.to_string());
+        tracker.observe(
+            &verified.with_workspace_observation(WorkspaceObservation::unchanged(revision)),
+        );
+
+        assert!(tracker.allows_final());
+        assert!(tracker.summary().unresolved_failures.is_empty());
+    }
+
+    #[test]
+    fn exact_verification_only_supersedes_input_failures_after_a_verified_mutation() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let verified = |revision| {
+            let mut result = ToolResult::summary("verified", TOOL_COMMAND, true, "ok");
+            result.result_id = Some(digest.to_string());
+            result.with_workspace_observation(WorkspaceObservation::unchanged(revision))
+        };
+
+        let mut before_mutation =
+            CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(digest, 1)])
+                .expect("completion tracker");
+        let mut rejected = ToolResult::summary("patch", TOOL_PATCH, false, "invalid input");
+        rejected.failure_kind = Some(ToolFailureKind::Input);
+        rejected.error_code = Some("invalid_tool_input".to_string());
+        before_mutation.observe(&rejected);
+        before_mutation.observe(&verified(WorkspaceRevision::initial()));
+        assert!(!before_mutation.allows_final());
+        let revision = WorkspaceRevision::initial().next().expect("revision");
+        before_mutation.observe(
+            &ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision)),
+        );
+        before_mutation.observe(&verified(revision));
+        assert!(before_mutation.allows_final());
+
+        let mut executed_failure =
+            CompletionTracker::from_requirements(&[AgentVerificationRequirement::new(digest, 1)])
+                .expect("completion tracker");
+        executed_failure.observe(
+            &ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision)),
+        );
+        let mut failed = ToolResult::summary("patch", TOOL_PATCH, false, "execution failed");
+        failed.failure_kind = Some(ToolFailureKind::Execution);
+        failed.error_code = Some("expected_content_missing".to_string());
+        executed_failure.observe(&failed);
+        executed_failure.observe(&verified(revision));
+        assert!(!executed_failure.allows_final());
+        assert_eq!(
+            executed_failure.summary().unresolved_failures,
+            vec!["workspace_mutation:expected_content_missing".to_string()]
+        );
+    }
+
+    #[test]
     fn exact_completion_requires_required_commands_as_the_terminal_multiset() {
         let required = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut tracker =

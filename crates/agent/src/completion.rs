@@ -148,6 +148,7 @@ impl CompletionTracker {
                         revision,
                         window_len,
                     );
+                    self.clear_superseded_workspace_input_failures();
                 } else if observed_mutation.is_none() {
                     self.mark_workspace_revision_invalid("verification_observation_missing");
                 }
@@ -211,6 +212,20 @@ impl CompletionTracker {
     pub(super) fn clear_terminal_command_observations(&mut self) {
         self.terminal_command_scope_digests.clear();
         self.terminal_command_revisions.clear();
+    }
+
+    /// Clear only side-effect-free mutation input failures superseded by complete verification.
+    fn clear_superseded_workspace_input_failures(&mut self) {
+        if !self.workspace_mutated || !self.verification_satisfied() {
+            return;
+        }
+        self.unresolved_failures.retain(|failure| {
+            !matches!(
+                failure.as_str(),
+                "workspace_mutation:invalid_tool_arguments"
+                    | "workspace_mutation:invalid_tool_input"
+            )
+        });
     }
 
     pub(super) fn record_terminal_command_observation(
