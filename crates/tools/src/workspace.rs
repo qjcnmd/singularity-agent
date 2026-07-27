@@ -1498,12 +1498,14 @@ fn bind_workspace_namespace(
             "workspace root changed while it was being bound".to_string(),
         ));
     }
-    let actual_path = winx::file::get_file_path(final_guard).map_err(|_| {
+    let handle_path = winx::file::get_file_path(final_guard).map_err(|_| {
         WorkspaceToolError::PathIdentityUnsupported(
             "workspace root handle path is unavailable".to_string(),
         )
     })?;
-    let actual_path = singularity_sandbox::expand_windows_path_alias(&actual_path);
+    // Namespace guards deny delete sharing, so the path cannot be replaced while
+    // canonicalization expands a short-name spelling returned by the handle API.
+    let actual_path = std::fs::canonicalize(handle_path).map_err(io_error)?;
     // A short-name spelling is accepted only while opening the existing root. The
     // handle-derived path must be the normalized long spelling before it becomes
     // the workspace display/root path; re-run the strict component checks on it.

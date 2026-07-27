@@ -91,6 +91,18 @@ mod tests {
         compute_allow_paths_for_permissions(&permissions, command_cwd, env_map)
     }
 
+    fn expected_protected_paths(roots: &[&Path]) -> HashSet<PathBuf> {
+        roots
+            .iter()
+            .flat_map(|root| {
+                let canonical = dunce::canonicalize(root).expect("canonical protected root");
+                PROTECTED_METADATA_PATH_NAMES
+                    .iter()
+                    .map(move |name| canonical.join(name))
+            })
+            .collect()
+    }
+
     #[test]
     fn includes_additional_writable_roots() {
         let tmp = TempDir::new().expect("tempdir");
@@ -124,16 +136,7 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&extra_root).unwrap())
         );
-        let expected_deny: HashSet<PathBuf> = [
-            command_cwd.join(".git"),
-            command_cwd.join(".agents"),
-            command_cwd.join(".singularity"),
-            extra_root.join(".git"),
-            extra_root.join(".agents"),
-            extra_root.join(".singularity"),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&command_cwd, &extra_root]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -168,13 +171,7 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&command_cwd).unwrap())
         );
-        let expected_deny: HashSet<PathBuf> = [
-            workspace_root.join(".git"),
-            workspace_root.join(".agents"),
-            workspace_root.join(".singularity"),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&workspace_root]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -213,13 +210,7 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&temp_dir).unwrap())
         );
-        let expected_deny: HashSet<PathBuf> = [
-            command_cwd.join(".git"),
-            command_cwd.join(".agents"),
-            command_cwd.join(".singularity"),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&command_cwd]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -256,16 +247,7 @@ mod tests {
         .collect();
 
         assert_eq!(expected_allow, paths.allow);
-        let expected_deny: HashSet<PathBuf> = [
-            command_cwd.join(".git"),
-            command_cwd.join(".agents"),
-            command_cwd.join(".singularity"),
-            temp_dir.join(".git"),
-            temp_dir.join(".agents"),
-            temp_dir.join(".singularity"),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&command_cwd, &temp_dir]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -293,13 +275,7 @@ mod tests {
             .collect();
 
         assert_eq!(expected_allow, paths.allow);
-        let expected_deny: HashSet<PathBuf> = [
-            command_cwd.join(".git"),
-            command_cwd.join(".agents"),
-            command_cwd.join(".singularity"),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&command_cwd]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -326,13 +302,7 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
-        let expected_deny: HashSet<PathBuf> = [
-            dunce::canonicalize(&git_dir).unwrap(),
-            command_cwd.join(".agents"),
-            command_cwd.join(".singularity"),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&command_cwd]);
 
         assert_eq!(expected_allow, paths.allow);
         assert_eq!(expected_deny, paths.deny);
@@ -362,13 +332,7 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
-        let expected_deny: HashSet<PathBuf> = [
-            dunce::canonicalize(&git_file).unwrap(),
-            command_cwd.join(".agents"),
-            command_cwd.join(".singularity"),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&command_cwd]);
 
         assert_eq!(expected_allow, paths.allow);
         assert_eq!(expected_deny, paths.deny);
@@ -399,13 +363,7 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
-        let expected_deny: HashSet<PathBuf> = [
-            command_cwd.join(".git"),
-            dunce::canonicalize(&singularity_dir).unwrap(),
-            dunce::canonicalize(&agents_dir).unwrap(),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&command_cwd]);
 
         assert_eq!(expected_allow, paths.allow);
         assert_eq!(expected_deny, paths.deny);
@@ -431,14 +389,12 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(paths.allow.len(), 1);
-        let expected_deny: HashSet<PathBuf> = [
-            command_cwd.join(".git"),
-            command_cwd.join(".agents"),
-            command_cwd.join(".singularity"),
-        ]
-        .into_iter()
-        .collect();
+        let expected_deny = expected_protected_paths(&[&command_cwd]);
         assert_eq!(expected_deny, paths.deny);
-        assert!(paths.deny.contains(&command_cwd.join(".git")));
+        assert!(
+            paths
+                .deny
+                .contains(&dunce::canonicalize(&command_cwd).unwrap().join(".git"))
+        );
     }
 }
