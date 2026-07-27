@@ -1825,6 +1825,25 @@ fn workspace_root_binding_rejects_junction_components() {
     remove_workspace(&actual);
 }
 
+#[cfg(windows)]
+#[test]
+fn workspace_root_binding_accepts_existing_short_name_ancestor() {
+    let parent = test_workspace("short-name-parent-with-long-component");
+    let workspace = parent.join("workspace");
+    std::fs::create_dir(&workspace).expect("create workspace root");
+    let Some(short_parent) = windows_short_path(&parent) else {
+        remove_workspace(&parent);
+        return;
+    };
+    let alias_root = short_parent.join("workspace");
+
+    let tools = WorkspaceTools::new(&alias_root).expect("bind workspace through short ancestor");
+    let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    assert_eq!(tools.workspace_root(), canonical.as_path());
+    drop(tools);
+    remove_workspace(&parent);
+}
+
 #[test]
 fn workspace_capability_survives_workspace_path_replacement() {
     let workspace = test_workspace("capability-path-replacement");
@@ -3543,6 +3562,23 @@ fn create_dir_junction(target: &Path, link: &Path) -> std::io::Result<()> {
             "junction fixture unavailable",
         ))
     }
+}
+
+#[cfg(windows)]
+fn windows_short_path(path: &Path) -> Option<PathBuf> {
+    let command = format!("for %I in (\"{}\") do @echo %~sI", path.display());
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", &command])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let short = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if short.is_empty() || !short.contains('~') {
+        return None;
+    }
+    Some(PathBuf::from(short))
 }
 
 #[cfg(unix)]

@@ -1452,6 +1452,9 @@ fn absolute_workspace_root(path: PathBuf) -> Result<PathBuf, WorkspaceToolError>
 }
 
 fn bind_workspace_root(workspace_root: &Path) -> Result<CapabilityDir, WorkspaceToolError> {
+    #[cfg(windows)]
+    let (anchor, components) = workspace_anchor_and_components_with_policy(workspace_root, true)?;
+    #[cfg(not(windows))]
     let (anchor, components) = workspace_anchor_and_components(workspace_root)?;
     let mut capability =
         CapabilityDir::open_ambient_dir(anchor, ambient_authority()).map_err(io_error)?;
@@ -1473,7 +1476,7 @@ fn bind_workspace_namespace(
     workspace_root: &Path,
     capability: &CapabilityDir,
 ) -> Result<(PathBuf, Vec<std::fs::File>), WorkspaceToolError> {
-    let (anchor, components) = workspace_anchor_and_components(workspace_root)?;
+    let (anchor, components) = workspace_anchor_and_components_with_policy(workspace_root, true)?;
     let mut current = anchor;
     let mut guards = Vec::with_capacity(components.len().saturating_add(1));
     guards.push(open_workspace_namespace_guard(&current)?);
@@ -1500,6 +1503,10 @@ fn bind_workspace_namespace(
             "workspace root handle path is unavailable".to_string(),
         )
     })?;
+    // A short-name spelling is accepted only while opening the existing root. The
+    // handle-derived path must be the normalized long spelling before it becomes
+    // the workspace display/root path; re-run the strict component checks on it.
+    workspace_anchor_and_components(&actual_path)?;
     Ok((actual_path, guards))
 }
 
@@ -1545,6 +1552,14 @@ fn workspace_anchor_and_components(
 fn workspace_anchor_and_components(
     workspace_root: &Path,
 ) -> Result<(PathBuf, Vec<OsString>), WorkspaceToolError> {
+    workspace_anchor_and_components_with_policy(workspace_root, false)
+}
+
+#[cfg(windows)]
+fn workspace_anchor_and_components_with_policy(
+    workspace_root: &Path,
+    allow_short_name_alias: bool,
+) -> Result<(PathBuf, Vec<OsString>), WorkspaceToolError> {
     let mut components = workspace_root.components();
     let prefix = match components.next() {
         Some(Component::Prefix(prefix)) => prefix,
@@ -1573,7 +1588,7 @@ fn workspace_anchor_and_components(
     for component in components {
         match component {
             Component::Normal(name) => {
-                validate_windows_component(name)?;
+                validate_windows_component(name, !allow_short_name_alias)?;
                 relative_components.push(name.to_os_string());
             }
             Component::CurDir
@@ -1694,7 +1709,7 @@ impl CapabilityRelativePath {
                 }
             };
             #[cfg(windows)]
-            validate_windows_component(name)?;
+            validate_windows_component(name, true)?;
             relative.push(name);
             component_count = component_count.saturating_add(1);
         }
@@ -1858,7 +1873,10 @@ fn normal_component(component: Component<'_>) -> Result<&OsStr, CapabilityAccess
 }
 
 #[cfg(windows)]
-fn validate_windows_component(name: &OsStr) -> Result<(), WorkspaceToolError> {
+fn validate_windows_component(
+    name: &OsStr,
+    reject_short_name_alias: bool,
+) -> Result<(), WorkspaceToolError> {
     let name = name.to_string_lossy();
     let upper = name.to_ascii_uppercase();
     let stem = upper.split('.').next().unwrap_or_default();
@@ -1908,7 +1926,7 @@ fn validate_windows_component(name: &OsStr) -> Result<(), WorkspaceToolError> {
         || name.ends_with('.')
         || name.ends_with(' ')
         || dos_device
-        || short_name_alias
+        || (reject_short_name_alias && short_name_alias)
     {
         return Err(WorkspaceToolError::InvalidInput(
             "workspace path contains an unsupported Windows component".to_string(),
@@ -2574,4 +2592,17 @@ fn metadata_is_reparse_point(metadata: &CapabilityMetadata) -> bool {
 #[cfg(not(windows))]
 fn metadata_is_reparse_point(_metadata: &CapabilityMetadata) -> bool {
     false
+}
+
+#[cfg(all(test, windows))]
+mod windows_root_binding_tests {
+    use super::*;
+
+    #[test]
+    fn short_name_aliases_are_root_only_and_relative_paths_stay_strict() {
+        let alias_root = Path::new(r"C:\Users\RUNNER~1\workspace");
+        assert!(workspace_anchor_and_components(alias_root).is_err());
+        assert!(workspace_anchor_and_components_with_policy(alias_root, true).is_ok());
+        assert!(CapabilityRelativePath::parse("RUNNER~1/file.txt").is_err());
+    }
 }
