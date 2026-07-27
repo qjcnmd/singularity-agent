@@ -240,6 +240,7 @@ fn windows_temp_env_roots(env_map: &HashMap<String, String>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use crate::path_normalization::canonicalize_path_allow_missing;
     use crate::permissions::FileSystemAccessMode;
     use crate::permissions::FileSystemSandboxEntry;
@@ -319,10 +320,11 @@ mod tests {
             .find(|root| root.root == dunce::canonicalize(&cwd).expect("canonical cwd"))
             .expect("workspace writable root");
 
-        assert_eq!(
-            root.read_only_subpaths,
-            vec![canonicalize_path_allow_missing(&explicit_git_deny)]
-        );
+        #[cfg(windows)]
+        let expected_git_deny = canonicalize_path_allow_missing(&explicit_git_deny);
+        #[cfg(not(windows))]
+        let expected_git_deny = explicit_git_deny;
+        assert_eq!(root.read_only_subpaths, vec![expected_git_deny]);
         assert!(!root.read_only_subpaths.contains(&cwd.join(".agents")));
         assert!(!root.read_only_subpaths.contains(&cwd.join(".singularity")));
     }

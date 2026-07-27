@@ -1,4 +1,5 @@
 use crate::absolute_path::AbsolutePathBuf;
+#[cfg(windows)]
 use crate::path_normalization::canonicalize_path_allow_missing;
 use serde::Deserialize;
 use serde::Serialize;
@@ -584,7 +585,14 @@ fn canonical_or_lexical(path: &Path) -> AbsolutePathBuf {
 }
 
 fn canonical_or_path_buf(path: &Path) -> PathBuf {
-    canonicalize_path_allow_missing(path)
+    #[cfg(windows)]
+    {
+        canonicalize_path_allow_missing(path)
+    }
+    #[cfg(not(windows))]
+    {
+        dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
 }
 
 fn dedup_paths(mut paths: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {
