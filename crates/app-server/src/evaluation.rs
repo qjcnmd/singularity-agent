@@ -194,10 +194,15 @@ struct StageDiagnostics {
 struct TaskDiagnostics {
     source: Option<SourceProvenance>,
     source_commands: Vec<CommandDiagnostic>,
+    source_preparation_duration_ms: u64,
     baseline: StageDiagnostics,
     agent: StageDiagnostics,
     public: StageDiagnostics,
     hidden: StageDiagnostics,
+    trial_duration_ms: u64,
+    baseline_duration_ms: u64,
+    public_duration_ms: u64,
+    hidden_duration_ms: u64,
     changed_files: Vec<String>,
     patch_evidence: Vec<WorkspaceChangeEvidence>,
     patch_digest: Option<String>,
@@ -350,6 +355,7 @@ struct PreparedTaskSource {
     source_dir: PathBuf,
     source: SourceProvenance,
     source_commands: Vec<CommandDiagnostic>,
+    duration_ms: u64,
     blocker: Option<EvaluationBlocker>,
 }
 
@@ -360,6 +366,7 @@ struct PreparedTaskContext<'a> {
     source_dir: &'a Path,
     source: &'a SourceProvenance,
     source_commands: &'a [CommandDiagnostic],
+    source_preparation_duration_ms: u64,
     plan: &'a WorkspacePlan,
     sandbox_backend: &'a SharedSandboxBackend,
     provider_snapshot: &'a ProviderConfigSnapshot,
@@ -1169,6 +1176,7 @@ fn prepare_task_source(
     context: &EvaluationRunContext<'_>,
     plan: &WorkspacePlan,
 ) -> PreparedTaskSource {
+    let started = Instant::now();
     let task_root = context.run_dir.join(plan.task_id.as_str());
     let source_dir = task_root.join(SOURCE_DIR);
     let initial_source = source_provenance(&plan.source, &source_dir, context.manifest_dir);
@@ -1177,6 +1185,7 @@ fn prepare_task_source(
         source_dir,
         source: initial_source,
         source_commands: Vec::new(),
+        duration_ms: 0,
         blocker: None,
     };
     if context.cancellation.is_cancelled() {
@@ -1184,6 +1193,7 @@ fn prepare_task_source(
             BlockerKind::AgentRuntime,
             "evaluation cancelled",
         ));
+        prepared.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         return prepared;
     }
     if let Err(error) = fs::create_dir(&prepared.task_root) {
@@ -1194,6 +1204,7 @@ fn prepare_task_source(
                 prepared.task_root.display()
             ),
         ));
+        prepared.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         return prepared;
     }
     if context.sandbox_preflight.outcome != SandboxPreflightOutcome::Supported {
@@ -1205,6 +1216,7 @@ fn prepare_task_source(
                 .unwrap_or_else(|| "sandbox_preflight_unavailable".to_string()),
             "validated sandbox preflight contract is not supported",
         ));
+        prepared.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         return prepared;
     }
     match prepare_source(
@@ -1225,6 +1237,7 @@ fn prepare_task_source(
                 source_provenance(&plan.source, &prepared.source_dir, context.manifest_dir);
         }
     }
+    prepared.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     prepared
 }
 
@@ -1241,6 +1254,7 @@ fn run_task_trials_inner(
             blocker.clone(),
             prepared_source.source.clone(),
             prepared_source.source_commands.clone(),
+            prepared_source.duration_ms,
             matches!(blocker.kind, BlockerKind::WorkspacePreparation),
         );
     }
@@ -1251,6 +1265,7 @@ fn run_task_trials_inner(
             evaluation_blocker(BlockerKind::AgentRuntime, "evaluation cancelled"),
             prepared_source.source.clone(),
             prepared_source.source_commands.clone(),
+            prepared_source.duration_ms,
             false,
         );
     }
@@ -1260,6 +1275,7 @@ fn run_task_trials_inner(
         source_dir: &prepared_source.source_dir,
         source: &prepared_source.source,
         source_commands: &prepared_source.source_commands,
+        source_preparation_duration_ms: prepared_source.duration_ms,
         plan,
         sandbox_backend: context.sandbox_backend,
         provider_snapshot: context.provider_snapshot,
@@ -1279,6 +1295,7 @@ fn blocked_task_trials(
     blocker: EvaluationBlocker,
     source: SourceProvenance,
     source_commands: Vec<CommandDiagnostic>,
+    source_preparation_duration_ms: u64,
     source_preparation_failed: bool,
 ) -> TaskEvaluation {
     let trials = (1..=trials_per_task)
@@ -1286,6 +1303,7 @@ fn blocked_task_trials(
             let mut diagnostics = TaskDiagnostics {
                 source: Some(source.clone()),
                 source_commands: source_commands.clone(),
+                source_preparation_duration_ms,
                 smoke_command_satisfied: plan.agent.projection.smoke_commands.is_empty(),
                 error: Some(blocker.message.clone()),
                 ..TaskDiagnostics::default()
@@ -1350,7 +1368,9 @@ fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
         TraceSpanKind::Turn,
         "evaluation trial",
     );
-    let execution = run_task_inner(prepared, trial, &trace);
+    let mut execution = run_task_inner(prepared, trial, &trace);
+    execution.diagnostics.trial_duration_ms =
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     trace.sink.end(
         &trace.session_id,
         &trace.turn_span_id,
@@ -1371,6 +1391,7 @@ fn run_task_inner(
     let mut diagnostics = TaskDiagnostics {
         source: Some(prepared.source.clone()),
         source_commands: prepared.source_commands.to_vec(),
+        source_preparation_duration_ms: prepared.source_preparation_duration_ms,
         smoke_command_satisfied: prepared.plan.agent.projection.smoke_commands.is_empty(),
         ..TaskDiagnostics::default()
     };
@@ -1399,6 +1420,7 @@ fn run_task_inner(
         }
     };
 
+    let baseline_started = Instant::now();
     let baseline = run_verification_stage(
         prepared.source_dir,
         &task_dir.join(BASELINE_DIR),
@@ -1408,6 +1430,8 @@ fn run_task_inner(
         prepared.plan.baseline.expectation,
         Arc::clone(prepared.sandbox_backend),
     );
+    diagnostics.baseline_duration_ms =
+        u64::try_from(baseline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     diagnostics.baseline = baseline.diagnostics.clone();
     if baseline.result.status != StageStatus::Passed {
         let agent = StageExecution::skipped(
@@ -1510,23 +1534,20 @@ fn run_task_inner(
         );
     }
 
-    let public = run_verification_stage_with_agent_changes(
-        prepared.source_dir,
-        agent_workspace,
-        &agent_execution.changed_files,
-        &task_dir.join(PUBLIC_DIR),
-        &prepared.plan.public,
-        Arc::clone(prepared.sandbox_backend),
-    );
+    let public_dir = task_dir.join(PUBLIC_DIR);
+    let hidden_dir = task_dir.join(HIDDEN_DIR);
+    let ((public, public_duration_ms), (hidden, hidden_duration_ms)) =
+        run_post_agent_verification_stages(
+            prepared.source_dir,
+            agent_workspace,
+            &agent_execution.changed_files,
+            (&public_dir, &prepared.plan.public),
+            (&hidden_dir, &prepared.plan.hidden),
+            prepared.sandbox_backend,
+        );
+    diagnostics.public_duration_ms = public_duration_ms;
+    diagnostics.hidden_duration_ms = hidden_duration_ms;
     diagnostics.public = public.diagnostics.clone();
-    let hidden = run_verification_stage_with_agent_changes(
-        prepared.source_dir,
-        agent_workspace,
-        &agent_execution.changed_files,
-        &task_dir.join(HIDDEN_DIR),
-        &prepared.plan.hidden,
-        Arc::clone(prepared.sandbox_backend),
-    );
     diagnostics.hidden = hidden.diagnostics.clone();
     finish_task(
         &prepared.plan.task_id,
@@ -1537,6 +1558,56 @@ fn run_task_inner(
         hidden,
         diagnostics,
     )
+}
+
+fn run_post_agent_verification_stages(
+    source_dir: &Path,
+    agent_dir: &Path,
+    changed_files: &[String],
+    public: (&Path, &VerificationStagePlan),
+    hidden: (&Path, &VerificationStagePlan),
+    sandbox_backend: &SharedSandboxBackend,
+) -> ((StageExecution, u64), (StageExecution, u64)) {
+    let (public_dir, public_plan) = public;
+    let (hidden_dir, hidden_plan) = hidden;
+    std::thread::scope(|scope| {
+        let public_backend = Arc::clone(sandbox_backend);
+        let public = scope.spawn(|| {
+            let started = Instant::now();
+            let execution = run_verification_stage_with_agent_changes(
+                source_dir,
+                agent_dir,
+                changed_files,
+                public_dir,
+                public_plan,
+                public_backend,
+            );
+            (
+                execution,
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )
+        });
+        let hidden_backend = Arc::clone(sandbox_backend);
+        let hidden = scope.spawn(|| {
+            let started = Instant::now();
+            let execution = run_verification_stage_with_agent_changes(
+                source_dir,
+                agent_dir,
+                changed_files,
+                hidden_dir,
+                hidden_plan,
+                hidden_backend,
+            );
+            (
+                execution,
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )
+        });
+        (
+            public.join().expect("public verification thread panicked"),
+            hidden.join().expect("hidden verification thread panicked"),
+        )
+    })
 }
 
 fn source_provenance(
@@ -3897,14 +3968,16 @@ mod tests {
     use serde::Serializer;
     use singularity_agent::UPDATE_PLAN_TOOL;
     use singularity_evaluation::{
-        Argv, GitCommit, RelativePath, RemoteRepository, ToolCapabilityName,
-        ToolCapabilityRequirement,
+        Argv, EvaluationStage, GitCommit, RelativePath, RemoteRepository, ToolCapabilityName,
+        ToolCapabilityRequirement, WorkspaceSeed,
     };
     use singularity_tools::{
         CommandExecutionStatus, CommandRequest, CommandResult, SandboxBackendEnforcement,
         SandboxCapabilities, WorkspaceMutation, WorkspaceObservation, WorkspaceRevision,
     };
+    use std::sync::Condvar;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn command(argv: &[&str]) -> CommandSpec {
         CommandSpec {
@@ -4152,6 +4225,12 @@ mod tests {
     #[test]
     fn task_diagnostics_serializes_only_safe_provider_fields() {
         let diagnostics = TaskDiagnostics {
+            source_preparation_duration_ms: 11,
+            trial_duration_ms: 22,
+            baseline_duration_ms: 3,
+            agent_duration_ms: 4,
+            public_duration_ms: 5,
+            hidden_duration_ms: 6,
             provider_diagnostic: Some(ProviderDiagnostic {
                 code: Some("provider_response_invalid".to_string()),
                 stage: Some(singularity_model::ProviderErrorStage::ResponseValidation),
@@ -4165,6 +4244,12 @@ mod tests {
         let serialized = serde_json::to_string(&diagnostics).expect("serialize diagnostics");
         assert!(serialized.contains("missing_tool_call_id"));
         assert!(serialized.contains("\"timeout_seconds\":120"));
+        assert!(serialized.contains("\"source_preparation_duration_ms\":11"));
+        assert!(serialized.contains("\"trial_duration_ms\":22"));
+        assert!(serialized.contains("\"baseline_duration_ms\":3"));
+        assert!(serialized.contains("\"agent_duration_ms\":4"));
+        assert!(serialized.contains("\"public_duration_ms\":5"));
+        assert!(serialized.contains("\"hidden_duration_ms\":6"));
         assert!(!serialized.contains("Authorization"));
         assert!(!serialized.contains("raw_response"));
     }
@@ -5168,6 +5253,85 @@ mod tests {
                 .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
+    }
+
+    #[derive(Default)]
+    struct ConcurrentVerificationBackend {
+        active_and_peak: Mutex<(usize, usize)>,
+        rendezvous: Condvar,
+    }
+
+    impl ConcurrentVerificationBackend {
+        fn peak(&self) -> usize {
+            self.active_and_peak.lock().expect("lock").1
+        }
+    }
+
+    impl SandboxBackend for ConcurrentVerificationBackend {
+        fn name(&self) -> &'static str {
+            "concurrent_verification_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            let mut state = self.active_and_peak.lock().expect("lock");
+            state.0 += 1;
+            state.1 = state.1.max(state.0);
+            if state.0 == 2 {
+                self.rendezvous.notify_all();
+            } else {
+                let (next, timeout) = self
+                    .rendezvous
+                    .wait_timeout_while(state, Duration::from_secs(2), |state| state.1 < 2)
+                    .expect("wait");
+                state = next;
+                assert!(!timeout.timed_out(), "verification stages did not overlap");
+            }
+            state.0 -= 1;
+            drop(state);
+            CommandResult::completed(&request.command_id, "verified")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    #[test]
+    fn public_and_hidden_verification_run_concurrently_in_isolated_workspaces() {
+        let temp = tempfile::tempdir().expect("temp");
+        let source = temp.path().join("source");
+        let agent = temp.path().join("agent");
+        fs::create_dir(&source).expect("source");
+        fs::create_dir(&agent).expect("agent");
+        fs::write(source.join("source.txt"), "source").expect("source file");
+        fs::write(agent.join("source.txt"), "source").expect("agent file");
+        let plan = |stage| VerificationStagePlan {
+            stage,
+            seed: WorkspaceSeed::AgentOutput,
+            expectation: CommandExpectation::Success,
+            setup_commands: Vec::new(),
+            test_patch: None,
+            commands: vec![command(&["verify"])],
+        };
+        let public_plan = plan(EvaluationStage::Public);
+        let hidden_plan = plan(EvaluationStage::Hidden);
+        let backend = Arc::new(ConcurrentVerificationBackend::default());
+        let shared: SharedSandboxBackend = backend.clone();
+
+        let ((public, _), (hidden, _)) = run_post_agent_verification_stages(
+            &source,
+            &agent,
+            &[],
+            (&temp.path().join("public"), &public_plan),
+            (&temp.path().join("hidden"), &hidden_plan),
+            &shared,
+        );
+
+        assert_eq!(public.result.status, StageStatus::Passed);
+        assert_eq!(hidden.result.status, StageStatus::Passed);
+        assert_eq!(backend.peak(), 2);
     }
 
     struct EvaluatorPatchSandboxBackend {
