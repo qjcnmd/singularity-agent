@@ -4077,12 +4077,13 @@ fn openai_cancelled_capability_probe_does_not_publish_cache() {
             ))
             .expect("send cancelled probe result");
     });
+    // Cold parallel CI can spend more than one second initializing the HTTP client before accept.
     started
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(5))
         .expect("probe started");
     cancellation.cancel();
     let error = result_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(5))
         .expect("cancelled probe result")
         .expect_err("cancelled probe must fail");
     assert_eq!(error.error.kind, ModelErrorKind::Cancelled);
