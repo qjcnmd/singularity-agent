@@ -4581,30 +4581,64 @@ fn prepare_child_filesystem(
         None,
         CHILD_SETUP_CAPABILITY,
     )?);
-    for (target, data, flags) in [
-        (
-            "/run",
-            "size=64m,mode=1777",
-            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-        ),
-        ("/dev", "size=4m,mode=755", libc::MS_NOSUID | libc::MS_NODEV),
-    ] {
-        operations.push(mount_operation(
-            Some("tmpfs"),
-            Path::new(target),
-            Some("tmpfs"),
-            flags,
-            Some(data),
-            CHILD_SETUP_CAPABILITY,
-        )?);
-    }
-    for path in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"] {
+    let run_tmpfs_flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    operations.push(mount_operation(
+        Some("tmpfs"),
+        Path::new("/run"),
+        Some("tmpfs"),
+        run_tmpfs_flags,
+        Some("size=64m,mode=1777"),
+        CHILD_SETUP_CAPABILITY,
+    )?);
+    let runtime_devices = ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
+    for (index, source) in runtime_devices.iter().enumerate() {
+        let staging = PathBuf::from(format!("/run/.sandbox-device-{index}"));
         operations.push(ChildFilesystemOperation::CreateFile {
-            path: CString::new(path).map_err(|_| LinuxSandboxError::Unavailable)?,
+            path: path_cstring(&staging).map_err(|_| LinuxSandboxError::Unavailable)?,
             mode: 0o666,
             error: CHILD_SETUP_CAPABILITY,
         });
+        operations.push(mount_operation(
+            Some(source),
+            &staging,
+            None,
+            libc::MS_BIND,
+            None,
+            CHILD_SETUP_CAPABILITY,
+        )?);
     }
+    operations.push(mount_operation(
+        Some("tmpfs"),
+        Path::new("/dev"),
+        Some("tmpfs"),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some("size=4m,mode=755"),
+        CHILD_SETUP_CAPABILITY,
+    )?);
+    for (index, target) in runtime_devices.iter().enumerate() {
+        let staging = PathBuf::from(format!("/run/.sandbox-device-{index}"));
+        operations.push(ChildFilesystemOperation::CreateFile {
+            path: CString::new(*target).map_err(|_| LinuxSandboxError::Unavailable)?,
+            mode: 0o666,
+            error: CHILD_SETUP_CAPABILITY,
+        });
+        operations.push(mount_operation(
+            staging.to_str(),
+            Path::new(target),
+            None,
+            libc::MS_BIND,
+            None,
+            CHILD_SETUP_CAPABILITY,
+        )?);
+    }
+    operations.push(mount_operation(
+        Some("tmpfs"),
+        Path::new("/run"),
+        Some("tmpfs"),
+        run_tmpfs_flags,
+        Some("size=64m,mode=1777"),
+        CHILD_SETUP_CAPABILITY,
+    )?);
     if prepared.filesystem == SandboxFilesystemMode::WorkspaceWrite {
         let overlay_error =
             || LinuxSandboxError::CapabilityNotSupported(LinuxCapability::OverlayFilesystem);

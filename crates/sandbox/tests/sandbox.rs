@@ -1947,7 +1947,38 @@ time.sleep(30)
     }
 
     #[test]
-    fn linux_workspace_write_runs_tiny_git_index_pack() {
+    fn linux_runtime_devices_preserve_character_device_semantics() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = strict_backend().execute(&request(
+            "linux_runtime_devices",
+            &[
+                "/bin/sh",
+                "-c",
+                "test -c /dev/null && test -c /dev/zero && test -c /dev/random && test -c /dev/urandom && test ! -e /run/.sandbox-device-0 && test ! -e /run/.sandbox-device-1 && test ! -e /run/.sandbox-device-2 && test ! -e /run/.sandbox-device-3 && head -c 32 /dev/urandom > random.bin && test \"$(wc -c < random.bin)\" -eq 32 && printf discarded > /dev/null",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            result.stderr_preview
+        );
+        assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            fs::metadata(workspace.path().join("random.bin"))
+                .expect("random output")
+                .len(),
+            32
+        );
+    }
+
+    #[test]
+    fn linux_workspace_write_runs_tiny_git_index_pack_from_file_and_stdin() {
         let source = tempfile::tempdir().expect("source repository");
         let run_git = |arguments: &[&str]| {
             let output = Command::new("/usr/bin/git")
@@ -1995,6 +2026,45 @@ time.sleep(30)
         assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
         assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
         assert!(workspace.path().join("tiny.idx").is_file());
+
+        let stdin_workspace = tempfile::tempdir().expect("stdin sandbox workspace");
+        fs::copy(&pack, stdin_workspace.path().join("tiny.pack")).expect("copy stdin fixture");
+        let mut stdin_request = request(
+            "linux_tiny_git_index_pack_stdin",
+            &[
+                "/bin/sh",
+                "-c",
+                "git init --bare --quiet target && cd target && git index-pack --stdin < ../tiny.pack",
+            ],
+            stdin_workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        );
+        stdin_request.timeout_seconds = 10;
+        let stdin_result = strict_backend().execute(&stdin_request);
+
+        assert_eq!(
+            stdin_result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            stdin_result.stderr_preview
+        );
+        assert_eq!(
+            stdin_result.exit_code,
+            Some(0),
+            "{}",
+            stdin_result.stderr_preview
+        );
+        assert_eq!(stdin_result.workspace_mutation, WorkspaceMutation::Changed);
+        assert!(
+            fs::read_dir(stdin_workspace.path().join("target/objects/pack"))
+                .expect("stdin pack directory")
+                .filter_map(Result::ok)
+                .any(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("idx")
+                )
+        );
     }
 
     #[test]
