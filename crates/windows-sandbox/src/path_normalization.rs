@@ -113,14 +113,15 @@ fn expand_remaining_short_components(path: &Path) -> std::io::Result<PathBuf> {
     let mut probe = PathBuf::new();
     let mut expanded = PathBuf::new();
     for component in path.components() {
-        probe.push(component.as_os_str());
         if let std::path::Component::Normal(name) = component {
             if is_short_name_alias(name) {
-                expanded.push(long_entry_name(&probe)?);
+                expanded.push(long_entry_name(&probe, name)?);
             } else {
                 expanded.push(name);
             }
+            probe.push(name);
         } else {
+            probe.push(component.as_os_str());
             expanded.push(component.as_os_str());
         }
     }
@@ -140,13 +141,19 @@ fn is_short_name_alias(name: &std::ffi::OsStr) -> bool {
 }
 
 #[cfg(windows)]
-fn long_entry_name(path: &Path) -> std::io::Result<std::ffi::OsString> {
+fn long_entry_name(
+    parent: &Path,
+    short_name: &std::ffi::OsStr,
+) -> std::io::Result<std::ffi::OsString> {
     use std::mem::MaybeUninit;
-    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
+    };
 
-    let mut input = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let search = parent.join("*");
+    let mut input = search.as_os_str().encode_wide().collect::<Vec<_>>();
     input.push(0);
     let mut data = MaybeUninit::<WIN32_FIND_DATAW>::uninit();
     // SAFETY: `input` is NUL-terminated and immutable for the call. `data`
@@ -155,18 +162,47 @@ fn long_entry_name(path: &Path) -> std::io::Result<std::ffi::OsString> {
     if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: a valid search handle means `FindFirstFileW` initialized `data`.
-    let data = unsafe { data.assume_init() };
+    let mut result = None;
+    loop {
+        // SAFETY: the successful first/next search call initialized `data`,
+        // and the reference is not retained across the next write.
+        let entry = unsafe { data.assume_init_ref() };
+        let long_name = wide_name(&entry.cFileName);
+        let alternate_name = wide_name(&entry.cAlternateFileName);
+        if alternate_name
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&short_name.to_string_lossy())
+        {
+            result = Some(long_name);
+            break;
+        }
+        // SAFETY: `handle` remains live and `data` is writable output storage.
+        if unsafe { FindNextFileW(handle, data.as_mut_ptr()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                // SAFETY: `handle` is the live search handle returned above.
+                unsafe { FindClose(handle) };
+                return Err(error);
+            }
+            break;
+        }
+    }
     // SAFETY: `handle` is the live search handle returned above and is closed once.
     if unsafe { FindClose(handle) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let length = data
-        .cFileName
+    result.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
+#[cfg(windows)]
+fn wide_name(value: &[u16]) -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let length = value
         .iter()
         .position(|character| *character == 0)
-        .unwrap_or(data.cFileName.len());
-    Ok(std::ffi::OsString::from_wide(&data.cFileName[..length]))
+        .unwrap_or(value.len());
+    std::ffi::OsString::from_wide(&value[..length])
 }
 
 #[cfg(test)]
