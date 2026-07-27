@@ -32,6 +32,12 @@ pub fn canonical_path_key(path: &Path) -> String {
     lexical_path_key(&canonicalize_path_allow_missing(path))
 }
 
+/// Expands an existing Windows short-name alias without changing its path form.
+#[cfg(windows)]
+pub fn expand_windows_path_alias(path: &Path) -> PathBuf {
+    long_path_name(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Resolves the nearest existing ancestor while preserving any missing final components.
 pub fn canonicalize_path_allow_missing(path: &Path) -> PathBuf {
     let mut cursor = path.to_path_buf();
@@ -40,7 +46,7 @@ pub fn canonicalize_path_allow_missing(path: &Path) -> PathBuf {
         if let Ok(mut canonical) = dunce::canonicalize(&cursor) {
             #[cfg(windows)]
             {
-                canonical = long_path_name(&canonical).unwrap_or(canonical);
+                canonical = expand_windows_path_alias(&canonical);
             }
             for component in missing_tail.iter().rev() {
                 canonical.push(component);
@@ -64,7 +70,8 @@ fn long_path_name(path: &Path) -> std::io::Result<PathBuf> {
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
 
-    let mut input = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let ordinary = PathBuf::from(normalized_path_text(path));
+    let mut input = ordinary.as_os_str().encode_wide().collect::<Vec<_>>();
     input.push(0);
     let mut output = vec![0_u16; 260];
     loop {
@@ -84,7 +91,17 @@ fn long_path_name(path: &Path) -> std::io::Result<PathBuf> {
         let written = written as usize;
         if written < output.len() {
             output.truncate(written);
-            return Ok(PathBuf::from(OsString::from_wide(&output)));
+            let expanded = PathBuf::from(OsString::from_wide(&output));
+            let original = path.to_string_lossy();
+            let expanded = expanded.to_string_lossy();
+            if original.starts_with(r"\\?\UNC\") {
+                let expanded = expanded.strip_prefix(r"\\").unwrap_or(&expanded);
+                return Ok(PathBuf::from(format!(r"\\?\UNC\{expanded}")));
+            }
+            if original.starts_with(r"\\?\") && !expanded.starts_with(r"\\?\") {
+                return Ok(PathBuf::from(format!(r"\\?\{expanded}")));
+            }
+            return Ok(PathBuf::from(expanded.as_ref()));
         }
         output.resize(written.saturating_add(1), 0);
     }
@@ -95,6 +112,8 @@ mod tests {
     use super::canonical_path_key;
     use super::canonicalize_path_allow_missing;
     use super::lexical_path_key;
+    #[cfg(windows)]
+    use super::long_path_name;
     use super::normalized_path_text;
     use pretty_assertions::assert_eq;
     use std::path::Path;
@@ -159,6 +178,24 @@ mod tests {
         assert_eq!(
             lexical_path_key(&canonicalize_path_allow_missing(&short)),
             lexical_path_key(&canonicalize_path_allow_missing(&long))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_short_name_is_expanded_without_changing_path_form() {
+        let short_program_files = Path::new(r"C:\PROGRA~1");
+        if !short_program_files.exists() {
+            return;
+        }
+
+        let expanded =
+            long_path_name(Path::new(r"\\?\C:\PROGRA~1")).expect("expand verbatim short name");
+
+        assert!(expanded.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(
+            lexical_path_key(&expanded),
+            lexical_path_key(Path::new(r"C:\Program Files"))
         );
     }
 }

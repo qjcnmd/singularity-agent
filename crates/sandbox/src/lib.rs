@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
 #[cfg(windows)]
-pub use singularity_windows_sandbox::canonicalize_path_allow_missing as canonicalize_windows_path_allow_missing;
+pub use singularity_windows_sandbox::expand_windows_path_alias;
 
 mod workspace_change;
 pub use workspace_change::is_toolchain_artifact_path;
