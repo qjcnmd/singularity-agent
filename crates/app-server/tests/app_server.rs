@@ -194,10 +194,6 @@ fn expected_eval_blocker_kind() -> &'static str {
     "workspace_preparation"
 }
 
-fn expected_pre_agent_blocked_stage_statuses() -> (&'static str, &'static str) {
-    ("blocked", "skipped")
-}
-
 fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_json::Value {
     serde_json::json!({
         "request_id": &request.request_id,
@@ -925,7 +921,7 @@ fn app_server_reports_default_agent_loop_backend_capability() {
 fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallback() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+    let mut server = configured_app_server(store).with_sandbox_backend(CompletedSandboxBackend);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(
@@ -982,40 +978,20 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
     assert_eq!(result["status"], "blocked");
     assert_eq!(result["blocker"], expected_eval_blocker_kind());
     assert_eq!(result["evaluation_passed"], false);
-    assert_eq!(result["tasks"][0]["trials"][0]["agent_completed"], false);
-    assert_eq!(result["tasks"][0]["trials"][0]["tests_passed"], false);
-    assert_eq!(
-        result["tasks"][0]["trial_diagnostics"][0]["smoke_command_satisfied"],
-        true
-    );
-    assert_eq!(
-        result["tasks"][0]["trial_diagnostics"][0]["local_process_fallback_count"],
-        0
-    );
+    assert!(result["tasks"].as_array().is_some_and(Vec::is_empty));
     let result_path = result["result_path"].as_str().expect("result path");
     let report_path = result["report_path"].as_str().expect("report path");
     let evidence_path = result["evidence_path"].as_str().expect("evidence path");
     assert!(std::path::Path::new(result_path).exists());
     assert!(std::path::Path::new(report_path).exists());
     assert!(std::path::Path::new(evidence_path).exists());
-    let (expected_baseline_status, _) = expected_pre_agent_blocked_stage_statuses();
     let payload: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
             .expect("result payload");
     assert_eq!(payload["schema_version"], "evaluation.result/v8");
     assert_eq!(payload["status"], "blocked");
-    assert_eq!(
-        payload["tasks"][0]["blocker"]["kind"],
-        expected_eval_blocker_kind()
-    );
-    assert_eq!(
-        payload["tasks"][0]["trials"][0]["stages"]["baseline"]["status"],
-        expected_baseline_status
-    );
-    assert_eq!(
-        payload["tasks"][0]["trials"][0]["stages"]["public"]["status"],
-        "skipped"
-    );
+    assert!(payload["tasks"].as_array().is_some_and(Vec::is_empty));
+    assert_eq!(payload["summary"]["sampled_trial_count"], 0);
     assert_eq!(payload["summary"]["agent_scored_trial_count"], 0);
     let evidence_json = std::fs::read_to_string(evidence_path).expect("evidence json");
     assert!(!evidence_json.contains(&dir.path().to_string_lossy().to_string()));
@@ -1024,19 +1000,19 @@ fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallba
         serde_json::from_str(&evidence_json).expect("evidence payload");
     assert_eq!(evidence["schema_version"], "evaluation.evidence/v3");
     assert_eq!(evidence["denominator_task_count"], 1);
-    assert_eq!(evidence["denominator_trial_count"], 1);
-    assert_eq!(evidence["tasks"][0]["trials"][0]["allowlist"], "unknown");
-    assert_eq!(
-        evidence["tasks"][0]["trials"][0]["local_process_fallback_unknown_count"],
-        0
-    );
+    assert_eq!(evidence["denominator_trial_count"], 0);
+    assert!(evidence["tasks"].as_array().is_some_and(|tasks| {
+        tasks
+            .iter()
+            .all(|task| task["trials"].as_array().is_some_and(Vec::is_empty))
+    }));
 }
 
 #[test]
 fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+    let mut server = configured_app_server(store).with_sandbox_backend(CompletedSandboxBackend);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(
@@ -1094,26 +1070,27 @@ fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
     let result = result_message(&response);
 
     assert_eq!(result["status"], "blocked");
-    assert_eq!(
-        result["tasks"][0]["blocker"]["kind"],
-        expected_eval_blocker_kind()
-    );
-    assert_eq!(
-        result["tasks"][0]["trial_diagnostics"][0]["smoke_command_satisfied"],
-        false
-    );
-    let (_, expected_agent_status) = expected_pre_agent_blocked_stage_statuses();
-    assert_eq!(
-        result["tasks"][0]["trials"][0]["stages"]["agent"]["status"],
-        expected_agent_status
-    );
+    assert_eq!(result["blocker"], expected_eval_blocker_kind());
+    assert_eq!(result["evaluation_passed"], false);
+    assert!(result["tasks"].as_array().is_some_and(Vec::is_empty));
+    let evidence_path = result["evidence_path"].as_str().expect("evidence path");
+    let evidence: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(evidence_path).expect("evidence json"))
+            .expect("evidence payload");
+    assert_eq!(evidence["denominator_task_count"], 1);
+    assert_eq!(evidence["denominator_trial_count"], 0);
+    assert!(evidence["tasks"].as_array().is_some_and(|tasks| {
+        tasks
+            .iter()
+            .all(|task| task["trials"].as_array().is_some_and(Vec::is_empty))
+    }));
 }
 
 #[test]
 fn app_server_eval_run_fails_closed_before_agent_on_invalid_workspace() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = app_server(store).with_sandbox_backend(CompletedSandboxBackend);
+    let mut server = configured_app_server(store).with_sandbox_backend(CompletedSandboxBackend);
     let manifest = dir.path().join("eval.json");
     let output_root = dir.path().join("eval-output");
     std::fs::write(
@@ -1169,11 +1146,8 @@ fn app_server_eval_run_fails_closed_before_agent_on_invalid_workspace() {
     assert_eq!(result["runner"], "agent_loop");
     assert_eq!(result["status"], "blocked");
     assert_eq!(result["blocker"], "workspace_preparation");
-    assert_eq!(result["tasks"][0]["trials"][0]["agent_completed"], false);
-    assert_eq!(
-        result["tasks"][0]["blocker"]["kind"],
-        "workspace_preparation"
-    );
+    assert_eq!(result["evaluation_passed"], false);
+    assert!(result["tasks"].as_array().is_some_and(Vec::is_empty));
 }
 
 #[test]

@@ -6148,7 +6148,12 @@ mod tests {
         let response = run_evaluation(
             &params,
             Arc::new(SourceSandboxBackend),
-            &ProviderConfigSnapshot::capture(|_| None),
+            &ProviderConfigSnapshot::capture(|name| match name {
+                "SINGULARITY_API_KEY" => Some("fixture-key".to_string()),
+                "SINGULARITY_BASE_URL" => Some("http://127.0.0.1:1/v1".to_string()),
+                "SINGULARITY_MODEL" => Some("fixture-model".to_string()),
+                _ => None,
+            }),
             &CancellationToken::new(),
             &trace_store,
         )
