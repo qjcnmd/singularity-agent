@@ -168,7 +168,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 
       - name: Test workspace (full)
-        if: ${{ matrix.test_scope == 'full' }}
+        if: ${{ matrix.test_scope != 'hosted_linux' }}
         run: cargo test --workspace --all-targets --locked --no-fail-fast
 
       - name: Test workspace (hosted Linux contracts)
