@@ -191,7 +191,10 @@ fn long_entry_name(
     if unsafe { FindClose(handle) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    result.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+    match result {
+        Some(long_name) => Ok(long_name),
+        None => long_directory_name_by_identity(parent, short_name),
+    }
 }
 
 #[cfg(windows)]
@@ -203,6 +206,76 @@ fn wide_name(value: &[u16]) -> std::ffi::OsString {
         .position(|character| *character == 0)
         .unwrap_or(value.len());
     std::ffi::OsString::from_wide(&value[..length])
+}
+
+#[cfg(windows)]
+/// Resolves directory aliases on filesystems that omit `cAlternateFileName`.
+fn long_directory_name_by_identity(
+    parent: &Path,
+    short_name: &std::ffi::OsStr,
+) -> std::io::Result<std::ffi::OsString> {
+    let target_identity = directory_identity(&parent.join(short_name))?;
+    let mut result = None;
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&short_name.to_string_lossy())
+        {
+            continue;
+        }
+        let Ok(identity) = directory_identity(&entry.path()) else {
+            continue;
+        };
+        if identity == target_identity && result.replace(name).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "short-name directory identity is ambiguous",
+            ));
+        }
+    }
+    result.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
+#[cfg(windows)]
+fn directory_identity(path: &Path) -> std::io::Result<(u32, u64)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let directory = options.open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the file keeps the handle live and `information` is writable output storage.
+    if unsafe {
+        GetFileInformationByHandle(directory.as_raw_handle() as isize, information.as_mut_ptr())
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful call initialized the complete output structure.
+    let information = unsafe { information.assume_init() };
+    let volume = information.dwVolumeSerialNumber;
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    if volume == 0 || index == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory identity is unavailable",
+        ));
+    }
+    Ok((volume, index))
 }
 
 #[cfg(test)]
