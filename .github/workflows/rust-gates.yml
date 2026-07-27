@@ -43,6 +43,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_HOME=$cargoHome"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "RUSTUP_HOME=$rustupHome"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'cargo-target')"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_INCREMENTAL=0"
 
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -51,16 +52,52 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Restore Cargo registry and git cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: rust-gates-supply-cargo-v1-${{ runner.os }}-rust-1.96.0-audit-0.22.2-deny-0.20.2
+
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
 
+      - name: Restore supply-chain tool cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cargo-tools
+          key: rust-gates-tools-v1-${{ runner.os }}-rust-1.96.0-audit-0.22.2-deny-0.20.2
+
       - name: Install pinned supply-chain tools
         run: |
+          $ErrorActionPreference = "Stop"
           $toolRoot = Join-Path $env:RUNNER_TEMP "cargo-tools"
+          $toolSpecs = @(
+            @{ Name = "cargo-audit"; Version = "0.22.2"; Root = (Join-Path $toolRoot "cargo-audit") }
+            @{ Name = "cargo-deny"; Version = "0.20.2"; Root = (Join-Path $toolRoot "cargo-deny") }
+          )
+          foreach ($tool in $toolSpecs) {
+            $binaryName = $tool.Name
+            if ($IsWindows) {
+              $binaryName += ".exe"
+            }
+            $binary = Join-Path $tool.Root (Join-Path "bin" $binaryName)
+            $needsInstall = -not (Test-Path -LiteralPath $binary -PathType Leaf)
+            if (-not $needsInstall) {
+              $versionOutput = (& $binary --version 2>&1 | Out-String).Trim()
+              $versionPattern = "(?m)\b$([regex]::Escape($tool.Name))\s+$([regex]::Escape($tool.Version))\b"
+              $needsInstall = ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch $versionPattern)
+            }
+            if ($needsInstall) {
+              cargo install $tool.Name --version $tool.Version --locked --force --root $tool.Root
+              if ($LASTEXITCODE -ne 0) {
+                throw "failed to install $($tool.Name) $($tool.Version)"
+              }
+            }
+          }
           $auditRoot = Join-Path $toolRoot "cargo-audit"
           $denyRoot = Join-Path $toolRoot "cargo-deny"
-          cargo install cargo-audit --version 0.22.2 --locked --root $auditRoot
-          cargo install cargo-deny --version 0.20.2 --locked --root $denyRoot
           Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $auditRoot "bin")
           Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $denyRoot "bin")
 
@@ -101,6 +138,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_HOME=$cargoHome"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "RUSTUP_HOME=$rustupHome"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'cargo-target')"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_INCREMENTAL=0"
 
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -108,6 +146,14 @@ jobs:
           clean: true
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Restore Cargo registry and git cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
+          key: rust-gates-cargo-v1-${{ runner.os }}-rust-1.96.0-lock-${{ hashFiles('Cargo.lock') }}
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
