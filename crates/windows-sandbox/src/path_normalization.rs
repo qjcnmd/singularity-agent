@@ -86,26 +86,36 @@ fn long_path_name(path: &Path) -> std::io::Result<PathBuf> {
             )
         };
         if written == 0 {
-            return Err(std::io::Error::last_os_error());
+            let error = std::io::Error::last_os_error();
+            let expanded = expand_remaining_short_components(&ordinary)?;
+            if expanded == ordinary {
+                return Err(error);
+            }
+            return preserve_windows_path_form(path, &expanded);
         }
         let written = written as usize;
         if written < output.len() {
             output.truncate(written);
             let expanded =
                 expand_remaining_short_components(&PathBuf::from(OsString::from_wide(&output)))?;
-            let original = path.to_string_lossy();
-            let expanded = expanded.to_string_lossy();
-            if original.starts_with(r"\\?\UNC\") {
-                let expanded = expanded.strip_prefix(r"\\").unwrap_or(&expanded);
-                return Ok(PathBuf::from(format!(r"\\?\UNC\{expanded}")));
-            }
-            if original.starts_with(r"\\?\") && !expanded.starts_with(r"\\?\") {
-                return Ok(PathBuf::from(format!(r"\\?\{expanded}")));
-            }
-            return Ok(PathBuf::from(expanded.as_ref()));
+            return preserve_windows_path_form(path, &expanded);
         }
         output.resize(written.saturating_add(1), 0);
     }
+}
+
+#[cfg(windows)]
+fn preserve_windows_path_form(original: &Path, expanded: &Path) -> std::io::Result<PathBuf> {
+    let original = original.to_string_lossy();
+    let expanded = expanded.to_string_lossy();
+    if original.starts_with(r"\\?\UNC\") {
+        let expanded = expanded.strip_prefix(r"\\").unwrap_or(&expanded);
+        return Ok(PathBuf::from(format!(r"\\?\UNC\{expanded}")));
+    }
+    if original.starts_with(r"\\?\") && !expanded.starts_with(r"\\?\") {
+        return Ok(PathBuf::from(format!(r"\\?\{expanded}")));
+    }
+    Ok(PathBuf::from(expanded.as_ref()))
 }
 
 #[cfg(windows)]
