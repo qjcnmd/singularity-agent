@@ -1530,6 +1530,7 @@ dependencies = [
 name = "singularity_core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cap-fs-ext",
  "cap-std",
  "schemars",
@@ -1600,6 +1601,8 @@ dependencies = [
  "cap-std",
  "dunce",
  "libc",
+ "rustls-pki-types",
+ "rustls-webpki",
  "schemars",
  "serde",
  "serde_json",

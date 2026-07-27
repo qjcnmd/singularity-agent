@@ -18,7 +18,9 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata, OpenOptions};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use singularity_core::is_protected_path;
+use singularity_core::{
+    is_protected_path, is_public_certificate_only_pem, is_public_certificate_pem_path,
+};
 
 use super::WorkspaceChangeSummary;
 
@@ -27,6 +29,7 @@ const MAX_SNAPSHOT_DEPTH: usize = 256;
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CHANGED_FILES: usize = 64;
 const MAX_CHANGED_PATH_CHARS: usize = 512;
+const MAX_PUBLIC_CERTIFICATE_PEM_BYTES: u64 = 1024 * 1024;
 
 /// Return whether a relative workspace path belongs to the closed toolchain artifact set.
 ///
@@ -405,7 +408,24 @@ fn visit_directory(
             .ok_or_else(|| "workspace change snapshot contains a non-Unicode path".to_string())?;
         let relative = relative_parent.join(&name);
         let relative_text = workspace_relative_path(&relative)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("workspace change snapshot type failed: {error}"))?;
         if protect_paths && (is_protected_path(name_text) || is_protected_path(&relative_text)) {
+            if file_type.is_file()
+                && is_public_certificate_pem_path(&relative_text)
+                && is_public_certificate_entry(directory, Path::new(&name))?
+            {
+                let snapshot_entry = snapshot_file(directory, Path::new(&name), state)?;
+                if !is_public_certificate_entry(directory, Path::new(&name))? {
+                    return Err(
+                        "public certificate changed while its workspace snapshot was captured"
+                            .to_string(),
+                    );
+                }
+                state.entries.insert(relative_text, snapshot_entry);
+                continue;
+            }
             #[cfg(not(windows))]
             {
                 let metadata = directory
@@ -418,9 +438,6 @@ fn visit_directory(
             }
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("workspace change snapshot type failed: {error}"))?;
         #[cfg(windows)]
         let is_link = file_type.is_symlink()
             || entry
@@ -497,6 +514,44 @@ fn snapshot_symlink(directory: &Dir, name: &Path) -> Result<SnapshotEntry, Strin
         metadata: metadata_before,
         target_digest: hash_os_str(first.as_os_str()),
     })
+}
+
+fn is_public_certificate_entry(directory: &Dir, name: &Path) -> Result<bool, String> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let mut file = directory
+        .open_with(name, &options)
+        .map_err(|error| format!("public certificate open failed: {error}"))?;
+    let before = file
+        .metadata()
+        .and_then(|metadata| entry_metadata(&metadata))
+        .map_err(|error| format!("public certificate metadata failed: {error}"))?;
+    if before.object_kind != 1 || before.length > MAX_PUBLIC_CERTIFICATE_PEM_BYTES {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_PUBLIC_CERTIFICATE_PEM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("public certificate read failed: {error}"))?;
+    if bytes.len() as u64 > MAX_PUBLIC_CERTIFICATE_PEM_BYTES {
+        return Ok(false);
+    }
+    let after = file
+        .metadata()
+        .and_then(|metadata| entry_metadata(&metadata))
+        .map_err(|error| format!("public certificate revalidation failed: {error}"))?;
+    let path_after = directory
+        .symlink_metadata(name)
+        .and_then(|metadata| entry_metadata(&metadata))
+        .map_err(|error| format!("public certificate path revalidation failed: {error}"))?;
+    if before != after || before != path_after {
+        return Err("public certificate changed while it was classified".to_string());
+    }
+    Ok(is_public_certificate_only_pem(&bytes, |der| {
+        let certificate = rustls_pki_types::CertificateDer::from(der);
+        webpki::EndEntityCert::try_from(&certificate).is_ok()
+    }))
 }
 
 fn snapshot_file(

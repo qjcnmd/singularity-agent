@@ -13,6 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -26,7 +27,10 @@ use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use sha2::{Digest, Sha256};
-use singularity_core::{CancellationToken, is_protected_path};
+use singularity_core::{
+    CancellationToken, is_protected_path, is_public_certificate_only_pem,
+    is_public_certificate_pem_path,
+};
 
 use super::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
@@ -48,6 +52,7 @@ const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
 const SANDBOX_CHILD_CANCELLED: &str = "linux sandbox command cancelled";
 const SANDBOX_CHILD_TIMED_OUT: &str = "linux sandbox command timed out";
 const SANDBOX_HOME: &str = "/run/singularity-home";
+const MAX_PUBLIC_CERTIFICATE_PEM_BYTES: u64 = 1024 * 1024;
 
 /// Read-only system roots needed by dynamically dispatched executables.
 ///
@@ -1173,6 +1178,7 @@ fn snapshot_workspace_view(
     protect_workspace_metadata: bool,
 ) -> Result<(), std::io::Error> {
     fn visit(
+        workspace: &Path,
         directory: &Dir,
         lower: &Path,
         relative_parent: &Path,
@@ -1190,9 +1196,16 @@ fn snapshot_workspace_view(
             let Some(relative_text) = relative.to_str() else {
                 return Err(std::io::Error::other("non-Unicode hardlink path"));
             };
-            if protect_workspace_metadata
-                && (is_protected_path(name_text) || is_protected_path(relative_text))
-            {
+            let protected = is_protected_path(name_text) || is_protected_path(relative_text);
+            let validated_public_certificate = protected
+                && fs::symlink_metadata(workspace.join(&relative)).is_ok_and(|metadata| {
+                    validated_public_certificate_change(
+                        &workspace.join(&relative),
+                        &relative,
+                        &metadata,
+                    )
+                });
+            if protect_workspace_metadata && protected && !validated_public_certificate {
                 materialize_protected_snapshot_root(
                     &directory.symlink_metadata(&name)?,
                     &lower.join(&relative),
@@ -1205,6 +1218,7 @@ fn snapshot_workspace_view(
                 let child = directory.open_dir_nofollow(&name)?;
                 fs::create_dir(&destination)?;
                 visit(
+                    workspace,
                     &child,
                     lower,
                     &relative,
@@ -1262,6 +1276,7 @@ fn snapshot_workspace_view(
     let mut hardlink_groups = BTreeMap::new();
     let workspace_directory = Dir::open_ambient_dir(workspace, ambient_authority())?;
     visit(
+        workspace,
         &workspace_directory,
         lower,
         Path::new(""),
@@ -1859,7 +1874,11 @@ fn is_protected_relative(workspace: &Path, path: &Path) -> bool {
 }
 
 fn collect_protected_paths(workspace: &Path) -> Result<Vec<ProtectedPath>, std::io::Error> {
-    fn visit(directory: &Path, paths: &mut Vec<ProtectedPath>) -> Result<(), std::io::Error> {
+    fn visit(
+        workspace: &Path,
+        directory: &Path,
+        paths: &mut Vec<ProtectedPath>,
+    ) -> Result<(), std::io::Error> {
         let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
@@ -1868,6 +1887,12 @@ fn collect_protected_paths(workspace: &Path) -> Result<Vec<ProtectedPath>, std::
             let name = entry.file_name();
             let protected = is_protected_path(&name.to_string_lossy());
             if protected {
+                let relative = path
+                    .strip_prefix(workspace)
+                    .map_err(|_| std::io::Error::other("protected path escaped workspace"))?;
+                if validated_public_certificate_change(&path, relative, &metadata) {
+                    continue;
+                }
                 if metadata.file_type().is_symlink() {
                     return Err(std::io::Error::other("protected symlink"));
                 }
@@ -1878,14 +1903,14 @@ fn collect_protected_paths(workspace: &Path) -> Result<Vec<ProtectedPath>, std::
                 continue;
             }
             if metadata.is_dir() {
-                visit(&path, paths)?;
+                visit(workspace, &path, paths)?;
             }
         }
         Ok(())
     }
 
     let mut paths = Vec::new();
-    visit(workspace, &mut paths)?;
+    visit(workspace, workspace, &mut paths)?;
     paths.sort_by_key(|item| item.path.components().count());
     let mut top_level = Vec::new();
     for item in paths {
@@ -2266,7 +2291,7 @@ fn run_prepared_command(
             None => result,
         };
     }
-    let mut trusted_transaction_changed = None;
+    let mut transaction_changed = None;
     if interrupted == InterruptKind::None
         && let Some(transaction) = prepared.transaction.as_ref()
     {
@@ -2288,9 +2313,7 @@ fn run_prepared_command(
             prepared.protect_workspace_metadata,
         ) {
             Ok(changed) => {
-                if !prepared.protect_workspace_metadata {
-                    trusted_transaction_changed = Some(changed);
-                }
+                transaction_changed = Some(changed);
             }
             Err(error) => {
                 return match error {
@@ -2332,7 +2355,9 @@ fn run_prepared_command(
             }
         }
     }
-    let (mutation, summary) = if let Some(changed) = trusted_transaction_changed {
+    let (mutation, summary) = if !prepared.protect_workspace_metadata
+        && let Some(changed) = transaction_changed
+    {
         (
             if changed {
                 WorkspaceMutation::Changed
@@ -2342,7 +2367,12 @@ fn run_prepared_command(
             None,
         )
     } else {
-        observed_workspace_change(&prepared.before, &prepared.workspace)
+        let observed = observed_workspace_change(&prepared.before, &prepared.workspace);
+        if transaction_changed == Some(true) && observed.0 == WorkspaceMutation::Unknown {
+            (WorkspaceMutation::Changed, None)
+        } else {
+            observed
+        }
     };
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     let mut result = if interrupted == InterruptKind::Cancelled {
@@ -2395,10 +2425,12 @@ fn overlay_contains_protected_change(upper: &Path) -> bool {
             let relative = relative_parent.join(&name);
             let name_text = name.to_str().ok_or(())?;
             let relative_text = relative.to_str().ok_or(())?;
-            if is_protected_path(name_text) || is_protected_path(relative_text) {
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| ())?;
+            if (is_protected_path(name_text) || is_protected_path(relative_text))
+                && !validated_public_certificate_change(&entry.path(), &relative, &metadata)
+            {
                 return Ok(true);
             }
-            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| ())?;
             if metadata.is_dir() && visit(&entry.path(), &relative)? {
                 return Ok(true);
             }
@@ -2407,6 +2439,63 @@ fn overlay_contains_protected_change(upper: &Path) -> bool {
     }
 
     visit(upper, Path::new("")).unwrap_or(true)
+}
+
+fn validated_public_certificate_change(
+    path: &Path,
+    relative: &Path,
+    metadata: &fs::Metadata,
+) -> bool {
+    if !metadata.is_file() || !is_public_certificate_pem_path(&relative.to_string_lossy()) {
+        return false;
+    }
+    let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(file_metadata) = file.metadata() else {
+        return false;
+    };
+    if !file_metadata.is_file()
+        || file_metadata.dev() != metadata.dev()
+        || file_metadata.ino() != metadata.ino()
+        || file_metadata.len() != metadata.len()
+        || file_metadata.len() > MAX_PUBLIC_CERTIFICATE_PEM_BYTES
+    {
+        return false;
+    }
+    let Ok(stat_before) = stable_file_stat(&file) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if Read::by_ref(&mut file)
+        .take(MAX_PUBLIC_CERTIFICATE_PEM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_PUBLIC_CERTIFICATE_PEM_BYTES
+    {
+        return false;
+    }
+    if stable_file_stat(&file).ok() != Some(stat_before) {
+        return false;
+    }
+    let Ok(path_after) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if path_after.dev() != file_metadata.dev()
+        || path_after.ino() != file_metadata.ino()
+        || path_after.len() != file_metadata.len()
+        || path_after.modified().ok() != file_metadata.modified().ok()
+    {
+        return false;
+    }
+    is_public_certificate_only_pem(&bytes, |der| {
+        let certificate = rustls_pki_types::CertificateDer::from(der);
+        webpki::EndEntityCert::try_from(&certificate).is_ok()
+    })
 }
 
 const MAX_TRANSACTION_ENTRIES: usize = 100_000;
@@ -2967,9 +3056,7 @@ fn capture_transaction_entry(
     Ok(())
 }
 
-fn stable_file_stat(
-    file: &cap_std::fs::File,
-) -> Result<FileStatEvidence, WorkspaceTransactionError> {
+fn stable_file_stat(file: &impl AsRawFd) -> Result<FileStatEvidence, WorkspaceTransactionError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
         return Err(WorkspaceTransactionError::CapabilityNotSupported);
@@ -3131,7 +3218,9 @@ fn commit_workspace_transaction(
     }
     let stage_state = TransactionTreeState::capture(&area.stage)?;
     let expected = expected_transaction_state(&before_state, &stage_state, &operations)?;
-    if protect_workspace_metadata && protected_transaction_state_changed(&before_state, &expected) {
+    if protect_workspace_metadata
+        && protected_transaction_state_changed(&before_state, &expected, &area.stage, &operations)
+    {
         return Err(WorkspaceTransactionError::PolicyDenied);
     }
     if cancellation.is_cancelled() {
@@ -3216,13 +3305,28 @@ fn commit_workspace_transaction(
 fn protected_transaction_state_changed(
     before: &TransactionTreeState,
     expected: &TransactionTreeState,
+    stage: &Path,
+    operations: &[WorkspaceOperation],
 ) -> bool {
     before.entries.iter().any(|(path, entry)| {
         let protected = path
             .components()
             .filter_map(|component| component.as_os_str().to_str())
             .any(is_protected_path);
-        protected && expected.entries.get(path) != Some(entry)
+        protected
+            && expected.entries.get(path) != Some(entry)
+            && !operations.iter().any(|operation| {
+                let WorkspaceOperation::Replace(relative) = operation else {
+                    return false;
+                };
+                if relative != path {
+                    return false;
+                }
+                let staged = stage.join(relative);
+                fs::symlink_metadata(&staged).is_ok_and(|metadata| {
+                    validated_public_certificate_change(&staged, relative, &metadata)
+                })
+            })
     })
 }
 
@@ -3325,14 +3429,15 @@ fn plan_overlay_directory(
         let relative_text = relative
             .to_str()
             .ok_or(WorkspaceTransactionError::PolicyDenied)?;
-        if protect_workspace_metadata
-            && (is_protected_path(name_text) || is_protected_path(relative_text))
-        {
-            return Err(WorkspaceTransactionError::PolicyDenied);
-        }
         let source = entry.path();
         let metadata = fs::symlink_metadata(&source)
             .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        if protect_workspace_metadata
+            && (is_protected_path(name_text) || is_protected_path(relative_text))
+            && !validated_public_certificate_change(&source, &relative, &metadata)
+        {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
         let file_type = metadata.file_type();
         if file_type.is_char_device() && metadata.rdev() == 0 {
             operations.push(WorkspaceOperation::Delete(relative));
@@ -3473,13 +3578,19 @@ fn copy_upper_tree(
         let name_text = name
             .to_str()
             .ok_or(WorkspaceTransactionError::PolicyDenied)?;
-        if protect_workspace_metadata && is_protected_path(name_text) {
-            return Err(WorkspaceTransactionError::PolicyDenied);
-        }
         let source = entry.path();
         let destination = destination.join(&name);
         let child_metadata = fs::symlink_metadata(&source)
             .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        let relative = source
+            .strip_prefix(upper_root)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        if protect_workspace_metadata
+            && is_protected_path(name_text)
+            && !validated_public_certificate_change(&source, relative, &child_metadata)
+        {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
         let file_type = child_metadata.file_type();
         validate_overlay_attributes(&source, upper_root, file_type.is_dir())?;
         if file_type.is_char_device() && child_metadata.rdev() == 0 {

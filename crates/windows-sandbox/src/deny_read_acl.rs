@@ -15,12 +15,11 @@ use crate::path_safety::open_filesystem_root;
 use crate::path_safety::validate_plain_directory;
 use anyhow::Context;
 use anyhow::Result;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cap_std::fs::Dir;
 use serde::Deserialize;
 use serde::Serialize;
 use singularity_core::PROTECTED_GIT_DIR_NAME;
+use singularity_core::is_public_certificate_only_pem as classify_public_certificate_pem;
 use std::collections::HashSet;
 use std::ffi::{OsStr, c_void};
 use std::io::Read;
@@ -76,26 +75,6 @@ fn is_pem_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pem"))
 }
 
-fn public_certificate_label<'a>(line: &'a str, boundary: &str) -> Option<&'a str> {
-    line.strip_prefix(boundary)
-        .and_then(|line| line.strip_suffix("-----"))
-        .filter(|label| matches!(*label, "CERTIFICATE" | "TRUSTED CERTIFICATE"))
-}
-
-fn is_public_certificate_metadata_comment(line: &str) -> bool {
-    [
-        "# Issuer:",
-        "# Subject:",
-        "# Label:",
-        "# Serial:",
-        "# MD5 Fingerprint:",
-        "# SHA1 Fingerprint:",
-        "# SHA256 Fingerprint:",
-    ]
-    .iter()
-    .any(|prefix| line.starts_with(prefix))
-}
-
 fn is_x509_certificate_der(bytes: &[u8]) -> bool {
     let Ok(length) = u32::try_from(bytes.len()) else {
         return false;
@@ -127,51 +106,10 @@ fn is_public_certificate_only_pem(file: &mut std::fs::File) -> Result<bool> {
     if bytes.len() as u64 > MAX_PEM_CLASSIFICATION_BYTES {
         return Ok(false);
     }
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Ok(false);
-    };
-    let mut open_label = None;
-    let mut encoded_block = String::new();
-    let mut certificate_count = 0usize;
-    for line in text.lines().map(str::trim) {
-        match open_label {
-            None => {
-                if line.is_empty() || is_public_certificate_metadata_comment(line) {
-                    continue;
-                }
-                let Some(label) = public_certificate_label(line, "-----BEGIN ") else {
-                    return Ok(false);
-                };
-                open_label = Some(label);
-                encoded_block.clear();
-            }
-            Some(expected_label) => {
-                if let Some(label) = public_certificate_label(line, "-----END ") {
-                    let decoded = BASE64_STANDARD.decode(encoded_block.as_bytes());
-                    if label != expected_label
-                        || encoded_block.is_empty()
-                        || !decoded.as_deref().is_ok_and(is_x509_certificate_der)
-                    {
-                        return Ok(false);
-                    }
-                    certificate_count = certificate_count.saturating_add(1);
-                    open_label = None;
-                    continue;
-                }
-                if line.is_empty()
-                    || line.starts_with("-----")
-                    || !line.is_ascii()
-                    || !line.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
-                    })
-                {
-                    return Ok(false);
-                }
-                encoded_block.push_str(line);
-            }
-        }
-    }
-    Ok(open_label.is_none() && certificate_count > 0)
+    Ok(classify_public_certificate_pem(
+        &bytes,
+        is_x509_certificate_der,
+    ))
 }
 
 fn is_reparse_point_attributes(attributes: u32) -> bool {

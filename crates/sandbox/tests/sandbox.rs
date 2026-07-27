@@ -1737,6 +1737,11 @@ time.sleep(30)
                 "printf ordinary > source.txt; mv source.txt .env",
                 ".env",
             ),
+            (
+                "private_key_pem",
+                "protected=generated.; protected=${protected}pem; printf '%s\n' '-----BEGIN PRIVATE KEY-----' 'a2V5' '-----END PRIVATE KEY-----' > \"$protected\"",
+                "generated.pem",
+            ),
         ] {
             let workspace = tempfile::tempdir().expect("workspace");
             let result = backend.execute(&request(
@@ -2153,17 +2158,15 @@ time.sleep(30)
     }
 
     #[test]
-    fn linux_trusted_preparation_commits_standard_venv() {
+    fn linux_workspace_transaction_commits_standard_venv() {
         let workspace = tempfile::tempdir().expect("workspace");
         let backend = strict_backend();
-        let create = backend.execute(&CommandRequest::trusted_workspace_preparation(
+        let create = backend.execute(&request(
             "linux_python_venv_create",
-            ["/usr/bin/python3", "-m", "venv", ".venv"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            path_str(workspace.path()),
-            path_str(workspace.path()),
+            &["/usr/bin/python3", "-m", "venv", ".venv"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
         ));
 
         assert_eq!(
@@ -2179,15 +2182,12 @@ time.sleep(30)
                 .expect("absolute interpreter symlink"),
             Path::new("/usr/bin/python3")
         );
-
-        let invoke = backend.execute(&CommandRequest::trusted_workspace_preparation(
+        let invoke = backend.execute(&request(
             "linux_python_venv_invoke",
-            [".venv/bin/python", "-m", "pip", "--version"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            path_str(workspace.path()),
-            path_str(workspace.path()),
+            &[".venv/bin/python", "-m", "pip", "--version"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
         ));
         assert_eq!(
             invoke.execution_status,
@@ -2197,6 +2197,34 @@ time.sleep(30)
         );
         assert_eq!(invoke.exit_code, Some(0), "{}", invoke.stderr_preview);
         assert!(invoke.stdout_preview.starts_with("pip "));
+
+        let update_certificate = backend.execute(&request(
+            "linux_python_venv_update_public_certificate",
+            &[
+                ".venv/bin/python",
+                "-c",
+                "from pathlib import Path; p = next(Path('.venv').rglob('cacert.' + 'pem')); p.write_bytes(p.read_bytes() + b'\\n')",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+        assert_eq!(
+            update_certificate.execution_status,
+            CommandExecutionStatus::Completed,
+            "{}",
+            update_certificate.stderr_preview
+        );
+        assert_eq!(
+            update_certificate.exit_code,
+            Some(0),
+            "{}",
+            update_certificate.stderr_preview
+        );
+        assert_eq!(
+            update_certificate.workspace_mutation,
+            WorkspaceMutation::Changed
+        );
     }
 
     #[test]

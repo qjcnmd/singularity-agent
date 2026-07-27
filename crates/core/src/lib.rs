@@ -15,6 +15,8 @@ pub use project_instructions::{
 
 use std::fmt::{Display, Formatter};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -347,6 +349,104 @@ pub fn is_protected_path(path: &str) -> bool {
         })
 }
 
+/// 判断 protected `.pem` 路径是否只有文件后缀本身需要内容分类。
+///
+/// 任何受保护祖先，或同时命中 `.env`、credential、private-key、secret 等规则的文件名
+/// 仍保持拒绝；只有普通名称的 `.pem` 叶对象可以继续接受证书内容验证。
+pub fn is_public_certificate_pem_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let components = normalized.split('/').collect::<Vec<_>>();
+    let Some((leaf, parents)) = components.split_last() else {
+        return false;
+    };
+    if leaf.is_empty()
+        || parents.iter().any(|component| {
+            component.is_empty() || matches!(*component, "." | "..") || is_protected_path(component)
+        })
+    {
+        return false;
+    }
+    let Some((stem, extension)) = leaf.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty() && extension.eq_ignore_ascii_case("pem") && !is_protected_path(stem)
+}
+
+fn public_certificate_label<'a>(line: &'a str, boundary: &str) -> Option<&'a str> {
+    line.strip_prefix(boundary)
+        .and_then(|line| line.strip_suffix("-----"))
+        .filter(|label| matches!(*label, "CERTIFICATE" | "TRUSTED CERTIFICATE"))
+}
+
+fn is_public_certificate_metadata_comment(line: &str) -> bool {
+    [
+        "# Issuer:",
+        "# Subject:",
+        "# Label:",
+        "# Serial:",
+        "# MD5 Fingerprint:",
+        "# SHA1 Fingerprint:",
+        "# SHA256 Fingerprint:",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+/// 判断 PEM 内容是否只包含可解析的公开 X.509 证书。
+///
+/// 调用方负责通过已固定、无跟随的文件句柄读取 `bytes`，并用平台的 X.509 解析器提供
+/// `is_x509_certificate_der`；未知标签、混合私钥、格式错误或无法解析的 DER 均拒绝。
+pub fn is_public_certificate_only_pem(
+    bytes: &[u8],
+    mut is_x509_certificate_der: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut open_label = None;
+    let mut encoded_block = String::new();
+    let mut certificate_count = 0usize;
+    for line in text.lines().map(str::trim) {
+        match open_label {
+            None => {
+                if line.is_empty() || is_public_certificate_metadata_comment(line) {
+                    continue;
+                }
+                let Some(label) = public_certificate_label(line, "-----BEGIN ") else {
+                    return false;
+                };
+                open_label = Some(label);
+                encoded_block.clear();
+            }
+            Some(expected_label) => {
+                if let Some(label) = public_certificate_label(line, "-----END ") {
+                    let decoded = BASE64_STANDARD.decode(encoded_block.as_bytes());
+                    if label != expected_label
+                        || encoded_block.is_empty()
+                        || !decoded.as_deref().is_ok_and(&mut is_x509_certificate_der)
+                    {
+                        return false;
+                    }
+                    certificate_count = certificate_count.saturating_add(1);
+                    open_label = None;
+                    continue;
+                }
+                if line.is_empty()
+                    || line.starts_with("-----")
+                    || !line.is_ascii()
+                    || !line.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+                    })
+                {
+                    return false;
+                }
+                encoded_block.push_str(line);
+            }
+        }
+    }
+    open_label.is_none() && certificate_count > 0
+}
+
 fn contains_secret_like_token(text: &str) -> bool {
     text.split(secret_token_delimiter)
         .any(is_secret_like_token_fragment)
@@ -435,7 +535,7 @@ fn is_base64url_char(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_protected_path;
+    use super::{is_protected_path, is_public_certificate_pem_path};
 
     #[test]
     fn protected_path_policy_covers_exact_prefix_and_suffix_markers() {
@@ -454,6 +554,29 @@ mod tests {
         }
         for path in ["src/main.rs", "config/example.env.sample", "notes/key.txt"] {
             assert!(!is_protected_path(path), "{path} should be allowed");
+        }
+    }
+
+    #[test]
+    fn public_certificate_path_requires_an_unprotected_pem_leaf() {
+        for path in ["cacert.pem", "nested/cacert.PEM"] {
+            assert!(
+                is_public_certificate_pem_path(path),
+                "{path} should be eligible for content validation"
+            );
+        }
+        for path in [
+            ".env.pem",
+            "private-key.pem",
+            "secret.pem",
+            "nested/.env/cacert.pem",
+            "../cacert.pem",
+            r"nested\secret\cacert.pem",
+        ] {
+            assert!(
+                !is_public_certificate_pem_path(path),
+                "{path} should remain protected"
+            );
         }
     }
 }
