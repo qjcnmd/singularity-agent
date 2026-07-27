@@ -30,7 +30,7 @@
           },
           {
             "argv": [
-              ".venv/Scripts/python.exe",
+              ".venv/bin/python",
               "-m",
               "pip",
               "install",
@@ -44,7 +44,7 @@
           },
           {
             "argv": [
-              ".venv/Scripts/python.exe",
+              ".venv/bin/python",
               "-m",
               "pip",
               "install",
@@ -75,7 +75,7 @@
         "smoke_commands": [
           {
             "argv": [
-              ".venv/Scripts/python.exe",
+              ".venv/bin/python",
               "-B",
               "-c",
               "import ast, pathlib; ast.parse(pathlib.Path('src/sqlfluff/rules/L060.py').read_text(encoding='utf-8'))"
@@ -97,7 +97,7 @@
           "commands": [
             {
               "argv": [
-                ".venv/Scripts/python.exe",
+                ".venv/bin/python",
                 "-m",
                 "pytest",
                 "test/rules/std_L060_test.py::test__rules__std_L060_raised"
@@ -110,7 +110,7 @@
           "commands": [
             {
               "argv": [
-                ".venv/Scripts/python.exe",
+                ".venv/bin/python",
                 "-m",
                 "pytest",
                 "test/rules/std_L060_test.py::test__rules__std_L060_raised"
@@ -123,7 +123,7 @@
           "commands": [
             {
               "argv": [
-                ".venv/Scripts/python.exe",
+                ".venv/bin/python",
                 "-m",
                 "pytest",
                 "test/rules/std_L060_hidden_test.py::test__rules__std_L060_individual_diagnostics"
