@@ -5027,15 +5027,41 @@ fn openai_provider_cancels_during_retry_backoff() {
     );
     let cancellation = singularity_core::CancellationToken::new();
     let worker_cancellation = cancellation.clone();
+    let (backoff_ready_tx, backoff_ready_rx) = mpsc::channel();
+    let (backoff_release_tx, backoff_release_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
+        let mut backoff_release_rx = Some(backoff_release_rx);
+        let mut on_attempt = |event| {
+            if let ProviderAttemptEvent::Finished(occurrence) = event
+                && occurrence.retry_scheduled
+                && let Some(release_rx) = backoff_release_rx.take()
+            {
+                backoff_ready_tx
+                    .send(())
+                    .expect("send retry backoff signal");
+                release_rx.recv().expect("release retry backoff handshake");
+            }
+            true
+        };
         result_tx
-            .send(provider.complete(&request, &worker_cancellation))
+            .send(Provider::complete_observed(
+                &provider,
+                &request,
+                &worker_cancellation,
+                &mut on_attempt,
+            ))
             .expect("send provider result");
     });
 
     assert_eq!(attempts.recv_timeout(Duration::from_secs(1)), Ok(1));
+    backoff_ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("provider retry backoff was scheduled");
     cancellation.cancel();
+    backoff_release_tx
+        .send(())
+        .expect("release retry backoff handshake");
     let error = result_rx
         .recv_timeout(Duration::from_millis(500))
         .expect("provider cancellation during backoff was bounded")
