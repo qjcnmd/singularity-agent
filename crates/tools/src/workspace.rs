@@ -1504,11 +1504,14 @@ fn bind_workspace_namespace(
         )
     })?;
     // Namespace guards deny delete sharing, so the path cannot be replaced while
-    // canonicalization normalizes the handle path and alias expansion resolves any
-    // short-name spelling returned by the handle API.
-    let actual_path = singularity_sandbox::expand_windows_path_alias(
-        &std::fs::canonicalize(handle_path).map_err(io_error)?,
-    );
+    // alias expansion resolves short-name spelling and canonicalization then
+    // normalizes the expanded long form returned by the handle API.
+    // Expand before canonicalize: some Windows Server temp/namespace layouts keep
+    // short components through GetFinalPathNameByHandle, and expanding the raw
+    // handle spelling is the reliable way to force long names first.
+    let actual_path =
+        std::fs::canonicalize(singularity_sandbox::expand_windows_path_alias(&handle_path))
+            .map_err(io_error)?;
     // A short-name spelling is accepted only while opening the existing root. The
     // handle-derived path must be the normalized long spelling before it becomes
     // the workspace display/root path; re-run the strict component checks on it.

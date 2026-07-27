@@ -124,13 +124,13 @@ fn preserve_windows_path_form(original: &Path, expanded: &Path) -> std::io::Resu
 
 #[cfg(windows)]
 fn expand_remaining_short_components(path: &Path) -> std::io::Result<PathBuf> {
-    let mut probe = PathBuf::new();
     let mut expanded = PathBuf::new();
     for component in path.components() {
-        probe.push(component.as_os_str());
         if let std::path::Component::Normal(name) = component {
             if is_short_name_alias(name) {
-                expanded.push(long_entry_name(&probe)?);
+                // Resolve against the already-expanded parent so multi-level
+                // aliases (for example `RUNNER~1\SINGUL~1`) expand left-to-right.
+                expanded.push(long_entry_name(&expanded, name)?);
             } else {
                 expanded.push(name);
             }
@@ -154,13 +154,23 @@ fn is_short_name_alias(name: &std::ffi::OsStr) -> bool {
 }
 
 #[cfg(windows)]
-fn long_entry_name(path: &Path) -> std::io::Result<std::ffi::OsString> {
+fn long_entry_name(
+    parent: &Path,
+    short_name: &std::ffi::OsStr,
+) -> std::io::Result<std::ffi::OsString> {
     use std::mem::MaybeUninit;
-    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
+    };
 
-    let mut input = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    // Prefer parent enumeration over probing the short path itself: some server SKUs
+    // return the short spelling from FindFirstFileW(short_path) and omit
+    // cAlternateFileName, so a probe-by-short-path lookup can appear successful while
+    // leaving the short name unexpanded.
+    let search = parent.join("*");
+    let mut input = search.as_os_str().encode_wide().collect::<Vec<_>>();
     input.push(0);
     let mut data = MaybeUninit::<WIN32_FIND_DATAW>::uninit();
     // SAFETY: `input` is NUL-terminated and immutable for the call. `data`
@@ -169,18 +179,120 @@ fn long_entry_name(path: &Path) -> std::io::Result<std::ffi::OsString> {
     if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: a valid search handle means `FindFirstFileW` initialized `data`.
-    let data = unsafe { data.assume_init() };
+    let mut result = None;
+    loop {
+        // SAFETY: the successful first/next search call initialized `data`,
+        // and the reference is not retained across the next write.
+        let entry = unsafe { data.assume_init_ref() };
+        let long_name = wide_name(&entry.cFileName);
+        let alternate_name = wide_name(&entry.cAlternateFileName);
+        if alternate_name
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&short_name.to_string_lossy())
+        {
+            result = Some(long_name);
+            break;
+        }
+        // SAFETY: `handle` remains live and `data` is writable output storage.
+        if unsafe { FindNextFileW(handle, data.as_mut_ptr()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                // SAFETY: `handle` is the live search handle returned above.
+                unsafe { FindClose(handle) };
+                return Err(error);
+            }
+            break;
+        }
+    }
     // SAFETY: `handle` is the live search handle returned above and is closed once.
     if unsafe { FindClose(handle) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let length = data
-        .cFileName
+    match result {
+        Some(long_name) => Ok(long_name),
+        None => long_directory_name_by_identity(parent, short_name),
+    }
+}
+
+#[cfg(windows)]
+fn wide_name(value: &[u16]) -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let length = value
         .iter()
         .position(|character| *character == 0)
-        .unwrap_or(data.cFileName.len());
-    Ok(std::ffi::OsString::from_wide(&data.cFileName[..length]))
+        .unwrap_or(value.len());
+    std::ffi::OsString::from_wide(&value[..length])
+}
+
+#[cfg(windows)]
+/// Resolves directory aliases on filesystems that omit `cAlternateFileName`.
+fn long_directory_name_by_identity(
+    parent: &Path,
+    short_name: &std::ffi::OsStr,
+) -> std::io::Result<std::ffi::OsString> {
+    let target_identity = directory_identity(&parent.join(short_name))?;
+    let mut result = None;
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&short_name.to_string_lossy())
+        {
+            continue;
+        }
+        let Ok(identity) = directory_identity(&entry.path()) else {
+            continue;
+        };
+        if identity == target_identity && result.replace(name).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "short-name directory identity is ambiguous",
+            ));
+        }
+    }
+    result.ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+}
+
+#[cfg(windows)]
+fn directory_identity(path: &Path) -> std::io::Result<(u32, u64)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let directory = options.open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the file keeps the handle live and `information` is writable output storage.
+    if unsafe {
+        GetFileInformationByHandle(directory.as_raw_handle() as isize, information.as_mut_ptr())
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful call initialized the complete output structure.
+    let information = unsafe { information.assume_init() };
+    let volume = information.dwVolumeSerialNumber;
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    if volume == 0 || index == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory identity is unavailable",
+        ));
+    }
+    Ok((volume, index))
 }
 
 #[cfg(test)]
