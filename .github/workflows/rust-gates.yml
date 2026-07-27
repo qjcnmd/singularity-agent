@@ -4,10 +4,10 @@ on:
   workflow_call:
     inputs:
       rust_runner_matrix:
-        description: JSON matrix whose runs_on values are JSON-encoded runner selectors
+        description: JSON matrix whose runs_on values are JSON-encoded runner selectors and whose test_scope values select full or hosted_linux tests
         required: false
         type: string
-        default: '{"include":[{"name":"Linux","runs_on":"\"ubuntu-latest\""},{"name":"Windows","runs_on":"\"windows-latest\""}]}'
+        default: '{"include":[{"name":"Linux hosted contracts","runs_on":"\"ubuntu-latest\"","test_scope":"hosted_linux"},{"name":"Windows","runs_on":"\"windows-latest\"","test_scope":"full"}]}'
       supply_chain_runner:
         description: JSON-encoded runner selector for the supply-chain job
         required: false
@@ -167,8 +167,24 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
 
-      - name: Test workspace
+      - name: Test workspace (full)
+        if: ${{ matrix.test_scope == 'full' }}
         run: cargo test --workspace --all-targets --locked --no-fail-fast
+
+      - name: Test workspace (hosted Linux contracts)
+        if: ${{ matrix.test_scope == 'hosted_linux' }}
+        run: |
+          cargo test --workspace --all-targets --locked --no-fail-fast --exclude singularity_app_server --exclude singularity_sandbox
+
+      - name: Test app-server (hosted Linux contracts)
+        if: ${{ matrix.test_scope == 'hosted_linux' }}
+        run: |
+          cargo test -p singularity_app_server --all-targets --locked --no-fail-fast -- --skip native_linux_preflight_verifies_trusted_workspace_preparation
+
+      - name: Test sandbox (hosted Linux contracts)
+        if: ${{ matrix.test_scope == 'hosted_linux' }}
+        run: |
+          cargo test -p singularity_sandbox --all-targets --locked --no-fail-fast -- --skip linux_tests::
 
       - name: Build workspace binaries
         run: cargo build --workspace --bins --locked

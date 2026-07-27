@@ -38,5 +38,5 @@ jobs:
       contents: read
     with:
       rust_runner_matrix: >-
-        {"include":[{"name":"Windows self-hosted","runs_on":"[\"self-hosted\",\"windows\",\"x64\",\"singularity\"]"}]}
+        {"include":[{"name":"Windows self-hosted","runs_on":"[\"self-hosted\",\"windows\",\"x64\",\"singularity\"]","test_scope":"full"}]}
       run_supply_chain: false
