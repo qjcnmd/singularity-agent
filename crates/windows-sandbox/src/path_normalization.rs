@@ -38,6 +38,10 @@ pub fn canonicalize_path_allow_missing(path: &Path) -> PathBuf {
     let mut missing_tail = Vec::new();
     loop {
         if let Ok(mut canonical) = dunce::canonicalize(&cursor) {
+            #[cfg(windows)]
+            {
+                canonical = long_path_name(&canonical).unwrap_or(canonical);
+            }
             for component in missing_tail.iter().rev() {
                 canonical.push(component);
             }
@@ -51,6 +55,38 @@ pub fn canonicalize_path_allow_missing(path: &Path) -> PathBuf {
         };
         missing_tail.push(file_name);
         cursor = parent.to_path_buf();
+    }
+}
+
+#[cfg(windows)]
+fn long_path_name(path: &Path) -> std::io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+
+    let mut input = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    input.push(0);
+    let mut output = vec![0_u16; 260];
+    loop {
+        // SAFETY: `input` is NUL-terminated and immutable for the call. `output`
+        // owns `len` writable UTF-16 elements, and the API receives that exact
+        // capacity. A successful result is decoded only within the returned size.
+        let written = unsafe {
+            GetLongPathNameW(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                output.len().try_into().unwrap_or(u32::MAX),
+            )
+        };
+        if written == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let written = written as usize;
+        if written < output.len() {
+            output.truncate(written);
+            return Ok(PathBuf::from(OsString::from_wide(&output)));
+        }
+        output.resize(written.saturating_add(1), 0);
     }
 }
 

@@ -1503,6 +1503,7 @@ fn bind_workspace_namespace(
             "workspace root handle path is unavailable".to_string(),
         )
     })?;
+    let actual_path = singularity_sandbox::canonicalize_windows_path_allow_missing(&actual_path);
     // A short-name spelling is accepted only while opening the existing root. The
     // handle-derived path must be the normalized long spelling before it becomes
     // the workspace display/root path; re-run the strict component checks on it.

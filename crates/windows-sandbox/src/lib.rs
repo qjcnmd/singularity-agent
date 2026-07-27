@@ -306,7 +306,7 @@ pub use logging::log_note;
 #[cfg(target_os = "windows")]
 pub use logging::log_writer;
 #[cfg(target_os = "windows")]
-pub use path_normalization::canonicalize_path;
+pub use path_normalization::{canonicalize_path, canonicalize_path_allow_missing};
 #[cfg(target_os = "windows")]
 pub use path_safety::ProtectedMetadataError;
 #[cfg(target_os = "windows")]
