@@ -119,6 +119,12 @@ pub(super) struct WorkspaceSnapshot {
 }
 
 impl WorkspaceSnapshot {
+    /// Return the pinned Unix identity used to bind a transaction to this workspace root.
+    #[cfg(unix)]
+    pub(super) fn root_identity(&self) -> (u64, u64) {
+        (self.root.device, self.root.inode)
+    }
+
     /// Compare two trusted observations and produce the final changed paths and diff digest.
     pub(super) fn change_summary(
         &self,

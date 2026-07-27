@@ -167,6 +167,22 @@ struct TransactionTestDirective {
 static TRANSACTION_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
+std::thread_local! {
+    static TRANSACTION_FULL_TREE_CAPTURES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_transaction_full_tree_captures() {
+    TRANSACTION_FULL_TREE_CAPTURES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn transaction_full_tree_captures() -> usize {
+    TRANSACTION_FULL_TREE_CAPTURES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 fn transaction_test_control() -> &'static (
     std::sync::Mutex<Option<TransactionTestDirective>>,
     std::sync::Condvar,
@@ -2420,12 +2436,66 @@ struct TransactionObjectState {
     device: u64,
     inode: u64,
     length: u64,
+    filesystem_links: u64,
     workspace_links: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TransactionTreeState {
     entries: BTreeMap<PathBuf, TransactionObjectState>,
+}
+
+/// File identity groups used to preserve hardlink membership while freezing a commit plan.
+#[derive(Default)]
+struct FileLinkGroups {
+    identity_by_path: BTreeMap<PathBuf, (u64, u64)>,
+    paths_by_identity: BTreeMap<(u64, u64), Vec<PathBuf>>,
+    count_by_identity: BTreeMap<(u64, u64), u64>,
+}
+
+impl FileLinkGroups {
+    fn insert(
+        &mut self,
+        path: PathBuf,
+        identity: (u64, u64),
+        filesystem_links: u64,
+    ) -> Result<(), WorkspaceTransactionError> {
+        self.identity_by_path.insert(path.clone(), identity);
+        self.paths_by_identity
+            .entry(identity)
+            .or_default()
+            .push(path);
+        if self
+            .count_by_identity
+            .insert(identity, filesystem_links)
+            .is_some_and(|previous| previous != filesystem_links)
+        {
+            return Err(WorkspaceTransactionError::Drift);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), WorkspaceTransactionError> {
+        for paths in self.paths_by_identity.values_mut() {
+            paths.sort();
+        }
+        if self.paths_by_identity.iter().any(|(identity, paths)| {
+            self.count_by_identity.get(identity).copied() != Some(paths.len() as u64)
+        }) {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        Ok(())
+    }
+
+    fn same_members(&self, other: &Self, path: &Path) -> bool {
+        let Some(identity) = self.identity_by_path.get(path) else {
+            return false;
+        };
+        let Some(other_identity) = other.identity_by_path.get(path) else {
+            return false;
+        };
+        self.paths_by_identity.get(identity) == other.paths_by_identity.get(other_identity)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2461,20 +2531,26 @@ struct CommitArea {
 /// Pinned directory identity and timestamps restored after entry-level renames.
 struct DirectoryTimes {
     directory: Dir,
+    device: u64,
+    inode: u64,
     access: cap_std::time::SystemTime,
     modified: cap_std::time::SystemTime,
 }
 
 /// Capability handles and rollback state retained until post-commit verification succeeds.
 struct AppliedWorkspaceOperations {
+    workspace_path: PathBuf,
     workspace_directory: Dir,
+    workspace_device: u64,
+    workspace_inode: u64,
     stage_directory: Dir,
     backup_directory: Dir,
     metadata_directory: Dir,
     moved: Vec<MovedWorkspaceObject>,
     installed: Vec<InstalledWorkspaceObject>,
     detached_metadata: Vec<MovedWorkspaceObject>,
-    directory_times: Vec<DirectoryTimes>,
+    directory_times: BTreeMap<PathBuf, DirectoryTimes>,
+    touched_directory_paths: std::collections::BTreeSet<PathBuf>,
 }
 
 struct MovedWorkspaceObject {
@@ -2509,6 +2585,8 @@ impl TransactionTreeState {
     }
 
     fn capture_from_dir(root: &Dir) -> Result<Self, WorkspaceTransactionError> {
+        #[cfg(test)]
+        TRANSACTION_FULL_TREE_CAPTURES.with(|count| count.set(count.get().saturating_add(1)));
         let mut state = Self {
             entries: BTreeMap::new(),
         };
@@ -2522,6 +2600,46 @@ impl TransactionTreeState {
             &mut bytes,
             &mut state,
         )?;
+        state.recompute_workspace_links();
+        Ok(state)
+    }
+
+    /// Capture an optional leaf through an already pinned parent capability.
+    fn capture_subtree_from_parent(
+        parent: &Dir,
+        name: &Path,
+        relative: &Path,
+    ) -> Result<Self, WorkspaceTransactionError> {
+        let component_count = relative.components().count();
+        if component_count == 0 || component_count.saturating_sub(1) > MAX_TRANSACTION_DEPTH {
+            return Err(WorkspaceTransactionError::CapabilityNotSupported);
+        }
+        let mut state = Self {
+            entries: BTreeMap::new(),
+        };
+        let mut visited = 0usize;
+        let mut bytes = 0u64;
+        match capture_transaction_entry(
+            parent,
+            name,
+            relative,
+            component_count.saturating_sub(1),
+            &mut visited,
+            &mut bytes,
+            &mut state,
+        ) {
+            Ok(()) => {}
+            Err(WorkspaceTransactionError::Drift)
+                if parent
+                    .symlink_metadata(name)
+                    .is_err_and(|error| matches!(error.raw_os_error(), Some(libc::ENOENT))) =>
+            {
+                return Ok(Self {
+                    entries: BTreeMap::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
         state.recompute_workspace_links();
         Ok(state)
     }
@@ -2541,20 +2659,54 @@ impl TransactionTreeState {
         }
     }
 
+    fn file_link_groups(&self) -> Result<FileLinkGroups, WorkspaceTransactionError> {
+        let mut groups = FileLinkGroups::default();
+        for (path, entry) in &self.entries {
+            if matches!(entry.kind, TransactionObjectKind::File(_)) {
+                groups.insert(
+                    path.clone(),
+                    (entry.device, entry.inode),
+                    entry.filesystem_links,
+                )?;
+            }
+        }
+        groups.finish()?;
+        Ok(groups)
+    }
+
     fn remove_subtree(&mut self, relative: &Path) {
-        self.entries
-            .retain(|path, _| path != relative && !path.starts_with(relative));
+        if relative.as_os_str().is_empty() {
+            self.entries.clear();
+            return;
+        }
+        self.entries.remove(relative);
+        let descendants = self
+            .entries
+            .range(relative.to_path_buf()..)
+            .take_while(|(path, _)| path.starts_with(relative))
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        for descendant in descendants {
+            self.entries.remove(&descendant);
+        }
     }
 
     fn subtree(&self, relative: &Path) -> Self {
-        let mut subtree = Self {
-            entries: self
-                .entries
-                .iter()
-                .filter(|(path, _)| *path == relative || path.starts_with(relative))
-                .map(|(path, entry)| (path.clone(), entry.clone()))
-                .collect(),
-        };
+        if relative.as_os_str().is_empty() {
+            return self.clone();
+        }
+        let mut entries = BTreeMap::new();
+        if let Some(entry) = self.entries.get(relative) {
+            entries.insert(relative.to_path_buf(), entry.clone());
+        }
+        entries.extend(
+            self.entries
+                .range(relative.to_path_buf()..)
+                .skip_while(|(path, _)| *path == relative)
+                .take_while(|(path, _)| path.starts_with(relative))
+                .map(|(path, entry)| (path.clone(), entry.clone())),
+        );
+        let mut subtree = Self { entries };
         subtree.recompute_workspace_links();
         subtree
     }
@@ -2696,94 +2848,118 @@ fn capture_transaction_directory(
         .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        *visited = visited.saturating_add(1);
-        if *visited > MAX_TRANSACTION_ENTRIES {
+        let name = PathBuf::from(entry.file_name());
+        let relative = relative_parent.join(&name);
+        capture_transaction_entry(directory, &name, &relative, depth, visited, bytes, state)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_transaction_entry(
+    directory: &Dir,
+    name: &Path,
+    relative: &Path,
+    depth: usize,
+    visited: &mut usize,
+    bytes: &mut u64,
+    state: &mut TransactionTreeState,
+) -> Result<(), WorkspaceTransactionError> {
+    *visited = visited.saturating_add(1);
+    if *visited > MAX_TRANSACTION_ENTRIES || depth > MAX_TRANSACTION_DEPTH {
+        return Err(WorkspaceTransactionError::CapabilityNotSupported);
+    }
+    let metadata = directory.symlink_metadata(name).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WorkspaceTransactionError::Drift
+        } else {
+            WorkspaceTransactionError::CapabilityNotSupported
+        }
+    })?;
+    let mode = cap_std::fs::PermissionsExt::mode(&metadata.permissions());
+    let modified = metadata
+        .modified()
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    let device = cap_fs_ext::MetadataExt::dev(&metadata);
+    let inode = cap_fs_ext::MetadataExt::ino(&metadata);
+    let length = metadata.len();
+    let kind = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let child = directory
+            .open_dir_nofollow(name)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        capture_transaction_directory(&child, relative, depth + 1, visited, bytes, state)?;
+        TransactionObjectKind::Directory
+    } else if metadata.is_file() {
+        *bytes = bytes.saturating_add(length);
+        if *bytes > 512 * 1024 * 1024 {
             return Err(WorkspaceTransactionError::CapabilityNotSupported);
         }
-        let name = entry.file_name();
-        let relative = relative_parent.join(&name);
-        let metadata = directory
-            .symlink_metadata(&name)
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = directory
+            .open_with(name, &options)
             .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-        let mode = cap_std::fs::PermissionsExt::mode(&metadata.permissions());
-        let modified = metadata
-            .modified()
-            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-        let device = cap_fs_ext::MetadataExt::dev(&metadata);
-        let inode = cap_fs_ext::MetadataExt::ino(&metadata);
-        let length = metadata.len();
-        let kind = if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            let child = directory
-                .open_dir_nofollow(&name)
-                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-            capture_transaction_directory(&child, &relative, depth + 1, visited, bytes, state)?;
-            TransactionObjectKind::Directory
-        } else if metadata.is_file() {
-            *bytes = bytes.saturating_add(length);
-            if *bytes > 512 * 1024 * 1024 {
-                return Err(WorkspaceTransactionError::CapabilityNotSupported);
-            }
-            let mut options = cap_std::fs::OpenOptions::new();
-            options.read(true).follow(FollowSymlinks::No);
-            let mut file = directory
-                .open_with(&name, &options)
-                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-            let stat_before = stable_file_stat(&file)?;
-            if stat_before.device != device
-                || stat_before.inode != inode
-                || stat_before.length != length
-            {
-                return Err(WorkspaceTransactionError::Drift);
-            }
-            let mut hasher = Sha256::new();
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let read = file
-                    .read(&mut buffer)
-                    .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-            }
-            if stable_file_stat(&file)? != stat_before {
-                return Err(WorkspaceTransactionError::Drift);
-            }
-            TransactionObjectKind::File(hasher.finalize().into())
-        } else if metadata.file_type().is_symlink() {
-            let target = directory
-                .read_link(&name)
-                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-            TransactionObjectKind::Symlink(target.as_os_str().as_bytes().to_vec())
-        } else {
-            return Err(WorkspaceTransactionError::CapabilityNotSupported);
-        };
-        let after = directory
-            .symlink_metadata(&name)
-            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-        if cap_fs_ext::MetadataExt::dev(&after) != device
-            || cap_fs_ext::MetadataExt::ino(&after) != inode
-            || after.len() != length
-            || after
-                .modified()
-                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?
-                != modified
+        let stat_before = stable_file_stat(&file)?;
+        if stat_before.device != device
+            || stat_before.inode != inode
+            || stat_before.length != length
         {
             return Err(WorkspaceTransactionError::Drift);
         }
-        state.entries.insert(
-            relative,
-            TransactionObjectState {
-                kind,
-                mode,
-                modified,
-                device,
-                inode,
-                length,
-                workspace_links: 0,
-            },
-        );
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if stable_file_stat(&file)? != stat_before {
+            return Err(WorkspaceTransactionError::Drift);
+        }
+        TransactionObjectKind::File(hasher.finalize().into())
+    } else if metadata.file_type().is_symlink() {
+        let target = directory
+            .read_link(name)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        TransactionObjectKind::Symlink(target.as_os_str().as_bytes().to_vec())
+    } else {
+        return Err(WorkspaceTransactionError::CapabilityNotSupported);
+    };
+    let filesystem_links = if matches!(kind, TransactionObjectKind::Directory) {
+        0
+    } else {
+        cap_fs_ext::MetadataExt::nlink(&metadata)
+    };
+    let after = directory
+        .symlink_metadata(name)
+        .map_err(|_| WorkspaceTransactionError::Drift)?;
+    if cap_fs_ext::MetadataExt::dev(&after) != device
+        || cap_fs_ext::MetadataExt::ino(&after) != inode
+        || after.len() != length
+        || after
+            .modified()
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?
+            != modified
+    {
+        return Err(WorkspaceTransactionError::Drift);
     }
+    state.entries.insert(
+        relative.to_path_buf(),
+        TransactionObjectState {
+            kind,
+            mode,
+            modified,
+            device,
+            inode,
+            length,
+            filesystem_links,
+            workspace_links: 0,
+        },
+    );
     Ok(())
 }
 
@@ -2916,6 +3092,9 @@ fn commit_workspace_transaction(
     protect_workspace_metadata: bool,
 ) -> Result<bool, WorkspaceTransactionError> {
     let mut area = CommitArea::new(workspace)?;
+    let before_state = TransactionTreeState::capture(workspace)?;
+    let workspace_links = before_state.file_link_groups()?;
+    let upper_links = capture_overlay_file_links(upper)?;
     let mut operations = Vec::new();
     let mut visited = 0usize;
     let mut staged_links = BTreeMap::new();
@@ -2929,13 +3108,14 @@ fn commit_workspace_transaction(
         &mut visited,
         &mut operations,
         &mut staged_links,
+        &upper_links,
+        &workspace_links,
         protect_workspace_metadata,
     )?;
     if cancellation.is_cancelled() {
         return Err(WorkspaceTransactionError::Cancelled);
     }
     let final_volatile_directories = operation_parent_directories(&operations);
-    let before_state = TransactionTreeState::capture(workspace)?;
     let current = if protect_workspace_metadata {
         snapshot_workspace(workspace)
     } else {
@@ -2960,9 +3140,14 @@ fn commit_workspace_transaction(
     ) {
         return Err(WorkspaceTransactionError::Drift);
     }
-    let mut applied = AppliedWorkspaceOperations::new(workspace, &area, &operations)?;
-    if let Err(error) = apply_workspace_operations(
+    let mut applied = AppliedWorkspaceOperations::new(
         workspace,
+        &area,
+        &operations,
+        &before_state,
+        current.root_identity(),
+    )?;
+    if let Err(error) = apply_workspace_operations(
         &operations,
         &before_state,
         &stage_state,
@@ -3052,6 +3237,48 @@ fn rollback_or_preserve(
     }
 }
 
+fn capture_overlay_file_links(root: &Path) -> Result<FileLinkGroups, WorkspaceTransactionError> {
+    let mut groups = FileLinkGroups::default();
+    let mut visited = 0usize;
+    capture_overlay_file_links_in(root, Path::new(""), 0, &mut visited, &mut groups)?;
+    groups.finish()?;
+    Ok(groups)
+}
+
+fn capture_overlay_file_links_in(
+    directory: &Path,
+    relative_parent: &Path,
+    depth: usize,
+    visited: &mut usize,
+    groups: &mut FileLinkGroups,
+) -> Result<(), WorkspaceTransactionError> {
+    if depth > MAX_TRANSACTION_DEPTH {
+        return Err(WorkspaceTransactionError::PolicyDenied);
+    }
+    let mut entries = fs::read_dir(directory)
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        *visited = visited.saturating_add(1);
+        if *visited > MAX_TRANSACTION_ENTRIES {
+            return Err(WorkspaceTransactionError::PolicyDenied);
+        }
+        let name = entry.file_name();
+        let relative = relative_parent.join(&name);
+        let source = entry.path();
+        let metadata = fs::symlink_metadata(&source)
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            capture_overlay_file_links_in(&source, &relative, depth + 1, visited, groups)?;
+        } else if metadata.is_file() {
+            groups.insert(relative, (metadata.dev(), metadata.ino()), metadata.nlink())?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Convert OverlayFS upper entries into a bounded, no-follow commit plan.
 fn plan_overlay_directory(
@@ -3064,6 +3291,8 @@ fn plan_overlay_directory(
     visited: &mut usize,
     operations: &mut Vec<WorkspaceOperation>,
     staged_links: &mut BTreeMap<(u64, u64), PathBuf>,
+    upper_links: &FileLinkGroups,
+    workspace_links: &FileLinkGroups,
     protect_workspace_metadata: bool,
 ) -> Result<(), WorkspaceTransactionError> {
     if depth > MAX_TRANSACTION_DEPTH {
@@ -3122,6 +3351,8 @@ fn plan_overlay_directory(
                     visited,
                     operations,
                     staged_links,
+                    upper_links,
+                    workspace_links,
                     protect_workspace_metadata,
                 )?;
                 let desired_mode = metadata.permissions().mode();
@@ -3162,7 +3393,9 @@ fn plan_overlay_directory(
         }
         if file_type.is_file() || file_type.is_symlink() {
             let destination = workspace.join(&relative);
-            if upper_object_matches_workspace(&source, &destination, &metadata)? {
+            if upper_object_matches_workspace(&source, &destination, &metadata)?
+                && (!file_type.is_file() || upper_links.same_members(workspace_links, &relative))
+            {
                 continue;
             }
             copy_upper_object(&source, &stage.join(&relative), &metadata, staged_links)?;
@@ -3456,18 +3689,16 @@ fn overlay_attribute_value(
     Ok(value)
 }
 
-fn rename_noreplace(
-    source_root: &Dir,
-    source: &Path,
-    destination_root: &Dir,
-    destination: &Path,
+/// Atomically move one leaf between already pinned parent directory capabilities.
+fn rename_noreplace_pinned(
+    source_directory: &Dir,
+    source_name: &Path,
+    destination_directory: &Dir,
+    destination_name: &Path,
 ) -> Result<(), std::io::Error> {
-    let (source_directory, source_name) = open_relative_parent_nofollow(source_root, source)?;
-    let (destination_directory, destination_name) =
-        open_relative_parent_nofollow(destination_root, destination)?;
-    let source = path_cstring(&source_name)
+    let source = path_cstring(source_name)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid source"))?;
-    let destination = path_cstring(&destination_name).map_err(|_| {
+    let destination = path_cstring(destination_name).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid destination")
     })?;
     let result = unsafe {
@@ -3602,10 +3833,30 @@ impl AppliedWorkspaceOperations {
         workspace: &Path,
         area: &CommitArea,
         operations: &[WorkspaceOperation],
+        before: &TransactionTreeState,
+        expected_workspace_root: (u64, u64),
     ) -> Result<Self, WorkspaceTransactionError> {
+        let workspace_directory = Dir::open_ambient_dir(workspace, ambient_authority())
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        let workspace_metadata = workspace_directory
+            .dir_metadata()
+            .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        let workspace_device = cap_fs_ext::MetadataExt::dev(&workspace_metadata);
+        let workspace_inode = cap_fs_ext::MetadataExt::ino(&workspace_metadata);
+        if (workspace_device, workspace_inode) != expected_workspace_root {
+            return Err(WorkspaceTransactionError::Drift);
+        }
         Ok(Self {
-            workspace_directory: Dir::open_ambient_dir(workspace, ambient_authority())
-                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
+            workspace_path: workspace.to_path_buf(),
+            directory_times: capture_parent_directory_times(
+                &workspace_directory,
+                operations,
+                before,
+                expected_workspace_root,
+            )?,
+            workspace_directory,
+            workspace_device,
+            workspace_inode,
             stage_directory: Dir::open_ambient_dir(&area.stage, ambient_authority())
                 .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
             backup_directory: Dir::open_ambient_dir(&area.backup, ambient_authority())
@@ -3615,14 +3866,65 @@ impl AppliedWorkspaceOperations {
             moved: Vec::new(),
             installed: Vec::new(),
             detached_metadata: Vec::new(),
-            directory_times: capture_parent_directory_times(workspace, operations)?,
+            touched_directory_paths: std::collections::BTreeSet::new(),
         })
+    }
+
+    /// Revalidate one planned workspace parent and return its original pinned capability.
+    fn pinned_workspace_parent(
+        &self,
+        relative: &Path,
+    ) -> Result<(Dir, PathBuf), WorkspaceTransactionError> {
+        let name = relative
+            .file_name()
+            .ok_or(WorkspaceTransactionError::CapabilityNotSupported)?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let ambient_root = fs::symlink_metadata(&self.workspace_path)
+            .map_err(|_| WorkspaceTransactionError::Drift)?;
+        if !ambient_root.is_dir()
+            || ambient_root.file_type().is_symlink()
+            || (ambient_root.dev(), ambient_root.ino())
+                != (self.workspace_device, self.workspace_inode)
+        {
+            return Err(WorkspaceTransactionError::Drift);
+        }
+        let planned = self
+            .directory_times
+            .get(parent)
+            .ok_or(WorkspaceTransactionError::Drift)?;
+        let current = open_relative_directory_nofollow(&self.workspace_directory, parent)
+            .map_err(|_| WorkspaceTransactionError::Drift)?;
+        let current_metadata = current
+            .dir_metadata()
+            .map_err(|_| WorkspaceTransactionError::Drift)?;
+        if (
+            cap_fs_ext::MetadataExt::dev(&current_metadata),
+            cap_fs_ext::MetadataExt::ino(&current_metadata),
+        ) != (planned.device, planned.inode)
+        {
+            return Err(WorkspaceTransactionError::Drift);
+        }
+        Ok((
+            planned
+                .directory
+                .try_clone()
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
+            PathBuf::from(name),
+        ))
+    }
+
+    fn mark_workspace_parent_touched(&mut self, relative: &Path) {
+        self.touched_directory_paths.insert(
+            relative
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf(),
+        );
     }
 }
 
 /// Apply a validated plan through no-replace capability-relative renames.
 fn apply_workspace_operations(
-    workspace: &Path,
     operations: &[WorkspaceOperation],
     before: &TransactionTreeState,
     stage: &TransactionTreeState,
@@ -3632,12 +3934,6 @@ fn apply_workspace_operations(
 ) -> Result<(), WorkspaceTransactionError> {
     let mut current = before.clone();
     let volatile_directories = operation_parent_directories(operations);
-    ensure_workspace_state(
-        workspace,
-        &current,
-        &volatile_directories,
-        protect_workspace_metadata,
-    )?;
 
     for operation in operations {
         let relative = match operation {
@@ -3647,17 +3943,25 @@ fn apply_workspace_operations(
             WorkspaceOperation::SetMetadata { .. } => continue,
         };
         check_transaction_cancellation(cancellation)?;
-        ensure_workspace_state(
-            workspace,
-            &current,
+        let expected_before = before.subtree(relative);
+        let (workspace_parent, workspace_name) = applied.pinned_workspace_parent(relative)?;
+        let actual_before = TransactionTreeState::capture_subtree_from_parent(
+            &workspace_parent,
+            &workspace_name,
+            relative,
+        )?;
+        if !actual_before.matches_ignoring_directory_times(
+            &expected_before,
             &volatile_directories,
             protect_workspace_metadata,
-        )?;
+        ) {
+            return Err(WorkspaceTransactionError::Drift);
+        }
         transaction_test_pause(TransactionTestPoint::WorkspaceMove);
         check_transaction_cancellation(cancellation)?;
-        let expected_before = before.subtree(relative);
+        let (workspace_parent, workspace_name) = applied.pinned_workspace_parent(relative)?;
         if expected_before.entries.is_empty() {
-            match applied.workspace_directory.symlink_metadata(relative) {
+            match workspace_parent.symlink_metadata(&workspace_name) {
                 Ok(_) => return Err(WorkspaceTransactionError::Drift),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err(WorkspaceTransactionError::CapabilityNotSupported),
@@ -3672,11 +3976,14 @@ fn apply_workspace_operations(
                 .create_dir_all(parent)
                 .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
         }
-        rename_noreplace(
-            &applied.workspace_directory,
-            relative,
-            &applied.backup_directory,
-            relative,
+        let (backup_parent, backup_name) =
+            open_relative_parent_nofollow(&applied.backup_directory, relative)
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        rename_noreplace_pinned(
+            &workspace_parent,
+            &workspace_name,
+            &backup_parent,
+            &backup_name,
         )
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists
@@ -3687,12 +3994,21 @@ fn apply_workspace_operations(
                 WorkspaceTransactionError::CapabilityNotSupported
             }
         })?;
-        let backup = TransactionTreeState::capture_from_dir(&applied.backup_directory)?;
-        let moved_state = backup.subtree(relative);
+        applied.mark_workspace_parent_touched(relative);
         applied.moved.push(MovedWorkspaceObject {
             relative: relative.clone(),
-            expected_before: moved_state.clone(),
+            expected_before: expected_before.clone(),
         });
+        let moved_state = TransactionTreeState::capture_subtree_from_parent(
+            &backup_parent,
+            &backup_name,
+            relative,
+        )?;
+        applied
+            .moved
+            .last_mut()
+            .expect("moved transaction object was recorded")
+            .expected_before = moved_state.clone();
         if !moved_state.matches_ignoring_directory_times(
             &expected_before,
             &std::collections::BTreeSet::new(),
@@ -3701,13 +4017,6 @@ fn apply_workspace_operations(
             return Err(WorkspaceTransactionError::Drift);
         }
         current.remove_subtree(relative);
-        current.recompute_workspace_links();
-        ensure_workspace_state(
-            workspace,
-            &current,
-            &volatile_directories,
-            protect_workspace_metadata,
-        )?;
     }
 
     for operation in operations {
@@ -3722,15 +4031,14 @@ fn apply_workspace_operations(
             }
         };
         check_transaction_cancellation(cancellation)?;
-        ensure_workspace_state(
-            workspace,
-            &current,
-            &volatile_directories,
-            protect_workspace_metadata,
-        )?;
-        if let Some(parent) = relative.parent()
-            && !parent.as_os_str().is_empty()
-            && open_relative_directory_nofollow(&applied.workspace_directory, parent).is_err()
+        let (workspace_parent, workspace_name) = applied.pinned_workspace_parent(relative)?;
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &workspace_parent,
+            &workspace_name,
+            relative,
+        )?
+        .entries
+        .is_empty()
         {
             return Err(WorkspaceTransactionError::Drift);
         }
@@ -3738,16 +4046,31 @@ fn apply_workspace_operations(
             InstalledWorkspaceSource::Stage => &applied.stage_directory,
             InstalledWorkspaceSource::Metadata(_) => &applied.metadata_directory,
         };
-        if let Err(error) = rename_noreplace(
-            source_directory,
+        let (source_parent, source_name) =
+            open_relative_parent_nofollow(source_directory, relative)
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &source_parent,
+            &source_name,
             relative,
-            &applied.workspace_directory,
-            relative,
+        )?
+        .matches_ignoring_directory_times(
+            &expected_after,
+            &std::collections::BTreeSet::new(),
+            protect_workspace_metadata,
+        ) {
+            return Err(WorkspaceTransactionError::Drift);
+        }
+        if let Err(error) = rename_noreplace_pinned(
+            &source_parent,
+            &source_name,
+            &workspace_parent,
+            &workspace_name,
         ) {
             if let InstalledWorkspaceSource::Metadata(original) = source {
-                let directory =
-                    open_relative_directory_nofollow(&applied.metadata_directory, relative)
-                        .map_err(|_| WorkspaceTransactionError::RollbackFailed)?;
+                let directory = source_parent
+                    .open_dir_nofollow(&source_name)
+                    .map_err(|_| WorkspaceTransactionError::RollbackFailed)?;
                 restore_pinned_directory_metadata(&directory, original)?;
             }
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -3756,20 +4079,26 @@ fn apply_workspace_operations(
                 WorkspaceTransactionError::CapabilityNotSupported
             });
         }
+        applied.mark_workspace_parent_touched(relative);
         applied.installed.push(InstalledWorkspaceObject {
             relative: relative.clone(),
             expected_after: expected_after.clone(),
             source,
         });
-        current.remove_subtree(relative);
-        current.insert_subtree(&expected_after);
-        current.recompute_workspace_links();
-        ensure_workspace_state(
-            workspace,
-            &current,
+        let installed_state = TransactionTreeState::capture_subtree_from_parent(
+            &workspace_parent,
+            &workspace_name,
+            relative,
+        )?;
+        if !installed_state.matches_ignoring_directory_times(
+            &expected_after,
             &volatile_directories,
             protect_workspace_metadata,
-        )?;
+        ) {
+            return Err(WorkspaceTransactionError::Drift);
+        }
+        current.remove_subtree(relative);
+        current.insert_subtree(&expected_after);
     }
 
     for operation in operations {
@@ -3783,18 +4112,26 @@ fn apply_workspace_operations(
             continue;
         };
         check_transaction_cancellation(cancellation)?;
-        ensure_workspace_state(
-            workspace,
-            &current,
-            &volatile_directories,
-            protect_workspace_metadata,
-        )?;
-        transaction_test_pause(TransactionTestPoint::MetadataMutation);
-        check_transaction_cancellation(cancellation)?;
         let expected_before = current.subtree(relative);
         if expected_before.entries.is_empty() {
             return Err(WorkspaceTransactionError::Drift);
         }
+        let (workspace_parent, workspace_name) = applied.pinned_workspace_parent(relative)?;
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &workspace_parent,
+            &workspace_name,
+            relative,
+        )?
+        .matches_ignoring_directory_times(
+            &expected_before,
+            &volatile_directories,
+            protect_workspace_metadata,
+        ) {
+            return Err(WorkspaceTransactionError::Drift);
+        }
+        transaction_test_pause(TransactionTestPoint::MetadataMutation);
+        check_transaction_cancellation(cancellation)?;
+        let (workspace_parent, workspace_name) = applied.pinned_workspace_parent(relative)?;
         if let Some(parent) = relative.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -3803,11 +4140,14 @@ fn apply_workspace_operations(
                 .create_dir_all(parent)
                 .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
         }
-        rename_noreplace(
-            &applied.workspace_directory,
-            relative,
-            &applied.metadata_directory,
-            relative,
+        let (metadata_parent, metadata_name) =
+            open_relative_parent_nofollow(&applied.metadata_directory, relative)
+                .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        rename_noreplace_pinned(
+            &workspace_parent,
+            &workspace_name,
+            &metadata_parent,
+            &metadata_name,
         )
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists
@@ -3818,12 +4158,21 @@ fn apply_workspace_operations(
                 WorkspaceTransactionError::CapabilityNotSupported
             }
         })?;
-        let metadata_state = TransactionTreeState::capture_from_dir(&applied.metadata_directory)?;
-        let detached = metadata_state.subtree(relative);
+        applied.mark_workspace_parent_touched(relative);
         applied.detached_metadata.push(MovedWorkspaceObject {
             relative: relative.clone(),
-            expected_before: detached.clone(),
+            expected_before: expected_before.clone(),
         });
+        let detached = TransactionTreeState::capture_subtree_from_parent(
+            &metadata_parent,
+            &metadata_name,
+            relative,
+        )?;
+        applied
+            .detached_metadata
+            .last_mut()
+            .expect("detached metadata object was recorded")
+            .expected_before = detached.clone();
         let detached_volatile_directories = detached
             .entries
             .iter()
@@ -3838,7 +4187,8 @@ fn apply_workspace_operations(
         ) {
             return Err(WorkspaceTransactionError::Drift);
         }
-        let directory = open_relative_directory_nofollow(&applied.metadata_directory, relative)
+        let directory = metadata_parent
+            .open_dir_nofollow(&metadata_name)
             .map_err(|_| WorkspaceTransactionError::Drift)?;
         let original = update_pinned_directory_metadata(&directory, *mode, *access, *modified)?;
         let mut expected_after = expected_before;
@@ -3848,23 +4198,24 @@ fn apply_workspace_operations(
             .ok_or(WorkspaceTransactionError::Drift)?;
         entry.mode = *mode;
         entry.modified = *modified;
-        let metadata_state = TransactionTreeState::capture_from_dir(&applied.metadata_directory)?;
-        if !metadata_state
-            .subtree(relative)
-            .matches_ignoring_directory_times(
-                &expected_after,
-                &detached_volatile_directories,
-                protect_workspace_metadata,
-            )
-        {
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &metadata_parent,
+            &metadata_name,
+            relative,
+        )?
+        .matches_ignoring_directory_times(
+            &expected_after,
+            &detached_volatile_directories,
+            protect_workspace_metadata,
+        ) {
             restore_pinned_directory_metadata(&directory, original)?;
             return Err(WorkspaceTransactionError::Drift);
         }
-        if let Err(error) = rename_noreplace(
-            &applied.metadata_directory,
-            relative,
-            &applied.workspace_directory,
-            relative,
+        if let Err(error) = rename_noreplace_pinned(
+            &metadata_parent,
+            &metadata_name,
+            &workspace_parent,
+            &workspace_name,
         ) {
             restore_pinned_directory_metadata(&directory, original)?;
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -3873,9 +4224,10 @@ fn apply_workspace_operations(
                 WorkspaceTransactionError::CapabilityNotSupported
             });
         }
-        let installed_directory =
-            open_relative_directory_nofollow(&applied.workspace_directory, relative)
-                .map_err(|_| WorkspaceTransactionError::Drift)?;
+        applied.mark_workspace_parent_touched(relative);
+        let installed_directory = workspace_parent
+            .open_dir_nofollow(&workspace_name)
+            .map_err(|_| WorkspaceTransactionError::Drift)?;
         let installed_metadata = installed_directory
             .dir_metadata()
             .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
@@ -3898,30 +4250,57 @@ fn apply_workspace_operations(
             },
         )
         .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &workspace_parent,
+            &workspace_name,
+            relative,
+        )?
+        .matches_ignoring_directory_times(
+            &expected_after,
+            &detached_volatile_directories,
+            protect_workspace_metadata,
+        ) {
+            return Err(WorkspaceTransactionError::Drift);
+        }
         applied.detached_metadata.pop();
         applied.installed.push(InstalledWorkspaceObject {
             relative: relative.clone(),
             expected_after: expected_after.clone(),
             source: InstalledWorkspaceSource::Metadata(original),
         });
+        remove_empty_transaction_parents(&applied.metadata_directory, relative)?;
         current.remove_subtree(relative);
         current.insert_subtree(&expected_after);
-        current.recompute_workspace_links();
-        ensure_workspace_state(
-            workspace,
-            &current,
-            &volatile_directories,
-            protect_workspace_metadata,
-        )?;
     }
 
-    restore_directory_times(&applied.directory_times)?;
-    ensure_workspace_state(
-        workspace,
-        &current,
-        &volatile_directories,
-        protect_workspace_metadata,
-    )?;
+    restore_directory_times(&applied.directory_times, &applied.touched_directory_paths)?;
+    Ok(())
+}
+
+/// Remove transaction-owned empty scaffolding left by a nested metadata operation.
+fn remove_empty_transaction_parents(
+    root: &Dir,
+    relative: &Path,
+) -> Result<(), WorkspaceTransactionError> {
+    let mut parents = relative
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    parents.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for parent in parents {
+        match root.remove_dir(&parent) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(_) => return Err(WorkspaceTransactionError::CapabilityNotSupported),
+        }
+    }
     Ok(())
 }
 
@@ -3939,24 +4318,6 @@ fn operation_parent_directories(
         })
         .map(Path::to_path_buf)
         .collect()
-}
-
-fn ensure_workspace_state(
-    workspace: &Path,
-    expected: &TransactionTreeState,
-    volatile_directories: &std::collections::BTreeSet<PathBuf>,
-    protect_workspace_metadata: bool,
-) -> Result<(), WorkspaceTransactionError> {
-    let actual = TransactionTreeState::capture(workspace)?;
-    if actual.matches_ignoring_directory_times(
-        expected,
-        volatile_directories,
-        protect_workspace_metadata,
-    ) {
-        Ok(())
-    } else {
-        Err(WorkspaceTransactionError::Drift)
-    }
 }
 
 fn check_transaction_cancellation(
@@ -3979,8 +4340,13 @@ fn rollback_partial(
     let mut failed = false;
     let mut blocked_restore = std::collections::BTreeSet::new();
     for installed in applied.installed.iter().rev() {
-        let current = TransactionTreeState::capture_from_dir(&applied.workspace_directory)?;
-        let actual = current.subtree(&installed.relative);
+        let (workspace_parent, workspace_name) =
+            applied.pinned_workspace_parent(&installed.relative)?;
+        let actual = TransactionTreeState::capture_subtree_from_parent(
+            &workspace_parent,
+            &workspace_name,
+            &installed.relative,
+        )?;
         if actual.entries.is_empty() {
             failed = true;
             blocked_restore.insert(installed.relative.clone());
@@ -3995,6 +4361,8 @@ fn rollback_partial(
             continue;
         }
         transaction_test_pause(TransactionTestPoint::RollbackInstalledMove);
+        let (workspace_parent, workspace_name) =
+            applied.pinned_workspace_parent(&installed.relative)?;
         let destination_directory = match installed.source {
             InstalledWorkspaceSource::Stage => &applied.stage_directory,
             InstalledWorkspaceSource::Metadata(_) => &applied.metadata_directory,
@@ -4006,19 +4374,31 @@ fn rollback_partial(
             failed = true;
             continue;
         }
-        if rename_noreplace(
-            &applied.workspace_directory,
-            &installed.relative,
-            destination_directory,
-            &installed.relative,
+        let (destination_parent, destination_name) =
+            match open_relative_parent_nofollow(destination_directory, &installed.relative) {
+                Ok(parent) => parent,
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            };
+        if rename_noreplace_pinned(
+            &workspace_parent,
+            &workspace_name,
+            &destination_parent,
+            &destination_name,
         )
         .is_err()
         {
             failed = true;
             continue;
         }
-        let moved = match TransactionTreeState::capture_from_dir(destination_directory) {
-            Ok(state) => state.subtree(&installed.relative),
+        let moved = match TransactionTreeState::capture_subtree_from_parent(
+            &destination_parent,
+            &destination_name,
+            &installed.relative,
+        ) {
+            Ok(state) => state,
             Err(_) => {
                 blocked_restore.insert(installed.relative.clone());
                 failed = true;
@@ -4030,21 +4410,18 @@ fn rollback_partial(
             &std::collections::BTreeSet::new(),
             protect_workspace_metadata,
         ) {
-            let _ = rename_noreplace(
-                destination_directory,
-                &installed.relative,
-                &applied.workspace_directory,
-                &installed.relative,
+            let _ = rename_noreplace_pinned(
+                &destination_parent,
+                &destination_name,
+                &workspace_parent,
+                &workspace_name,
             );
             blocked_restore.insert(installed.relative.clone());
             failed = true;
             continue;
         }
         if let InstalledWorkspaceSource::Metadata(original) = installed.source {
-            let directory = match open_relative_directory_nofollow(
-                &applied.metadata_directory,
-                &installed.relative,
-            ) {
+            let directory = match destination_parent.open_dir_nofollow(&destination_name) {
                 Ok(directory) => directory,
                 Err(_) => {
                     failed = true;
@@ -4055,11 +4432,11 @@ fn rollback_partial(
                 failed = true;
                 continue;
             }
-            if rename_noreplace(
-                &applied.metadata_directory,
-                &installed.relative,
-                &applied.workspace_directory,
-                &installed.relative,
+            if rename_noreplace_pinned(
+                &destination_parent,
+                &destination_name,
+                &workspace_parent,
+                &workspace_name,
             )
             .is_err()
             {
@@ -4068,30 +4445,50 @@ fn rollback_partial(
         }
     }
     for detached in applied.detached_metadata.iter().rev() {
-        let current = TransactionTreeState::capture_from_dir(&applied.workspace_directory)?;
-        if !current.subtree(&detached.relative).entries.is_empty() {
-            failed = true;
-            blocked_restore.insert(detached.relative.clone());
-            continue;
-        }
-        let metadata = TransactionTreeState::capture_from_dir(&applied.metadata_directory)?;
-        if !metadata
-            .subtree(&detached.relative)
-            .matches_ignoring_directory_times(
-                &detached.expected_before,
-                &std::collections::BTreeSet::new(),
-                protect_workspace_metadata,
-            )
+        let (workspace_parent, workspace_name) =
+            applied.pinned_workspace_parent(&detached.relative)?;
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &workspace_parent,
+            &workspace_name,
+            &detached.relative,
+        )?
+        .entries
+        .is_empty()
         {
             failed = true;
             blocked_restore.insert(detached.relative.clone());
             continue;
         }
-        if rename_noreplace(
-            &applied.metadata_directory,
+        let (metadata_parent, metadata_name) =
+            match open_relative_parent_nofollow(&applied.metadata_directory, &detached.relative) {
+                Ok(parent) => parent,
+                Err(_) => {
+                    failed = true;
+                    blocked_restore.insert(detached.relative.clone());
+                    continue;
+                }
+            };
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &metadata_parent,
+            &metadata_name,
             &detached.relative,
-            &applied.workspace_directory,
-            &detached.relative,
+        )?
+        .matches_ignoring_directory_times(
+            &detached.expected_before,
+            &std::collections::BTreeSet::new(),
+            protect_workspace_metadata,
+        ) {
+            failed = true;
+            blocked_restore.insert(detached.relative.clone());
+            continue;
+        }
+        let (workspace_parent, workspace_name) =
+            applied.pinned_workspace_parent(&detached.relative)?;
+        if rename_noreplace_pinned(
+            &metadata_parent,
+            &metadata_name,
+            &workspace_parent,
+            &workspace_name,
         )
         .is_err()
         {
@@ -4106,35 +4503,55 @@ fn rollback_partial(
             failed = true;
             continue;
         }
-        let current = TransactionTreeState::capture_from_dir(&applied.workspace_directory)?;
-        if !current.subtree(&moved.relative).entries.is_empty() {
-            failed = true;
-            continue;
-        }
-        let backup = TransactionTreeState::capture_from_dir(&applied.backup_directory)?;
-        if !backup
-            .subtree(&moved.relative)
-            .matches_ignoring_directory_times(
-                &moved.expected_before,
-                &std::collections::BTreeSet::new(),
-                protect_workspace_metadata,
-            )
+        let (workspace_parent, workspace_name) =
+            applied.pinned_workspace_parent(&moved.relative)?;
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &workspace_parent,
+            &workspace_name,
+            &moved.relative,
+        )?
+        .entries
+        .is_empty()
         {
             failed = true;
             continue;
         }
-        if rename_noreplace(
-            &applied.backup_directory,
+        let (backup_parent, backup_name) =
+            match open_relative_parent_nofollow(&applied.backup_directory, &moved.relative) {
+                Ok(parent) => parent,
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            };
+        if !TransactionTreeState::capture_subtree_from_parent(
+            &backup_parent,
+            &backup_name,
             &moved.relative,
-            &applied.workspace_directory,
-            &moved.relative,
+        )?
+        .matches_ignoring_directory_times(
+            &moved.expected_before,
+            &std::collections::BTreeSet::new(),
+            protect_workspace_metadata,
+        ) {
+            failed = true;
+            continue;
+        }
+        let (workspace_parent, workspace_name) =
+            applied.pinned_workspace_parent(&moved.relative)?;
+        if rename_noreplace_pinned(
+            &backup_parent,
+            &backup_name,
+            &workspace_parent,
+            &workspace_name,
         )
         .is_err()
         {
             failed = true;
         }
     }
-    if restore_directory_times(&applied.directory_times).is_err() {
+    if restore_directory_times(&applied.directory_times, &applied.touched_directory_paths).is_err()
+    {
         failed = true;
     }
     if failed {
@@ -4145,11 +4562,11 @@ fn rollback_partial(
 }
 
 fn capture_parent_directory_times(
-    workspace: &Path,
+    workspace_directory: &Dir,
     operations: &[WorkspaceOperation],
-) -> Result<Vec<DirectoryTimes>, WorkspaceTransactionError> {
-    let workspace_directory = Dir::open_ambient_dir(workspace, ambient_authority())
-        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
+    before: &TransactionTreeState,
+    expected_workspace_root: (u64, u64),
+) -> Result<BTreeMap<PathBuf, DirectoryTimes>, WorkspaceTransactionError> {
     let mut paths = operations
         .iter()
         .filter_map(|operation| match operation {
@@ -4164,31 +4581,59 @@ fn capture_parent_directory_times(
     paths.dedup();
     paths
         .into_iter()
-        .map(|path| {
+        .try_fold(BTreeMap::new(), |mut pinned, path| {
             let directory = if path.as_os_str().is_empty() {
                 workspace_directory.try_clone()
             } else {
-                open_relative_directory_nofollow(&workspace_directory, &path)
+                open_relative_directory_nofollow(workspace_directory, &path)
             }
             .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
             let metadata = directory
                 .dir_metadata()
                 .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?;
-            Ok(DirectoryTimes {
-                directory,
-                access: metadata
-                    .accessed()
-                    .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
-                modified: metadata
-                    .modified()
-                    .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
-            })
+            let device = cap_fs_ext::MetadataExt::dev(&metadata);
+            let inode = cap_fs_ext::MetadataExt::ino(&metadata);
+            let expected_identity = if path.as_os_str().is_empty() {
+                expected_workspace_root
+            } else {
+                let expected = before
+                    .entries
+                    .get(&path)
+                    .ok_or(WorkspaceTransactionError::Drift)?;
+                if !matches!(expected.kind, TransactionObjectKind::Directory) {
+                    return Err(WorkspaceTransactionError::Drift);
+                }
+                (expected.device, expected.inode)
+            };
+            if (device, inode) != expected_identity {
+                return Err(WorkspaceTransactionError::Drift);
+            }
+            pinned.insert(
+                path,
+                DirectoryTimes {
+                    directory,
+                    device,
+                    inode,
+                    access: metadata
+                        .accessed()
+                        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
+                    modified: metadata
+                        .modified()
+                        .map_err(|_| WorkspaceTransactionError::CapabilityNotSupported)?,
+                },
+            );
+            Ok(pinned)
         })
-        .collect()
 }
 
-fn restore_directory_times(times: &[DirectoryTimes]) -> Result<(), WorkspaceTransactionError> {
-    for entry in times {
+fn restore_directory_times(
+    times: &BTreeMap<PathBuf, DirectoryTimes>,
+    touched_paths: &std::collections::BTreeSet<PathBuf>,
+) -> Result<(), WorkspaceTransactionError> {
+    for path in touched_paths {
+        let entry = times
+            .get(path)
+            .ok_or(WorkspaceTransactionError::RollbackFailed)?;
         entry
             .directory
             .set_times(
@@ -5420,6 +5865,196 @@ mod tests {
     }
 
     #[test]
+    fn full_tree_validation_count_does_not_scale_with_operation_count() {
+        let _serial = TRANSACTION_TEST_SERIAL
+            .lock()
+            .expect("transaction test serial");
+        let backend = strict_backend();
+        let capture_count = |entries: usize| {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let script = format!(
+                "i=0; while [ \"$i\" -lt {entries} ]; do printf x > \"entry-$i\"; i=$((i + 1)); done"
+            );
+            reset_transaction_full_tree_captures();
+            let result = backend.execute(&request(
+                &format!("transaction_scale_{entries}"),
+                &script,
+                workspace.path(),
+            ));
+            assert_eq!(
+                result.execution_status,
+                CommandExecutionStatus::Completed,
+                "{result:?}"
+            );
+            assert_eq!(
+                result.semantic_status,
+                CommandSemanticStatus::Succeeded,
+                "{result:?}"
+            );
+            assert_eq!(
+                fs::read_dir(workspace.path())
+                    .expect("workspace entries")
+                    .count(),
+                entries
+            );
+            transaction_full_tree_captures()
+        };
+
+        let single_capture_count = capture_count(1);
+        let large_capture_count = capture_count(2_048);
+
+        assert_eq!(
+            large_capture_count, single_capture_count,
+            "full-tree validation must be bounded by transaction boundaries, not operation count"
+        );
+        assert!(
+            large_capture_count <= 4,
+            "successful commit exceeded the four full-tree transaction boundaries"
+        );
+
+        let workspace = tempfile::tempdir().expect("rollback workspace");
+        let workspace_path = workspace.path().to_path_buf();
+        arm_transaction_test(TransactionTestPoint::FinalVerification, false);
+        let worker = thread::spawn(move || {
+            let script =
+                "i=0; while [ \"$i\" -lt 2048 ]; do printf x > \"entry-$i\"; i=$((i + 1)); done";
+            reset_transaction_full_tree_captures();
+            let result = strict_backend().execute(&request(
+                "transaction_scale_rollback",
+                script,
+                &workspace_path,
+            ));
+            (result, transaction_full_tree_captures())
+        });
+        wait_for_transaction_test_point();
+        fs::write(workspace.path().join("concurrent.txt"), "concurrent")
+            .expect("concurrent fixture");
+        release_transaction_test_point();
+        let (result, rollback_capture_count) = worker.join().expect("rollback worker");
+        clear_transaction_test();
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::PolicyDenied
+        );
+        assert!(result.stderr_preview.contains("transaction drift"));
+        assert_eq!(rollback_capture_count, large_capture_count);
+        assert_eq!(
+            fs::read_dir(workspace.path())
+                .expect("rollback workspace entries")
+                .map(|entry| entry.expect("rollback entry").file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("concurrent.txt")]
+        );
+    }
+
+    #[test]
+    fn nested_metadata_operations_do_not_conflict_in_private_staging() {
+        let _serial = TRANSACTION_TEST_SERIAL
+            .lock()
+            .expect("transaction test serial");
+        let owner = tempfile::tempdir().expect("owner");
+        let workspace = owner.path().join("workspace");
+        let parent = workspace.join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).expect("nested fixture");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755))
+            .expect("parent permissions");
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o755)).expect("child permissions");
+
+        let result = strict_backend().execute(&request(
+            "transaction_nested_metadata",
+            "chmod 700 parent/child; chmod 711 parent",
+            &workspace,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{result:?}"
+        );
+        assert_eq!(
+            result.semantic_status,
+            CommandSemanticStatus::Succeeded,
+            "{result:?}"
+        );
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            fs::metadata(&parent)
+                .expect("parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o711
+        );
+        assert_eq!(
+            fs::metadata(&child)
+                .expect("child metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(
+            fs::read_dir(owner.path())
+                .expect("owner entries")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".singularity-workspace-commit-")),
+            "successful nested metadata commit must clean its private transaction area"
+        );
+    }
+
+    #[test]
+    fn concurrent_external_hardlink_is_detected_and_original_is_restored() {
+        let _serial = TRANSACTION_TEST_SERIAL
+            .lock()
+            .expect("transaction test serial");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let target = workspace.path().join("target.txt");
+        let concurrent = workspace.path().join("concurrent.txt");
+        fs::write(&target, "before").expect("fixture");
+        let before = fs::metadata(&target).expect("target metadata");
+        arm_transaction_test(TransactionTestPoint::WorkspaceMove, false);
+        let workspace_path = workspace.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            strict_backend().execute(&request(
+                "transaction_concurrent_hardlink",
+                "printf transaction > target.txt",
+                &workspace_path,
+            ))
+        });
+
+        wait_for_transaction_test_point();
+        fs::hard_link(&target, &concurrent).expect("concurrent hardlink");
+        release_transaction_test_point();
+        let result = worker.join().expect("transaction worker");
+        clear_transaction_test();
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::PolicyDenied,
+            "{result:?}"
+        );
+        assert!(result.stderr_preview.contains("transaction drift"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        assert_eq!(fs::read_to_string(&concurrent).unwrap(), "before");
+        let target_after = fs::metadata(&target).expect("restored target metadata");
+        let concurrent_after = fs::metadata(&concurrent).expect("concurrent metadata");
+        assert_eq!(
+            (target_after.dev(), target_after.ino()),
+            (before.dev(), before.ino())
+        );
+        assert_eq!(
+            (concurrent_after.dev(), concurrent_after.ino()),
+            (before.dev(), before.ino())
+        );
+        assert_eq!(target_after.nlink(), 2);
+    }
+
+    #[test]
     fn concurrent_replacement_before_workspace_move_is_rejected_without_overwrite() {
         let _serial = TRANSACTION_TEST_SERIAL
             .lock()
@@ -5491,12 +6126,11 @@ mod tests {
         let result = worker.join().expect("transaction worker");
         clear_transaction_test();
 
-        assert_eq!(result.execution_status, CommandExecutionStatus::Unsupported);
-        assert!(
-            result
-                .stderr_preview
-                .contains("capability_not_supported:workspace_transaction")
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::PolicyDenied
         );
+        assert!(result.stderr_preview.contains("transaction drift"));
         assert_eq!(fs::read_to_string(&protected_target).unwrap(), "protected");
         let protected_after = fs::metadata(&protected).expect("protected metadata");
         assert_eq!(
@@ -5515,6 +6149,73 @@ mod tests {
             fs::read_to_string(displaced.join("target.txt")).unwrap(),
             "before"
         );
+    }
+
+    #[test]
+    fn parent_directory_replacement_is_not_touched_by_workspace_move_or_rollback() {
+        let _serial = TRANSACTION_TEST_SERIAL
+            .lock()
+            .expect("transaction test serial");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let nested = workspace.path().join("nested");
+        fs::create_dir(&nested).expect("nested");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755))
+            .expect("nested permissions");
+        fs::write(nested.join("target.txt"), "before").expect("fixture");
+        arm_transaction_test(TransactionTestPoint::WorkspaceMove, false);
+        let workspace_path = workspace.path().to_path_buf();
+        let worker = thread::spawn(move || {
+            strict_backend().execute(&request(
+                "transaction_parent_directory_replacement",
+                "printf transaction > nested/target.txt",
+                &workspace_path,
+            ))
+        });
+
+        wait_for_transaction_test_point();
+        let displaced = workspace.path().join("displaced");
+        fs::rename(&nested, &displaced).expect("displace original parent");
+        fs::create_dir(&nested).expect("replacement parent");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755))
+            .expect("replacement permissions");
+        fs::write(nested.join("target.txt"), "before").expect("matching replacement fixture");
+        let identity = |path: &Path| {
+            let metadata = fs::metadata(path).expect("directory metadata");
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.permissions().mode(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let replacement_identity = identity(&nested);
+        let displaced_identity = identity(&displaced);
+        assert_ne!(
+            (replacement_identity.0, replacement_identity.1),
+            (displaced_identity.0, displaced_identity.1)
+        );
+        release_transaction_test_point();
+        let result = worker.join().expect("transaction worker");
+        clear_transaction_test();
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::PolicyDenied
+        );
+        assert!(result.stderr_preview.contains("transaction drift"));
+        assert_eq!(
+            fs::read_to_string(nested.join("target.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(
+            fs::read_to_string(displaced.join("target.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(identity(&nested), replacement_identity);
+        assert_eq!(identity(&displaced), displaced_identity);
     }
 
     #[test]

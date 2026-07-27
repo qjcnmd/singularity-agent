@@ -1512,6 +1512,91 @@ time.sleep(30)
     }
 
     #[test]
+    fn linux_workspace_transaction_commits_new_internal_hardlink_identity() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first_path = workspace.path().join("first.txt");
+        let second_path = workspace.path().join("second.txt");
+        fs::write(&first_path, "shared").expect("first fixture");
+
+        let result = strict_backend().execute(&request(
+            "linux_transaction_new_hardlink",
+            &["/bin/ln", "first.txt", "second.txt"],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{result:?}"
+        );
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+        let first = fs::metadata(&first_path).expect("first metadata");
+        let second = fs::metadata(&second_path).expect("second metadata");
+        assert_eq!(
+            (first.dev(), first.ino()),
+            (second.dev(), second.ino()),
+            "the committed paths must preserve the hardlink identity created in the sandbox"
+        );
+        assert_eq!(first.nlink(), 2);
+        assert_eq!(fs::read(&first_path).unwrap(), b"shared");
+        assert_eq!(fs::read(&second_path).unwrap(), b"shared");
+    }
+
+    #[test]
+    fn linux_workspace_transaction_commits_equal_content_hardlink_regrouping() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let paths = ["a.txt", "b.txt", "c.txt", "d.txt"].map(|name| workspace.path().join(name));
+        fs::write(&paths[0], "same").expect("first group fixture");
+        hard_link(&paths[0], &paths[1]).expect("first group hardlink");
+        fs::write(&paths[2], "same").expect("second group fixture");
+        hard_link(&paths[2], &paths[3]).expect("second group hardlink");
+        let fixed_time = UNIX_EPOCH + Duration::from_secs(946_684_800);
+        fs::File::options()
+            .write(true)
+            .open(&paths[0])
+            .expect("first group file")
+            .set_modified(fixed_time)
+            .expect("first group timestamp");
+        fs::File::options()
+            .write(true)
+            .open(&paths[2])
+            .expect("second group file")
+            .set_modified(fixed_time)
+            .expect("second group timestamp");
+
+        let result = strict_backend().execute(&request(
+            "linux_transaction_regroup_hardlinks",
+            &[
+                "/bin/sh",
+                "-c",
+                "rm b.txt d.txt; ln a.txt d.txt; ln c.txt b.txt",
+            ],
+            workspace.path(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+        ));
+
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{result:?}"
+        );
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        let metadata = paths.map(|path| fs::metadata(path).expect("committed metadata"));
+        assert_eq!(metadata[0].ino(), metadata[3].ino());
+        assert_eq!(metadata[2].ino(), metadata[1].ino());
+        assert_ne!(
+            metadata[0].ino(),
+            metadata[1].ino(),
+            "equal content and link counts must not hide changed hardlink membership"
+        );
+        assert!(metadata.iter().all(|entry| entry.nlink() == 2));
+    }
+
+    #[test]
     fn linux_workspace_transaction_rejects_tmpdir_resolving_inside_workspace() {
         if run_environment_test_in_subprocess(
             "linux_tests::linux_workspace_transaction_rejects_tmpdir_resolving_inside_workspace",
