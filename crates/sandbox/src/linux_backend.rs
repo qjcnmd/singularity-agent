@@ -5372,9 +5372,16 @@ mod tests {
 
         assert_eq!(
             denied.execution_status,
-            CommandExecutionStatus::PolicyDenied
+            CommandExecutionStatus::Completed,
+            "{denied:?}"
         );
-        assert_ne!(denied.workspace_mutation, WorkspaceMutation::Changed);
+        assert_eq!(
+            denied.semantic_status,
+            CommandSemanticStatus::ExitNonzero,
+            "{denied:?}"
+        );
+        assert_ne!(denied.exit_code, Some(0), "{denied:?}");
+        assert_eq!(denied.workspace_mutation, WorkspaceMutation::Unchanged);
         assert_eq!(fs::read(config).expect("git config after denial"), before);
     }
 
