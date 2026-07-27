@@ -3402,6 +3402,25 @@ fn run_sandbox_preflight(
             ),
         }));
     }
+    let scratch = match fs::canonicalize(&scratch) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            let mut report =
+                SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
+            report.outcome = SandboxPreflightOutcome::Unsupported;
+            report.error_code = Some("sandbox_preflight_scratch_unavailable".to_string());
+            report
+                .missing_capabilities
+                .push("scratch_workspace".to_string());
+            return Err(Box::new(SandboxPreflightFailure {
+                report,
+                blocker: sandbox_preflight_blocker(
+                    "sandbox_preflight_scratch_unavailable",
+                    format!("sandbox preflight scratch workspace unavailable: {error}"),
+                ),
+            }));
+        }
+    };
     let mut report = sandbox_backend.preflight(&scratch, cancellation);
     if report.outcome == SandboxPreflightOutcome::Supported
         && let Err((code, missing)) =
@@ -4771,9 +4790,13 @@ mod tests {
 
         fn preflight(
             &self,
-            _workspace: &Path,
+            workspace: &Path,
             _cancellation: &CancellationToken,
         ) -> SandboxPreflightReport {
+            assert!(
+                workspace.is_absolute(),
+                "evaluation preflight must pass one canonical workspace to every probe"
+            );
             supported_sandbox_preflight(self.name())
         }
 
@@ -5423,6 +5446,54 @@ mod tests {
         assert_eq!(report.outcome, SandboxPreflightOutcome::Supported);
         assert!(report.missing_capabilities.is_empty());
         assert!(report.proves_supported_contract_for(backend.name()));
+        assert!(!run_dir.join(".sandbox-preflight").exists());
+    }
+
+    #[test]
+    fn preflight_canonicalizes_a_relative_run_directory_before_backend_calls() {
+        let current_dir = std::env::current_dir().expect("current directory");
+        let temp = tempfile::Builder::new()
+            .prefix("relative-preflight-")
+            .tempdir_in(&current_dir)
+            .expect("relative temp");
+        let relative_temp = temp
+            .path()
+            .strip_prefix(&current_dir)
+            .expect("temp below current directory");
+        assert!(!relative_temp.is_absolute());
+        let run_dir = relative_temp.join("run");
+        fs::create_dir(&run_dir).expect("run directory");
+        let fixture = relative_temp.join("fixture");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed\n").expect("fixture README");
+        let manifest_path = write_preflight_manifest(
+            relative_temp,
+            "relative-preflight",
+            "preflight canonicalizes its run-owned scratch path",
+            1,
+            json!({"type": "local", "path": "fixture"}),
+        );
+        let manifest = EvaluationManifest::from_json_str(
+            &fs::read_to_string(&manifest_path).expect("manifest"),
+            relative_temp,
+        )
+        .expect("evaluation manifest");
+        let plans = manifest
+            .task_set()
+            .tasks
+            .iter()
+            .map(|task| {
+                manifest
+                    .workspace_plan(&task.task_id)
+                    .expect("workspace plan")
+            })
+            .collect::<Vec<_>>();
+        let backend: SharedSandboxBackend = Arc::new(SourceSandboxBackend);
+
+        let report = run_sandbox_preflight(&run_dir, &plans, &backend, &CancellationToken::new())
+            .expect("relative run directory preflight");
+
+        assert_eq!(report.outcome, SandboxPreflightOutcome::Supported);
         assert!(!run_dir.join(".sandbox-preflight").exists());
     }
 
