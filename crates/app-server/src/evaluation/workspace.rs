@@ -5,6 +5,11 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use singularity_sandbox::is_toolchain_artifact_path;
@@ -93,7 +98,7 @@ pub(super) fn apply_agent_changes(
     }
     Ok(())
 }
-/// 在排除 .git 和 reparse point 后安全复制工作区。
+/// 在排除 `.git` 且不跟随链接的前提下安全复制工作区。
 pub(super) fn copy_tree_checked(source: &Path, destination: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| format!("failed to inspect source {}: {error}", source.display()))?;
@@ -175,13 +180,14 @@ fn copy_tree_entries(source: &Path, destination: &Path) -> Result<(), String> {
                 source_path.display()
             )
         })?;
-        if is_reparse_point(&metadata) {
+        if metadata.file_type().is_symlink() {
+            copy_symlink(&source_path, &destination_path)?;
+        } else if is_reparse_point(&metadata) {
             return Err(format!(
-                "evaluation workspace contains a symlink or reparse point: {}",
+                "evaluation workspace contains an unsupported reparse point: {}",
                 source_path.display()
             ));
-        }
-        if metadata.is_dir() {
+        } else if metadata.is_dir() {
             fs::create_dir(&destination_path).map_err(|error| {
                 format!(
                     "failed to create workspace directory {}: {error}",
@@ -206,7 +212,45 @@ fn copy_tree_entries(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 校验工作区树只包含可接受的普通文件和目录。
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<(), String> {
+    let target = fs::read_link(source).map_err(|error| {
+        format!(
+            "failed to read workspace link {}: {error}",
+            source.display()
+        )
+    })?;
+    symlink(&target, destination).map_err(|error| {
+        format!(
+            "failed to copy workspace link {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    let source_after = fs::read_link(source).map_err(|error| {
+        format!(
+            "failed to revalidate workspace link {}: {error}",
+            source.display()
+        )
+    })?;
+    if source_after != target {
+        return Err(format!(
+            "workspace link changed while it was being copied: {}",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(source: &Path, _destination: &Path) -> Result<(), String> {
+    Err(format!(
+        "evaluation workspace contains an unsupported reparse point: {}",
+        source.display()
+    ))
+}
+
+/// 校验工作区树只包含可接受且可无跟随观测的对象。
 pub(super) fn validate_tree(root: &Path) -> Result<(), String> {
     snapshot_workspace(root).map(|_| ())
 }
@@ -253,20 +297,18 @@ fn snapshot_entries(
                 path.display()
             )
         })?;
-        if is_reparse_point(&metadata) {
+        if metadata.file_type().is_symlink() {
+            let relative = workspace_relative_path(root, &path)?;
+            snapshot.insert(relative, symlink_sha256(&path)?);
+        } else if is_reparse_point(&metadata) {
             return Err(format!(
-                "workspace contains a symlink or reparse point: {}",
+                "workspace contains an unsupported reparse point: {}",
                 path.display()
             ));
-        }
-        if metadata.is_dir() {
+        } else if metadata.is_dir() {
             snapshot_entries(root, &path, snapshot)?;
         } else if metadata.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|error| error.to_string())?
-                .to_string_lossy()
-                .replace('\\', "/");
+            let relative = workspace_relative_path(root, &path)?;
             snapshot.insert(relative, file_sha256(&path)?);
         } else {
             return Err(format!(
@@ -278,10 +320,19 @@ fn snapshot_entries(
     Ok(())
 }
 
+fn workspace_relative_path(root: &Path, path: &Path) -> Result<String, String> {
+    Ok(path
+        .strip_prefix(root)
+        .map_err(|error| error.to_string())?
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
 fn file_sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path)
         .map_err(|error| format!("failed to open workspace file {}: {error}", path.display()))?;
     let mut digest = Sha256::new();
+    digest.update(b"file\0");
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).map_err(|error| {
@@ -293,6 +344,24 @@ fn file_sha256(path: &Path) -> Result<String, String> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+#[cfg(unix)]
+fn symlink_sha256(path: &Path) -> Result<String, String> {
+    let target = fs::read_link(path)
+        .map_err(|error| format!("failed to read workspace link {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"symlink\0");
+    digest.update(target.as_os_str().as_bytes());
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+#[cfg(not(unix))]
+fn symlink_sha256(path: &Path) -> Result<String, String> {
+    Err(format!(
+        "workspace contains an unsupported reparse point: {}",
+        path.display()
+    ))
 }
 
 /// 返回前后快照中内容发生变化的路径。

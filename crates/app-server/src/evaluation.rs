@@ -4387,6 +4387,64 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn workspace_copy_preserves_opaque_symlink_targets_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let outside = temp.path().join("outside.txt");
+        fs::create_dir(&source).expect("source");
+        fs::write(&outside, "outside").expect("outside");
+        symlink(".", source.join("loop")).expect("loop link");
+        symlink("../outside.txt", source.join("relative-escape")).expect("relative link");
+        symlink(&outside, source.join("absolute-escape")).expect("absolute link");
+
+        let source_snapshot = snapshot_workspace(&source).expect("source snapshot");
+        copy_tree_checked(&source, &destination).expect("copy");
+        let destination_snapshot = snapshot_workspace(&destination).expect("destination snapshot");
+
+        assert_eq!(destination_snapshot, source_snapshot);
+        assert_eq!(
+            fs::read_link(destination.join("loop")).expect("loop target"),
+            Path::new(".")
+        );
+        assert_eq!(
+            fs::read_link(destination.join("relative-escape")).expect("relative target"),
+            Path::new("../outside.txt")
+        );
+        assert_eq!(
+            fs::read_link(destination.join("absolute-escape")).expect("absolute target"),
+            outside
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_snapshot_distinguishes_symlink_target_and_object_kind() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("entry");
+        symlink("first", &path).expect("first link");
+        let first = snapshot_workspace(temp.path()).expect("first snapshot");
+
+        fs::remove_file(&path).expect("remove first link");
+        symlink("second", &path).expect("second link");
+        let second = snapshot_workspace(temp.path()).expect("second snapshot");
+        assert_eq!(super::workspace::changed_paths(&first, &second), ["entry"]);
+
+        fs::remove_file(&path).expect("remove second link");
+        fs::write(&path, "second").expect("replacement file");
+        let regular = snapshot_workspace(temp.path()).expect("regular snapshot");
+        assert_eq!(
+            super::workspace::changed_paths(&second, &regular),
+            ["entry"]
+        );
+    }
+
     #[test]
     fn workspace_copy_rejects_destination_inside_source() {
         let temp = tempfile::tempdir().expect("temp");
