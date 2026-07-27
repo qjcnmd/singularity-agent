@@ -2153,15 +2153,17 @@ time.sleep(30)
     }
 
     #[test]
-    fn linux_workspace_write_commits_venv_absolute_symlinks() {
+    fn linux_trusted_preparation_commits_standard_venv() {
         let workspace = tempfile::tempdir().expect("workspace");
         let backend = strict_backend();
-        let create = backend.execute(&request(
+        let create = backend.execute(&CommandRequest::trusted_workspace_preparation(
             "linux_python_venv_create",
-            &["/usr/bin/python3", "-m", "venv", "--without-pip", ".venv"],
-            workspace.path(),
-            SandboxFilesystemMode::WorkspaceWrite,
-            SandboxNetworkMode::Denied,
+            ["/usr/bin/python3", "-m", "venv", ".venv"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            path_str(workspace.path()),
+            path_str(workspace.path()),
         ));
 
         assert_eq!(
@@ -2178,12 +2180,14 @@ time.sleep(30)
             Path::new("/usr/bin/python3")
         );
 
-        let invoke = backend.execute(&request(
+        let invoke = backend.execute(&CommandRequest::trusted_workspace_preparation(
             "linux_python_venv_invoke",
-            &[".venv/bin/python", "-c", "print('venv-ok')"],
-            workspace.path(),
-            SandboxFilesystemMode::WorkspaceWrite,
-            SandboxNetworkMode::Denied,
+            [".venv/bin/python", "-m", "pip", "--version"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            path_str(workspace.path()),
+            path_str(workspace.path()),
         ));
         assert_eq!(
             invoke.execution_status,
@@ -2192,7 +2196,7 @@ time.sleep(30)
             invoke.stderr_preview
         );
         assert_eq!(invoke.exit_code, Some(0), "{}", invoke.stderr_preview);
-        assert_eq!(invoke.stdout_preview.trim(), "venv-ok");
+        assert!(invoke.stdout_preview.starts_with("pip "));
     }
 
     #[test]
@@ -2323,6 +2327,43 @@ time.sleep(30)
             CommandExecutionStatus::Completed
         );
         assert_eq!(allowed_result.exit_code, Some(0));
+    }
+
+    #[test]
+    fn linux_standard_runtime_data_is_readable_when_network_is_denied() {
+        let python = Path::new("/usr/bin/python3");
+        if !python.is_file() {
+            return;
+        }
+        let paths = [
+            "/etc/debian_version",
+            "/etc/mime.types",
+            "/usr/share/python-wheels",
+        ];
+        for path in paths {
+            assert!(Path::new(path).exists(), "missing runtime path: {path}");
+        }
+        let workspace = tempfile::tempdir().expect("workspace");
+        let script = concat!(
+            "import sys; from pathlib import Path; path = Path(sys.argv[1]); ",
+            "path.read_bytes() if path.is_file() else list(path.iterdir())"
+        );
+        for path in paths {
+            let result = strict_backend().execute(&request(
+                "linux_standard_runtime_data",
+                &[path_str(python), "-c", script, path],
+                workspace.path(),
+                SandboxFilesystemMode::ReadOnly,
+                SandboxNetworkMode::Denied,
+            ));
+            assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
+            assert_eq!(
+                result.exit_code,
+                Some(0),
+                "failed to read {path}: {}",
+                result.stderr_preview
+            );
+        }
     }
 
     #[test]

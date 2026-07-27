@@ -54,7 +54,7 @@ const SANDBOX_HOME: &str = "/run/singularity-home";
 /// `/usr/libexec` is intentionally an execute/read-only root rather than a
 /// tool-specific exception: compiler drivers commonly dispatch helpers from
 /// this standard system location (for example, `collect2`).
-const STANDARD_RUNTIME_ROOTS: [&str; 12] = [
+const STANDARD_RUNTIME_ROOTS: [&str; 13] = [
     "/bin",
     "/sbin",
     "/usr/bin",
@@ -66,8 +66,12 @@ const STANDARD_RUNTIME_ROOTS: [&str; 12] = [
     "/usr/lib64",
     "/usr/libexec",
     "/usr/share/nodejs",
+    "/usr/share/python-wheels",
     "/proc",
 ];
+
+/// Non-secret platform files required by standard language runtimes.
+const STANDARD_RUNTIME_FILES: [&str; 2] = ["/etc/debian_version", "/etc/mime.types"];
 
 /// Host name resolution and TLS trust inputs required by network-enabled processes.
 const NETWORK_RUNTIME_READ_PATHS: [&str; 7] = [
@@ -5248,6 +5252,17 @@ fn prepare_landlock_rules(
             rules.push(LandlockRule {
                 path: CString::new(root).map_err(|_| LinuxSandboxError::Unavailable)?,
                 allowed_access: runtime_read,
+            });
+        }
+    }
+    for path in STANDARD_RUNTIME_FILES {
+        let path = Path::new(path);
+        if path.exists() {
+            rules.push(LandlockRule {
+                path: path_cstring(path).map_err(|_| LinuxSandboxError::Unavailable)?,
+                allowed_access: runtime_read_access(path).ok_or(
+                    LinuxSandboxError::CapabilityNotSupported(LinuxCapability::Landlock),
+                )?,
             });
         }
     }
