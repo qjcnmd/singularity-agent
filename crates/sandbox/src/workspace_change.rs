@@ -133,6 +133,48 @@ impl WorkspaceSnapshot {
         &self,
         after: &Self,
     ) -> Result<Option<WorkspaceChangeSummary>, String> {
+        let changed_files = self.changed_paths(after)?;
+        if changed_files.is_empty() {
+            return Ok(None);
+        }
+        if !changed_paths_are_bounded(&changed_files) {
+            return Err("workspace change exceeds the bounded verification scope".to_string());
+        }
+        self.summary_for_paths(after, changed_files).map(Some)
+    }
+
+    /// Summarize a trusted control-plane transaction without applying the model-facing path cap.
+    ///
+    /// Large source preparations retain the complete bounded before/after snapshot as the digest
+    /// input and use `.` as the honest transaction-wide path projection. Ordinary agent commands
+    /// continue to require the exact bounded path list through `change_summary`.
+    pub(super) fn trusted_change_summary(
+        &self,
+        after: &Self,
+    ) -> Result<Option<WorkspaceChangeSummary>, String> {
+        let changed_files = self.changed_paths(after)?;
+        if changed_files.is_empty() {
+            return Ok(None);
+        }
+        if changed_paths_are_bounded(&changed_files) {
+            return self.summary_for_paths(after, changed_files).map(Some);
+        }
+        let encoded = serde_json::to_vec(&(
+            &self.root,
+            &after.root,
+            &self.entries,
+            &after.entries,
+            &self.protected_entries,
+            &after.protected_entries,
+        ))
+        .map_err(|error| format!("trusted workspace change encoding failed: {error}"))?;
+        Ok(Some(WorkspaceChangeSummary::new(
+            vec![".".to_string()],
+            format!("sha256:{:x}", Sha256::digest(encoded)),
+        )))
+    }
+
+    fn changed_paths(&self, after: &Self) -> Result<Vec<String>, String> {
         if (self.root.device, self.root.inode) != (after.root.device, after.root.inode) {
             return Err("workspace root identity changed between trusted observations".to_string());
         }
@@ -166,16 +208,14 @@ impl WorkspaceSnapshot {
         if root_behavior_changed(&self.root, &after.root) {
             changed_files.push(".".to_string());
         }
-        if changed_files.is_empty() {
-            return Ok(None);
-        }
-        if changed_files.len() > MAX_CHANGED_FILES
-            || changed_files
-                .iter()
-                .any(|path| path.chars().count() > MAX_CHANGED_PATH_CHARS)
-        {
-            return Err("workspace change exceeds the bounded verification scope".to_string());
-        }
+        Ok(changed_files)
+    }
+
+    fn summary_for_paths(
+        &self,
+        after: &Self,
+        changed_files: Vec<String>,
+    ) -> Result<WorkspaceChangeSummary, String> {
         let changed_entries = changed_files
             .iter()
             .map(|path| (path, self.entries.get(path), after.entries.get(path)))
@@ -184,13 +224,11 @@ impl WorkspaceSnapshot {
             .map_err(|error| format!("workspace change summary encoding failed: {error}"))?;
         let verification_relevant =
             workspace_change_is_verification_relevant(self, after, &changed_files);
-        Ok(Some(
-            WorkspaceChangeSummary::new(
-                changed_files,
-                format!("sha256:{:x}", Sha256::digest(encoded)),
-            )
-            .with_verification_relevant(verification_relevant),
-        ))
+        Ok(WorkspaceChangeSummary::new(
+            changed_files,
+            format!("sha256:{:x}", Sha256::digest(encoded)),
+        )
+        .with_verification_relevant(verification_relevant))
     }
 
     /// Compare the workspace baseline while ignoring trusted metadata churn on protected
@@ -209,6 +247,13 @@ impl WorkspaceSnapshot {
             )
             && protected_entries_match(&self.protected_entries, &after.protected_entries)
     }
+}
+
+fn changed_paths_are_bounded(changed_files: &[String]) -> bool {
+    changed_files.len() <= MAX_CHANGED_FILES
+        && changed_files
+            .iter()
+            .all(|path| path.chars().count() <= MAX_CHANGED_PATH_CHARS)
 }
 
 fn workspace_change_is_verification_relevant(
@@ -721,6 +766,38 @@ mod tests {
             .expect("alternate summary")
             .expect("alternate changed");
         assert_ne!(summary.diff_digest, alternate.diff_digest);
+    }
+
+    #[test]
+    fn trusted_summary_collapses_only_the_path_projection_for_large_transactions() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let before = snapshot_trusted_workspace(workspace.path()).expect("before snapshot");
+        for index in 0..=super::MAX_CHANGED_FILES {
+            std::fs::write(
+                workspace.path().join(format!("file-{index:03}.txt")),
+                b"payload",
+            )
+            .expect("write transaction file");
+        }
+        let after = snapshot_trusted_workspace(workspace.path()).expect("after snapshot");
+
+        assert!(before.change_summary(&after).is_err());
+        let summary = before
+            .trusted_change_summary(&after)
+            .expect("trusted summary")
+            .expect("changed transaction");
+        assert_eq!(summary.changed_files, ["."]);
+        assert!(summary.diff_digest.starts_with("sha256:"));
+        assert_eq!(summary.diff_digest.len(), "sha256:".len() + 64);
+
+        std::fs::write(workspace.path().join("file-000.txt"), b"different")
+            .expect("change transaction content");
+        let changed = snapshot_trusted_workspace(workspace.path()).expect("changed snapshot");
+        let changed = before
+            .trusted_change_summary(&changed)
+            .expect("changed trusted summary")
+            .expect("changed transaction");
+        assert_ne!(summary.diff_digest, changed.diff_digest);
     }
 
     #[test]

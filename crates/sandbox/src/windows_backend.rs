@@ -574,7 +574,7 @@ fn execute_prepared_command(
                     .duplicate_root_handle()
                     .map_err(|error| error.code().to_string())
                     .and_then(|handle| snapshot_trusted_workspace_from_handle(&handle))
-                    .and_then(|after| before.change_summary(&after))
+                    .and_then(|after| before.trusted_change_summary(&after))
             });
         let summary = match summary {
             Ok(summary) => summary,

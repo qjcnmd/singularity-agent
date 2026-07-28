@@ -697,6 +697,46 @@ fn windows_elevated_preflight_verifies_full_contract() {
         SandboxBackendEnforcement::Strict
     );
     assert!(!result.sandbox.local_process_fallback);
+
+    let mut bulk_request = CommandRequest::trusted_workspace_preparation(
+        "trusted_preparation_large_change_set",
+        vec![
+            "powershell.exe".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "$ErrorActionPreference='Stop'; 0..64 | ForEach-Object { [IO.File]::WriteAllText(('bulk-{0:D3}.txt' -f $_), 'payload') }".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    bulk_request.network.mode = SandboxNetworkMode::Denied;
+    bulk_request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    let bulk_result = backend.execute(&bulk_request);
+    assert_eq!(
+        bulk_result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{bulk_result:#?}"
+    );
+    assert_eq!(
+        bulk_result.semantic_status,
+        CommandSemanticStatus::Succeeded
+    );
+    assert_eq!(bulk_result.workspace_mutation, WorkspaceMutation::Changed);
+    assert_eq!(
+        bulk_result
+            .workspace_change_summary
+            .as_ref()
+            .expect("trusted large transaction summary")
+            .changed_files,
+        ["."]
+    );
+    assert_eq!(
+        bulk_result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!bulk_result.sandbox.local_process_fallback);
 }
 
 #[cfg(windows)]
