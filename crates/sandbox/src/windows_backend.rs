@@ -278,11 +278,6 @@ impl SandboxBackend for WindowsSandboxBackend {
             return report;
         }
         report.network_denied = SandboxPreflightFact::Passed;
-        if let Err(code) = self.probe_protected_paths(workspace, cancellation) {
-            report.unsupported(code, &["protected_metadata_admission"]);
-            return report;
-        }
-        report.protected_paths = SandboxPreflightFact::Passed;
         if let Err(code) = self.probe_trusted_transaction(workspace, cancellation) {
             report.unsupported(
                 code,
@@ -291,6 +286,11 @@ impl SandboxBackend for WindowsSandboxBackend {
             return report;
         }
         report.transactional_workspace = SandboxPreflightFact::Passed;
+        if let Err(code) = self.probe_protected_paths(workspace, cancellation) {
+            report.unsupported(code, &["protected_metadata_admission"]);
+            return report;
+        }
+        report.protected_paths = SandboxPreflightFact::Passed;
         report.outcome = super::SandboxPreflightOutcome::Supported;
         report.error_code = None;
         report

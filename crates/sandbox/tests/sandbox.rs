@@ -603,6 +603,27 @@ fn windows_elevated_backend_allows_only_declared_loopback_proxy_port() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_elevated_preflight_verifies_full_contract() {
+    let work_root = std::env::current_dir()
+        .expect("current directory")
+        .join("work");
+    std::fs::create_dir_all(&work_root).expect("work root");
+    let workspace = tempfile::Builder::new()
+        .prefix(".trusted-preparation-")
+        .tempdir_in(work_root)
+        .expect("workspace");
+    let report =
+        WindowsSandboxBackend::new().preflight(workspace.path(), &CancellationToken::new());
+
+    assert!(
+        report.proves_supported_contract_for("windows"),
+        "{report:#?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
 #[ignore = "requires first-run Windows UAC sandbox setup and an additional ACL-authority elevation"]
 fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
     let workspace = if let Some(root) =
