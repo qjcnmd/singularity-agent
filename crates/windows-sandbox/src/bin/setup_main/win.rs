@@ -13,21 +13,28 @@ use singularity_windows_sandbox::SETUP_VERSION;
 use singularity_windows_sandbox::SetupErrorCode;
 use singularity_windows_sandbox::SetupErrorReport;
 use singularity_windows_sandbox::SetupFailure;
+use singularity_windows_sandbox::TrustedWorkspaceSetupPin;
 use singularity_windows_sandbox::WindowsAclError;
 use singularity_windows_sandbox::acquire_read_acl_mutex;
 use singularity_windows_sandbox::add_deny_write_ace;
+use singularity_windows_sandbox::add_deny_write_ace_to_handle;
 use singularity_windows_sandbox::canonicalize_path;
 use singularity_windows_sandbox::convert_string_sid_to_sid;
+use singularity_windows_sandbox::duplicate_setup_root_handle;
 use singularity_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
+use singularity_windows_sandbox::ensure_allow_mask_aces_with_inheritance_to_handle;
 use singularity_windows_sandbox::ensure_allow_write_aces;
+use singularity_windows_sandbox::ensure_allow_write_aces_to_handle;
 use singularity_windows_sandbox::ensure_case_insensitive_acl_path;
 use singularity_windows_sandbox::ensure_missing_protected_path_materialized;
 use singularity_windows_sandbox::extract_setup_failure;
+use singularity_windows_sandbox::handle_mask_allows;
 use singularity_windows_sandbox::hide_newly_created_users;
 use singularity_windows_sandbox::install_wfp_filters;
 use singularity_windows_sandbox::is_command_cwd_root;
 use singularity_windows_sandbox::log_note;
 use singularity_windows_sandbox::log_writer;
+use singularity_windows_sandbox::open_pinned_workspace_path;
 use singularity_windows_sandbox::path_mask_allows;
 use singularity_windows_sandbox::plan_deny_read_acl_paths;
 use singularity_windows_sandbox::probe_read_acl_mutex;
@@ -37,7 +44,7 @@ use singularity_windows_sandbox::sandbox_dir;
 use singularity_windows_sandbox::sandbox_secrets_dir;
 use singularity_windows_sandbox::set_dacl_for_path;
 use singularity_windows_sandbox::string_from_sid_bytes;
-use singularity_windows_sandbox::sync_persistent_deny_read_acls;
+use singularity_windows_sandbox::sync_persistent_deny_read_acls_with_pinned_root;
 use singularity_windows_sandbox::to_wide;
 use singularity_windows_sandbox::workspace_write_cap_sid_for_root;
 use singularity_windows_sandbox::workspace_write_root_overlaps_path;
@@ -45,7 +52,9 @@ use singularity_windows_sandbox::write_setup_error_report;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
+use std::fs::File;
 use std::io::Write;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -131,6 +140,13 @@ struct Payload {
     mode: SetupMode,
     #[serde(default)]
     refresh_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trusted_workspace_root: Option<TrustedWorkspaceSetupPin>,
+}
+
+struct PinnedWorkspaceRoot {
+    path: PathBuf,
+    handle: File,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -210,20 +226,26 @@ fn workspace_write_cap_sids_for_path(
     Ok(sid_strs)
 }
 
-fn write_root_needs_refresh(root: &Path, psid: *mut c_void) -> Result<bool> {
-    if !path_mask_allows(
+fn write_root_needs_refresh(
+    root: &Path,
+    psid: *mut c_void,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<bool> {
+    if !path_mask_allows_for_path(
         root,
         &[psid],
         WRITE_ROOT_ALLOW_MASK,
         /*require_all_bits*/ true,
+        pinned_workspace_root,
     )? {
         return Ok(true);
     }
-    path_mask_allows(
+    path_mask_allows_for_path(
         root,
         &[psid],
         FILE_DELETE_CHILD,
         /*require_all_bits*/ false,
+        pinned_workspace_root,
     )
 }
 
@@ -250,6 +272,7 @@ struct ReadAclSubjects<'a> {
     rx_psids: &'a [*mut c_void],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_read_acls(
     read_roots: &[PathBuf],
     subjects: &ReadAclSubjects<'_>,
@@ -258,6 +281,7 @@ fn apply_read_acls(
     access_mask: u32,
     access_label: &str,
     inheritance: u32,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
 ) -> Result<()> {
     for root in read_roots {
         if !root.exists() {
@@ -275,6 +299,7 @@ fn apply_read_acls(
             access_label,
             refresh_errors,
             log,
+            pinned_workspace_root,
         )?;
         if builtin_has {
             continue;
@@ -287,6 +312,7 @@ fn apply_read_acls(
             access_label,
             refresh_errors,
             log,
+            pinned_workspace_root,
         )?;
         if sandbox_has {
             continue;
@@ -299,11 +325,12 @@ fn apply_read_acls(
             ),
         )?;
         let result = unsafe {
-            ensure_allow_mask_aces_with_inheritance(
+            ensure_allow_mask_aces_with_inheritance_for_path(
                 root,
                 &[subjects.sandbox_group_psid],
                 access_mask,
                 inheritance,
+                pinned_workspace_root,
             )
         };
         if let Err(err) = result {
@@ -323,6 +350,7 @@ fn apply_read_acls(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_mask_allows_or_log(
     root: &Path,
     psids: &[*mut c_void],
@@ -331,8 +359,15 @@ fn read_mask_allows_or_log(
     access_label: &str,
     refresh_errors: &mut Vec<String>,
     log: &mut dyn Write,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
 ) -> Result<bool> {
-    match path_mask_allows(root, psids, read_mask, /*require_all_bits*/ true) {
+    match path_mask_allows_for_path(
+        root,
+        psids,
+        read_mask,
+        /*require_all_bits*/ true,
+        pinned_workspace_root,
+    ) {
         Ok(has) => Ok(has),
         Err(e) => {
             let label_suffix = label
@@ -356,6 +391,99 @@ fn read_mask_allows_or_log(
             Ok(false)
         }
     }
+}
+
+fn path_mask_allows_for_path(
+    path: &Path,
+    psids: &[*mut c_void],
+    desired_mask: u32,
+    require_all_bits: bool,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<bool> {
+    if let Some(pinned) = pinned_workspace_root
+        && let Some(handle) = open_pinned_workspace_path(
+            &pinned.handle,
+            &pinned.path,
+            path,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+        )?
+    {
+        return unsafe {
+            handle_mask_allows(
+                handle.as_raw_handle() as _,
+                psids,
+                desired_mask,
+                require_all_bits,
+            )
+        };
+    }
+    path_mask_allows(path, psids, desired_mask, require_all_bits)
+}
+
+unsafe fn ensure_allow_mask_aces_with_inheritance_for_path(
+    path: &Path,
+    psids: &[*mut c_void],
+    allow_mask: u32,
+    inheritance: u32,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<bool> {
+    if let Some(pinned) = pinned_workspace_root
+        && let Some(handle) = open_pinned_workspace_path(
+            &pinned.handle,
+            &pinned.path,
+            path,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+        )?
+    {
+        return unsafe {
+            ensure_allow_mask_aces_with_inheritance_to_handle(
+                handle.as_raw_handle() as _,
+                psids,
+                allow_mask,
+                inheritance,
+            )
+        };
+    }
+    unsafe { ensure_allow_mask_aces_with_inheritance(path, psids, allow_mask, inheritance) }
+}
+
+unsafe fn ensure_allow_write_aces_for_path(
+    path: &Path,
+    psids: &[*mut c_void],
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<bool> {
+    if let Some(pinned) = pinned_workspace_root
+        && let Some(handle) = open_pinned_workspace_path(
+            &pinned.handle,
+            &pinned.path,
+            path,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+        )?
+    {
+        return unsafe { ensure_allow_write_aces_to_handle(handle.as_raw_handle() as _, psids) };
+    }
+    unsafe { ensure_allow_write_aces(path, psids) }
+}
+
+unsafe fn add_deny_write_ace_for_path(
+    path: &Path,
+    psid: *mut c_void,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<bool> {
+    if let Some(pinned) = pinned_workspace_root
+        && let Some(handle) = open_pinned_workspace_path(
+            &pinned.handle,
+            &pinned.path,
+            path,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+        )?
+    {
+        return unsafe { add_deny_write_ace_to_handle(handle.as_raw_handle() as _, psid) };
+    }
+    unsafe { add_deny_write_ace(path, psid) }
 }
 
 fn lock_sandbox_dir(
@@ -493,7 +621,23 @@ fn real_main() -> Result<()> {
             ),
         )));
     }
-    validate_payload_acl_paths(&payload)?;
+    let pinned_workspace_root = payload
+        .trusted_workspace_root
+        .as_ref()
+        .map(|pin| {
+            duplicate_setup_root_handle(pin).map(|handle| PinnedWorkspaceRoot {
+                path: pin.root_path.clone(),
+                handle,
+            })
+        })
+        .transpose()
+        .map_err(|error| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperRequestArgsFailed,
+                format!("duplicate trusted workspace root handle failed: {error}"),
+            ))
+        })?;
+    validate_payload_acl_paths(&payload, pinned_workspace_root.as_ref())?;
     let sbx_dir = sandbox_dir(&payload.sandbox_home);
     std::fs::create_dir_all(&sbx_dir).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -507,7 +651,7 @@ fn real_main() -> Result<()> {
             format!("open log in {} failed", sbx_dir.display()),
         ))
     })?;
-    let result = run_setup(&payload, &mut log, &sbx_dir);
+    let result = run_setup(&payload, &mut log, &sbx_dir, pinned_workspace_root.as_ref());
     if let Err(err) = &result {
         let _ = log_line(&mut log, &format!("setup error: {err:?}"));
         log_note(&format!("setup error: {err:?}"), Some(sbx_dir.as_path()));
@@ -534,15 +678,20 @@ fn real_main() -> Result<()> {
     result
 }
 
-fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
+fn run_setup(
+    payload: &Payload,
+    log: &mut dyn Write,
+    sbx_dir: &Path,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<()> {
     let writes_setup_marker = !payload.refresh_only && payload.mode != SetupMode::ReadAclsOnly;
     if writes_setup_marker {
         prepare_setup_marker(&payload.sandbox_home, &payload.real_user)?;
     }
     match payload.mode {
-        SetupMode::ReadAclsOnly => run_read_acl_only(payload, log),
+        SetupMode::ReadAclsOnly => run_read_acl_only(payload, log, pinned_workspace_root),
         SetupMode::ProvisionOnly => run_provision_only(payload, log, sbx_dir),
-        SetupMode::Full => run_setup_full(payload, log, sbx_dir),
+        SetupMode::Full => run_setup_full(payload, log, sbx_dir, pinned_workspace_root),
     }?;
     if writes_setup_marker {
         commit_setup_marker(
@@ -556,32 +705,72 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
     Ok(())
 }
 
-fn validate_payload_acl_paths(payload: &Payload) -> Result<()> {
+fn validate_payload_acl_paths(
+    payload: &Payload,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<()> {
     ensure_case_insensitive_acl_path(&payload.sandbox_home)?;
     match payload.mode {
         SetupMode::ProvisionOnly => {}
         SetupMode::ReadAclsOnly => {
             for path in &payload.read_roots {
-                ensure_case_insensitive_acl_path(path)?;
+                validate_payload_acl_path(path, pinned_workspace_root, true)?;
             }
         }
         SetupMode::Full => {
             drop(plan_deny_read_acl_paths(&payload.deny_read_paths)?);
-            ensure_case_insensitive_acl_path(&payload.command_cwd)?;
-            for path in payload
-                .read_roots
-                .iter()
-                .chain(&payload.write_roots)
-                .chain(&payload.deny_write_paths)
-            {
-                ensure_case_insensitive_acl_path(path)?;
+            validate_payload_acl_path(&payload.command_cwd, pinned_workspace_root, false)?;
+            for path in &payload.read_roots {
+                validate_payload_acl_path(path, pinned_workspace_root, true)?;
+            }
+            for path in &payload.write_roots {
+                validate_payload_acl_path(path, pinned_workspace_root, true)?;
+            }
+            for path in &payload.deny_write_paths {
+                validate_payload_acl_path(path, pinned_workspace_root, true)?;
             }
         }
     }
     Ok(())
 }
 
-fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
+fn validate_payload_acl_path(
+    path: &Path,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+    allow_missing_leaf: bool,
+) -> Result<()> {
+    if let Some(pinned) = pinned_workspace_root {
+        match open_pinned_workspace_path(&pinned.handle, &pinned.path, path, 0) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) if allow_missing_leaf && is_missing_path_error(&error) => {
+                if let Some(parent) = path.parent()
+                    && open_pinned_workspace_path(&pinned.handle, &pinned.path, parent, 0)?
+                        .is_some()
+                {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    ensure_case_insensitive_acl_path(path)
+}
+
+fn is_missing_path_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn run_read_acl_only(
+    payload: &Payload,
+    log: &mut dyn Write,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<()> {
     let _read_acl_guard = match acquire_read_acl_mutex()? {
         Some(guard) => guard,
         None => {
@@ -617,6 +806,7 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             "read",
             OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            pinned_workspace_root,
         )?;
     }
     if !refresh_errors.is_empty() {
@@ -801,7 +991,12 @@ fn run_provision_only(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) ->
     Ok(())
 }
 
-fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
+fn run_setup_full(
+    payload: &Payload,
+    log: &mut dyn Write,
+    sbx_dir: &Path,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<()> {
     let refresh_only = payload.refresh_only;
     if !refresh_only {
         provision_and_hide_sandbox_users(payload, log, sbx_dir)?;
@@ -845,11 +1040,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
     // holds the execution mutex across setup and the complete Job Object lifetime; this helper's
     // state mutex then serializes the ownership-aware current-set reconciliation itself.
     let applied_deny_read_paths = unsafe {
-        sync_persistent_deny_read_acls(
+        sync_persistent_deny_read_acls_with_pinned_root(
             &payload.sandbox_home,
             &sandbox_group_sid_str,
             &payload.deny_read_paths,
             sandbox_group_psid,
+            pinned_workspace_root.map(|pinned| (&pinned.handle, pinned.path.as_path())),
         )
     }
     .map_err(|error| {
@@ -963,7 +1159,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             ("sandbox_group", sandbox_group_psid),
             (cap_label, root_cap_psid),
         ] {
-            let needs_refresh = match write_root_needs_refresh(root, psid) {
+            let needs_refresh = match write_root_needs_refresh(root, psid, pinned_workspace_root) {
                 Ok(needs_refresh) => needs_refresh,
                 Err(e) => {
                     let message = format!(
@@ -1023,7 +1219,9 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                     }
                 }
 
-                let res = unsafe { ensure_allow_write_aces(&root, &psids) };
+                let res = unsafe {
+                    ensure_allow_write_aces_for_path(&root, &psids, pinned_workspace_root)
+                };
 
                 for psid in psids {
                     unsafe {
@@ -1085,7 +1283,9 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 
             let result = match &materialized {
                 Some(materialized) => unsafe { materialized.add_deny_write_ace(deny_psid) },
-                None => unsafe { add_deny_write_ace(path, deny_psid) },
+                None => unsafe {
+                    add_deny_write_ace_for_path(path, deny_psid, pinned_workspace_root)
+                },
             };
             match result {
                 Ok(true) => {
@@ -1165,11 +1365,14 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::Payload;
+    use super::PinnedWorkspaceRoot;
     use super::SETUP_VERSION;
     use super::WRITE_ROOT_ALLOW_MASK;
     use super::convert_string_sid_to_sid;
+    use super::validate_payload_acl_path;
     use super::workspace_write_cap_sids_for_path;
     use super::write_root_needs_refresh;
+    use singularity_windows_sandbox::TrustedWorkspaceLease;
     use singularity_windows_sandbox::ensure_allow_mask_aces;
     use singularity_windows_sandbox::ensure_allow_write_aces;
     use singularity_windows_sandbox::load_or_create_cap_sids;
@@ -1206,6 +1409,28 @@ mod tests {
     }
 
     #[test]
+    fn pinned_payload_validation_preserves_missing_leaf_semantics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("workspace");
+        let missing = root.join("future-root");
+        fs::create_dir(&root).expect("workspace");
+        let lease = TrustedWorkspaceLease::acquire(&root).expect("trusted workspace lease");
+        let pinned = PinnedWorkspaceRoot {
+            path: root,
+            handle: lease
+                .duplicate_root_handle()
+                .expect("duplicate root handle"),
+        };
+
+        validate_payload_acl_path(&missing, Some(&pinned), true)
+            .expect("missing read/write leaf is validated through pinned parent");
+        assert!(
+            validate_payload_acl_path(&missing, Some(&pinned), false).is_err(),
+            "command cwd must remain required"
+        );
+    }
+
+    #[test]
     fn write_root_refresh_replaces_stale_delete_child_grant() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sandbox_home = temp.path().join("singularity-home");
@@ -1220,11 +1445,11 @@ mod tests {
         let seeded = unsafe { ensure_allow_mask_aces(&workspace, &[psid], stale_write_mask) }
             .expect("seed stale write ACE");
         let needs_refresh_before =
-            write_root_needs_refresh(&workspace, psid).expect("check stale write ACE");
+            write_root_needs_refresh(&workspace, psid, None).expect("check stale write ACE");
         let replaced = unsafe { ensure_allow_write_aces(&workspace, &[psid]) }
             .expect("replace stale write ACE");
         let needs_refresh_after =
-            write_root_needs_refresh(&workspace, psid).expect("check refreshed write ACE");
+            write_root_needs_refresh(&workspace, psid, None).expect("check refreshed write ACE");
         unsafe {
             LocalFree(psid as HLOCAL);
         }

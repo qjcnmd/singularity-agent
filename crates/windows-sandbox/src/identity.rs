@@ -16,6 +16,7 @@ use crate::setup::sandbox_users_path;
 use crate::setup::setup_marker_path;
 use crate::setup_error::SetupErrorCode;
 use crate::setup_error::failure;
+use crate::trusted_workspace::TrustedWorkspaceLease;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -188,6 +189,7 @@ pub fn require_logon_sandbox_creds(
     deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
 ) -> Result<SandboxCreds> {
     let sandbox_dir = crate::setup::sandbox_dir(sandbox_home);
     let needed_read = read_roots_override
@@ -264,6 +266,7 @@ pub fn require_logon_sandbox_creds(
                 deny_write_paths: Some(deny_write_paths_override.to_vec()),
             },
             &desired_offline_proxy_settings,
+            trusted_workspace,
         )?;
         identity = select_identity(network_identity, sandbox_home)?;
     }
@@ -289,6 +292,7 @@ pub fn require_logon_sandbox_creds(
         setup_request(),
         setup_overrides(),
         &desired_offline_proxy_settings,
+        trusted_workspace,
     ) {
         if !is_acl_authority_failure(&error) {
             return Err(error);
@@ -301,6 +305,7 @@ pub fn require_logon_sandbox_creds(
             setup_request(),
             setup_overrides(),
             &desired_offline_proxy_settings,
+            trusted_workspace,
         )
         .map_err(|elevated_error| {
             elevated_error.context("elevated ACL authority was required after access denial")
@@ -362,6 +367,7 @@ pub(crate) fn refresh_logon_sandbox_creds(
     deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
 ) -> Result<SandboxCreds> {
     remove_sandbox_users_file(sandbox_home, "sandbox user login failed")?;
     require_logon_sandbox_creds(
@@ -376,6 +382,7 @@ pub(crate) fn refresh_logon_sandbox_creds(
         deny_write_paths_override,
         proxy_enforced,
         proxy_settings_mode,
+        trusted_workspace,
     )
 }
 

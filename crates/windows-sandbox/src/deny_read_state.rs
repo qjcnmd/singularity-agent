@@ -1,11 +1,13 @@
 use crate::acl::deny_read_acl_fingerprint;
-use crate::acl::revoke_deny_read_ace_with_fingerprint;
+use crate::acl::deny_read_acl_fingerprint_to_handle;
+use crate::acl::revoke_deny_read_ace_with_fingerprint_to_handle;
 use crate::deny_read_acl::ManagedDenyReadAcl;
 use crate::deny_read_acl::apply_deny_read_acls_with_ownership_before_set;
 use crate::deny_read_acl::plan_deny_read_acl_paths;
 use crate::path_normalization::canonical_path_key;
 use crate::path_safety::canonicalize_case_insensitive_state_path;
 use crate::path_safety::ensure_case_insensitive_acl_path;
+use crate::path_safety::open_pinned_workspace_path;
 use crate::setup::sandbox_dir;
 use crate::token::current_user_sid_bytes;
 use crate::winutil::resolve_sid;
@@ -21,8 +23,10 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::c_void;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
@@ -407,6 +411,7 @@ unsafe fn recover_pending_principal(
     state: &mut PersistentDenyReadAclState,
     principal_sid: &str,
     psid: *mut c_void,
+    pinned_workspace_root: Option<(&File, &Path)>,
 ) -> Result<bool> {
     let Some(pending) = state.pending_principals.get(principal_sid).cloned() else {
         return Ok(false);
@@ -418,14 +423,15 @@ unsafe fn recover_pending_principal(
         .unwrap_or_default();
     for entry in pending {
         let current = match std::fs::symlink_metadata(&entry.path) {
-            Ok(_) => {
-                unsafe { deny_read_acl_fingerprint(&entry.path, psid) }.with_context(|| {
-                    format!(
-                        "recover pending deny-read ACL fingerprint {}",
-                        entry.path.display()
-                    )
-                })?
+            Ok(_) => unsafe {
+                deny_read_acl_fingerprint_for_path(&entry.path, psid, pinned_workspace_root)
             }
+            .with_context(|| {
+                format!(
+                    "recover pending deny-read ACL fingerprint {}",
+                    entry.path.display()
+                )
+            })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -453,6 +459,62 @@ unsafe fn recover_pending_principal(
         state.principals.insert(principal_sid.to_string(), managed);
     }
     Ok(true)
+}
+
+fn validate_state_acl_path(
+    path: &Path,
+    pinned_workspace_root: Option<(&File, &Path)>,
+) -> Result<()> {
+    if let Some((handle, root_path)) = pinned_workspace_root
+        && open_pinned_workspace_path(handle, root_path, path, 0)?.is_some()
+    {
+        return Ok(());
+    }
+    ensure_case_insensitive_acl_path(path)
+}
+
+unsafe fn deny_read_acl_fingerprint_for_path(
+    path: &Path,
+    psid: *mut c_void,
+    pinned_workspace_root: Option<(&File, &Path)>,
+) -> Result<crate::acl::DenyReadAclFingerprint> {
+    if let Some((handle, root_path)) = pinned_workspace_root
+        && let Some(target) = open_pinned_workspace_path(
+            handle,
+            root_path,
+            path,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+        )?
+    {
+        return unsafe { deny_read_acl_fingerprint_to_handle(target.as_raw_handle() as _, psid) };
+    }
+    unsafe { deny_read_acl_fingerprint(path, psid) }
+}
+
+unsafe fn revoke_deny_read_ace_for_path(
+    path: &Path,
+    psid: *mut c_void,
+    expected: &crate::acl::DenyReadAclFingerprint,
+    pinned_workspace_root: Option<(&File, &Path)>,
+) -> Result<()> {
+    if let Some((handle, root_path)) = pinned_workspace_root
+        && let Some(target) = open_pinned_workspace_path(
+            handle,
+            root_path,
+            path,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+        )?
+    {
+        return unsafe {
+            revoke_deny_read_ace_with_fingerprint_to_handle(
+                target.as_raw_handle() as _,
+                psid,
+                expected,
+            )
+        };
+    }
+    unsafe { crate::acl::revoke_deny_read_ace_with_fingerprint(path, psid, expected) }
 }
 
 fn upsert_managed_path(entries: &mut Vec<ManagedDenyReadAcl>, candidate: ManagedDenyReadAcl) {
@@ -546,6 +608,32 @@ pub unsafe fn sync_persistent_deny_read_acls(
     desired_paths: &[PathBuf],
     psid: *mut c_void,
 ) -> Result<Vec<PathBuf>> {
+    unsafe {
+        sync_persistent_deny_read_acls_with_pinned_root(
+            sandbox_home,
+            principal_sid,
+            desired_paths,
+            psid,
+            None,
+        )
+    }
+}
+
+/// Reconciles deny-read state while reusing a duplicated trusted workspace root handle.
+///
+/// Paths inside the pinned root are opened only relative to that handle; all other paths retain
+/// the ordinary ACL opener. The handle must remain alive for the complete reconciliation.
+///
+/// # Safety
+/// Caller must pass a valid SID pointer matching `principal_sid`. If a pinned root is provided,
+/// its handle must remain valid for the complete reconciliation.
+pub unsafe fn sync_persistent_deny_read_acls_with_pinned_root(
+    sandbox_home: &Path,
+    principal_sid: &str,
+    desired_paths: &[PathBuf],
+    psid: *mut c_void,
+    pinned_workspace_root: Option<(&File, &Path)>,
+) -> Result<Vec<PathBuf>> {
     drop(plan_deny_read_acl_paths(desired_paths)?);
     let state_path = sandbox_dir(sandbox_home).join(DENY_READ_ACL_STATE_FILE);
     let lock = lock_state(&state_path)?;
@@ -564,7 +652,7 @@ pub unsafe fn sync_persistent_deny_read_acls(
                 .flatten(),
         )
     {
-        ensure_case_insensitive_acl_path(&managed.path)?;
+        validate_state_acl_path(&managed.path, pinned_workspace_root)?;
     }
     for path in state
         .legacy_unmanaged_principals
@@ -572,9 +660,10 @@ pub unsafe fn sync_persistent_deny_read_acls(
         .into_iter()
         .flatten()
     {
-        ensure_case_insensitive_acl_path(path)?;
+        validate_state_acl_path(path, pinned_workspace_root)?;
     }
-    if unsafe { recover_pending_principal(&mut state, principal_sid, psid) }? {
+    if unsafe { recover_pending_principal(&mut state, principal_sid, psid, pinned_workspace_root) }?
+    {
         store_state(state_path, &state).context("commit recovered pending deny-read ownership")?;
     }
     let previous_managed = state
@@ -598,13 +687,15 @@ pub unsafe fn sync_persistent_deny_read_acls(
     let application = match application_result {
         Ok(application) => application,
         Err(error) => {
-            let recovery = unsafe { recover_pending_principal(&mut state, principal_sid, psid) }
-                .and_then(|changed| {
-                    changed
-                        .then(|| store_state(state_path, &state))
-                        .transpose()
-                        .map(|_| ())
-                });
+            let recovery = unsafe {
+                recover_pending_principal(&mut state, principal_sid, psid, pinned_workspace_root)
+            }
+            .and_then(|changed| {
+                changed
+                    .then(|| store_state(state_path, &state))
+                    .transpose()
+                    .map(|_| ())
+            });
             return match recovery {
                 Ok(()) => Err(error),
                 Err(recovery_error) => Err(error.context(format!(
@@ -661,7 +752,9 @@ pub unsafe fn sync_persistent_deny_read_acls(
                 continue;
             }
         }
-        let current_fingerprint = match unsafe { deny_read_acl_fingerprint(&managed.path, psid) } {
+        let current_fingerprint = match unsafe {
+            deny_read_acl_fingerprint_for_path(&managed.path, psid, pinned_workspace_root)
+        } {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
                 revoke_error_count = revoke_error_count.saturating_add(1);
@@ -696,7 +789,12 @@ pub unsafe fn sync_persistent_deny_read_acls(
             continue;
         }
         if let Err(error) = unsafe {
-            revoke_deny_read_ace_with_fingerprint(&managed.path, psid, &managed.fingerprint)
+            revoke_deny_read_ace_for_path(
+                &managed.path,
+                psid,
+                &managed.fingerprint,
+                pinned_workspace_root,
+            )
         } {
             revoke_error_count = revoke_error_count.saturating_add(1);
             retain_preferred_reconciliation_error(
@@ -789,6 +887,8 @@ fn merge_tracked_paths(
     merged
 }
 
+/// Decodes structural state without reopening ACL targets that may now deny this caller.
+/// Path consumers perform no-follow admission immediately before reconciliation.
 fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -798,9 +898,6 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                 Some(version) if version == u64::from(DENY_READ_ACL_STATE_VERSION) => {
                     let state: PersistentDenyReadAclState = serde_json::from_value(value)
                         .with_context(|| format!("parse deny-read ACL state {}", path.display()))?;
-                    validate_state_paths(&state).with_context(|| {
-                        format!("validate deny-read ACL state paths {}", path.display())
-                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate deny-read ACL state {}", path.display())
                     })?;
@@ -823,12 +920,6 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         active_runner_leases: previous.active_runner_leases,
                         ..PersistentDenyReadAclState::default()
                     };
-                    validate_state_paths(&state).with_context(|| {
-                        format!(
-                            "validate version 3 deny-read ACL state paths {}",
-                            path.display()
-                        )
-                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate version 3 deny-read ACL state {}", path.display())
                     })?;
@@ -852,12 +943,6 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         ),
                         ..PersistentDenyReadAclState::default()
                     };
-                    validate_state_paths(&state).with_context(|| {
-                        format!(
-                            "validate version 2 deny-read ACL state paths {}",
-                            path.display()
-                        )
-                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate version 2 deny-read ACL state {}", path.display())
                     })?;
@@ -876,12 +961,6 @@ fn load_state(path: &Path) -> Result<PersistentDenyReadAclState> {
                         legacy_unmanaged_principals: legacy.principals,
                         ..PersistentDenyReadAclState::default()
                     };
-                    validate_state_paths(&state).with_context(|| {
-                        format!(
-                            "validate legacy deny-read ACL state paths {}",
-                            path.display()
-                        )
-                    })?;
                     validate_state(&state).with_context(|| {
                         format!("validate legacy deny-read ACL state {}", path.display())
                     })?;
@@ -912,20 +991,6 @@ fn merge_legacy_principals(
         current.dedup();
     }
     merged
-}
-
-fn validate_state_paths(state: &PersistentDenyReadAclState) -> Result<()> {
-    for path in state
-        .principals
-        .values()
-        .flatten()
-        .chain(state.pending_principals.values().flatten())
-        .map(|managed| &managed.path)
-        .chain(state.legacy_unmanaged_principals.values().flatten())
-    {
-        ensure_case_insensitive_acl_path(path)?;
-    }
-    Ok(())
 }
 
 fn validate_state(state: &PersistentDenyReadAclState) -> Result<()> {
@@ -964,8 +1029,8 @@ fn validate_state(state: &PersistentDenyReadAclState) -> Result<()> {
     Ok(())
 }
 
+/// Persists structurally valid state; ACL target admission belongs to the reconciliation boundary.
 fn store_state(path: &Path, state: &PersistentDenyReadAclState) -> Result<()> {
-    validate_state_paths(state)?;
     validate_state(state)?;
     let bytes = serde_json::to_vec_pretty(state).context("serialize deny-read ACL state")?;
     atomic_store(path, &bytes)

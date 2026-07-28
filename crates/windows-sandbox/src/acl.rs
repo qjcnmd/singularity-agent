@@ -707,16 +707,13 @@ fn effective_file_access_mask(mask: u32) -> u32 {
 const WRITE_ALLOW_MASK: u32 =
     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
 
-unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
-    path: &Path,
+unsafe fn ensure_allow_mask_aces_for_target(
+    target: AclTarget,
     sids: &[*mut c_void],
     allow_mask: u32,
     disallow_mask: u32,
     inheritance: u32,
 ) -> Result<bool> {
-    // SAFETY: the caller supplies valid SID pointers and an existing non-reparse path; the
-    // target handle and DACL remain live for the complete ACL update.
-    let target = unsafe { open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) }?;
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     for sid in sids {
         let allows = unsafe {
@@ -780,6 +777,35 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     Ok(added)
 }
 
+/// Captures deny ACEs for `psid` through an already pinned target handle.
+///
+/// # Safety
+/// Caller must pass a valid target handle and SID pointer.
+pub(crate) unsafe fn deny_read_acl_fingerprint_to_handle(
+    handle: HANDLE,
+    psid: *mut c_void,
+) -> Result<DenyReadAclFingerprint> {
+    let target = unsafe { borrow_acl_target(handle) }?;
+    Ok(DenyReadAclFingerprint {
+        entries: unsafe { deny_aces_for_sid(target.p_dacl, psid) }?,
+    })
+}
+
+unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
+    path: &Path,
+    sids: &[*mut c_void],
+    allow_mask: u32,
+    disallow_mask: u32,
+    inheritance: u32,
+) -> Result<bool> {
+    // SAFETY: the caller supplies valid SID pointers and an existing non-reparse path; the
+    // target handle and DACL remain live for the complete ACL update.
+    let target = unsafe { open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) }?;
+    unsafe {
+        ensure_allow_mask_aces_for_target(target, sids, allow_mask, disallow_mask, inheritance)
+    }
+}
+
 /// Ensure all provided SIDs have an allow ACE with the requested mask on the path.
 /// Returns true if any ACE was added.
 ///
@@ -837,6 +863,56 @@ pub unsafe fn ensure_allow_write_aces(path: &Path, sids: &[*mut c_void]) -> Resu
             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
         )
     }
+}
+
+/// Ensures write-capable allow ACEs through an already pinned file handle.
+///
+/// # Safety
+/// Caller must pass a valid existing non-reparse target handle and valid SID pointers. The handle
+/// must grant `READ_CONTROL | WRITE_DAC`.
+pub unsafe fn ensure_allow_write_aces_to_handle(
+    handle: HANDLE,
+    sids: &[*mut c_void],
+) -> Result<bool> {
+    let target = unsafe { borrow_acl_target(handle) }?;
+    unsafe {
+        ensure_allow_mask_aces_for_target(
+            target,
+            sids,
+            WRITE_ALLOW_MASK,
+            FILE_DELETE_CHILD,
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        )
+    }
+}
+
+/// Ensures allow ACEs through an already pinned file handle.
+///
+/// # Safety
+/// Caller must pass a valid existing non-reparse target handle and valid SID pointers. The handle
+/// must grant `READ_CONTROL | WRITE_DAC`.
+pub unsafe fn ensure_allow_mask_aces_with_inheritance_to_handle(
+    handle: HANDLE,
+    sids: &[*mut c_void],
+    allow_mask: u32,
+    inheritance: u32,
+) -> Result<bool> {
+    let target = unsafe { borrow_acl_target(handle) }?;
+    unsafe { ensure_allow_mask_aces_for_target(target, sids, allow_mask, 0, inheritance) }
+}
+
+/// Checks an allow mask through an already pinned file handle.
+///
+/// # Safety
+/// Caller must pass a valid existing non-reparse target handle and valid SID pointers.
+pub unsafe fn handle_mask_allows(
+    handle: HANDLE,
+    psids: &[*mut c_void],
+    desired_mask: u32,
+    require_all_bits: bool,
+) -> Result<bool> {
+    let target = unsafe { borrow_acl_target(handle) }?;
+    Ok(unsafe { dacl_mask_allows(target.p_dacl, psids, desired_mask, require_all_bits) })
 }
 
 /// Adds an allow ACE granting read/write/execute to the given SID on the target path.
@@ -1044,10 +1120,7 @@ unsafe fn add_deny_ace_to_target(
 /// # Safety
 /// Caller must ensure `handle` is a valid directory handle with `READ_CONTROL | WRITE_DAC` and
 /// `psid` points to a valid SID.
-pub(crate) unsafe fn add_deny_write_ace_to_handle(
-    handle: HANDLE,
-    psid: *mut c_void,
-) -> Result<bool> {
+pub unsafe fn add_deny_write_ace_to_handle(handle: HANDLE, psid: *mut c_void) -> Result<bool> {
     Ok(unsafe { add_deny_ace_to_handle(handle, psid, DenyAceKind::Write) }?.added)
 }
 
@@ -1111,12 +1184,43 @@ pub(crate) unsafe fn revoke_deny_read_ace_with_fingerprint(
     unsafe { revoke_deny_read_ace_impl(path, psid, Some(expected)) }
 }
 
+/// Revokes a runtime-owned deny-read ACE through an already pinned target handle.
+///
+/// # Safety
+/// Caller must pass a valid target handle and SID pointer.
+pub(crate) unsafe fn revoke_deny_read_ace_with_fingerprint_to_handle(
+    handle: HANDLE,
+    psid: *mut c_void,
+    expected: &DenyReadAclFingerprint,
+) -> Result<()> {
+    unsafe {
+        revoke_deny_read_ace_impl_with_target(
+            Path::new("<pinned workspace target>"),
+            psid,
+            Some(handle),
+            Some(expected),
+        )
+    }
+}
+
 unsafe fn revoke_deny_read_ace_impl(
     path: &Path,
     psid: *mut c_void,
     expected: Option<&DenyReadAclFingerprint>,
 ) -> Result<()> {
-    let target = match unsafe { open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) } {
+    unsafe { revoke_deny_read_ace_impl_with_target(path, psid, None, expected) }
+}
+
+unsafe fn revoke_deny_read_ace_impl_with_target(
+    path: &Path,
+    psid: *mut c_void,
+    pinned_handle: Option<HANDLE>,
+    expected: Option<&DenyReadAclFingerprint>,
+) -> Result<()> {
+    let target = match pinned_handle
+        .map(|handle| unsafe { borrow_acl_target(handle) })
+        .unwrap_or_else(|| unsafe { open_acl_target(path, READ_CONTROL | WRITE_DAC, 1) })
+    {
         Ok(target) => target,
         Err(error) if is_missing_target_error(&error) => return Ok(()),
         Err(error) => return Err(error),

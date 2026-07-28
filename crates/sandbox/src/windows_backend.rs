@@ -526,6 +526,7 @@ fn execute_prepared_command(
         command_id,
         cancellation,
         prepared,
+        trusted_lease.as_ref(),
         observe_workspace_change.then_some(&mut monitor),
     ) {
         Ok(result) => result,
@@ -960,6 +961,7 @@ impl PreparedCommand {
 fn elevated_capture_request<'a>(
     prepared: &'a PreparedCommand,
     windows_cancellation: WindowsSandboxCancellationToken,
+    trusted_workspace: Option<&'a TrustedWorkspaceLease>,
     workspace_change_monitor: Option<&'a mut Option<WorkspaceChangeMonitor>>,
 ) -> ElevatedSandboxProfileCaptureRequest<'a> {
     let mut elevated = ElevatedSandboxProfileCaptureRequest::new(
@@ -976,6 +978,7 @@ fn elevated_capture_request<'a>(
     elevated.deny_read_paths_override = &prepared.protected_deny_read_paths;
     elevated.deny_write_paths_override = &prepared.protected_deny_write_paths;
     elevated.protect_workspace_metadata = prepared.protect_workspace_metadata;
+    elevated.trusted_workspace = trusted_workspace;
     elevated.workspace_change_monitor = workspace_change_monitor;
     elevated
 }
@@ -984,6 +987,7 @@ fn execute_windows_sandbox(
     command_id: &str,
     cancellation: &CancellationToken,
     prepared: PreparedCommand,
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
     workspace_change_monitor: Option<&mut Option<WorkspaceChangeMonitor>>,
 ) -> Result<CommandResult, String> {
     let started = Instant::now();
@@ -995,6 +999,7 @@ fn execute_windows_sandbox(
         run_windows_sandbox_capture_for_permission_profile_elevated(elevated_capture_request(
             &prepared,
             windows_cancellation.clone(),
+            trusted_workspace,
             workspace_change_monitor,
         ));
     match elevated {
@@ -1831,6 +1836,7 @@ mod tests {
             &prepared,
             WindowsSandboxCancellationToken::new(|| false),
             None,
+            None,
         );
         assert_eq!(
             elevated.deny_read_paths_override,
@@ -1959,6 +1965,7 @@ mod tests {
         let elevated = elevated_capture_request(
             &prepared,
             WindowsSandboxCancellationToken::new(|| false),
+            None,
             None,
         );
         assert_eq!(

@@ -1,5 +1,7 @@
 use crate::absolute_path::AbsolutePathBuf;
 use crate::permissions::PermissionProfile;
+#[cfg(target_os = "windows")]
+use crate::trusted_workspace::TrustedWorkspaceLease;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,6 +26,8 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub protect_workspace_metadata: bool,
     #[cfg(target_os = "windows")]
     pub workspace_change_monitor: Option<&'a mut Option<crate::WorkspaceChangeMonitor>>,
+    #[cfg(target_os = "windows")]
+    pub trusted_workspace: Option<&'a TrustedWorkspaceLease>,
 }
 
 impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
@@ -55,6 +59,8 @@ impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
             protect_workspace_metadata: true,
             #[cfg(target_os = "windows")]
             workspace_change_monitor: None,
+            #[cfg(target_os = "windows")]
+            trusted_workspace: None,
         }
     }
 }
@@ -75,7 +81,6 @@ mod windows_impl {
     use crate::env::inherit_path_env;
     use crate::env::normalize_null_device_env;
     use crate::identity::refresh_logon_sandbox_creds;
-    use crate::identity::require_logon_sandbox_creds;
     use crate::ipc_framed::EmptyPayload;
     use crate::ipc_framed::FramedMessage;
     use crate::ipc_framed::Message;
@@ -199,6 +204,7 @@ mod windows_impl {
             deny_write_paths_override,
             protect_workspace_metadata,
             workspace_change_monitor,
+            trusted_workspace,
         } = request;
         // Resolve safe aliases once so the execution mutex, setup payload, runner registration,
         // cleanup, and every state-file operation share one long-lived sandbox-home identity.
@@ -275,7 +281,7 @@ mod windows_impl {
         else {
             return Ok(cancelled_capture_result());
         };
-        let sandbox_creds = require_logon_sandbox_creds(
+        let sandbox_creds = crate::identity::require_logon_sandbox_creds(
             &permissions,
             cwd,
             &env_map,
@@ -287,6 +293,7 @@ mod windows_impl {
             &deny_write_paths_override,
             proxy_enforced,
             crate::WindowsSandboxProxySettingsMode::Reconcile,
+            trusted_workspace,
         )?;
         // Setup refresh/elevation is a synchronous external operation and cannot be interrupted
         // safely from this call. Do not continue into ACL mutation or runner creation if it
@@ -400,6 +407,7 @@ mod windows_impl {
                         &deny_write_paths_override,
                         proxy_enforced,
                         crate::WindowsSandboxProxySettingsMode::Reconcile,
+                        trusted_workspace,
                     )
                 },
             ) {

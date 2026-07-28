@@ -12,6 +12,7 @@ mod windows {
     use crate::path_safety::open_existing_acl_target;
     use rand::rngs::SmallRng;
     use rand::{RngCore, SeedableRng};
+    use serde::{Deserialize, Serialize};
     use std::ffi::{OsStr, c_void};
     use std::fs::File;
     use std::os::windows::ffi::OsStrExt;
@@ -22,14 +23,19 @@ mod windows {
         NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
-        HANDLE, STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_COLLISION, STATUS_SUCCESS,
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
+        STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_COLLISION, STATUS_SUCCESS,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
         FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FILE_LIST_DIRECTORY,
-        FILE_READ_ATTRIBUTES, FileDispositionInfoEx, GetFileInformationByHandle,
-        SetFileInformationByHandle,
+        FILE_READ_ATTRIBUTES, FileDispositionInfoEx, GetFileInformationByHandle, READ_CONTROL,
+        SetFileInformationByHandle, WRITE_DAC,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetProcessId, OpenProcess, PROCESS_DUP_HANDLE,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     const MAX_QUARANTINE_ATTEMPTS: usize = 8;
@@ -44,6 +50,18 @@ mod windows {
         QuarantineFailed,
         CleanupFailed,
         AlreadyFinalized,
+    }
+
+    /// Serialized capability metadata used to duplicate the lease root into the setup helper.
+    ///
+    /// The handle value is meaningful only in `parent_pid`; the helper must duplicate it before
+    /// any workspace ACL/path operation and then verify the resulting object identity.
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    pub struct TrustedWorkspaceSetupPin {
+        pub parent_pid: u32,
+        pub root_handle: u64,
+        pub root_path: PathBuf,
+        pub root_identity: (u32, u64, u32),
     }
 
     impl TrustedWorkspaceError {
@@ -137,7 +155,7 @@ mod windows {
             let root_file = open_existing_child(
                 &parent,
                 &root_name,
-                DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+                DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
             )
             .map_err(classify_open_error)?;
             let parent_identity = object_identity(&parent)?;
@@ -170,7 +188,7 @@ mod windows {
             let (root_file, _) = crate::path_safety::nt_open_relative(
                 &parent,
                 &root_name,
-                DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+                DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
                 FILE_CREATE,
                 FILE_DIRECTORY_FILE,
             )
@@ -266,6 +284,29 @@ mod windows {
             self.identity_fingerprint() == fingerprint
         }
 
+        /// Produce the parent-process handle pin consumed by the elevated setup helper.
+        pub fn setup_pin(
+            &self,
+        ) -> std::result::Result<TrustedWorkspaceSetupPin, TrustedWorkspaceError> {
+            self.verify()?;
+            let root_path = dunce::canonicalize(self.parent_path.join(&self.root_name))
+                .map_err(|_| TrustedWorkspaceError::RootUnavailable)?;
+            let root_handle = self.root.as_raw_handle() as usize;
+            if root_handle == 0 || root_handle == INVALID_HANDLE_VALUE as usize {
+                return Err(TrustedWorkspaceError::IdentityUnavailable);
+            }
+            Ok(TrustedWorkspaceSetupPin {
+                parent_pid: unsafe { GetCurrentProcessId() },
+                root_handle: root_handle as u64,
+                root_path,
+                root_identity: (
+                    self.root_identity.volume_serial,
+                    self.root_identity.file_index,
+                    self.root_identity.links,
+                ),
+            })
+        }
+
         /// Duplicate the pinned root handle for capability-relative inspection by the sandbox
         /// adapter without reopening the pathname or weakening the no-delete-sharing lease.
         pub fn duplicate_root_handle(&self) -> std::result::Result<File, TrustedWorkspaceError> {
@@ -343,6 +384,65 @@ mod windows {
             file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
             links: info.nNumberOfLinks,
         })
+    }
+
+    /// Duplicate and verify a parent-held trusted root handle in the current helper process.
+    ///
+    /// A dead parent, a reused PID/handle, or an object identity mismatch is rejected before the
+    /// caller can perform any ACL or path side effect. Once duplicated, the returned handle keeps
+    /// the root pinned even if the parent process exits.
+    pub fn duplicate_setup_root_handle(
+        pin: &TrustedWorkspaceSetupPin,
+    ) -> std::result::Result<File, TrustedWorkspaceError> {
+        if pin.parent_pid == 0 || pin.root_handle == 0 {
+            return Err(TrustedWorkspaceError::IdentityUnavailable);
+        }
+        let source = unsafe {
+            OpenProcess(
+                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pin.parent_pid,
+            )
+        };
+        if source == 0 || source == INVALID_HANDLE_VALUE {
+            return Err(TrustedWorkspaceError::IdentityUnavailable);
+        }
+        let source_pid = unsafe { GetProcessId(source) };
+        if source_pid != pin.parent_pid {
+            unsafe {
+                CloseHandle(source);
+            }
+            return Err(TrustedWorkspaceError::IdentityUnavailable);
+        }
+        let mut duplicate: HANDLE = 0;
+        let duplicated = unsafe {
+            DuplicateHandle(
+                source,
+                pin.root_handle as HANDLE,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        unsafe {
+            CloseHandle(source);
+        }
+        if duplicated == 0 || duplicate == 0 || duplicate == INVALID_HANDLE_VALUE {
+            if duplicate != 0 && duplicate != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(duplicate);
+                }
+            }
+            return Err(TrustedWorkspaceError::IdentityUnavailable);
+        }
+        let file = unsafe { File::from_raw_handle(duplicate as _) };
+        let identity = object_identity(&file)?;
+        if (identity.volume_serial, identity.file_index, identity.links) != pin.root_identity {
+            return Err(TrustedWorkspaceError::RootDrift);
+        }
+        Ok(file)
     }
 
     impl ObjectIdentity {
@@ -496,11 +596,14 @@ mod windows {
 }
 
 #[cfg(target_os = "windows")]
-pub use windows::{Error as TrustedWorkspaceError, TrustedWorkspaceLease};
+pub use windows::{
+    Error as TrustedWorkspaceError, TrustedWorkspaceLease, TrustedWorkspaceSetupPin,
+    duplicate_setup_root_handle,
+};
 
 #[cfg(all(target_os = "windows", test))]
 mod tests {
-    use super::{TrustedWorkspaceError, TrustedWorkspaceLease};
+    use super::{TrustedWorkspaceError, TrustedWorkspaceLease, duplicate_setup_root_handle};
     use std::fs;
     use std::os::windows::fs::symlink_dir;
     use std::path::{Path, PathBuf};
@@ -529,6 +632,18 @@ mod tests {
         lease.commit().expect("commit");
 
         assert!(root.is_dir());
+    }
+
+    #[test]
+    fn setup_pin_duplicates_root_and_survives_parent_lease_drop() {
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).expect("root");
+        let lease = TrustedWorkspaceLease::acquire(&root).expect("acquire");
+        let pin = lease.setup_pin().expect("setup pin");
+        let duplicate = duplicate_setup_root_handle(&pin).expect("duplicate pinned root");
+        drop(lease);
+        assert!(duplicate.metadata().expect("metadata").is_dir());
     }
 
     #[test]

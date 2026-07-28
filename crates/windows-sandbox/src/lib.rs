@@ -210,6 +210,8 @@ pub use acl::WindowsAclError;
 pub use acl::add_deny_read_ace;
 #[cfg(target_os = "windows")]
 pub use acl::add_deny_write_ace;
+#[cfg(target_os = "windows")]
+pub use acl::add_deny_write_ace_to_handle;
 
 #[cfg(target_os = "windows")]
 pub use acl::allow_null_device;
@@ -218,9 +220,15 @@ pub use acl::ensure_allow_mask_aces;
 #[cfg(target_os = "windows")]
 pub use acl::ensure_allow_mask_aces_with_inheritance;
 #[cfg(target_os = "windows")]
+pub use acl::ensure_allow_mask_aces_with_inheritance_to_handle;
+#[cfg(target_os = "windows")]
 pub use acl::ensure_allow_write_aces;
 #[cfg(target_os = "windows")]
+pub use acl::ensure_allow_write_aces_to_handle;
+#[cfg(target_os = "windows")]
 pub use acl::fetch_dacl_handle;
+#[cfg(target_os = "windows")]
+pub use acl::handle_mask_allows;
 #[cfg(target_os = "windows")]
 pub use acl::path_mask_allows;
 #[cfg(target_os = "windows")]
@@ -253,6 +261,8 @@ pub use deny_read_resolver::resolve_windows_deny_read_paths;
 pub use deny_read_state::acquire_registered_runner_lease;
 #[cfg(target_os = "windows")]
 pub use deny_read_state::sync_persistent_deny_read_acls;
+#[cfg(target_os = "windows")]
+pub use deny_read_state::sync_persistent_deny_read_acls_with_pinned_root;
 #[cfg(target_os = "windows")]
 pub use desktop::LaunchDesktop;
 #[cfg(target_os = "windows")]
@@ -317,6 +327,8 @@ pub use path_safety::ProtectedMetadataError;
 pub use path_safety::ensure_case_insensitive_acl_path;
 #[cfg(target_os = "windows")]
 pub use path_safety::ensure_case_insensitive_path_ancestors;
+#[cfg(target_os = "windows")]
+pub use path_safety::open_pinned_workspace_path;
 #[cfg(target_os = "windows")]
 pub use process::JobObject;
 #[cfg(target_os = "windows")]
@@ -406,7 +418,10 @@ pub use token::create_workspace_write_token_with_caps_from;
 #[cfg(target_os = "windows")]
 pub use token::get_current_token_for_restriction;
 #[cfg(target_os = "windows")]
-pub use trusted_workspace::{TrustedWorkspaceError, TrustedWorkspaceLease};
+pub use trusted_workspace::{
+    TrustedWorkspaceError, TrustedWorkspaceLease, TrustedWorkspaceSetupPin,
+    duplicate_setup_root_handle,
+};
 #[cfg(target_os = "windows")]
 pub use wfp_setup::install_wfp_filters;
 #[cfg(target_os = "windows")]

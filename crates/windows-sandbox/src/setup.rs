@@ -39,6 +39,7 @@ use crate::setup_error::extract_failure;
 use crate::setup_error::failure;
 use crate::setup_error::read_setup_error_report;
 use crate::ssh_config_dependencies::ssh_config_dependency_paths;
+use crate::trusted_workspace::{TrustedWorkspaceLease, TrustedWorkspaceSetupPin};
 use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine;
@@ -263,6 +264,7 @@ pub fn run_setup_refresh(
         SetupRootOverrides::default(),
         /*offline_proxy_settings_override*/ None,
         /*elevated_authority*/ false,
+        /*trusted_workspace*/ None,
     )
 }
 
@@ -270,12 +272,14 @@ pub(crate) fn run_setup_refresh_with_overrides_and_proxy_settings(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings: &OfflineProxySettings,
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
 ) -> Result<()> {
     run_setup_refresh_inner(
         request,
         overrides,
         Some(offline_proxy_settings),
         /*elevated_authority*/ false,
+        trusted_workspace,
     )
 }
 
@@ -283,12 +287,14 @@ pub(crate) fn run_setup_refresh_with_elevated_acl_authority(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings: &OfflineProxySettings,
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
 ) -> Result<()> {
     run_setup_refresh_inner(
         request,
         overrides,
         Some(offline_proxy_settings),
         /*elevated_authority*/ true,
+        trusted_workspace,
     )
 }
 
@@ -328,6 +334,7 @@ pub fn run_setup_refresh_with_extra_read_roots(
         },
         /*offline_proxy_settings_override*/ None,
         /*elevated_authority*/ false,
+        /*trusted_workspace*/ None,
     )
 }
 
@@ -336,6 +343,7 @@ fn run_setup_refresh_inner(
     overrides: SetupRootOverrides,
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
     elevated_authority: bool,
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
 ) -> Result<()> {
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
@@ -345,6 +353,9 @@ fn run_setup_refresh_inner(
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
+    let trusted_workspace_root = trusted_workspace
+        .map(TrustedWorkspaceLease::setup_pin)
+        .transpose()?;
     let payload = ElevationPayload {
         version: SETUP_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
@@ -360,6 +371,7 @@ fn run_setup_refresh_inner(
         real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
         mode: SetupMode::Full,
         refresh_only: true,
+        trusted_workspace_root,
     };
     let json = serde_json::to_vec(&payload)?;
     let b64 = BASE64_STANDARD.encode(json);
@@ -699,6 +711,8 @@ struct ElevationPayload {
     mode: SetupMode,
     #[serde(default)]
     refresh_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trusted_workspace_root: Option<TrustedWorkspaceSetupPin>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -1043,6 +1057,7 @@ pub fn run_elevated_setup(
 ) -> Result<()> {
     run_elevated_setup_inner(
         request, overrides, /*offline_proxy_settings_override*/ None,
+        /*trusted_workspace*/ None,
     )
 }
 
@@ -1050,14 +1065,21 @@ pub(crate) fn run_elevated_setup_with_proxy_settings(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings: &OfflineProxySettings,
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
 ) -> Result<()> {
-    run_elevated_setup_inner(request, overrides, Some(offline_proxy_settings))
+    run_elevated_setup_inner(
+        request,
+        overrides,
+        Some(offline_proxy_settings),
+        trusted_workspace,
+    )
 }
 
 fn run_elevated_setup_inner(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
     offline_proxy_settings_override: Option<&OfflineProxySettings>,
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
 ) -> Result<()> {
     if !request.permissions.is_enforceable_by_windows_sandbox() {
         anyhow::bail!("unsupported filesystem permissions for Windows sandbox setup");
@@ -1075,6 +1097,9 @@ fn run_elevated_setup_inner(
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
+    let trusted_workspace_root = trusted_workspace
+        .map(TrustedWorkspaceLease::setup_pin)
+        .transpose()?;
     let payload = ElevationPayload {
         version: SETUP_VERSION,
         offline_username: OFFLINE_USERNAME.to_string(),
@@ -1090,6 +1115,7 @@ fn run_elevated_setup_inner(
         real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
         mode: SetupMode::Full,
         refresh_only: false,
+        trusted_workspace_root,
     };
     let needs_elevation = !is_elevated().map_err(|err| {
         failure(
@@ -1134,6 +1160,7 @@ pub fn run_elevated_provisioning_setup(sandbox_home: &Path, real_user: &str) -> 
         real_user: real_user.to_string(),
         mode: SetupMode::ProvisionOnly,
         refresh_only: false,
+        trusted_workspace_root: None,
     };
     run_setup_exe(&payload, /*needs_elevation*/ false, sandbox_home)
 }

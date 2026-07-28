@@ -462,11 +462,93 @@ pub(crate) fn open_existing_acl_target(path: &Path, desired_access: u32) -> Resu
     Ok(file)
 }
 
+/// Opens a workspace root or descendant relative to an already pinned root handle.
+///
+/// `Ok(None)` means the lexical target is outside `root_path` and the caller may use its normal
+/// opener. A target lexically inside the root is never reopened by pathname: every component is
+/// opened from the previous handle with `FILE_OPEN_REPARSE_POINT`, and any reparse object is
+/// rejected before the handle is returned.
+pub fn open_pinned_workspace_path(
+    root_handle: &std::fs::File,
+    root_path: &Path,
+    target: &Path,
+    desired_access: u32,
+) -> Result<Option<std::fs::File>> {
+    let (root_anchor, root_descendants) = absolute_path_components(root_path)?;
+    let (target_anchor, target_descendants) = absolute_path_components(target)?;
+    if !root_anchor
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&target_anchor.to_string_lossy())
+        || target_descendants.len() < root_descendants.len()
+        || !root_descendants
+            .iter()
+            .zip(&target_descendants)
+            .all(|(left, right)| {
+                left.to_string_lossy()
+                    .eq_ignore_ascii_case(&right.to_string_lossy())
+            })
+    {
+        return Ok(None);
+    }
+
+    let mut current = root_handle
+        .try_clone()
+        .context("duplicate pinned workspace root handle")?;
+    validate_plain_directory(&current, root_path)?;
+    let descendants = &target_descendants[root_descendants.len()..];
+    if descendants.is_empty() {
+        validate_pinned_target(&current, target)?;
+        return Ok(Some(current));
+    }
+    let mut current_path = root_path.to_path_buf();
+    for (index, component) in descendants.iter().enumerate() {
+        let is_final = index + 1 == descendants.len();
+        let access = if is_final {
+            desired_access
+        } else {
+            FILE_LIST_DIRECTORY
+        };
+        let options = if is_final { 0 } else { FILE_DIRECTORY_FILE };
+        let (next, _) = nt_open_relative(&current, component, access, FILE_OPEN, options)
+            .with_context(|| format!("open pinned workspace component {}", target.display()))?;
+        current_path.push(component);
+        if !is_final {
+            validate_plain_directory(&next, &current_path)?;
+        }
+        current = next;
+    }
+    validate_pinned_target(&current, target)?;
+    Ok(Some(current))
+}
+
+fn validate_pinned_target(file: &std::fs::File, path: &Path) -> Result<()> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect pinned workspace target {}", path.display()))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(anyhow::Error::new(
+            ProtectedMetadataError::ReparseTargetUnsupported {
+                path: path.to_path_buf(),
+            },
+        ));
+    }
+    if metadata.is_dir() {
+        ensure_case_insensitive_directory(file, path)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::CaseSensitivityTestOutcome;
     use super::ProtectedMetadataError;
     use super::enable_case_sensitive_directory_for_test;
     use super::ensure_case_insensitive_acl_path;
+    use super::open_filesystem_root;
+    use super::open_pinned_workspace_path;
+    use super::override_case_sensitivity_for_test;
+    use std::fs;
+    use windows_sys::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY;
 
     #[test]
     #[ignore = "requires permission to enable an NTFS per-directory case-sensitive flag"]
@@ -484,6 +566,27 @@ mod tests {
             Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported {
                 path: temp.path().to_path_buf(),
             })
+        );
+    }
+
+    #[test]
+    fn pinned_workspace_rejects_case_sensitive_intermediate_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("root");
+        let nested = root.join("nested");
+        let leaf = nested.join("leaf.txt");
+        fs::create_dir(&root).expect("root");
+        fs::create_dir(&nested).expect("nested");
+        fs::write(&leaf, b"payload").expect("leaf");
+
+        let root_handle = open_filesystem_root(&root, FILE_LIST_DIRECTORY).expect("root handle");
+        let _override =
+            override_case_sensitivity_for_test(&nested, CaseSensitivityTestOutcome::CaseSensitive);
+        let error = open_pinned_workspace_path(&root_handle, &root, &leaf, 0)
+            .expect_err("case-sensitive intermediate directory must fail closed");
+        assert_eq!(
+            error.downcast_ref::<ProtectedMetadataError>(),
+            Some(&ProtectedMetadataError::CaseSensitiveDirectoryUnsupported { path: nested })
         );
     }
 }

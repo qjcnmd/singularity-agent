@@ -3,9 +3,9 @@
 use schemars::schema_for;
 use singularity_core::CancellationToken;
 #[cfg(windows)]
-use singularity_sandbox::SandboxNetworkMode;
-#[cfg(windows)]
 use singularity_sandbox::WorkspaceMutation;
+#[cfg(windows)]
+use singularity_sandbox::{CommandEnvironmentPolicy, SandboxNetworkMode};
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
     CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
@@ -613,13 +613,44 @@ fn windows_elevated_preflight_verifies_full_contract() {
         .prefix(".trusted-preparation-")
         .tempdir_in(work_root)
         .expect("workspace");
-    let report =
-        WindowsSandboxBackend::new().preflight(workspace.path(), &CancellationToken::new());
+    let backend = WindowsSandboxBackend::new();
+    let report = backend.preflight(workspace.path(), &CancellationToken::new());
 
     assert!(
         report.proves_supported_contract_for("windows"),
         "{report:#?}"
     );
+    let mut request = CommandRequest::trusted_workspace_preparation(
+        "trusted_preparation_after_preflight",
+        vec![
+            "git".to_string(),
+            "init".to_string(),
+            "--quiet".to_string(),
+            "follow-up-source".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Denied;
+    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    let result = backend.execute(&request);
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result:#?}"
+    );
+    assert_eq!(
+        result.semantic_status,
+        CommandSemanticStatus::Succeeded,
+        "{result:#?}"
+    );
+    assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+    assert!(result.workspace_change_summary.is_some());
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result.sandbox.local_process_fallback);
 }
 
 #[cfg(windows)]
