@@ -152,6 +152,8 @@ mod resolved_permissions;
 #[cfg(target_os = "windows")]
 mod token;
 #[cfg(target_os = "windows")]
+mod trusted_workspace;
+#[cfg(target_os = "windows")]
 mod wfp;
 #[cfg(target_os = "windows")]
 mod wfp_setup;
@@ -401,6 +403,8 @@ pub use token::create_workspace_write_token_with_caps_and_user_from;
 pub use token::create_workspace_write_token_with_caps_from;
 #[cfg(target_os = "windows")]
 pub use token::get_current_token_for_restriction;
+#[cfg(target_os = "windows")]
+pub use trusted_workspace::{TrustedWorkspaceError, TrustedWorkspaceLease};
 #[cfg(target_os = "windows")]
 pub use wfp::install_wfp_filters_for_account;
 #[cfg(target_os = "windows")]

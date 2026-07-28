@@ -341,12 +341,29 @@ pub(super) fn snapshot_trusted_workspace(workspace: &Path) -> Result<WorkspaceSn
     snapshot_workspace_with_protected_paths(workspace, false)
 }
 
+/// Snapshot a trusted workspace through an already pinned root handle.
+#[cfg(target_os = "windows")]
+pub(super) fn snapshot_trusted_workspace_from_handle(
+    handle: &std::fs::File,
+) -> Result<WorkspaceSnapshot, String> {
+    let root = Dir::from_std_file(
+        handle
+            .try_clone()
+            .map_err(|error| format!("workspace change snapshot handle clone failed: {error}"))?,
+    );
+    snapshot_opened_directory(root, false)
+}
+
 fn snapshot_workspace_with_protected_paths(
     workspace: &Path,
     protect_paths: bool,
 ) -> Result<WorkspaceSnapshot, String> {
     let root = Dir::open_ambient_dir(workspace, ambient_authority())
         .map_err(|error| format!("workspace change snapshot is unavailable: {error}"))?;
+    snapshot_opened_directory(root, protect_paths)
+}
+
+fn snapshot_opened_directory(root: Dir, protect_paths: bool) -> Result<WorkspaceSnapshot, String> {
     let root_before = root
         .dir_metadata()
         .and_then(|metadata| entry_metadata(&metadata))

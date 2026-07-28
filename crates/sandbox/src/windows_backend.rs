@@ -13,7 +13,7 @@ use super::{
     SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightReport,
     WorkspaceChangeSummary, WorkspaceMutation, WorkspaceSnapshot, command_request_denial,
     command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
-    snapshot_trusted_workspace, snapshot_workspace,
+    snapshot_trusted_workspace, snapshot_trusted_workspace_from_handle, snapshot_workspace,
 };
 use singularity_core::{
     PROTECTED_METADATA_PATH_NAMES, PROTECTED_PATH_CONTAINS_MARKERS, PROTECTED_PATH_EXACT_MARKERS,
@@ -22,9 +22,9 @@ use singularity_core::{
 use singularity_windows_sandbox::{
     AbsolutePathBuf, ElevatedSandboxProfileCaptureRequest, FileSystemAccessMode, FileSystemPath,
     FileSystemSandboxEntry, FileSystemSandboxPolicy, ManagedFileSystemPermissions,
-    NetworkSandboxPolicy, PermissionProfile, WindowsSandboxCancellationToken,
-    WorkspaceChangeMonitor, WorkspaceChangeObservation, resolve_windows_deny_read_paths,
-    run_windows_sandbox_capture_for_permission_profile_elevated,
+    NetworkSandboxPolicy, PermissionProfile, TrustedWorkspaceError, TrustedWorkspaceLease,
+    WindowsSandboxCancellationToken, WorkspaceChangeMonitor, WorkspaceChangeObservation,
+    resolve_windows_deny_read_paths, run_windows_sandbox_capture_for_permission_profile_elevated,
     run_windows_sandbox_capture_with_filesystem_overrides, safe_windows_error_summary,
 };
 
@@ -40,8 +40,7 @@ const RESTRICTED_FAILURE_PREFIX: &str = "restricted-token Windows sandbox failed
 const PROTECTED_PATH_ENFORCEMENT_FAILED: &str = "protected workspace path enforcement failed";
 const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
     "capability_not_supported:workspace_change_summary";
-const TRUSTED_PREPARATION_UNSUPPORTED_CODE: &str =
-    "sandbox_preflight_trusted_preparation_unsupported";
+const TRUSTED_WORKSPACE_ROLLBACK_FAILED: &str = "trusted_workspace_rollback_failed";
 
 #[derive(Debug)]
 struct ResolvedExecutable {
@@ -86,6 +85,167 @@ impl WindowsSandboxBackend {
     pub fn new() -> Self {
         Self
     }
+
+    fn probe_network_denied(
+        &self,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), &'static str> {
+        use std::net::TcpListener;
+
+        if cancellation.is_cancelled() {
+            return Err("sandbox_preflight_cancelled");
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|_| "sandbox_preflight_network_probe_unavailable")?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| "sandbox_preflight_network_probe_unavailable")?;
+        let port = listener
+            .local_addr()
+            .map_err(|_| "sandbox_preflight_network_probe_unavailable")?
+            .port();
+        let script = format!(
+            "$ErrorActionPreference='Stop'; $client=New-Object System.Net.Sockets.TcpClient; try {{ $client.Connect('127.0.0.1',{port}); exit 17 }} catch {{ exit 0 }}"
+        );
+        let result = self.run_preflight_script(
+            workspace,
+            "sandbox_preflight_network_denied",
+            script,
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+            cancellation,
+        );
+        let connected = listener.accept().is_ok();
+        if connected {
+            return Err("sandbox_preflight_network_denied_unverified");
+        }
+        if cancellation.is_cancelled() {
+            return Err("sandbox_preflight_cancelled");
+        }
+        if !strict_elevated_result(&result)
+            || result.semantic_status != CommandSemanticStatus::Succeeded
+        {
+            return Err("sandbox_preflight_network_denied_unverified");
+        }
+        Ok(())
+    }
+
+    fn probe_protected_paths(
+        &self,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), &'static str> {
+        let protected = workspace.join(".git");
+        let sentinel = protected.join("singularity-preflight-protected.txt");
+        std::fs::create_dir_all(&protected)
+            .map_err(|_| "sandbox_preflight_protected_probe_unavailable")?;
+        std::fs::write(&sentinel, "singularity-protected-sentinel")
+            .map_err(|_| "sandbox_preflight_protected_probe_unavailable")?;
+        let read_result = self.run_preflight_script(
+            workspace,
+            "sandbox_preflight_protected_read",
+            "$ErrorActionPreference='Stop'; try { $value=Get-Content -LiteralPath '.git\\singularity-preflight-protected.txt' -Raw; if ($value -match 'singularity-protected-sentinel') { exit 17 }; exit 18 } catch { exit 0 }".to_string(),
+            SandboxFilesystemMode::ReadOnly,
+            SandboxNetworkMode::Denied,
+            cancellation,
+        );
+        if cancellation.is_cancelled() {
+            return Err("sandbox_preflight_cancelled");
+        }
+        if !strict_elevated_result(&read_result)
+            || read_result.semantic_status != CommandSemanticStatus::Succeeded
+            || read_result
+                .stdout_preview
+                .contains("singularity-protected-sentinel")
+        {
+            return Err("sandbox_preflight_protected_probe_failed");
+        }
+        let write_result = self.run_preflight_script(
+            workspace,
+            "sandbox_preflight_protected_write",
+            "$ErrorActionPreference='Stop'; try { Set-Content -LiteralPath '.git\\singularity-preflight-protected.txt' -Value 'tampered'; exit 17 } catch { exit 0 }".to_string(),
+            SandboxFilesystemMode::WorkspaceWrite,
+            SandboxNetworkMode::Denied,
+            cancellation,
+        );
+        let preserved = std::fs::read_to_string(&sentinel).ok().as_deref()
+            == Some("singularity-protected-sentinel");
+        if cancellation.is_cancelled() {
+            return Err("sandbox_preflight_cancelled");
+        }
+        if !preserved
+            || !strict_elevated_result(&write_result)
+            || write_result.semantic_status != CommandSemanticStatus::Succeeded
+            || write_result.workspace_mutation == WorkspaceMutation::Changed
+        {
+            return Err("sandbox_preflight_protected_probe_failed");
+        }
+        Ok(())
+    }
+
+    fn probe_trusted_transaction(
+        &self,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), &'static str> {
+        if cancellation.is_cancelled() {
+            return Err("sandbox_preflight_cancelled");
+        }
+        let mut request = CommandRequest::trusted_workspace_preparation(
+            "sandbox_preflight_trusted_transaction",
+            vec![
+                "git".to_string(),
+                "init".to_string(),
+                "--quiet".to_string(),
+                "source".to_string(),
+            ],
+            workspace.to_string_lossy().into_owned(),
+            workspace.to_string_lossy().into_owned(),
+        );
+        request.timeout_seconds = 30;
+        request.network.mode = SandboxNetworkMode::Denied;
+        request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+        let result = self.execute_cancellable(&request, cancellation);
+        if cancellation.is_cancelled() {
+            return Err("sandbox_preflight_cancelled");
+        }
+        if !strict_elevated_result(&result)
+            || result.semantic_status != CommandSemanticStatus::Succeeded
+            || result.workspace_mutation != WorkspaceMutation::Changed
+            || result.workspace_change_summary.is_none()
+        {
+            return Err("sandbox_preflight_trusted_preparation_unverified");
+        }
+        Ok(())
+    }
+
+    fn run_preflight_script(
+        &self,
+        workspace: &Path,
+        command_id: &str,
+        script: String,
+        filesystem: SandboxFilesystemMode,
+        network: SandboxNetworkMode,
+        cancellation: &CancellationToken,
+    ) -> CommandResult {
+        let mut request = CommandScriptRequest::agent_requested_with_policy(
+            command_id,
+            script,
+            workspace.to_string_lossy().into_owned(),
+            workspace.to_string_lossy().into_owned(),
+            filesystem,
+            network,
+        );
+        request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+        self.execute_script_cancellable(&request, cancellation)
+    }
+}
+
+fn strict_elevated_result(result: &CommandResult) -> bool {
+    result.sandbox.backend == ELEVATED_BACKEND_NAME
+        && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
+        && !result.sandbox.local_process_fallback
 }
 
 impl SandboxBackend for WindowsSandboxBackend {
@@ -113,10 +273,26 @@ impl SandboxBackend for WindowsSandboxBackend {
             report.unsupported("sandbox_preflight_cancelled", &["cancellation"]);
             return report;
         }
-        // Windows trusted preparation currently has no isolated staging, drift ownership,
-        // or failure/cancellation rollback. Do not write a probe into the real workspace or
-        // advertise transactional capability until that contract is implemented.
-        mark_trusted_preparation_unsupported(&mut report);
+        if let Err(code) = self.probe_network_denied(workspace, cancellation) {
+            report.unsupported(code, &["network_denied"]);
+            return report;
+        }
+        report.network_denied = SandboxPreflightFact::Passed;
+        if let Err(code) = self.probe_protected_paths(workspace, cancellation) {
+            report.unsupported(code, &["protected_metadata_admission"]);
+            return report;
+        }
+        report.protected_paths = SandboxPreflightFact::Passed;
+        if let Err(code) = self.probe_trusted_transaction(workspace, cancellation) {
+            report.unsupported(
+                code,
+                &["transactional_workspace", "trusted_workspace_preparation"],
+            );
+            return report;
+        }
+        report.transactional_workspace = SandboxPreflightFact::Passed;
+        report.outcome = super::SandboxPreflightOutcome::Supported;
+        report.error_code = None;
         report
     }
 
@@ -230,15 +406,6 @@ impl SandboxBackend for WindowsSandboxBackend {
     }
 }
 
-/// Mark Windows Evaluation preflight unsupported until trusted preparation is transactional.
-fn mark_trusted_preparation_unsupported(report: &mut SandboxPreflightReport) {
-    report.transactional_workspace = SandboxPreflightFact::Failed;
-    report.unsupported(
-        TRUSTED_PREPARATION_UNSUPPORTED_CODE,
-        &["transactional_workspace", "trusted_workspace_preparation"],
-    );
-}
-
 #[cfg(windows)]
 fn windows_filesystem_fact(workspace: &Path) -> Option<String> {
     use windows_sys::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
@@ -330,9 +497,12 @@ fn execute_prepared_command(
     prepared: PreparedCommand,
     observe_workspace_change: bool,
 ) -> CommandResult {
+    let mut prepared = prepared;
     let workspace = prepared.workspace_roots[0].as_path().to_path_buf();
     let before = prepared.before.clone();
     let protect_workspace_metadata = prepared.protect_workspace_metadata;
+    let mut trusted_lease = prepared.trusted_workspace.take();
+    let trusted_workspace = trusted_lease.is_some();
     let mut monitor = None;
     let result = match execute_windows_sandbox(
         command_id,
@@ -342,11 +512,90 @@ fn execute_prepared_command(
     ) {
         Ok(result) => result,
         Err(error) => {
+            if let Some(mut lease) = trusted_lease.take()
+                && let Err(rollback) = lease.rollback()
+            {
+                return CommandResult::backend_error(
+                    command_id,
+                    format!("{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}", rollback.code()),
+                )
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable);
+            }
             return CommandResult::backend_error(command_id, error)
                 .with_workspace_mutation(WorkspaceMutation::Unknown)
                 .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable);
         }
     };
+    if trusted_workspace {
+        let Some(mut lease) = trusted_lease.take() else {
+            return CommandResult::backend_error(
+                command_id,
+                TrustedWorkspaceError::AlreadyFinalized.code(),
+            )
+            .with_workspace_mutation(WorkspaceMutation::Unknown)
+            .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable);
+        };
+        if !trusted_command_succeeded(&result) {
+            if let Err(rollback) = lease.rollback() {
+                return CommandResult::backend_error(
+                    command_id,
+                    format!("{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}", rollback.code()),
+                )
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable);
+            }
+            return result.with_workspace_mutation(WorkspaceMutation::Unknown);
+        }
+        let summary = before
+            .as_ref()
+            .ok_or_else(|| "trusted workspace baseline unavailable".to_string())
+            .and_then(|before| {
+                lease
+                    .duplicate_root_handle()
+                    .map_err(|error| error.code().to_string())
+                    .and_then(|handle| snapshot_trusted_workspace_from_handle(&handle))
+                    .and_then(|after| before.change_summary(&after))
+            });
+        let summary = match summary {
+            Ok(summary) => summary,
+            Err(_) => {
+                return match lease.rollback() {
+                    Ok(()) => CommandResult::backend_error(
+                        command_id,
+                        TrustedWorkspaceError::RootDrift.code(),
+                    )
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
+                    .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable),
+                    Err(rollback) => CommandResult::backend_error(
+                        command_id,
+                        format!("{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}", rollback.code()),
+                    )
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
+                    .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable),
+                };
+            }
+        };
+        if let Err(error) = lease.commit() {
+            return match lease.rollback() {
+                Ok(()) => CommandResult::backend_error(command_id, error.code())
+                    .with_workspace_mutation(WorkspaceMutation::Unknown)
+                    .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable),
+                Err(rollback) => CommandResult::backend_error(
+                    command_id,
+                    format!("{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}", rollback.code()),
+                )
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable),
+            };
+        }
+        return match summary {
+            Some(summary) => result
+                .with_workspace_mutation(WorkspaceMutation::Changed)
+                .with_workspace_change_summary(summary),
+            None => result.with_workspace_mutation(WorkspaceMutation::Unchanged),
+        };
+    }
     let observation = monitor.map(|monitor| monitor.finish().map_err(|_| ()));
     let (mutation, summary) = if protect_workspace_metadata {
         let snapshot_change = before.map(|before| {
@@ -366,6 +615,14 @@ fn execute_prepared_command(
         Some(summary) => result.with_workspace_change_summary(summary),
         None => result,
     }
+}
+
+fn trusted_command_succeeded(result: &CommandResult) -> bool {
+    result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::Succeeded
+        && result.sandbox.backend == ELEVATED_BACKEND_NAME
+        && result.sandbox.enforcement == SandboxBackendEnforcement::Strict
+        && !result.sandbox.local_process_fallback
 }
 
 fn reconcile_workspace_change(
@@ -468,6 +725,7 @@ struct PreparedCommand {
     protected_deny_write_paths: Vec<AbsolutePathBuf>,
     protect_workspace_metadata: bool,
     before: Option<WorkspaceSnapshot>,
+    trusted_workspace: Option<TrustedWorkspaceLease>,
 }
 
 impl PreparedCommand {
@@ -475,19 +733,6 @@ impl PreparedCommand {
         let workspace_root = canonical_directory(Path::new(&request.filesystem.workspace_root))
             .map_err(PrepareCommandError::Backend)?;
         let protect_workspace_metadata = !request.is_trusted_workspace_preparation();
-        let before = matches!(
-            request.filesystem.mode,
-            SandboxFilesystemMode::WorkspaceWrite
-        )
-        .then(|| {
-            if protect_workspace_metadata {
-                snapshot_workspace(&workspace_root)
-            } else {
-                snapshot_trusted_workspace(&workspace_root)
-            }
-        })
-        .transpose()
-        .map_err(|_| PrepareCommandError::WorkspaceObservation)?;
         let cwd =
             canonical_directory(Path::new(&request.cwd)).map_err(PrepareCommandError::Backend)?;
         let env_map = child_environment(&request.environment);
@@ -511,7 +756,7 @@ impl PreparedCommand {
         } else {
             Vec::new()
         };
-        let workspace_roots = vec![workspace_root];
+        let workspace_roots = vec![workspace_root.clone()];
         let network = match request.network.mode {
             SandboxNetworkMode::Denied => NetworkSandboxPolicy::Restricted,
             SandboxNetworkMode::Allowed => NetworkSandboxPolicy::Enabled,
@@ -540,10 +785,59 @@ impl PreparedCommand {
         .supports_restricted_token_fallback()
             && protected_deny_read_paths.is_empty()
             && protect_workspace_metadata;
+        let sandbox_home = sandbox_home().map_err(PrepareCommandError::Backend)?;
+        // Acquire the lease only after all fallible admission work above. Once held, the
+        // remaining snapshot is the only fallible step and explicitly rolls back on failure.
+        let mut trusted_workspace = if request.is_trusted_workspace_preparation()
+            && matches!(
+                request.filesystem.mode,
+                SandboxFilesystemMode::WorkspaceWrite
+            ) {
+            Some(
+                TrustedWorkspaceLease::acquire(&workspace_root)
+                    .map_err(|error| PrepareCommandError::Backend(error.code().to_string()))?,
+            )
+        } else {
+            None
+        };
+        let before = if matches!(
+            request.filesystem.mode,
+            SandboxFilesystemMode::WorkspaceWrite
+        ) {
+            let snapshot = if protect_workspace_metadata {
+                snapshot_workspace(&workspace_root)
+            } else {
+                trusted_workspace
+                    .as_ref()
+                    .ok_or_else(|| "trusted workspace lease unavailable".to_string())
+                    .and_then(|lease| {
+                        lease
+                            .duplicate_root_handle()
+                            .map_err(|error| error.code().to_string())
+                    })
+                    .and_then(|handle| snapshot_trusted_workspace_from_handle(&handle))
+            };
+            match snapshot {
+                Ok(snapshot) => Some(snapshot),
+                Err(_) => {
+                    if let Some(lease) = trusted_workspace.as_mut() {
+                        if let Err(error) = lease.rollback() {
+                            return Err(PrepareCommandError::Backend(format!(
+                                "{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}",
+                                error.code()
+                            )));
+                        }
+                    }
+                    return Err(PrepareCommandError::WorkspaceObservation);
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             permission_profile,
             workspace_roots,
-            sandbox_home: sandbox_home().map_err(PrepareCommandError::Backend)?,
+            sandbox_home,
             cwd,
             env_map,
             timeout_ms: request.timeout_seconds.saturating_mul(1_000),
@@ -554,6 +848,7 @@ impl PreparedCommand {
             protected_deny_write_paths,
             protect_workspace_metadata,
             before,
+            trusted_workspace,
         })
     }
 
@@ -638,6 +933,7 @@ impl PreparedCommand {
             protected_deny_write_paths,
             protect_workspace_metadata: true,
             before,
+            trusted_workspace: None,
         })
     }
 }
@@ -1125,30 +1421,24 @@ mod tests {
     }
 
     #[test]
-    fn preflight_rejects_untransactional_trusted_preparation_without_writing_probe() {
+    fn native_preflight_reports_verified_controls_or_typed_blocker() {
         let workspace = tempfile::tempdir().expect("workspace");
         let report =
             WindowsSandboxBackend::new().preflight(workspace.path(), &CancellationToken::new());
 
-        assert_eq!(report.outcome, SandboxPreflightOutcome::Unsupported);
-        assert_eq!(report.transactional_workspace, SandboxPreflightFact::Failed);
-        assert_eq!(
-            report.error_code.as_deref(),
-            Some(TRUSTED_PREPARATION_UNSUPPORTED_CODE)
-        );
-        assert!(
-            report
-                .missing_capabilities
-                .iter()
-                .any(|capability| capability == "trusted_workspace_preparation")
-        );
+        if report.outcome == SandboxPreflightOutcome::Supported {
+            assert_eq!(report.error_code, None);
+            assert_eq!(report.transactional_workspace, SandboxPreflightFact::Passed);
+            assert_eq!(report.network_denied, SandboxPreflightFact::Passed);
+            assert_eq!(report.protected_paths, SandboxPreflightFact::Passed);
+            assert!(report.proves_supported_contract_for("windows"));
+        } else {
+            let code = report.error_code.as_deref().expect("typed blocker");
+            assert!(!code.is_empty());
+            assert!(!report.missing_capabilities.is_empty());
+            assert_ne!(report.transactional_workspace, SandboxPreflightFact::Passed);
+        }
         assert!(!workspace.path().join("singularity-preflight.txt").exists());
-        assert!(
-            fs::read_dir(workspace.path())
-                .expect("read workspace")
-                .next()
-                .is_none()
-        );
     }
 
     #[test]

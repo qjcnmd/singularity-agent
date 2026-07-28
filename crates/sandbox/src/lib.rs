@@ -16,9 +16,13 @@ use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
 #[cfg(windows)]
 pub use singularity_windows_sandbox::expand_windows_path_alias;
+#[cfg(windows)]
+pub use singularity_windows_sandbox::{TrustedWorkspaceError, TrustedWorkspaceLease};
 
 mod workspace_change;
 pub use workspace_change::is_toolchain_artifact_path;
+#[cfg(target_os = "windows")]
+use workspace_change::snapshot_trusted_workspace_from_handle;
 use workspace_change::{WorkspaceSnapshot, snapshot_trusted_workspace, snapshot_workspace};
 
 /// command tool 未指定超时时使用的秒数。

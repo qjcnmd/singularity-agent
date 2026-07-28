@@ -43,6 +43,8 @@ use singularity_protocol::{
     EvalRunParams, EvalRunResult, TraceEvent, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
     TraceSpanStatus,
 };
+#[cfg(windows)]
+use singularity_sandbox::{TrustedWorkspaceError, TrustedWorkspaceLease};
 use singularity_tools::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
     CommandScriptRequest, CommandSemanticStatus, ExecutableAvailability, SandboxBackend,
@@ -3472,25 +3474,110 @@ fn run_sandbox_preflight(
     // The run-owned scratch directory is on the same filesystem as task roots. One probe
     // therefore establishes the backend/profile contract for the entire task set without
     // touching any task source or starting a provider trial.
-    let scratch = run_dir.join(".sandbox-preflight");
-    if let Err(error) = fs::create_dir_all(&scratch) {
-        let mut report = SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
-        report.outcome = SandboxPreflightOutcome::Unsupported;
-        report.error_code = Some("sandbox_preflight_scratch_unavailable".to_string());
-        report
-            .missing_capabilities
-            .push("scratch_workspace".to_string());
-        return Err(Box::new(SandboxPreflightFailure {
-            report,
-            blocker: sandbox_preflight_blocker(
+    let scratch_path = run_dir.join(".sandbox-preflight");
+    #[cfg(windows)]
+    let (scratch, scratch_identity) = {
+        let mut lease = match TrustedWorkspaceLease::create(&scratch_path) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let mut report =
+                    SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
+                report.outcome = SandboxPreflightOutcome::Unsupported;
+                report.error_code = Some("sandbox_preflight_scratch_unavailable".to_string());
+                report
+                    .missing_capabilities
+                    .push("scratch_workspace".to_string());
+                return Err(Box::new(SandboxPreflightFailure {
+                    report,
+                    blocker: sandbox_preflight_blocker(
+                        "sandbox_preflight_scratch_unavailable",
+                        format!(
+                            "sandbox preflight scratch workspace unavailable: {}",
+                            error.code()
+                        ),
+                    ),
+                }));
+            }
+        };
+        let scratch_identity = lease.identity_fingerprint();
+        let scratch = match fs::canonicalize(&scratch_path) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                let cleanup_error = lease.rollback().err();
+                let mut report =
+                    SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
+                report.outcome = SandboxPreflightOutcome::Unsupported;
+                let error_code = cleanup_error.as_ref().map_or(
+                    "sandbox_preflight_scratch_unavailable",
+                    |_| "sandbox_preflight_scratch_cleanup",
+                );
+                report.error_code = Some(error_code.to_string());
+                report.missing_capabilities.push(
+                    if cleanup_error.is_some() {
+                        "scratch_cleanup"
+                    } else {
+                        "scratch_workspace"
+                    }
+                    .to_string(),
+                );
+                return Err(Box::new(SandboxPreflightFailure {
+                    report,
+                    blocker: sandbox_preflight_blocker(
+                        error_code,
+                        match cleanup_error {
+                            Some(cleanup_error) => format!(
+                                "sandbox preflight scratch canonicalization failed: {error}; cleanup failed: {}",
+                                cleanup_error.code()
+                            ),
+                            None => {
+                                format!("sandbox preflight scratch workspace unavailable: {error}")
+                            }
+                        },
+                    ),
+                }));
+            }
+        };
+        if let Err(error) = lease.commit() {
+            let cleanup_error = lease.rollback().err();
+            let mut report =
+                SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
+            report.outcome = SandboxPreflightOutcome::Unsupported;
+            let error_code = cleanup_error.as_ref().map_or(
                 "sandbox_preflight_scratch_unavailable",
-                format!("sandbox preflight scratch workspace unavailable: {error}"),
-            ),
-        }));
-    }
-    let scratch = match fs::canonicalize(&scratch) {
-        Ok(scratch) => scratch,
-        Err(error) => {
+                |_| "sandbox_preflight_scratch_cleanup",
+            );
+            report.error_code = Some(error_code.to_string());
+            report.missing_capabilities.push(
+                if cleanup_error.is_some() {
+                    "scratch_cleanup"
+                } else {
+                    "scratch_workspace"
+                }
+                .to_string(),
+            );
+            return Err(Box::new(SandboxPreflightFailure {
+                report,
+                blocker: sandbox_preflight_blocker(
+                    error_code,
+                    match cleanup_error {
+                        Some(cleanup_error) => format!(
+                            "sandbox preflight scratch identity changed: {}; cleanup failed: {}",
+                            error.code(),
+                            cleanup_error.code()
+                        ),
+                        None => format!(
+                            "sandbox preflight scratch workspace identity changed: {}",
+                            error.code()
+                        ),
+                    },
+                ),
+            }));
+        }
+        (scratch, scratch_identity)
+    };
+    #[cfg(not(windows))]
+    let scratch = {
+        if let Err(error) = fs::create_dir_all(&scratch_path) {
             let mut report =
                 SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
             report.outcome = SandboxPreflightOutcome::Unsupported;
@@ -3505,6 +3592,25 @@ fn run_sandbox_preflight(
                     format!("sandbox preflight scratch workspace unavailable: {error}"),
                 ),
             }));
+        }
+        match fs::canonicalize(&scratch_path) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                let mut report =
+                    SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
+                report.outcome = SandboxPreflightOutcome::Unsupported;
+                report.error_code = Some("sandbox_preflight_scratch_unavailable".to_string());
+                report
+                    .missing_capabilities
+                    .push("scratch_workspace".to_string());
+                return Err(Box::new(SandboxPreflightFailure {
+                    report,
+                    blocker: sandbox_preflight_blocker(
+                        "sandbox_preflight_scratch_unavailable",
+                        format!("sandbox preflight scratch workspace unavailable: {error}"),
+                    ),
+                }));
+            }
         }
     };
     let mut report = sandbox_backend.preflight(&scratch, cancellation);
@@ -3562,7 +3668,23 @@ fn run_sandbox_preflight(
                 .push("trusted_workspace_preparation".to_string());
         }
     }
-    if let Err(error) = fs::remove_dir_all(&scratch) {
+    #[cfg(windows)]
+    let scratch_cleanup = (|| {
+        match fs::symlink_metadata(&scratch) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        }
+        let mut lease =
+            TrustedWorkspaceLease::acquire(&scratch).map_err(|error| error.code().to_string())?;
+        if !lease.matches_identity(scratch_identity) {
+            return Err(TrustedWorkspaceError::RootDrift.code().to_string());
+        }
+        lease.rollback().map_err(|error| error.code().to_string())
+    })();
+    #[cfg(not(windows))]
+    let scratch_cleanup = fs::remove_dir_all(&scratch).map_err(|error| error.to_string());
+    if let Err(error) = scratch_cleanup {
         report.outcome = SandboxPreflightOutcome::Unsupported;
         report.error_code = Some("sandbox_preflight_scratch_cleanup".to_string());
         report
