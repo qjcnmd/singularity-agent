@@ -217,10 +217,13 @@ fn workspace_change_is_verification_relevant(
     changed_files: &[String],
 ) -> bool {
     changed_files.iter().any(|path| {
+        if is_incidental_artifact_ancestor_change(before, after, changed_files, path) {
+            return false;
+        }
         if is_toolchain_artifact_path(path) {
             return before.entries.contains_key(path);
         }
-        !is_incidental_artifact_ancestor_change(before, after, changed_files, path)
+        true
     })
 }
 
@@ -833,6 +836,32 @@ mod tests {
             .expect("nested artifact change");
 
         assert!(summary.changed_files.iter().any(|path| path == "src"));
+        assert!(!summary.verification_relevant);
+    }
+
+    #[test]
+    fn nested_new_artifact_under_existing_artifact_directory_is_incidental_when_safe() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cache = workspace.path().join("__pycache__");
+        std::fs::create_dir(&cache).expect("artifact directory");
+        std::fs::write(cache.join("test_calculator.pyc"), b"existing artifact")
+            .expect("existing artifact");
+        let before = snapshot_workspace(workspace.path()).expect("before snapshot");
+
+        std::fs::write(cache.join("calculator.pyc"), b"new artifact").expect("new artifact");
+        let after = snapshot_workspace(workspace.path()).expect("after snapshot");
+        let summary = before
+            .change_summary(&after)
+            .expect("summary")
+            .expect("nested artifact change");
+
+        assert_eq!(
+            summary.changed_files,
+            [
+                "__pycache__".to_string(),
+                "__pycache__/calculator.pyc".to_string()
+            ]
+        );
         assert!(!summary.verification_relevant);
     }
 
