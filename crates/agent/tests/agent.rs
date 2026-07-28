@@ -4418,13 +4418,12 @@ fn caller_verification_floor_survives_turn_checkpoint_resume() {
     assert_eq!(interrupted.status, AgentStatus::Failed, "{interrupted:?}");
     let checkpoint = checkpoints
         .iter()
-        .filter(|event| {
+        .rfind(|event| {
             event
                 .checkpoint
                 .encode()
                 .is_ok_and(|payload| !payload["verification_plan"].is_null())
         })
-        .last()
         .expect("checkpoint with installed verification plan")
         .checkpoint
         .clone();
