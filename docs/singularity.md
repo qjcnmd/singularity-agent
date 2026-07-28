@@ -299,6 +299,7 @@ CommandToolInput { command, cwd?, timeout_seconds? }
 
 - thread 与 sandbox backend 只表达 `read-only` 和 `workspace-write`；不存在 unsandboxed filesystem mode 或本地进程 fallback。
 - network denied 映射到 restricted network，必须使用 elevated offline identity；不能走 unelevated fallback。
+- offline identity 的 setup marker 只记录期望配置，不证明网络控制仍然存在。Windows Firewall rule 是纵深防御和配置漂移信号；普通本地账户的权威强制边界是按 offline SID 限定的 persistent WFP filter：connect、bind/resource assignment、listen 和 receive/accept 默认 block。明确的 loopback TCP proxy 端口或既有 local-binding 模式只在 connect layer 获得更高权重 permit；配置这些 connect 例外时会保留客户端所需的本地地址/临时端口分配，但 listen 和 receive/accept 仍然 block。每次选择该 identity 时，adapter 都会只读核对产品自有 Firewall rule 的配置，并核对全部 WFP filter 的 key、provider、sublayer、layer、action、weight、SID 与完整条件。缺失或漂移会触发现有一次 elevated setup；setup 后仍无法按同一合同复核时在 child spawn 前 fail closed。setup 只给实际调用用户授予这些产品 filter 的 `FWPM_ACTRL_READ`，不授予修改或删除权限；network-allowed identity 不执行该检查。
 - network allowed 可以在 elevated 路径失败且 restricted token 足够时走 unelevated 路径。
 - 产品层只表达单一 workspace root 与 `denied` / `allowed` 两种网络模式，不要求用户维护 allowlist 或额外读写根目录配置。
 - 模型提交的 command string 由 adapter 以受控 shell 方言执行；shell quoting、管道、重定向和条件语义由该 adapter 负责，模型不能提交 sandbox、network 或 capability 字段。普通 argv 和 model script 在进入 elevated backend 前使用同一 existing protected-path 投影建立 OS deny-read，workspace-write 同时建立 deny-write；命令 token 检查只是更早的拒绝层，不承担运行期强制执行，因此运行时拼接或间接解析路径不能绕过 protected metadata。Policy、Approval、workspace/protected-path、超时和严格 backend 才是安全边界，不依赖禁止 shell 字符串。

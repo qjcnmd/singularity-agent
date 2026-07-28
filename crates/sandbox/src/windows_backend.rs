@@ -820,13 +820,13 @@ impl PreparedCommand {
             match snapshot {
                 Ok(snapshot) => Some(snapshot),
                 Err(_) => {
-                    if let Some(lease) = trusted_workspace.as_mut() {
-                        if let Err(error) = lease.rollback() {
-                            return Err(PrepareCommandError::Backend(format!(
-                                "{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}",
-                                error.code()
-                            )));
-                        }
+                    if let Some(lease) = trusted_workspace.as_mut()
+                        && let Err(error) = lease.rollback()
+                    {
+                        return Err(PrepareCommandError::Backend(format!(
+                            "{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}",
+                            error.code()
+                        )));
                     }
                     return Err(PrepareCommandError::WorkspaceObservation);
                 }

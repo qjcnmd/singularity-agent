@@ -14,6 +14,8 @@ use crate::setup::run_setup_refresh_with_elevated_acl_authority;
 use crate::setup::run_setup_refresh_with_overrides_and_proxy_settings;
 use crate::setup::sandbox_users_path;
 use crate::setup::setup_marker_path;
+use crate::setup_error::SetupErrorCode;
+use crate::setup_error::failure;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -48,6 +50,34 @@ pub fn sandbox_setup_is_complete(sandbox_home: &Path) -> bool {
         return false;
     }
     matches!(load_users(sandbox_home), Ok(Some(users)) if users.version_matches())
+}
+
+fn offline_network_controls_are_current(marker: &SetupMarker) -> Result<bool> {
+    let offline_sid = crate::winutil::resolve_sid(crate::product_identity::OFFLINE_ACCOUNT_NAME)
+        .map_err(|_| {
+            failure(
+                SetupErrorCode::HelperFirewallPolicyAccessFailed,
+                "offline network controls readiness could not resolve the offline identity",
+            )
+        })?;
+    let offline_sid_string = crate::winutil::string_from_sid_bytes(&offline_sid).map_err(|_| {
+        failure(
+            SetupErrorCode::HelperFirewallPolicyAccessFailed,
+            "offline network controls readiness could not format the offline identity",
+        )
+    })?;
+    crate::network_controls::offline_network_controls_are_current(
+        &offline_sid,
+        &offline_sid_string,
+        &marker.proxy_ports,
+        marker.allow_local_binding,
+    )
+    .map_err(|_| {
+        failure(
+            SetupErrorCode::HelperFirewallPolicyAccessFailed,
+            "offline network controls readiness query failed",
+        )
+    })
 }
 
 fn load_marker(sandbox_home: &Path) -> Result<Option<SetupMarker>> {
@@ -186,6 +216,13 @@ pub fn require_logon_sandbox_creds(
             {
                 setup_reason = Some(reason);
                 None
+            } else if network_identity.uses_offline_identity()
+                && !offline_network_controls_are_current(&marker)?
+            {
+                setup_reason = Some(
+                    "offline firewall or WFP enforcement is missing or inconsistent".to_string(),
+                );
+                None
             } else {
                 let selected = select_identity(network_identity, sandbox_home)?;
                 if selected.is_none() {
@@ -268,6 +305,22 @@ pub fn require_logon_sandbox_creds(
         .map_err(|elevated_error| {
             elevated_error.context("elevated ACL authority was required after access denial")
         })?;
+    }
+    if network_identity.uses_offline_identity() {
+        let marker = load_marker(sandbox_home)?
+            .filter(SetupMarker::version_matches)
+            .ok_or_else(|| {
+                failure(
+                    SetupErrorCode::HelperFirewallRuleVerifyFailed,
+                    "offline network controls have no valid setup marker",
+                )
+            })?;
+        if !offline_network_controls_are_current(&marker)? {
+            return Err(failure(
+                SetupErrorCode::HelperFirewallRuleVerifyFailed,
+                "offline firewall or WFP enforcement is missing or inconsistent",
+            ));
+        }
     }
     let identity = identity.ok_or_else(|| {
         anyhow!(

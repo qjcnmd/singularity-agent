@@ -616,7 +616,7 @@ mod tests {
         let target = parent.path().join("target");
         fs::create_dir(&root).expect("workspace");
         fs::create_dir(&target).expect("target");
-        if symlink_dir(&target, &root.join("linked-dir")).is_err() {
+        if symlink_dir(&target, root.join("linked-dir")).is_err() {
             return;
         }
 

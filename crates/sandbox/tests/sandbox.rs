@@ -32,6 +32,10 @@ const FORBIDDEN_RELAXED_SANDBOX_CONTRACTS: [&str; 2] = ["HostWorkspace", "Relaxe
 const CRASH_CALLER_CHILD_ENV: &str = "SINGULARITY_CRASH_CALLER_CHILD";
 #[cfg(windows)]
 const CRASH_CALLER_WORKSPACE_ENV: &str = "SINGULARITY_CRASH_CALLER_WORKSPACE";
+#[cfg(windows)]
+const LOOPBACK_PROXY_PROBE_ALLOWED_PORT_ENV: &str = "SINGULARITY_LOOPBACK_PROXY_PROBE_ALLOWED_PORT";
+#[cfg(windows)]
+const LOOPBACK_PROXY_PROBE_DENIED_PORT_ENV: &str = "SINGULARITY_LOOPBACK_PROXY_PROBE_DENIED_PORT";
 
 #[test]
 fn command_request_and_result_are_schema_backed_boundaries() {
@@ -437,6 +441,164 @@ fn windows_elevated_backend_executes_network_denied_command() {
         .expect("trusted Windows workspace change summary");
     assert_eq!(summary.changed_files, ["changed.txt"]);
     assert!(summary.diff_digest.starts_with("sha256:"));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_elevated_backend_blocks_loopback_for_network_denied_command() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+    listener
+        .set_nonblocking(true)
+        .expect("make loopback listener nonblocking");
+    let port = listener.local_addr().expect("listener address").port();
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $client=New-Object System.Net.Sockets.TcpClient; try {{ $client.Connect('127.0.0.1',{port}); exit 17 }} catch {{ exit 0 }}"
+    );
+    let mut request = CommandRequest::project_verification(
+        "command_elevated_loopback_denied",
+        vec![
+            "powershell.exe".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            script,
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Denied;
+
+    let result = WindowsSandboxBackend::new().execute(&request);
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result:#?}"
+    );
+    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
+    assert_eq!(result.sandbox.backend, "windows_elevated");
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
+    assert!(!result.sandbox.local_process_fallback);
+    let error = listener
+        .accept()
+        .expect_err("network-denied sandbox connected to the host listener");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_elevated_backend_allows_only_declared_loopback_proxy_port() {
+    if let (Ok(allowed_port), Ok(denied_port)) = (
+        std::env::var(LOOPBACK_PROXY_PROBE_ALLOWED_PORT_ENV),
+        std::env::var(LOOPBACK_PROXY_PROBE_DENIED_PORT_ENV),
+    ) {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let script = format!(
+            "$ErrorActionPreference='Stop'; $allowed=New-Object System.Net.Sockets.TcpClient; try {{ $allowed.Connect('127.0.0.1',{allowed_port}) }} catch {{ exit 20 }} finally {{ $allowed.Dispose() }}; $denied=New-Object System.Net.Sockets.TcpClient; try {{ $denied.Connect('127.0.0.1',{denied_port}); exit 21 }} catch {{ exit 0 }} finally {{ $denied.Dispose() }}"
+        );
+        let request = CommandRequest::project_verification(
+            "command_elevated_loopback_proxy",
+            vec![
+                "powershell.exe".to_string(),
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                script,
+            ],
+            path_str(workspace.path()),
+            path_str(workspace.path()),
+        );
+
+        let result = WindowsSandboxBackend::new().execute(&request);
+        assert_eq!(
+            result.execution_status,
+            CommandExecutionStatus::Completed,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.semantic_status,
+            CommandSemanticStatus::Succeeded,
+            "{result:#?}"
+        );
+        assert_eq!(result.sandbox.backend, "windows_elevated");
+        assert_eq!(
+            result.sandbox.enforcement,
+            SandboxBackendEnforcement::Strict
+        );
+        assert!(!result.sandbox.local_process_fallback);
+        return;
+    }
+
+    let allowed_listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind declared proxy listener");
+    let denied_listener =
+        std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind undeclared listener");
+    let allowed_port = allowed_listener
+        .local_addr()
+        .expect("allowed address")
+        .port();
+    let denied_port = denied_listener.local_addr().expect("denied address").port();
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"));
+    child
+        .args([
+            "--exact",
+            "windows_elevated_backend_allows_only_declared_loopback_proxy_port",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(
+            LOOPBACK_PROXY_PROBE_ALLOWED_PORT_ENV,
+            allowed_port.to_string(),
+        )
+        .env(
+            LOOPBACK_PROXY_PROBE_DENIED_PORT_ENV,
+            denied_port.to_string(),
+        );
+    for name in [
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "WS_PROXY",
+        "WSS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "ws_proxy",
+        "wss_proxy",
+        "SINGULARITY_NETWORK_ALLOW_LOCAL_BINDING",
+    ] {
+        child.env_remove(name);
+    }
+    child.env("HTTP_PROXY", format!("http://127.0.0.1:{allowed_port}"));
+    let output = child.output().expect("isolated loopback proxy probe");
+    assert!(
+        output.status.success(),
+        "isolated loopback proxy probe failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    allowed_listener
+        .set_nonblocking(true)
+        .expect("make allowed listener nonblocking");
+    denied_listener
+        .set_nonblocking(true)
+        .expect("make denied listener nonblocking");
+    allowed_listener
+        .accept()
+        .expect("declared loopback proxy was not reached");
+    let error = denied_listener
+        .accept()
+        .expect_err("undeclared loopback port was reached");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
 }
 
 #[cfg(windows)]
