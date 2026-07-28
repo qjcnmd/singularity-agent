@@ -845,15 +845,44 @@ impl AppServerClient {
 
     // 序列化、写入并 flush 一条 JSON-RPC 消息。
     fn write_message(&mut self, message: &JsonRpcMessage) -> Result<(), String> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "app-server stdin unavailable".to_string())?;
-        writeln!(stdin, "{}", message.to_wire_value())
-            .map_err(|error| format!("failed to write app-server request: {error}"))?;
-        stdin
-            .flush()
-            .map_err(|error| format!("failed to flush app-server request: {error}"))
+        let write_result = {
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "app-server stdin unavailable".to_string())?;
+            writeln!(stdin, "{}", message.to_wire_value())
+        };
+        if let Err(error) = write_result {
+            return Err(
+                self.classify_transport_write_error("failed to write app-server request", error)
+            );
+        }
+
+        let flush_result = {
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "app-server stdin unavailable".to_string())?;
+            stdin.flush()
+        };
+        if let Err(error) = flush_result {
+            return Err(
+                self.classify_transport_write_error("failed to flush app-server request", error)
+            );
+        }
+        Ok(())
+    }
+
+    // 写端失败时先确认 app-server 是否已经退出，避免以竞争性的 Broken pipe
+    // 覆盖“响应前退出”的稳定传输错误；进程仍存活时保留真实 I/O 原因。
+    fn classify_transport_write_error(&mut self, operation: &str, error: std::io::Error) -> String {
+        match self.child.try_wait() {
+            Ok(Some(status)) => format!("app-server exited before response: {status}"),
+            Ok(None) => format!("{operation}: {error}"),
+            Err(status_error) => format!(
+                "{operation}: {error}; failed to poll app-server process status: {status_error}"
+            ),
+        }
     }
 
     // 从 stdout reader 读取一条消息，并区分超时、断开与非法 JSON。
