@@ -49,6 +49,11 @@ const KNOWN_LEGACY_MIGRATIONS: [&str; 13] = [
     TURN_RESUME_CHECKPOINT_SCHEMA_MIGRATION,
 ];
 
+// Hashing was introduced during the schema-v5 lifetime, so released v1-v9
+// stores can still contain pre-hash rows. Those rows are re-sanitized during
+// migration; the v10 contract and later schemas require hash verification.
+const TRACE_PAYLOAD_HASH_REQUIRED_SCHEMA_VERSION: u32 = 10;
+
 #[derive(Debug, Clone)]
 struct LegacyThreadRow {
     thread_id: String,
@@ -1379,18 +1384,23 @@ fn read_legacy_traces(
             .validate_span_lifecycle()
             .map_err(|error| StoreError::InvalidState(format!("trace span is invalid: {error}")))?;
         if event.redaction_applied {
-            let expected_hash = if version <= 11 {
-                trace_payload_hash(&event.payload)
-            } else {
-                trace_envelope_hash(&event)
-            };
-            if event.payload_hash != expected_hash {
-                return Err(StoreError::TraceIntegrity(format!(
-                    "trace envelope hash mismatch for {event_id}"
-                )));
-            }
-            if version <= 11 {
+            if version < TRACE_PAYLOAD_HASH_REQUIRED_SCHEMA_VERSION && event.payload_hash.is_empty()
+            {
                 event = sanitize_trace_event(&event);
+            } else {
+                let expected_hash = if version <= 11 {
+                    trace_payload_hash(&event.payload)
+                } else {
+                    trace_envelope_hash(&event)
+                };
+                if event.payload_hash != expected_hash {
+                    return Err(StoreError::TraceIntegrity(format!(
+                        "trace envelope hash mismatch for {event_id}"
+                    )));
+                }
+                if version <= 11 {
+                    event = sanitize_trace_event(&event);
+                }
             }
         } else if allow_repair {
             event = sanitize_trace_event(&event);

@@ -6608,6 +6608,129 @@ fn v11_to_v13_migration_rehashes_legacy_trace_without_fabricating_spans() {
 }
 
 #[test]
+fn v9_empty_trace_payload_hash_migrates_as_pre_hash_legacy() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("v9-empty-trace-hash.sqlite3");
+    create_legacy_enum_database(&db_path, 9);
+    remove_legacy_pending_approval(&db_path, 9);
+
+    let mut legacy = TraceEvent::new(
+        "v9_empty_trace_hash",
+        "thread_legacy",
+        "thread_legacy",
+        "legacy",
+        "Authorization: Bearer v9-secret",
+    );
+    legacy.redaction_applied = true;
+    legacy.payload = serde_json::json!({"authorization": "Bearer v9-secret"});
+    legacy.payload_hash.clear();
+    let connection = rusqlite::Connection::open(&db_path).expect("open v9 connection");
+    connection
+        .execute(
+            "insert into trace_events(event_id, run_id, session_id, payload)
+             values(?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                legacy.event_id,
+                legacy.run_id,
+                legacy.session_id,
+                serde_json::to_string(&legacy).expect("legacy trace")
+            ],
+        )
+        .expect("insert v9 trace");
+    drop(connection);
+
+    let migrated = SessionStore::open(&db_path).expect("migrate v9 store");
+    let stored = migrated
+        .show_trace("v9_empty_trace_hash")
+        .expect("read migrated trace");
+    assert_eq!(migrated.descriptor().schema_version, 13);
+    assert_eq!(stored.summary, "[redacted]");
+    assert_eq!(stored.payload["authorization"], "[redacted]");
+    assert!(stored.payload_hash.starts_with("sha256:"));
+}
+
+#[test]
+fn v9_nonempty_trace_payload_hash_mismatch_fails_closed_without_mutation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("v9-bad-trace-hash.sqlite3");
+    create_legacy_enum_database(&db_path, 9);
+    remove_legacy_pending_approval(&db_path, 9);
+
+    let mut legacy = TraceEvent::new(
+        "v9_bad_trace_hash",
+        "thread_legacy",
+        "thread_legacy",
+        "legacy",
+        "legacy event",
+    );
+    legacy.redaction_applied = true;
+    legacy.payload = serde_json::json!({"safe": true});
+    legacy.payload_hash = format!("sha256:{}", "0".repeat(64));
+    let connection = rusqlite::Connection::open(&db_path).expect("open v9 connection");
+    connection
+        .execute(
+            "insert into trace_events(event_id, run_id, session_id, payload)
+             values(?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                legacy.event_id,
+                legacy.run_id,
+                legacy.session_id,
+                serde_json::to_string(&legacy).expect("legacy trace")
+            ],
+        )
+        .expect("insert v9 trace");
+    drop(connection);
+    let before = sqlite_snapshot(&db_path);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::TraceIntegrity(message))
+            if message.contains("trace envelope hash mismatch")
+    ));
+    assert_eq!(sqlite_snapshot(&db_path), before);
+}
+
+#[test]
+fn v10_empty_trace_payload_hash_fails_closed_without_mutation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("v10-empty-trace-hash.sqlite3");
+    create_v10_database(&db_path);
+
+    let mut legacy = TraceEvent::new(
+        "v10_empty_trace_hash",
+        "thread_v10",
+        "thread_v10",
+        "legacy",
+        "legacy event",
+    );
+    legacy.redaction_applied = true;
+    legacy.payload = serde_json::json!({"safe": true});
+    legacy.payload_hash.clear();
+    let connection = rusqlite::Connection::open(&db_path).expect("open v10 connection");
+    connection
+        .execute(
+            "insert into trace_events(event_id, run_id, session_id, payload)
+             values(?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                legacy.event_id,
+                legacy.run_id,
+                legacy.session_id,
+                serde_json::to_string(&legacy).expect("legacy trace")
+            ],
+        )
+        .expect("insert v10 trace");
+    drop(connection);
+    let before = sqlite_snapshot(&db_path);
+
+    assert!(matches!(
+        SessionStore::open(&db_path),
+        Err(StoreError::TraceIntegrity(message))
+            if message.contains("trace envelope hash mismatch")
+    ));
+    assert_eq!(sqlite_snapshot(&db_path), before);
+}
+
+#[test]
 fn invalid_v11_span_data_rolls_back_without_mutation() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("invalid-v11.sqlite3");
