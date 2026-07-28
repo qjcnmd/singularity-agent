@@ -9,11 +9,12 @@ use std::os::windows::ffi::OsStrExt;
 use super::{
     COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
-    CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
-    SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightReport,
-    WorkspaceChangeSummary, WorkspaceMutation, WorkspaceSnapshot, command_request_denial,
-    command_script_request_denial, is_secret_env_name, path_has_sensitive_component,
-    snapshot_trusted_workspace, snapshot_trusted_workspace_from_handle, snapshot_workspace,
+    CommandSemanticStatus, ExecutableAvailability, SandboxBackend, SandboxBackendEnforcement,
+    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact,
+    SandboxPreflightReport, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceSnapshot,
+    command_request_denial, command_script_request_denial, is_secret_env_name,
+    path_has_sensitive_component, snapshot_trusted_workspace,
+    snapshot_trusted_workspace_from_handle, snapshot_workspace,
 };
 use singularity_core::{
     PROTECTED_METADATA_PATH_NAMES, PROTECTED_PATH_CONTAINS_MARKERS, PROTECTED_PATH_EXACT_MARKERS,
@@ -294,6 +295,23 @@ impl SandboxBackend for WindowsSandboxBackend {
         report.outcome = super::SandboxPreflightOutcome::Supported;
         report.error_code = None;
         report
+    }
+
+    fn probe_executable(
+        &self,
+        workspace: &Path,
+        executable: &str,
+        environment: &CommandEnvironmentPolicy,
+    ) -> ExecutableAvailability {
+        let Ok(cwd) = canonical_directory(workspace) else {
+            return ExecutableAvailability::Unknown;
+        };
+        let env = child_environment(environment);
+        match resolve_executable(&[executable.to_string()], &cwd, &env) {
+            Ok(_) => ExecutableAvailability::Available,
+            Err(ExecutableResolutionError::Unavailable(_)) => ExecutableAvailability::Unavailable,
+            Err(_) => ExecutableAvailability::Unknown,
+        }
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
@@ -1537,6 +1555,31 @@ mod tests {
             Some("-C target-cpu=native")
         );
         assert!(env_value(&ordinary, "SERVICE_API_KEY").is_none());
+    }
+
+    #[test]
+    fn executable_probe_uses_windows_command_resolution() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let executable = std::env::current_exe().expect("current executable");
+        let missing = workspace.path().join("missing-executable.exe");
+        let backend = WindowsSandboxBackend::new();
+
+        assert_eq!(
+            backend.probe_executable(
+                workspace.path(),
+                &executable.to_string_lossy(),
+                &CommandEnvironmentPolicy::EvaluationIsolated,
+            ),
+            ExecutableAvailability::Available
+        );
+        assert_eq!(
+            backend.probe_executable(
+                workspace.path(),
+                &missing.to_string_lossy(),
+                &CommandEnvironmentPolicy::EvaluationIsolated,
+            ),
+            ExecutableAvailability::Unavailable
+        );
     }
 
     #[test]
