@@ -19,6 +19,9 @@ use super::{
     is_repairable_tool_result, is_sha256_fingerprint,
 };
 
+/// Exact pre-execution failure recorded when a command arrives before its mutation-bound plan.
+const VERIFICATION_PLAN_REQUIRED_FAILURE: &str = "verification:verification_plan_required";
+
 /// 由 tool 结果和 approval 检查点共享的完成门禁状态。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub(super) struct CompletionTracker {
@@ -139,6 +142,15 @@ impl CompletionTracker {
 
     pub(super) fn observe(&mut self, tool_result: &ToolResult) {
         self.observe_with_window(tool_result, None);
+    }
+
+    /// Clear only the typed failure produced by submitting a command before installing a plan.
+    ///
+    /// A valid revision-bound plan makes that command legally submitable; it does not erase any
+    /// failure from a command that actually crossed the execution boundary.
+    pub(super) fn clear_verification_plan_required_failure(&mut self) {
+        self.unresolved_failures
+            .remove(VERIFICATION_PLAN_REQUIRED_FAILURE);
     }
 
     fn observe_with_window(&mut self, tool_result: &ToolResult, terminal_window: Option<usize>) {

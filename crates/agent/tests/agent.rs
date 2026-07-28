@@ -5565,6 +5565,200 @@ fn invalid_verification_command_input_does_not_open_a_mutation_bound_repair_cycl
 }
 
 #[test]
+fn verification_plan_precondition_recovery_persists_checkpoint_without_consuming_repair_budget() {
+    let workspace = tempfile::tempdir().expect("verification plan recovery workspace");
+    std::fs::write(workspace.path().join("README.md"), "before")
+        .expect("write verification fixture");
+    let command = test_command_script("verification plan recovery");
+
+    let verification_plan = |request: &str, call_id: &str, sandbox_mode: &str| {
+        let mut response = ModelTurnResponse::completed(request, call_id, "");
+        response.tool_calls.push(tool_call(
+            call_id,
+            "update_plan",
+            serde_json::json!({
+                "steps": [{"step": "verify the changed fixture", "status": "completed"}],
+                "verification": [{
+                    "risk": "general_mutation",
+                    "evidence": "the fixture changed",
+                    "affected_path": "README.md",
+                    "affected_symbol": "README.md::value",
+                    "current_gap": "the changed revision is not verified",
+                    "action": {
+                        "command": command,
+                        "cwd": ".",
+                        "timeout_seconds": 5,
+                        "sandbox_mode": sandbox_mode,
+                        "network_access": "denied"
+                    },
+                    "required": 1
+                }]
+            }),
+        ));
+        response
+    };
+    let mut mutation = ModelTurnResponse::completed(
+        "model_request_turn_verification_recovery_0",
+        "response_mutation",
+        "",
+    );
+    mutation.tool_calls.push(tool_call(
+        "edit_verification_recovery",
+        "edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let mut command_before_plan = ModelTurnResponse::completed(
+        "model_request_turn_verification_recovery_2",
+        "response_command_before_plan",
+        "",
+    );
+    command_before_plan.tool_calls.push(tool_call(
+        "command_before_plan",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let mut command_after_plan = ModelTurnResponse::completed(
+        "model_request_turn_verification_recovery_5",
+        "response_command_after_plan",
+        "",
+    );
+    command_after_plan.tool_calls.push(tool_call(
+        "command_after_plan",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let backend_calls = Arc::new(AtomicUsize::new(0));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                mutation,
+                verification_plan(
+                    "model_request_turn_verification_recovery_1",
+                    "wrong_plan_1",
+                    "read_only",
+                ),
+                command_before_plan,
+                verification_plan(
+                    "model_request_turn_verification_recovery_3",
+                    "wrong_plan_2",
+                    "read_only",
+                ),
+                verification_plan(
+                    "model_request_turn_verification_recovery_4",
+                    "valid_plan",
+                    "workspace_write",
+                ),
+                command_after_plan,
+                ModelTurnResponse::completed(
+                    "model_request_turn_verification_recovery_6",
+                    "response_final",
+                    "done",
+                ),
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind verification recovery workspace")
+            .with_sandbox_backend(ExecutionCountingBackend {
+                calls: Arc::clone(&backend_calls),
+            }),
+    );
+    let input = AgentLoopInput::new(
+        "thread_verification_recovery",
+        "turn_verification_recovery",
+        "change and verify the fixture",
+    )
+    .with_max_turns(7);
+    let mut checkpoints = Vec::new();
+    let result =
+        agent_loop.run_with_events_and_checkpoints(&input, &mut |_event| Ok(()), &mut |event| {
+            checkpoints.push(event);
+            Ok(())
+        });
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+    assert_eq!(backend_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        result
+            .tool_results
+            .iter()
+            .any(|result| { result.error_code.as_deref() == Some("verification_plan_required") })
+    );
+    assert_eq!(
+        result
+            .tool_results
+            .iter()
+            .filter(|result| result.error_code.as_deref() == Some("invalid_tool_arguments"))
+            .count(),
+        2
+    );
+    let valid_plan_checkpoint = checkpoints
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.phase,
+                TurnCheckpointPhase::ToolResultsCommitted { tool_call_ids }
+                    if tool_call_ids == &["valid_plan".to_string()]
+            )
+        })
+        .expect("valid verification plan checkpoint");
+    assert!(valid_plan_checkpoint.checkpoint.encode().is_ok());
+    assert_eq!(
+        valid_plan_checkpoint
+            .checkpoint
+            .encode()
+            .expect("encode valid plan checkpoint")["repair_attempts"],
+        0
+    );
+    let requests = seen_requests
+        .lock()
+        .expect("verification recovery requests");
+    let planning_feedback = requests
+        .iter()
+        .find_map(|request| {
+            request.messages.iter().find(|message| {
+                message.role == ModelRole::Developer
+                    && message.content.contains("current_session_profile=")
+            })
+        })
+        .expect("current session profile guidance");
+    assert!(
+        planning_feedback
+            .content
+            .contains("current_session_profile=")
+    );
+    assert!(
+        planning_feedback
+            .content
+            .contains("\"sandbox_mode\":\"workspace_write\"")
+    );
+    assert!(
+        planning_feedback
+            .content
+            .contains("\"network_access\":\"denied\"")
+    );
+}
+
+#[test]
 fn agent_loop_validates_patch_arguments_before_policy() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "content").expect("write file");

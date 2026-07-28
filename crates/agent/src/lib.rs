@@ -1717,6 +1717,9 @@ impl AgentLoopState {
         let effective =
             CompletionTracker::merged_requirements(caller_requirements, &plan.requirements())?;
         self.completion.replace_requirements(&effective)?;
+        // Installing a valid plan resolves only the pre-execution command precondition.  Any
+        // failure from a command that actually ran remains in CompletionTracker.
+        self.completion.clear_verification_plan_required_failure();
         self.verification_plan = Some(VerificationPlanState {
             plan,
             revision: Some(revision),
@@ -2311,6 +2314,7 @@ impl AgentLoopState {
                 if plan.plan.reason != AgentRepairReason::ToolFailure
                     || plan.plan.required_revision.is_some()
                     || changed_with_verification_planning
+                    || self.completion.has_unresolved_failures()
                 {
                     return false;
                 }
@@ -5601,10 +5605,16 @@ where
                     "prior_verification_failures": failure_hint,
                 }))
                 .unwrap_or_else(|_| "{}".to_string());
+                let (sandbox_mode, network_access) = effective_command_policy(&self.policy.profile);
+                let current_session_profile = serde_json::to_string(&json!({
+                    "sandbox_mode": sandbox_mode,
+                    "network_access": network_access,
+                }))
+                .unwrap_or_else(|_| "{}".to_string());
                 state.messages.push(ModelMessage::text(
                     ModelRole::Developer,
                     format!(
-                        "A real workspace mutation requires a revision-bound verification entry in the same update_plan call before any command. trusted_change={trusted_change}. Each entry must include affected_path exactly matching one changed_paths value, an affected_symbol, bounded evidence and current_gap, and an exact action command/profile. When one command proves multiple risks, reuse the identical command, cwd, timeout and profile for those entries; after installing the plan, execute every distinct planned action exactly instead of substituting a semantically equivalent command."
+                        "A real workspace mutation requires a revision-bound verification entry in the same update_plan call before any command. trusted_change={trusted_change}. The current session profile is fixed and must be used exactly for every verification action: current_session_profile={current_session_profile}. Each entry must include affected_path exactly matching one changed_paths value, an affected_symbol, bounded evidence and current_gap, and an exact action command/profile. When one command proves multiple risks, reuse the identical command, cwd, timeout and profile for those entries; after installing the plan, execute every distinct planned action exactly instead of substituting a semantically equivalent command."
                     ),
                 ));
             }
