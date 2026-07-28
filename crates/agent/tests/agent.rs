@@ -1055,7 +1055,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
     let pending = pending_approval(&blocked);
     let steered_checkpoint = pending
         .checkpoint()
-        .into_turn_checkpoint(&["use a different implementation".to_string()], true)
+        .into_turn_checkpoint(&["use a different implementation".to_string()], true, &[])
         .expect("approval steer handoff")
         .encode()
         .expect("turn checkpoint");
@@ -1225,6 +1225,77 @@ fn finalization_stream_agent(
 
 fn plan_tool_call(id: &str, steps: serde_json::Value) -> ModelToolCall {
     tool_call(id, "update_plan", serde_json::json!({"steps": steps}))
+}
+
+fn workspace_edit_response(
+    request: &str,
+    response: &str,
+    call_id: &str,
+    expected: &str,
+    replacement: &str,
+) -> ModelTurnResponse {
+    let mut response = ModelTurnResponse::completed(request, response, "");
+    response.tool_calls.push(tool_call(
+        call_id,
+        "edit",
+        serde_json::json!({
+            "path": "README.md",
+            "expected": expected,
+            "replacement": replacement
+        }),
+    ));
+    response
+}
+
+fn workspace_command_response(
+    request: &str,
+    response: &str,
+    call_id: &str,
+    argument: &str,
+) -> ModelTurnResponse {
+    let mut response = ModelTurnResponse::completed(request, response, "");
+    response.tool_calls.push(tool_call(
+        call_id,
+        "command",
+        serde_json::json!({
+            "command": test_command_script(argument),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
+    ));
+    response
+}
+
+fn workspace_verification_plan_response(
+    request: &str,
+    response: &str,
+    call_id: &str,
+    argument: &str,
+) -> ModelTurnResponse {
+    let mut response = ModelTurnResponse::completed(request, response, "");
+    response.tool_calls.push(tool_call(
+        call_id,
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "verify the changed fixture", "status": "completed"}],
+            "verification": [{
+                "risk": "general_mutation",
+                "evidence": "changed README.md",
+                "affected_path": "README.md",
+                "affected_symbol": "README.md::fixture_boundary",
+                "current_gap": "verification evidence is not yet recorded",
+                "action": {
+                    "command": test_command_script(argument),
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+                "required": 1
+            }]
+        }),
+    ));
+    response
 }
 
 #[test]
@@ -4182,6 +4253,457 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
     assert_eq!(requests[6].tool_choice.mode, ToolChoiceMode::None);
     assert_eq!(requests[6].tool_choice.max_tool_calls, 0);
     assert!(requests[6].tools.is_empty());
+}
+
+/// 两次 mutation 后模型把同一 digest 的 repeat count 从 2 缩减为 1：完成门禁必须仍按
+/// 调用方下限要求 2 次成功，提前的 final answer 被拒。
+#[test]
+fn caller_verification_floor_survives_replan_with_shrunk_count() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let caller_digest = command_script_scope_digest_with_policy(
+        &test_command_script("success"),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice and verify")
+        .with_max_turns(7)
+        .with_verification_requirements([AgentVerificationRequirement::new(&caller_digest, 2)]);
+    let shrunk_plan = workspace_verification_plan_response(
+        "model_request_turn_1_2",
+        "response_2",
+        "shrunk_plan",
+        "success",
+    );
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                workspace_edit_response(
+                    "model_request_turn_1_0",
+                    "response_0",
+                    "edit_0",
+                    "before",
+                    "intermediate",
+                ),
+                workspace_edit_response(
+                    "model_request_turn_1_1",
+                    "response_1",
+                    "edit_1",
+                    "intermediate",
+                    "after",
+                ),
+                shrunk_plan,
+                workspace_command_response(
+                    "model_request_turn_1_3",
+                    "response_3",
+                    "command_3",
+                    "success",
+                ),
+                ModelTurnResponse::completed("model_request_turn_1_4", "response_4", "premature"),
+                workspace_command_response(
+                    "model_request_turn_1_5",
+                    "response_5",
+                    "command_5",
+                    "success",
+                ),
+                ModelTurnResponse::completed("model_request_turn_1_6", "response_6", "done"),
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(&input);
+
+    assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(result.verification.required_command_count, 2);
+    assert_eq!(result.verification.satisfied_command_count, 2);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
+}
+
+/// TurnCheckpoint 必须持久化并恢复"调用方 ∪ 模型 plan"的合并要求集：checkpoint 中只装
+/// 了模型 plan 子集时，resume 后完成门禁仍要求调用方 command。
+#[test]
+fn caller_verification_floor_survives_turn_checkpoint_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let caller_digest = command_script_scope_digest_with_policy(
+        &test_command_script("success"),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let plan_digest = command_script_scope_digest_with_policy(
+        &test_command_script("second-success"),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice and verify")
+        .with_max_turns(3)
+        .with_verification_requirements([AgentVerificationRequirement::new(&caller_digest, 1)]);
+    let subset_plan = workspace_verification_plan_response(
+        "model_request_turn_1_2",
+        "response_2",
+        "subset_plan",
+        "second-success",
+    );
+    let policy = || {
+        allow_read_execute_policy().with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        )
+    };
+    let mut checkpoints = Vec::new();
+
+    let interrupted = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                workspace_edit_response(
+                    "model_request_turn_1_0",
+                    "response_0",
+                    "edit_0",
+                    "before",
+                    "intermediate",
+                ),
+                workspace_edit_response(
+                    "model_request_turn_1_1",
+                    "response_1",
+                    "edit_1",
+                    "intermediate",
+                    "after",
+                ),
+                subset_plan,
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run_with_events_and_checkpoints(&input, &mut |_event| Ok(()), &mut |checkpoint| {
+        checkpoints.push(checkpoint);
+        Ok(())
+    });
+
+    assert_eq!(interrupted.status, AgentStatus::Failed, "{interrupted:?}");
+    let checkpoint = checkpoints
+        .iter()
+        .filter(|event| {
+            event
+                .checkpoint
+                .encode()
+                .is_ok_and(|payload| !payload["verification_plan"].is_null())
+        })
+        .last()
+        .expect("checkpoint with installed verification plan")
+        .checkpoint
+        .clone();
+    let payload = checkpoint.encode().expect("encode checkpoint");
+    assert_eq!(
+        payload["completion"]["required_command_counts"],
+        serde_json::json!({ caller_digest.clone(): 1, plan_digest.clone(): 1 }),
+        "checkpoint must persist the caller requirement unioned with the model plan"
+    );
+
+    let resumed = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                workspace_command_response(
+                    "model_request_turn_1_3",
+                    "response_3",
+                    "command_3",
+                    "second-success",
+                ),
+                workspace_command_response(
+                    "model_request_turn_1_4",
+                    "response_4",
+                    "command_4",
+                    "success",
+                ),
+                ModelTurnResponse::completed("model_request_turn_1_5", "response_5", "done"),
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy(),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .resume_turn(&input.with_max_turns(8), &checkpoint);
+
+    assert_eq!(resumed.status, AgentStatus::Completed, "{resumed:?}");
+    assert_eq!(resumed.final_answer.as_deref(), Some("done"));
+    assert_eq!(resumed.verification.required_command_count, 2);
+    assert_eq!(resumed.verification.satisfied_command_count, 2);
+}
+
+/// ApprovalCheckpoint 必须持久化合并要求集：批准后 resume 的完成门禁仍要求调用方
+/// command 与模型 plan command 都成功。
+#[test]
+fn caller_verification_floor_survives_approval_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let caller_digest = command_script_scope_digest_with_policy(
+        &test_command_script("success"),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let plan_digest = command_script_scope_digest_with_policy(
+        &test_command_script("second-success"),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice and verify")
+        .with_max_turns(6)
+        .with_verification_requirements([AgentVerificationRequirement::new(&caller_digest, 1)]);
+    let subset_plan = workspace_verification_plan_response(
+        "model_request_turn_1_2",
+        "response_2",
+        "subset_plan",
+        "second-success",
+    );
+    let policy = allow_read_write_policy().with_rule(
+        PermissionRule::new(
+            "ask_execute",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Ask,
+        )
+        .for_operation(PermissionOperation::Execute),
+    );
+
+    let agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                workspace_edit_response(
+                    "model_request_turn_1_0",
+                    "response_0",
+                    "edit_0",
+                    "before",
+                    "intermediate",
+                ),
+                workspace_edit_response(
+                    "model_request_turn_1_1",
+                    "response_1",
+                    "edit_1",
+                    "intermediate",
+                    "after",
+                ),
+                subset_plan,
+                workspace_command_response(
+                    "model_request_turn_1_3",
+                    "response_3",
+                    "command_3",
+                    "second-success",
+                ),
+                workspace_command_response(
+                    "model_request_turn_1_4",
+                    "response_4",
+                    "command_4",
+                    "success",
+                ),
+                ModelTurnResponse::completed("model_request_turn_1_5", "response_5", "done"),
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    );
+    let blocked = agent_loop.run(&input);
+
+    assert_eq!(blocked.status, AgentStatus::Blocked, "{blocked:?}");
+    let pending = pending_approval(&blocked);
+    let payload = pending
+        .encode_checkpoint()
+        .expect("encode approval checkpoint");
+    assert_eq!(
+        payload["completion"]["required_command_counts"],
+        serde_json::json!({ caller_digest.clone(): 1, plan_digest.clone(): 1 }),
+        "approval checkpoint must persist the caller requirement unioned with the model plan"
+    );
+    let steered = pending
+        .checkpoint()
+        .into_turn_checkpoint(
+            &["continue with a different approach".to_string()],
+            true,
+            &input.verification_requirements,
+        )
+        .expect("steer after installed model plan");
+    let steered_payload = steered.encode().expect("encode steered checkpoint");
+    assert!(
+        steered_payload["verification_plan"].is_null(),
+        "steer must clear an installed model plan"
+    );
+    assert_eq!(
+        steered_payload["completion"]["required_command_counts"],
+        serde_json::json!({ caller_digest.clone(): 1 }),
+        "steer must restore only the explicit caller floor"
+    );
+
+    let resumed_input = input.clone().with_approval_grant(ApprovalGrant::allow(
+        pending.pending_tool_call().request_id.clone(),
+        pending.pending_tool_call().tool_name.clone(),
+        pending.pending_tool_call().resources.clone(),
+    ));
+    let blocked_again = agent_loop.resume_pending_approval(&resumed_input, &pending);
+
+    assert_eq!(
+        blocked_again.status,
+        AgentStatus::Blocked,
+        "{blocked_again:?}"
+    );
+    let pending_again = pending_approval(&blocked_again);
+    let resumed_input_again = input.clone().with_approval_grant(ApprovalGrant::allow(
+        pending_again.pending_tool_call().request_id.clone(),
+        pending_again.pending_tool_call().tool_name.clone(),
+        pending_again.pending_tool_call().resources.clone(),
+    ));
+    let resumed = agent_loop.resume_pending_approval(&resumed_input_again, &pending_again);
+
+    assert_eq!(resumed.status, AgentStatus::Completed, "{resumed:?}");
+    assert_eq!(resumed.final_answer.as_deref(), Some("done"));
+    assert_eq!(resumed.verification.required_command_count, 2);
+    assert_eq!(resumed.verification.satisfied_command_count, 2);
+}
+
+/// approval steer 即使发生在模型 plan 安装前，也必须从显式 caller requirements 恢复
+/// 完成门禁下限；恢复过程不能依赖 synthetic plan 或 checkpoint 形状推断。
+#[test]
+fn caller_verification_floor_survives_approval_steer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let caller_digest = command_script_scope_digest_with_policy(
+        &test_command_script("success"),
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let input = AgentLoopInput::new("thread_1", "turn_1", "edit and verify")
+        .with_max_turns(4)
+        .with_verification_requirements([AgentVerificationRequirement::new(&caller_digest, 1)]);
+    let edit = workspace_edit_response(
+        "model_request_turn_1_0",
+        "response_0",
+        "edit_0",
+        "before",
+        "after",
+    );
+    let mut steps_only_plan =
+        ModelTurnResponse::completed("model_request_turn_1_1", "response_1", "");
+    steps_only_plan.tool_calls.push(tool_call(
+        "steps_only_plan",
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "verify the workspace state", "status": "completed"}]
+        }),
+    ));
+    let command = workspace_command_response(
+        "model_request_turn_1_2",
+        "response_2",
+        "command_2",
+        "success",
+    );
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "ask_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Ask,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+
+    let agent_loop = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit,
+                steps_only_plan,
+                command,
+                ModelTurnResponse::completed("model_request_turn_1_3", "response_3", "done"),
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    );
+    let blocked = agent_loop.run(&input);
+
+    assert_eq!(blocked.status, AgentStatus::Blocked, "{blocked:?}");
+    let pending = pending_approval(&blocked);
+    let steered = pending
+        .checkpoint()
+        .into_turn_checkpoint(
+            &["verify without editing".to_string()],
+            true,
+            &input.verification_requirements,
+        )
+        .expect("approval steer handoff");
+    let payload = steered.encode().expect("encode steered checkpoint");
+    assert!(
+        payload["verification_plan"].is_null(),
+        "steer must discard the old model plan"
+    );
+    assert_eq!(
+        payload["completion"]["required_command_counts"],
+        serde_json::json!({ caller_digest.clone(): 1 }),
+        "steer must keep the caller-declared requirement set"
+    );
+
+    let resumed = agent_loop.resume_turn(&input, &steered);
+
+    assert_eq!(resumed.status, AgentStatus::Completed, "{resumed:?}");
+    assert_eq!(resumed.final_answer.as_deref(), Some("done"));
+    assert_eq!(resumed.verification.required_command_count, 1);
+    assert_eq!(resumed.verification.satisfied_command_count, 1);
 }
 
 #[test]

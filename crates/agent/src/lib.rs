@@ -62,6 +62,7 @@ impl TurnCheckpoint {
         mut self,
         inputs: &[String],
         cancel_pending_tool_calls: bool,
+        caller_requirements: &[AgentVerificationRequirement],
     ) -> Result<Self, String> {
         if inputs.is_empty() || inputs.iter().any(|input| input.trim().is_empty()) {
             return Err("turn checkpoint user input is empty".to_string());
@@ -73,7 +74,7 @@ impl TurnCheckpoint {
                 false,
             )?;
         }
-        self.append_user_inputs(inputs)
+        self.append_user_inputs(inputs, caller_requirements)
     }
 
     fn with_pending_tool_failure(
@@ -117,7 +118,11 @@ impl TurnCheckpoint {
         Ok(self)
     }
 
-    fn append_user_inputs(mut self, inputs: &[String]) -> Result<Self, String> {
+    fn append_user_inputs(
+        mut self,
+        inputs: &[String],
+        caller_requirements: &[AgentVerificationRequirement],
+    ) -> Result<Self, String> {
         self.state.messages.extend(
             inputs
                 .iter()
@@ -131,10 +136,13 @@ impl TurnCheckpoint {
         self.state
             .completion
             .mark_workspace_revision_invalid("user_input_revision");
-        self.state.completion.replace_requirements(&[])?;
-        self.state.plan = None;
+        // A steer starts a new input epoch: old model evidence and its revision-bound plan are
+        // discarded, while the caller-declared floor is reinstalled from the new AgentLoop input.
+        self.state
+            .completion
+            .replace_requirements(caller_requirements)?;
         self.state.verification_plan = None;
-        self.state.verification_change = None;
+        self.state.plan = None;
         self.state.verification_failure_history.clear();
         self.state.repair_plan = None;
         self.state.final_review_verdict = None;
@@ -153,6 +161,7 @@ impl ApprovalCheckpoint {
         &self,
         inputs: &[String],
         cancel_pending_tool_call: bool,
+        caller_requirements: &[AgentVerificationRequirement],
     ) -> Result<TurnCheckpoint, String> {
         if cancel_pending_tool_call == inputs.is_empty() {
             return Err("approval checkpoint input handoff is inconsistent".to_string());
@@ -164,7 +173,7 @@ impl ApprovalCheckpoint {
             pending_tool_calls: vec![self.pending_tool_call.clone()],
         };
         if cancel_pending_tool_call {
-            checkpoint.with_user_inputs(inputs, true)
+            checkpoint.with_user_inputs(inputs, true, caller_requirements)
         } else {
             checkpoint.encode().map(|_| checkpoint)
         }
@@ -174,6 +183,7 @@ impl ApprovalCheckpoint {
     pub fn into_turn_checkpoint_after_denial(
         &self,
         inputs: &[String],
+        caller_requirements: &[AgentVerificationRequirement],
     ) -> Result<TurnCheckpoint, String> {
         if inputs.iter().any(|input| input.trim().is_empty()) {
             return Err("approval checkpoint input handoff is inconsistent".to_string());
@@ -192,7 +202,7 @@ impl ApprovalCheckpoint {
         if inputs.is_empty() {
             checkpoint.encode().map(|_| checkpoint)
         } else {
-            checkpoint.append_user_inputs(inputs)
+            checkpoint.append_user_inputs(inputs, caller_requirements)
         }
     }
 }
@@ -1692,7 +1702,11 @@ impl AgentLoopState {
         true
     }
 
-    fn install_verification_plan(&mut self, plan: AgentVerificationPlan) -> Result<(), String> {
+    fn install_verification_plan(
+        &mut self,
+        plan: AgentVerificationPlan,
+        caller_requirements: &[AgentVerificationRequirement],
+    ) -> Result<(), String> {
         plan.validate()?;
         let Some(revision) = self.completion.workspace_revision else {
             return Err("verification plan requires an observed workspace revision".to_string());
@@ -1700,7 +1714,9 @@ impl AgentLoopState {
         if !self.verification_planning_required {
             return Err("verification plan is not currently required".to_string());
         }
-        self.completion.replace_requirements(&plan.requirements())?;
+        let effective =
+            CompletionTracker::merged_requirements(caller_requirements, &plan.requirements())?;
+        self.completion.replace_requirements(&effective)?;
         self.verification_plan = Some(VerificationPlanState {
             plan,
             revision: Some(revision),
@@ -2153,9 +2169,9 @@ impl AgentLoopState {
         };
         active.plan.attempt = self.repair_attempts.saturating_add(1);
         active.plan.required_revision = Some(revision);
-        // A mutation invalidates the previous revision's verification requirements before the
-        // next plan is installed. Bind the prospective repair to that cleared requirement set so
-        // the durable mutation checkpoint remains internally consistent until replanning.
+        // A mutation invalidates the previous revision's verification evidence before the
+        // next plan is installed. Bind the prospective repair to the surviving caller-declared
+        // floor so the durable mutation checkpoint remains internally consistent until replanning.
         active.plan.required_check_count = self.completion.required_command_count();
     }
 
@@ -4410,6 +4426,7 @@ where
             &mut state,
             &occurrence.context,
             &mut on_event,
+            &input.verification_requirements,
         );
         match self.record_tool_results(
             input,
@@ -4871,6 +4888,7 @@ where
                     .expect("single approval occurrence is present")
                     .context,
                 on_event,
+                &input.verification_requirements,
             );
             state.append_hidden_tool_result(result.result);
             if emit_event(
@@ -4925,6 +4943,7 @@ where
                 .expect("single tool occurrence is present")
                 .context,
             on_event,
+            &input.verification_requirements,
         );
         let control = self.record_tool_results(
             input,
@@ -5368,7 +5387,9 @@ where
                         .mark_workspace_revision_invalid("mutation_revision_missing");
                     state.verification_planning_required = true;
                     state.verification_plan = None;
-                    let _ = state.completion.replace_requirements(&[]);
+                    let _ = state
+                        .completion
+                        .replace_requirements(&input.verification_requirements);
                     return ToolBatchControl::Failed(
                         "workspace mutation revision is missing".to_string(),
                     );
@@ -5381,7 +5402,9 @@ where
                             .mark_workspace_revision_invalid("mutation_diff_summary_invalid");
                         state.verification_planning_required = true;
                         state.verification_plan = None;
-                        let _ = state.completion.replace_requirements(&[]);
+                        let _ = state
+                            .completion
+                            .replace_requirements(&input.verification_requirements);
                         return ToolBatchControl::Failed(error);
                     }
                 }
@@ -5392,7 +5415,12 @@ where
                 if had_bound_plan && verification_planning_available {
                     state.verification_plan = None;
                     state.verification_planning_required = true;
-                    if let Err(error) = state.completion.replace_requirements(&[]) {
+                    // A mutation clears stale revision evidence but never the caller-declared
+                    // floor; the next installed plan is unioned with it again.
+                    if let Err(error) = state
+                        .completion
+                        .replace_requirements(&input.verification_requirements)
+                    {
                         return ToolBatchControl::Failed(error);
                     }
                 } else if state.verification_plan.is_none() && verification_planning_available {
@@ -5416,12 +5444,18 @@ where
                         .as_ref()
                         .is_some_and(|plan| plan.revision.is_some()));
             if plan_started {
-                let requirements = state
-                    .verification_plan
-                    .as_ref()
-                    .expect("bound verification plan")
-                    .plan
-                    .requirements();
+                let requirements = match CompletionTracker::merged_requirements(
+                    &input.verification_requirements,
+                    &state
+                        .verification_plan
+                        .as_ref()
+                        .expect("bound verification plan")
+                        .plan
+                        .requirements(),
+                ) {
+                    Ok(requirements) => requirements,
+                    Err(error) => return ToolBatchControl::Failed(error),
+                };
                 if let Err(error) = state.completion.activate_requirements(&requirements) {
                     return ToolBatchControl::Failed(error);
                 }
@@ -5626,6 +5660,7 @@ where
         state: &mut AgentLoopState,
         occurrence: &ToolOccurrenceContext,
         on_event: &mut Option<&mut AgentLoopEventCallback<'_>>,
+        caller_requirements: &[AgentVerificationRequirement],
     ) -> RuntimeToolResult {
         let started = std::time::Instant::now();
         let call = &prepared.call;
@@ -5656,7 +5691,7 @@ where
             .tool_broker
             .execute(&envelope, decision.clone(), |executor, _| match executor {
                 ToolExecutor::AgentControl(AgentControlToolExecutor::UpdatePlan) => {
-                    self.execute_plan_update(call, state)
+                    self.execute_plan_update(call, state, caller_requirements)
                 }
                 ToolExecutor::Workspace(_) => {
                     let execution = self.execute_workspace_tool(
@@ -5707,7 +5742,12 @@ where
             .is_ok()
     }
 
-    fn execute_plan_update(&self, call: &ModelToolCall, state: &mut AgentLoopState) -> ToolOutput {
+    fn execute_plan_update(
+        &self,
+        call: &ModelToolCall,
+        state: &mut AgentLoopState,
+        caller_requirements: &[AgentVerificationRequirement],
+    ) -> ToolOutput {
         let update = match update_plan_tool_input(&call.arguments) {
             Ok(update) => update,
             Err(error) => {
@@ -5764,7 +5804,7 @@ where
             None
         };
         if let Some(plan) = verification_plan
-            && let Err(error) = state.install_verification_plan(plan)
+            && let Err(error) = state.install_verification_plan(plan, caller_requirements)
         {
             return ToolOutput::failure("invalid_tool_arguments", json!({"summary": error}));
         }
@@ -6633,10 +6673,13 @@ fn restore_checkpoint(
     {
         return Err("approval checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let requirements = checkpoint_state.verification_plan.as_ref().map_or_else(
-        || verification_requirements(input),
-        |plan| Ok(plan.plan.requirements()),
-    )?;
+    let caller_requirements = verification_requirements(input)?;
+    let requirements = match checkpoint_state.verification_plan.as_ref() {
+        Some(plan) => {
+            CompletionTracker::merged_requirements(&caller_requirements, &plan.plan.requirements())?
+        }
+        None => caller_requirements.clone(),
+    };
     let mut derived_completion = CompletionTracker::from_requirements(&requirements)?;
     for occurrence in &tool_result_occurrences {
         if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
@@ -6644,8 +6687,11 @@ fn restore_checkpoint(
         }
     }
     if checkpoint_state.input_revision > checkpoint_state.replanned_input_revision {
+        if checkpoint_state.verification_plan.is_some() {
+            return Err("approval checkpoint verification plan survived user steer".to_string());
+        }
         derived_completion.mark_workspace_revision_invalid("user_input_revision");
-        derived_completion.replace_requirements(&[])?;
+        derived_completion.replace_requirements(&caller_requirements)?;
     }
     if !derived_completion.is_consistent() {
         return Err("approval checkpoint derived workspace revision state is invalid".to_string());
@@ -6741,10 +6787,13 @@ fn restore_turn_checkpoint(
     {
         return Err("turn checkpoint tool result occurrence bindings are invalid".to_string());
     }
-    let requirements = checkpoint_state.verification_plan.as_ref().map_or_else(
-        || verification_requirements(input),
-        |plan| Ok(plan.plan.requirements()),
-    )?;
+    let caller_requirements = verification_requirements(input)?;
+    let requirements = match checkpoint_state.verification_plan.as_ref() {
+        Some(plan) => {
+            CompletionTracker::merged_requirements(&caller_requirements, &plan.plan.requirements())?
+        }
+        None => caller_requirements.clone(),
+    };
     let mut derived_completion = CompletionTracker::from_requirements(&requirements)?;
     for occurrence in &checkpoint_state.tool_result_occurrences {
         if occurrence.result().error_code.as_deref() != Some("not_executed_due_to_user_input") {
@@ -6752,8 +6801,11 @@ fn restore_turn_checkpoint(
         }
     }
     if checkpoint_state.input_revision > checkpoint_state.replanned_input_revision {
+        if checkpoint_state.verification_plan.is_some() {
+            return Err("turn checkpoint verification plan survived user steer".to_string());
+        }
         derived_completion.mark_workspace_revision_invalid("user_input_revision");
-        derived_completion.replace_requirements(&[])?;
+        derived_completion.replace_requirements(&caller_requirements)?;
     }
     if !derived_completion.is_consistent() || derived_completion != checkpoint_state.completion {
         return Err("turn checkpoint completion state mismatch".to_string());

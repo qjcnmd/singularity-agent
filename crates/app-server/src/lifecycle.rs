@@ -422,6 +422,7 @@ impl AppServer {
         thread_id: &str,
         turn_id: &str,
         event: TurnCheckpointEvent,
+        caller_requirements: &[singularity_agent::AgentVerificationRequirement],
     ) -> AppServerResult<TurnBoundaryAction> {
         let checkpoint_version = event.checkpoint.checkpoint_version();
         let checkpoint = event
@@ -534,7 +535,7 @@ impl AppServer {
             } else {
                 let updated = event
                     .checkpoint
-                    .with_user_inputs(&messages, cancel_pending_tools)
+                    .with_user_inputs(&messages, cancel_pending_tools, caller_requirements)
                     .map_err(|_| AppServerError::TurnExecution {
                         stage: TurnFailureStage::ApprovalCheckpoint,
                         cause: TurnFailureCause::Serialization,
@@ -1404,7 +1405,12 @@ impl AppServer {
                 if callback_error.borrow().is_some() {
                     return Err(AgentLoopEventSinkError);
                 }
-                match self.persist_turn_checkpoint_event(&thread.thread_id, &turn.turn_id, event) {
+                match self.persist_turn_checkpoint_event(
+                    &thread.thread_id,
+                    &turn.turn_id,
+                    event,
+                    &loop_input.verification_requirements,
+                ) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {
                         *boundary_action.borrow_mut() = Some(action);
@@ -1624,6 +1630,7 @@ impl AppServer {
                     &invocation.thread.thread_id,
                     invocation.turn_id,
                     event,
+                    &loop_input.verification_requirements,
                 ) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {
@@ -1781,6 +1788,7 @@ impl AppServer {
                     &invocation.thread.thread_id,
                     invocation.turn_id,
                     event,
+                    &loop_input.verification_requirements,
                 ) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {
@@ -1860,6 +1868,7 @@ impl AppServer {
                 phase: TurnCheckpointPhase::ModelResponseCommitted,
                 checkpoint,
             },
+            &[],
         )? {
             TurnBoundaryAction::Restart(checkpoint) => checkpoint,
             TurnBoundaryAction::Paused => return Ok(AgentRunStatus::paused()),

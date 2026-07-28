@@ -69,6 +69,41 @@ impl CompletionTracker {
         })
     }
 
+    /// Merge the caller floor with a model plan without changing either side's duplicate rules.
+    ///
+    /// Caller requirements are reduced by `from_requirements`, whose checked-add semantics keep
+    /// repeated caller declarations additive. The caller supplies `plan` after
+    /// `AgentVerificationPlan::requirements` has already reduced model duplicates by maximum;
+    /// merging the two validated maps then takes the maximum for a digest shared by both sets.
+    pub(super) fn merged_requirements(
+        caller: &[AgentVerificationRequirement],
+        plan: &[AgentVerificationRequirement],
+    ) -> Result<Vec<AgentVerificationRequirement>, String> {
+        let caller = Self::from_requirements(caller)?;
+        let plan = Self::from_requirements(plan)?;
+        let mut required_command_counts = caller.required_command_counts;
+        for (digest, count) in plan.required_command_counts {
+            required_command_counts
+                .entry(digest)
+                .and_modify(|current| *current = (*current).max(count))
+                .or_insert(count);
+        }
+        if required_command_counts.len() > MAX_VERIFICATION_REQUIREMENTS {
+            return Err(format!(
+                "verification requirements must not contain more than {MAX_VERIFICATION_REQUIREMENTS} entries"
+            ));
+        }
+        Ok(required_command_counts
+            .into_iter()
+            .map(
+                |(command_scope_digest, required_success_count)| AgentVerificationRequirement {
+                    command_scope_digest,
+                    required_success_count,
+                },
+            )
+            .collect())
+    }
+
     /// Activate exact command requirements once a real workspace mutation creates a verification
     /// boundary. Read-only turns keep the legacy requirement state unchanged until this point.
     pub(super) fn activate_requirements(
@@ -398,6 +433,56 @@ impl CompletionTracker {
         self.terminal_command_revisions
             .iter()
             .all(|revision| Some(*revision) == self.workspace_revision)
+    }
+}
+
+#[cfg(test)]
+mod requirement_merge_tests {
+    use super::*;
+
+    fn requirement(digest: &str, count: u32) -> AgentVerificationRequirement {
+        AgentVerificationRequirement::new(digest, count)
+    }
+
+    #[test]
+    fn merged_requirements_preserves_caller_addition_and_plan_max() {
+        let caller_digest = format!("sha256:{}", "a".repeat(64));
+        let plan_digest = format!("sha256:{}", "b".repeat(64));
+        let model_plan = super::super::AgentVerificationPlan {
+            risks: vec![super::super::AgentVerificationRisk::GeneralMutation],
+            checks: vec![
+                super::super::AgentVerificationCheck::new(
+                    super::super::AgentVerificationRisk::GeneralMutation,
+                    requirement(&plan_digest, 1),
+                ),
+                super::super::AgentVerificationCheck::new(
+                    super::super::AgentVerificationRisk::GeneralMutation,
+                    requirement(&plan_digest, 3),
+                ),
+            ],
+            entries: Vec::new(),
+        };
+        let caller = vec![
+            requirement(&caller_digest, 2),
+            requirement(&caller_digest, 3),
+        ];
+        let merged = CompletionTracker::merged_requirements(&caller, &model_plan.requirements())
+            .expect("valid requirement union");
+        assert_eq!(
+            merged,
+            vec![requirement(&caller_digest, 5), requirement(&plan_digest, 3)]
+        );
+    }
+
+    #[test]
+    fn merged_requirements_rejects_caller_overflow() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let error = CompletionTracker::merged_requirements(
+            &[requirement(&digest, u32::MAX), requirement(&digest, 1)],
+            &[],
+        )
+        .expect_err("caller duplicate overflow must fail closed");
+        assert!(error.contains("exceeds the supported range"));
     }
 }
 
