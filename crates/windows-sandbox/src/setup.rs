@@ -43,6 +43,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use singularity_core::PROTECTED_GIT_DIR_NAME;
 
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
@@ -1192,8 +1193,37 @@ fn build_payload_deny_write_paths(
         .into_iter()
         .map(|path| canonicalize_path_allow_missing(&path))
         .collect();
-    deny_write_paths.extend(allow_deny_paths.deny);
+    let explicit_paths = deny_write_paths.clone();
+    deny_write_paths.extend(
+        allow_deny_paths
+            .deny
+            .into_iter()
+            .filter(|path| !nested_git_path_shadowed_by_explicit(path, &explicit_paths)),
+    );
     deny_write_paths
+}
+
+fn nested_git_path_shadowed_by_explicit(path: &Path, explicit_paths: &[PathBuf]) -> bool {
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(PROTECTED_GIT_DIR_NAME))
+    {
+        return false;
+    }
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        let marker = directory.join(PROTECTED_GIT_DIR_NAME);
+        let marker_key = canonical_path_key(&marker);
+        if explicit_paths
+            .iter()
+            .any(|candidate| canonical_path_key(candidate) == marker_key)
+        {
+            return true;
+        }
+        parent = directory.parent();
+    }
+    false
 }
 
 fn build_payload_deny_read_paths(explicit_deny_read_paths: Option<Vec<PathBuf>>) -> Vec<PathBuf> {
@@ -1350,6 +1380,7 @@ mod tests {
     use crate::setup_error::extract_failure;
     use crate::setup_error::write_setup_error_report;
     use pretty_assertions::assert_eq;
+    use singularity_core::PROTECTED_GIT_DIR_NAME;
     use std::collections::HashMap;
     use std::collections::HashSet;
     use std::fs;
@@ -2194,6 +2225,43 @@ mod tests {
             .collect::<HashSet<PathBuf>>(),
             deny_write_paths.into_iter().collect()
         );
+    }
+
+    #[test]
+    fn payload_deny_write_paths_drop_nested_git_when_ancestor_is_explicit() {
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repository root")
+            .to_path_buf();
+        let work_root = repository.join("work");
+        let workspace = tempfile::Builder::new()
+            .prefix("setup-filter-")
+            .tempdir_in(&work_root)
+            .expect("nested workspace");
+        let sandbox_home = workspace.path().join("singularity-home");
+        let permission_profile = workspace_write_profile(
+            &[],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        );
+        let workspace_roots = workspace_roots_for(workspace.path());
+        let permissions = permissions_for(&permission_profile, workspace_roots.as_slice());
+        let request = super::SandboxSetupRequest {
+            permissions: &permissions,
+            command_cwd: workspace.path(),
+            env_map: &HashMap::new(),
+            sandbox_home: &sandbox_home,
+            proxy_enforced: false,
+        };
+        let ancestor_marker = repository.join(PROTECTED_GIT_DIR_NAME);
+        let deny_write_paths =
+            super::build_payload_deny_write_paths(&request, Some(vec![ancestor_marker.clone()]));
+
+        assert!(deny_write_paths.contains(&canonicalize_path_allow_missing(&ancestor_marker)));
+        assert!(!deny_write_paths.contains(&canonicalize_path_allow_missing(
+            &workspace.path().join(PROTECTED_GIT_DIR_NAME),
+        )));
     }
 
     #[test]

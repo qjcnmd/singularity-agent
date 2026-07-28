@@ -23,6 +23,7 @@ use singularity_core::is_public_certificate_only_pem as classify_public_certific
 use std::collections::HashSet;
 use std::ffi::{OsStr, c_void};
 use std::io::Read;
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use windows_sys::Wdk::Storage::FileSystem::{FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF};
@@ -205,6 +206,116 @@ fn ancestor_has_git_marker(directory: &std::fs::File) -> Result<bool> {
         }
         Err(error) => Err(error).context("inspect ancestor Git marker"),
     }
+}
+
+/// Resolves a missing workspace `.git` path to the existing repository marker above it.
+///
+/// The returned handle is opened relative to pinned, no-follow parent handles and keeps delete
+/// sharing disabled for the caller's complete sandbox setup and child lifetime. This lets the
+/// caller protect the real ancestor marker without creating a synthetic nested `.git` object.
+pub(crate) fn open_existing_git_ancestor(path: &Path) -> Result<Option<(PathBuf, std::fs::File)>> {
+    if !is_missing_git_marker(path) {
+        return Ok(None);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect nested Git marker {}", path.display()));
+        }
+    }
+    let (anchor, descendants) = absolute_path_components(path)?;
+    if descendants.is_empty() {
+        return Ok(None);
+    }
+    let mut current = open_filesystem_root(&anchor, FILE_LIST_DIRECTORY)?;
+    let mut current_path = anchor;
+    let mut nearest_marker = None;
+    for component in descendants.iter().take(descendants.len() - 1) {
+        match nt_open_relative(
+            &current,
+            OsStr::new(PROTECTED_GIT_DIR_NAME),
+            0,
+            FILE_OPEN,
+            0,
+        ) {
+            Ok((_marker, _)) => {
+                // Close the probe before reopening the marker with delete access. The probe's
+                // share mode intentionally excludes delete, so retaining it would make the final
+                // open fail with a sharing violation for an existing marker.
+                nearest_marker = Some((
+                    current_path.join(PROTECTED_GIT_DIR_NAME),
+                    current
+                        .try_clone()
+                        .context("pin ancestor Git marker parent")?,
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+                ) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect ancestor Git marker while resolving {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+
+        let next_path = current_path.join(component);
+        let directory = match nt_open_relative(
+            &current,
+            component,
+            FILE_LIST_DIRECTORY,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+        ) {
+            Ok((directory, _)) => directory,
+            Err(error)
+                if matches!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+                ) =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("traverse Git ancestor path {}", next_path.display())
+                });
+            }
+        };
+        validate_plain_directory(&directory, &next_path)?;
+        current_path = next_path;
+        current = directory;
+    }
+    let Some((marker_path, marker_parent)) = nearest_marker else {
+        return Ok(None);
+    };
+    let (marker, _) = nt_open_relative(
+        &marker_parent,
+        OsStr::new(PROTECTED_GIT_DIR_NAME),
+        DELETE | READ_CONTROL | WRITE_DAC,
+        FILE_OPEN,
+        0,
+    )
+    .with_context(|| format!("open ancestor Git marker {}", marker_path.display()))?;
+    let metadata = marker
+        .metadata()
+        .with_context(|| format!("inspect ancestor Git marker {}", marker_path.display()))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(anyhow::Error::new(
+            ProtectedMetadataError::ReparseTargetUnsupported { path: marker_path },
+        ));
+    }
+    if metadata.is_dir() {
+        ensure_case_insensitive_directory(&marker, &marker_path)?;
+    }
+    Ok(Some((marker_path, marker)))
 }
 
 /// Creates or opens an absolute directory through pinned, no-follow native handles.
@@ -506,6 +617,7 @@ mod tests {
     use super::apply_deny_read_acls_with_ownership_before_set;
     use super::ensure_directory_materialized;
     use super::ensure_directory_materialized_with_hook;
+    use super::open_existing_git_ancestor;
     use super::plan_deny_read_acl_paths;
     use crate::acl::dacl_has_read_deny_for_sid;
     use crate::acl::fetch_dacl_handle;
@@ -981,5 +1093,63 @@ mod tests {
             }
         );
         assert!(!nested_git.exists());
+    }
+
+    #[test]
+    fn missing_nested_git_resolves_to_pinned_ancestor_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repository = tmp.path().join("repository");
+        let workspace = repository.join("nested");
+        std::fs::create_dir_all(&workspace).expect("create nested workspace");
+        let ancestor_git = repository.join(".git");
+        std::fs::create_dir(&ancestor_git).expect("create ancestor git marker");
+
+        let (resolved, handle) = open_existing_git_ancestor(&workspace.join(".git"))
+            .expect("resolve nested git")
+            .expect("ancestor git marker");
+        assert_eq!(resolved, ancestor_git);
+        assert!(handle.metadata().expect("marker metadata").is_dir());
+        assert!(
+            std::fs::rename(&resolved, repository.join(".git-replaced")).is_err(),
+            "pinned marker handle must prevent concurrent replacement"
+        );
+    }
+
+    #[test]
+    fn missing_nested_git_resolves_to_pinned_worktree_pointer_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repository = tmp.path().join("repository");
+        let workspace = repository.join("nested");
+        std::fs::create_dir_all(&workspace).expect("create nested workspace");
+        let ancestor_git = repository.join(".git");
+        std::fs::write(&ancestor_git, "gitdir: C:/repo/.git/worktrees/nested\n")
+            .expect("create worktree pointer");
+
+        let (resolved, handle) = open_existing_git_ancestor(&workspace.join(".git"))
+            .expect("resolve nested git")
+            .expect("ancestor git marker");
+        assert_eq!(resolved, ancestor_git);
+        assert!(handle.metadata().expect("marker metadata").is_file());
+        assert!(
+            std::fs::rename(&resolved, repository.join(".git-replaced")).is_err(),
+            "pinned marker handle must prevent concurrent replacement"
+        );
+    }
+
+    #[test]
+    fn existing_nested_git_is_not_replaced_by_ancestor_resolution() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repository = tmp.path().join("repository");
+        let workspace = repository.join("nested");
+        let ancestor_git = repository.join(".git");
+        let nested_git = workspace.join(".git");
+        std::fs::create_dir_all(&nested_git).expect("create nested git marker");
+        std::fs::create_dir(&ancestor_git).expect("create ancestor git marker");
+
+        assert!(
+            open_existing_git_ancestor(&nested_git)
+                .expect("inspect existing nested git")
+                .is_none()
+        );
     }
 }

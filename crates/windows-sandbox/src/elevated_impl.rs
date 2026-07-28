@@ -63,8 +63,10 @@ mod windows_impl {
     use super::ElevatedSandboxProfileCaptureRequest;
     use crate::absolute_path::AbsolutePathBuf;
     use crate::acl::allow_null_device;
+    use crate::allow::compute_allow_paths_for_permissions;
     use crate::cap::workspace_cap_sid_for_cwd;
     use crate::cap::workspace_write_cap_sid_for_root;
+    use crate::deny_read_acl::open_existing_git_ancestor;
     use crate::deny_read_state::StateMutex;
     use crate::deny_read_state::reconcile_runner_leases;
     use crate::deny_read_state::register_runner_lease;
@@ -95,6 +97,7 @@ mod windows_impl {
     use crate::setup::gather_read_roots;
     use crate::token::LocalSid;
     use anyhow::Result;
+    use std::collections::HashSet;
     use std::fs::File;
     use std::path::Path;
     use std::path::PathBuf;
@@ -230,14 +233,24 @@ mod windows_impl {
         let read_roots_override = merged_read_roots.as_deref().or(read_roots_override);
         let read_roots_include_platform_defaults =
             read_roots_include_platform_defaults && merged_read_roots.is_none();
-        let deny_read_paths_override = deny_read_paths_override
-            .iter()
-            .map(AbsolutePathBuf::to_path_buf)
-            .collect::<Vec<_>>();
-        let deny_write_paths_override = deny_write_paths_override
-            .iter()
-            .map(AbsolutePathBuf::to_path_buf)
-            .collect::<Vec<_>>();
+        let (deny_read_paths_override, mut protected_git_marker_handles) =
+            resolve_nested_git_paths(deny_read_paths_override)?;
+        let mut deny_write_inputs = deny_write_paths_override.to_vec();
+        deny_write_inputs.extend(
+            compute_allow_paths_for_permissions(&permissions, cwd, &env_map)
+                .deny
+                .into_iter()
+                .filter(|path| is_git_marker_path(path))
+                .map(AbsolutePathBuf::from_absolute_path_checked)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        );
+        let (deny_write_paths_override, deny_write_marker_handles) =
+            resolve_nested_git_paths(&deny_write_inputs)?;
+        protected_git_marker_handles.extend(deny_write_marker_handles);
+        // Keep the no-follow ancestor marker handles alive through setup, runner spawn, and Job
+        // Object cleanup. This prevents a host-side rename from replacing the protected object
+        // between resolution and the deny-read ACL mutation.
+        let _protected_git_marker_handles = protected_git_marker_handles;
         normalize_null_device_env(&mut env_map);
         ensure_non_interactive_pager(&mut env_map);
         inherit_path_env(&mut env_map);
@@ -476,6 +489,33 @@ mod windows_impl {
             (Ok(capture), Ok(())) => Ok(capture),
             (Err(error), Ok(())) | (_, Err(error)) => Err(error),
         }
+    }
+
+    fn resolve_nested_git_paths(paths: &[AbsolutePathBuf]) -> Result<(Vec<PathBuf>, Vec<File>)> {
+        let mut resolved = Vec::with_capacity(paths.len());
+        let mut handles = Vec::new();
+        let mut seen = HashSet::new();
+        for path in paths {
+            let path = path.as_path();
+            let (effective, handle) = match open_existing_git_ancestor(path)? {
+                Some((ancestor, handle)) => (ancestor, Some(handle)),
+                None => (path.to_path_buf(), None),
+            };
+            let key = effective.to_string_lossy().to_ascii_lowercase();
+            if seen.insert(key) {
+                resolved.push(effective);
+                if let Some(handle) = handle {
+                    handles.push(handle);
+                }
+            }
+        }
+        Ok((resolved, handles))
+    }
+
+    fn is_git_marker_path(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(singularity_core::PROTECTED_GIT_DIR_NAME))
     }
 
     #[cfg(test)]
