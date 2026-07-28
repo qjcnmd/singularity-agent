@@ -1498,17 +1498,17 @@ fn bind_workspace_namespace(
             "workspace root changed while it was being bound".to_string(),
         ));
     }
-    let handle_path = winx::file::get_file_path(final_guard).map_err(|_| {
-        WorkspaceToolError::PathIdentityUnsupported(
-            "workspace root handle path is unavailable".to_string(),
-        )
-    })?;
-    // Namespace guards deny delete sharing, so the path cannot be replaced while
-    // alias expansion resolves short-name spelling and canonicalization then
-    // normalizes the expanded long form returned by the handle API.
-    // Expand before canonicalize: some Windows Server temp/namespace layouts keep
-    // short components through GetFinalPathNameByHandle, and expanding the raw
-    // handle spelling is the reliable way to force long names first.
+    let handle_path =
+        winx::file::get_file_path(&capability.try_clone().map_err(io_error)?.into_std_file())
+            .map_err(|_| {
+                WorkspaceToolError::PathIdentityUnsupported(
+                    "workspace root handle path is unavailable".to_string(),
+                )
+            })?;
+    // Namespace guards provide delete protection and have already matched the
+    // capability identity. Use that same normal capability handle for the display
+    // path; alias expansion and canonicalization normalize any short spelling it
+    // returns before the strict component checks below.
     let actual_path =
         std::fs::canonicalize(singularity_sandbox::expand_windows_path_alias(&handle_path))
             .map_err(io_error)?;
