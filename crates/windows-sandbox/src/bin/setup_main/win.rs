@@ -39,6 +39,7 @@ use singularity_windows_sandbox::path_mask_allows;
 use singularity_windows_sandbox::plan_deny_read_acl_paths;
 use singularity_windows_sandbox::probe_read_acl_mutex;
 use singularity_windows_sandbox::product_identity::SANDBOX_HOME_ENV;
+use singularity_windows_sandbox::revoke_deny_write_ace_to_handle;
 use singularity_windows_sandbox::sandbox_bin_dir;
 use singularity_windows_sandbox::sandbox_dir;
 use singularity_windows_sandbox::sandbox_secrets_dir;
@@ -131,6 +132,8 @@ struct Payload {
     deny_read_paths: Vec<PathBuf>,
     #[serde(default)]
     deny_write_paths: Vec<PathBuf>,
+    #[serde(default)]
+    revoke_deny_write_paths: Vec<PathBuf>,
     proxy_ports: Vec<u16>,
     #[serde(default)]
     allow_local_binding: bool,
@@ -729,6 +732,9 @@ fn validate_payload_acl_paths(
             for path in &payload.deny_write_paths {
                 validate_payload_acl_path(path, pinned_workspace_root, true)?;
             }
+            for path in &payload.revoke_deny_write_paths {
+                validate_payload_acl_path(path, pinned_workspace_root, true)?;
+            }
         }
     }
     Ok(())
@@ -817,6 +823,77 @@ fn run_read_acl_only(
         anyhow::bail!("read ACL run had errors");
     }
     log_line(log, "read ACL run completed")?;
+    Ok(())
+}
+
+fn revoke_deny_write_paths(
+    payload: &Payload,
+    log: &mut dyn Write,
+    pinned_workspace_root: Option<&PinnedWorkspaceRoot>,
+) -> Result<()> {
+    if payload.revoke_deny_write_paths.is_empty() {
+        return Ok(());
+    }
+    let pinned_workspace_root = pinned_workspace_root
+        .ok_or_else(|| anyhow::anyhow!("trusted deny-write revoke requires a pinned workspace"))?;
+    let mut seen = HashSet::new();
+    for path in &payload.revoke_deny_write_paths {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let deny_sid_strs = workspace_write_cap_sids_for_path(
+            &payload.sandbox_home,
+            &payload.command_cwd,
+            &payload.write_roots,
+            path,
+        )?;
+        let handle = open_pinned_workspace_path(
+            &pinned_workspace_root.handle,
+            &pinned_workspace_root.path,
+            path,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("trusted deny-write path escaped pinned workspace"))?;
+        for deny_sid_str in deny_sid_strs {
+            let deny_psid = unsafe {
+                convert_string_sid_to_sid(&deny_sid_str)
+                    .ok_or_else(|| anyhow::anyhow!("convert deny capability SID failed"))?
+            };
+            let result =
+                unsafe { revoke_deny_write_ace_to_handle(handle.as_raw_handle() as _, deny_psid) };
+            unsafe {
+                LocalFree(deny_psid as HLOCAL);
+            }
+            if let Err(error) = result {
+                if let Some(acl_error) = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<WindowsAclError>())
+                    .copied()
+                {
+                    return Err(anyhow::Error::new(
+                        SetupFailure::new(
+                            SetupErrorCode::HelperAclRefreshFailed,
+                            "deny-write ACL cleanup failed",
+                        )
+                        .with_acl_error(acl_error),
+                    ));
+                }
+                return Err(anyhow::anyhow!(
+                    "revoke deny-write ACE on {} for {} failed: {error}",
+                    path.display(),
+                    deny_sid_str
+                ));
+            }
+        }
+        log_line(
+            log,
+            &format!(
+                "removed stale runtime deny-write ACEs from {}",
+                path.display()
+            ),
+        )?;
+    }
     Ok(())
 }
 
@@ -1034,6 +1111,10 @@ fn run_setup_full(
     if !refresh_only {
         configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
     }
+
+    // Trusted preparation skips protected-path deny installation; revoke only the current,
+    // already-existing runtime-owned deny-write ACEs before the normal refresh grants run.
+    revoke_deny_write_paths(payload, log, pinned_workspace_root)?;
 
     // Codex uses the dedicated Sandbox Users group as the authoritative read principal.
     // Apply deny-read ACLs to that same principal before any child starts. The product caller

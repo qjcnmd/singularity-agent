@@ -1203,6 +1203,94 @@ pub(crate) unsafe fn revoke_deny_read_ace_with_fingerprint_to_handle(
     }
 }
 
+/// Removes a runtime-owned deny-write ACE through an already pinned target handle.
+///
+/// Capability SIDs are generated and persisted by this sandbox, so a complete write deny for
+/// one of them is runtime-owned. Combined deny ACEs are never weakened: callers must first
+/// resolve the boundary that installed the additional mask.
+///
+/// # Safety
+/// Caller must pass a valid target handle and SID pointer.
+pub unsafe fn revoke_deny_write_ace_to_handle(handle: HANDLE, psid: *mut c_void) -> Result<()> {
+    unsafe { revoke_deny_write_ace_impl_to_handle(handle, psid) }
+}
+
+unsafe fn revoke_deny_write_ace_impl_to_handle(handle: HANDLE, psid: *mut c_void) -> Result<()> {
+    let target = unsafe { borrow_acl_target(handle) }?;
+    if target.p_dacl.is_null() {
+        return Ok(());
+    }
+
+    // SAFETY: `target.p_dacl` is the ACL returned for the live target handle. The copied ACL is
+    // sized from Win32 metadata, each ACE lookup is checked, and `psid` is caller-validated.
+    unsafe {
+        let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+        if GetAclInformation(
+            target.p_dacl as *const ACL,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ) == 0
+        {
+            return Err(anyhow::Error::new(WindowsAclError::new(
+                AclOperation::GetAclInformation,
+                GetLastError(),
+            )));
+        }
+        let acl_size = info.AclBytesInUse.saturating_add(info.AclBytesFree) as usize;
+        let word_count = acl_size.div_ceil(std::mem::size_of::<u32>());
+        let mut acl_words = vec![0u32; word_count];
+        std::ptr::copy_nonoverlapping(
+            target.p_dacl as *const u8,
+            acl_words.as_mut_ptr() as *mut u8,
+            acl_size,
+        );
+        let copied_acl = acl_words.as_mut_ptr() as *mut ACL;
+        let effective_write_mask = effective_file_access_mask(DENY_WRITE_MASK);
+        let mut changed = false;
+        for index in (0..info.AceCount).rev() {
+            let mut p_ace: *mut c_void = std::ptr::null_mut();
+            if GetAce(copied_acl as *const ACL, index, &mut p_ace) == 0 {
+                return Err(anyhow::Error::new(WindowsAclError::new(
+                    AclOperation::GetAce,
+                    GetLastError(),
+                )));
+            }
+            let header = &*(p_ace as *const ACE_HEADER);
+            if header.AceType != ACCESS_DENIED_ACE_TYPE {
+                continue;
+            }
+            let ace = &*(p_ace as *const ACCESS_DENIED_ACE);
+            let sid_ptr = (p_ace as usize
+                + std::mem::size_of::<ACE_HEADER>()
+                + std::mem::size_of::<u32>()) as *mut c_void;
+            if EqualSid(sid_ptr, psid) == 0 || !is_runtime_managed_deny_ace(header.AceFlags) {
+                continue;
+            }
+            let effective_mask = effective_file_access_mask(ace.Mask);
+            if effective_mask != effective_write_mask {
+                if (effective_mask & effective_write_mask) == effective_write_mask {
+                    anyhow::bail!(
+                        "refusing to partially revoke a combined deny-write ACE on pinned target"
+                    );
+                }
+                continue;
+            }
+            if DeleteAce(copied_acl, index) == 0 {
+                return Err(anyhow::Error::new(WindowsAclError::new(
+                    AclOperation::DeleteAce,
+                    GetLastError(),
+                )));
+            }
+            changed = true;
+        }
+        if changed {
+            set_target_dacl(&target, copied_acl, 1)?;
+        }
+        Ok(())
+    }
+}
+
 unsafe fn revoke_deny_read_ace_impl(
     path: &Path,
     psid: *mut c_void,
@@ -1414,6 +1502,7 @@ mod tests {
     use super::open_acl_target;
     use super::path_contains_reparse_component;
     use super::revoke_deny_read_ace;
+    use super::revoke_deny_write_ace_to_handle;
     use super::set_target_dacl;
     use crate::path_safety::CaseSensitivityTestOutcome;
     use crate::path_safety::ProtectedMetadataError;
@@ -1593,6 +1682,82 @@ mod tests {
 
         unsafe { set_target_dacl(&target, target.p_dacl, 1).expect("restore original DACL") };
         assert!(write_blocked, "complete deny ACE must block writes");
+    }
+
+    #[test]
+    fn runtime_write_deny_can_be_revoked_without_touching_other_sids() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("write-target.txt");
+        std::fs::write(&path, b"payload").expect("write fixture");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+        let other_sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4445")
+            .expect("other capability SID");
+        let target = unsafe { open_acl_target(&path, READ_CONTROL | WRITE_DAC, 1) }
+            .expect("open ACL target");
+
+        assert!(unsafe { add_deny_write_ace(&path, sid.as_ptr()) }.expect("install runtime deny"));
+        assert!(
+            unsafe { add_deny_write_ace(&path, other_sid.as_ptr()) }.expect("install other deny")
+        );
+        unsafe {
+            revoke_deny_write_ace_to_handle(target.handle, sid.as_ptr())
+                .expect("revoke runtime deny")
+        };
+
+        assert!(!unsafe { fetch_has_deny(&path, sid.as_ptr(), true) });
+        assert!(unsafe { fetch_has_deny(&path, other_sid.as_ptr(), true) });
+        unsafe { set_target_dacl(&target, target.p_dacl, 1).expect("restore original DACL") };
+    }
+
+    #[test]
+    fn revoke_write_deny_rejects_a_combined_deny_without_weakening_it() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("combined-write-target");
+        std::fs::create_dir(&path).expect("create fixture");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+        let target = unsafe { open_acl_target(&path, READ_CONTROL | WRITE_DAC, 1) }
+            .expect("open ACL target");
+
+        unsafe {
+            seed_deny(
+                &target,
+                sid.as_ptr(),
+                super::DENY_WRITE_MASK | FILE_READ_DATA,
+                super::CONTAINER_INHERIT_ACE | super::OBJECT_INHERIT_ACE,
+            )
+        };
+        let error = unsafe { revoke_deny_write_ace_to_handle(target.handle, sid.as_ptr()) }
+            .expect_err("combined deny must fail closed");
+        assert!(error.to_string().contains("combined deny-write ACE"));
+        assert!(unsafe { fetch_has_deny(&path, sid.as_ptr(), true) });
+
+        unsafe { set_target_dacl(&target, target.p_dacl, 1).expect("restore original DACL") };
+    }
+
+    #[test]
+    fn revoking_directory_write_deny_does_not_leave_inherited_child_deny() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("write-target");
+        std::fs::create_dir(&path).expect("create directory fixture");
+        let child = path.join("child.txt");
+        let sid = LocalSid::from_string("S-1-5-21-1111111111-2222222222-3333333333-4444")
+            .expect("test capability SID");
+        let target = unsafe { open_acl_target(&path, READ_CONTROL | WRITE_DAC, 1) }
+            .expect("open ACL target");
+
+        assert!(unsafe { add_deny_write_ace(&path, sid.as_ptr()) }.expect("install runtime deny"));
+        std::fs::write(&child, b"payload").expect("write inherited child");
+        assert!(unsafe { fetch_has_deny(&child, sid.as_ptr(), true) });
+        unsafe {
+            revoke_deny_write_ace_to_handle(target.handle, sid.as_ptr())
+                .expect("revoke runtime deny")
+        };
+
+        assert!(!unsafe { fetch_has_deny(&path, sid.as_ptr(), true) });
+        assert!(!unsafe { fetch_has_deny(&child, sid.as_ptr(), true) });
+        unsafe { set_target_dacl(&target, target.p_dacl, 1).expect("restore original DACL") };
     }
 
     #[test]

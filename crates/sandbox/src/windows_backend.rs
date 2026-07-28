@@ -742,6 +742,7 @@ struct PreparedCommand {
     read_roots: Vec<PathBuf>,
     protected_deny_read_paths: Vec<AbsolutePathBuf>,
     protected_deny_write_paths: Vec<AbsolutePathBuf>,
+    trusted_deny_write_paths: Vec<AbsolutePathBuf>,
     protect_workspace_metadata: bool,
     before: Option<WorkspaceSnapshot>,
     trusted_workspace: Option<TrustedWorkspaceLease>,
@@ -761,17 +762,36 @@ impl PreparedCommand {
             AbsolutePathBuf::from_absolute_path_checked(&workspace_root).map_err(|error| {
                 PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
             })?;
-        let protected_deny_read_paths = if protect_workspace_metadata {
+        let resolved_protected_paths = if protect_workspace_metadata
+            || matches!(
+                request.filesystem.mode,
+                SandboxFilesystemMode::WorkspaceWrite
+            ) {
             resolve_existing_protected_paths(&workspace_root)
                 .map_err(PrepareCommandError::ProtectedPaths)?
+        } else {
+            Vec::new()
+        };
+        let protected_deny_read_paths = if protect_workspace_metadata {
+            resolved_protected_paths.clone()
         } else {
             Vec::new()
         };
         let protected_deny_write_paths = if matches!(
             request.filesystem.mode,
             SandboxFilesystemMode::WorkspaceWrite
-        ) {
-            protected_deny_read_paths.clone()
+        ) && protect_workspace_metadata
+        {
+            resolved_protected_paths.clone()
+        } else {
+            Vec::new()
+        };
+        let trusted_deny_write_paths = if request.is_trusted_workspace_preparation()
+            && matches!(
+                request.filesystem.mode,
+                SandboxFilesystemMode::WorkspaceWrite
+            ) {
+            resolved_protected_paths
         } else {
             Vec::new()
         };
@@ -792,7 +812,7 @@ impl PreparedCommand {
                 PermissionProfile::workspace_write_with(&[], network, false, false)
             }
         };
-        let restricted_token_fallback = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+        let resolved_permissions = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
             &permission_profile,
             &workspace_roots,
         )
@@ -800,8 +820,8 @@ impl PreparedCommand {
             PrepareCommandError::Backend(format!(
                 "invalid Windows sandbox permissions: {error}"
             ))
-        })?
-        .supports_restricted_token_fallback()
+        })?;
+        let restricted_token_fallback = resolved_permissions.supports_restricted_token_fallback()
             && protected_deny_read_paths.is_empty()
             && protect_workspace_metadata;
         let sandbox_home = sandbox_home().map_err(PrepareCommandError::Backend)?;
@@ -865,6 +885,7 @@ impl PreparedCommand {
             read_roots: resolved.read_roots,
             protected_deny_read_paths,
             protected_deny_write_paths,
+            trusted_deny_write_paths,
             protect_workspace_metadata,
             before,
             trusted_workspace,
@@ -927,7 +948,7 @@ impl PreparedCommand {
                 PermissionProfile::workspace_write_with(&[], network, false, false)
             }
         };
-        let restricted_token_fallback = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+        let resolved_permissions = singularity_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
             &permission_profile,
             &workspace_roots,
         )
@@ -935,8 +956,8 @@ impl PreparedCommand {
             PrepareCommandError::Backend(format!(
                 "invalid Windows sandbox permissions: {error}"
             ))
-        })?
-        .supports_restricted_token_fallback()
+        })?;
+        let restricted_token_fallback = resolved_permissions.supports_restricted_token_fallback()
             && protected_deny_read_paths.is_empty();
         Ok(Self {
             permission_profile,
@@ -950,6 +971,7 @@ impl PreparedCommand {
             read_roots: executable_read_roots(&powershell),
             protected_deny_read_paths,
             protected_deny_write_paths,
+            trusted_deny_write_paths: Vec::new(),
             protect_workspace_metadata: true,
             before,
             trusted_workspace: None,
@@ -977,6 +999,7 @@ fn elevated_capture_request<'a>(
     elevated.additional_read_roots = &prepared.read_roots;
     elevated.deny_read_paths_override = &prepared.protected_deny_read_paths;
     elevated.deny_write_paths_override = &prepared.protected_deny_write_paths;
+    elevated.trusted_deny_write_paths_override = &prepared.trusted_deny_write_paths;
     elevated.protect_workspace_metadata = prepared.protect_workspace_metadata;
     elevated.trusted_workspace = trusted_workspace;
     elevated.workspace_change_monitor = workspace_change_monitor;
@@ -1846,6 +1869,10 @@ mod tests {
             elevated.deny_write_paths_override,
             prepared.protected_deny_write_paths.as_slice()
         );
+        assert_eq!(
+            elevated.trusted_deny_write_paths_override,
+            prepared.trusted_deny_write_paths.as_slice()
+        );
     }
 
     #[test]
@@ -1873,6 +1900,7 @@ mod tests {
         assert!(request.is_trusted_workspace_preparation());
         assert!(prepared.protected_deny_read_paths.is_empty());
         assert!(prepared.protected_deny_write_paths.is_empty());
+        assert!(!prepared.trusted_deny_write_paths.is_empty());
         assert!(!prepared.protect_workspace_metadata);
         assert!(!prepared.restricted_token_fallback);
     }
@@ -1975,6 +2003,10 @@ mod tests {
         assert_eq!(
             elevated.deny_write_paths_override,
             prepared.protected_deny_write_paths.as_slice()
+        );
+        assert_eq!(
+            elevated.trusted_deny_write_paths_override,
+            prepared.trusted_deny_write_paths.as_slice()
         );
     }
 

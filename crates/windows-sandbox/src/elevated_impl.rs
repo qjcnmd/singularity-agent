@@ -23,6 +23,11 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub write_roots_override: Option<&'a [PathBuf]>,
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
     pub deny_write_paths_override: &'a [AbsolutePathBuf],
+    /// Existing capability-scoped deny-write paths to revoke before trusted preparation.
+    ///
+    /// This is separate from `deny_write_paths_override`: the latter is the policy to install
+    /// for the child, while this collection is only the current, already-existing stale set.
+    pub trusted_deny_write_paths_override: &'a [AbsolutePathBuf],
     pub protect_workspace_metadata: bool,
     #[cfg(target_os = "windows")]
     pub workspace_change_monitor: Option<&'a mut Option<crate::WorkspaceChangeMonitor>>,
@@ -56,6 +61,7 @@ impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
             write_roots_override: None,
             deny_read_paths_override: &[],
             deny_write_paths_override: &[],
+            trusted_deny_write_paths_override: &[],
             protect_workspace_metadata: true,
             #[cfg(target_os = "windows")]
             workspace_change_monitor: None,
@@ -93,6 +99,7 @@ mod windows_impl {
     use crate::logging::log_start;
     use crate::logging::log_success;
     use crate::path_normalization::canonicalize_path_allow_missing;
+    use crate::path_safety::open_pinned_workspace_path;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use crate::runner_client::retry_runner_spawn_once;
     use crate::runner_client::spawn_runner_transport;
@@ -110,6 +117,7 @@ mod windows_impl {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
+    use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 
     pub use crate::windows_impl::CaptureResult;
 
@@ -202,6 +210,7 @@ mod windows_impl {
             write_roots_override,
             deny_read_paths_override,
             deny_write_paths_override,
+            trusted_deny_write_paths_override,
             protect_workspace_metadata,
             workspace_change_monitor,
             trusted_workspace,
@@ -253,9 +262,30 @@ mod windows_impl {
         let (deny_write_paths_override, deny_write_marker_handles) =
             resolve_nested_git_paths(&deny_write_inputs)?;
         protected_git_marker_handles.extend(deny_write_marker_handles);
-        // Keep the no-follow ancestor marker handles alive through setup, runner spawn, and Job
-        // Object cleanup. This prevents a host-side rename from replacing the protected object
-        // between resolution and the deny-read ACL mutation.
+        let (trusted_deny_write_paths_override, trusted_deny_write_target_handles) =
+            if trusted_workspace.is_some() {
+                resolve_trusted_deny_write_paths(
+                    trusted_deny_write_paths_override,
+                    workspace_roots
+                        .first()
+                        .map(AbsolutePathBuf::as_path)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("trusted deny-write cleanup requires a workspace root")
+                        })?,
+                    trusted_workspace.ok_or_else(|| {
+                        anyhow::anyhow!("trusted deny-write cleanup requires a workspace lease")
+                    })?,
+                    &permissions,
+                    cwd,
+                    &env_map,
+                )?
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        protected_git_marker_handles.extend(trusted_deny_write_target_handles);
+        // Keep no-follow target handles alive through setup, runner spawn, and Job Object cleanup.
+        // This prevents a host-side rename from replacing a protected object between resolution
+        // and the ACL mutation or child startup.
         let _protected_git_marker_handles = protected_git_marker_handles;
         normalize_null_device_env(&mut env_map);
         ensure_non_interactive_pager(&mut env_map);
@@ -291,6 +321,7 @@ mod windows_impl {
             write_roots_override,
             &deny_read_paths_override,
             &deny_write_paths_override,
+            &trusted_deny_write_paths_override,
             proxy_enforced,
             crate::WindowsSandboxProxySettingsMode::Reconcile,
             trusted_workspace,
@@ -405,6 +436,7 @@ mod windows_impl {
                         write_roots_override,
                         &deny_read_paths_override,
                         &deny_write_paths_override,
+                        &trusted_deny_write_paths_override,
                         proxy_enforced,
                         crate::WindowsSandboxProxySettingsMode::Reconcile,
                         trusted_workspace,
@@ -515,6 +547,57 @@ mod windows_impl {
                 if let Some(handle) = handle {
                     handles.push(handle);
                 }
+            }
+        }
+        Ok((resolved, handles))
+    }
+
+    fn resolve_trusted_deny_write_paths(
+        paths: &[AbsolutePathBuf],
+        workspace_root: &Path,
+        trusted_workspace: &crate::trusted_workspace::TrustedWorkspaceLease,
+        permissions: &ResolvedWindowsSandboxPermissions,
+        cwd: &Path,
+        env_map: &std::collections::HashMap<String, String>,
+    ) -> Result<(Vec<PathBuf>, Vec<File>)> {
+        let mut cleanup_inputs = paths.to_vec();
+        if permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
+            cleanup_inputs.extend(
+                compute_allow_paths_for_permissions(permissions, cwd, env_map)
+                    .deny
+                    .into_iter()
+                    .map(AbsolutePathBuf::from_absolute_path_checked)
+                    .collect::<std::io::Result<Vec<_>>>()?,
+            );
+        }
+        let mut resolved = Vec::new();
+        let mut handles = Vec::new();
+        let mut seen = HashSet::new();
+        let root_handle = trusted_workspace
+            .duplicate_root_handle()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        for path in cleanup_inputs {
+            let path = path.as_path();
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let key = path.to_string_lossy().to_ascii_lowercase();
+            if seen.insert(key) {
+                // Open the final object relative to the trusted no-follow root without delete
+                // sharing. Holding this handle prevents pathname replacement after setup has
+                // inspected the same existing object.
+                let handle =
+                    open_pinned_workspace_path(&root_handle, workspace_root, path, READ_CONTROL)?
+                        .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "trusted deny-write path is outside the pinned workspace: {}",
+                            path.display()
+                        )
+                    })?;
+                handles.push(handle);
+                resolved.push(path.to_path_buf());
             }
         }
         Ok((resolved, handles))

@@ -187,6 +187,7 @@ pub fn require_logon_sandbox_creds(
     write_roots_override: Option<&[PathBuf]>,
     deny_read_paths_override: &[PathBuf],
     deny_write_paths_override: &[PathBuf],
+    revoke_deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
     trusted_workspace: Option<&TrustedWorkspaceLease>,
@@ -264,6 +265,8 @@ pub fn require_logon_sandbox_creds(
                 write_roots: Some(needed_write.clone()),
                 deny_read_paths: Some(deny_read_paths_override.to_vec()),
                 deny_write_paths: Some(deny_write_paths_override.to_vec()),
+                revoke_deny_write_paths: (!revoke_deny_write_paths_override.is_empty())
+                    .then(|| revoke_deny_write_paths_override.to_vec()),
             },
             &desired_offline_proxy_settings,
             trusted_workspace,
@@ -287,6 +290,8 @@ pub fn require_logon_sandbox_creds(
         write_roots: Some(needed_write.clone()),
         deny_read_paths: Some(deny_read_paths_override.to_vec()),
         deny_write_paths: Some(deny_write_paths_override.to_vec()),
+        revoke_deny_write_paths: (!revoke_deny_write_paths_override.is_empty())
+            .then(|| revoke_deny_write_paths_override.to_vec()),
     };
     if let Err(error) = run_setup_refresh_with_overrides_and_proxy_settings(
         setup_request(),
@@ -365,6 +370,7 @@ pub(crate) fn refresh_logon_sandbox_creds(
     write_roots_override: Option<&[PathBuf]>,
     deny_read_paths_override: &[PathBuf],
     deny_write_paths_override: &[PathBuf],
+    revoke_deny_write_paths_override: &[PathBuf],
     proxy_enforced: bool,
     proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
     trusted_workspace: Option<&TrustedWorkspaceLease>,
@@ -380,6 +386,7 @@ pub(crate) fn refresh_logon_sandbox_creds(
         write_roots_override,
         deny_read_paths_override,
         deny_write_paths_override,
+        revoke_deny_write_paths_override,
         proxy_enforced,
         proxy_settings_mode,
         trusted_workspace,

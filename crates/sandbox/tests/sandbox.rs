@@ -620,13 +620,59 @@ fn windows_elevated_preflight_verifies_full_contract() {
         report.proves_supported_contract_for("windows"),
         "{report:#?}"
     );
+    let sandbox_home = std::env::var_os("SINGULARITY_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .map(|profile| profile.join(".singularity"))
+        })
+        .expect("sandbox home environment");
+    let sandbox_home = if sandbox_home.is_absolute() {
+        sandbox_home
+    } else {
+        std::env::current_dir()
+            .expect("current directory")
+            .join(sandbox_home)
+    };
+    let workspace_root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+    let capability_sid = singularity_windows_sandbox::workspace_write_cap_sid_for_root(
+        &sandbox_home,
+        &workspace_root,
+        &workspace_root,
+    )
+    .expect("workspace capability SID");
+    let protected_git = workspace.path().join("source").join(".git");
+    let acl_output = std::process::Command::new("icacls")
+        .arg(&protected_git)
+        .output()
+        .expect("icacls protected Git directory");
+    assert!(
+        acl_output.status.success(),
+        "icacls protected Git directory failed: {}",
+        String::from_utf8_lossy(&acl_output.stderr)
+    );
+    let acl_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&acl_output.stdout),
+        String::from_utf8_lossy(&acl_output.stderr)
+    );
+    let capability_deny = acl_text
+        .lines()
+        .any(|line| line.contains(&capability_sid) && line.contains("(DENY)"));
+    assert!(
+        capability_deny,
+        "ordinary protected-path probe did not leave capability deny-write ACE on {}: {}",
+        protected_git.display(),
+        acl_text
+    );
     let mut request = CommandRequest::trusted_workspace_preparation(
         "trusted_preparation_after_preflight",
         vec![
             "git".to_string(),
             "init".to_string(),
             "--quiet".to_string(),
-            "follow-up-source".to_string(),
+            "source".to_string(),
         ],
         path_str(workspace.path()),
         path_str(workspace.path()),

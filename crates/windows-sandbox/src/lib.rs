@@ -212,6 +212,8 @@ pub use acl::add_deny_read_ace;
 pub use acl::add_deny_write_ace;
 #[cfg(target_os = "windows")]
 pub use acl::add_deny_write_ace_to_handle;
+#[cfg(target_os = "windows")]
+pub use acl::revoke_deny_write_ace_to_handle;
 
 #[cfg(target_os = "windows")]
 pub use acl::allow_null_device;

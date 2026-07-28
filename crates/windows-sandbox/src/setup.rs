@@ -235,6 +235,7 @@ pub struct SetupRootOverrides {
     pub write_roots: Option<Vec<PathBuf>>,
     pub deny_read_paths: Option<Vec<PathBuf>>,
     pub deny_write_paths: Option<Vec<PathBuf>>,
+    pub revoke_deny_write_paths: Option<Vec<PathBuf>>,
 }
 
 pub fn run_setup_refresh(
@@ -331,6 +332,7 @@ pub fn run_setup_refresh_with_extra_read_roots(
             write_roots: Some(Vec::new()),
             deny_read_paths: None,
             deny_write_paths: None,
+            revoke_deny_write_paths: None,
         },
         /*offline_proxy_settings_override*/ None,
         /*elevated_authority*/ false,
@@ -351,6 +353,7 @@ fn run_setup_refresh_inner(
     let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
     let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
+    let revoke_deny_write_paths = overrides.revoke_deny_write_paths.unwrap_or_default();
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
     let trusted_workspace_root = trusted_workspace
@@ -366,6 +369,7 @@ fn run_setup_refresh_inner(
         write_roots,
         deny_read_paths,
         deny_write_paths,
+        revoke_deny_write_paths,
         proxy_ports: offline_proxy_settings.proxy_ports,
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
@@ -704,6 +708,8 @@ struct ElevationPayload {
     deny_read_paths: Vec<PathBuf>,
     #[serde(default)]
     deny_write_paths: Vec<PathBuf>,
+    #[serde(default)]
+    revoke_deny_write_paths: Vec<PathBuf>,
     proxy_ports: Vec<u16>,
     #[serde(default)]
     allow_local_binding: bool,
@@ -1095,6 +1101,7 @@ fn run_elevated_setup_inner(
     let (read_roots, write_roots) = build_payload_roots(&request, &overrides);
     let deny_read_paths = build_payload_deny_read_paths(overrides.deny_read_paths);
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
+    let revoke_deny_write_paths = overrides.revoke_deny_write_paths.unwrap_or_default();
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
     let trusted_workspace_root = trusted_workspace
@@ -1110,6 +1117,7 @@ fn run_elevated_setup_inner(
         write_roots,
         deny_read_paths,
         deny_write_paths,
+        revoke_deny_write_paths,
         proxy_ports: offline_proxy_settings.proxy_ports,
         allow_local_binding: offline_proxy_settings.allow_local_binding,
         real_user: std::env::var("USERNAME").unwrap_or_else(|_| "Administrators".to_string()),
@@ -1155,6 +1163,7 @@ pub fn run_elevated_provisioning_setup(sandbox_home: &Path, real_user: &str) -> 
         write_roots: Vec::new(),
         deny_read_paths: Vec::new(),
         deny_write_paths: Vec::new(),
+        revoke_deny_write_paths: Vec::new(),
         proxy_ports: Vec::new(),
         allow_local_binding: false,
         real_user: real_user.to_string(),
@@ -2048,6 +2057,7 @@ mod tests {
                 write_roots: None,
                 deny_read_paths: None,
                 deny_write_paths: None,
+                revoke_deny_write_paths: None,
             },
         );
         let expected_helper =
@@ -2095,6 +2105,7 @@ mod tests {
                 write_roots: None,
                 deny_read_paths: None,
                 deny_write_paths: None,
+                revoke_deny_write_paths: None,
             },
         );
         let expected_helper =
@@ -2151,6 +2162,7 @@ mod tests {
             write_roots: Some(override_roots.clone()),
             deny_read_paths: None,
             deny_write_paths: None,
+            revoke_deny_write_paths: None,
         };
 
         let effective_write_roots = super::effective_write_roots_for_setup(
