@@ -80,6 +80,25 @@ struct WorkspaceObservationPreparation {
     workspace_root_lease: WorkspaceRootLease,
 }
 
+impl WorkspaceObservationPreparation {
+    /// Keep the live monitor for execution independently of protected-path cache reuse.
+    fn into_execution_parts(
+        self,
+    ) -> (
+        Option<BeforeSnapshotSeed>,
+        Option<WorkspaceChangeMonitor>,
+        Option<Vec<AbsolutePathBuf>>,
+        Option<WorkspaceRootLease>,
+    ) {
+        (
+            self.seed,
+            Some(self.monitor),
+            self.cached_protected_paths,
+            Some(self.workspace_root_lease),
+        )
+    }
+}
+
 /// One atomically published observation checkpoint and its concrete protected-path fact.
 struct WorkspaceObservationCache {
     snapshot: WorkspaceSnapshot,
@@ -655,15 +674,7 @@ impl SandboxBackend for WindowsSandboxBackend {
                 .as_deref_mut()
                 .map(WorkspaceObservationSession::prepare_for_command)
             {
-                Some(Ok(preparation)) => {
-                    let keep_monitor = preparation.cached_protected_paths.is_some();
-                    (
-                        preparation.seed,
-                        keep_monitor.then_some(preparation.monitor),
-                        preparation.cached_protected_paths,
-                        Some(preparation.workspace_root_lease),
-                    )
-                }
+                Some(Ok(preparation)) => preparation.into_execution_parts(),
                 Some(Err(_)) => {
                     if let Some(session) = observation_session.as_deref_mut() {
                         session.invalidate();
@@ -762,15 +773,7 @@ impl SandboxBackend for WindowsSandboxBackend {
                 .as_deref_mut()
                 .map(WorkspaceObservationSession::prepare_for_command)
             {
-                Some(Ok(preparation)) => {
-                    let keep_monitor = preparation.cached_protected_paths.is_some();
-                    (
-                        preparation.seed,
-                        keep_monitor.then_some(preparation.monitor),
-                        preparation.cached_protected_paths,
-                        Some(preparation.workspace_root_lease),
-                    )
-                }
+                Some(Ok(preparation)) => preparation.into_execution_parts(),
                 Some(Err(_)) => {
                     if let Some(session) = observation_session.as_deref_mut() {
                         session.invalidate();
@@ -2560,29 +2563,43 @@ mod tests {
         );
         let mut session = WorkspaceObservationSession::start(root.clone()).expect("session");
         let first_preparation = session.prepare_for_command().expect("first preparation");
-        assert!(first_preparation.cached_protected_paths.is_none());
+        let (first_seed, first_monitor, first_cached_protected_paths, first_workspace_root_lease) =
+            first_preparation.into_execution_parts();
+        assert!(first_seed.is_none());
+        assert!(first_monitor.is_some());
+        assert!(first_cached_protected_paths.is_none());
         FULL_PROTECTED_RESOLVER_SCANS.with(|count| count.set(0));
-        let first = PreparedCommand::from_request(&request, None, None).expect("first command");
+        let first = PreparedCommand::from_request(
+            &request,
+            first_cached_protected_paths.as_deref(),
+            first_workspace_root_lease,
+        )
+        .expect("first command");
         assert_eq!(FULL_PROTECTED_RESOLVER_SCANS.with(Cell::get), 1);
         let first_snapshot = snapshot_workspace_as_sandbox_user(&root, &[]).expect("snapshot");
         session.publish_with_protected_paths(
             first_snapshot,
             first.protected_deny_read_paths.clone(),
-            Some(first_preparation.monitor),
+            first_monitor,
         );
 
         let second_preparation = session.prepare_for_command().expect("second preparation");
+        let (
+            second_seed,
+            second_monitor,
+            second_cached_protected_paths,
+            second_workspace_root_lease,
+        ) = second_preparation.into_execution_parts();
+        assert!(second_seed.is_some());
+        assert!(second_monitor.is_some());
         assert_eq!(
-            second_preparation
-                .cached_protected_paths
-                .as_ref()
-                .map(Vec::len),
+            second_cached_protected_paths.as_ref().map(Vec::len),
             Some(first.protected_deny_read_paths.len())
         );
         let _second = PreparedCommand::from_request(
             &request,
-            second_preparation.cached_protected_paths.as_deref(),
-            None,
+            second_cached_protected_paths.as_deref(),
+            second_workspace_root_lease,
         )
         .expect("cached command");
         assert_eq!(FULL_PROTECTED_RESOLVER_SCANS.with(Cell::get), 1);
