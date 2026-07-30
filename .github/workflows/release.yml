@@ -60,7 +60,7 @@ jobs:
           "path=$($tool.FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Build release binaries
-        run: cargo build --workspace --bins --release --locked
+        run: cargo build --release --locked --package singularity_cli --package singularity_app_server --package singularity_windows_sandbox --bins
 
       - name: Sign release binaries
         id: sign

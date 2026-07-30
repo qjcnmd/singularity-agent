@@ -1500,7 +1500,6 @@ dependencies = [
  "sha2",
  "singularity_agent",
  "singularity_core",
- "singularity_evaluation",
  "singularity_model",
  "singularity_policy",
  "singularity_protocol",
@@ -1545,12 +1544,27 @@ dependencies = [
 name = "singularity_evaluation"
 version = "0.1.0"
 dependencies = [
+ "assert_cmd",
+ "cap-fs-ext",
+ "cap-std",
+ "clap",
  "serde",
  "serde_json",
  "sha2",
+ "singularity_agent",
+ "singularity_app_server",
+ "singularity_core",
+ "singularity_model",
  "singularity_policy",
+ "singularity_protocol",
+ "singularity_sandbox",
+ "singularity_store",
+ "singularity_tools",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

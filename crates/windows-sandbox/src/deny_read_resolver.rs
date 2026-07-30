@@ -2,14 +2,19 @@ use crate::absolute_path::AbsolutePathBuf;
 use crate::path_normalization::canonicalize_path_allow_missing;
 use crate::path_normalization::lexical_path_key;
 use crate::path_safety::ProtectedMetadataError;
+use crate::path_safety::ensure_case_insensitive_directory;
+use crate::path_safety::ensure_case_insensitive_directory_direct;
 use crate::path_safety::ensure_case_insensitive_directory_path;
 use crate::path_safety::ensure_case_insensitive_path_ancestors;
+use crate::path_safety::open_pinned_workspace_path;
 use crate::permissions::FileSystemAccessMode;
 use crate::permissions::FileSystemPath;
 use crate::permissions::FileSystemSandboxEntry;
 use crate::permissions::FileSystemSandboxPolicy;
 use crate::permissions::ReadDenyMatcher;
+use crate::trusted_workspace::TrustedWorkspaceLease;
 use std::collections::HashSet;
+use std::fs::File;
 use std::fs::Metadata;
 use std::path::Path;
 use std::path::PathBuf;
@@ -25,14 +30,25 @@ struct GlobScanPlan {
 
 struct ScanState {
     scanned_entries: usize,
+    deferred_inaccessible: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InaccessibleScanPolicy {
+    Deny,
+    DeferToSandboxIdentity,
 }
 
 struct GlobScanContext<'a> {
     matcher: &'a ReadDenyMatcher,
+    opaque_paths: &'a HashSet<String>,
     paths: &'a mut Vec<AbsolutePathBuf>,
     seen_paths: &'a mut HashSet<PathBuf>,
     seen_scan_dirs: &'a mut HashSet<String>,
     scan_boundary: &'a Path,
+    pinned_root: Option<&'a File>,
+    validate_path_ancestors: bool,
+    inaccessible_policy: InaccessibleScanPolicy,
     scan_plan: &'a GlobScanPlan,
     scan_state: &'a mut ScanState,
 }
@@ -46,6 +62,88 @@ pub fn resolve_windows_deny_read_paths(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     cwd: &AbsolutePathBuf,
 ) -> Result<Vec<AbsolutePathBuf>, String> {
+    resolve_windows_deny_read_paths_inner(
+        file_system_sandbox_policy,
+        cwd,
+        true,
+        &HashSet::new(),
+        InaccessibleScanPolicy::Deny,
+        None,
+    )
+    .map(|(paths, _)| paths)
+}
+
+/// Resolves paths visible to the controller and reports whether an inaccessible subtree still
+/// requires the already-provisioned sandbox identity to complete the scan.
+pub fn resolve_windows_deny_read_paths_for_controller(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &AbsolutePathBuf,
+) -> Result<(Vec<AbsolutePathBuf>, bool), String> {
+    resolve_windows_deny_read_paths_inner(
+        file_system_sandbox_policy,
+        cwd,
+        true,
+        &HashSet::new(),
+        InaccessibleScanPolicy::DeferToSandboxIdentity,
+        None,
+    )
+}
+
+/// Resolves controller-visible deny-read globs relative to a pinned workspace root.
+///
+/// The pinned handle is the path-validation authority for the workspace root.  This avoids
+/// reopening the root by pathname while a trusted lease deliberately holds the root without
+/// delete sharing.
+pub fn resolve_windows_deny_read_paths_for_controller_with_pinned_workspace_root(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &AbsolutePathBuf,
+    trusted_workspace: &TrustedWorkspaceLease,
+) -> Result<(Vec<AbsolutePathBuf>, bool), String> {
+    trusted_workspace
+        .verify()
+        .map_err(|error| error.code().to_string())?;
+    resolve_windows_deny_read_paths_inner(
+        file_system_sandbox_policy,
+        cwd,
+        false,
+        &HashSet::new(),
+        InaccessibleScanPolicy::DeferToSandboxIdentity,
+        Some(trusted_workspace.root_handle()),
+    )
+}
+
+/// Resolves deny-read globs after the caller has already validated the workspace root.
+///
+/// This form is used while impersonating a sandbox account that can open the workspace itself
+/// but is intentionally denied traversal of the controller's profile ancestors.
+pub fn resolve_windows_deny_read_paths_from_validated_workspace(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &AbsolutePathBuf,
+    previously_protected: &[AbsolutePathBuf],
+) -> Result<Vec<AbsolutePathBuf>, String> {
+    let opaque_paths = previously_protected
+        .iter()
+        .map(|path| path_key(path.as_path()))
+        .collect();
+    resolve_windows_deny_read_paths_inner(
+        file_system_sandbox_policy,
+        cwd,
+        false,
+        &opaque_paths,
+        InaccessibleScanPolicy::Deny,
+        None,
+    )
+    .map(|(paths, _)| paths)
+}
+
+fn resolve_windows_deny_read_paths_inner(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    cwd: &AbsolutePathBuf,
+    validate_path_ancestors: bool,
+    opaque_paths: &HashSet<String>,
+    inaccessible_policy: InaccessibleScanPolicy,
+    pinned_root: Option<&File>,
+) -> Result<(Vec<AbsolutePathBuf>, bool), String> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
 
@@ -55,7 +153,7 @@ pub fn resolve_windows_deny_read_paths(
 
     let unreadable_globs = file_system_sandbox_policy.get_unreadable_globs_with_cwd(cwd.as_path());
     if unreadable_globs.is_empty() {
-        return Ok(paths);
+        return Ok((paths, false));
     }
 
     let glob_policy = FileSystemSandboxPolicy::restricted(
@@ -72,13 +170,28 @@ pub fn resolve_windows_deny_read_paths(
     let Some(matcher) = ReadDenyMatcher::try_new(&glob_policy, cwd.as_path())
         .map_err(|error| sanitize_glob_error(&error))?
     else {
-        return Ok(paths);
+        return Ok((paths, false));
     };
 
-    let scan_boundary = dunce::canonicalize(cwd.as_path())
-        .map_err(|_| "deny_read_resolution_workspace_unavailable".to_string())?;
-    ensure_case_insensitive_directory_path(&scan_boundary)
+    let scan_boundary = if pinned_root.is_some() {
+        cwd.as_path().to_path_buf()
+    } else {
+        dunce::canonicalize(cwd.as_path())
+            .map_err(|_| "deny_read_resolution_workspace_unavailable".to_string())?
+    };
+    if let Some(root_handle) = pinned_root {
+        ensure_case_insensitive_directory(root_handle, &scan_boundary)
+            .map_err(|error| sanitize_path_safety_error(&error))?;
+    } else {
+        if validate_path_ancestors {
+            ensure_case_insensitive_path_ancestors(&scan_boundary)
+                .map_err(|error| sanitize_path_safety_error(&error))?;
+            ensure_case_insensitive_directory_path(&scan_boundary)
+        } else {
+            ensure_case_insensitive_directory_direct(&scan_boundary)
+        }
         .map_err(|error| sanitize_path_safety_error(&error))?;
+    }
     let mut scan_plans = Vec::new();
     for pattern in unreadable_globs {
         let mut scan_plan =
@@ -86,27 +199,39 @@ pub fn resolve_windows_deny_read_paths(
         if !scan_plan.root.is_absolute() {
             scan_plan.root = cwd.as_path().join(&scan_plan.root);
         }
-        ensure_case_insensitive_path_ancestors(&scan_plan.root)
-            .map_err(|error| sanitize_path_safety_error(&error))?;
+        if let Some(root_handle) = pinned_root {
+            ensure_pinned_directory_case_insensitive(root_handle, &scan_boundary, &scan_plan.root)
+                .map_err(|error| sanitize_path_safety_error(&error))?;
+        } else if validate_path_ancestors {
+            ensure_case_insensitive_path_ancestors(&scan_plan.root)
+                .map_err(|error| sanitize_path_safety_error(&error))?;
+        }
         merge_scan_plan(&mut scan_plans, scan_plan);
     }
 
-    let mut scan_state = ScanState { scanned_entries: 0 };
+    let mut scan_state = ScanState {
+        scanned_entries: 0,
+        deferred_inaccessible: false,
+    };
     for scan_plan in scan_plans {
         let mut seen_scan_dirs = HashSet::new();
         let mut context = GlobScanContext {
             matcher: &matcher,
+            opaque_paths,
             paths: &mut paths,
             seen_paths: &mut seen,
             seen_scan_dirs: &mut seen_scan_dirs,
             scan_boundary: &scan_boundary,
+            pinned_root,
+            validate_path_ancestors,
+            inaccessible_policy,
             scan_plan: &scan_plan,
             scan_state: &mut scan_state,
         };
         collect_existing_glob_matches(&scan_plan.root, /*depth*/ 0, &mut context)?;
     }
 
-    Ok(paths)
+    Ok((paths, scan_state.deferred_inaccessible))
 }
 
 fn collect_existing_glob_matches(
@@ -117,12 +242,24 @@ fn collect_existing_glob_matches(
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && context.inaccessible_policy
+                    == InaccessibleScanPolicy::DeferToSandboxIdentity =>
+        {
+            context.scan_state.deferred_inaccessible = true;
+            return Ok(());
+        }
         Err(_) => {
             push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
             return Ok(());
         }
     };
     let reparse_point = metadata_is_reparse_point(&metadata);
+    if context.opaque_paths.contains(&path_key(path)) {
+        push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+        return Ok(());
+    }
 
     if context.matcher.is_read_denied(path) {
         push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
@@ -131,15 +268,31 @@ fn collect_existing_glob_matches(
         }
     };
 
-    let canonical = match dunce::canonicalize(path) {
-        Ok(canonical) => canonical,
-        Err(_) => {
-            push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
-            return Ok(());
+    let canonical = if context.pinned_root.is_some() && !reparse_point {
+        // The walk starts from a pinned plain root and descends through plain directory handles;
+        // avoiding a pathname canonicalization here keeps that root handle authoritative.
+        path.to_path_buf()
+    } else {
+        match dunce::canonicalize(path) {
+            Ok(canonical) => canonical,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && context.inaccessible_policy
+                        == InaccessibleScanPolicy::DeferToSandboxIdentity =>
+            {
+                context.scan_state.deferred_inaccessible = true;
+                return Ok(());
+            }
+            Err(_) => {
+                push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
+                return Ok(());
+            }
         }
     };
-    ensure_case_insensitive_path_ancestors(&canonical)
-        .map_err(|error| sanitize_path_safety_error(&error))?;
+    if context.validate_path_ancestors {
+        ensure_case_insensitive_path_ancestors(&canonical)
+            .map_err(|error| sanitize_path_safety_error(&error))?;
+    }
     if !path_is_within(&canonical, context.scan_boundary) {
         // workspace 外的 reparse target 是未知子树：只 deny 词法入口，不跟随越界 target。
         push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
@@ -155,6 +308,14 @@ fn collect_existing_glob_matches(
     let target_metadata = if reparse_point {
         match std::fs::metadata(path) {
             Ok(metadata) => metadata,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && context.inaccessible_policy
+                        == InaccessibleScanPolicy::DeferToSandboxIdentity =>
+            {
+                context.scan_state.deferred_inaccessible = true;
+                return Ok(());
+            }
             Err(_) => {
                 push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
                 return Ok(());
@@ -166,8 +327,25 @@ fn collect_existing_glob_matches(
     if !target_metadata.is_dir() {
         return Ok(());
     }
-    ensure_case_insensitive_directory_path(&canonical)
-        .map_err(|error| sanitize_path_safety_error(&error))?;
+    let case_sensitivity = if let Some(root_handle) = context.pinned_root {
+        ensure_pinned_directory_case_insensitive(root_handle, context.scan_boundary, &canonical)
+    } else if context.validate_path_ancestors {
+        ensure_case_insensitive_directory_path(&canonical)
+    } else {
+        ensure_case_insensitive_directory_direct(&canonical)
+    };
+    if let Err(error) = case_sensitivity {
+        if context.inaccessible_policy == InaccessibleScanPolicy::DeferToSandboxIdentity
+            && matches!(
+                error.downcast_ref::<ProtectedMetadataError>(),
+                Some(ProtectedMetadataError::CaseSensitivityQueryFailed { code: 5, .. })
+            )
+        {
+            context.scan_state.deferred_inaccessible = true;
+            return Ok(());
+        }
+        return Err(sanitize_path_safety_error(&error));
+    }
 
     // canonical directory key 防止 symlink/junction cycle 无限递归；词法路径交给
     // ACL planner，并由其统一拒绝无法 no-follow enforcement 的 reparse 路径。
@@ -186,6 +364,14 @@ fn collect_existing_glob_matches(
     let mut entries = Vec::new();
     for entry in match std::fs::read_dir(path) {
         Ok(entries) => entries,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && context.inaccessible_policy
+                    == InaccessibleScanPolicy::DeferToSandboxIdentity =>
+        {
+            context.scan_state.deferred_inaccessible = true;
+            return Ok(());
+        }
         Err(_) => {
             push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
             return Ok(());
@@ -198,6 +384,14 @@ fn collect_existing_glob_matches(
         context.scan_state.scanned_entries += 1;
         match entry {
             Ok(entry) => entries.push(entry),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && context.inaccessible_policy
+                        == InaccessibleScanPolicy::DeferToSandboxIdentity =>
+            {
+                context.scan_state.deferred_inaccessible = true;
+                return Ok(());
+            }
             Err(_) => {
                 push_absolute_path(context.paths, context.seen_paths, path.to_path_buf())?;
                 return Ok(());
@@ -210,6 +404,21 @@ fn collect_existing_glob_matches(
     }
 
     Ok(())
+}
+
+fn ensure_pinned_directory_case_insensitive(
+    root_handle: &File,
+    root_path: &Path,
+    target: &Path,
+) -> anyhow::Result<()> {
+    let handle = open_pinned_workspace_path(
+        root_handle,
+        root_path,
+        target,
+        windows_sys::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("pinned workspace target is outside the workspace root"))?;
+    ensure_case_insensitive_directory(&handle, target)
 }
 
 fn push_absolute_path(
@@ -397,6 +606,9 @@ mod tests {
     use super::glob_scan_plan;
     use super::path_is_within;
     use super::resolve_windows_deny_read_paths;
+    #[cfg(windows)]
+    use super::resolve_windows_deny_read_paths_for_controller;
+    use super::resolve_windows_deny_read_paths_from_validated_workspace;
     use super::sanitize_path_safety_error;
     use crate::absolute_path::AbsolutePathBuf;
     #[cfg(windows)]
@@ -581,6 +793,31 @@ mod tests {
     }
 
     #[test]
+    fn previously_protected_directory_is_reused_without_scanning_its_children() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let protected = tmp.path().join(".private");
+        let nested = protected.join("nested").join("private-key.pem");
+        std::fs::create_dir_all(nested.parent().expect("nested parent"))
+            .expect("create protected tree");
+        std::fs::write(&nested, "secret").expect("write protected child");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/**/private-key.pem",
+            tmp.path().display()
+        ))]);
+        let initial = vec![
+            AbsolutePathBuf::from_absolute_path(protected.clone())
+                .expect("absolute protected path"),
+        ];
+
+        assert_eq!(
+            resolve_windows_deny_read_paths_from_validated_workspace(&policy, &cwd, &initial)
+                .expect("resolve opaque protected directory"),
+            initial
+        );
+    }
+
+    #[test]
     fn invalid_glob_patterns_fail_before_expansion() {
         let tmp = TempDir::new().expect("tempdir");
         let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
@@ -638,6 +875,38 @@ mod tests {
 
         assert_eq!(error, "deny_read_resolution_case_sensitivity_query_failed");
         assert!(!error.contains(tmp.path().to_string_lossy().as_ref()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn controller_defers_acl_private_subtree_to_existing_sandbox_identity() {
+        let tmp = TempDir::new().expect("tempdir");
+        let private = tmp.path().join("private");
+        let secret = private.join(".env");
+        std::fs::create_dir(&private).expect("private directory");
+        std::fs::write(&secret, "secret").expect("protected file");
+        let cwd = AbsolutePathBuf::from_absolute_path(tmp.path()).expect("absolute cwd");
+        let policy = FileSystemSandboxPolicy::restricted(vec![unreadable_glob_entry(format!(
+            "{}/**/.env",
+            tmp.path().display()
+        ))]);
+        let query_failure = override_case_sensitivity_for_test(
+            &private,
+            CaseSensitivityTestOutcome::QueryFailed(5),
+        );
+
+        let (controller_paths, incomplete) =
+            resolve_windows_deny_read_paths_for_controller(&policy, &cwd)
+                .expect("controller partial resolution");
+
+        assert!(incomplete);
+        assert!(controller_paths.is_empty());
+        drop(query_failure);
+        assert_eq!(
+            resolve_windows_deny_read_paths_from_validated_workspace(&policy, &cwd, &[])
+                .expect("sandbox identity resolution"),
+            [AbsolutePathBuf::from_absolute_path(secret).expect("absolute protected path")]
+        );
     }
 
     #[test]

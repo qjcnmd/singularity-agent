@@ -4,12 +4,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::{Argv, BlockerKind, CommandSpec, EvaluationBlocker};
 use serde::Serialize;
-use singularity_evaluation::{BlockerKind, CommandSpec, EvaluationBlocker};
 use singularity_policy::NetworkAccess;
 use singularity_tools::{
     CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
-    CommandSemanticStatus, SandboxFilesystemMode, SandboxNetworkMode, command_scope_digest,
+    CommandSemanticStatus, SandboxFilesystemMode, SandboxNetworkMode, WorkspaceObservationMetrics,
+    command_scope_digest,
 };
 
 use super::workspace::canonical_or_original;
@@ -34,6 +35,8 @@ pub(super) struct CommandDiagnostic {
     pub(super) local_process_fallback: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) scope_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_observation_metrics: Option<WorkspaceObservationMetrics>,
 }
 
 impl CommandDiagnostic {
@@ -53,6 +56,7 @@ impl CommandDiagnostic {
             sandbox_enforcement: result.sandbox.enforcement.clone(),
             local_process_fallback: result.sandbox.local_process_fallback,
             scope_digest: None,
+            workspace_observation_metrics: result.workspace_observation_metrics.clone(),
         }
     }
 
@@ -83,6 +87,7 @@ pub(super) fn command_scope_digest_for_spec(
     command: &CommandSpec,
     default_timeout_seconds: u64,
 ) -> Result<String, String> {
+    let command = project_command_spec(workspace, command)?;
     let cwd = resolve_command_cwd(workspace, command.cwd.as_ref().map(|cwd| cwd.as_str()))?;
     Ok(command_scope_digest(
         command.argv.as_slice(),
@@ -100,6 +105,7 @@ pub(super) fn run_command_spec(
     default_timeout_seconds: u64,
     sandbox_backend: SharedSandboxBackend,
 ) -> Result<CommandResult, String> {
+    let command = project_command_spec(workspace, command)?;
     let cwd = resolve_command_cwd(workspace, command.cwd.as_ref().map(|cwd| cwd.as_str()))?;
     Ok(run_raw_command(
         workspace,
@@ -109,6 +115,115 @@ pub(super) fn run_command_spec(
         sandbox_network_mode(command.network_access),
         sandbox_backend,
     ))
+}
+
+/// Projects a manifest command onto an executable layout proven by the prepared workspace.
+pub(super) fn project_command_spec(
+    workspace: &Path,
+    command: &CommandSpec,
+) -> Result<CommandSpec, String> {
+    let mut projected = command.clone();
+    #[cfg(windows)]
+    let argv = {
+        let mut argv = command.argv.as_slice().to_vec();
+        let cwd = projection_cwd(workspace, command.cwd.as_ref().map(|cwd| cwd.as_str()))?;
+        if let Some(executable) = argv.first_mut()
+            && let Some(cwd) = cwd.as_deref()
+            && let Some(windows_executable) = windows_venv_executable(cwd, executable)
+        {
+            *executable = windows_executable;
+        }
+        argv
+    };
+    #[cfg(not(windows))]
+    let argv = {
+        let _ = workspace;
+        command.argv.as_slice().to_vec()
+    };
+    projected.argv = Argv::new(argv)?;
+    Ok(projected)
+}
+
+#[cfg(windows)]
+fn projection_cwd(workspace: &Path, cwd: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let workspace = fs::canonicalize(workspace).map_err(|error| {
+        format!(
+            "failed to resolve workspace {} for command projection: {error}",
+            workspace.display()
+        )
+    })?;
+    let candidate = cwd
+        .map(|cwd| workspace.join(cwd))
+        .unwrap_or_else(|| workspace.clone());
+    match fs::canonicalize(&candidate) {
+        Ok(canonical) => {
+            if !canonical.starts_with(&workspace) {
+                return Err(format!(
+                    "evaluation command cwd escapes workspace: {}",
+                    canonical.display()
+                ));
+            }
+            Ok(Some(canonical))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to resolve command cwd {} for projection: {error}",
+            candidate.display()
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn windows_venv_executable(cwd: &Path, executable: &str) -> Option<String> {
+    use std::path::Component;
+
+    let executable = Path::new(executable);
+    if executable.is_absolute()
+        || executable.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+        || !executable
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("python"))
+    {
+        return None;
+    }
+    let binary_dir = executable.parent()?;
+    if !binary_dir
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+    {
+        return None;
+    }
+    let environment = binary_dir.parent()?;
+    let environment_root = cwd.join(environment);
+    if !is_plain_directory(&environment_root)
+        || !is_plain_file(&environment_root.join("pyvenv.cfg"))
+    {
+        return None;
+    }
+    let windows_executable = environment.join("Scripts").join("python.exe");
+    if !is_plain_file(&cwd.join(&windows_executable)) {
+        return None;
+    }
+    Some(windows_executable.to_string_lossy().into_owned())
+}
+
+#[cfg(windows)]
+fn is_plain_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_plain_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// 执行已经解析的 Evaluation command 请求。
@@ -133,6 +248,39 @@ pub(super) fn run_raw_command(
         timeout_seconds,
         network,
         SandboxFilesystemMode::WorkspaceWrite,
+        sandbox_backend,
+    )
+}
+
+/// 在 materialized task-like workspace 中执行固定的普通 strict no-op。
+///
+/// 该探针故意复用 Evaluation manifest command 的普通 `project_verification` 来源，
+/// 以便验证真实 task/trial/agent 路径，而不是只验证 trusted preparation workspace。
+pub(super) fn run_task_workspace_preflight_command(
+    workspace: &Path,
+    sandbox_backend: SharedSandboxBackend,
+) -> CommandResult {
+    let argv = if cfg!(windows) {
+        vec![
+            "cmd.exe".to_string(),
+            "/d".to_string(),
+            "/c".to_string(),
+            "exit".to_string(),
+            "0".to_string(),
+        ]
+    } else {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 0".to_string(),
+        ]
+    };
+    run_raw_command(
+        workspace,
+        workspace,
+        argv,
+        30,
+        SandboxNetworkMode::Denied,
         sandbox_backend,
     )
 }
@@ -243,6 +391,12 @@ pub(super) fn command_succeeded(result: &CommandResult) -> bool {
         && result.sandbox.enforcement == singularity_tools::SandboxBackendEnforcement::Strict
 }
 
+/// 判断固定 no-op 是否在严格 sandbox 下完成且确认工作区未变化。
+pub(super) fn unchanged_command_succeeded(result: &CommandResult) -> bool {
+    command_succeeded(result)
+        && result.workspace_mutation == singularity_tools::WorkspaceMutation::Unchanged
+}
+
 /// 将 sandbox/backend 状态映射为基础设施 blocker。
 pub(super) fn infrastructure_blocker(
     result: &CommandResult,
@@ -255,10 +409,13 @@ pub(super) fn infrastructure_blocker(
         ));
     }
     if result.sandbox.enforcement != singularity_tools::SandboxBackendEnforcement::Strict {
-        return Some(evaluation_blocker(
-            BlockerKind::Sandbox,
-            format!("{context}: strict sandbox enforcement is required"),
-        ));
+        let detail = result.stderr_preview.trim();
+        let message = if detail.is_empty() {
+            format!("{context}: strict sandbox enforcement is required")
+        } else {
+            format!("{context}: strict sandbox enforcement is required: {detail}")
+        };
+        return Some(evaluation_blocker(BlockerKind::Sandbox, message));
     }
     match result.execution_status {
         CommandExecutionStatus::Completed
@@ -321,6 +478,7 @@ mod tests {
     use super::*;
     use singularity_tools::{
         SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities, WorkspaceMutation,
+        WorkspaceObservationMode, WorkspaceObservationPhaseMetrics,
     };
 
     struct EnvironmentCaptureBackend;
@@ -355,6 +513,17 @@ mod tests {
             vec!["test-command".to_string()],
             30,
             SandboxNetworkMode::Denied,
+            Arc::new(EnvironmentCaptureBackend),
+        );
+
+        assert!(command_succeeded(&result));
+    }
+
+    #[test]
+    fn task_workspace_preflight_uses_an_ordinary_strict_noop() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = run_task_workspace_preflight_command(
+            workspace.path(),
             Arc::new(EnvironmentCaptureBackend),
         );
 
@@ -415,6 +584,15 @@ mod tests {
     }
 
     #[test]
+    fn strict_noop_requires_unchanged_workspace_mutation() {
+        let result = CommandResult::completed("changed_mutation", "ok")
+            .with_workspace_mutation(WorkspaceMutation::Changed)
+            .with_sandbox_execution("strict", SandboxBackendEnforcement::Strict);
+
+        assert!(!unchanged_command_succeeded(&result));
+    }
+
+    #[test]
     fn missing_host_executable_is_an_environment_blocker() {
         let result = CommandResult::executable_unavailable(
             "missing_tool",
@@ -428,6 +606,26 @@ mod tests {
         assert_eq!(blocker.kind, BlockerKind::Environment);
         assert!(blocker.message.contains("'python'"));
         assert!(!blocker.message.contains("C:\\"));
+    }
+
+    #[test]
+    fn unavailable_enforcement_preserves_bounded_backend_detail() {
+        let result = CommandResult::backend_error(
+            "unavailable",
+            "open protected marker failed: capability unavailable",
+        )
+        .with_sandbox_execution("windows", SandboxBackendEnforcement::Unavailable);
+
+        let blocker = infrastructure_blocker(&result, "task workspace preflight failed")
+            .expect("unavailable enforcement must block");
+
+        assert_eq!(blocker.kind, BlockerKind::Sandbox);
+        assert!(
+            blocker
+                .message
+                .contains("strict sandbox enforcement is required")
+        );
+        assert!(blocker.message.contains("open protected marker failed"));
     }
 
     #[test]
@@ -469,5 +667,211 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn command_diagnostics_include_internal_workspace_observation_work() {
+        let result = CommandResult::completed("command", "ok")
+            .with_sandbox_execution("windows", SandboxBackendEnforcement::Strict)
+            .with_workspace_mutation(WorkspaceMutation::Unchanged)
+            .with_workspace_observation_metrics(WorkspaceObservationMetrics {
+                contract: "windows_workspace_observation/v1".to_string(),
+                before: WorkspaceObservationPhaseMetrics {
+                    mode: WorkspaceObservationMode::Reused,
+                    duration_ms: 2,
+                    entries_read: 1,
+                    content_bytes_read: 0,
+                },
+                after: WorkspaceObservationPhaseMetrics {
+                    mode: WorkspaceObservationMode::Incremental,
+                    duration_ms: 3,
+                    entries_read: 4,
+                    content_bytes_read: 5,
+                },
+            });
+
+        let diagnostic = serde_json::to_value(CommandDiagnostic::new("verification", &result))
+            .expect("serialize diagnostic");
+        assert_eq!(
+            diagnostic["workspace_observation_metrics"]["contract"],
+            "windows_workspace_observation/v1"
+        );
+        assert_eq!(
+            diagnostic["workspace_observation_metrics"]["before"]["mode"],
+            "reused"
+        );
+        assert_eq!(
+            diagnostic["workspace_observation_metrics"]["after"]["mode"],
+            "incremental"
+        );
+    }
+
+    #[cfg(windows)]
+    struct ProjectedCommandCaptureBackend;
+
+    #[cfg(windows)]
+    impl SandboxBackend for ProjectedCommandCaptureBackend {
+        fn name(&self) -> &'static str {
+            "projected_command_capture"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            assert_eq!(
+                Path::new(&request.argv[0]),
+                Path::new(".venv").join("Scripts").join("python.exe")
+            );
+            assert_eq!(&request.argv[1..], ["-m", "pytest"]);
+            CommandResult::completed(&request.command_id, "ok")
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_venv_projection_is_shared_by_execution_and_scope_digest() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join(".venv").join("Scripts"))
+            .expect("venv scripts directory");
+        std::fs::write(
+            workspace.path().join(".venv").join("pyvenv.cfg"),
+            "home = C:\\Python",
+        )
+        .expect("venv marker");
+        std::fs::write(
+            workspace
+                .path()
+                .join(".venv")
+                .join("Scripts")
+                .join("python.exe"),
+            b"fixture",
+        )
+        .expect("venv executable");
+        let command = CommandSpec {
+            argv: Argv::new(vec![
+                ".venv/bin/python".to_string(),
+                "-m".to_string(),
+                "pytest".to_string(),
+            ])
+            .expect("argv"),
+            cwd: None,
+            timeout_seconds: Some(45),
+            network_access: NetworkAccess::Denied,
+        };
+
+        let projected = project_command_spec(workspace.path(), &command).expect("projection");
+        assert_eq!(
+            Path::new(&projected.argv.as_slice()[0]),
+            Path::new(".venv").join("Scripts").join("python.exe")
+        );
+        assert_eq!(
+            command_scope_digest_for_spec(workspace.path(), &command, 30).expect("scope"),
+            command_scope_digest_for_spec(workspace.path(), &projected, 30).expect("scope")
+        );
+        let result = run_command_spec(
+            workspace.path(),
+            &command,
+            30,
+            Arc::new(ProjectedCommandCaptureBackend),
+        )
+        .expect("run projected command");
+        assert!(command_succeeded(&result));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_non_venv_executable_is_not_rewritten() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let command = CommandSpec {
+            argv: Argv::new(vec![
+                "tools/bin/python".to_string(),
+                "--version".to_string(),
+            ])
+            .expect("argv"),
+            cwd: None,
+            timeout_seconds: None,
+            network_access: NetworkAccess::Denied,
+        };
+
+        let projected = project_command_spec(workspace.path(), &command).expect("projection");
+        assert_eq!(projected, command);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_venv_projection_respects_command_cwd() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested cwd");
+        std::fs::create_dir_all(nested.join(".venv").join("Scripts"))
+            .expect("nested venv scripts directory");
+        std::fs::write(nested.join(".venv").join("pyvenv.cfg"), "home = C:\\Python")
+            .expect("nested venv marker");
+        std::fs::write(
+            nested.join(".venv").join("Scripts").join("python.exe"),
+            b"fixture",
+        )
+        .expect("nested venv executable");
+        let command = CommandSpec {
+            argv: Argv::new(vec![
+                ".venv/bin/python".to_string(),
+                "--version".to_string(),
+            ])
+            .expect("argv"),
+            cwd: Some(crate::RelativePath::new("nested").expect("cwd")),
+            timeout_seconds: None,
+            network_access: NetworkAccess::Denied,
+        };
+
+        let projected = project_command_spec(workspace.path(), &command).expect("projection");
+        assert_eq!(
+            projected.argv.as_slice()[0].as_str(),
+            Path::new(".venv")
+                .join("Scripts")
+                .join("python.exe")
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_venv_projection_does_not_substitute_a_root_environment_for_nested_cwd() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested cwd");
+        std::fs::create_dir_all(workspace.path().join(".venv").join("Scripts"))
+            .expect("root venv scripts directory");
+        std::fs::write(
+            workspace.path().join(".venv").join("pyvenv.cfg"),
+            "home = C:\\Python",
+        )
+        .expect("root venv marker");
+        std::fs::write(
+            workspace
+                .path()
+                .join(".venv")
+                .join("Scripts")
+                .join("python.exe"),
+            b"fixture",
+        )
+        .expect("root venv executable");
+        let command = CommandSpec {
+            argv: Argv::new(vec![
+                ".venv/bin/python".to_string(),
+                "--version".to_string(),
+            ])
+            .expect("argv"),
+            cwd: Some(crate::RelativePath::new("nested").expect("cwd")),
+            timeout_seconds: None,
+            network_access: NetworkAccess::Denied,
+        };
+
+        let projected = project_command_spec(workspace.path(), &command).expect("projection");
+        assert_eq!(projected, command);
     }
 }

@@ -318,6 +318,11 @@ mod windows {
                 .map_err(|_| TrustedWorkspaceError::IdentityUnavailable)
         }
 
+        /// Borrow the pinned root handle for resolver path validation while the lease is alive.
+        pub(crate) fn root_handle(&self) -> &File {
+            &self.root
+        }
+
         /// Retain the root after a successful strict command.
         pub fn commit(&mut self) -> std::result::Result<(), TrustedWorkspaceError> {
             self.verify()?;

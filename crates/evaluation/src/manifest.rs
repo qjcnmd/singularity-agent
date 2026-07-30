@@ -147,25 +147,23 @@ impl EvaluationTask {
             task_id: self.task_id.clone(),
             capabilities: self.capabilities.clone(),
             source,
+            setup_commands: self.workspace.setup_commands.clone(),
             baseline: BaselineStagePlan {
                 stage: EvaluationStage::Baseline,
                 seed: WorkspaceSeed::TaskSource,
                 expectation: CommandExpectation::Failure,
-                setup_commands: self.workspace.setup_commands.clone(),
                 test_patch: public_test_patch.clone(),
                 commands: self.evaluator.baseline.commands.clone(),
             },
             agent: AgentStagePlan {
                 stage: EvaluationStage::Agent,
                 seed: WorkspaceSeed::TaskSource,
-                setup_commands: self.workspace.setup_commands.clone(),
                 projection: self.agent_projection(),
             },
             public: VerificationStagePlan {
                 stage: EvaluationStage::Public,
                 seed: WorkspaceSeed::AgentOutput,
                 expectation: CommandExpectation::Success,
-                setup_commands: self.workspace.setup_commands.clone(),
                 test_patch: public_test_patch,
                 commands: self.evaluator.public.commands.clone(),
             },
@@ -173,7 +171,6 @@ impl EvaluationTask {
                 stage: EvaluationStage::Hidden,
                 seed: WorkspaceSeed::AgentOutput,
                 expectation: CommandExpectation::Success,
-                setup_commands: self.workspace.setup_commands.clone(),
                 test_patch: self.evaluator.hidden_test_patch.clone(),
                 commands: self.evaluator.hidden.commands.clone(),
             },
@@ -512,6 +509,8 @@ pub struct WorkspacePlan {
     pub task_id: TaskId,
     pub capabilities: Vec<EvaluationCapability>,
     pub source: PlannedWorkspaceSource,
+    /// Commands that prepare the fixed workspace once before any trial stage executes.
+    pub setup_commands: Vec<CommandSpec>,
     pub baseline: BaselineStagePlan,
     pub agent: AgentStagePlan,
     pub public: VerificationStagePlan,
@@ -524,7 +523,6 @@ pub struct BaselineStagePlan {
     pub stage: EvaluationStage,
     pub seed: WorkspaceSeed,
     pub expectation: CommandExpectation,
-    pub setup_commands: Vec<CommandSpec>,
     pub test_patch: Option<EvaluatorTestPatch>,
     pub commands: Vec<CommandSpec>,
 }
@@ -534,7 +532,6 @@ pub struct BaselineStagePlan {
 pub struct AgentStagePlan {
     pub stage: EvaluationStage,
     pub seed: WorkspaceSeed,
-    pub setup_commands: Vec<CommandSpec>,
     pub projection: AgentTaskProjection,
 }
 
@@ -544,7 +541,6 @@ pub struct VerificationStagePlan {
     pub stage: EvaluationStage,
     pub seed: WorkspaceSeed,
     pub expectation: CommandExpectation,
-    pub setup_commands: Vec<CommandSpec>,
     pub test_patch: Option<EvaluatorTestPatch>,
     pub commands: Vec<CommandSpec>,
 }

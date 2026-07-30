@@ -1,7 +1,6 @@
 //! 工作区 capability、读写搜索、命令接入及 verification 观察。
 
 use super::*;
-use singularity_sandbox::is_toolchain_artifact_path;
 
 mod mutation;
 mod read;
@@ -64,24 +63,6 @@ impl fmt::Display for WorkspaceToolError {
 }
 
 impl std::error::Error for WorkspaceToolError {}
-
-fn artifact_summary_is_trusted(summary: &WorkspaceChangeSummary) -> bool {
-    if summary.changed_files.is_empty() || !is_sha256_digest(&summary.diff_digest) {
-        return false;
-    }
-    let mut paths = BTreeSet::new();
-    summary
-        .changed_files
-        .iter()
-        .all(|path| paths.insert(path) && is_toolchain_artifact_path(path))
-}
-
-fn is_sha256_digest(value: &str) -> bool {
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return false;
-    };
-    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
 
 /// 工作区 tool 接受的有界文件读取请求。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -839,6 +820,7 @@ impl WorkspaceTools {
         drop(bound_command_cwd);
         let mutation = result.workspace_mutation;
         let workspace_change_summary = result.workspace_change_summary.clone();
+        let workspace_observation_metrics = result.workspace_observation_metrics.clone();
         let execution = result.sandbox.clone();
         let command_id_binding_valid = result.command_id == request.command_id;
         let sandbox_execution = SandboxExecutionObservation {
@@ -878,9 +860,9 @@ impl WorkspaceTools {
         // A producer may mark a physical diff as verification-irrelevant only for a fully
         // classified, newly-created toolchain artifact set with a bound digest. Missing or
         // malformed summaries, and a false flag attached to an unknown path, remain relevant.
-        let verification_relevant = workspace_change_summary.as_ref().is_none_or(|summary| {
-            summary.verification_relevant || !artifact_summary_is_trusted(summary)
-        });
+        let verification_relevant = workspace_change_summary
+            .as_ref()
+            .is_none_or(|summary| !summary.is_trusted_artifact_only());
         let observation = match (&requested_filesystem, mutation, verification_relevant) {
             (SandboxFilesystemMode::WorkspaceWrite, WorkspaceMutation::Unchanged, _) => {
                 WorkspaceObservation::unchanged(self.current_workspace_revision())
@@ -914,7 +896,7 @@ impl WorkspaceTools {
             output.metadata[WORKSPACE_CHANGE_SUMMARY_METADATA] = json!(summary);
         }
         output.metadata["result_id"] = json!(expected_scope.as_str());
-        output.metadata["audit"] = json!({
+        let mut audit = json!({
             "cwd": request.cwd,
             "timeout_seconds": request.timeout_seconds,
             "sandbox_mode": request.filesystem.mode,
@@ -925,6 +907,16 @@ impl WorkspaceTools {
             "command_scope_digest": expected_scope.as_str(),
             "command_provenance": "agent_requested",
         });
+        if let Some(metrics) = workspace_observation_metrics {
+            audit["workspace_observation_metrics"] = json!({
+                "stage": "agent_command",
+                "revision": observation.revision().map(WorkspaceRevision::value),
+                "contract": metrics.contract,
+                "before": metrics.before,
+                "after": metrics.after,
+            });
+        }
+        output.metadata["audit"] = audit;
         on_event(SandboxExecutionBoundary::Finished(
             sandbox_execution.clone(),
         ))

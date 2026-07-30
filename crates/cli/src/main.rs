@@ -1,7 +1,7 @@
 //! `sg` 的命令行入口：通过 stdio JSON-RPC 调用 app-server 并渲染结果。
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
@@ -12,25 +12,23 @@ use serde_json::{Value, json};
 use singularity_core::ClientInfo;
 use singularity_protocol::{
     AgentCapabilityResult, ApprovalDecision, ApprovalOutcome, ApprovalPolicy, EmptyParams,
-    EvalRunParams, EvalRunResult, EventClass, EventDelivery, EventGapReason, EventMetadata,
-    EventRecoveryQuery, EventSubscribeParams, InitializeParams, InputItem, ItemEventParams,
-    JsonRpcId, JsonRpcMessage, JsonRpcNotification, Method, PermissionProfileName,
-    ProviderConfigurationStatus, RpcMethod, Thread, ThreadEventParams, ThreadIdParams,
-    ThreadStartParams, TraceEvent, TraceMetric, TraceMetricAvailability,
-    TraceMetricUnavailableReason, TraceMetrics, TraceMetricsParams, TraceShowParams,
-    TraceTailParams, Turn, TurnEventParams, TurnIdParams, TurnStartParams, TurnStatus, rpc_methods,
+    EventClass, EventDelivery, EventGapReason, EventMetadata, EventRecoveryQuery,
+    EventSubscribeParams, InitializeParams, InputItem, ItemEventParams, JsonRpcId, JsonRpcMessage,
+    JsonRpcNotification, Method, PermissionProfileName, ProviderConfigurationStatus, RpcMethod,
+    Thread, ThreadEventParams, ThreadIdParams, ThreadStartParams, TraceEvent, TraceMetric,
+    TraceMetricAvailability, TraceMetricUnavailableReason, TraceMetrics, TraceMetricsParams,
+    TraceShowParams, TraceTailParams, Turn, TurnEventParams, TurnIdParams, TurnStartParams,
+    TurnStatus, rpc_methods,
 };
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
-const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const CLI_CLIENT_NAME: &str = "singularity_cli";
 const CLI_CLIENT_TITLE: &str = "Singularity CLI";
 const CLI_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_TRACE_TAIL_LIMIT: usize = 20;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-const EVAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const AGENT_TURN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3600);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const TURN_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -101,11 +99,6 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    /// Validate evaluation manifests and report the current runner path.
-    Eval {
-        #[command(subcommand)]
-        command: EvalCommand,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -113,19 +106,6 @@ enum Command {
 enum ConfigCommand {
     /// Print app-server client diagnostics.
     Doctor,
-}
-
-#[derive(Debug, Subcommand)]
-// Evaluation 的 CLI 子命令。
-enum EvalCommand {
-    /// Validate and run an evaluation manifest.
-    Run {
-        manifest: PathBuf,
-        #[arg(long)]
-        run_id: String,
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -324,14 +304,6 @@ fn run_cli(cli: Cli) -> Result<(), String> {
             print_readiness()?;
             Ok(())
         }
-        Command::Eval {
-            command:
-                EvalCommand::Run {
-                    manifest,
-                    run_id,
-                    json,
-                },
-        } => run_eval(manifest, &run_id, json),
     }
 }
 
@@ -368,7 +340,6 @@ fn print_readiness() -> Result<(), String> {
     client.initialize()?;
     let capability = client.agent_capability()?;
     println!("agent_loop={}", capability.agent_loop.status);
-    println!("evaluation=agent_loop");
     print_provider_configuration(&capability.provider_configuration)
 }
 
@@ -411,35 +382,6 @@ fn print_provider_configuration(provider: &ProviderConfigurationStatus) -> Resul
         println!("{name}={status}");
     }
     Ok(())
-}
-
-// 通过 app-server 校验并执行指定 evaluation manifest。
-fn run_eval(manifest: PathBuf, run_id: &str, json_output: bool) -> Result<(), String> {
-    if !manifest.exists() {
-        return Err(format!("eval manifest not found: {}", manifest.display()));
-    }
-    let mut client = AppServerClient::spawn()?;
-    client.response_timeout = EVAL_RESPONSE_TIMEOUT;
-    client.initialize()?;
-    let result = client.eval_run(&manifest, run_id)?;
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string(&result).map_err(|error| error.to_string())?
-        );
-    } else {
-        println!(
-            "eval {} {} runner={}",
-            result.run_id, result.status, result.runner
-        );
-    }
-    if result.evaluation_passed {
-        Ok(())
-    } else {
-        Err(result
-            .blocker
-            .unwrap_or_else(|| "evaluation_failed".to_string()))
-    }
 }
 
 // 维护 app-server 子进程及其 JSON-RPC stdio 通道。
@@ -541,16 +483,6 @@ impl AppServerClient {
             render_messages(&reply.notifications, false);
         }
         Ok((reply.result.thread, reply.notifications))
-    }
-
-    // 提交 evaluation manifest，并返回 app-server 的结果对象。
-    fn eval_run(&mut self, manifest: &Path, run_id: &str) -> Result<EvalRunResult, String> {
-        let reply = self.request::<rpc_methods::EvalRun>(&EvalRunParams {
-            manifest: manifest.to_string_lossy().to_string(),
-            run_id: run_id.to_string(),
-            output_root: std::env::var(EVAL_OUTPUT_DIR_ENV).ok(),
-        })?;
-        Ok(reply.result)
     }
 
     // 恢复现有 thread，不向 app-server 上传历史。

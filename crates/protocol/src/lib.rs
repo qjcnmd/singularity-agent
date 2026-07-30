@@ -151,7 +151,6 @@ method_registry! {
     TurnInput => ("turn/input", Request, TurnInputParams, TurnResult),
     TurnPause => ("turn/pause", Request, TurnIdParams, TurnResult),
     TurnResume => ("turn/resume", Request, TurnIdParams, TurnResult),
-    EvalRun => ("eval/run", Request, EvalRunParams, EvalRunResult),
     AgentCapability => ("agent/capability", Request, EmptyParams, AgentCapabilityResult),
     TurnInterrupt => ("turn/interrupt", Request, TurnIdParams, TurnInterruptResult),
     TurnStatus => ("turn/status", Request, TurnIdParams, TurnResult),
@@ -909,35 +908,6 @@ pub struct AgentCapabilityResult {
     pub agent_loop: AgentLoopCapabilityStatus,
     #[serde(rename = "providerConfiguration")]
     pub provider_configuration: ProviderConfigurationStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// 启动 Evaluation 的参数。
-pub struct EvalRunParams {
-    pub manifest: String,
-    #[serde(rename = "runId")]
-    pub run_id: String,
-    #[serde(rename = "outputRoot", skip_serializing_if = "Option::is_none")]
-    pub output_root: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-/// Evaluation 启动结果。
-pub struct EvalRunResult {
-    pub run_id: String,
-    pub manifest: String,
-    pub runner: String,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocker: Option<String>,
-    pub tasks: Vec<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub report_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence_path: Option<String>,
-    pub evaluation_passed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

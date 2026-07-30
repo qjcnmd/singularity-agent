@@ -388,7 +388,7 @@ fn json_rpc_payload_distinguishes_empty_single_and_mixed_batch() {
 
 #[test]
 fn method_registry_is_the_unique_name_and_contract_source() {
-    assert_eq!(METHOD_REGISTRY.len(), 29);
+    assert_eq!(METHOD_REGISTRY.len(), 28);
     for spec in METHOD_REGISTRY {
         assert_eq!(Method::parse(spec.name), Some(spec.method));
         assert_eq!(spec.method.as_str(), spec.name);
@@ -405,6 +405,7 @@ fn method_registry_is_the_unique_name_and_contract_source() {
     assert!(thread_read.validate_params(serde_json::json!({})).is_err());
     assert_eq!(Method::Initialized.spec().kind, MethodKind::Notification);
     assert_eq!(Method::ThreadRead.spec().kind, MethodKind::Request);
+    assert_eq!(Method::parse("eval/run"), None);
 }
 
 #[test]

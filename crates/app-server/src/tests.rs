@@ -1879,8 +1879,7 @@ fn responses_finalization_deltas_share_item_id_with_terminal_store_item() {
                 "timeout_seconds": 5,
                 "sandbox_mode": "workspace_write",
                 "network_access": "denied"
-            },
-            "required": 1
+            }
         }]
     });
     let mut plan_response =
@@ -2959,8 +2958,7 @@ fn agent_loop_approval_resume_uses_stored_pending_tool_call_after_gate() {
                 "timeout_seconds": 5,
                 "sandbox_mode": "workspace_write",
                 "network_access": "denied"
-            },
-            "required": 1
+            }
         }]
     });
     let mut plan_response =

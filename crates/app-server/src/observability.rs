@@ -27,7 +27,7 @@ use singularity_store::{SessionStore, StoreError};
 use singularity_tools::{SandboxBackendEnforcement, WorkspaceMutation};
 
 /// Projects already-typed Agent/Provider runtime occurrences into the single Store trace stream.
-pub(crate) struct TraceProjector<'a> {
+pub struct TraceProjector<'a> {
     store: &'a SessionStore,
     run_id: String,
     session_id: String,
@@ -79,10 +79,8 @@ impl<'a> TraceProjector<'a> {
         })
     }
 
-    /// Bind the projector to an evaluation run that intentionally has no
-    /// ordinary Thread/Turn rows.  The run/session ids remain explicit in the
-    /// trace and Store still validates the typed span graph and payload.
-    pub(crate) fn new_external(
+    /// Bind the projector to an external AgentLoop execution without ordinary Thread/Turn rows.
+    pub fn new_external(
         store: &'a SessionStore,
         run_id: &str,
         session_id: &str,
@@ -98,7 +96,7 @@ impl<'a> TraceProjector<'a> {
     }
 
     /// Project one AgentLoop event in callback order; FinalTextDelta has no trace side effect.
-    pub(crate) fn project_event(&mut self, event: AgentLoopEvent) -> Result<(), StoreError> {
+    pub fn project_event(&mut self, event: AgentLoopEvent) -> Result<(), StoreError> {
         match event {
             AgentLoopEvent::FinalTextDelta { .. } => Ok(()),
             AgentLoopEvent::Observation(observation) => self.project_observation(observation),
@@ -109,7 +107,7 @@ impl<'a> TraceProjector<'a> {
     ///
     /// Provider attempts are projected synchronously from `AgentObservation` so SQLite has the
     /// Start before the HTTP side effect and the matching End immediately after that attempt.
-    pub(crate) fn project_result(&mut self, status: &AgentRunStatus) -> Result<(), StoreError> {
+    pub fn project_result(&mut self, status: &AgentRunStatus) -> Result<(), StoreError> {
         if let Some(metadata) = &status.provider_capability_metadata {
             for (index, observation) in metadata.cache_observations.iter().enumerate() {
                 let timestamp = Timestamp::from_unix_ms(observation.observed_at_unix_ms)

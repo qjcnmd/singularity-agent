@@ -4,22 +4,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use serde::Serialize;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use singularity_agent::{AgentLoopResult, terminal_command_scope_digests};
-use singularity_evaluation::{
+use crate::{
     CommandSpec, EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationResult,
     EvaluationSandboxPreflight, EvaluationScopeEvidence, EvaluationTaskEvidence,
     EvaluationTrialEvidence, EvidenceVerdict, PlannedWorkspaceSource, RunId, WorkspacePlan,
     task_selection_digest,
 };
+use serde::Serialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use singularity_agent::{AgentLoopResult, terminal_command_scope_digests};
 use singularity_tools::ToolResult;
 
 use super::command::command_scope_digest_for_spec;
 use super::{
-    AGENT_DIR, BASELINE_DIR, DEFAULT_COMMAND_TIMEOUT_SECONDS, HIDDEN_DIR, PUBLIC_DIR,
-    StageDiagnostics, TOOL_COMMAND, TaskEvaluation, TaskExecution,
+    AGENT_DIR, DEFAULT_COMMAND_TIMEOUT_SECONDS, StageDiagnostics, TOOL_COMMAND, TaskEvaluation,
+    TaskExecution,
 };
 
 /// 从任务计划和执行诊断构造脱敏 evidence。
@@ -327,19 +327,19 @@ fn build_trial_evidence(
             &diagnostics.observed_smoke_scope_digests,
         ),
         baseline: scope_evidence(
-            &task_dir.join(BASELINE_DIR),
+            &task_dir.join(AGENT_DIR),
             &plan.baseline.commands,
             &observed_verification_scopes(&diagnostics.baseline),
             DEFAULT_COMMAND_TIMEOUT_SECONDS,
         ),
         public: scope_evidence(
-            &task_dir.join(PUBLIC_DIR),
+            &task_dir.join(AGENT_DIR),
             &plan.public.commands,
             &observed_verification_scopes(&diagnostics.public),
             DEFAULT_COMMAND_TIMEOUT_SECONDS,
         ),
         hidden: scope_evidence(
-            &task_dir.join(HIDDEN_DIR),
+            &task_dir.join(AGENT_DIR),
             &plan.hidden.commands,
             &observed_verification_scopes(&diagnostics.hidden),
             DEFAULT_COMMAND_TIMEOUT_SECONDS,
@@ -476,13 +476,13 @@ fn is_sha256_digest(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use singularity_evaluation::{Argv, CommandSpec, EvidenceVerdict};
+    use crate::{Argv, CommandSpec, EvidenceVerdict};
     use singularity_policy::NetworkAccess;
     use singularity_tools::{SandboxFilesystemMode, command_script_scope_digest_with_policy};
 
     use super::smoke_scope_evidence;
-    use crate::evaluation::command::sandbox_network_mode;
-    use crate::evaluation::{
+    use crate::runner::command::sandbox_network_mode;
+    use crate::runner::{
         DEFAULT_COMMAND_TIMEOUT_SECONDS, command_script_from_argv, resolved_smoke_cwd,
     };
 

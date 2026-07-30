@@ -7,7 +7,8 @@ use singularity_agent::{
     AgentContextItem, AgentContextItemPriority, AgentLoop, AgentLoopEvent, AgentLoopEventSinkError,
     AgentLoopInput, AgentLoopResult, AgentObservation, AgentPlan, AgentPlanStep,
     AgentPlanStepStatus, AgentPlanUpdateInput, AgentRecoveryMetrics, AgentRepairReason,
-    AgentRunStatus, AgentStatus, AgentVerificationCheck, AgentVerificationPlan,
+    AgentRunStatus, AgentStatus, AgentVerificationAction, AgentVerificationCheck,
+    AgentVerificationCommand, AgentVerificationEntry, AgentVerificationPlan,
     AgentVerificationRequirement, AgentVerificationRisk, ApprovalGrant, FinalReviewStatus,
     FinalReviewVerdict, OccurrenceLifecycle, PendingApprovalOccurrence, PolicyDecisionCause,
     PolicyDecisionStatus, PromptAssemblyStatus, RepairPlanningStatus, SandboxExecutionStatus,
@@ -1010,7 +1011,11 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
     verify_response.tool_calls.push(tool_call(
         "verify_call_1",
         "command",
-        serde_json::json!({"command": test_command_script("success"), "timeout_seconds": 5}),
+        serde_json::json!({
+            "command": test_command_script("success"),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
     ));
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let negotiation_calls = Arc::new(AtomicUsize::new(0));
@@ -1089,7 +1094,7 @@ fn approval_resume_re_negotiates_instead_of_using_checkpoint_capabilities() {
     ));
     let resumed = agent_loop.resume_pending_approval(&resumed_input, &pending);
 
-    assert_eq!(resumed.status, AgentStatus::Completed);
+    assert_eq!(resumed.status, AgentStatus::Completed, "{resumed:?}");
     assert_eq!(negotiation_calls.load(Ordering::SeqCst), 2);
     let requests = seen_requests.lock().expect("seen requests lock");
     assert_eq!(requests.len(), 3);
@@ -1170,15 +1175,24 @@ fn test_command_script(argument: &str) -> String {
     format!("test-program {argument}")
 }
 
+fn verification_command(
+    command: impl Into<String>,
+    required_success_count: u32,
+) -> AgentVerificationCommand {
+    AgentVerificationCommand::new(
+        AgentVerificationAction {
+            command: command.into(),
+            cwd: ".".to_string(),
+            timeout_seconds: 5,
+            sandbox_mode: SandboxFilesystemMode::WorkspaceWrite,
+            network_access: SandboxNetworkMode::Denied,
+        },
+        required_success_count,
+    )
+}
+
 fn finalization_stream_fixture() -> (AgentLoopInput, ModelTurnResponse) {
     let verification_argv = test_command("verify");
-    let verification_digest = command_script_scope_digest_with_policy(
-        &verification_argv.join(" "),
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let mut setup_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "");
     let call = tool_call(
@@ -1200,10 +1214,7 @@ fn finalization_stream_fixture() -> (AgentLoopInput, ModelTurnResponse) {
     (
         AgentLoopInput::new("thread_1", "turn_1", "verify")
             .with_max_turns(2)
-            .with_verification_requirements([AgentVerificationRequirement::new(
-                verification_digest,
-                1,
-            )]),
+            .with_verification_commands([verification_command(verification_argv.join(" "), 1)]),
         setup_response,
     )
 }
@@ -1291,8 +1302,45 @@ fn workspace_verification_plan_response(
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
+        }),
+    ));
+    response
+}
+
+fn workspace_verification_plan_response_with_commands(
+    request: &str,
+    response: &str,
+    call_id: &str,
+    arguments: &[&str],
+) -> ModelTurnResponse {
+    let verification = arguments
+        .iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            serde_json::json!({
+                "risk": "general_mutation",
+                "evidence": "changed README.md",
+                "affected_path": "README.md",
+                "affected_symbol": format!("README.md::fixture_boundary_{index}"),
+                "current_gap": "verification evidence is not yet recorded",
+                "action": {
+                    "command": test_command_script(argument),
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut response = ModelTurnResponse::completed(request, response, "");
+    response.tool_calls.push(tool_call(
+        call_id,
+        "update_plan",
+        serde_json::json!({
+            "steps": [{"step": "verify the changed fixture", "status": "completed"}],
+            "verification": verification
         }),
     ));
     response
@@ -1544,13 +1592,6 @@ fn agent_loop_does_not_project_stream_deltas_before_response_validation() {
 #[test]
 fn agent_loop_projects_only_finalization_text_deltas_in_order() {
     let verification_argv = test_command("verify");
-    let verification_digest = command_script_scope_digest_with_policy(
-        &verification_argv.join(" "),
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let mut tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "intermediate");
     let call = tool_call(
@@ -1647,10 +1688,7 @@ fn agent_loop_projects_only_finalization_text_deltas_in_order() {
     .run_with_events(
         &AgentLoopInput::new("thread_1", "turn_1", "verify")
             .with_max_turns(2)
-            .with_verification_requirements([AgentVerificationRequirement::new(
-                verification_digest,
-                1,
-            )]),
+            .with_verification_commands([verification_command(verification_argv.join(" "), 1)]),
         &mut |event| {
             if let AgentLoopEvent::FinalTextDelta { delta } = &event {
                 deltas.push(delta.clone());
@@ -1792,10 +1830,7 @@ fn agent_loop_withholds_unvalidated_final_review_text_when_terminal_validation_f
     .run_with_text_deltas(
         &AgentLoopInput::new("thread_1", "turn_1", "verify")
             .with_max_turns(2)
-            .with_verification_requirements([AgentVerificationRequirement::new(
-                verification_digest,
-                1,
-            )]),
+            .with_verification_commands([verification_command(verification_argv.join(" "), 1)]),
         &mut |delta| deltas.push(delta.to_string()),
     );
 
@@ -1873,13 +1908,6 @@ fn agent_loop_withholds_unvalidated_final_review_text_when_cancelled() {
 #[test]
 fn approval_resume_projects_finalization_text_deltas() {
     let verification_argv = test_command("verify");
-    let verification_digest = command_script_scope_digest_with_policy(
-        &verification_argv.join(" "),
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let mut tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_tool", "approval needed");
     let call = tool_call(
@@ -1935,10 +1963,7 @@ fn approval_resume_projects_finalization_text_deltas() {
     );
     let input = AgentLoopInput::new("thread_1", "turn_1", "verify")
         .with_max_turns(2)
-        .with_verification_requirements([AgentVerificationRequirement::new(
-            verification_digest,
-            1,
-        )]);
+        .with_verification_commands([verification_command(verification_argv.join(" "), 1)]);
     let blocked = agent_loop.run(&input);
     assert_eq!(blocked.status, AgentStatus::Blocked);
     let pending = pending_approval(&blocked);
@@ -2117,15 +2142,16 @@ fn agent_loop_rejects_final_after_mutation_without_verification() {
 }
 
 #[test]
-fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() {
+fn agent_loop_preserves_portable_unknown_tool_history_with_empty_arguments() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "ready").expect("write fixture");
     let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(3);
-    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
-    response.tool_calls.push(tool_call(
+    let mut portable_unknown =
+        ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    portable_unknown.tool_calls.push(tool_call(
         "call_1",
-        "builtin/missing",
-        serde_json::json!({}),
+        "run_tests",
+        serde_json::json!({"unexpected": true}),
     ));
     let mut repaired_response =
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
@@ -2144,7 +2170,7 @@ fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() 
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
 
     let result = agent_loop_with_responses_and_requests(
-        vec![response, repaired_response, final_response],
+        vec![portable_unknown, repaired_response, final_response],
         allow_read_policy(),
         Arc::clone(&seen_requests),
     )
@@ -2163,7 +2189,7 @@ fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() 
         result.tool_results[0].error_code.as_deref(),
         Some("tool_not_visible")
     );
-    assert_eq!(result.tool_results[0].tool_name, "builtin/missing");
+    assert_eq!(result.tool_results[0].tool_name, "run_tests");
     let audit = result.tool_results[0]
         .audit_metadata()
         .expect("unknown tool audit");
@@ -2175,8 +2201,16 @@ fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() 
     assert_eq!(result.recovery_metrics.invalid_tool_call_count, 1);
     assert!(result.error.is_none());
     assert!(result.provider_diagnostic.is_none());
+
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
+    assert!(requests[1].tools.iter().any(|tool| tool.name == "read"));
+    assert!(
+        requests[1]
+            .tools
+            .iter()
+            .all(|tool| tool.name != "run_tests")
+    );
     let rejected_assistant = requests[1]
         .messages
         .iter()
@@ -2193,35 +2227,104 @@ fn agent_loop_recovers_from_nonportable_unknown_native_tool_without_execution() 
         .iter()
         .find(|call| call.tool_call_id == "call_1")
         .expect("rejected assistant tool call");
-    assert_eq!(rejected_call.tool_name, "tool_rejected");
+    assert_eq!(rejected_call.tool_name, "run_tests");
     assert_eq!(rejected_call.arguments, serde_json::json!({}));
     assert_eq!(rejected_call.raw_arguments, "{}");
-    assert!(
-        requests[1]
-            .messages
-            .iter()
-            .flat_map(|message| &message.tool_calls)
-            .all(|call| call.tool_name.chars().all(
-                |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
-            ))
-    );
-    let tool_message = requests[1]
+    let assistant_position = requests[1]
         .messages
         .iter()
-        .rev()
-        .find(|message| message.role == ModelRole::Tool)
-        .expect("tool error message");
-    assert_eq!(tool_message.role, ModelRole::Tool);
-    assert_eq!(tool_message.tool_call_id.as_deref(), Some("call_1"));
+        .position(|message| message.role == ModelRole::Assistant && !message.tool_calls.is_empty())
+        .expect("assistant tool call position");
+    let tool_position = requests[1]
+        .messages
+        .iter()
+        .position(|message| {
+            message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some("call_1")
+        })
+        .expect("tool result position");
+    assert!(assistant_position < tool_position);
+    let tool_message = &requests[1].messages[tool_position];
     let payload: serde_json::Value =
         serde_json::from_str(&tool_message.content).expect("tool result payload");
-    assert_eq!(payload["tool_name"], "tool_rejected");
+    assert_eq!(payload["tool_name"], "run_tests");
     assert_eq!(payload["error_code"], "tool_not_visible");
-    assert!(
-        !requests[1]
-            .messages
+    for field in [
+        "visible_tool_names",
+        "rejection_kind",
+        "name_projection",
+        "correction",
+        "placeholder_non_callable",
+    ] {
+        assert!(
+            payload["content"].get(field).is_none(),
+            "unexpected field {field}"
+        );
+    }
+    assert!(requests.iter().all(|request| {
+        request
+            .tools
             .iter()
-            .any(|message| message.content.contains("builtin/missing"))
+            .all(|tool| tool.name != "tool_rejected")
+            && request
+                .messages
+                .iter()
+                .flat_map(|message| message.tool_calls.iter())
+                .all(|call| call.tool_name != "tool_rejected")
+    }));
+}
+
+#[test]
+fn agent_loop_rejects_nonportable_provider_tool_name_before_history() {
+    let unsafe_name = "private/C:\\sensitive-tool";
+    let unsafe_argument = "C:\\private\\credential.txt";
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "call_unsafe",
+        unsafe_name,
+        serde_json::json!({"path": unsafe_argument}),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_responses_and_requests(
+        vec![response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read").with_max_turns(3));
+
+    assert_eq!(result.status, AgentStatus::Failed, "result={result:?}");
+    assert!(result.tool_results.is_empty());
+    assert_eq!(result.model_turns, 1);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("model response validation failed: tool_name_not_provider_portable")
+    );
+    let diagnostic = result
+        .provider_diagnostic
+        .as_ref()
+        .expect("provider diagnostic");
+    assert_eq!(
+        diagnostic.code.as_deref(),
+        Some("provider_response_invalid")
+    );
+    assert_eq!(
+        diagnostic.validation_errors,
+        vec!["tool_name_not_provider_portable".to_string()]
+    );
+    let serialized = serde_json::to_string(&result).expect("serialize public result");
+    assert!(!serialized.contains(unsafe_name));
+    assert!(!serialized.contains(unsafe_argument));
+    assert!(!serialized.contains("tool_rejected"));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].messages.iter().all(|message| {
+        message.tool_calls.is_empty() && !message.content.contains(unsafe_name)
+    }));
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .all(|tool| tool.name != "tool_rejected")
     );
 }
 
@@ -2593,6 +2696,65 @@ fn agent_loop_rejects_an_invalid_read_batch_before_policy_or_execution() {
         assert_eq!(payload["content"]["batch_executed"], false);
         assert_eq!(payload["content"]["call_executed"], false);
     }
+}
+
+#[test]
+fn agent_loop_rejects_an_unsafe_batch_before_history_or_tool_results() {
+    let unsafe_name = "private/C:\\sensitive-tool";
+    let unsafe_argument = "C:\\private\\credential.txt";
+    let mut response = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    response.tool_calls.push(tool_call(
+        "call_unsafe",
+        unsafe_name,
+        serde_json::json!({"path": unsafe_argument}),
+    ));
+    response.tool_calls.push(tool_call(
+        "call_read",
+        "read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+
+    let result = agent_loop_with_capabilities(
+        vec![response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+        ProviderProtocolContract {
+            supports_parallel_tool_calls: true,
+            ..ProviderProtocolContract::default()
+        },
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read files").with_max_turns(3));
+
+    assert_eq!(result.status, AgentStatus::Failed, "result={result:?}");
+    assert!(result.tool_results.is_empty());
+    assert_eq!(result.model_turns, 1);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("model response validation failed: tool_name_not_provider_portable")
+    );
+    assert_eq!(
+        result
+            .provider_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.code.as_deref()),
+        Some("provider_response_invalid")
+    );
+    let serialized = serde_json::to_string(&result).expect("serialize public result");
+    assert!(!serialized.contains(unsafe_name));
+    assert!(!serialized.contains(unsafe_argument));
+    assert!(!serialized.contains("tool_rejected"));
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].messages.iter().all(|message| {
+        message.tool_calls.is_empty() && !message.content.contains(unsafe_name)
+    }));
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .all(|tool| tool.name != "tool_rejected")
+    );
 }
 
 #[test]
@@ -3865,15 +4027,7 @@ fn agent_loop_rechecks_context_budget_before_each_model_request() {
 #[test]
 fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let bound_cwd = ".";
     let required_argv = test_command("second-success");
-    let required_digest = command_script_scope_digest_with_policy(
-        &required_argv.join(" "),
-        bound_cwd,
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
@@ -3920,10 +4074,7 @@ fn agent_loop_compacts_large_tool_output_before_the_next_model_request() {
     .run_with_events(
         &AgentLoopInput::new("thread_1", "turn_1", "run the command")
             .with_max_turns(3)
-            .with_verification_requirements([AgentVerificationRequirement::new(
-                required_digest,
-                1,
-            )]),
+            .with_verification_commands([verification_command(required_argv.join(" "), 1)]),
         &mut |event| {
             events.push(event);
             Ok(())
@@ -4151,20 +4302,50 @@ fn verification_plan_shares_one_exact_action_across_multiple_risks() {
 }
 
 #[test]
-fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicates() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
-    let bound_cwd = ".";
-    let required_digest = command_script_scope_digest_with_policy(
-        &test_command_script("success"),
-        bound_cwd,
+fn verification_plan_rejects_a_check_bound_to_a_different_entry_action() {
+    let action = AgentVerificationAction {
+        command: test_command_script("entry-action"),
+        cwd: ".".to_string(),
+        timeout_seconds: 5,
+        sandbox_mode: SandboxFilesystemMode::WorkspaceWrite,
+        network_access: SandboxNetworkMode::Denied,
+    };
+    let different_scope = command_script_scope_digest_with_policy(
+        &test_command_script("different-check"),
+        ".",
         5,
         SandboxFilesystemMode::WorkspaceWrite,
         SandboxNetworkMode::Denied,
     );
+    let plan = AgentVerificationPlan {
+        risks: vec![AgentVerificationRisk::GeneralMutation],
+        checks: vec![AgentVerificationCheck::new(
+            AgentVerificationRisk::GeneralMutation,
+            AgentVerificationRequirement::new(different_scope, 1),
+        )],
+        entries: vec![AgentVerificationEntry {
+            risk: AgentVerificationRisk::GeneralMutation,
+            evidence: "exercise the changed behavior".to_string(),
+            affected_path: "README.md".to_string(),
+            affected_symbol: "documented_behavior".to_string(),
+            current_gap: "the changed behavior is not verified".to_string(),
+            action,
+        }],
+    };
+
+    assert_eq!(
+        plan.validate().expect_err("mismatched binding"),
+        "verification entry must exactly match its risk and command scope binding"
+    );
+}
+
+#[test]
+fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicates() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit and verify")
         .with_max_turns(7)
-        .with_verification_requirements([AgentVerificationRequirement::new(required_digest, 2)]);
+        .with_verification_commands([verification_command(test_command_script("success"), 2)]);
 
     let command_response = |turn_index: u32, call_id: &str, argument: &str| {
         let mut response = ModelTurnResponse::completed(
@@ -4255,22 +4436,15 @@ fn exact_verification_ignores_wrong_or_pre_mutation_results_and_counts_duplicate
     assert!(requests[6].tools.is_empty());
 }
 
-/// 两次 mutation 后模型把同一 digest 的 repeat count 从 2 缩减为 1：完成门禁必须仍按
-/// 调用方下限要求 2 次成功，提前的 final answer 被拒。
+/// 两次 mutation 后模型重新声明同一 digest：完成门禁必须仍按调用方下限要求 2 次成功，
+/// 不能把模型单次 requirement 当成降低 typed caller contract，提前的 final answer 被拒。
 #[test]
-fn caller_verification_floor_survives_replan_with_shrunk_count() {
+fn caller_verification_floor_survives_replan_with_single_model_requirement() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "before").expect("write file");
-    let caller_digest = command_script_scope_digest_with_policy(
-        &test_command_script("success"),
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice and verify")
         .with_max_turns(7)
-        .with_verification_requirements([AgentVerificationRequirement::new(&caller_digest, 2)]);
+        .with_verification_commands([verification_command(test_command_script("success"), 2)]);
     let shrunk_plan = workspace_verification_plan_response(
         "model_request_turn_1_2",
         "response_2",
@@ -4339,8 +4513,289 @@ fn caller_verification_floor_survives_replan_with_shrunk_count() {
     assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
 }
 
-/// TurnCheckpoint 必须持久化并恢复"调用方 ∪ 模型 plan"的合并要求集：checkpoint 中只装
-/// 了模型 plan 子集时，resume 后完成门禁仍要求调用方 command。
+/// A caller floor may name a different exact command than the model plan. The completion gate
+/// must retain both scopes, and the caller-owned action remains available to revision replanning.
+#[test]
+fn caller_and_model_verification_scopes_use_caller_owned_action_union() {
+    let dir = tempfile::tempdir().expect("different scope workspace");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let caller_command = test_command_script("caller-scope");
+    let model_command = test_command_script("model-scope");
+    let caller_digest = command_script_scope_digest_with_policy(
+        &caller_command,
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let model_digest = command_script_scope_digest_with_policy(
+        &model_command,
+        ".",
+        5,
+        SandboxFilesystemMode::WorkspaceWrite,
+        SandboxNetworkMode::Denied,
+    );
+    let incomplete_plan = workspace_verification_plan_response_with_commands(
+        "model_request_turn_different_scope_2",
+        "response_different_scope_2",
+        "plan_different_scope",
+        &["model-scope"],
+    );
+    let complete_plan = workspace_verification_plan_response_with_commands(
+        "model_request_turn_different_scope_3",
+        "response_different_scope_3",
+        "plan_different_scope_complete",
+        &["model-scope", "caller-scope"],
+    );
+    let mut model_verification = ModelTurnResponse::completed(
+        "model_request_turn_different_scope_4",
+        "response_different_scope_4",
+        "",
+    );
+    model_verification.tool_calls.push(tool_call(
+        "command_model_scope",
+        "command",
+        serde_json::json!({"command": model_command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let mut caller_verification = ModelTurnResponse::completed(
+        "model_request_turn_different_scope_5",
+        "response_different_scope_5",
+        "",
+    );
+    caller_verification.tool_calls.push(tool_call(
+        "command_caller_scope",
+        "command",
+        serde_json::json!({"command": caller_command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                workspace_edit_response(
+                    "model_request_turn_different_scope_0",
+                    "response_different_scope_0",
+                    "edit_different_scope",
+                    "before",
+                    "middle",
+                ),
+                workspace_edit_response(
+                    "model_request_turn_different_scope_1",
+                    "response_different_scope_1",
+                    "edit_different_scope_again",
+                    "middle",
+                    "after",
+                ),
+                incomplete_plan,
+                complete_plan,
+                model_verification,
+                caller_verification,
+                ModelTurnResponse::completed(
+                    "model_request_turn_different_scope_6",
+                    "response_different_scope_6",
+                    "done",
+                ),
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind different scope workspace")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new(
+            "thread_different_scope",
+            "turn_different_scope",
+            "edit and run both verification scopes",
+        )
+        .with_max_turns(7)
+        .with_verification_commands([verification_command(caller_command.clone(), 1)]),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.verification.required_command_count, 2);
+    assert_eq!(result.verification.satisfied_command_count, 2);
+    let rejected_plan = result
+        .tool_results
+        .iter()
+        .find(|result| result.tool_call_id == "plan_different_scope")
+        .expect("incomplete plan result");
+    assert_eq!(
+        rejected_plan.error_code.as_deref(),
+        Some("invalid_tool_arguments")
+    );
+    let rejected_payload = rejected_plan.to_message_payload();
+    let rejected_summary = rejected_payload["content"]["summary"]
+        .as_str()
+        .expect("safe incomplete-plan summary");
+    assert!(rejected_summary.contains("all caller-required exact checks"));
+    assert!(!rejected_summary.contains(&caller_command));
+    let command_digests = result
+        .tool_results
+        .iter()
+        .filter(|result| result.tool_name == "command" && result.ok)
+        .filter_map(|result| {
+            result
+                .audit_metadata()
+                .and_then(|metadata| metadata.get("command_scope_digest"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(command_digests.len(), 2);
+    assert!(command_digests.contains(&caller_digest.as_str()));
+    assert!(command_digests.contains(&model_digest.as_str()));
+    let requests = seen_requests.lock().expect("different scope requests");
+    assert!(requests[2].tools.iter().all(|tool| tool.name != "command"));
+    assert!(
+        requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "update_plan")
+    );
+    assert!(requests[3].tools.iter().all(|tool| tool.name != "command"));
+    assert!(
+        requests[3]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "update_plan")
+    );
+    let model_command_schema = &requests[4]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "command")
+        .expect("model exact command tool")
+        .parameters_schema;
+    assert_eq!(
+        model_command_schema["properties"]["command"]["const"],
+        serde_json::json!(model_command)
+    );
+    let caller_command_schema = &requests[5]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "command")
+        .expect("caller exact command tool")
+        .parameters_schema;
+    assert_eq!(
+        caller_command_schema["properties"]["command"]["const"],
+        serde_json::json!(caller_command)
+    );
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == ModelRole::Developer
+            && message.content.contains("caller_verification_commands=")
+            && message.content.contains(&caller_command)
+    }));
+}
+
+/// A model plan may lower a repeated count for a scope, but the caller floor remains authoritative
+/// when selecting the next exact command after the first successful observation.
+#[test]
+fn caller_floor_keeps_shared_scope_pinned_after_plan_count_shrink() {
+    let dir = tempfile::tempdir().expect("shared scope workspace");
+    std::fs::write(dir.path().join("README.md"), "before").expect("write file");
+    let command = test_command_script("shared-scope");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let policy = allow_read_execute_policy().with_rule(
+        PermissionRule::new(
+            "allow_write",
+            SettingsScope::Project,
+            PermissionDecisionOutcome::Allow,
+        )
+        .for_operation(PermissionOperation::Write),
+    );
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                workspace_edit_response(
+                    "model_request_turn_shared_scope_0",
+                    "response_shared_scope_0",
+                    "edit_shared_scope_0",
+                    "before",
+                    "middle",
+                ),
+                workspace_edit_response(
+                    "model_request_turn_shared_scope_1",
+                    "response_shared_scope_1",
+                    "edit_shared_scope_1",
+                    "middle",
+                    "after",
+                ),
+                workspace_verification_plan_response(
+                    "model_request_turn_shared_scope_2",
+                    "response_shared_scope_2",
+                    "plan_shared_scope",
+                    "shared-scope",
+                ),
+                workspace_command_response(
+                    "model_request_turn_shared_scope_3",
+                    "response_shared_scope_3",
+                    "command_shared_scope_0",
+                    "shared-scope",
+                ),
+                ModelTurnResponse::completed(
+                    "model_request_turn_shared_scope_4",
+                    "response_shared_scope_4",
+                    "not finished",
+                ),
+                workspace_command_response(
+                    "model_request_turn_shared_scope_5",
+                    "response_shared_scope_5",
+                    "command_shared_scope_1",
+                    "shared-scope",
+                ),
+                ModelTurnResponse::completed(
+                    "model_request_turn_shared_scope_6",
+                    "response_shared_scope_6",
+                    "done",
+                ),
+            ],
+            seen_requests: Arc::clone(&seen_requests),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        policy,
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind shared scope workspace")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new(
+            "thread_shared_scope",
+            "turn_shared_scope",
+            "edit and run the shared verification twice",
+        )
+        .with_max_turns(7)
+        .with_verification_commands([verification_command(command.clone(), 2)]),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.verification.required_command_count, 2);
+    assert_eq!(result.verification.satisfied_command_count, 2);
+    let requests = seen_requests.lock().expect("shared scope requests");
+    let pinned = &requests[4];
+    assert_eq!(pinned.tools.len(), 1, "request={pinned:?}");
+    assert_eq!(pinned.tools[0].name, "command");
+    assert_eq!(
+        pinned.tools[0].parameters_schema["properties"]["command"]["const"],
+        serde_json::json!(command)
+    );
+}
+
+/// TurnCheckpoint 必须持久化并恢复覆盖 caller floor 的完整模型 plan，resume 后完成门禁
+/// 仍要求调用方与模型 plan 的合并 command 集。
 #[test]
 fn caller_verification_floor_survives_turn_checkpoint_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4361,12 +4816,12 @@ fn caller_verification_floor_survives_turn_checkpoint_resume() {
     );
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice and verify")
         .with_max_turns(3)
-        .with_verification_requirements([AgentVerificationRequirement::new(&caller_digest, 1)]);
-    let subset_plan = workspace_verification_plan_response(
+        .with_verification_commands([verification_command(test_command_script("success"), 1)]);
+    let complete_plan = workspace_verification_plan_response_with_commands(
         "model_request_turn_1_2",
         "response_2",
-        "subset_plan",
-        "second-success",
+        "complete_plan",
+        &["second-success", "success"],
     );
     let policy = || {
         allow_read_execute_policy().with_rule(
@@ -4397,7 +4852,7 @@ fn caller_verification_floor_survives_turn_checkpoint_resume() {
                     "intermediate",
                     "after",
                 ),
-                subset_plan,
+                complete_plan,
             ],
             seen_requests: Arc::new(Mutex::new(Vec::new())),
             capabilities: ProviderProtocolContract::default(),
@@ -4492,12 +4947,12 @@ fn caller_verification_floor_survives_approval_resume() {
     );
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit twice and verify")
         .with_max_turns(6)
-        .with_verification_requirements([AgentVerificationRequirement::new(&caller_digest, 1)]);
-    let subset_plan = workspace_verification_plan_response(
+        .with_verification_commands([verification_command(test_command_script("success"), 1)]);
+    let complete_plan = workspace_verification_plan_response_with_commands(
         "model_request_turn_1_2",
         "response_2",
-        "subset_plan",
-        "second-success",
+        "complete_plan",
+        &["second-success", "success"],
     );
     let policy = allow_read_write_policy().with_rule(
         PermissionRule::new(
@@ -4525,7 +4980,7 @@ fn caller_verification_floor_survives_approval_resume() {
                     "intermediate",
                     "after",
                 ),
-                subset_plan,
+                complete_plan,
                 workspace_command_response(
                     "model_request_turn_1_3",
                     "response_3",
@@ -4568,7 +5023,9 @@ fn caller_verification_floor_survives_approval_resume() {
         .into_turn_checkpoint(
             &["continue with a different approach".to_string()],
             true,
-            &input.verification_requirements,
+            &input
+                .verification_requirements()
+                .expect("caller verification requirements"),
         )
         .expect("steer after installed model plan");
     let steered_payload = steered.encode().expect("encode steered checkpoint");
@@ -4623,7 +5080,7 @@ fn caller_verification_floor_survives_approval_steer() {
     );
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit and verify")
         .with_max_turns(4)
-        .with_verification_requirements([AgentVerificationRequirement::new(&caller_digest, 1)]);
+        .with_verification_commands([verification_command(test_command_script("success"), 1)]);
     let edit = workspace_edit_response(
         "model_request_turn_1_0",
         "response_0",
@@ -4683,7 +5140,9 @@ fn caller_verification_floor_survives_approval_steer() {
         .into_turn_checkpoint(
             &["verify without editing".to_string()],
             true,
-            &input.verification_requirements,
+            &input
+                .verification_requirements()
+                .expect("caller verification requirements"),
         )
         .expect("approval steer handoff");
     let payload = steered.encode().expect("encode steered checkpoint");
@@ -4764,9 +5223,31 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     let requests = seen_requests.lock().expect("seen requests");
     assert_eq!(requests.len(), 3);
-    assert!(requests[1].messages.iter().any(|message| {
-        message.role == ModelRole::Tool && message.content.contains("\"failure_kind\":\"policy\"")
-    }));
+    let denied_feedback = requests[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some("denied")
+        })
+        .expect("denied tool feedback");
+    let denied_call = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .find(|call| call.tool_call_id == "denied")
+        .expect("denied assistant tool call");
+    assert_eq!(
+        denied_call.arguments,
+        serde_json::json!({"path": "README.md"}),
+        "a policy denial must preserve already-validated provider history"
+    );
+    assert!(
+        denied_feedback
+            .content
+            .contains("\"failure_kind\":\"policy\"")
+    );
+    assert!(!denied_feedback.content.contains("rejection_kind"));
+    assert!(!denied_feedback.content.contains("placeholder_non_callable"));
     assert_eq!(
         std::fs::read_to_string(workspace.path().join("README.md")).expect("fixture remains"),
         "unchanged"
@@ -4798,34 +5279,15 @@ fn policy_denial_is_a_recoverable_non_execution_result() {
 fn approval_resume_preserves_exact_verification_and_compaction_state() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), "before").expect("write file");
-    let bound_cwd = ".";
     let sandbox_mode = SandboxFilesystemMode::WorkspaceWrite;
     let network_access = SandboxNetworkMode::Denied;
     let first_argv = test_command("success");
     let second_argv = test_command("second-success");
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit and verify twice")
         .with_max_turns(3)
-        .with_verification_requirements([
-            AgentVerificationRequirement::new(
-                command_script_scope_digest_with_policy(
-                    &first_argv.join(" "),
-                    bound_cwd,
-                    5,
-                    sandbox_mode.clone(),
-                    network_access.clone(),
-                ),
-                1,
-            ),
-            AgentVerificationRequirement::new(
-                command_script_scope_digest_with_policy(
-                    &second_argv.join(" "),
-                    bound_cwd,
-                    5,
-                    sandbox_mode.clone(),
-                    network_access.clone(),
-                ),
-                1,
-            ),
+        .with_verification_commands([
+            verification_command(first_argv.join(" "), 1),
+            verification_command(second_argv.join(" "), 1),
         ]);
 
     let mut edit = ModelTurnResponse::completed("model_request_turn_1_0", "response_0", "");
@@ -5168,7 +5630,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     let dir = tempfile::tempdir().expect("temp dir");
     let file_path = dir.path().join("README.md");
     std::fs::write(&file_path, "before").expect("write file");
-    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(4);
+    let input = AgentLoopInput::new("thread_1", "turn_1", "hello").with_max_turns(5);
     let mut failing_tool_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     failing_tool_response.tool_calls.push(tool_call(
@@ -5184,6 +5646,13 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
     repaired_tool_response.tool_calls.push(tool_call(
         "call_2",
+        "read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    let mut changed_tool_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+    changed_tool_response.tool_calls.push(tool_call(
+        "call_3",
         "edit",
         serde_json::json!({
             "path": "README.md",
@@ -5192,16 +5661,24 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         }),
     ));
     let mut verification_response =
-        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "");
     verification_response.tool_calls.push(tool_call(
-        "call_3",
+        "call_4",
         "command",
         serde_json::json!({"command": "cargo test", "timeout_seconds": 5}),
     ));
     let final_response =
-        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+        ModelTurnResponse::completed("model_request_turn_1_4", "response_5", "done");
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let policy = PolicyEngine::new(PermissionProfile::workspace_write())
+        .with_rule(
+            PermissionRule::new(
+                "allow_read",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Read),
+        )
         .with_rule(
             PermissionRule::new(
                 "allow_write",
@@ -5223,6 +5700,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         vec![
             failing_tool_response,
             repaired_tool_response,
+            changed_tool_response,
             verification_response,
             final_response,
         ],
@@ -5237,14 +5715,15 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
     .run(&input);
 
     assert_eq!(result.status, AgentStatus::Completed);
-    assert_eq!(result.model_turns, 4);
-    assert_eq!(result.tool_results.len(), 3);
+    assert_eq!(result.model_turns, 5);
+    assert_eq!(result.tool_results.len(), 4);
     assert_eq!(
         result.tool_results[0].error_code.as_deref(),
         Some("expected_content_missing")
     );
     assert!(result.tool_results[1].ok);
     assert!(result.tool_results[2].ok);
+    assert!(result.tool_results[3].ok);
     assert!(result.verification.passed);
     assert_eq!(result.final_answer.as_deref(), Some("done"));
     assert_eq!(
@@ -5252,7 +5731,7 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
         "after"
     );
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert_eq!(requests[0].tool_choice.mode, ToolChoiceMode::Auto);
     assert_eq!(requests[1].tool_choice.mode, ToolChoiceMode::Auto);
     let feedback = requests[1]
@@ -5271,6 +5750,37 @@ fn agent_loop_retries_model_after_repairable_workspace_tool_failure() {
             .is_some_and(|summary| summary.contains("expected content not found"))
     );
     assert!(payload.get("preview").is_none());
+    let post_diagnostic_feedback = requests[2]
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == ModelRole::Developer && message.content.contains(" repair_context=")
+        })
+        .expect("post-diagnostic repair context");
+    let context: serde_json::Value = serde_json::from_str(
+        post_diagnostic_feedback
+            .content
+            .split_once(" repair_context=")
+            .expect("repair context delimiter")
+            .1,
+    )
+    .expect("structured repair context");
+    assert_eq!(
+        context["failed_requirement"],
+        "workspace_mutation:expected_content_missing"
+    );
+    assert!(
+        context["evidence"]
+            .as_str()
+            .is_some_and(|evidence| evidence.contains("expected content not found"))
+    );
+    assert_eq!(context["previous_action"], "read");
+    assert!(
+        context["previous_result"]
+            .as_str()
+            .is_some_and(|result| result.contains("before"))
+    );
 }
 
 #[test]
@@ -5357,11 +5867,42 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
         .rev()
         .find(|message| message.role == ModelRole::Tool)
         .expect("tool feedback");
+    let rejected_call = requests[1]
+        .messages
+        .iter()
+        .find(|message| {
+            message.role == ModelRole::Assistant
+                && message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.tool_call_id == "call_1")
+        })
+        .and_then(|message| {
+            message
+                .tool_calls
+                .iter()
+                .find(|call| call.tool_call_id == "call_1")
+        })
+        .expect("rejected command assistant call");
+    assert_eq!(rejected_call.arguments, serde_json::json!({}));
+    assert_eq!(rejected_call.raw_arguments, "{}");
     assert_eq!(feedback.role, ModelRole::Tool);
     let payload: serde_json::Value =
         serde_json::from_str(&feedback.content).expect("structured tool payload");
     assert_eq!(payload["error_code"], "invalid_tool_arguments");
     assert_eq!(payload["content"]["validation_code"], "command_not_string");
+    for field in [
+        "visible_tool_names",
+        "rejection_kind",
+        "name_projection",
+        "correction",
+        "placeholder_non_callable",
+    ] {
+        assert!(
+            payload["content"].get(field).is_none(),
+            "unexpected field {field}"
+        );
+    }
     assert_eq!(
         payload["content"]["retry_inputs"].as_array().map(Vec::len),
         Some(0)
@@ -5385,6 +5926,106 @@ fn agent_loop_returns_invalid_command_arguments_to_model_for_repair() {
     assert_eq!(
         run_status.audit_events[1]["approval_decision"],
         "allowed_by_policy"
+    );
+}
+
+#[test]
+fn agent_loop_projects_invalid_json_tool_calls_with_safe_history_and_feedback() {
+    let dir = tempfile::tempdir().expect("workspace");
+    std::fs::write(dir.path().join("README.md"), "ready").expect("fixture");
+    let mut malformed = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
+    malformed.tool_calls.push(ModelToolCall {
+        tool_call_id: "parse_1".to_string(),
+        tool_name: "read".to_string(),
+        arguments: serde_json::json!({}),
+        raw_arguments: r#"{"path":"C:\\secrets\\token"}"#.to_string(),
+        parse_status: ModelToolParseStatus::InvalidJson,
+        validation_errors: vec!["invalid_json".to_string()],
+    });
+    let mut repaired = ModelTurnResponse::completed("model_request_turn_1_1", "response_2", "");
+    repaired.tool_calls.push(tool_call(
+        "read_1",
+        "read",
+        serde_json::json!({"path": "README.md"}),
+    ));
+    let final_response =
+        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "done");
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_responses_and_requests(
+        vec![malformed, repaired, final_response],
+        allow_read_policy(),
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(WorkspaceTools::new(dir.path()).expect("workspace tools"))
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "read"));
+
+    assert_eq!(result.status, AgentStatus::Completed, "{result:?}");
+    assert_eq!(result.tool_results.len(), 2);
+    assert_eq!(
+        result.tool_results[0].error_code.as_deref(),
+        Some("invalid_tool_arguments")
+    );
+    let requests = seen_requests.lock().expect("seen requests");
+    let assistant_positions = requests[1]
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message.role == ModelRole::Assistant
+                && message
+                    .tool_calls
+                    .iter()
+                    .any(|call| call.tool_call_id == "parse_1")
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let tool_positions = requests[1]
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some("parse_1")
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_positions.len(), 1);
+    assert_eq!(tool_positions.len(), 1);
+    assert!(
+        assistant_positions[0] < tool_positions[0],
+        "assistant tool call must precede its paired ToolResult"
+    );
+    let rejected_call = requests[1].messages[assistant_positions[0]]
+        .tool_calls
+        .iter()
+        .find(|call| call.tool_call_id == "parse_1")
+        .expect("parse rejection assistant call");
+    assert_eq!(rejected_call.tool_name, "read");
+    assert_eq!(rejected_call.arguments, serde_json::json!({}));
+    assert_eq!(rejected_call.raw_arguments, "{}");
+    let feedback = &requests[1].messages[tool_positions[0]];
+    let payload: serde_json::Value =
+        serde_json::from_str(&feedback.content).expect("structured feedback");
+    assert_eq!(payload["tool_call_id"], "parse_1");
+    assert_eq!(payload["tool_name"], "read");
+    for field in [
+        "visible_tool_names",
+        "rejection_kind",
+        "name_projection",
+        "correction",
+        "placeholder_non_callable",
+    ] {
+        assert!(
+            payload["content"].get(field).is_none(),
+            "unexpected field {field}"
+        );
+    }
+    assert!(!feedback.content.contains("tool_rejected"));
+    assert!(!feedback.content.contains("C:\\secrets\\token"));
+    assert!(
+        requests[1]
+            .tools
+            .iter()
+            .all(|tool| tool.name != "tool_rejected")
     );
 }
 
@@ -5435,7 +6076,6 @@ fn invalid_verification_command_input_does_not_open_a_mutation_bound_repair_cycl
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
         }),
     ));
@@ -5495,7 +6135,6 @@ fn invalid_verification_command_input_does_not_open_a_mutation_bound_repair_cycl
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
         }),
     ));
@@ -5591,7 +6230,6 @@ fn verification_plan_precondition_recovery_persists_checkpoint_without_consuming
                         "sandbox_mode": sandbox_mode,
                         "network_access": "denied"
                     },
-                    "required": 1
                 }]
             }),
         ));
@@ -5697,12 +6335,9 @@ fn verification_plan_precondition_recovery_persists_checkpoint_without_consuming
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     assert_eq!(backend_calls.load(Ordering::SeqCst), 1);
-    assert!(
-        result
-            .tool_results
-            .iter()
-            .any(|result| { result.error_code.as_deref() == Some("verification_plan_required") })
-    );
+    assert!(result.tool_results.iter().any(|result| {
+        result.tool_name == "command" && result.error_code.as_deref() == Some("tool_not_visible")
+    }));
     assert_eq!(
         result
             .tool_results
@@ -5969,19 +6604,9 @@ fn event_aware_command_run_links_tool_policy_sandbox_verification_and_final_revi
     let dir = tempfile::tempdir().expect("temp dir");
     let secret = "token=runtime-observation-secret";
     let command = format!("test-program {secret}");
-    let verification_digest = command_script_scope_digest_with_policy(
-        &command,
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let input = AgentLoopInput::new("thread_1", "turn_1", "run command")
         .with_max_turns(2)
-        .with_verification_requirements([AgentVerificationRequirement::new(
-            verification_digest,
-            1,
-        )]);
+        .with_verification_commands([verification_command(command.clone(), 1)]);
     let mut command_response =
         ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     command_response.tool_calls.push(tool_call(
@@ -6843,16 +7468,7 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
     .run_with_events(
         &AgentLoopInput::new("thread_1", "turn_1", "edit and verify")
             .with_max_turns(5)
-            .with_verification_requirements([AgentVerificationRequirement::new(
-                command_script_scope_digest_with_policy(
-                    "test-program verify",
-                    ".",
-                    5,
-                    SandboxFilesystemMode::WorkspaceWrite,
-                    SandboxNetworkMode::Denied,
-                ),
-                1,
-            )]),
+            .with_verification_commands([verification_command("test-program verify", 1)]),
         &mut |event| {
             events.push(event);
             Ok(())
@@ -6897,16 +7513,7 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
 fn verification_plan_occurrences_keep_distinct_identity_after_failed_initial_check() {
     let workspace = tempfile::tempdir().expect("workspace");
     let command = test_command_script("verification_identity");
-    let requirement = AgentVerificationRequirement::new(
-        command_script_scope_digest_with_policy(
-            &command,
-            ".",
-            5,
-            SandboxFilesystemMode::WorkspaceWrite,
-            SandboxNetworkMode::Denied,
-        ),
-        1,
-    );
+    let verification_command = verification_command(command.clone(), 1);
     let mut failed_command = ModelTurnResponse::completed(
         "model_request_turn_verification_identity_0",
         "response_identity",
@@ -6943,7 +7550,7 @@ fn verification_plan_occurrences_keep_distinct_identity_after_failed_initial_che
             "run the verification",
         )
         .with_max_turns(1)
-        .with_verification_requirements([requirement]),
+        .with_verification_commands([verification_command]),
         &mut |event| {
             events.push(event);
             Ok(())
@@ -7039,7 +7646,6 @@ fn command_mutation_keeps_verification_span_identity_after_plan_invalidation() {
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 2
             }]
         }),
     ));
@@ -8433,6 +9039,65 @@ fn plan_tool_contract_preserves_actionable_validation_causes() {
 }
 
 #[test]
+fn plan_shape_failure_explains_json_structure_without_echoing_input() {
+    let invalid_result = |arguments: serde_json::Value| {
+        let mut response = ModelTurnResponse::completed(
+            "model_request_turn_plan_shape_0",
+            "response_plan_shape_0",
+            "",
+        );
+        response
+            .tool_calls
+            .push(tool_call("invalid_plan_shape", "update_plan", arguments));
+        agent_loop_with_capabilities_and_plan(
+            vec![response],
+            allow_read_policy(),
+            Arc::new(Mutex::new(Vec::new())),
+            ProviderProtocolContract::default(),
+            true,
+        )
+        .run(
+            &AgentLoopInput::new("thread_plan_shape", "turn_plan_shape", "update the plan")
+                .with_max_turns(1),
+        )
+        .tool_results[0]
+            .to_message_payload()
+    };
+
+    let shape_payload = invalid_result(serde_json::json!({"steps": "SENSITIVE_PLAN_PAYLOAD"}));
+    let shape_summary = shape_payload["content"]["summary"]
+        .as_str()
+        .expect("plan shape summary");
+    assert!(shape_summary.contains("steps field is an array"));
+    assert!(shape_summary.contains("Do not encode"));
+    assert!(!shape_summary.contains("SENSITIVE_PLAN_PAYLOAD"));
+
+    let path_payload = invalid_result(serde_json::json!({
+        "steps": [{"step": "verify", "status": "in_progress"}],
+        "verification": [{
+            "risk": "general_mutation",
+            "evidence": "verify the mutation",
+            "affected_path": "calculator.py",
+            "affected_symbol": "multiline_total",
+            "current_gap": "tests have not run",
+            "action": {
+                "command": "python -m unittest",
+                "cwd": "/workspace",
+                "timeout_seconds": 30,
+                "sandbox_mode": "workspace_write",
+                "network_access": "denied"
+            },
+        }]
+    }));
+    let path_summary = path_payload["content"]["summary"]
+        .as_str()
+        .expect("plan path summary");
+    assert!(path_summary.contains("workspace-relative"));
+    assert!(path_summary.contains("cwd \".\""));
+    assert!(!path_summary.contains("/workspace"));
+}
+
+#[test]
 fn agent_binds_provider_runtime_observations_to_each_prompt_assembly() {
     let mut first = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     first.tool_calls.push(plan_tool_call(
@@ -8778,6 +9443,11 @@ fn plan_tool_schema_matches_runtime_bounds() {
         spec.input_schema["properties"]["steps"]["items"]["properties"]["step"]["maxLength"],
         512
     );
+    let verification_entry = &spec.input_schema["properties"]["verification"]["items"];
+    assert!(
+        verification_entry["properties"].get("required").is_none(),
+        "model verification entries must not control repeat counts"
+    );
     assert_eq!(spec.input_schema["additionalProperties"], false);
 }
 
@@ -8868,15 +9538,7 @@ fn incomplete_plan_rejects_final_until_every_step_is_completed() {
 #[test]
 fn verified_completed_plan_enters_tool_free_finalization() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let bound_cwd = ".";
     let verification_argv = test_command("verify");
-    let verification_digest = command_script_scope_digest_with_policy(
-        &verification_argv.join(" "),
-        bound_cwd,
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let mut initial_plan = ModelTurnResponse::completed("model_request_turn_1_0", "response_1", "");
     initial_plan.tool_calls.push(plan_tool_call(
         "plan_call_1",
@@ -8942,10 +9604,7 @@ fn verified_completed_plan_enters_tool_free_finalization() {
     .run(
         &AgentLoopInput::new("thread_1", "turn_1", "finish and verify")
             .with_max_turns(3)
-            .with_verification_requirements([AgentVerificationRequirement::new(
-                verification_digest,
-                1,
-            )]),
+            .with_verification_commands([verification_command(verification_argv.join(" "), 1)]),
     );
 
     assert_eq!(result.status, AgentStatus::Completed);
@@ -9074,7 +9733,6 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 }]
             }),
         ));
@@ -9122,7 +9780,6 @@ fn verification_plan_repair_review_completion_closes_boundary_fixture_matrix() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 }]
             }),
         ));
@@ -9310,7 +9967,6 @@ fn final_review_repair_requires_mutation_replan_and_second_review() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 }]
             }),
         ));
@@ -9491,7 +10147,6 @@ fn missing_verification_repair_constrains_the_next_command_to_the_exact_action()
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
         }),
     ));
@@ -9681,7 +10336,6 @@ fn pre_execution_protected_exact_action_releases_pin_for_bounded_replan() {
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
         }),
     ));
@@ -9736,7 +10390,6 @@ fn pre_execution_protected_exact_action_releases_pin_for_bounded_replan() {
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
         }),
     ));
@@ -9835,15 +10488,17 @@ fn pre_execution_protected_exact_action_releases_pin_for_bounded_replan() {
         replan_request.tools.iter().any(|tool| tool.name == "edit"),
         "pre-execution boundary must allow a new mutation"
     );
-    let command_schema = &replan_request
-        .tools
-        .iter()
-        .find(|tool| tool.name == "command")
-        .expect("command remains visible during replan")
-        .parameters_schema;
     assert!(
-        command_schema["properties"]["cwd"].get("const").is_none(),
-        "pre-execution boundary must release the impossible exact action: {command_schema}"
+        replan_request
+            .tools
+            .iter()
+            .all(|tool| tool.name != "command" && tool.name != "update_plan"),
+        "a strategy-change boundary must not permit repeated verification or replanning: {:?}",
+        replan_request.tools
+    );
+    assert!(
+        replan_request.tools.iter().any(|tool| tool.name == "read"),
+        "inspection tools must remain available during strategy change"
     );
     let repair_feedback = replan_request
         .messages
@@ -9861,6 +10516,176 @@ fn pre_execution_protected_exact_action_releases_pin_for_bounded_replan() {
         "repair_feedback={}",
         repair_feedback.content
     );
+    let repaired_plan_request = &requests[4];
+    assert!(
+        repaired_plan_request
+            .tools
+            .iter()
+            .all(|tool| tool.name != "command"),
+        "a planning prerequisite must hide command until update_plan succeeds"
+    );
+    assert!(
+        repaired_plan_request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "update_plan"),
+        "a planning prerequisite must keep update_plan visible"
+    );
+}
+
+#[test]
+fn premature_completion_does_not_orphan_update_plan_input_repair() {
+    let workspace = tempfile::tempdir().expect("plan repair workspace");
+    let fixture_name = "plan_repair.txt";
+    std::fs::write(workspace.path().join(fixture_name), "before").expect("write fixture");
+    let command = test_command_script("verified");
+
+    let mut edit = ModelTurnResponse::completed(
+        "model_request_turn_plan_repair_0",
+        "response_plan_repair_0",
+        "",
+    );
+    edit.tool_calls.push(tool_call(
+        "edit_plan_repair",
+        "edit",
+        serde_json::json!({
+            "path": fixture_name,
+            "expected": "before",
+            "replacement": "after"
+        }),
+    ));
+    let plan_input = |gap: &str, include_verification: bool, status: &str| {
+        let mut input = serde_json::json!({
+            "steps": [{"step": "repair and verify", "status": status}]
+        });
+        if include_verification {
+            input["verification"] = serde_json::json!([{
+                "risk": "general_mutation",
+                "evidence": "changed the fixture",
+                "affected_path": fixture_name,
+                "affected_symbol": "plan_repair::value",
+                "current_gap": gap,
+                "action": {
+                    "command": command,
+                    "cwd": ".",
+                    "timeout_seconds": 5,
+                    "sandbox_mode": "workspace_write",
+                    "network_access": "denied"
+                },
+            }]);
+        }
+        input
+    };
+    let plan_response = |turn: u32, call_id: &str, input: serde_json::Value| {
+        let mut response = ModelTurnResponse::completed(
+            format!("model_request_turn_plan_repair_{turn}"),
+            format!("response_plan_repair_{turn}"),
+            "",
+        );
+        response
+            .tool_calls
+            .push(tool_call(call_id, "update_plan", input));
+        response
+    };
+    let mut verification = ModelTurnResponse::completed(
+        "model_request_turn_plan_repair_2",
+        "response_plan_repair_2",
+        "",
+    );
+    verification.tool_calls.push(tool_call(
+        "command_plan_repair",
+        "command",
+        serde_json::json!({"command": command, "cwd": ".", "timeout_seconds": 5}),
+    ));
+    let mut unrelated_invalid_command = ModelTurnResponse::completed(
+        "model_request_turn_plan_repair_4",
+        "response_plan_repair_4",
+        "",
+    );
+    unrelated_invalid_command.tool_calls.push(tool_call(
+        "invalid_command_during_plan_repair",
+        "command",
+        serde_json::json!({"command": 17, "cwd": ".", "timeout_seconds": 5}),
+    ));
+
+    let result = AgentLoop::new(
+        StaticProvider {
+            responses: vec![
+                edit,
+                plan_response(
+                    1,
+                    "install_plan_repair",
+                    plan_input("not run", true, "in_progress"),
+                ),
+                verification,
+                plan_response(
+                    3,
+                    "invalid_plan_repair",
+                    plan_input("changed after binding", true, "completed"),
+                ),
+                unrelated_invalid_command,
+                ModelTurnResponse::completed(
+                    "model_request_turn_plan_repair_5",
+                    "response_plan_repair_5",
+                    "done too soon",
+                ),
+                plan_response(6, "correct_plan_repair", plan_input("", false, "completed")),
+                {
+                    let mut response = ModelTurnResponse::completed(
+                        "model_request_turn_plan_repair_7",
+                        "response_plan_repair_7",
+                        "",
+                    );
+                    response.tool_calls.push(tool_call(
+                        "command_after_plan_repair",
+                        "command",
+                        serde_json::json!({
+                            "command": command,
+                            "cwd": ".",
+                            "timeout_seconds": 5
+                        }),
+                    ));
+                    response
+                },
+                ModelTurnResponse::completed(
+                    "model_request_turn_plan_repair_8",
+                    "response_plan_repair_8",
+                    "__fixture_review_accept__",
+                ),
+            ],
+            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            capabilities: ProviderProtocolContract::default(),
+        },
+        agent_tool_broker_for_test(true),
+        allow_read_execute_policy().with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        ),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(workspace.path())
+            .expect("bind plan repair workspace")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(
+        &AgentLoopInput::new(
+            "thread_plan_repair",
+            "turn_plan_repair",
+            "repair the fixture",
+        )
+        .with_max_turns(9),
+    );
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
+    assert!(result.tool_results.iter().any(|tool_result| {
+        tool_result.tool_name == "update_plan"
+            && tool_result.error_code.as_deref() == Some("invalid_tool_arguments")
+    }));
 }
 
 #[test]
@@ -9910,7 +10735,6 @@ fn installed_exact_actions_constrain_each_pre_gate_request_in_order() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 },
                 {
                     "risk": "optional_null",
@@ -9925,7 +10749,6 @@ fn installed_exact_actions_constrain_each_pre_gate_request_in_order() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 }
             ]
         }),
@@ -10102,7 +10925,6 @@ fn failed_exact_verification_remains_strategy_change_evidence_after_other_comman
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
         }),
     ));
@@ -10183,17 +11005,13 @@ fn failed_exact_verification_remains_strategy_change_evidence_after_other_comman
                 .content
                 .starts_with("Trusted exact verification remains pending.")
         }));
-        let command_schema = &repair_request
-            .tools
-            .iter()
-            .find(|tool| tool.name == "command")
-            .expect("command remains visible")
-            .parameters_schema;
         assert!(
-            command_schema["properties"]["command"]
-                .get("const")
-                .is_none(),
-            "a later diagnostic must not erase the failed exact action's strategy-change evidence: {command_schema}"
+            repair_request
+                .tools
+                .iter()
+                .all(|tool| tool.name != "command" && tool.name != "update_plan"),
+            "a later diagnostic must not reopen verification or planning before a changed patch: {:?}",
+            repair_request.tools
         );
         let repair_messages = repair_request
             .messages
@@ -10278,7 +11096,6 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 },
                 {
                     "risk": "optional_null",
@@ -10293,7 +11110,6 @@ fn repair_budget_waits_for_new_mutation_and_exposes_bounded_context() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 }
             ]
         }),
@@ -10531,7 +11347,6 @@ fn pre_plan_command_failure_commits_after_mutation_bound_verification() {
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
         }),
     ));
@@ -10629,7 +11444,6 @@ fn changed_same_tool_retry_commits_after_revision_bound_verification() {
                     "sandbox_mode": "workspace_write",
                     "network_access": "denied"
                 },
-                "required": 1
             }]
         }),
     ));
@@ -10746,7 +11560,6 @@ fn repair_mutation_checkpoint_commits_the_new_revision_before_replanning() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 }]
             }),
         ));
@@ -10817,30 +11630,17 @@ fn repair_mutation_checkpoint_commits_the_new_revision_before_replanning() {
         });
 
     assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
-    let pre_plan_rejection = checkpoint_events
-        .iter()
-        .find(|event| {
-            matches!(
-                &event.phase,
-                TurnCheckpointPhase::ToolResultsCommitted { tool_call_ids }
-                    if tool_call_ids == &["command_before_plan".to_string()]
-            )
-        })
-        .expect("pre-plan rejection checkpoint");
-    let pre_plan_checkpoint = pre_plan_rejection
-        .checkpoint
-        .encode()
-        .expect("pre-plan rejection checkpoint encodes");
-    assert_eq!(pre_plan_checkpoint["repair_attempts"], 0);
-    assert_eq!(
-        pre_plan_checkpoint["tool_result_occurrences"]
-            .as_array()
-            .expect("checkpoint tool results")
-            .iter()
-            .find(|occurrence| { occurrence["result"]["tool_call_id"] == "command_before_plan" })
-            .expect("pre-plan command result")["result"]["ok"],
-        false
-    );
+    assert!(!checkpoint_events.iter().any(|event| {
+        matches!(
+            &event.phase,
+            TurnCheckpointPhase::ToolResultsCommitted { tool_call_ids }
+                if tool_call_ids == &["command_before_plan".to_string()]
+        )
+    }));
+    assert!(result.tool_results.iter().any(|result| {
+        result.tool_call_id == "command_before_plan"
+            && result.error_code.as_deref() == Some("tool_not_visible")
+    }));
     let second_mutation = checkpoint_events
         .iter()
         .find(|event| {
@@ -10930,7 +11730,6 @@ fn repair_budget_survives_mutation_replan_and_checkpoint_resume() {
                         "sandbox_mode": "workspace_write",
                         "network_access": "denied"
                     },
-                    "required": 1
                 }]
             }),
         ));
@@ -11279,7 +12078,6 @@ fn repair_cycle_requires_matching_scope_and_all_revision_checks() {
                             "sandbox_mode": "workspace_write",
                             "network_access": "denied"
                         },
-                        "required": 1
                     },
                     {
                         "risk": "general_mutation",
@@ -11294,7 +12092,6 @@ fn repair_cycle_requires_matching_scope_and_all_revision_checks() {
                             "sandbox_mode": "workspace_write",
                             "network_access": "denied"
                         },
-                        "required": 1
                     }
                 ]
             }),
@@ -11398,13 +12195,6 @@ fn repair_cycle_requires_matching_scope_and_all_revision_checks() {
 fn malformed_final_review_retries_within_the_model_turn_budget() {
     let workspace = tempfile::tempdir().expect("workspace");
     let command = test_command_script("verify");
-    let verification_digest = command_script_scope_digest_with_policy(
-        &command,
-        ".",
-        5,
-        SandboxFilesystemMode::WorkspaceWrite,
-        SandboxNetworkMode::Denied,
-    );
     let mut verification =
         ModelTurnResponse::completed("model_request_turn_review_retry_0", "response_verify", "");
     verification.tool_calls.push(tool_call(
@@ -11448,10 +12238,7 @@ fn malformed_final_review_retries_within_the_model_turn_budget() {
     .run_with_events_and_checkpoints(
         &AgentLoopInput::new("thread_review_retry", "turn_review_retry", "verify")
             .with_max_turns(3)
-            .with_verification_requirements([AgentVerificationRequirement::new(
-                verification_digest,
-                1,
-            )]),
+            .with_verification_commands([verification_command(command.clone(), 1)]),
         &mut |event| {
             events.push(event);
             Ok(())
@@ -11538,16 +12325,7 @@ fn malformed_final_review_retries_within_the_model_turn_budget() {
     .run(
         &AgentLoopInput::new("thread_review_retry", "turn_review_retry", "verify")
             .with_max_turns(1)
-            .with_verification_requirements([AgentVerificationRequirement::new(
-                command_script_scope_digest_with_policy(
-                    &command,
-                    ".",
-                    5,
-                    SandboxFilesystemMode::WorkspaceWrite,
-                    SandboxNetworkMode::Denied,
-                ),
-                1,
-            )]),
+            .with_verification_commands([verification_command(command, 1)]),
     );
     assert_eq!(exhausted.status, AgentStatus::Failed, "{exhausted:?}");
     assert_eq!(
@@ -11576,15 +12354,7 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
         FinalizationCase::Cancelled,
     ] {
         let workspace = tempfile::tempdir().expect("workspace");
-        let bound_cwd = ".";
         let verification_argv = test_command("verify");
-        let verification_digest = command_script_scope_digest_with_policy(
-            &verification_argv.join(" "),
-            bound_cwd,
-            5,
-            SandboxFilesystemMode::WorkspaceWrite,
-            SandboxNetworkMode::Denied,
-        );
         let response_with_accounting = |request_id: &str,
                                         response_id: &str,
                                         content: &str,
@@ -11725,10 +12495,7 @@ fn terminal_finalization_failures_are_fail_closed_and_side_effect_free() {
         let result = result.run_with_events(
             &AgentLoopInput::new("thread_1", "turn_1", "verify")
                 .with_max_turns(1)
-                .with_verification_requirements([AgentVerificationRequirement::new(
-                    verification_digest,
-                    1,
-                )]),
+                .with_verification_commands([verification_command(verification_argv.join(" "), 1)]),
             &mut |event| {
                 events.push(event);
                 Ok(())
@@ -11887,10 +12654,7 @@ fn agent_loop_reports_all_unsatisfied_completion_invariants() {
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let input = AgentLoopInput::new("thread_1", "turn_1", "finish the plan")
         .with_max_turns(3)
-        .with_verification_requirements([AgentVerificationRequirement::new(
-            format!("sha256:{}", "0".repeat(64)),
-            1,
-        )]);
+        .with_verification_commands([verification_command(test_command_script("unobserved"), 1)]);
     let result = agent_loop_with_plan_capabilities(
         vec![initial_plan, premature_final, plain_text],
         allow_read_policy(),
@@ -11981,6 +12745,46 @@ fn repeated_invalid_calls_update_recovery_metrics_without_public_raw_arguments()
     assert_eq!(result.recovery_metrics.repair_attempt_count, 0);
     assert_eq!(result.recovery_metrics.completion_rejection_count, 0);
     let requests = seen_requests.lock().expect("seen requests");
+    for (request, call_id) in [(&requests[1], "call_1"), (&requests[2], "call_2")] {
+        let assistant_call = request
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_calls.iter())
+            .find(|call| call.tool_call_id == call_id)
+            .expect("repeated invalid assistant call");
+        assert_eq!(assistant_call.tool_name, "command");
+        assert_eq!(assistant_call.arguments, serde_json::json!({}));
+        assert_eq!(assistant_call.raw_arguments, "{}");
+        let feedback = request
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == ModelRole::Tool && message.tool_call_id.as_deref() == Some(call_id)
+            })
+            .expect("repeated invalid feedback");
+        let payload: serde_json::Value =
+            serde_json::from_str(&feedback.content).expect("repeated structured feedback");
+        assert_eq!(payload["tool_call_id"], call_id);
+        assert_eq!(payload["tool_name"], "command");
+        for field in [
+            "visible_tool_names",
+            "rejection_kind",
+            "name_projection",
+            "correction",
+            "placeholder_non_callable",
+        ] {
+            assert!(
+                payload["content"].get(field).is_none(),
+                "unexpected field {field}"
+            );
+        }
+        assert!(
+            request
+                .tools
+                .iter()
+                .all(|tool| tool.name != "tool_rejected")
+        );
+    }
     assert!(requests[2].messages.iter().any(|message| {
         message.role == ModelRole::Developer
             && message
@@ -12052,11 +12856,15 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         ..Default::default()
     });
     let mut verify_response =
-        ModelTurnResponse::completed("model_request_turn_1_2", "response_3", "");
+        ModelTurnResponse::completed("model_request_turn_1_3", "response_3", "");
     verify_response.tool_calls.push(tool_call(
         "verify_call_1",
         "command",
-        serde_json::json!({"command": test_command_script("success"), "timeout_seconds": 5}),
+        serde_json::json!({
+            "command": test_command_script("success"),
+            "cwd": ".",
+            "timeout_seconds": 5
+        }),
     ));
     verify_response.usage = ModelUsage {
         input_tokens: 30,
@@ -12076,7 +12884,7 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         ..Default::default()
     });
     let mut final_response =
-        ModelTurnResponse::completed("model_request_turn_1_3", "response_4", "done");
+        ModelTurnResponse::completed("model_request_turn_1_4", "response_4", "done");
     final_response.usage = ModelUsage {
         input_tokens: 40,
         output_tokens: 4,
@@ -12095,10 +12903,17 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         ..Default::default()
     });
     let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let post_mutation_plan = workspace_verification_plan_response(
+        "model_request_turn_1_2",
+        "response_plan_after_edit",
+        "plan_call_after_edit",
+        "success",
+    );
     let agent_loop = agent_loop_with_plan_capabilities(
         vec![
             plan_response,
             edit_response,
+            post_mutation_plan,
             verify_response,
             final_response,
         ],
@@ -12112,17 +12927,8 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
             .with_sandbox_backend(AgentStrictBackend),
     );
     let input = AgentLoopInput::new("thread_1", "turn_1", "edit")
-        .with_max_turns(3)
-        .with_verification_requirements([AgentVerificationRequirement::new(
-            command_script_scope_digest_with_policy(
-                &test_command_script("success"),
-                ".",
-                5,
-                SandboxFilesystemMode::WorkspaceWrite,
-                SandboxNetworkMode::Denied,
-            ),
-            1,
-        )]);
+        .with_max_turns(4)
+        .with_verification_commands([verification_command(test_command_script("success"), 1)]);
     let blocked = agent_loop.run(&input);
 
     assert_eq!(blocked.status, AgentStatus::Blocked);
@@ -12159,10 +12965,10 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
             .expect("approval checkpoint decode");
     let resumed = agent_loop.resume_pending_approval(&resumed_input, &restored);
 
-    assert_eq!(resumed.status, AgentStatus::Completed);
-    assert_eq!(resumed.model_turns, 4);
-    assert_eq!(resumed.model_turn_limit, 3);
-    assert_eq!(resumed.plan_update_count, 1);
+    assert_eq!(resumed.status, AgentStatus::Completed, "{resumed:?}");
+    assert_eq!(resumed.model_turns, 5);
+    assert_eq!(resumed.model_turn_limit, 4);
+    assert_eq!(resumed.plan_update_count, 2);
     assert_eq!(resumed.recovery_metrics, AgentRecoveryMetrics::default());
     assert_eq!(resumed.model_usage.input_tokens, 100);
     assert_eq!(resumed.model_usage.output_tokens, 10);
@@ -12199,12 +13005,12 @@ fn approval_resume_preserves_plan_and_recovery_metrics() {
         "after"
     );
     let requests = seen_requests.lock().expect("seen requests");
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert!(
-        requests[..3]
+        requests[..4]
             .iter()
             .all(|request| request.tool_choice.mode == ToolChoiceMode::Auto)
     );
-    assert_eq!(requests[3].tool_choice.mode, ToolChoiceMode::None);
-    assert!(requests[3].tools.is_empty());
+    assert_eq!(requests[4].tool_choice.mode, ToolChoiceMode::None);
+    assert!(requests[4].tools.is_empty());
 }

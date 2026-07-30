@@ -6,10 +6,11 @@
 
 mod approval;
 mod dispatch;
-mod evaluation;
 mod events;
 mod lifecycle;
 mod observability;
+
+pub use observability::TraceProjector;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -29,8 +30,8 @@ use singularity_agent::{
     agent_control_tool_entries, project_audit_event,
 };
 use singularity_core::{
-    CancellationToken, ErrorCode, JSON_RPC_INTERNAL_ERROR, ProjectInstructionError,
-    contains_sensitive_text, load_project_instructions,
+    CancellationToken, ErrorCode, ProjectInstructionError, contains_sensitive_text,
+    load_project_instructions,
 };
 use singularity_model::{Provider, ProviderConfigSnapshot};
 use singularity_policy::{
@@ -41,8 +42,8 @@ use singularity_policy::{
 use singularity_protocol::{
     AgentCapabilityResult, AgentLoopCapabilityStatus, AppEvent, ApprovalCenterResult,
     ApprovalDecisionResult, ApprovalListResult, ArtifactFetchParams, ArtifactFetchResult,
-    ConversationMessage, ConversationRole, EvalRunParams, EventClass, EventDelivery, EventGap,
-    EventGapReason, EventMetadata, EventRecoveryQuery, EventSubscribeParams, EventSubscribeResult,
+    ConversationMessage, ConversationRole, EventClass, EventDelivery, EventGap, EventGapReason,
+    EventMetadata, EventRecoveryQuery, EventSubscribeParams, EventSubscribeResult,
     InitializeParams, InitializeResult, Item, JsonRpcId, JsonRpcMessage, Method, MethodKind,
     ProviderConfigurationStatus, ServerCapabilitiesResult, ServerShutdownResult, Thread,
     ThreadDeleteResult, ThreadForkParams, ThreadForkResult, ThreadIdParams, ThreadListResult,
@@ -56,10 +57,10 @@ use singularity_store::{
     CreateStartedTurnParams, SessionStore, StoreError, ToolExecution, ToolExecutionState,
     TurnOutcomeAuthority,
 };
+#[cfg(test)]
+use singularity_tools::EDIT_TOOL as TOOL_EDIT;
 use singularity_tools::{
-    COMMAND_TOOL as TOOL_COMMAND, EDIT_TOOL as TOOL_EDIT, GREP_TOOL as TOOL_GREP,
-    LIST_TOOL as TOOL_LIST, PATCH_TOOL as TOOL_PATCH, READ_TOOL as TOOL_READ, ToolBroker,
-    ToolRegistry, WorkspaceTools, workspace_tool_entries,
+    COMMAND_TOOL as TOOL_COMMAND, ToolBroker, ToolRegistry, WorkspaceTools, workspace_tool_entries,
 };
 use thiserror::Error;
 
@@ -486,7 +487,6 @@ pub struct AppServer {
     provider_snapshot: ProviderConfigSnapshot,
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     execution_stopped: Arc<AtomicBool>,
-    evaluation_cancellation: CancellationToken,
     output_order: OutputOrderCoordinator,
     pending_transport_trace_binding: Option<TransportTraceBinding>,
     #[doc(hidden)]
@@ -499,7 +499,6 @@ pub struct AppServer {
 pub struct AppServerCancellationHandle {
     active_turns: Arc<Mutex<HashMap<String, CancellationToken>>>,
     execution_stopped: Arc<AtomicBool>,
-    evaluation_cancellation: CancellationToken,
 }
 
 /// 每个 stdio app-server 生命周期共享的事件订阅和传输 cursor。
@@ -520,7 +519,6 @@ impl AppServerCancellationHandle {
         {
             cancellation.cancel();
         }
-        self.evaluation_cancellation.cancel();
         Ok(())
     }
 }

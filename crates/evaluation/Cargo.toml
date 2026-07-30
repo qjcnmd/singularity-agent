@@ -9,12 +9,37 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "singularity-evaluation"
+path = "src/main.rs"
+
 [dependencies]
+cap-fs-ext.workspace = true
+cap-std.workspace = true
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+singularity_agent = { path = "../agent" }
+singularity_app_server = { path = "../app-server" }
+singularity_core = { path = "../core" }
+singularity_model = { path = "../model" }
 singularity_policy = { path = "../policy" }
+singularity_protocol = { path = "../protocol" }
+singularity_sandbox = { path = "../sandbox" }
+singularity_store = { path = "../store" }
+singularity_tools = { path = "../tools" }
 thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+]
 
 [dev-dependencies]
+assert_cmd.workspace = true
 tempfile.workspace = true

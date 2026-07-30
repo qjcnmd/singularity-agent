@@ -27,7 +27,6 @@ impl AppServer {
             provider_snapshot,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
             execution_stopped: Arc::new(AtomicBool::new(false)),
-            evaluation_cancellation: CancellationToken::new(),
             output_order: OutputOrderCoordinator::new(),
             pending_transport_trace_binding: None,
             test_provider_override: None,
@@ -73,7 +72,6 @@ impl AppServer {
         AppServerCancellationHandle {
             active_turns: Arc::clone(&self.active_turns),
             execution_stopped: Arc::clone(&self.execution_stopped),
-            evaluation_cancellation: self.evaluation_cancellation.clone(),
         }
     }
 
@@ -99,7 +97,6 @@ impl AppServer {
             provider_snapshot: self.provider_snapshot.clone(),
             active_turns: Arc::clone(&self.active_turns),
             execution_stopped: Arc::clone(&self.execution_stopped),
-            evaluation_cancellation: self.evaluation_cancellation.clone(),
             output_order: self.output_order.clone(),
             pending_transport_trace_binding: None,
             test_provider_override: self.test_provider_override.clone(),
@@ -219,37 +216,104 @@ impl AppServer {
     /// Explicitly claim and resume a non-approval suspended turn. The store CAS prevents two
     /// callers from issuing a duplicate first `ModelTurnRequest`.
     pub(super) fn turn_resume(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
+        let mut messages = Vec::new();
+        let trace_binding = RefCell::new(None);
+        let result = self.handle_turn_resume_streaming_values(
+            message,
+            |binding| *trace_binding.borrow_mut() = Some(binding),
+            |message| messages.push(message),
+        );
+        self.pending_transport_trace_binding = trace_binding.into_inner();
+        result?;
+        Ok(messages)
+    }
+
+    /// 执行 `turn/resume`，在恢复期间实时发出生命周期事件并保留唯一最终响应。
+    pub fn handle_turn_resume_streaming_with_output(
+        &mut self,
+        message: JsonRpcMessage,
+        mut emit: impl FnMut(AppServerOutput),
+    ) -> AppServerResult<()> {
+        let coordinator = self.output_order.clone();
+        let mut sequencing_error = None;
+        let trace_binding = RefCell::new(None);
+        let result = self.handle_turn_resume_streaming_values(
+            message,
+            |binding| *trace_binding.borrow_mut() = Some(binding),
+            |message| {
+                if sequencing_error.is_some() {
+                    return;
+                }
+                match sequence_output(&coordinator, message, trace_binding.borrow().clone()) {
+                    Ok(output) => emit(output),
+                    Err(error) => sequencing_error = Some(error),
+                }
+            },
+        );
+        if let Some(error) = sequencing_error {
+            return Err(error);
+        }
+        result
+    }
+
+    fn handle_turn_resume_streaming_values(
+        &mut self,
+        message: JsonRpcMessage,
+        mut bind_trace: impl FnMut(TransportTraceBinding),
+        mut emit: impl FnMut(Value),
+    ) -> AppServerResult<()> {
         let params: TurnIdParams = parse_params(&message)?;
         let current = match self.store.get_turn(&params.turn_id) {
             Ok(turn) => turn,
             Err(StoreError::NotFound(_)) => {
-                return not_found_response(message.required_id(), TURN_NOT_FOUND);
+                emit_messages(
+                    &mut emit,
+                    not_found_response(message.required_id(), TURN_NOT_FOUND)?,
+                );
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
         if !matches!(current.status, TurnStatus::Paused | TurnStatus::Suspended) {
-            return invalid_state_response(
-                message.required_id(),
-                "turn is not paused or suspended",
+            emit_messages(
+                &mut emit,
+                invalid_state_response(message.required_id(), "turn is not paused or suspended")?,
             );
+            return Ok(());
         }
         let thread = self.store.get_thread(&current.thread_id)?;
         if thread.status != singularity_protocol::ThreadStatus::Active {
-            return invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION);
+            emit_messages(
+                &mut emit,
+                invalid_state_response(message.required_id(), THREAD_ARCHIVED_CONTINUATION)?,
+            );
+            return Ok(());
         }
         let Some(_execution_guard) = self
             .store
             .try_begin_workspace_execution(&thread.thread_id)?
         else {
-            return invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE);
+            emit_messages(
+                &mut emit,
+                invalid_state_response(message.required_id(), WORKSPACE_EXECUTION_ACTIVE)?,
+            );
+            return Ok(());
         };
         let (turn, checkpoint_payload) = match self.store.claim_suspended_turn(&params.turn_id) {
             Ok(claimed) => claimed,
             Err(StoreError::InvalidState(error)) => {
-                return invalid_state_response(message.required_id(), error);
+                emit_messages(
+                    &mut emit,
+                    invalid_state_response(message.required_id(), error)?,
+                );
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
+        bind_trace(TransportTraceBinding::for_turn(
+            thread.thread_id.clone(),
+            turn.turn_id.clone(),
+        ));
         let checkpoint = match TurnCheckpoint::decode(&checkpoint_payload) {
             Ok(checkpoint) => checkpoint,
             Err(_) => {
@@ -258,13 +322,14 @@ impl AppServer {
                     TurnStatus::Failed,
                     AgentStatus::Failed.as_str(),
                 );
-                return invalid_state_response(
-                    message.required_id(),
-                    "turn checkpoint unavailable",
+                emit_messages(
+                    &mut emit,
+                    invalid_state_response(message.required_id(), "turn checkpoint unavailable")?,
                 );
+                return Ok(());
             }
         };
-        let resumed = (|| -> AppServerResult<Vec<Value>> {
+        let resumed = (|| -> AppServerResult<()> {
             let resume_attempt = match checkpoint.resume_attempt().checked_add(1) {
                 Some(resume_attempt) => resume_attempt,
                 None => {
@@ -306,11 +371,13 @@ impl AppServer {
             let (cancellation, mut active_turn) = self.activate_turn(&turn.turn_id)?;
             let mut assistant_events =
                 AssistantItemEventState::new(SessionStore::allocate_assistant_item_id());
-            let mut emit = Vec::new();
             let mut status = {
                 let mut on_event = |event: AgentLoopEvent| match event {
                     AgentLoopEvent::FinalTextDelta { delta } => {
-                        emit.extend(self.project_assistant_delta(&mut assistant_events, &delta)?);
+                        emit_messages(
+                            &mut emit,
+                            self.project_assistant_delta(&mut assistant_events, &delta)?,
+                        );
                         Ok(())
                     }
                     AgentLoopEvent::Observation(_) => Ok(()),
@@ -361,35 +428,39 @@ impl AppServer {
                 ) {
                     Ok(committed) => break committed,
                     Err(AppServerError::Store(StoreError::TurnBoundaryPending { .. })) => {
-                        status =
-                            self.resume_pending_terminal_boundary(
-                                AgentLoopInvocation {
-                                    thread: &thread,
-                                    params: &params_for_agent,
-                                    turn_id: &turn.turn_id,
-                                    history: &history.messages,
-                                    cancellation: &cancellation,
-                                    monitor_control: active_turn.monitor_control(),
-                                },
-                                &mut |event| match event {
-                                    AgentLoopEvent::FinalTextDelta { delta } => {
-                                        emit.extend(self.project_assistant_delta(
+                        status = self.resume_pending_terminal_boundary(
+                            AgentLoopInvocation {
+                                thread: &thread,
+                                params: &params_for_agent,
+                                turn_id: &turn.turn_id,
+                                history: &history.messages,
+                                cancellation: &cancellation,
+                                monitor_control: active_turn.monitor_control(),
+                            },
+                            &mut |event| match event {
+                                AgentLoopEvent::FinalTextDelta { delta } => {
+                                    emit_messages(
+                                        &mut emit,
+                                        self.project_assistant_delta(
                                             &mut assistant_events,
                                             &delta,
-                                        )?);
-                                        Ok(())
-                                    }
-                                    AgentLoopEvent::Observation(_) => Ok(()),
-                                },
-                                true,
-                            )?;
+                                        )?,
+                                    );
+                                    Ok(())
+                                }
+                                AgentLoopEvent::Observation(_) => Ok(()),
+                            },
+                            true,
+                        )?;
                     }
                     Err(error) => return Err(error),
                 }
             };
-            let mut outputs = emit;
-            outputs.extend(self.committed_turn_events(&committed, Some(&assistant_events))?);
-            outputs.push(
+            emit_messages(
+                &mut emit,
+                self.committed_turn_events(&committed, Some(&assistant_events))?,
+            );
+            emit(
                 JsonRpcMessage::response(
                     message.required_id(),
                     serde_json::to_value(TurnResult {
@@ -398,10 +469,10 @@ impl AppServer {
                 )
                 .to_wire_value(),
             );
-            Ok(outputs)
+            Ok(())
         })();
         match resumed {
-            Ok(outputs) => Ok(outputs),
+            Ok(()) => Ok(()),
             Err(error) => {
                 let failure = turn_failure_from_error(&error, TurnFailureStage::AgentLoop);
                 match self.store.suspend_claimed_turn_after_failure(&turn.turn_id) {
@@ -1032,40 +1103,6 @@ impl AppServer {
         )
     }
 
-    pub(super) fn eval_run(&mut self, message: JsonRpcMessage) -> AppServerResult<Vec<Value>> {
-        let params: EvalRunParams = parse_params(&message)?;
-        match evaluation::run_evaluation(
-            &params,
-            Arc::clone(&self.sandbox_backend),
-            &self.provider_snapshot,
-            &self.evaluation_cancellation,
-            &self.store,
-        ) {
-            Ok(result) => json_response(message.required_id(), result),
-            Err(error) => match error.kind() {
-                evaluation::EvaluationRunErrorKind::Input => json_error(
-                    Some(message.required_id()),
-                    ErrorCode::invalid_params("Invalid params"),
-                ),
-                evaluation::EvaluationRunErrorKind::Publication
-                | evaluation::EvaluationRunErrorKind::Infrastructure => json_error(
-                    Some(message.required_id()),
-                    ErrorCode::new(JSON_RPC_INTERNAL_ERROR, "Internal error"),
-                ),
-                evaluation::EvaluationRunErrorKind::Cancelled => {
-                    if let Some(partial) = error.partial_result() {
-                        json_response(message.required_id(), partial.clone())
-                    } else {
-                        json_error(
-                            Some(message.required_id()),
-                            ErrorCode::new(JSON_RPC_INTERNAL_ERROR, "Internal error"),
-                        )
-                    }
-                }
-            },
-        }
-    }
-
     /// 根据已捕获的模型提供方、工作区策略和持久化历史构建 `AgentLoop`。
     pub(super) fn run_agent_loop(
         &self,
@@ -1373,6 +1410,9 @@ impl AppServer {
                 return Ok(Some((turn.clone(), run_status, Vec::new())));
             }
         };
+        let verification_requirements = loop_input
+            .verification_requirements()
+            .map_err(AppServerError::InvalidParams)?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
                 &self.store,
@@ -1409,7 +1449,7 @@ impl AppServer {
                     &thread.thread_id,
                     &turn.turn_id,
                     event,
-                    &loop_input.verification_requirements,
+                    &verification_requirements,
                 ) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {
@@ -1591,6 +1631,9 @@ impl AppServer {
             &workspace_root,
             invocation.history,
         )?;
+        let verification_requirements = loop_input
+            .verification_requirements()
+            .map_err(AppServerError::InvalidParams)?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
                 &self.store,
@@ -1630,7 +1673,7 @@ impl AppServer {
                     &invocation.thread.thread_id,
                     invocation.turn_id,
                     event,
-                    &loop_input.verification_requirements,
+                    &verification_requirements,
                 ) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {
@@ -1749,6 +1792,9 @@ impl AppServer {
             invocation.history,
         )?
         .with_resume_attempt(checkpoint.resume_attempt());
+        let verification_requirements = loop_input
+            .verification_requirements()
+            .map_err(AppServerError::InvalidParams)?;
         let mut projector = if project_observability {
             Some(observability::TraceProjector::new(
                 &self.store,
@@ -1788,7 +1834,7 @@ impl AppServer {
                     &invocation.thread.thread_id,
                     invocation.turn_id,
                     event,
-                    &loop_input.verification_requirements,
+                    &verification_requirements,
                 ) {
                     Ok(TurnBoundaryAction::Continue) => Ok(()),
                     Ok(action) => {

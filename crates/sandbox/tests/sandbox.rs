@@ -5,7 +5,7 @@ use singularity_core::CancellationToken;
 #[cfg(windows)]
 use singularity_sandbox::WorkspaceMutation;
 #[cfg(windows)]
-use singularity_sandbox::{CommandEnvironmentPolicy, SandboxNetworkMode};
+use singularity_sandbox::{CommandEnvironmentPolicy, SandboxNetworkMode, WorkspaceObservationMode};
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
     CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
@@ -741,6 +741,164 @@ fn windows_elevated_preflight_verifies_full_contract() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_complete_snapshot_proves_large_ordinary_command_change() {
+    let work_root = std::env::current_dir()
+        .expect("current directory")
+        .join("work");
+    std::fs::create_dir_all(&work_root).expect("work root");
+    let workspace = tempfile::Builder::new()
+        .prefix(".ordinary-large-change-")
+        .tempdir_in(work_root)
+        .expect("workspace");
+    let backend = WindowsSandboxBackend::new();
+    let mut request = CommandRequest::project_verification(
+        "ordinary_large_change_set",
+        vec![
+            "powershell.exe".to_string(),
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "$ErrorActionPreference='Stop'; 0..1024 | ForEach-Object { [IO.File]::WriteAllText(('ordinary-{0:D4}.txt' -f $_), 'payload') }".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Denied;
+    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+
+    let result = backend.execute(&request);
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result:#?}"
+    );
+    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
+    assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+    assert!(
+        result.workspace_change_summary.is_none(),
+        "an unbounded ordinary change must not expose an imprecise model-facing path summary"
+    );
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result.sandbox.local_process_fallback);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_snapshot_observes_private_python_directory() {
+    let work_root = std::env::current_dir()
+        .expect("current directory")
+        .join("work");
+    std::fs::create_dir_all(&work_root).expect("work root");
+    let workspace = tempfile::Builder::new()
+        .prefix(".python-private-change-")
+        .tempdir_in(work_root)
+        .expect("workspace");
+    let backend = WindowsSandboxBackend::new();
+    let mut request = CommandRequest::project_verification(
+        "python_private_directory",
+        vec![
+            "python".to_string(),
+            "-c".to_string(),
+            "import os; from pathlib import Path; os.mkdir('.private', 0o700); Path('.private/value.txt').write_text('private')".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Denied;
+    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+
+    let result = backend.execute(&request);
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result:#?}"
+    );
+    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
+    assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result.sandbox.local_process_fallback);
+
+    let follow_up = backend.execute(&CommandRequest::project_verification(
+        "python_private_directory_follow_up",
+        vec![
+            "python".to_string(),
+            "-c".to_string(),
+            "print('follow-up')".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    ));
+    assert_eq!(
+        follow_up.execution_status,
+        CommandExecutionStatus::Completed,
+        "{follow_up:#?}"
+    );
+    assert_eq!(follow_up.workspace_mutation, WorkspaceMutation::Unchanged);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_trusted_git_dir_can_initialize_host_created_metadata_directory() {
+    let work_root = std::env::current_dir()
+        .expect("current directory")
+        .join("work");
+    std::fs::create_dir_all(&work_root).expect("work root");
+    let workspace = tempfile::Builder::new()
+        .prefix(".trusted-evaluator-git-")
+        .tempdir_in(work_root)
+        .expect("workspace");
+    std::fs::create_dir(workspace.path().join(".singularity-evaluator-git"))
+        .expect("evaluator git directory");
+    let backend = WindowsSandboxBackend::new();
+    let mut request = CommandRequest::trusted_workspace_preparation(
+        "trusted_evaluator_git_init",
+        vec![
+            "git".to_string(),
+            "--git-dir=.singularity-evaluator-git".to_string(),
+            "--work-tree=.".to_string(),
+            "init".to_string(),
+            "--quiet".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Denied;
+    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+
+    let result = backend.execute(&request);
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result:#?}"
+    );
+    assert_eq!(
+        result.semantic_status,
+        CommandSemanticStatus::Succeeded,
+        "{result:#?}"
+    );
+    assert_eq!(result.workspace_mutation, WorkspaceMutation::Changed);
+    assert!(result.workspace_change_summary.is_some());
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result.sandbox.local_process_fallback);
+}
+
+#[cfg(windows)]
+#[test]
 #[ignore = "requires first-run Windows UAC sandbox setup and an additional ACL-authority elevation"]
 fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
     let workspace = if let Some(root) =
@@ -777,7 +935,11 @@ fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
         CommandExecutionStatus::Completed,
         "{create_result:#?}"
     );
-    assert_eq!(create_result.workspace_mutation, WorkspaceMutation::Changed);
+    assert_eq!(
+        create_result.workspace_mutation,
+        WorkspaceMutation::Changed,
+        "{create_result:#?}"
+    );
     assert!(
         generated.exists(),
         "sandbox command must create the protected file"
@@ -811,6 +973,111 @@ fn windows_elevated_refreshes_acl_for_sandbox_owned_generated_protected_file() {
     );
     assert!(!read_result.sandbox.local_process_fallback);
     assert_eq!(read_result.exit_code, Some(0), "{read_result:#?}");
+
+    let repeated_read_result = backend.execute(&read_request);
+    assert_eq!(
+        repeated_read_result.execution_status,
+        CommandExecutionStatus::Completed,
+        "an already-protected sandbox-owned object must remain observable by later commands: {repeated_read_result:#?}"
+    );
+    assert_eq!(
+        repeated_read_result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert_eq!(
+        repeated_read_result.exit_code,
+        Some(0),
+        "{repeated_read_result:#?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup and Python venv support"]
+fn windows_public_certificate_replacement_is_rejected_after_protected_setup_boundary() {
+    let work_root = std::env::current_dir()
+        .expect("current directory")
+        .join("work");
+    std::fs::create_dir_all(&work_root).expect("work root");
+    let workspace = tempfile::Builder::new()
+        .prefix(".public-certificate-replace-")
+        .tempdir_in(work_root)
+        .expect("workspace");
+    let backend = WindowsSandboxBackend::new();
+    let mut create = CommandRequest::project_verification(
+        "create_python_venv",
+        vec![
+            "python".to_string(),
+            "-m".to_string(),
+            "venv".to_string(),
+            ".venv".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    create.network.mode = SandboxNetworkMode::Denied;
+    create.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    let create_result = backend.execute(&create);
+    assert_eq!(
+        create_result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{create_result:#?}"
+    );
+    assert_eq!(
+        create_result.semantic_status,
+        CommandSemanticStatus::Succeeded
+    );
+    let create_observation = create_result
+        .workspace_observation_metrics
+        .as_ref()
+        .expect("create observation metrics");
+    assert_eq!(
+        create_observation.before.mode,
+        WorkspaceObservationMode::Full
+    );
+    assert_eq!(
+        create_observation.after.mode,
+        WorkspaceObservationMode::Incremental
+    );
+
+    let mut replace = CommandRequest::project_verification(
+        "replace_public_certificate",
+        vec![
+            "python".to_string(),
+            "-c".to_string(),
+            "from pathlib import Path; p=next(Path('.venv').rglob('cacert.' + 'pem')); q=p.with_name(p.name + '.replacement');\ntry:\n    q.write_bytes(p.read_bytes())\n    try:\n        q.replace(p)\n    except OSError:\n        pass\n    else:\n        raise SystemExit(23)\nfinally:\n    try:\n        q.unlink()\n    except FileNotFoundError:\n        pass".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    replace.network.mode = SandboxNetworkMode::Denied;
+    replace.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    let replace_result = backend.execute(&replace);
+    assert_eq!(
+        replace_result.execution_status,
+        CommandExecutionStatus::Completed,
+        "the setup-boundary identity pin must reject a public certificate replacement: {replace_result:#?}"
+    );
+    assert_eq!(
+        replace_result.semantic_status,
+        CommandSemanticStatus::Succeeded,
+        "{replace_result:#?}"
+    );
+    assert_eq!(
+        replace_result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!replace_result.sandbox.local_process_fallback);
+    assert_ne!(
+        replace_result
+            .workspace_observation_metrics
+            .as_ref()
+            .expect("replace observation metrics")
+            .before
+            .mode,
+        WorkspaceObservationMode::Full,
+        "the unchanged prepared dependency tree must not be scanned in full before the next command"
+    );
 }
 
 #[cfg(windows)]

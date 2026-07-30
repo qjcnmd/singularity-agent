@@ -1,20 +1,30 @@
-use std::collections::HashMap;
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::iter::once;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use std::os::windows::ffi::OsStrExt;
 
+use super::workspace_change::{
+    CachedProtectedPath, capture_cached_protected_paths, validate_cached_protected_paths,
+    validate_cached_workspace_root,
+};
 use super::{
     COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
-    CommandSemanticStatus, ExecutableAvailability, SandboxBackend, SandboxBackendEnforcement,
-    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact,
-    SandboxPreflightReport, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceSnapshot,
-    command_request_denial, command_script_request_denial, is_secret_env_name,
+    CommandSemanticStatus, ExecutableAvailability, IncrementalSnapshot,
+    PreparedWorkspaceObservation, PreparedWorkspaceObserver, SandboxBackend,
+    SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode,
+    SandboxPreflightFact, SandboxPreflightReport, WorkspaceChangeSummary, WorkspaceMutation,
+    WorkspaceObservationMetrics, WorkspaceObservationMode, WorkspaceObservationPhaseMetrics,
+    WorkspaceSnapshot, command_request_denial, command_script_request_denial, is_secret_env_name,
     path_has_sensitive_component, snapshot_trusted_workspace,
-    snapshot_trusted_workspace_from_handle, snapshot_workspace,
+    snapshot_trusted_workspace_from_handle, snapshot_workspace_as_sandbox_user,
+    snapshot_workspace_as_sandbox_user_for_cached_root, update_workspace_snapshot_as_sandbox_user,
 };
 use singularity_core::{
     PROTECTED_METADATA_PATH_NAMES, PROTECTED_PATH_CONTAINS_MARKERS, PROTECTED_PATH_EXACT_MARKERS,
@@ -25,7 +35,11 @@ use singularity_windows_sandbox::{
     FileSystemSandboxEntry, FileSystemSandboxPolicy, ManagedFileSystemPermissions,
     NetworkSandboxPolicy, PermissionProfile, TrustedWorkspaceError, TrustedWorkspaceLease,
     WindowsSandboxCancellationToken, WorkspaceChangeMonitor, WorkspaceChangeObservation,
-    resolve_windows_deny_read_paths, run_windows_sandbox_capture_for_permission_profile_elevated,
+    WorkspaceRootLease, resolve_windows_deny_read_paths_for_controller,
+    resolve_windows_deny_read_paths_for_controller_with_pinned_workspace_root,
+    resolve_windows_deny_read_paths_from_validated_workspace,
+    run_windows_sandbox_capture_for_permission_profile_elevated,
+    run_windows_sandbox_capture_for_permission_profile_with_observations_elevated,
     run_windows_sandbox_capture_with_filesystem_overrides, safe_windows_error_summary,
 };
 
@@ -39,6 +53,201 @@ const UNSAFE_BATCH_ARGUMENT: &str = "batch command contains unsupported shell sy
 const ELEVATED_FAILURE_PREFIX: &str = "elevated Windows sandbox failed";
 const RESTRICTED_FAILURE_PREFIX: &str = "restricted-token Windows sandbox failed";
 const PROTECTED_PATH_ENFORCEMENT_FAILED: &str = "protected workspace path enforcement failed";
+const MAX_WORKSPACE_OBSERVATION_SESSIONS: usize = 16;
+const WORKSPACE_OBSERVATION_CONTRACT: &str = "windows_workspace_observation/v1";
+
+#[cfg(test)]
+thread_local! {
+    static FULL_PROTECTED_RESOLVER_SCANS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WorkspaceObservationSessionKey {
+    root: PathBuf,
+    contract: String,
+}
+
+#[derive(Clone)]
+struct BeforeSnapshotSeed {
+    snapshot: WorkspaceSnapshot,
+    observation: WorkspaceChangeObservation,
+}
+
+struct WorkspaceObservationPreparation {
+    seed: Option<BeforeSnapshotSeed>,
+    monitor: WorkspaceChangeMonitor,
+    cached_protected_paths: Option<Vec<AbsolutePathBuf>>,
+    workspace_root_lease: WorkspaceRootLease,
+}
+
+/// One atomically published observation checkpoint and its concrete protected-path fact.
+struct WorkspaceObservationCache {
+    snapshot: WorkspaceSnapshot,
+    protected_paths: Vec<CachedProtectedPath>,
+}
+
+struct WorkspaceObservationSession {
+    root: PathBuf,
+    monitor: Option<WorkspaceChangeMonitor>,
+    cache: Option<WorkspaceObservationCache>,
+}
+
+impl WorkspaceObservationSession {
+    fn start(root: PathBuf) -> Result<Self, String> {
+        let monitor = WorkspaceChangeMonitor::start(&root)
+            .map_err(|error| format!("workspace observation session failed to start: {error}"))?;
+        Ok(Self {
+            root,
+            monitor: Some(monitor),
+            cache: None,
+        })
+    }
+
+    fn prepare_for_command(&mut self) -> Result<WorkspaceObservationPreparation, String> {
+        let workspace_root_lease = WorkspaceRootLease::acquire(&self.root)
+            .map_err(|error| format!("workspace root lease acquisition failed: {error:#}"))?;
+        let Some(previous) = self.monitor.take() else {
+            return Err("workspace observation monitor is unavailable".to_string());
+        };
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(WorkspaceObservationPreparation {
+                seed: None,
+                monitor: previous,
+                cached_protected_paths: None,
+                workspace_root_lease,
+            });
+        };
+        let snapshot = cache.snapshot.clone();
+        let next = WorkspaceChangeMonitor::start(&self.root)
+            .map_err(|error| format!("workspace observation rollover failed: {error}"))?;
+        let observation = previous
+            .finish()
+            .map_err(|error| format!("workspace observation checkpoint failed: {error}"))?;
+        let can_reuse = matches!(observation, WorkspaceChangeObservation::Unchanged)
+            && validate_cached_workspace_root(&self.root, &snapshot).is_ok()
+            && validate_cached_protected_paths(&self.root, &cache.protected_paths).is_ok();
+        let cached_protected_paths = can_reuse.then(|| {
+            cache
+                .protected_paths
+                .iter()
+                .map(|cached| cached.path.clone())
+                .collect()
+        });
+        let seed = can_reuse.then_some(BeforeSnapshotSeed {
+            snapshot,
+            observation,
+        });
+        if !can_reuse {
+            self.cache = None;
+        }
+        Ok(WorkspaceObservationPreparation {
+            seed,
+            monitor: next,
+            cached_protected_paths,
+            workspace_root_lease,
+        })
+    }
+
+    #[cfg(test)]
+    fn before_seed(&mut self) -> Result<Option<BeforeSnapshotSeed>, String> {
+        let preparation = self.prepare_for_command()?;
+        self.monitor = Some(preparation.monitor);
+        Ok(preparation.seed)
+    }
+
+    #[cfg(test)]
+    fn publish(
+        &mut self,
+        snapshot: WorkspaceSnapshot,
+        continuation: Option<WorkspaceChangeMonitor>,
+    ) {
+        let _ = self.publish_with_protected_paths(snapshot, Vec::new(), continuation);
+    }
+
+    fn publish_with_protected_paths(
+        &mut self,
+        snapshot: WorkspaceSnapshot,
+        protected_paths: Vec<AbsolutePathBuf>,
+        continuation: Option<WorkspaceChangeMonitor>,
+    ) -> bool {
+        if let Some(continuation) = continuation {
+            self.monitor = Some(continuation);
+        }
+        match capture_cached_protected_paths(&self.root, &protected_paths) {
+            Ok(protected_paths) => {
+                self.cache = Some(WorkspaceObservationCache {
+                    snapshot,
+                    protected_paths,
+                });
+                true
+            }
+            Err(_) => {
+                // A capture failure is a cache miss, not a successful reuse. The caller records
+                // this bounded reason in the existing sandbox trace while the next command falls
+                // back to the full resolver.
+                self.cache = None;
+                false
+            }
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.cache = None;
+    }
+}
+
+#[derive(Default)]
+struct WorkspaceObservationSessions {
+    sessions: HashMap<WorkspaceObservationSessionKey, Arc<Mutex<WorkspaceObservationSession>>>,
+    insertion_order: VecDeque<WorkspaceObservationSessionKey>,
+}
+
+struct WorkspaceSnapshots {
+    before: WorkspaceSnapshot,
+    after: WorkspaceSnapshot,
+    observation: WorkspaceChangeObservation,
+    protected_paths: Vec<AbsolutePathBuf>,
+    metrics: WorkspaceObservationMetrics,
+}
+type ObservedWorkspaceSnapshots = Option<WorkspaceSnapshots>;
+
+#[derive(Debug)]
+struct ObservedWorkspaceSnapshot {
+    snapshot: WorkspaceSnapshot,
+    metrics: WorkspaceObservationPhaseMetrics,
+}
+
+struct WindowsPreparedWorkspaceObserver {
+    workspace: PathBuf,
+    monitor: Option<WorkspaceChangeMonitor>,
+}
+
+fn prepared_workspace_observation(
+    observation: WorkspaceChangeObservation,
+) -> PreparedWorkspaceObservation {
+    match observation {
+        WorkspaceChangeObservation::Unchanged => PreparedWorkspaceObservation::Unchanged,
+        WorkspaceChangeObservation::Unknown => PreparedWorkspaceObservation::Unknown,
+        WorkspaceChangeObservation::Changed(changes) => PreparedWorkspaceObservation::Changed(
+            changes.into_iter().map(|change| change.path).collect(),
+        ),
+    }
+}
+
+impl PreparedWorkspaceObserver for WindowsPreparedWorkspaceObserver {
+    fn checkpoint(&mut self) -> Result<PreparedWorkspaceObservation, String> {
+        let next = WorkspaceChangeMonitor::start(&self.workspace)
+            .map_err(|error| format!("prepared workspace observer rollover failed: {error}"))?;
+        let previous = self
+            .monitor
+            .replace(next)
+            .ok_or_else(|| "prepared workspace observer is unavailable".to_string())?;
+        previous
+            .finish()
+            .map_err(|error| format!("prepared workspace observation failed: {error}"))
+            .map(prepared_workspace_observation)
+    }
+}
 const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
     "capability_not_supported:workspace_change_summary";
 const TRUSTED_WORKSPACE_ROLLBACK_FAILED: &str = "trusted_workspace_rollback_failed";
@@ -77,14 +286,88 @@ impl ExecutableResolutionError {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 /// Windows 严格 sandbox backend。
-pub struct WindowsSandboxBackend;
+pub struct WindowsSandboxBackend {
+    observation_sessions: Arc<Mutex<WorkspaceObservationSessions>>,
+}
+
+impl std::fmt::Debug for WindowsSandboxBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WindowsSandboxBackend")
+            .finish_non_exhaustive()
+    }
+}
 
 impl WindowsSandboxBackend {
     /// 创建 Windows sandbox backend。
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    fn observation_session(
+        &self,
+        key: Option<WorkspaceObservationSessionKey>,
+    ) -> Option<Arc<Mutex<WorkspaceObservationSession>>> {
+        let key = key?;
+        let mut sessions = self.observation_sessions.lock().ok()?;
+        if let Some(session) = sessions.sessions.get(&key) {
+            return Some(Arc::clone(session));
+        }
+        let session = Arc::new(Mutex::new(
+            WorkspaceObservationSession::start(key.root.clone()).ok()?,
+        ));
+        if sessions.sessions.len() >= MAX_WORKSPACE_OBSERVATION_SESSIONS {
+            let removable = sessions.insertion_order.iter().position(|oldest| {
+                sessions
+                    .sessions
+                    .get(oldest)
+                    .is_some_and(|session| Arc::strong_count(session) == 1)
+            })?;
+            let oldest = sessions.insertion_order.remove(removable)?;
+            sessions.sessions.remove(&oldest);
+        }
+        sessions.insertion_order.push_back(key.clone());
+        sessions.sessions.insert(key, Arc::clone(&session));
+        Some(session)
+    }
+
+    /// Release every cached observation contract rooted at one canonical workspace.
+    fn release_workspace_observation_for_root(&self, workspace: &Path) -> Result<(), String> {
+        let root = release_observation_root(workspace)?;
+        let mut sessions = self
+            .observation_sessions
+            .lock()
+            .map_err(|_| "workspace observation session cache lock poisoned".to_string())?;
+        let keys = sessions
+            .sessions
+            .keys()
+            .filter(|key| key.root == root)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for key in &keys {
+            let session = sessions.sessions.get(key).ok_or_else(|| {
+                "workspace observation session cache changed during release".to_string()
+            })?;
+            if Arc::strong_count(session) != 1 {
+                return Err(format!(
+                    "workspace observation session for {} still has active owners",
+                    root.display()
+                ));
+            }
+            let session_guard = session
+                .lock()
+                .map_err(|_| "workspace observation session lock poisoned".to_string())?;
+            drop(session_guard);
+        }
+
+        for key in keys {
+            sessions.sessions.remove(&key);
+            sessions.insertion_order.retain(|entry| entry != &key);
+        }
+        Ok(())
     }
 
     fn probe_network_denied(
@@ -270,6 +553,10 @@ impl SandboxBackend for WindowsSandboxBackend {
         if report.outcome == super::SandboxPreflightOutcome::Unsupported {
             return report;
         }
+        if let Some(code) = windows_filesystem_gate_error(report.filesystem.as_deref()) {
+            report.unsupported(code, &["ntfs_workspace"]);
+            return report;
+        }
         if cancellation.is_cancelled() {
             report.unsupported("sandbox_preflight_cancelled", &["cancellation"]);
             return report;
@@ -314,8 +601,26 @@ impl SandboxBackend for WindowsSandboxBackend {
         }
     }
 
+    fn observe_prepared_workspace(
+        &self,
+        workspace: &Path,
+    ) -> Result<Option<Box<dyn PreparedWorkspaceObserver>>, String> {
+        let workspace = canonical_directory(workspace)
+            .map_err(|error| format!("prepared workspace root is unavailable: {error}"))?;
+        let monitor = WorkspaceChangeMonitor::start(&workspace)
+            .map_err(|error| format!("prepared workspace observer failed to start: {error}"))?;
+        Ok(Some(Box::new(WindowsPreparedWorkspaceObserver {
+            workspace,
+            monitor: Some(monitor),
+        })))
+    }
+
     fn execute(&self, request: &CommandRequest) -> CommandResult {
         self.execute_cancellable(request, &CancellationToken::new())
+    }
+
+    fn release_workspace_observation(&self, workspace: &Path) -> Result<(), String> {
+        self.release_workspace_observation_for_root(workspace)
     }
 
     fn execute_cancellable(
@@ -333,24 +638,74 @@ impl SandboxBackend for WindowsSandboxBackend {
                 .with_workspace_mutation(WorkspaceMutation::Unknown)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
         }
-        let prepared = match PreparedCommand::from_request(request) {
+        if let Some(code) =
+            windows_workspace_filesystem_gate_error(Path::new(&request.filesystem.workspace_root))
+        {
+            return CommandResult::unsupported(&request.command_id, code)
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
+        }
+        let observation_session_key = request_observation_session_key(request);
+        let observation_session = self.observation_session(observation_session_key);
+        let mut observation_session = observation_session
+            .as_ref()
+            .and_then(|session| session.lock().ok());
+        let (before_seed, monitor, cached_protected_paths, workspace_root_lease) =
+            match observation_session
+                .as_deref_mut()
+                .map(WorkspaceObservationSession::prepare_for_command)
+            {
+                Some(Ok(preparation)) => {
+                    let keep_monitor = preparation.cached_protected_paths.is_some();
+                    (
+                        preparation.seed,
+                        keep_monitor.then_some(preparation.monitor),
+                        preparation.cached_protected_paths,
+                        Some(preparation.workspace_root_lease),
+                    )
+                }
+                Some(Err(_)) => {
+                    if let Some(session) = observation_session.as_deref_mut() {
+                        session.invalidate();
+                    }
+                    (None, None, None, None)
+                }
+                None => (None, None, None, None),
+            };
+        let prepared = match PreparedCommand::from_request(
+            request,
+            cached_protected_paths.as_deref(),
+            workspace_root_lease,
+        ) {
             Ok(prepared) => prepared,
             Err(PrepareCommandError::Executable(error)) => {
+                if let Some(session) = observation_session.as_deref_mut() {
+                    session.invalidate();
+                }
                 return error
                     .into_command_result(&request.command_id)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
             Err(PrepareCommandError::Backend(error)) => {
+                if let Some(session) = observation_session.as_deref_mut() {
+                    session.invalidate();
+                }
                 return CommandResult::backend_error(&request.command_id, error)
                     .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
             Err(PrepareCommandError::ProtectedPaths(error)) => {
+                if let Some(session) = observation_session.as_deref_mut() {
+                    session.invalidate();
+                }
                 return CommandResult::backend_error(&request.command_id, error)
                     .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
             Err(PrepareCommandError::WorkspaceObservation) => {
+                if let Some(session) = observation_session.as_deref_mut() {
+                    session.invalidate();
+                }
                 return CommandResult::unsupported(
                     &request.command_id,
                     WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE,
@@ -364,6 +719,10 @@ impl SandboxBackend for WindowsSandboxBackend {
             cancellation,
             prepared,
             should_monitor_workspace_change(request),
+            monitor,
+            before_seed,
+            cached_protected_paths,
+            observation_session.as_deref_mut(),
         )
     }
 
@@ -386,24 +745,74 @@ impl SandboxBackend for WindowsSandboxBackend {
                 .with_workspace_mutation(WorkspaceMutation::Unknown)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
         }
-        let prepared = match PreparedCommand::from_script_request(request) {
+        if let Some(code) =
+            windows_workspace_filesystem_gate_error(Path::new(&request.filesystem.workspace_root))
+        {
+            return CommandResult::unsupported(&request.command_id, code)
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
+        }
+        let observation_session_key = script_observation_session_key(request);
+        let observation_session = self.observation_session(observation_session_key);
+        let mut observation_session = observation_session
+            .as_ref()
+            .and_then(|session| session.lock().ok());
+        let (before_seed, monitor, cached_protected_paths, workspace_root_lease) =
+            match observation_session
+                .as_deref_mut()
+                .map(WorkspaceObservationSession::prepare_for_command)
+            {
+                Some(Ok(preparation)) => {
+                    let keep_monitor = preparation.cached_protected_paths.is_some();
+                    (
+                        preparation.seed,
+                        keep_monitor.then_some(preparation.monitor),
+                        preparation.cached_protected_paths,
+                        Some(preparation.workspace_root_lease),
+                    )
+                }
+                Some(Err(_)) => {
+                    if let Some(session) = observation_session.as_deref_mut() {
+                        session.invalidate();
+                    }
+                    (None, None, None, None)
+                }
+                None => (None, None, None, None),
+            };
+        let prepared = match PreparedCommand::from_script_request(
+            request,
+            cached_protected_paths.as_deref(),
+            workspace_root_lease,
+        ) {
             Ok(prepared) => prepared,
             Err(PrepareCommandError::Executable(error)) => {
+                if let Some(session) = observation_session.as_deref_mut() {
+                    session.invalidate();
+                }
                 return error
                     .into_command_result(&request.command_id)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
             Err(PrepareCommandError::Backend(error)) => {
+                if let Some(session) = observation_session.as_deref_mut() {
+                    session.invalidate();
+                }
                 return CommandResult::backend_error(&request.command_id, error)
                     .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
             Err(PrepareCommandError::ProtectedPaths(error)) => {
+                if let Some(session) = observation_session.as_deref_mut() {
+                    session.invalidate();
+                }
                 return CommandResult::backend_error(&request.command_id, error)
                     .with_workspace_mutation(WorkspaceMutation::Unknown)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
             Err(PrepareCommandError::WorkspaceObservation) => {
+                if let Some(session) = observation_session.as_deref_mut() {
+                    session.invalidate();
+                }
                 return CommandResult::unsupported(
                     &request.command_id,
                     WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE,
@@ -420,6 +829,10 @@ impl SandboxBackend for WindowsSandboxBackend {
                 request.filesystem.mode,
                 SandboxFilesystemMode::WorkspaceWrite
             ),
+            monitor,
+            before_seed,
+            cached_protected_paths,
+            observation_session.as_deref_mut(),
         )
     }
 }
@@ -472,6 +885,18 @@ fn windows_filesystem_fact(workspace: &Path) -> Option<String> {
     )
 }
 
+fn windows_filesystem_gate_error(filesystem: Option<&str>) -> Option<&'static str> {
+    match filesystem {
+        Some(filesystem) if filesystem.eq_ignore_ascii_case("NTFS") => None,
+        Some(_) => Some("sandbox_unsupported_filesystem"),
+        None => Some("sandbox_filesystem_unknown"),
+    }
+}
+
+fn windows_workspace_filesystem_gate_error(workspace: &Path) -> Option<&'static str> {
+    windows_filesystem_gate_error(windows_filesystem_fact(workspace).as_deref())
+}
+
 #[cfg(windows)]
 fn windows_kernel_fact() -> Option<String> {
     #[repr(C)]
@@ -509,28 +934,87 @@ fn should_monitor_workspace_change(request: &CommandRequest) -> bool {
     ) && !request.is_trusted_workspace_preparation()
 }
 
+fn request_observation_session_key(
+    request: &CommandRequest,
+) -> Option<WorkspaceObservationSessionKey> {
+    if !should_monitor_workspace_change(request) {
+        return None;
+    }
+    observation_session_key(
+        &request.filesystem.workspace_root,
+        &request.filesystem.mode,
+        &request.network.mode,
+        &request.environment,
+    )
+}
+
+fn script_observation_session_key(
+    request: &CommandScriptRequest,
+) -> Option<WorkspaceObservationSessionKey> {
+    if !matches!(
+        request.filesystem.mode,
+        SandboxFilesystemMode::WorkspaceWrite
+    ) {
+        return None;
+    }
+    observation_session_key(
+        &request.filesystem.workspace_root,
+        &request.filesystem.mode,
+        &request.network.mode,
+        &request.environment,
+    )
+}
+
+fn observation_session_key(
+    workspace_root: &str,
+    filesystem: &SandboxFilesystemMode,
+    network: &SandboxNetworkMode,
+    environment: &CommandEnvironmentPolicy,
+) -> Option<WorkspaceObservationSessionKey> {
+    let root = canonical_directory(Path::new(workspace_root)).ok()?;
+    let contract = serde_json::to_string(&(
+        filesystem,
+        network,
+        environment,
+        WORKSPACE_OBSERVATION_CONTRACT,
+    ))
+    .ok()?;
+    Some(WorkspaceObservationSessionKey { root, contract })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_prepared_command(
     command_id: &str,
     cancellation: &CancellationToken,
     prepared: PreparedCommand,
     observe_workspace_change: bool,
+    monitor: Option<WorkspaceChangeMonitor>,
+    before_seed: Option<BeforeSnapshotSeed>,
+    cached_protected_paths: Option<Vec<AbsolutePathBuf>>,
+    mut observation_session: Option<&mut WorkspaceObservationSession>,
 ) -> CommandResult {
     let mut prepared = prepared;
     let workspace = prepared.workspace_roots[0].as_path().to_path_buf();
+    let sandbox_home_for_observation_log = prepared.sandbox_home.clone();
     let before = prepared.before.clone();
     let protect_workspace_metadata = prepared.protect_workspace_metadata;
     let mut trusted_lease = prepared.trusted_workspace.take();
     let trusted_workspace = trusted_lease.is_some();
-    let mut monitor = None;
-    let result = match execute_windows_sandbox(
+    let mut monitor = monitor;
+    let (result, observed_snapshots) = match execute_windows_sandbox(
         command_id,
         cancellation,
         prepared,
         trusted_lease.as_ref(),
         observe_workspace_change.then_some(&mut monitor),
+        before_seed,
+        cached_protected_paths,
     ) {
         Ok(result) => result,
         Err(error) => {
+            if let Some(session) = observation_session.as_deref_mut() {
+                session.invalidate();
+            }
             if let Some(mut lease) = trusted_lease.take()
                 && let Err(rollback) = lease.rollback()
             {
@@ -546,6 +1030,36 @@ fn execute_prepared_command(
                 .with_sandbox_execution(BACKEND_NAME, SandboxBackendEnforcement::Unavailable);
         }
     };
+    let result = match observed_snapshots.as_ref() {
+        Some(snapshots) => result.with_workspace_observation_metrics(snapshots.metrics.clone()),
+        None => result,
+    };
+    if matches!(
+        result.execution_status,
+        CommandExecutionStatus::Cancelled | CommandExecutionStatus::TimedOut
+    ) {
+        if let Some(session) = observation_session.as_deref_mut() {
+            session.invalidate();
+        }
+    } else if let (Some(session), Some(snapshots)) =
+        (observation_session, observed_snapshots.as_ref())
+    {
+        if monitor.is_some() {
+            let cached = session.publish_with_protected_paths(
+                snapshots.after.clone(),
+                snapshots.protected_paths.clone(),
+                monitor.take(),
+            );
+            if !cached {
+                singularity_windows_sandbox::log_note(
+                    "OBSERVATION_CACHE protected_path_capture_failed; next command uses full resolver",
+                    Some(&sandbox_home_for_observation_log),
+                );
+            }
+        } else {
+            session.invalidate();
+        }
+    }
     if trusted_workspace {
         let Some(mut lease) = trusted_lease.take() else {
             return CommandResult::backend_error(
@@ -615,11 +1129,13 @@ fn execute_prepared_command(
             None => result.with_workspace_mutation(WorkspaceMutation::Unchanged),
         };
     }
-    let observation = monitor.map(|monitor| monitor.finish().map_err(|_| ()));
+    let observation = observed_snapshots
+        .as_ref()
+        .map(|snapshots| Ok(snapshots.observation.clone()))
+        .or_else(|| monitor.map(|monitor| monitor.finish().map_err(|_| ())));
     let (mutation, summary) = if protect_workspace_metadata {
-        let snapshot_change = before.map(|before| {
-            snapshot_workspace(&workspace).and_then(|after| before.change_summary(&after))
-        });
+        let snapshot_change =
+            observed_snapshots.map(|snapshots| snapshots.before.observed_change(&snapshots.after));
         reconcile_workspace_change(observation, snapshot_change)
     } else {
         let mutation = match (before, snapshot_trusted_workspace(&workspace)) {
@@ -646,17 +1162,19 @@ fn trusted_command_succeeded(result: &CommandResult) -> bool {
 
 fn reconcile_workspace_change(
     observation: Option<Result<WorkspaceChangeObservation, ()>>,
-    snapshot_change: Option<Result<Option<WorkspaceChangeSummary>, String>>,
+    snapshot_change: Option<Result<(bool, Option<WorkspaceChangeSummary>), String>>,
 ) -> (WorkspaceMutation, Option<WorkspaceChangeSummary>) {
     match (observation, snapshot_change) {
-        (None, Some(Ok(None))) => (WorkspaceMutation::Unchanged, None),
-        (None, Some(Ok(Some(summary)))) => (WorkspaceMutation::Changed, Some(summary)),
-        (Some(Ok(WorkspaceChangeObservation::Unchanged)), Some(Ok(None))) => {
+        (None, Some(Ok((false, None)))) => (WorkspaceMutation::Unchanged, None),
+        (None, Some(Ok((true, summary)))) => (WorkspaceMutation::Changed, summary),
+        (Some(Ok(WorkspaceChangeObservation::Unchanged)), Some(Ok((false, None)))) => {
             (WorkspaceMutation::Unchanged, None)
         }
-        (Some(Ok(WorkspaceChangeObservation::Changed)), Some(Ok(Some(summary)))) => {
-            (WorkspaceMutation::Changed, Some(summary))
-        }
+        (
+            Some(Ok(WorkspaceChangeObservation::Changed(_) | WorkspaceChangeObservation::Unknown))
+            | Some(Err(())),
+            Some(Ok((true, summary))),
+        ) => (WorkspaceMutation::Changed, summary),
         _ => (WorkspaceMutation::Unknown, None),
     }
 }
@@ -664,10 +1182,21 @@ fn reconcile_workspace_change(
 /// 将 core 的 protected path 规则投影为 resolver 可展开的 workspace glob。
 fn resolve_existing_protected_paths(
     workspace_root: &AbsolutePathBuf,
-) -> Result<Vec<AbsolutePathBuf>, String> {
+    trusted_workspace: Option<&TrustedWorkspaceLease>,
+) -> Result<(Vec<AbsolutePathBuf>, bool), String> {
+    #[cfg(test)]
+    FULL_PROTECTED_RESOLVER_SCANS.with(|count| count.set(count.get().saturating_add(1)));
     let entries = protected_path_glob_entries(workspace_root);
     let policy = FileSystemSandboxPolicy::restricted(entries);
-    resolve_windows_deny_read_paths(&policy, workspace_root)
+    if let Some(trusted_workspace) = trusted_workspace {
+        resolve_windows_deny_read_paths_for_controller_with_pinned_workspace_root(
+            &policy,
+            workspace_root,
+            trusted_workspace,
+        )
+    } else {
+        resolve_windows_deny_read_paths_for_controller(&policy, workspace_root)
+    }
 }
 
 fn protected_path_glob_entries(workspace_root: &AbsolutePathBuf) -> Vec<FileSystemSandboxEntry> {
@@ -743,18 +1272,53 @@ struct PreparedCommand {
     protected_deny_read_paths: Vec<AbsolutePathBuf>,
     protected_deny_write_paths: Vec<AbsolutePathBuf>,
     trusted_deny_write_paths: Vec<AbsolutePathBuf>,
+    protected_path_scan_incomplete: bool,
     protect_workspace_metadata: bool,
     before: Option<WorkspaceSnapshot>,
     trusted_workspace: Option<TrustedWorkspaceLease>,
+    workspace_root_lease: Option<WorkspaceRootLease>,
 }
 
 impl PreparedCommand {
-    fn from_request(request: &CommandRequest) -> Result<Self, PrepareCommandError> {
+    fn from_request(
+        request: &CommandRequest,
+        cached_protected_paths: Option<&[AbsolutePathBuf]>,
+        workspace_root_lease: Option<WorkspaceRootLease>,
+    ) -> Result<Self, PrepareCommandError> {
         let workspace_root = canonical_directory(Path::new(&request.filesystem.workspace_root))
             .map_err(PrepareCommandError::Backend)?;
         let protect_workspace_metadata = !request.is_trusted_workspace_preparation();
         let cwd =
             canonical_directory(Path::new(&request.cwd)).map_err(PrepareCommandError::Backend)?;
+        let workspace_write = matches!(
+            request.filesystem.mode,
+            SandboxFilesystemMode::WorkspaceWrite
+        );
+        let workspace_root_lease = if request.is_trusted_workspace_preparation() && workspace_write
+        {
+            // Trusted workspace-write preparation has its own DELETE-capable lease; never overlap
+            // it with the controller observation lease, whose no-delete handle would reject
+            // acquisition. Trusted read-only requests still need the ordinary ancestor lease.
+            drop(workspace_root_lease);
+            None
+        } else {
+            match workspace_root_lease {
+                Some(lease) => Some(lease),
+                None => Some(
+                    WorkspaceRootLease::acquire(&workspace_root)
+                        .map_err(|error| PrepareCommandError::Backend(error.to_string()))?,
+                ),
+            }
+        };
+        let mut trusted_workspace = if request.is_trusted_workspace_preparation() && workspace_write
+        {
+            Some(
+                TrustedWorkspaceLease::acquire(&workspace_root)
+                    .map_err(|error| PrepareCommandError::Backend(error.code().to_string()))?,
+            )
+        } else {
+            None
+        };
         let env_map = child_environment(&request.environment);
         let resolved = resolve_executable(&request.argv, &cwd, &env_map)
             .map_err(PrepareCommandError::Executable)?;
@@ -762,16 +1326,25 @@ impl PreparedCommand {
             AbsolutePathBuf::from_absolute_path_checked(&workspace_root).map_err(|error| {
                 PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
             })?;
-        let resolved_protected_paths = if protect_workspace_metadata
-            || matches!(
-                request.filesystem.mode,
-                SandboxFilesystemMode::WorkspaceWrite
-            ) {
-            resolve_existing_protected_paths(&workspace_root)
-                .map_err(PrepareCommandError::ProtectedPaths)?
-        } else {
-            Vec::new()
-        };
+        let (resolved_protected_paths, protected_path_scan_incomplete) =
+            if let Some(cached) = cached_protected_paths {
+                (cached.to_vec(), false)
+            } else if protect_workspace_metadata
+                || matches!(
+                    request.filesystem.mode,
+                    SandboxFilesystemMode::WorkspaceWrite
+                )
+            {
+                resolve_existing_protected_paths(&workspace_root, trusted_workspace.as_ref())
+                    .map_err(PrepareCommandError::ProtectedPaths)?
+            } else {
+                (Vec::new(), false)
+            };
+        if protected_path_scan_incomplete && !protect_workspace_metadata {
+            return Err(PrepareCommandError::ProtectedPaths(
+                "protected path scan requires the sandbox identity".to_string(),
+            ));
+        }
         let protected_deny_read_paths = if protect_workspace_metadata {
             resolved_protected_paths.clone()
         } else {
@@ -825,28 +1398,14 @@ impl PreparedCommand {
             && protected_deny_read_paths.is_empty()
             && protect_workspace_metadata;
         let sandbox_home = sandbox_home().map_err(PrepareCommandError::Backend)?;
-        // Acquire the lease only after all fallible admission work above. Once held, the
-        // remaining snapshot is the only fallible step and explicitly rolls back on failure.
-        let mut trusted_workspace = if request.is_trusted_workspace_preparation()
-            && matches!(
-                request.filesystem.mode,
-                SandboxFilesystemMode::WorkspaceWrite
-            ) {
-            Some(
-                TrustedWorkspaceLease::acquire(&workspace_root)
-                    .map_err(|error| PrepareCommandError::Backend(error.code().to_string()))?,
-            )
-        } else {
-            None
-        };
         let before = if matches!(
             request.filesystem.mode,
             SandboxFilesystemMode::WorkspaceWrite
         ) {
-            let snapshot = if protect_workspace_metadata {
-                snapshot_workspace(&workspace_root)
+            if protect_workspace_metadata {
+                None
             } else {
-                trusted_workspace
+                match trusted_workspace
                     .as_ref()
                     .ok_or_else(|| "trusted workspace lease unavailable".to_string())
                     .and_then(|lease| {
@@ -855,19 +1414,19 @@ impl PreparedCommand {
                             .map_err(|error| error.code().to_string())
                     })
                     .and_then(|handle| snapshot_trusted_workspace_from_handle(&handle))
-            };
-            match snapshot {
-                Ok(snapshot) => Some(snapshot),
-                Err(_) => {
-                    if let Some(lease) = trusted_workspace.as_mut()
-                        && let Err(error) = lease.rollback()
-                    {
-                        return Err(PrepareCommandError::Backend(format!(
-                            "{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}",
-                            error.code()
-                        )));
+                {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(_) => {
+                        if let Some(lease) = trusted_workspace.as_mut()
+                            && let Err(error) = lease.rollback()
+                        {
+                            return Err(PrepareCommandError::Backend(format!(
+                                "{TRUSTED_WORKSPACE_ROLLBACK_FAILED}: {}",
+                                error.code()
+                            )));
+                        }
+                        return Err(PrepareCommandError::WorkspaceObservation);
                     }
-                    return Err(PrepareCommandError::WorkspaceObservation);
                 }
             }
         } else {
@@ -886,22 +1445,22 @@ impl PreparedCommand {
             protected_deny_read_paths,
             protected_deny_write_paths,
             trusted_deny_write_paths,
+            protected_path_scan_incomplete,
             protect_workspace_metadata,
             before,
             trusted_workspace,
+            workspace_root_lease,
         })
     }
 
-    fn from_script_request(request: &CommandScriptRequest) -> Result<Self, PrepareCommandError> {
+    fn from_script_request(
+        request: &CommandScriptRequest,
+        cached_protected_paths: Option<&[AbsolutePathBuf]>,
+        workspace_root_lease: Option<WorkspaceRootLease>,
+    ) -> Result<Self, PrepareCommandError> {
         let workspace_root = canonical_directory(Path::new(&request.filesystem.workspace_root))
             .map_err(PrepareCommandError::Backend)?;
-        let before = matches!(
-            request.filesystem.mode,
-            SandboxFilesystemMode::WorkspaceWrite
-        )
-        .then(|| snapshot_workspace(&workspace_root))
-        .transpose()
-        .map_err(|_| PrepareCommandError::WorkspaceObservation)?;
+        let before = None;
         let cwd =
             canonical_directory(Path::new(&request.cwd)).map_err(PrepareCommandError::Backend)?;
         let env_map = child_environment(&request.environment);
@@ -921,8 +1480,20 @@ impl PreparedCommand {
             AbsolutePathBuf::from_absolute_path_checked(&workspace_root).map_err(|error| {
                 PrepareCommandError::Backend(format!("invalid workspace root: {error}"))
             })?;
-        let protected_deny_read_paths = resolve_existing_protected_paths(&workspace_root)
-            .map_err(PrepareCommandError::ProtectedPaths)?;
+        let workspace_root_lease = match workspace_root_lease {
+            Some(lease) => Some(lease),
+            None => Some(
+                WorkspaceRootLease::acquire(workspace_root.as_path())
+                    .map_err(|error| PrepareCommandError::Backend(error.to_string()))?,
+            ),
+        };
+        let (protected_deny_read_paths, protected_path_scan_incomplete) =
+            if let Some(cached) = cached_protected_paths {
+                (cached.to_vec(), false)
+            } else {
+                resolve_existing_protected_paths(&workspace_root, None)
+                    .map_err(PrepareCommandError::ProtectedPaths)?
+            };
         let protected_deny_write_paths = if matches!(
             request.filesystem.mode,
             SandboxFilesystemMode::WorkspaceWrite
@@ -972,9 +1543,11 @@ impl PreparedCommand {
             protected_deny_read_paths,
             protected_deny_write_paths,
             trusted_deny_write_paths: Vec::new(),
+            protected_path_scan_incomplete,
             protect_workspace_metadata: true,
             before,
             trusted_workspace: None,
+            workspace_root_lease,
         })
     }
 }
@@ -999,9 +1572,11 @@ fn elevated_capture_request<'a>(
     elevated.additional_read_roots = &prepared.read_roots;
     elevated.deny_read_paths_override = &prepared.protected_deny_read_paths;
     elevated.deny_write_paths_override = &prepared.protected_deny_write_paths;
+    elevated.protected_path_scan_incomplete = prepared.protected_path_scan_incomplete;
     elevated.trusted_deny_write_paths_override = &prepared.trusted_deny_write_paths;
     elevated.protect_workspace_metadata = prepared.protect_workspace_metadata;
     elevated.trusted_workspace = trusted_workspace;
+    elevated.workspace_root_lease = prepared.workspace_root_lease.as_ref();
     elevated.workspace_change_monitor = workspace_change_monitor;
     elevated
 }
@@ -1012,24 +1587,175 @@ fn execute_windows_sandbox(
     prepared: PreparedCommand,
     trusted_workspace: Option<&TrustedWorkspaceLease>,
     workspace_change_monitor: Option<&mut Option<WorkspaceChangeMonitor>>,
-) -> Result<CommandResult, String> {
+    before_seed: Option<BeforeSnapshotSeed>,
+    cached_protected_paths: Option<Vec<AbsolutePathBuf>>,
+) -> Result<(CommandResult, ObservedWorkspaceSnapshots), String> {
     let started = Instant::now();
+    let observe_final_snapshot =
+        prepared.protect_workspace_metadata && workspace_change_monitor.is_some();
+    let workspace = prepared.workspace_roots[0].as_path().to_path_buf();
     let windows_cancellation = WindowsSandboxCancellationToken::new({
         let cancellation = cancellation.clone();
         move || cancellation.is_cancelled()
     });
-    let elevated =
+    let elevated = if observe_final_snapshot {
+        let workspace_for_observer = workspace.clone();
+        let before_snapshot = Arc::new(Mutex::new(None::<WorkspaceSnapshot>));
+        let before_snapshot_for_observer = Arc::clone(&before_snapshot);
+        let before_snapshot_for_after = Arc::clone(&before_snapshot);
+        let observation_protected_paths = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let protected_paths_for_resolver = Arc::clone(&observation_protected_paths);
+        let protected_paths_for_before = Arc::clone(&observation_protected_paths);
+        let protected_paths_for_after = Arc::clone(&observation_protected_paths);
+        let mut accumulated_after_metrics = None;
+        run_windows_sandbox_capture_for_permission_profile_with_observations_elevated(
+            elevated_capture_request(
+                &prepared,
+                windows_cancellation.clone(),
+                trusted_workspace,
+                workspace_change_monitor,
+            ),
+            {
+                let workspace = prepared.workspace_roots[0].clone();
+                // The controller resolved these objects before sandbox setup. Seed the
+                // sandbox-side bounded scans with that same protected set so a later command
+                // does not try to enumerate a directory that an earlier command already made
+                // unreadable to the sandbox principal. The setup transaction still pins and
+                // revalidates every returned object before the child can start.
+                let mut previously_protected = prepared.protected_deny_read_paths.clone();
+                let cached_protected_paths = cached_protected_paths.clone();
+                move || {
+                    let protected = if let Some(cached) = cached_protected_paths.as_ref() {
+                        cached.clone()
+                    } else {
+                        let entries = protected_path_glob_entries(&workspace);
+                        let policy = FileSystemSandboxPolicy::restricted(entries);
+                        resolve_windows_deny_read_paths_from_validated_workspace(
+                            &policy,
+                            &workspace,
+                            &previously_protected,
+                        )?
+                    }
+                    .into_iter()
+                    .filter_map(|path| match std::fs::symlink_metadata(path.as_path()) {
+                        Ok(_) => Some(Ok(path)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            Some(Ok(path))
+                        }
+                        Err(error) => Some(Err(format!(
+                            "protected workspace path revalidation failed: {error}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                    previously_protected = protected.clone();
+                    *protected_paths_for_resolver.lock().map_err(|_| {
+                        "protected workspace observation path lock poisoned".to_string()
+                    })? = protected
+                        .iter()
+                        .map(|path| path.as_path().to_path_buf())
+                        .collect();
+                    Ok((protected.clone(), protected))
+                }
+            },
+            {
+                let workspace = workspace_for_observer.clone();
+                move || {
+                    let protected_paths = protected_paths_for_before
+                        .lock()
+                        .map_err(|_| {
+                            "protected workspace observation path lock poisoned".to_string()
+                        })?
+                        .clone();
+                    let observed = resolve_before_workspace_snapshot(
+                        &workspace,
+                        before_seed,
+                        &protected_paths,
+                    )?;
+                    *before_snapshot_for_observer
+                        .lock()
+                        .map_err(|_| "workspace snapshot handoff lock poisoned".to_string())? =
+                        Some(observed.snapshot.clone());
+                    Ok(observed)
+                }
+            },
+            move |observation| {
+                let before = before_snapshot_for_after
+                    .lock()
+                    .map_err(|_| "workspace snapshot handoff lock poisoned".to_string())?
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "workspace before snapshot unavailable".to_string())?;
+                let protected_paths = protected_paths_for_after
+                    .lock()
+                    .map_err(|_| "protected workspace observation path lock poisoned".to_string())?
+                    .clone();
+                let mut observed = resolve_after_workspace_snapshot(
+                    &workspace_for_observer,
+                    &before,
+                    &observation,
+                    &protected_paths,
+                )?;
+                *before_snapshot_for_after
+                    .lock()
+                    .map_err(|_| "workspace snapshot handoff lock poisoned".to_string())? =
+                    Some(observed.snapshot.clone());
+                observed.metrics = match accumulated_after_metrics {
+                    Some(previous) => merge_observation_phase_metrics(previous, observed.metrics),
+                    None => observed.metrics,
+                };
+                accumulated_after_metrics = Some(observed.metrics);
+                Ok(observed)
+            },
+        )
+        .and_then(|(capture, before, after, observation)| {
+            let protected_paths = observation_protected_paths
+                .lock()
+                .map_err(|_| {
+                    std::io::Error::other("protected workspace observation path lock poisoned")
+                })?
+                .iter()
+                .map(|path| {
+                    AbsolutePathBuf::from_absolute_path_checked(path).map_err(|error| {
+                        std::io::Error::other(format!(
+                            "protected workspace path is invalid: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, std::io::Error>>()?;
+            Ok((
+                capture,
+                Some(WorkspaceSnapshots {
+                    before: before.snapshot,
+                    after: after.snapshot,
+                    observation,
+                    protected_paths,
+                    metrics: WorkspaceObservationMetrics {
+                        contract: WORKSPACE_OBSERVATION_CONTRACT.to_string(),
+                        before: before.metrics,
+                        after: after.metrics,
+                    },
+                }),
+            ))
+        })
+    } else {
         run_windows_sandbox_capture_for_permission_profile_elevated(elevated_capture_request(
             &prepared,
             windows_cancellation.clone(),
             trusted_workspace,
             workspace_change_monitor,
-        ));
+        ))
+        .map(|capture| (capture, None))
+    };
     match elevated {
-        Ok(capture) => Ok(command_result_from_capture(command_id, capture, started)
-            .with_sandbox_execution(ELEVATED_BACKEND_NAME, SandboxBackendEnforcement::Strict)),
+        Ok((capture, after)) => Ok((
+            command_result_from_capture(command_id, capture, started)
+                .with_sandbox_execution(ELEVATED_BACKEND_NAME, SandboxBackendEnforcement::Strict),
+            after,
+        )),
         Err(elevated_error)
-            if prepared.restricted_token_fallback
+            if !observe_final_snapshot
+                && prepared.restricted_token_fallback
                 && prepared.protected_deny_read_paths.is_empty() =>
         {
             let elevated_error = windows_error_summary(&elevated_error);
@@ -1052,12 +1778,13 @@ fn execute_windows_sandbox(
                     "{ELEVATED_FAILURE_PREFIX}: {elevated_error}; {RESTRICTED_FAILURE_PREFIX}: {restricted_error}"
                 )
             })?;
-            Ok(
+            Ok((
                 command_result_from_capture(command_id, capture, started).with_sandbox_execution(
                     RESTRICTED_TOKEN_BACKEND_NAME,
                     SandboxBackendEnforcement::RestrictedToken,
                 ),
-            )
+                None,
+            ))
         }
         Err(error) => {
             if !prepared.protected_deny_read_paths.is_empty()
@@ -1073,6 +1800,144 @@ fn execute_windows_sandbox(
                     windows_error_summary(&error)
                 ))
             }
+        }
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn merge_observation_phase_metrics(
+    first: WorkspaceObservationPhaseMetrics,
+    second: WorkspaceObservationPhaseMetrics,
+) -> WorkspaceObservationPhaseMetrics {
+    let mode = match (first.mode, second.mode) {
+        (WorkspaceObservationMode::Full, _) | (_, WorkspaceObservationMode::Full) => {
+            WorkspaceObservationMode::Full
+        }
+        (WorkspaceObservationMode::Incremental, _) | (_, WorkspaceObservationMode::Incremental) => {
+            WorkspaceObservationMode::Incremental
+        }
+        (WorkspaceObservationMode::Reused, WorkspaceObservationMode::Reused) => {
+            WorkspaceObservationMode::Reused
+        }
+    };
+    WorkspaceObservationPhaseMetrics {
+        mode,
+        duration_ms: first.duration_ms.saturating_add(second.duration_ms),
+        entries_read: first.entries_read.saturating_add(second.entries_read),
+        content_bytes_read: first
+            .content_bytes_read
+            .saturating_add(second.content_bytes_read),
+    }
+}
+
+fn resolve_before_workspace_snapshot(
+    workspace: &Path,
+    seed: Option<BeforeSnapshotSeed>,
+    protected_paths: &[PathBuf],
+) -> Result<ObservedWorkspaceSnapshot, String> {
+    let started = Instant::now();
+    if let Some(seed) = seed {
+        match update_workspace_snapshot_as_sandbox_user(
+            workspace,
+            &seed.snapshot,
+            &seed.observation,
+            protected_paths,
+        )? {
+            IncrementalSnapshot::Updated(snapshot, work) => {
+                let mode = if matches!(seed.observation, WorkspaceChangeObservation::Unchanged) {
+                    WorkspaceObservationMode::Reused
+                } else {
+                    WorkspaceObservationMode::Incremental
+                };
+                return Ok(ObservedWorkspaceSnapshot {
+                    snapshot,
+                    metrics: WorkspaceObservationPhaseMetrics {
+                        mode,
+                        duration_ms: elapsed_ms(started),
+                        entries_read: work.entries_read,
+                        content_bytes_read: work.content_bytes_read,
+                    },
+                });
+            }
+            IncrementalSnapshot::FullRequired => {}
+        }
+        let snapshot = snapshot_workspace_as_sandbox_user_for_cached_root(
+            workspace,
+            &seed.snapshot,
+            protected_paths,
+        )?;
+        let work = snapshot.full_scan_work();
+        return Ok(ObservedWorkspaceSnapshot {
+            snapshot,
+            metrics: WorkspaceObservationPhaseMetrics {
+                mode: WorkspaceObservationMode::Full,
+                duration_ms: elapsed_ms(started),
+                entries_read: work.entries_read,
+                content_bytes_read: work.content_bytes_read,
+            },
+        });
+    }
+    let snapshot = snapshot_workspace_as_sandbox_user(workspace, protected_paths)?;
+    let work = snapshot.full_scan_work();
+    Ok(ObservedWorkspaceSnapshot {
+        snapshot,
+        metrics: WorkspaceObservationPhaseMetrics {
+            mode: WorkspaceObservationMode::Full,
+            duration_ms: elapsed_ms(started),
+            entries_read: work.entries_read,
+            content_bytes_read: work.content_bytes_read,
+        },
+    })
+}
+
+fn resolve_after_workspace_snapshot(
+    workspace: &Path,
+    before: &WorkspaceSnapshot,
+    observation: &WorkspaceChangeObservation,
+    protected_paths: &[PathBuf],
+) -> Result<ObservedWorkspaceSnapshot, String> {
+    let started = Instant::now();
+    match update_workspace_snapshot_as_sandbox_user(
+        workspace,
+        before,
+        observation,
+        protected_paths,
+    )? {
+        IncrementalSnapshot::Updated(snapshot, work) => {
+            let mode = if matches!(observation, WorkspaceChangeObservation::Unchanged) {
+                WorkspaceObservationMode::Reused
+            } else {
+                WorkspaceObservationMode::Incremental
+            };
+            Ok(ObservedWorkspaceSnapshot {
+                snapshot,
+                metrics: WorkspaceObservationPhaseMetrics {
+                    mode,
+                    duration_ms: elapsed_ms(started),
+                    entries_read: work.entries_read,
+                    content_bytes_read: work.content_bytes_read,
+                },
+            })
+        }
+        IncrementalSnapshot::FullRequired => {
+            let snapshot = snapshot_workspace_as_sandbox_user_for_cached_root(
+                workspace,
+                before,
+                protected_paths,
+            )?;
+            let work = snapshot.full_scan_work();
+            Ok(ObservedWorkspaceSnapshot {
+                snapshot,
+                metrics: WorkspaceObservationPhaseMetrics {
+                    mode: WorkspaceObservationMode::Full,
+                    duration_ms: elapsed_ms(started),
+                    entries_read: work.entries_read,
+                    content_bytes_read: work.content_bytes_read,
+                },
+            })
         }
     }
 }
@@ -1154,6 +2019,48 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, String> {
         return Err(format!("path is not a directory: {}", path.display()));
     }
     Ok(canonical)
+}
+
+/// Resolve the controller's canonical root, retaining its key after same-backend quarantine.
+fn release_observation_root(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("workspace observation root must be absolute".to_string());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(
+            "workspace observation root must not contain relative path components".to_string(),
+        );
+    }
+
+    match dunce::canonicalize(path) {
+        Ok(canonical) if canonical.is_dir() => Ok(canonical),
+        Ok(_) => Err(format!("path is not a directory: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| "workspace observation root has no parent".to_string())?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| "workspace observation root has no final component".to_string())?;
+            let canonical_parent = dunce::canonicalize(parent).map_err(|parent_error| {
+                format!(
+                    "workspace observation root and parent are unavailable: {}; {}",
+                    error, parent_error
+                )
+            })?;
+            if !canonical_parent.is_dir() {
+                return Err(format!(
+                    "workspace observation root parent is not a directory: {}",
+                    parent.display()
+                ));
+            }
+            Ok(canonical_parent.join(name))
+        }
+        Err(error) => Err(format!("failed to resolve {}: {error}", path.display())),
+    }
 }
 
 fn resolve_executable(
@@ -1482,16 +2389,503 @@ mod tests {
             let code = report.error_code.as_deref().expect("typed blocker");
             assert!(!code.is_empty());
             assert!(!report.missing_capabilities.is_empty());
-            assert_ne!(report.transactional_workspace, SandboxPreflightFact::Passed);
+            assert!(!report.proves_supported_contract_for("windows"));
         }
         assert!(!workspace.path().join("singularity-preflight.txt").exists());
     }
 
     #[test]
+    fn prepared_observation_exposes_only_bounded_relative_changed_paths() {
+        let changed = prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
+            singularity_windows_sandbox::WorkspacePathChange {
+                path: "nested/value.txt".to_string(),
+                kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
+            },
+        ]));
+        assert_eq!(
+            changed,
+            PreparedWorkspaceObservation::Changed(vec!["nested/value.txt".to_string()])
+        );
+        let PreparedWorkspaceObservation::Changed(paths) = changed else {
+            unreachable!("changed observation must retain its path set");
+        };
+        assert!(paths.iter().all(|path| {
+            !Path::new(path).is_absolute() && !path.contains(':') && !path.contains('\\')
+        }));
+        assert_eq!(
+            prepared_workspace_observation(WorkspaceChangeObservation::Unknown),
+            PreparedWorkspaceObservation::Unknown
+        );
+    }
+
+    #[test]
+    fn ntfs_filesystem_gate_rejects_unknown_and_refs_without_starting_a_child() {
+        assert_eq!(windows_filesystem_gate_error(Some("NTFS")), None);
+        assert_eq!(
+            windows_filesystem_gate_error(Some("ReFS")),
+            Some("sandbox_unsupported_filesystem")
+        );
+        assert_eq!(
+            windows_filesystem_gate_error(None),
+            Some("sandbox_filesystem_unknown")
+        );
+    }
+
+    #[test]
+    fn readonly_preparation_retains_a_workspace_root_lease() {
+        let temp = tempfile::tempdir().expect("workspace parent");
+        let parent = temp.path().join("parent");
+        let workspace = parent.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let comspec = std::env::var_os("ComSpec").expect("ComSpec");
+        let mut request = CommandRequest::project_verification(
+            "readonly-root-lease",
+            vec![PathBuf::from(comspec).to_string_lossy().into_owned()],
+            workspace.to_string_lossy(),
+            workspace.to_string_lossy(),
+        );
+        request.filesystem.mode = SandboxFilesystemMode::ReadOnly;
+
+        let prepared = PreparedCommand::from_request(&request, None, None)
+            .expect("read-only command preparation");
+        let lease = prepared
+            .workspace_root_lease
+            .as_ref()
+            .expect("read-only preparation must retain the root lease");
+        let displaced = temp.path().join("parent-displaced");
+        let replaced = fs::rename(&parent, &displaced).is_ok();
+        if replaced {
+            fs::create_dir_all(&workspace).expect("replacement workspace");
+            assert!(
+                lease.verify().is_err(),
+                "read-only preparation must reject a replaced parent chain"
+            );
+        } else {
+            lease.verify().expect("unchanged read-only root lease");
+        }
+    }
+
+    #[test]
+    fn trusted_readonly_preparation_retains_a_workspace_root_lease() {
+        let temp = tempfile::tempdir().expect("workspace parent");
+        let parent = temp.path().join("parent");
+        let workspace = parent.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let comspec = std::env::var_os("ComSpec").expect("ComSpec");
+        let mut request = CommandRequest::trusted_workspace_preparation(
+            "trusted-readonly-root-lease",
+            vec![PathBuf::from(comspec).to_string_lossy().into_owned()],
+            workspace.to_string_lossy(),
+            workspace.to_string_lossy(),
+        );
+        request.filesystem.mode = SandboxFilesystemMode::ReadOnly;
+
+        let prepared = PreparedCommand::from_request(&request, None, None)
+            .expect("trusted read-only command preparation");
+        let lease = prepared
+            .workspace_root_lease
+            .as_ref()
+            .expect("trusted read-only preparation must retain the root lease");
+        let displaced = temp.path().join("parent-displaced");
+        let replaced = fs::rename(&parent, &displaced).is_ok();
+        if replaced {
+            fs::create_dir_all(&workspace).expect("replacement workspace");
+            assert!(
+                lease.verify().is_err(),
+                "trusted read-only preparation must reject a replaced parent chain"
+            );
+        } else {
+            lease
+                .verify()
+                .expect("unchanged trusted read-only root lease");
+        }
+    }
+
+    #[test]
     fn workspace_monitor_failure_cannot_be_reconciled_as_unchanged() {
-        let (mutation, summary) = reconcile_workspace_change(Some(Err(())), Some(Ok(None)));
+        let (mutation, summary) =
+            reconcile_workspace_change(Some(Err(())), Some(Ok((false, None))));
 
         assert_eq!(mutation, WorkspaceMutation::Unknown);
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn second_command_before_snapshot_reuses_session_without_a_full_scan() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        create_test_file(&workspace.path().join("value.txt"), "value");
+        let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let mut session =
+            WorkspaceObservationSession::start(root.clone()).expect("observation session");
+
+        let first = resolve_before_workspace_snapshot(
+            &root,
+            session.before_seed().expect("first seed"),
+            &[],
+        )
+        .expect("first before snapshot");
+        assert_eq!(first.metrics.mode, WorkspaceObservationMode::Full);
+        assert_eq!(first.metrics.entries_read, 2);
+        assert_eq!(first.metrics.content_bytes_read, 5);
+        session.publish(first.snapshot, None);
+
+        let second_seed = session.before_seed().expect("second seed");
+        let second = resolve_before_workspace_snapshot(&root, second_seed, &[])
+            .expect("second before snapshot");
+        assert_eq!(second.metrics.mode, WorkspaceObservationMode::Reused);
+        assert_eq!(second.metrics.entries_read, 1);
+        assert_eq!(second.metrics.content_bytes_read, 0);
+        session.publish(second.snapshot.clone(), None);
+        assert_eq!(
+            session.cache.as_ref().map(|cache| &cache.snapshot),
+            Some(&second.snapshot)
+        );
+    }
+
+    #[test]
+    fn protected_path_cache_skips_full_resolver_on_second_unchanged_command() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        create_test_file(&workspace.path().join(".env"), "opaque");
+        let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let comspec = std::env::var_os("ComSpec").expect("ComSpec");
+        let request = CommandRequest::project_verification(
+            "cached-protected-paths",
+            vec![
+                PathBuf::from(comspec).to_string_lossy().into_owned(),
+                "/c".to_string(),
+                "echo ready".to_string(),
+            ],
+            root.to_string_lossy(),
+            root.to_string_lossy(),
+        );
+        let mut session = WorkspaceObservationSession::start(root.clone()).expect("session");
+        let first_preparation = session.prepare_for_command().expect("first preparation");
+        assert!(first_preparation.cached_protected_paths.is_none());
+        FULL_PROTECTED_RESOLVER_SCANS.with(|count| count.set(0));
+        let first = PreparedCommand::from_request(&request, None, None).expect("first command");
+        assert_eq!(FULL_PROTECTED_RESOLVER_SCANS.with(Cell::get), 1);
+        let first_snapshot = snapshot_workspace_as_sandbox_user(&root, &[]).expect("snapshot");
+        session.publish_with_protected_paths(
+            first_snapshot,
+            first.protected_deny_read_paths.clone(),
+            Some(first_preparation.monitor),
+        );
+
+        let second_preparation = session.prepare_for_command().expect("second preparation");
+        assert_eq!(
+            second_preparation
+                .cached_protected_paths
+                .as_ref()
+                .map(Vec::len),
+            Some(first.protected_deny_read_paths.len())
+        );
+        let _second = PreparedCommand::from_request(
+            &request,
+            second_preparation.cached_protected_paths.as_deref(),
+            None,
+        )
+        .expect("cached command");
+        assert_eq!(FULL_PROTECTED_RESOLVER_SCANS.with(Cell::get), 1);
+    }
+
+    #[test]
+    fn protected_path_cache_is_cleared_when_the_checkpoint_reports_changed() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let protected = workspace.path().join(".env");
+        create_test_file(&protected, "opaque");
+        let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let mut session = WorkspaceObservationSession::start(root.clone()).expect("session");
+        let first = session.prepare_for_command().expect("first preparation");
+        let snapshot = snapshot_workspace_as_sandbox_user(&root, &[]).expect("snapshot");
+        let protected_path =
+            AbsolutePathBuf::from_absolute_path_checked(&protected).expect("protected path");
+        session.publish_with_protected_paths(snapshot, vec![protected_path], Some(first.monitor));
+        std::fs::write(&protected, "changed").expect("change protected path");
+
+        let second = session.prepare_for_command().expect("changed preparation");
+        assert!(second.cached_protected_paths.is_none());
+        assert!(session.cache.is_none());
+    }
+
+    #[test]
+    fn protected_path_identity_rejects_same_content_replacement() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let protected = workspace.path().join(".env");
+        create_test_file(&protected, "opaque");
+        let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let path = AbsolutePathBuf::from_absolute_path_checked(&protected).expect("protected path");
+        let cached = capture_cached_protected_paths(&root, std::slice::from_ref(&path))
+            .expect("capture identity");
+        let displaced = workspace.path().join(".env.old");
+        std::fs::rename(&protected, displaced).expect("displace protected path");
+        create_test_file(&protected, "opaque");
+
+        assert!(validate_cached_protected_paths(&root, &cached).is_err());
+    }
+
+    #[test]
+    fn between_command_out_of_band_write_invalidates_the_cached_baseline() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let value = workspace.path().join("value.txt");
+        create_test_file(&value, "before");
+        let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let mut session =
+            WorkspaceObservationSession::start(root.clone()).expect("observation session");
+        let before =
+            resolve_before_workspace_snapshot(&root, None, &[]).expect("first before snapshot");
+        session.publish(before.snapshot, None);
+
+        create_test_file(&value, "after");
+        let seed = session.before_seed().expect("checkpoint");
+        assert!(seed.is_none(), "out-of-band writes must invalidate reuse");
+        let after = resolve_before_workspace_snapshot(&root, seed, &[]).expect("full refresh");
+
+        assert_eq!(after.metrics.mode, WorkspaceObservationMode::Full);
+        assert_eq!(after.metrics.entries_read, 2);
+        assert_eq!(after.metrics.content_bytes_read, 5);
+        assert_ne!(
+            session.cache.as_ref().map(|cache| &cache.snapshot),
+            Some(&after.snapshot)
+        );
+    }
+
+    #[test]
+    fn large_out_of_band_added_subtree_invalidates_the_cached_baseline() {
+        const FILES: usize = 5_000;
+        let workspace = tempfile::tempdir().expect("workspace");
+        create_test_file(&workspace.path().join("stable.txt"), "stable");
+        let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let mut session =
+            WorkspaceObservationSession::start(root.clone()).expect("observation session");
+        let before =
+            resolve_before_workspace_snapshot(&root, None, &[]).expect("first before snapshot");
+        session.publish(before.snapshot, None);
+
+        let added = workspace.path().join(".environment");
+        std::fs::create_dir(&added).expect("added directory");
+        for index in 0..FILES {
+            create_test_file(&added.join(format!("file-{index:04}.txt")), "x");
+        }
+        let seed = session.before_seed().expect("checkpoint");
+        assert!(seed.is_none(), "out-of-band writes must invalidate reuse");
+        let after = resolve_before_workspace_snapshot(&root, seed, &[]).expect("full refresh");
+
+        assert_eq!(after.metrics.mode, WorkspaceObservationMode::Full);
+        assert_eq!(after.metrics.entries_read, FILES + 3);
+        assert_eq!(after.metrics.content_bytes_read, FILES as u64 + 6);
+        assert_eq!(
+            after.snapshot,
+            snapshot_workspace_as_sandbox_user(&root, &[]).expect("full comparison")
+        );
+    }
+
+    #[test]
+    fn observation_contract_change_starts_a_distinct_session() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path().to_string_lossy();
+        let first_key = observation_session_key(
+            &root,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Denied,
+            &CommandEnvironmentPolicy::EvaluationIsolated,
+        )
+        .expect("first key");
+        let second_key = observation_session_key(
+            &root,
+            &SandboxFilesystemMode::WorkspaceWrite,
+            &SandboxNetworkMode::Allowed,
+            &CommandEnvironmentPolicy::EvaluationIsolated,
+        )
+        .expect("second key");
+        assert_ne!(first_key, second_key);
+
+        let backend = WindowsSandboxBackend::new();
+        let first = backend
+            .observation_session(Some(first_key))
+            .expect("first session");
+        let second = backend
+            .observation_session(Some(second_key))
+            .expect("second session");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(first.lock().expect("first lock").cache.is_none());
+        assert!(second.lock().expect("second lock").cache.is_none());
+    }
+
+    #[test]
+    fn release_workspace_observation_drops_exact_root_sessions_before_parent_rename() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let parent = temp.path().join("parent");
+        let first_root = parent.join("first");
+        let second_root = parent.join("second");
+        fs::create_dir_all(&first_root).expect("first workspace");
+        fs::create_dir_all(&second_root).expect("second workspace");
+        let first_root = dunce::canonicalize(first_root).expect("first canonical workspace");
+        let second_root = dunce::canonicalize(second_root).expect("second canonical workspace");
+        let key_for = |root: &Path| {
+            let root = root.to_string_lossy();
+            observation_session_key(
+                &root,
+                &SandboxFilesystemMode::WorkspaceWrite,
+                &SandboxNetworkMode::Denied,
+                &CommandEnvironmentPolicy::EvaluationIsolated,
+            )
+            .expect("observation session key")
+        };
+        let backend = WindowsSandboxBackend::new();
+        let first = backend
+            .observation_session(Some(key_for(&first_root)))
+            .expect("first observation session");
+        let first_snapshot = resolve_before_workspace_snapshot(&first_root, None, &[])
+            .expect("first snapshot")
+            .snapshot;
+        first
+            .lock()
+            .expect("first session lock")
+            .publish_with_protected_paths(first_snapshot, Vec::new(), None);
+        let first_other_key = {
+            let root = first_root.to_string_lossy();
+            observation_session_key(
+                &root,
+                &SandboxFilesystemMode::WorkspaceWrite,
+                &SandboxNetworkMode::Allowed,
+                &CommandEnvironmentPolicy::EvaluationIsolated,
+            )
+            .expect("second first-root observation session key")
+        };
+        let first_other = backend
+            .observation_session(Some(first_other_key))
+            .expect("second first-root observation session");
+        drop(first_other);
+        let active_error = backend
+            .release_workspace_observation(&first_root)
+            .expect_err("active observation owner must block release");
+        assert!(active_error.contains("active owners"));
+        drop(first);
+        let second = backend
+            .observation_session(Some(key_for(&second_root)))
+            .expect("second observation session");
+        drop(second);
+
+        let first_displaced = parent.join("first-displaced");
+        fs::rename(&first_root, &first_displaced).expect("quarantine first workspace");
+        assert!(!first_root.exists());
+        assert!(first_displaced.is_dir());
+
+        backend
+            .release_workspace_observation(&first_root)
+            .expect("release first observation root");
+        {
+            let sessions = backend
+                .observation_sessions
+                .lock()
+                .expect("observation session cache");
+            assert!(!sessions.sessions.keys().any(|key| key.root == first_root));
+            assert!(sessions.sessions.keys().any(|key| key.root == second_root));
+        }
+        backend
+            .release_workspace_observation(&second_root)
+            .expect("release second observation root");
+
+        let displaced = temp.path().join("parent-displaced");
+        fs::rename(parent, displaced).expect("parent quarantine rename after release");
+    }
+
+    #[test]
+    fn cancelled_command_invalidation_forces_the_next_full_before_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        create_test_file(&workspace.path().join("value.txt"), "value");
+        let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let mut session =
+            WorkspaceObservationSession::start(root.clone()).expect("observation session");
+        let before =
+            resolve_before_workspace_snapshot(&root, None, &[]).expect("first before snapshot");
+        session.publish(before.snapshot, None);
+
+        session.invalidate();
+        let after_cancel = resolve_before_workspace_snapshot(
+            &root,
+            session.before_seed().expect("invalidated seed"),
+            &[],
+        )
+        .expect("full snapshot after cancellation");
+
+        assert_eq!(after_cancel.metrics.mode, WorkspaceObservationMode::Full);
+        assert!(after_cancel.snapshot.full_scan_work().entries_read > 1);
+    }
+
+    #[test]
+    fn unknown_session_observation_forces_a_full_before_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        create_test_file(&workspace.path().join("value.txt"), "value");
+        let root = dunce::canonicalize(workspace.path()).expect("canonical workspace");
+        let snapshot = snapshot_workspace_as_sandbox_user(&root, &[]).expect("published snapshot");
+
+        let observed = resolve_before_workspace_snapshot(
+            &root,
+            Some(BeforeSnapshotSeed {
+                snapshot,
+                observation: WorkspaceChangeObservation::Unknown,
+            }),
+            &[],
+        )
+        .expect("full snapshot");
+
+        assert_eq!(observed.metrics.mode, WorkspaceObservationMode::Full);
+    }
+
+    #[test]
+    fn cached_session_rejects_same_content_root_replacement() {
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("workspace");
+        let displaced = parent.path().join("displaced");
+        fs::create_dir(&root).expect("workspace");
+        create_test_file(&root.join("value.txt"), "value");
+        let snapshot = snapshot_workspace_as_sandbox_user(&root, &[]).expect("snapshot");
+        fs::rename(&root, &displaced).expect("displace root");
+        fs::create_dir(&root).expect("replacement root");
+        create_test_file(&root.join("value.txt"), "value");
+
+        let error = resolve_before_workspace_snapshot(
+            &root,
+            Some(BeforeSnapshotSeed {
+                snapshot,
+                observation: WorkspaceChangeObservation::Changed(vec![
+                    singularity_windows_sandbox::WorkspacePathChange {
+                        path: "value.txt".to_string(),
+                        kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
+                    },
+                ]),
+            }),
+            &[],
+        )
+        .expect_err("replacement root must not become a new baseline");
+
+        assert!(error.contains("root identity or behavior drifted"));
+    }
+
+    #[test]
+    fn metadata_only_notification_without_snapshot_delta_fails_closed() {
+        let observation = WorkspaceChangeObservation::Changed(vec![
+            singularity_windows_sandbox::WorkspacePathChange {
+                path: "value.txt".to_string(),
+                kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
+            },
+        ]);
+        let (mutation, summary) =
+            reconcile_workspace_change(Some(Ok(observation)), Some(Ok((false, None))));
+
+        assert_eq!(mutation, WorkspaceMutation::Unknown);
+        assert!(summary.is_none());
+    }
+
+    #[test]
+    fn complete_snapshot_proves_large_change_when_monitor_overflows() {
+        let (mutation, summary) = reconcile_workspace_change(
+            Some(Ok(WorkspaceChangeObservation::Unknown)),
+            Some(Ok((true, None))),
+        );
+
+        assert_eq!(mutation, WorkspaceMutation::Changed);
         assert!(summary.is_none());
     }
 
@@ -1525,8 +2919,10 @@ mod tests {
         let workspace =
             AbsolutePathBuf::from_absolute_path_checked(&workspace).expect("absolute workspace");
 
-        let resolved = resolve_existing_protected_paths(&workspace).expect("protected paths");
+        let (resolved, incomplete) =
+            resolve_existing_protected_paths(&workspace, None).expect("protected paths");
 
+        assert!(!incomplete);
         assert!(
             resolved
                 .iter()
@@ -1832,8 +3228,8 @@ mod tests {
             workspace.path().to_string_lossy(),
         );
 
-        let prepared =
-            PreparedCommand::from_request(&request).expect("workspace-write command preparation");
+        let prepared = PreparedCommand::from_request(&request, None, None)
+            .expect("workspace-write command preparation");
         let protected_paths = prepared
             .protected_deny_write_paths
             .iter()
@@ -1894,8 +3290,8 @@ mod tests {
         );
         request.network.mode = SandboxNetworkMode::Allowed;
 
-        let prepared =
-            PreparedCommand::from_request(&request).expect("trusted workspace preparation");
+        let prepared = PreparedCommand::from_request(&request, None, None)
+            .expect("trusted workspace preparation");
 
         assert!(request.is_trusted_workspace_preparation());
         assert!(prepared.protected_deny_read_paths.is_empty());
@@ -1936,7 +3332,7 @@ mod tests {
             workspace.path().to_string_lossy(),
         );
 
-        let prepared = PreparedCommand::from_script_request(&request)
+        let prepared = PreparedCommand::from_script_request(&request, None, None)
             .expect("ordinary reparse must not reject script preparation");
         assert!(prepared.protected_deny_read_paths.is_empty());
     }
@@ -1963,7 +3359,7 @@ mod tests {
             SandboxNetworkMode::Allowed,
         );
 
-        let prepared = match PreparedCommand::from_script_request(&request) {
+        let prepared = match PreparedCommand::from_script_request(&request, None, None) {
             Ok(prepared) => prepared,
             Err(_) => panic!("script preparation should succeed"),
         };

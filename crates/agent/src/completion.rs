@@ -397,6 +397,19 @@ impl CompletionTracker {
             .fold(0u32, u32::saturating_add)
     }
 
+    /// Return the authoritative merged requirement count for one exact command scope.
+    pub(super) fn required_command_count_for(&self, command_scope_digest: &str) -> u32 {
+        self.required_command_counts
+            .get(command_scope_digest)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Return the exact scopes covered by the merged caller and model requirements.
+    pub(super) fn required_command_scope_digests(&self) -> Vec<String> {
+        self.required_command_counts.keys().cloned().collect()
+    }
+
     pub(super) fn terminal_command_scope_digests(&self) -> Vec<String> {
         self.terminal_command_scope_digests.clone()
     }

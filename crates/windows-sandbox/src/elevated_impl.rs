@@ -1,4 +1,6 @@
 use crate::absolute_path::AbsolutePathBuf;
+#[cfg(target_os = "windows")]
+use crate::path_safety::WorkspaceRootLease;
 use crate::permissions::PermissionProfile;
 #[cfg(target_os = "windows")]
 use crate::trusted_workspace::TrustedWorkspaceLease;
@@ -23,6 +25,8 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub write_roots_override: Option<&'a [PathBuf]>,
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
     pub deny_write_paths_override: &'a [AbsolutePathBuf],
+    /// Whether the controller deferred an ACL-private subtree to the sandbox identity.
+    pub protected_path_scan_incomplete: bool,
     /// Existing capability-scoped deny-write paths to revoke before trusted preparation.
     ///
     /// This is separate from `deny_write_paths_override`: the latter is the policy to install
@@ -33,6 +37,9 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub workspace_change_monitor: Option<&'a mut Option<crate::WorkspaceChangeMonitor>>,
     #[cfg(target_os = "windows")]
     pub trusted_workspace: Option<&'a TrustedWorkspaceLease>,
+    /// Controller-held no-delete workspace root handle kept alive through Job cleanup.
+    #[cfg(target_os = "windows")]
+    pub workspace_root_lease: Option<&'a WorkspaceRootLease>,
 }
 
 impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
@@ -61,12 +68,15 @@ impl<'a> ElevatedSandboxProfileCaptureRequest<'a> {
             write_roots_override: None,
             deny_read_paths_override: &[],
             deny_write_paths_override: &[],
+            protected_path_scan_incomplete: false,
             trusted_deny_write_paths_override: &[],
             protect_workspace_metadata: true,
             #[cfg(target_os = "windows")]
             workspace_change_monitor: None,
             #[cfg(target_os = "windows")]
             trusted_workspace: None,
+            #[cfg(target_os = "windows")]
+            workspace_root_lease: None,
         }
     }
 }
@@ -86,6 +96,11 @@ mod windows_impl {
     use crate::env::ensure_non_interactive_pager;
     use crate::env::inherit_path_env;
     use crate::env::normalize_null_device_env;
+
+    type WorkspaceObservation<T> = Option<(T, T, crate::WorkspaceChangeObservation)>;
+    use crate::identity::SandboxCreds;
+    use crate::identity::existing_sandbox_creds;
+    use crate::identity::observe_as_sandbox_user;
     use crate::identity::refresh_logon_sandbox_creds;
     use crate::ipc_framed::EmptyPayload;
     use crate::ipc_framed::FramedMessage;
@@ -100,6 +115,9 @@ mod windows_impl {
     use crate::logging::log_success;
     use crate::path_normalization::canonicalize_path_allow_missing;
     use crate::path_safety::open_pinned_workspace_path;
+    use crate::path_safety::pin_existing_workspace_paths;
+    use crate::path_safety::revalidate_existing_pinned_workspace_paths;
+    use crate::path_safety::revalidate_pinned_workspace_paths;
     use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
     use crate::runner_client::retry_runner_spawn_once;
     use crate::runner_client::spawn_runner_transport;
@@ -108,7 +126,7 @@ mod windows_impl {
     use crate::setup::effective_write_roots_for_permissions;
     use crate::setup::gather_read_roots;
     use crate::token::LocalSid;
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use std::collections::HashSet;
     use std::fs::File;
     use std::path::Path;
@@ -130,6 +148,106 @@ mod windows_impl {
             cancelled: true,
             output_truncated: false,
         }
+    }
+
+    /// One resolver result bound to no-follow handles for a single ACL reconciliation pass.
+    struct ProtectedSetupPlan {
+        deny_read: Vec<PathBuf>,
+        deny_write: Vec<PathBuf>,
+        pins: Vec<crate::path_safety::PinnedWorkspacePath>,
+        _handles: Vec<File>,
+    }
+
+    fn resolved_path_keys(paths: &[AbsolutePathBuf]) -> Vec<String> {
+        let mut keys = paths
+            .iter()
+            .map(|path| path.as_path().to_string_lossy().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    fn resolved_path_sets_equal(
+        left: &(Vec<AbsolutePathBuf>, Vec<AbsolutePathBuf>),
+        right: &(Vec<AbsolutePathBuf>, Vec<AbsolutePathBuf>),
+    ) -> bool {
+        resolved_path_keys(&left.0) == resolved_path_keys(&right.0)
+            && resolved_path_keys(&left.1) == resolved_path_keys(&right.1)
+    }
+
+    fn merge_required_protected_paths(
+        mut resolved: (Vec<AbsolutePathBuf>, Vec<AbsolutePathBuf>),
+        required_read: &[AbsolutePathBuf],
+        required_write: &[AbsolutePathBuf],
+    ) -> (Vec<AbsolutePathBuf>, Vec<AbsolutePathBuf>) {
+        resolved.0.extend_from_slice(required_read);
+        resolved.1.extend_from_slice(required_write);
+        for paths in [&mut resolved.0, &mut resolved.1] {
+            let mut seen = HashSet::new();
+            paths.retain(|path| seen.insert(path.as_path().to_string_lossy().to_ascii_lowercase()));
+        }
+        resolved
+    }
+
+    fn prepare_protected_setup_plan(
+        mut resolved: (Vec<AbsolutePathBuf>, Vec<AbsolutePathBuf>),
+        permissions: &ResolvedWindowsSandboxPermissions,
+        cwd: &Path,
+        env_map: &std::collections::HashMap<String, String>,
+        workspace: &AbsolutePathBuf,
+        observer_creds: Option<&SandboxCreds>,
+    ) -> Result<ProtectedSetupPlan> {
+        let mut targets = resolved.0.clone();
+        targets.extend(resolved.1.iter().cloned());
+        let mut pins = Vec::new();
+        let mut seen_targets = HashSet::new();
+        for target in targets {
+            let key = target.as_path().to_string_lossy().to_ascii_lowercase();
+            if !seen_targets.insert(key) {
+                continue;
+            }
+            match pin_existing_workspace_paths(workspace.as_path(), std::slice::from_ref(&target)) {
+                Ok(mut target_pins) => pins.append(&mut target_pins),
+                Err(controller_error) => {
+                    let creds = observer_creds.ok_or_else(|| {
+                        anyhow::anyhow!("sandbox observer credentials are unavailable")
+                    })?;
+                    let workspace = workspace.clone();
+                    let target_path = target.as_path().to_path_buf();
+                    let mut target_pins = observe_as_sandbox_user(creds, move || {
+                        pin_existing_workspace_paths(
+                            workspace.as_path(),
+                            std::slice::from_ref(&target),
+                        )
+                        .map_err(|sandbox_error| {
+                            format!(
+                                "protected workspace path pinning failed for both trusted and sandbox identities at {}: trusted={controller_error:#}; sandbox={sandbox_error:#}",
+                                target_path.display()
+                            )
+                        })
+                    })?;
+                    pins.append(&mut target_pins);
+                }
+            }
+        }
+        resolved.1.extend(
+            compute_allow_paths_for_permissions(permissions, cwd, env_map)
+                .deny
+                .into_iter()
+                .filter(|path| is_git_marker_path(path))
+                .map(AbsolutePathBuf::from_absolute_path_checked)
+                .collect::<std::io::Result<Vec<_>>>()?,
+        );
+        let (deny_read, mut handles) = resolve_nested_git_paths(&resolved.0)?;
+        let (deny_write, deny_write_handles) = resolve_nested_git_paths(&resolved.1)?;
+        handles.extend(deny_write_handles);
+        Ok(ProtectedSetupPlan {
+            deny_read,
+            deny_write,
+            pins,
+            _handles: handles,
+        })
     }
 
     fn acquire_deny_read_execution_guard(
@@ -193,6 +311,50 @@ mod windows_impl {
     pub fn run_windows_sandbox_capture_for_permission_profile(
         request: ElevatedSandboxProfileCaptureRequest<'_>,
     ) -> Result<CaptureResult> {
+        run_windows_sandbox_capture_for_permission_profile_inner::<
+            (),
+            fn() -> std::result::Result<(Vec<AbsolutePathBuf>, Vec<AbsolutePathBuf>), String>,
+            fn() -> std::result::Result<(), String>,
+            fn(crate::WorkspaceChangeObservation) -> std::result::Result<(), String>,
+        >(request, None)
+        .map(|(capture, _)| capture)
+    }
+
+    /// Captures a command between two workspace observations made as its sandbox account.
+    pub fn run_windows_sandbox_capture_for_permission_profile_with_observations<T, R, F, G>(
+        request: ElevatedSandboxProfileCaptureRequest<'_>,
+        protected_path_resolver: R,
+        before_observer: F,
+        after_observer: G,
+    ) -> Result<(CaptureResult, T, T, crate::WorkspaceChangeObservation)>
+    where
+        R: FnMut() -> std::result::Result<(Vec<AbsolutePathBuf>, Vec<AbsolutePathBuf>), String>
+            + Send,
+        F: FnOnce() -> std::result::Result<T, String> + Send,
+        G: FnMut(crate::WorkspaceChangeObservation) -> std::result::Result<T, String> + Send,
+        T: Send,
+    {
+        let (capture, observations) = run_windows_sandbox_capture_for_permission_profile_inner(
+            request,
+            Some((protected_path_resolver, before_observer, after_observer)),
+        )?;
+        let (before, after, change) = observations
+            .ok_or_else(|| anyhow::anyhow!("sandbox workspace observer credentials unavailable"))?;
+        Ok((capture, before, after, change))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_windows_sandbox_capture_for_permission_profile_inner<T, R, F, G>(
+        request: ElevatedSandboxProfileCaptureRequest<'_>,
+        observers: Option<(R, F, G)>,
+    ) -> Result<(CaptureResult, WorkspaceObservation<T>)>
+    where
+        R: FnMut() -> std::result::Result<(Vec<AbsolutePathBuf>, Vec<AbsolutePathBuf>), String>
+            + Send,
+        F: FnOnce() -> std::result::Result<T, String> + Send,
+        G: FnMut(crate::WorkspaceChangeObservation) -> std::result::Result<T, String> + Send,
+        T: Send,
+    {
         let ElevatedSandboxProfileCaptureRequest {
             permission_profile,
             workspace_roots,
@@ -210,11 +372,27 @@ mod windows_impl {
             write_roots_override,
             deny_read_paths_override,
             deny_write_paths_override,
+            protected_path_scan_incomplete,
             trusted_deny_write_paths_override,
             protect_workspace_metadata,
-            workspace_change_monitor,
+            mut workspace_change_monitor,
             trusted_workspace,
+            workspace_root_lease,
         } = request;
+        if let Some(root_lease) = workspace_root_lease {
+            // The controller owns this handle and keeps it alive until this function returns,
+            // which is after runner IPC and Job Object cleanup. Verify it before any ACL side
+            // effect; pathname replacement therefore cannot redirect the child to a new root.
+            root_lease
+                .verify()
+                .context("workspace root lease verification failed")?;
+        }
+        if let Some(trusted_workspace) = trusted_workspace {
+            trusted_workspace
+                .verify()
+                .map_err(|error| anyhow::anyhow!(error.code()))
+                .context("trusted workspace lease verification failed")?;
+        }
         // Resolve safe aliases once so the execution mutex, setup payload, runner registration,
         // cleanup, and every state-file operation share one long-lived sandbox-home identity.
         let canonical_sandbox_home = canonicalize_path_allow_missing(sandbox_home);
@@ -223,7 +401,7 @@ mod windows_impl {
             .as_ref()
             .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
         {
-            return Ok(cancelled_capture_result());
+            return Ok((cancelled_capture_result(), None));
         }
         let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots_with_protected_metadata(
             permission_profile,
@@ -248,20 +426,147 @@ mod windows_impl {
         let read_roots_override = merged_read_roots.as_deref().or(read_roots_override);
         let read_roots_include_platform_defaults =
             read_roots_include_platform_defaults && merged_read_roots.is_none();
-        let (deny_read_paths_override, mut protected_git_marker_handles) =
-            resolve_nested_git_paths(deny_read_paths_override)?;
-        let mut deny_write_inputs = deny_write_paths_override.to_vec();
-        deny_write_inputs.extend(
-            compute_allow_paths_for_permissions(&permissions, cwd, &env_map)
-                .deny
-                .into_iter()
-                .filter(|path| is_git_marker_path(path))
-                .map(AbsolutePathBuf::from_absolute_path_checked)
-                .collect::<std::io::Result<Vec<_>>>()?,
-        );
-        let (deny_write_paths_override, deny_write_marker_handles) =
-            resolve_nested_git_paths(&deny_write_inputs)?;
-        protected_git_marker_handles.extend(deny_write_marker_handles);
+        normalize_null_device_env(&mut env_map);
+        ensure_non_interactive_pager(&mut env_map);
+        inherit_path_env(&mut env_map);
+        inject_git_safe_directory(&mut env_map, cwd);
+        // Use a temp-based log dir that the sandbox user can write.
+        let sandbox_base = sandbox_home.join(".sandbox");
+        ensure_sandbox_home_exists(&sandbox_base)?;
+
+        let logs_base_dir: Option<&Path> = Some(sandbox_base.as_path());
+        log_start(&command, logs_base_dir);
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
+        {
+            return Ok((cancelled_capture_result(), None));
+        }
+        // The elevated identities share one authoritative read principal. Serialize setup and the
+        // complete Job Object lifetime so a concurrent workspace cannot reconcile that principal
+        // to a different deny-read set while this child is still alive.
+        let Some(_deny_read_execution_guard) =
+            acquire_deny_read_execution_guard(sandbox_home, cancellation.as_ref())?
+        else {
+            return Ok((cancelled_capture_result(), None));
+        };
+        let mut observer_creds = None;
+        let (resolved_by_sandbox, mut observers) = match observers {
+            Some((mut resolver, before, after)) => {
+                let scan_permissions =
+                    ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots_with_protected_metadata(
+                        permission_profile,
+                        workspace_roots,
+                        false,
+                    )?;
+                let scan_creds = match existing_sandbox_creds(
+                    &scan_permissions,
+                    proxy_enforced,
+                    sandbox_home,
+                )? {
+                    Some(creds) => creds,
+                    None => {
+                        if protected_path_scan_incomplete {
+                            anyhow::bail!(
+                                "protected path scan requires an existing sandbox identity"
+                            );
+                        }
+                        // A first-run setup may establish the account, but it must preserve
+                        // the controller's conservative protected-path set instead of
+                        // reconciling persisted denies against an empty placeholder.
+                        let mut scan_inputs = deny_read_paths_override.to_vec();
+                        scan_inputs.extend_from_slice(deny_write_paths_override);
+                        let scan_setup_pins = pin_existing_workspace_paths(
+                            workspace_roots
+                                .first()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("sandbox observation requires a workspace root")
+                                })?
+                                .as_path(),
+                            &scan_inputs,
+                        )?;
+                        let scan_deny_read_paths = deny_read_paths_override
+                            .iter()
+                            .map(AbsolutePathBuf::to_path_buf)
+                            .collect::<Vec<_>>();
+                        let scan_deny_write_paths = deny_write_paths_override
+                            .iter()
+                            .map(AbsolutePathBuf::to_path_buf)
+                            .collect::<Vec<_>>();
+                        let mut creds = crate::identity::require_logon_sandbox_creds(
+                            &scan_permissions,
+                            cwd,
+                            &env_map,
+                            sandbox_home,
+                            read_roots_override,
+                            read_roots_include_platform_defaults,
+                            write_roots_override,
+                            &scan_deny_read_paths,
+                            &scan_deny_write_paths,
+                            &[],
+                            proxy_enforced,
+                            crate::WindowsSandboxProxySettingsMode::Reconcile,
+                            None,
+                        )?;
+                        if revalidate_existing_pinned_workspace_paths(&scan_setup_pins)? {
+                            let materialized_pins = pin_existing_workspace_paths(
+                                workspace_roots
+                                    .first()
+                                    .expect("workspace root was required above")
+                                    .as_path(),
+                                &scan_inputs,
+                            )?;
+                            creds = crate::identity::require_logon_sandbox_creds(
+                                &scan_permissions,
+                                cwd,
+                                &env_map,
+                                sandbox_home,
+                                read_roots_override,
+                                read_roots_include_platform_defaults,
+                                write_roots_override,
+                                &scan_deny_read_paths,
+                                &scan_deny_write_paths,
+                                &[],
+                                proxy_enforced,
+                                crate::WindowsSandboxProxySettingsMode::Reconcile,
+                                None,
+                            )?;
+                            if revalidate_existing_pinned_workspace_paths(&materialized_pins)? {
+                                anyhow::bail!(
+                                    "protected path remained missing after bounded observer setup"
+                                );
+                            }
+                        }
+                        creds
+                    }
+                };
+                let resolved = merge_required_protected_paths(
+                    observe_as_sandbox_user(&scan_creds, &mut resolver)?,
+                    deny_read_paths_override,
+                    deny_write_paths_override,
+                );
+                observer_creds = Some(scan_creds);
+                (Some(resolved), Some((resolver, before, after)))
+            }
+            None => (None, None),
+        };
+        let mut current_resolved = resolved_by_sandbox.unwrap_or_else(|| {
+            (
+                deny_read_paths_override.to_vec(),
+                deny_write_paths_override.to_vec(),
+            )
+        });
+        let workspace = workspace_roots
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("sandbox setup requires a workspace root"))?;
+        let mut protected_setup = prepare_protected_setup_plan(
+            current_resolved.clone(),
+            &permissions,
+            cwd,
+            &env_map,
+            workspace,
+            observer_creds.as_ref(),
+        )?;
         let (trusted_deny_write_paths_override, trusted_deny_write_target_handles) =
             if trusted_workspace.is_some() {
                 resolve_trusted_deny_write_paths(
@@ -282,36 +587,9 @@ mod windows_impl {
             } else {
                 (Vec::new(), Vec::new())
             };
-        protected_git_marker_handles.extend(trusted_deny_write_target_handles);
         // Keep no-follow target handles alive through setup, runner spawn, and Job Object cleanup.
-        // This prevents a host-side rename from replacing a protected object between resolution
-        // and the ACL mutation or child startup.
-        let _protected_git_marker_handles = protected_git_marker_handles;
-        normalize_null_device_env(&mut env_map);
-        ensure_non_interactive_pager(&mut env_map);
-        inherit_path_env(&mut env_map);
-        inject_git_safe_directory(&mut env_map, cwd);
-        // Use a temp-based log dir that the sandbox user can write.
-        let sandbox_base = sandbox_home.join(".sandbox");
-        ensure_sandbox_home_exists(&sandbox_base)?;
-
-        let logs_base_dir: Option<&Path> = Some(sandbox_base.as_path());
-        log_start(&command, logs_base_dir);
-        if cancellation
-            .as_ref()
-            .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
-        {
-            return Ok(cancelled_capture_result());
-        }
-        // The elevated identities share one authoritative read principal. Serialize setup and the
-        // complete Job Object lifetime so a concurrent workspace cannot reconcile that principal
-        // to a different deny-read set while this child is still alive.
-        let Some(_deny_read_execution_guard) =
-            acquire_deny_read_execution_guard(sandbox_home, cancellation.as_ref())?
-        else {
-            return Ok(cancelled_capture_result());
-        };
-        let sandbox_creds = crate::identity::require_logon_sandbox_creds(
+        let _trusted_deny_write_target_handles = trusted_deny_write_target_handles;
+        let mut sandbox_creds = crate::identity::require_logon_sandbox_creds(
             &permissions,
             cwd,
             &env_map,
@@ -319,13 +597,62 @@ mod windows_impl {
             read_roots_override,
             read_roots_include_platform_defaults,
             write_roots_override,
-            &deny_read_paths_override,
-            &deny_write_paths_override,
+            &protected_setup.deny_read,
+            &protected_setup.deny_write,
             &trusted_deny_write_paths_override,
             proxy_enforced,
             crate::WindowsSandboxProxySettingsMode::Reconcile,
             trusted_workspace,
         )?;
+        let included_missing = revalidate_existing_pinned_workspace_paths(&protected_setup.pins)?;
+        let next_resolved = match observers.as_mut() {
+            Some((resolver, _, _)) => Some(merge_required_protected_paths(
+                observe_as_sandbox_user(
+                    observer_creds.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("sandbox observer credentials are unavailable")
+                    })?,
+                    resolver,
+                )?,
+                deny_read_paths_override,
+                deny_write_paths_override,
+            )),
+            None => None,
+        };
+        if included_missing
+            || next_resolved
+                .as_ref()
+                .is_some_and(|next| !resolved_path_sets_equal(&current_resolved, next))
+        {
+            if let Some(next) = next_resolved {
+                current_resolved = next;
+            }
+            protected_setup = prepare_protected_setup_plan(
+                current_resolved.clone(),
+                &permissions,
+                cwd,
+                &env_map,
+                workspace,
+                observer_creds.as_ref(),
+            )?;
+            sandbox_creds = crate::identity::require_logon_sandbox_creds(
+                &permissions,
+                cwd,
+                &env_map,
+                sandbox_home,
+                read_roots_override,
+                read_roots_include_platform_defaults,
+                write_roots_override,
+                &protected_setup.deny_read,
+                &protected_setup.deny_write,
+                &trusted_deny_write_paths_override,
+                proxy_enforced,
+                crate::WindowsSandboxProxySettingsMode::Reconcile,
+                trusted_workspace,
+            )?;
+            if revalidate_existing_pinned_workspace_paths(&protected_setup.pins)? {
+                anyhow::bail!("protected path remained unstable after bounded ACL setup");
+            }
+        }
         // Setup refresh/elevation is a synchronous external operation and cannot be interrupted
         // safely from this call. Do not continue into ACL mutation or runner creation if it
         // completes after the caller has cancelled.
@@ -333,8 +660,11 @@ mod windows_impl {
             .as_ref()
             .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
         {
-            return Ok(cancelled_capture_result());
+            return Ok((cancelled_capture_result(), None));
         }
+        // Preserve the initial observer identity for cancellation before runner spawn. A
+        // successful credential-refresh retry replaces it with the identity that actually ran.
+        let mut used_sandbox_creds = Some(sandbox_creds.clone());
         // Build per-workspace capability SIDs for ACL grants.
         let (sid_for_null, cap_sids) = if permissions.uses_write_capabilities_for_cwd(cwd, &env_map)
         {
@@ -363,7 +693,7 @@ mod windows_impl {
             .as_ref()
             .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
         {
-            return Ok(cancelled_capture_result());
+            return Ok((cancelled_capture_result(), None));
         }
         unsafe {
             allow_null_device(sid_for_null.as_ptr());
@@ -372,15 +702,48 @@ mod windows_impl {
             .as_ref()
             .is_some_and(crate::WindowsSandboxCancellationToken::is_cancelled)
         {
-            return Ok(cancelled_capture_result());
+            return Ok((cancelled_capture_result(), None));
         }
 
-        if let Some(slot) = workspace_change_monitor {
-            let workspace = workspace_roots
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("workspace change monitoring requires a root"))?;
-            *slot = Some(crate::WorkspaceChangeMonitor::start(workspace.as_path())?);
+        if let Some(slot) = workspace_change_monitor.as_deref_mut() {
+            // Rollover the cache checkpoint guard before the child starts. Setup notifications
+            // are not silently classified as harmless; any incomplete or changed guard fails
+            // closed before spawning the command.
+            let next = crate::WorkspaceChangeMonitor::start(workspace.as_path())?;
+            if let Some(setup_guard) = slot.take() {
+                let setup_observation = setup_guard.finish()?;
+                if setup_observation != crate::WorkspaceChangeObservation::Unchanged {
+                    anyhow::bail!("workspace changed during protected setup");
+                }
+            }
+            *slot = Some(next);
         }
+        if let Some((resolver, _, _)) = observers.as_mut() {
+            let final_resolved = merge_required_protected_paths(
+                observe_as_sandbox_user(
+                    observer_creds.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("sandbox observer credentials are unavailable")
+                    })?,
+                    resolver,
+                )?,
+                deny_read_paths_override,
+                deny_write_paths_override,
+            );
+            if !resolved_path_sets_equal(&current_resolved, &final_resolved) {
+                anyhow::bail!("protected path set changed after bounded ACL setup");
+            }
+        }
+        revalidate_pinned_workspace_paths(&protected_setup.pins)?;
+        // Keep the no-follow deny-set pins alive through runner spawn, IPC, and Job cleanup.
+        // Public certificate-only PEM targets are intentionally skipped by deny-read ACL
+        // mutation, but remain pinned so their admitted identity cannot be replaced meanwhile.
+        let (before_observation, after_observer) = match observers {
+            Some((_resolver, before_observer, after_observer)) => (
+                Some(observe_as_sandbox_user(&sandbox_creds, before_observer)?),
+                Some(after_observer),
+            ),
+            None => (None, None),
+        };
 
         let capture_result = (|| -> Result<CaptureResult> {
             let spawn_request = SpawnRequest {
@@ -405,6 +768,9 @@ mod windows_impl {
                     {
                         anyhow::bail!("sandbox capture cancelled before runner spawn");
                     }
+                    // Keep the credentials that actually established the successful runner
+                    // transport; the retry path may replace the initially selected identity.
+                    used_sandbox_creds = Some(sandbox_creds.clone());
                     let registration =
                         register_runner_lease(sandbox_home, &sandbox_creds.username)?;
                     let mut request = spawn_request.clone();
@@ -434,8 +800,8 @@ mod windows_impl {
                         read_roots_override,
                         read_roots_include_platform_defaults,
                         write_roots_override,
-                        &deny_read_paths_override,
-                        &deny_write_paths_override,
+                        &protected_setup.deny_read,
+                        &protected_setup.deny_write,
                         &trusted_deny_write_paths_override,
                         proxy_enforced,
                         crate::WindowsSandboxProxySettingsMode::Reconcile,
@@ -526,7 +892,73 @@ mod windows_impl {
             }
         };
         match (capture_result, lease_cleanup) {
-            (Ok(capture), Ok(())) => Ok(capture),
+            (Ok(capture), Ok(())) => {
+                let observation = match (before_observation, after_observer) {
+                    (Some(before), Some(mut after_observer)) => {
+                        let workspace = workspace_roots.first().ok_or_else(|| {
+                            anyhow::anyhow!("workspace observation requires a root")
+                        })?;
+                        // Overlap a second monitor with the end of the command monitor. This
+                        // closes the finish-to-snapshot TOCTOU gap: any out-of-band write while
+                        // the final snapshot is read invalidates the observation.
+                        let after_guard =
+                            crate::WorkspaceChangeMonitor::start(workspace.as_path())?;
+                        let monitor_slot = workspace_change_monitor.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "sandbox workspace change monitor unavailable after capture"
+                            )
+                        })?;
+                        let change = monitor_slot
+                            .take()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "sandbox workspace change monitor unavailable after capture"
+                                )
+                            })?
+                            .finish()?;
+                        let creds = used_sandbox_creds.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "sandbox workspace observer credentials unavailable after capture"
+                            )
+                        })?;
+                        let change_for_after = change.clone();
+                        let after =
+                            observe_as_sandbox_user(&creds, || after_observer(change_for_after))?;
+                        let retry_guard =
+                            crate::WorkspaceChangeMonitor::start(workspace.as_path())?;
+                        let trailing_change = after_guard.finish()?;
+                        if trailing_change == crate::WorkspaceChangeObservation::Unchanged {
+                            *monitor_slot = Some(retry_guard);
+                            Some((before, after, change))
+                        } else {
+                            let trailing_change_for_after = trailing_change.clone();
+                            let after = observe_as_sandbox_user(&creds, || {
+                                after_observer(trailing_change_for_after)
+                            })?;
+                            let continuation_guard =
+                                crate::WorkspaceChangeMonitor::start(workspace.as_path())?;
+                            if retry_guard.finish()? != crate::WorkspaceChangeObservation::Unchanged
+                            {
+                                anyhow::bail!(
+                                    "workspace did not stabilize during its final observation"
+                                );
+                            }
+                            *monitor_slot = Some(continuation_guard);
+                            Some((
+                                before,
+                                after,
+                                crate::workspace_change::merge_workspace_change_observations(
+                                    change,
+                                    trailing_change,
+                                ),
+                            ))
+                        }
+                    }
+                    (None, None) => None,
+                    _ => anyhow::bail!("sandbox workspace observer state is inconsistent"),
+                };
+                Ok((capture, observation))
+            }
             (Err(error), Ok(())) | (_, Err(error)) => Err(error),
         }
     }
@@ -613,10 +1045,18 @@ mod windows_impl {
     mod tests {
         use super::ElevatedSandboxProfileCaptureRequest;
         use super::acquire_deny_read_execution_guard;
+        use super::merge_required_protected_paths;
+        use super::prepare_protected_setup_plan;
+        use super::resolved_path_sets_equal;
+        use crate::AbsolutePathBuf;
         use crate::WindowsSandboxCancellationToken;
+        use crate::deny_read_acl::TEST_CERTIFICATE_DER_BASE64;
+        use crate::deny_read_acl::existing_public_certificate_only_pem;
         use crate::deny_read_state::try_lock_deny_read_execution;
         use crate::permissions::PermissionProfile;
+        use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
         use std::collections::HashMap;
+        use std::fs;
         use std::path::Path;
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
@@ -676,11 +1116,101 @@ mod windows_impl {
             release_tx.send(()).expect("release held execution mutex");
             holder.join().expect("join execution mutex holder");
         }
+
+        #[test]
+        fn protected_path_stabilization_compares_windows_sets_case_insensitively() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let lower = temp.path().join("secret.env");
+            let upper = temp.path().join("SECRET.ENV");
+            let lower =
+                AbsolutePathBuf::from_absolute_path_checked(&lower).expect("absolute lower path");
+            let upper =
+                AbsolutePathBuf::from_absolute_path_checked(&upper).expect("absolute upper path");
+
+            assert!(resolved_path_sets_equal(
+                &(vec![lower.clone(), lower.clone()], vec![]),
+                &(vec![upper], vec![])
+            ));
+            assert!(!resolved_path_sets_equal(
+                &(vec![lower.clone()], vec![]),
+                &(vec![], vec![lower])
+            ));
+        }
+
+        #[test]
+        fn protected_path_stabilization_retains_explicit_missing_targets() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let required =
+                AbsolutePathBuf::from_absolute_path_checked(temp.path().join("future-secret.env"))
+                    .expect("absolute required path");
+
+            let merged = merge_required_protected_paths(
+                (vec![], vec![]),
+                std::slice::from_ref(&required),
+                std::slice::from_ref(&required),
+            );
+
+            assert_eq!(merged.0.len(), 1);
+            assert_eq!(merged.1.len(), 1);
+        }
+
+        #[test]
+        fn public_certificate_setup_keeps_identity_pin_through_replacement_boundary() {
+            let temp = tempfile::tempdir().expect("workspace parent");
+            let workspace = temp.path().join("workspace");
+            fs::create_dir(&workspace).expect("workspace");
+            let certificate = workspace.join("certificate.pem");
+            let certificate_contents = format!(
+                "# Issuer: CN=Public Root\n# Subject: CN=Public Root\n-----BEGIN CERTIFICATE-----\n{TEST_CERTIFICATE_DER_BASE64}\n-----END CERTIFICATE-----\n"
+            );
+            fs::write(&certificate, &certificate_contents).expect("public certificate");
+            assert!(
+                existing_public_certificate_only_pem(&certificate)
+                    .expect("classify public certificate")
+            );
+
+            let workspace =
+                AbsolutePathBuf::from_absolute_path_checked(&workspace).expect("workspace path");
+            let target =
+                AbsolutePathBuf::from_absolute_path_checked(&certificate).expect("target path");
+            let permissions =
+                ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                    &PermissionProfile::workspace_write(),
+                    std::slice::from_ref(&workspace),
+                )
+                .expect("resolved workspace permissions");
+            let plan = prepare_protected_setup_plan(
+                (vec![target], vec![]),
+                &permissions,
+                workspace.as_path(),
+                &HashMap::new(),
+                &workspace,
+                None,
+            )
+            .expect("protected setup plan");
+            assert_eq!(plan.pins.len(), 1, "public certificate must remain pinned");
+
+            let displaced = temp.path().join("certificate-displaced.pem");
+            let replaced = fs::rename(&certificate, &displaced).is_ok();
+            if replaced {
+                fs::write(&certificate, certificate_contents).expect("replacement certificate");
+                assert!(
+                    crate::path_safety::revalidate_pinned_workspace_paths(&plan.pins).is_err(),
+                    "public certificate replacement must fail the setup boundary"
+                );
+            } else {
+                crate::path_safety::revalidate_pinned_workspace_paths(&plan.pins)
+                    .expect("unchanged public certificate pin");
+            }
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 pub use windows_impl::run_windows_sandbox_capture_for_permission_profile;
+
+#[cfg(target_os = "windows")]
+pub use windows_impl::run_windows_sandbox_capture_for_permission_profile_with_observations;
 
 #[cfg(not(target_os = "windows"))]
 mod stub {

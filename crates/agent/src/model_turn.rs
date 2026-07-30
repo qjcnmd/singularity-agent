@@ -14,7 +14,7 @@ use singularity_tools::{ToolBroker, ToolCallRequest, ToolResult, approximate_tok
 use super::context::{ContextBudget, model_messages_from_context};
 use super::{
     AGENT_DEVELOPER_INSTRUCTIONS, AgentLoopInput, AgentLoopState, ContextBundle,
-    PROVIDER_HISTORY_REJECTED_TOOL, ProviderProtocolContract, is_strict_tool_schema_compatible,
+    ProviderProtocolContract, is_strict_tool_schema_compatible,
 };
 
 pub(super) fn safe_request_digest(request: &ModelTurnRequest) -> String {
@@ -24,7 +24,6 @@ pub(super) fn safe_request_digest(request: &ModelTurnRequest) -> String {
 
 pub(super) struct ModelToolView {
     pub(super) tools: Vec<ModelToolSchema>,
-    pub(super) visible_tool_names: Vec<String>,
     pub(super) max_tool_calls: u32,
 }
 
@@ -32,7 +31,6 @@ impl ModelToolView {
     pub(super) fn finalization() -> Self {
         Self {
             tools: Vec::new(),
-            visible_tool_names: Vec::new(),
             max_tool_calls: 0,
         }
     }
@@ -137,10 +135,6 @@ pub(super) fn model_tool_view(
         return Err("provider tool-definition limit must be greater than zero".to_string());
     }
     let visible_tools = visible_model_tool_schemas(loop_tools);
-    let visible_tool_names = visible_tools
-        .iter()
-        .map(|tool| tool.name.clone())
-        .collect::<Vec<_>>();
     if visible_tools.len() > capabilities.max_tools_per_request as usize {
         return Err(format!(
             "provider direct tool-definition limit ({}) is below the required tool count ({})",
@@ -150,7 +144,6 @@ pub(super) fn model_tool_view(
     }
     Ok(ModelToolView {
         tools: visible_tools,
-        visible_tool_names,
         max_tool_calls,
     })
 }
@@ -250,41 +243,43 @@ pub(super) fn provider_history_assistant_message(
     original: Option<&ModelMessage>,
     model_visible_calls: &[ModelToolCall],
     execution_calls: &[ModelToolCall],
+    rejected_calls: &[bool],
 ) -> ModelMessage {
-    // 在内部 occurrence 中保留拒绝调用的诊断信息，但不把 provider 原始名称或参数重放到下一次请求。
+    // 拒绝调用的参数永不重放；可移植的原工具名和 call_id 保持配对。
     debug_assert_eq!(model_visible_calls.len(), execution_calls.len());
+    debug_assert_eq!(model_visible_calls.len(), rejected_calls.len());
     let mut message = original
         .cloned()
         .unwrap_or_else(|| ModelMessage::assistant_tool_calls(Vec::new()));
     message.tool_calls = model_visible_calls
         .iter()
         .zip(execution_calls)
-        .map(|(model_visible_call, execution_call)| {
-            if execution_call.parse_status == ModelToolParseStatus::Valid {
+        .zip(rejected_calls)
+        .map(|((model_visible_call, execution_call), rejected)| {
+            if !rejected && execution_call.parse_status == ModelToolParseStatus::Valid {
                 model_visible_call.clone()
             } else {
-                ModelToolCall {
-                    tool_call_id: model_visible_call.tool_call_id.clone(),
-                    tool_name: PROVIDER_HISTORY_REJECTED_TOOL.to_string(),
-                    arguments: json!({}),
-                    raw_arguments: "{}".to_string(),
-                    parse_status: ModelToolParseStatus::Valid,
-                    validation_errors: Vec::new(),
-                }
+                provider_history_rejected_tool_call(model_visible_call)
             }
         })
         .collect();
     message
 }
 
-pub(super) fn tool_result_message(
-    tool_result: &ToolResult,
-    provider_tool_name: Option<&str>,
-) -> ModelMessage {
-    let mut payload = tool_result.to_message_payload();
-    if let Some(provider_tool_name) = provider_tool_name {
-        payload["tool_name"] = json!(provider_tool_name);
+/// Build a provider-facing rejected call without replaying untrusted arguments.
+pub(super) fn provider_history_rejected_tool_call(call: &ModelToolCall) -> ModelToolCall {
+    ModelToolCall {
+        tool_call_id: call.tool_call_id.clone(),
+        tool_name: call.tool_name.clone(),
+        arguments: json!({}),
+        raw_arguments: "{}".to_string(),
+        parse_status: ModelToolParseStatus::Valid,
+        validation_errors: Vec::new(),
     }
+}
+
+pub(super) fn tool_result_message(tool_result: &ToolResult) -> ModelMessage {
+    let payload = tool_result.to_message_payload();
     let mut message = ModelMessage::text(ModelRole::Tool, payload.to_string());
     message.tool_call_id = Some(tool_result.tool_call_id.clone());
     message

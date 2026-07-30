@@ -190,10 +190,6 @@ fn configured_provider_drops_cleanly_inside_app_server_runtime() {
     );
 }
 
-fn expected_eval_blocker_kind() -> &'static str {
-    "workspace_preparation"
-}
-
 fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_json::Value {
     serde_json::json!({
         "request_id": &request.request_id,
@@ -771,7 +767,7 @@ fn app_server_binary_reports_only_redacted_provider_configuration() {
 }
 
 #[test]
-fn app_server_batch_shutdown_stays_with_stdin_owner_when_eval_is_present() {
+fn app_server_batch_shutdown_stays_with_stdin_owner_when_unknown_method_is_present() {
     let dir = tempfile::tempdir().expect("temp directory");
     let mut child = Command::new(app_server_bin())
         .current_dir(dir.path())
@@ -918,238 +914,23 @@ fn app_server_reports_default_agent_loop_backend_capability() {
 }
 
 #[test]
-fn app_server_eval_run_writes_blocked_agent_loop_result_artifacts_without_fallback() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = configured_app_server(store).with_sandbox_backend(CompletedSandboxBackend);
-    let manifest = dir.path().join("eval.json");
-    let output_root = dir.path().join("eval-output");
-    std::fs::write(
-        &manifest,
-        r#"{
-  "schema_version": "evaluation.task_set/v5",
-  "trial_count": 1,
-  "tasks": [
-    {
-      "task_id": "fixture_eval",
-      "description": "Exercise a blocked typed evaluation task.",
-      "capabilities": ["provider_failure_attribution"],
-      "workspace": {
-        "source": {"type": "local", "path": "missing-source"}
-      },
-      "agent": {
-        "instructions": "Finish the task.",
-        "allowed_paths": ["README.md"],
-        "required_tool_capabilities": [
-          {"capability": "workspace_read", "minimum_version": 1}
-        ]
-      },
-      "evaluator": {
-        "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "hidden": {"commands": [{"argv": ["git", "status", "--porcelain"]}]}
-      }
-    }
-  ]
-}"#,
-    )
-    .expect("manifest");
+fn app_server_does_not_expose_development_evaluation_method() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let mut server = app_server(store);
     server
         .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .unwrap();
+        .expect("initialize");
     server
         .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .unwrap();
+        .expect("initialized");
 
-    let request = serde_json::json!({
-        "jsonrpc": "2.0", "method": "eval/run",
-        "id": 2,
-        "params": {
-            "manifest": manifest,
-            "runId": "eval_blocked",
-            "outputRoot": output_root,
-        }
-    })
-    .to_string();
-    let response = server.handle_json(&request).unwrap();
-    let result = result_message(&response);
+    let response = server
+        .handle_json(r#"{"jsonrpc":"2.0","method":"eval/run","id":2,"params":{"manifest":"manifest.json","runId":"run"}}"#)
+        .expect("unknown method response");
 
-    assert_eq!(result["runner"], "agent_loop");
-    assert_eq!(result["status"], "blocked");
-    assert_eq!(result["blocker"], expected_eval_blocker_kind());
-    assert_eq!(result["evaluation_passed"], false);
-    assert!(result["tasks"].as_array().is_some_and(Vec::is_empty));
-    let result_path = result["result_path"].as_str().expect("result path");
-    let report_path = result["report_path"].as_str().expect("report path");
-    let evidence_path = result["evidence_path"].as_str().expect("evidence path");
-    assert!(std::path::Path::new(result_path).exists());
-    assert!(std::path::Path::new(report_path).exists());
-    assert!(std::path::Path::new(evidence_path).exists());
-    let payload: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(result_path).expect("result json"))
-            .expect("result payload");
-    assert_eq!(payload["schema_version"], "evaluation.result/v8");
-    assert_eq!(payload["status"], "blocked");
-    assert!(payload["tasks"].as_array().is_some_and(Vec::is_empty));
-    assert_eq!(payload["summary"]["sampled_trial_count"], 0);
-    assert_eq!(payload["summary"]["agent_scored_trial_count"], 0);
-    let evidence_json = std::fs::read_to_string(evidence_path).expect("evidence json");
-    assert!(!evidence_json.contains(&dir.path().to_string_lossy().to_string()));
-    assert!(!evidence_json.contains("missing-source"));
-    let evidence: serde_json::Value =
-        serde_json::from_str(&evidence_json).expect("evidence payload");
-    assert_eq!(evidence["schema_version"], "evaluation.evidence/v3");
-    assert_eq!(evidence["denominator_task_count"], 1);
-    assert_eq!(evidence["denominator_trial_count"], 0);
-    assert!(evidence["tasks"].as_array().is_some_and(|tasks| {
-        tasks
-            .iter()
-            .all(|task| task["trials"].as_array().is_some_and(Vec::is_empty))
-    }));
+    assert_eq!(response[0]["error"]["code"], -32601);
+    assert_eq!(response[0]["error"]["message"], "Method not found");
 }
-
-#[test]
-fn app_server_eval_run_reports_smoke_not_run_when_blocked_before_agent() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = configured_app_server(store).with_sandbox_backend(CompletedSandboxBackend);
-    let manifest = dir.path().join("eval.json");
-    let output_root = dir.path().join("eval-output");
-    std::fs::write(
-        &manifest,
-        r#"{
-  "schema_version": "evaluation.task_set/v5",
-  "trial_count": 1,
-  "tasks": [
-    {
-      "task_id": "fixture_eval",
-      "description": "Exercise a blocked typed evaluation smoke command.",
-      "capabilities": ["required_verification"],
-      "workspace": {
-        "source": {"type": "local", "path": "missing-source"}
-      },
-      "agent": {
-        "instructions": "Finish the task.",
-        "allowed_paths": ["README.md"],
-        "required_tool_capabilities": [
-          {"capability": "workspace_read", "minimum_version": 1},
-          {"capability": "command_execution", "minimum_version": 1}
-        ],
-        "smoke_commands": [
-          {"argv": ["git", "status", "--short"], "timeout_seconds": 30}
-        ]
-      },
-      "evaluator": {
-        "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "hidden": {"commands": [{"argv": ["git", "status", "--porcelain"]}]}
-      }
-    }
-  ]
-}"#,
-    )
-    .expect("manifest");
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .unwrap();
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .unwrap();
-
-    let request = serde_json::json!({
-        "jsonrpc": "2.0", "method": "eval/run",
-        "id": 2,
-        "params": {
-            "manifest": manifest,
-            "runId": "eval_smoke_not_run",
-            "outputRoot": output_root,
-        }
-    })
-    .to_string();
-    let response = server.handle_json(&request).unwrap();
-    let result = result_message(&response);
-
-    assert_eq!(result["status"], "blocked");
-    assert_eq!(result["blocker"], expected_eval_blocker_kind());
-    assert_eq!(result["evaluation_passed"], false);
-    assert!(result["tasks"].as_array().is_some_and(Vec::is_empty));
-    let evidence_path = result["evidence_path"].as_str().expect("evidence path");
-    let evidence: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(evidence_path).expect("evidence json"))
-            .expect("evidence payload");
-    assert_eq!(evidence["denominator_task_count"], 1);
-    assert_eq!(evidence["denominator_trial_count"], 0);
-    assert!(evidence["tasks"].as_array().is_some_and(|tasks| {
-        tasks
-            .iter()
-            .all(|task| task["trials"].as_array().is_some_and(Vec::is_empty))
-    }));
-}
-
-#[test]
-fn app_server_eval_run_fails_closed_before_agent_on_invalid_workspace() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let store = SessionStore::open(dir.path().join("sessions.sqlite3")).expect("open store");
-    let mut server = configured_app_server(store).with_sandbox_backend(CompletedSandboxBackend);
-    let manifest = dir.path().join("eval.json");
-    let output_root = dir.path().join("eval-output");
-    std::fs::write(
-        &manifest,
-        r#"{
-  "schema_version": "evaluation.task_set/v5",
-  "trial_count": 1,
-  "tasks": [
-    {
-      "task_id": "fixture_eval",
-      "description": "Exercise a blocked typed evaluation task.",
-      "capabilities": ["sandbox_enforcement"],
-      "workspace": {
-        "source": {"type": "local", "path": "missing-source"}
-      },
-      "agent": {
-        "instructions": "Finish the task.",
-        "allowed_paths": ["README.md"],
-        "required_tool_capabilities": [
-          {"capability": "workspace_read", "minimum_version": 1}
-        ]
-      },
-      "evaluator": {
-        "baseline": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "public": {"commands": [{"argv": ["git", "status", "--short"]}]},
-        "hidden": {"commands": [{"argv": ["git", "status", "--porcelain"]}]}
-      }
-    }
-  ]
-}"#,
-    )
-    .expect("manifest");
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test","title":"Test","version":"0.1.0"}}}"#)
-        .unwrap();
-    server
-        .handle_json(r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#)
-        .unwrap();
-
-    let request = serde_json::json!({
-        "jsonrpc": "2.0", "method": "eval/run",
-        "id": 2,
-        "params": {
-            "manifest": manifest,
-            "runId": "eval_agent_loop_unavailable",
-            "outputRoot": output_root,
-        }
-    })
-    .to_string();
-    let response = server.handle_json(&request).unwrap();
-    let result = result_message(&response);
-
-    assert_eq!(result["runner"], "agent_loop");
-    assert_eq!(result["status"], "blocked");
-    assert_eq!(result["blocker"], "workspace_preparation");
-    assert_eq!(result["evaluation_passed"], false);
-    assert!(result["tasks"].as_array().is_some_and(Vec::is_empty));
-}
-
 #[test]
 fn app_server_rejects_public_agent_host_selector() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3197,8 +2978,7 @@ fn approval_resume_workspace_write_e2e_from_json_rpc_entry() {
                 "timeout_seconds": 30,
                 "sandbox_mode": "workspace_write",
                 "network_access": "denied"
-            },
-            "required": 1
+            }
         }]
     });
     let mut plan_response = ModelTurnResponse::completed("req_2", "resp_2", "");

@@ -5,6 +5,7 @@
 mod evidence;
 mod manifest;
 mod result;
+pub mod runner;
 mod value;
 
 use std::path::PathBuf;

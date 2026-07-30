@@ -526,9 +526,6 @@ async fn send_output_async(
 }
 
 fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
-    if message.method_name() == Some(Method::EvalRun.as_str()) {
-        return true;
-    }
     if message.is_notification() {
         return false;
     }
@@ -536,8 +533,8 @@ fn is_request_worker_method(message: &JsonRpcMessage) -> bool {
         message.method_name(),
         Some(method)
             if method == Method::TurnStart.as_str()
+                || method == Method::TurnResume.as_str()
                 || method == Method::ApprovalDecision.as_str()
-                || method == Method::EvalRun.as_str()
     )
 }
 
@@ -636,40 +633,46 @@ fn run_request_worker(
     let request_id = message.id().cloned();
     let mut output_error = None;
     let streaming_method = message.method_name();
-    let result = if matches!(
-        streaming_method,
-        Some(method)
-            if method == Method::TurnStart.as_str()
-                || method == Method::ApprovalDecision.as_str()
-    ) {
-        let mut send_streaming_output = |output: AppServerOutput| {
-            if output_error.is_none()
-                && let Err(error) = send_reserved_output(
-                    &outputs,
-                    &cancellation,
-                    output.reservation.order,
-                    output.message,
-                    output.trace_binding,
-                )
-            {
-                output_error = Some(error);
-            } else if output_error.is_some() {
-                outputs.order_state.complete(output.reservation.order);
+    let result =
+        if matches!(
+            streaming_method,
+            Some(method)
+                if method == Method::TurnStart.as_str()
+                    || method == Method::TurnResume.as_str()
+                    || method == Method::ApprovalDecision.as_str()
+        ) {
+            let mut send_streaming_output = |output: AppServerOutput| {
+                if output_error.is_none()
+                    && let Err(error) = send_reserved_output(
+                        &outputs,
+                        &cancellation,
+                        output.reservation.order,
+                        output.message,
+                        output.trace_binding,
+                    )
+                {
+                    output_error = Some(error);
+                } else if output_error.is_some() {
+                    outputs.order_state.complete(output.reservation.order);
+                }
+            };
+            match streaming_method {
+                Some(method) if method == Method::TurnStart.as_str() => worker
+                    .handle_turn_start_streaming_with_output(message, &mut send_streaming_output),
+                Some(method) if method == Method::TurnResume.as_str() => worker
+                    .handle_turn_resume_streaming_with_output(message, &mut send_streaming_output),
+                _ => worker.handle_approval_decision_streaming_with_output(
+                    message,
+                    &mut send_streaming_output,
+                ),
+            }
+        } else {
+            match worker.handle_with_output(message) {
+                Ok(messages) => send_app_server_outputs(&outputs, &cancellation, messages)
+                    .map_err(AppServerError::Workspace),
+                Err(error) => Err(error),
             }
         };
-        if streaming_method == Some(Method::TurnStart.as_str()) {
-            worker.handle_turn_start_streaming_with_output(message, &mut send_streaming_output)
-        } else {
-            worker
-                .handle_approval_decision_streaming_with_output(message, &mut send_streaming_output)
-        }
-    } else {
-        match worker.handle_with_output(message) {
-            Ok(messages) => send_app_server_outputs(&outputs, &cancellation, messages)
-                .map_err(AppServerError::Workspace),
-            Err(error) => Err(error),
-        }
-    };
     if let Some(error) = output_error {
         return Err(error);
     }
@@ -2414,18 +2417,33 @@ mod tests {
     }
 
     #[test]
-    fn evaluation_requests_are_admitted_to_the_blocking_request_worker() {
+    fn development_evaluation_method_is_not_a_product_worker_method() {
         let message: JsonRpcMessage = serde_json::from_str(
             r#"{"jsonrpc":"2.0","method":"eval/run","id":1,"params":{"manifest":"manifest.json","runId":"run"}}"#,
         )
-        .expect("evaluation request");
+        .expect("unknown request");
 
-        assert!(is_request_worker_method(&message));
+        assert!(!is_request_worker_method(&message));
         let notification: JsonRpcMessage = serde_json::from_str(
             r#"{"jsonrpc":"2.0","method":"eval/run","params":{"manifest":"manifest.json","runId":"run"}}"#,
         )
-        .expect("evaluation notification");
-        assert!(is_request_worker_method(&notification));
+        .expect("unknown notification");
+        assert!(!is_request_worker_method(&notification));
+    }
+
+    #[test]
+    fn turn_resume_requests_are_admitted_to_the_blocking_request_worker() {
+        let request: JsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"turn/resume","id":1,"params":{"turnId":"turn"}}"#,
+        )
+        .expect("turn/resume request");
+        assert!(is_request_worker_method(&request));
+
+        let notification: JsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","method":"turn/resume","params":{"turnId":"turn"}}"#,
+        )
+        .expect("turn/resume notification");
+        assert!(!is_request_worker_method(&notification));
     }
 
     #[test]

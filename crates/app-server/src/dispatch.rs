@@ -113,7 +113,6 @@ impl AppServer {
             Method::TurnInput => self.turn_input(message),
             Method::TurnPause => self.turn_pause(message),
             Method::TurnResume => self.turn_resume(message),
-            Method::EvalRun => self.eval_run(message),
             Method::AgentCapability => self.agent_capability(message),
             Method::TurnInterrupt => self.turn_interrupt(message),
             Method::TurnStatus => self.turn_status(message),

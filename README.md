@@ -88,12 +88,6 @@ sg trace <run-id> --limit 20
 sg trace show <event-id>
 ```
 
-运行真实评估：
-
-```powershell
-sg eval run docs/evaluation/public-representative-task.json --run-id representative-001 --json
-```
-
 默认状态库位于当前工作目录的 `.singularity/rust-app-server.sqlite3`。sandbox 自身的受限账户元数据和 helper 缓存默认位于 `%USERPROFILE%\.singularity`；只有需要改变该位置时才设置 `SINGULARITY_HOME`。
 
 ## 安全边界
@@ -117,10 +111,16 @@ cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D w
 cargo test --workspace --all-targets --locked --no-fail-fast
 ```
 
+开发期能力评估使用独立工具，不属于 `sg` 或发布包：
+
+```powershell
+cargo run --locked -p singularity_evaluation --bin singularity-evaluation -- run docs/evaluation/public-representative-task.json --run-id representative-001 --json
+```
+
 完整 release 构建：
 
 ```powershell
-cargo build --workspace --bins --release --locked
+cargo build --release --locked --package singularity_cli --package singularity_app_server --package singularity_windows_sandbox --bins
 ```
 
 ## 许可证

@@ -1,3 +1,5 @@
+use crate::acl::AclOperation;
+use crate::acl::WindowsAclError;
 use crate::acl::deny_read_acl_fingerprint;
 use crate::acl::deny_read_acl_fingerprint_to_handle;
 use crate::acl::revoke_deny_read_ace_with_fingerprint_to_handle;
@@ -466,11 +468,33 @@ fn validate_state_acl_path(
     pinned_workspace_root: Option<(&File, &Path)>,
 ) -> Result<()> {
     if let Some((handle, root_path)) = pinned_workspace_root
-        && open_pinned_workspace_path(handle, root_path, path, 0)?.is_some()
+        && open_pinned_workspace_path(handle, root_path, path, 0)
+            .map_err(typed_acl_target_open_error)?
+            .is_some()
     {
         return Ok(());
     }
-    ensure_case_insensitive_acl_path(path)
+    ensure_case_insensitive_acl_path(path).map_err(typed_acl_target_open_error)
+}
+
+fn typed_acl_target_open_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| cause.is::<WindowsAclError>()) {
+        return error;
+    }
+    let native_code = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .map(|code| code as u32)
+    });
+    match native_code {
+        Some(code) => anyhow::Error::new(WindowsAclError {
+            operation: AclOperation::OpenTarget,
+            code,
+        })
+        .context(error),
+        None => error,
+    }
 }
 
 unsafe fn deny_read_acl_fingerprint_for_path(

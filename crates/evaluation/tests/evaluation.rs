@@ -88,6 +88,16 @@ fn public_representative_task_uses_the_current_runtime_contract() {
     }));
 }
 
+#[test]
+fn workspace_setup_is_one_trial_level_plan_step() {
+    let manifest = parse_manifest(&valid_manifest()).expect("manifest");
+    let task_id = TaskId::new("representative-task").expect("task id");
+    let plan = manifest.workspace_plan(&task_id).expect("workspace plan");
+
+    assert_eq!(plan.setup_commands.len(), 1);
+    assert_eq!(plan.setup_commands[0].argv.as_slice(), ["cargo", "fetch"]);
+}
+
 fn stages(agent: StageResult, public: StageResult, hidden: StageResult) -> EvaluationStageResults {
     EvaluationStageResults {
         baseline: StageResult {

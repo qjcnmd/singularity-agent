@@ -15,7 +15,6 @@ use support::{
 
 const APP_SERVER_BIN_ENV: &str = "SINGULARITY_APP_SERVER_BIN";
 const APP_SERVER_DB_ENV: &str = "SINGULARITY_APP_SERVER_DB";
-const EVAL_OUTPUT_DIR_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
 const DEFAULT_APP_SERVER_BIN: &str = "singularity_app_server";
 const FAKE_APP_SERVER_EXIT_CODE: i32 = 7;
 const JSON_RPC_SERVER_ERROR_CODE: i64 = -32000;
@@ -551,7 +550,7 @@ fn cli_run_continue_threads_trace_and_approvals_use_app_server_protocol() {
 
 // 验证 doctor 输出脱敏的 AgentLoop 与 provider readiness。
 #[test]
-fn cli_config_doctor_reports_redacted_agent_loop_and_eval_readiness() {
+fn cli_config_doctor_reports_redacted_agent_loop_and_provider_readiness() {
     let temp = tempfile::tempdir().expect("temp dir");
     let db_path = temp.path().join("sessions.sqlite3");
     let fake_server = FakeAppServer::new(
@@ -604,7 +603,7 @@ fn cli_config_doctor_reports_redacted_agent_loop_and_eval_readiness() {
     let doctor_stdout = stdout(&doctor);
     assert!(doctor_stdout.contains("client=protocol-only"));
     assert!(doctor_stdout.contains("agent_loop=completed"));
-    assert!(doctor_stdout.contains("evaluation=agent_loop"));
+    assert!(!doctor_stdout.contains("evaluation="));
     assert!(doctor_stdout.contains("provider_config_source=project_env"));
     assert!(doctor_stdout.contains("provider_snapshot_id=provider_snapshot_cli_test"));
     assert!(doctor_stdout.contains("provider_configured=false"));
@@ -947,163 +946,20 @@ fn cli_rejects_partial_agent_loop_capability_until_blockers_clear() {
     assert!(!trace.contains("turn/start"));
 }
 
-// 验证 eval 命令可脚本化校验 manifest 并拒绝缺失文件。
+// 产品 CLI 不暴露开发期 Evaluation runner。
 #[test]
-fn cli_eval_command_is_script_friendly_and_validates_manifest() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let missing_manifest = temp.path().join("missing.json");
-    let manifest = temp.path().join("eval.json");
-    std::fs::write(&manifest, "not json").expect("write manifest");
-
+fn cli_does_not_expose_development_evaluation_command() {
     let output = Command::cargo_bin("sg")
         .expect("binary")
-        .args([
-            "eval",
-            "run",
-            path_str(&missing_manifest),
-            "--run-id",
-            "eval_contract",
-            "--json",
-        ])
+        .args(["eval", "run", "manifest.json", "--run-id", "run"])
         .output()
-        .expect("eval cli");
+        .expect("sg cli");
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("eval manifest not found"));
-
-    let db_path = temp.path().join("sessions.sqlite3");
-    let invalid = cli_with_app_server(&app_server_bin(), &db_path)
-        .args([
-            "eval",
-            "run",
-            path_str(&manifest),
-            "--run-id",
-            "eval_invalid",
-            "--json",
-        ])
-        .output()
-        .expect("eval cli invalid");
-
-    assert!(!invalid.status.success());
-    assert!(stderr(&invalid).contains("app-server error: Invalid params"));
+    let error = stderr(&output);
+    assert!(error.contains("unrecognized subcommand"));
+    assert!(error.contains("eval"));
 }
-
-// 验证 eval run 通过 app-server 返回并渲染 verification 结果。
-#[test]
-fn cli_eval_run_uses_app_server_and_reports_verification_result() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let db_path = temp.path().join("sessions.sqlite3");
-    let eval_output = temp.path().join("eval-output");
-    let manifest = temp.path().join("eval.json");
-    let agent_loop_trace = temp.path().join("agent-loop-turn.json");
-    std::fs::write(
-        &manifest,
-        r#"{
-  "schema_version": "evaluation.task_set/v5",
-  "trial_count": 1,
-  "tasks": [{
-    "task_id": "fixture_agent",
-    "description": "Exercise the AgentLoop evaluation transport.",
-    "capabilities": ["single_file_fix", "required_verification"],
-    "workspace": {"source": {"type": "local", "path": "."}},
-    "agent": {
-      "instructions": "Change solution.txt so value is 1.",
-      "allowed_paths": ["solution.txt"],
-      "required_tool_capabilities": [
-        {"capability": "workspace_read", "minimum_version": 1},
-        {"capability": "workspace_write", "minimum_version": 1}
-      ]
-    },
-    "evaluator": {
-      "baseline": {"commands": [{"argv": ["rustc", "--version"]}]},
-      "public": {"commands": [{"argv": ["rustc", "--version"]}]},
-      "hidden": {"commands": [{"argv": ["rustc", "--version", "--verbose"]}]}
-    }
-  }]
-}"#,
-    )
-    .expect("write manifest");
-    let fake_server = FakeAppServer::new(
-        temp.path(),
-        Scenario::new()
-            .initialized()
-            .interaction(
-                "eval/run",
-                vec![
-                    capture_params(&agent_loop_trace),
-                    respond(json!({
-                        "run_id": "eval_agent",
-                        "manifest": path_str(&manifest),
-                        "runner": "agent_loop",
-                        "status": "completed",
-                        "blocker": null,
-                        "evaluation_passed": true,
-                        "tasks": [{
-                            "task_id": "fixture_agent",
-                            "status": "completed",
-                            "blocker": null,
-                            "stages": {
-                                "baseline": {"status": "passed", "blocker": null},
-                                "agent": {"status": "passed", "blocker": null},
-                                "public": {"status": "passed", "blocker": null},
-                                "hidden": {"status": "passed", "blocker": null}
-                            },
-                            "agent_completed": true,
-                            "tests_passed": true,
-                            "evaluation_passed": true,
-                            "diagnostics": {
-                                "smoke_command_satisfied": true,
-                                "local_process_fallback_count": 0,
-                                "local_process_fallback_unknown_count": 0
-                            }
-                        }],
-                        "result_path": path_str(&eval_output.join("eval_agent/result.json")),
-                        "report_path": path_str(&eval_output.join("eval_agent/report.json")),
-                        "evidence_path": path_str(&eval_output.join("eval_agent/evidence.json"))
-                    })),
-                ],
-            )
-            .shutdown(),
-    );
-
-    let output = cli_with_fake_app_server(&fake_server, &db_path)
-        .args([
-            "eval",
-            "run",
-            path_str(&manifest),
-            "--run-id",
-            "eval_agent",
-            "--json",
-        ])
-        .env(EVAL_OUTPUT_DIR_ENV, &eval_output)
-        .output()
-        .expect("eval cli");
-
-    assert!(output.status.success(), "stderr={}", stderr(&output));
-    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("eval json");
-    assert_eq!(value["runner"], "agent_loop");
-    assert_eq!(value["evaluation_passed"], true);
-    assert_eq!(value["tasks"][0]["agent_completed"], true);
-    assert_eq!(value["tasks"][0]["tests_passed"], true);
-    assert_eq!(
-        value["tasks"][0]["diagnostics"]["local_process_fallback_count"],
-        0
-    );
-    assert_eq!(
-        value["tasks"][0]["diagnostics"]["local_process_fallback_unknown_count"],
-        0
-    );
-    assert!(value["result_path"].as_str().is_some());
-    assert!(value["report_path"].as_str().is_some());
-    assert!(value["evidence_path"].as_str().is_some());
-    let params: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(agent_loop_trace).expect("agent loop trace"))
-            .expect("agent loop turn params");
-    assert_eq!(params["runId"], "eval_agent");
-    assert_eq!(params["manifest"], path_str(&manifest));
-    assert_eq!(params["outputRoot"], path_str(&eval_output));
-}
-
 // 验证完成的 turn 会渲染 AgentLoop 状态与 assistant answer。
 #[test]
 fn cli_renders_agent_loop_status_and_answer() {
@@ -1951,26 +1807,6 @@ fn stdout(output: &std::process::Output) -> String {
 // 解码 CLI stderr，便于测试断言。
 fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
-}
-
-// 定位或构建 app-server 二进制供生命周期测试使用。
-fn app_server_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_singularity_app_server").unwrap_or_else(|_| {
-        ensure_app_server_binary();
-        let profile_dir = std::env::current_exe()
-            .expect("current test binary")
-            .parent()
-            .and_then(Path::parent)
-            .expect("Cargo test profile directory")
-            .to_path_buf();
-        profile_dir
-            .join(format!(
-                "singularity_app_server{}",
-                std::env::consts::EXE_SUFFIX
-            ))
-            .to_string_lossy()
-            .into_owned()
-    })
 }
 
 // 只构建一次 app-server 二进制，供集成测试复用。

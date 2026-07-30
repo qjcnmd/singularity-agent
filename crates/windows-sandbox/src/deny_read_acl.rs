@@ -50,6 +50,26 @@ use windows_sys::Win32::System::WindowsProgramming::FILE_CREATED;
 
 const MAX_PEM_CLASSIFICATION_BYTES: u64 = 1024 * 1024;
 
+#[cfg(test)]
+pub(crate) const TEST_CERTIFICATE_DER_BASE64: &str = concat!(
+    "MIICzzCCAbegAwIBAgIJAPhKKnPDrEh9MA0GCSqGSIb3DQEBCwUAMCcxJTAjBgNV",
+    "BAMTHFNpbmd1bGFyaXR5IFRlc3QgQ2VydGlmaWNhdGUwHhcNMjYwNzE5MDMxNjI1",
+    "WhcNMjYwODE5MDMxNjI1WjAnMSUwIwYDVQQDExxTaW5ndWxhcml0eSBUZXN0IENl",
+    "cnRpZmljYXRlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzFHDKy/6",
+    "/bHJAeSQbXVimzISJ5bdtWseYdfQef4vW64r07zAnC23gdczH0I/hwiPCjHxAjfp",
+    "e4T0hVSnpHKRx/b+F5DWKceAPTw2E0gQ88DCtWP+FeLpP0JbOLalWId1HATZzCqO",
+    "as97UqHEfo3T8oP/4BmLJbi3WPZWbeBqrsfw+i4LgQ18+mdHbL3HfOQW3+p8Ar1",
+    "/Kj7RwgZJbsXXLuz7owisix8SMtkafQN4ZUh2HAnMtZIWki2Kc74/V7yVqQkFVAv",
+    "EZkpazll0hAmru3gWuYeGArConKHhxykEBl+bzcJgj6Q3UOcmrkImlG8H6jaQ7vw",
+    "Z4n1eEYWX1YXayQIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQB/w63efqTRm9qhf2xz",
+    "G3K2tJ6UEKUuj9o444nN0wE4ljiVquXFPo5QYl0j/cdv9cupkJ4PeAnAgbTr+0Or",
+    "FxEiqrhFEsTcPhEV3I62+huLV5EE7AoAb1JSKL/W7pcDF9zJMlkDc36VD21dlpDv",
+    "0BeAZR2/+wNvUvZNY3BwmMWWZSa3O88Aqe3JnJhEGt1YpQfFXaQDuoepBskyWtfw",
+    "QKd5d/pVL2mindlSqiCctJlly6W5BsKNpczWhQKkjc2eEDSDctgi5rshsTNvsjsc",
+    "HGhYnmwaX/HqJoKiaAXgojVbHh6SRcLj1ez+JfP3jM+kqsXVvhbGc7KYcG+Twae",
+    "7oD1o"
+);
+
 /// Build the exact ACL paths that should receive a deny-read ACE.
 ///
 /// Missing exact denies remain eligible for later materialization. Existing reparse targets are
@@ -111,6 +131,27 @@ fn is_public_certificate_only_pem(file: &mut std::fs::File) -> Result<bool> {
         &bytes,
         is_x509_certificate_der,
     ))
+}
+
+/// Returns whether an existing protected-path candidate is a pinned public-certificate-only PEM.
+///
+/// The caller must keep its workspace identity pin through the surrounding ACL setup boundary;
+/// this function never treats a missing, unreadable, reparse, malformed, or mixed PEM as public.
+pub fn existing_public_certificate_only_pem(path: &Path) -> Result<bool> {
+    if !is_pem_path(path) {
+        return Ok(false);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspect public certificate candidate {}", path.display())
+            });
+        }
+    }
+    let mut target = open_acl_target_file(path, FILE_GENERIC_READ)?;
+    is_public_certificate_only_pem(&mut target)
 }
 
 fn is_reparse_point_attributes(attributes: u32) -> bool {
@@ -613,6 +654,7 @@ pub(crate) unsafe fn apply_deny_read_acls_with_ownership_before_set(
 
 #[cfg(test)]
 mod tests {
+    use super::TEST_CERTIFICATE_DER_BASE64;
     use super::apply_deny_read_acls;
     use super::apply_deny_read_acls_with_ownership_before_set;
     use super::ensure_directory_materialized;
@@ -942,24 +984,6 @@ mod tests {
 
     #[test]
     fn pem_classification_allows_public_certificates_and_protects_private_keys() {
-        const TEST_CERTIFICATE_DER_BASE64: &str = concat!(
-            "MIICzzCCAbegAwIBAgIJAPhKKnPDrEh9MA0GCSqGSIb3DQEBCwUAMCcxJTAjBgNV",
-            "BAMTHFNpbmd1bGFyaXR5IFRlc3QgQ2VydGlmaWNhdGUwHhcNMjYwNzE5MDMxNjI1",
-            "WhcNMjYwODE5MDMxNjI1WjAnMSUwIwYDVQQDExxTaW5ndWxhcml0eSBUZXN0IENl",
-            "cnRpZmljYXRlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzFHDKy/6",
-            "/bHJAeSQbXVimzISJ5bdtWseYdfQef4vW64r07zAnC23gdczH0I/hwiPCjHxAjfp",
-            "e4T0hVSnpHKRx/b+F5DWKceAPTw2E0gQ88DCtWP+FeLpP0JbOLalWId1HATZzCqO",
-            "as97UqHEfo3T8oP/4BmLJbi3WPZWbeBqrsfw+i4LgQ18+mdHbL3HfOQW3+p8Ar1",
-            "/Kj7RwgZJbsXXLuz7owisix8SMtkafQN4ZUh2HAnMtZIWki2Kc74/V7yVqQkFVAv",
-            "EZkpazll0hAmru3gWuYeGArConKHhxykEBl+bzcJgj6Q3UOcmrkImlG8H6jaQ7vw",
-            "Z4n1eEYWX1YXayQIDAQABMA0GCSqGSIb3DQEBCwUAA4IBAQB/w63efqTRm9qhf2xz",
-            "G3K2tJ6UEKUuj9o444nN0wE4ljiVquXFPo5QYl0j/cdv9cupkJ4PeAnAgbTr+0Or",
-            "FxEiqrhFEsTcPhEV3I62+huLV5EE7AoAb1JSKL/W7pcDF9zJMlkDc36VD21dlpDv",
-            "0BeAZR2/+wNvUvZNY3BwmMWWZSa3O88Aqe3JnJhEGt1YpQfFXaQDuoepBskyWtfw",
-            "QKd5d/pVL2mindlSqiCctJlly6W5BsKNpczWhQKkjc2eEDSDctgi5rshsTNvsjsc",
-            "HGhYnmwaX/HqJoKiaAXgojVbHh6SRcLj1ez+JfP3jM+kqsXVvhbGc7KYcG+Twae",
-            "7oD1o"
-        );
         let tmp = TempDir::new().expect("tempdir");
         let certificate = tmp.path().join("certificate.pem");
         let disguised_secret = tmp.path().join("disguised-secret.pem");

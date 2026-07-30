@@ -1,8 +1,9 @@
-//! Evaluation runner 的任务投影、Agent stage、验证证据与安全产物协调。
+//! 开发期 Evaluation runner 的任务投影、Agent stage、验证证据与安全产物协调。
 //!
 //! 本模块只把 manifest 的可信内部命令和模型可见 command string 分开投影，
 //! 并在固定 gate、sandbox 与 evidence 合同下汇总结果。
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,17 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use serde::Serialize;
-use serde_json::{Value, json};
-use singularity_agent::{
-    AgentLoop, AgentLoopEventSinkError, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics,
-    AgentStatus, AgentVerificationRequirement, agent_control_tool_entries,
-    terminal_command_scope_digests,
-};
-use singularity_core::{
-    CancellationToken, Timestamp, contains_sensitive_text, load_project_instructions,
-};
-use singularity_evaluation::{
+use crate::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
     EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationPromptStructure,
     EvaluationProviderEvidence, EvaluationResult, EvaluationSandboxPreflight,
@@ -28,6 +19,17 @@ use singularity_evaluation::{
     EvaluationStatus, EvaluationTaskResult, EvaluationTrialResult, PatchFormat,
     PlannedWorkspaceSource, RunId, StageResult, StageStatus, TaskId, VerificationStagePlan,
     WorkspacePlan,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use singularity_agent::{
+    AgentLoop, AgentLoopEventSinkError, AgentLoopInput, AgentLoopResult, AgentRecoveryMetrics,
+    AgentStatus, AgentVerificationAction, AgentVerificationCommand, agent_control_tool_entries,
+    terminal_command_scope_digests,
+};
+use singularity_app_server::TraceProjector;
+use singularity_core::{
+    CancellationToken, Timestamp, contains_sensitive_text, load_project_instructions,
 };
 use singularity_model::{
     ModelErrorCategory, ModelUsage, OpenAiProvider, ProviderAttemptMetadata,
@@ -40,22 +42,22 @@ use singularity_policy::{
     SettingsScope, WorkspaceRelativePath,
 };
 use singularity_protocol::{
-    EvalRunParams, EvalRunResult, TraceEvent, TraceSpanKind, TraceSpanPhase, TraceSpanProjection,
-    TraceSpanStatus,
+    TraceEvent, TraceSpanKind, TraceSpanPhase, TraceSpanProjection, TraceSpanStatus,
 };
+use singularity_sandbox::PreparedWorkspaceObservation;
 #[cfg(windows)]
 use singularity_sandbox::{TrustedWorkspaceError, TrustedWorkspaceLease};
 use singularity_tools::{
-    CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest, CommandResult,
-    CommandScriptRequest, CommandSemanticStatus, ExecutableAvailability, SandboxBackend,
-    SandboxCapabilities, SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact,
-    SandboxPreflightOutcome, SandboxPreflightReport, ToolAuthorization, ToolBroker, ToolCapability,
-    ToolExecutor, ToolRegistry, WorkspaceMutation, WorkspaceToolExecutor, WorkspaceTools,
+    COMMAND_TOOL as TOOL_COMMAND, CommandEnvironmentPolicy, CommandExecutionStatus, CommandRequest,
+    CommandResult, CommandScriptRequest, CommandSemanticStatus, EDIT_TOOL as TOOL_EDIT,
+    ExecutableAvailability, PATCH_TOOL as TOOL_PATCH, SandboxBackend, SandboxCapabilities,
+    SandboxFilesystemMode, SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightOutcome,
+    SandboxPreflightReport, ToolAuthorization, ToolBroker, ToolCapability, ToolExecutor,
+    ToolRegistry, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceToolExecutor, WorkspaceTools,
     command_script_scope_digest_with_policy, workspace_tool_entries,
 };
-
-#[allow(unused_imports)]
-use super::{TOOL_COMMAND, TOOL_EDIT, TOOL_GREP, TOOL_LIST, TOOL_PATCH, TOOL_READ};
+#[cfg(test)]
+use singularity_tools::{GREP_TOOL as TOOL_GREP, LIST_TOOL as TOOL_LIST, READ_TOOL as TOOL_READ};
 
 mod command;
 mod evidence;
@@ -63,35 +65,33 @@ mod workspace;
 
 use command::{
     CommandDiagnostic, command_blocker, command_succeeded, infrastructure_blocker,
-    run_command_spec, run_workspace_preparation_command,
-    run_workspace_preparation_read_only_command, sandbox_network_mode,
+    project_command_spec, run_command_spec, run_raw_command, run_task_workspace_preflight_command,
+    run_workspace_preparation_command, run_workspace_preparation_read_only_command,
+    sandbox_network_mode, unchanged_command_succeeded,
 };
 use evidence::{
     agent_command_observation, build_evaluation_evidence, build_zero_sampling_evidence,
     canonical_json_digest, content_digest,
 };
 use workspace::{
-    WorkspaceChangeEvidence, apply_agent_changes, copy_tree_checked, evaluation_changed_paths,
-    patch_evidence_digest, path_is_allowed, snapshot_workspace, validate_tree,
-    workspace_change_evidence, workspace_tree_digest,
+    ObservedPreparedSource, WorkspaceChangeEvidence, WorkspaceObservationMetric, WorkspaceSnapshot,
+    copy_tree_for_preparation, evaluation_changed_paths, materialize_prepared_workspace,
+    patch_evidence_digest, path_is_allowed, snapshot_workspace_incremental,
+    snapshot_workspace_with_work, workspace_change_evidence, workspace_root_identity,
+    workspace_snapshot_digest,
 };
-
-use super::observability::TraceProjector;
+#[cfg(test)]
+use workspace::{copy_tree_checked, snapshot_workspace};
 
 const RUNNER_NAME: &str = "agent_loop";
 const OUTPUT_ROOT_ENV: &str = "SINGULARITY_EVAL_OUTPUT_DIR";
-const DEFAULT_OUTPUT_ROOT: [&str; 2] = ["work", "evaluations"];
 const DEFAULT_AGENT_MAX_TURNS: u32 = 24;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_SETUP_TIMEOUT_SECONDS: u64 = 900;
 const GIT_TIMEOUT_SECONDS: u64 = 900;
 const SOURCE_DIR: &str = "source";
-const BASELINE_DIR: &str = "baseline";
 const AGENT_DIR: &str = "agent";
-const PUBLIC_DIR: &str = "public";
-const HIDDEN_DIR: &str = "hidden";
 const EVALUATOR_PATCH_FILE: &str = ".singularity-evaluator.patch";
-const EVALUATOR_GIT_DIR: &str = ".singularity-evaluator-git";
 const RESULT_FILE: &str = "result.json";
 const REPORT_FILE: &str = "report.json";
 const EVIDENCE_FILE: &str = "evidence.json";
@@ -109,7 +109,35 @@ const CARGO_DEP_HEX: &str = "012345678901234567890123456789012345678901234567890
 
 static ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-type SharedSandboxBackend = Arc<dyn SandboxBackend + Send + Sync>;
+/// 一次开发期 Evaluation 运行的输入。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluationRunParams {
+    pub manifest: String,
+    pub run_id: String,
+    pub output_root: Option<String>,
+}
+
+/// 一次开发期 Evaluation 运行的有限结果摘要。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationRunResult {
+    pub run_id: String,
+    pub manifest: String,
+    pub runner: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+    pub tasks: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_path: Option<String>,
+    pub evaluation_passed: bool,
+}
+
+/// Evaluation runner 绑定的严格 sandbox backend。
+pub type SharedSandboxBackend = Arc<dyn SandboxBackend + Send + Sync>;
 
 /// 将 Evaluation 自身的停止令牌绑定到既有 sandbox 执行边界。
 ///
@@ -165,6 +193,10 @@ impl SandboxBackend for CancellationAwareSandboxBackend {
         self.backend.preflight(workspace, cancellation)
     }
 
+    fn release_workspace_observation(&self, workspace: &Path) -> Result<(), String> {
+        self.backend.release_workspace_observation(workspace)
+    }
+
     fn probe_executable(
         &self,
         workspace: &Path,
@@ -173,6 +205,16 @@ impl SandboxBackend for CancellationAwareSandboxBackend {
     ) -> ExecutableAvailability {
         self.backend
             .probe_executable(workspace, executable, environment)
+    }
+
+    fn observe_prepared_workspace(
+        &self,
+        workspace: &Path,
+    ) -> Result<Option<Box<dyn singularity_sandbox::PreparedWorkspaceObserver>>, String> {
+        if self.cancellation.is_cancelled() {
+            return Err("evaluation cancelled before prepared workspace observation".to_string());
+        }
+        self.backend.observe_prepared_workspace(workspace)
     }
 }
 
@@ -192,11 +234,28 @@ struct StageDiagnostics {
     commands: Vec<CommandDiagnostic>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentSnapshotObservation {
+    Reused,
+    Incremental,
+    Full,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 struct TaskDiagnostics {
     source: Option<SourceProvenance>,
     source_commands: Vec<CommandDiagnostic>,
     source_preparation_duration_ms: u64,
+    copy_ms: u64,
+    transaction_wall_ms: u64,
+    snapshot_ms: u64,
+    digest_ms: u64,
+    source_full_scans: u64,
+    source_tree_entries_read: usize,
+    source_tree_content_reads: usize,
+    source_tree_content_bytes: u64,
+    source_image_bytes: u64,
     baseline: StageDiagnostics,
     agent: StageDiagnostics,
     public: StageDiagnostics,
@@ -205,6 +264,23 @@ struct TaskDiagnostics {
     baseline_duration_ms: u64,
     public_duration_ms: u64,
     hidden_duration_ms: u64,
+    agent_copy_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_observation: Option<WorkspaceObservationMetric>,
+    agent_command_observations: Vec<Value>,
+    agent_setup_ms: u64,
+    agent_snapshot_before_ms: u64,
+    agent_snapshot_before_tree_entries_read: usize,
+    agent_snapshot_before_tree_content_reads: usize,
+    agent_snapshot_before_tree_content_bytes: u64,
+    agent_snapshot_after_ms: u64,
+    agent_snapshot_after_tree_entries_read: usize,
+    agent_snapshot_after_tree_content_reads: usize,
+    agent_snapshot_after_tree_content_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_snapshot_after_observation: Option<AgentSnapshotObservation>,
+    agent_snapshot_full_scans: u64,
+    agent_patch_digest_ms: u64,
     changed_files: Vec<String>,
     patch_evidence: Vec<WorkspaceChangeEvidence>,
     patch_digest: Option<String>,
@@ -231,6 +307,7 @@ struct TaskDiagnostics {
     reasoning_tokens: u64,
     total_tokens: u64,
     provider_latency_ms: u64,
+    /// AgentLoop/provider elapsed time between the before/after workspace snapshots.
     agent_duration_ms: u64,
     local_process_fallback_count: usize,
     local_process_fallback_unknown_count: usize,
@@ -351,11 +428,45 @@ struct TaskEvaluation {
     trials: Vec<TaskExecution>,
 }
 
+#[derive(Clone, Default)]
+struct SourcePreparationMetrics {
+    copy_ms: u64,
+    transaction_wall_ms: u64,
+    snapshot_ms: u64,
+    digest_ms: u64,
+    full_scans: u64,
+    source_tree_entries_read: usize,
+    source_tree_content_reads: usize,
+    source_tree_content_bytes: u64,
+    source_image_bytes: u64,
+}
+
+/// Git source preparation path selected from the sandboxed Git capability probe.
+///
+/// `clone --revision` is available starting with Git 2.49. Older Git releases keep the
+/// same fixed-commit contract through an explicit no-checkout clone followed by a detached
+/// checkout and controller-owned verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteGitPreparationStrategy {
+    RevisionBound,
+    CloneThenCheckout,
+}
+
+struct MaterializedSource {
+    commands: Vec<CommandDiagnostic>,
+    snapshot: WorkspaceSnapshot,
+    observed_prepared_source: Option<ObservedPreparedSource>,
+    metrics: SourcePreparationMetrics,
+}
+
 /// Materialized source state prepared before any provider trial in the run.
 struct PreparedTaskSource {
     task_root: PathBuf,
     source_dir: PathBuf,
     source: SourceProvenance,
+    source_snapshot: Option<WorkspaceSnapshot>,
+    observed_prepared_source: Option<ObservedPreparedSource>,
+    metrics: SourcePreparationMetrics,
     source_commands: Vec<CommandDiagnostic>,
     duration_ms: u64,
     blocker: Option<EvaluationBlocker>,
@@ -367,6 +478,9 @@ struct PreparedTaskContext<'a> {
     task_root: &'a Path,
     source_dir: &'a Path,
     source: &'a SourceProvenance,
+    source_snapshot: &'a WorkspaceSnapshot,
+    observed_prepared_source: Option<&'a ObservedPreparedSource>,
+    source_metrics: &'a SourcePreparationMetrics,
     source_commands: &'a [CommandDiagnostic],
     source_preparation_duration_ms: u64,
     plan: &'a WorkspacePlan,
@@ -586,10 +700,10 @@ impl EvaluationRunErrorKind {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct EvaluationRunError {
+pub struct EvaluationRunError {
     kind: EvaluationRunErrorKind,
     message: String,
-    partial_result: Option<Box<EvalRunResult>>,
+    partial_result: Option<Box<EvaluationRunResult>>,
 }
 
 impl EvaluationRunError {
@@ -617,7 +731,7 @@ impl EvaluationRunError {
         }
     }
 
-    fn cancelled(message: impl Into<String>, partial_result: Option<EvalRunResult>) -> Self {
+    fn cancelled(message: impl Into<String>, partial_result: Option<EvaluationRunResult>) -> Self {
         Self {
             kind: EvaluationRunErrorKind::Cancelled,
             message: message.into(),
@@ -625,11 +739,12 @@ impl EvaluationRunError {
         }
     }
 
-    pub(crate) fn kind(&self) -> EvaluationRunErrorKind {
+    #[cfg(test)]
+    fn kind(&self) -> EvaluationRunErrorKind {
         self.kind
     }
 
-    pub(crate) fn partial_result(&self) -> Option<&EvalRunResult> {
+    pub fn partial_result(&self) -> Option<&EvaluationRunResult> {
         self.partial_result.as_deref()
     }
 }
@@ -649,13 +764,13 @@ struct EvaluationFailureEvidence<'a> {
     message: &'a str,
 }
 
-pub(crate) fn run_evaluation(
-    params: &EvalRunParams,
+pub fn run_evaluation(
+    params: &EvaluationRunParams,
     sandbox_backend: SharedSandboxBackend,
     provider_snapshot: &ProviderConfigSnapshot,
     cancellation: &CancellationToken,
     trace_store: &singularity_store::SessionStore,
-) -> Result<EvalRunResult, EvaluationRunError> {
+) -> Result<EvaluationRunResult, EvaluationRunError> {
     if cancellation.is_cancelled() {
         let partial = RunId::new(params.run_id.clone())
             .ok()
@@ -938,7 +1053,7 @@ pub(crate) fn run_evaluation(
             }
         };
 
-    Ok(EvalRunResult {
+    Ok(EvaluationRunResult {
         run_id: run_id.as_str().to_string(),
         manifest: params.manifest.clone(),
         runner: RUNNER_NAME.to_string(),
@@ -953,10 +1068,10 @@ pub(crate) fn run_evaluation(
 }
 
 fn partial_evaluation_result(
-    params: &EvalRunParams,
+    params: &EvaluationRunParams,
     run_id: &RunId,
     task_executions: &[TaskEvaluation],
-) -> EvalRunResult {
+) -> EvaluationRunResult {
     let status = if task_executions
         .iter()
         .any(|execution| execution.result.status == EvaluationStatus::Failed)
@@ -965,7 +1080,7 @@ fn partial_evaluation_result(
     } else {
         "blocked"
     };
-    EvalRunResult {
+    EvaluationRunResult {
         run_id: run_id.as_str().to_string(),
         manifest: safe_text(&params.manifest),
         runner: RUNNER_NAME.to_string(),
@@ -1056,14 +1171,14 @@ fn run_task_trials(
 }
 
 fn publish_zero_sampling_blocked_run(
-    params: &EvalRunParams,
+    params: &EvaluationRunParams,
     run_dir: &Path,
     manifest_digest: String,
     plans: &[WorkspacePlan],
     trials_per_task: u32,
     result: EvaluationResult,
     preflight: EvaluationSandboxPreflight,
-) -> Result<EvalRunResult, EvaluationRunError> {
+) -> Result<EvaluationRunResult, EvaluationRunError> {
     let run_id = &result.run_id;
     if let Err(error) = result.validate() {
         return Err(preserve_incomplete_run(
@@ -1126,7 +1241,7 @@ fn publish_zero_sampling_blocked_run(
         .map_err(|error| {
             preserve_incomplete_run(run_dir, EvaluationRunError::publication(error))
         })?;
-    Ok(EvalRunResult {
+    Ok(EvaluationRunResult {
         run_id: run_id.as_str().to_string(),
         manifest: params.manifest.clone(),
         runner: RUNNER_NAME.to_string(),
@@ -1181,11 +1296,14 @@ fn prepare_task_source(
     let started = Instant::now();
     let task_root = context.run_dir.join(plan.task_id.as_str());
     let source_dir = task_root.join(SOURCE_DIR);
-    let initial_source = source_provenance(&plan.source, &source_dir, context.manifest_dir);
+    let initial_source = source_provenance(&plan.source, None, context.manifest_dir);
     let mut prepared = PreparedTaskSource {
         task_root,
         source_dir,
         source: initial_source,
+        source_snapshot: None,
+        observed_prepared_source: None,
+        metrics: SourcePreparationMetrics::default(),
         source_commands: Vec::new(),
         duration_ms: 0,
         blocker: None,
@@ -1226,17 +1344,28 @@ fn prepare_task_source(
         &prepared.task_root,
         &prepared.source_dir,
         Arc::clone(context.sandbox_backend),
+        context.sandbox_preflight,
     ) {
-        Ok(commands) => {
+        Ok(MaterializedSource {
+            commands,
+            snapshot,
+            observed_prepared_source,
+            mut metrics,
+        }) => {
             prepared.source_commands = commands;
-            prepared.source =
-                source_provenance(&plan.source, &prepared.source_dir, context.manifest_dir);
+            let digest_started = Instant::now();
+            let digest = workspace_snapshot_digest(&snapshot);
+            metrics.digest_ms =
+                u64::try_from(digest_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            prepared.source = source_provenance(&plan.source, Some(digest), context.manifest_dir);
+            prepared.observed_prepared_source = observed_prepared_source;
+            prepared.source_snapshot = Some(snapshot);
+            prepared.metrics = metrics;
         }
         Err((blocker, commands)) => {
             prepared.source_commands = commands;
             prepared.blocker = Some(blocker);
-            prepared.source =
-                source_provenance(&plan.source, &prepared.source_dir, context.manifest_dir);
+            prepared.source = source_provenance(&plan.source, None, context.manifest_dir);
         }
     }
     prepared.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1271,11 +1400,28 @@ fn run_task_trials_inner(
             false,
         );
     }
+    let Some(source_snapshot) = prepared_source.source_snapshot.as_ref() else {
+        return blocked_task_trials(
+            plan,
+            trials_per_task,
+            evaluation_blocker(
+                BlockerKind::WorkspacePreparation,
+                "prepared source snapshot is unavailable",
+            ),
+            prepared_source.source.clone(),
+            prepared_source.source_commands.clone(),
+            prepared_source.duration_ms,
+            true,
+        );
+    };
     let prepared = PreparedTaskContext {
         run_id: context.run_id,
         task_root: &prepared_source.task_root,
         source_dir: &prepared_source.source_dir,
         source: &prepared_source.source,
+        source_snapshot,
+        observed_prepared_source: prepared_source.observed_prepared_source.as_ref(),
+        source_metrics: &prepared_source.metrics,
         source_commands: &prepared_source.source_commands,
         source_preparation_duration_ms: prepared_source.duration_ms,
         plan,
@@ -1394,6 +1540,15 @@ fn run_task_inner(
         source: Some(prepared.source.clone()),
         source_commands: prepared.source_commands.to_vec(),
         source_preparation_duration_ms: prepared.source_preparation_duration_ms,
+        copy_ms: prepared.source_metrics.copy_ms,
+        transaction_wall_ms: prepared.source_metrics.transaction_wall_ms,
+        snapshot_ms: prepared.source_metrics.snapshot_ms,
+        digest_ms: prepared.source_metrics.digest_ms,
+        source_full_scans: prepared.source_metrics.full_scans,
+        source_tree_entries_read: prepared.source_metrics.source_tree_entries_read,
+        source_tree_content_reads: prepared.source_metrics.source_tree_content_reads,
+        source_tree_content_bytes: prepared.source_metrics.source_tree_content_bytes,
+        source_image_bytes: prepared.source_metrics.source_image_bytes,
         smoke_command_satisfied: prepared.plan.agent.projection.smoke_commands.is_empty(),
         ..TaskDiagnostics::default()
     };
@@ -1421,17 +1576,65 @@ fn run_task_inner(
             );
         }
     };
-
-    let baseline_started = Instant::now();
-    let baseline = run_verification_stage(
+    let agent_dir = task_dir.join(AGENT_DIR);
+    let materialized = match materialize_prepared_workspace(
+        "trial",
         prepared.source_dir,
-        &task_dir.join(BASELINE_DIR),
-        &prepared.plan.baseline.setup_commands,
-        prepared.plan.baseline.test_patch.as_ref(),
-        &prepared.plan.baseline.commands,
-        prepared.plan.baseline.expectation,
+        &agent_dir,
+        prepared.source_snapshot,
+        prepared.observed_prepared_source,
+        prepared.sandbox_backend.name(),
+        prepared.cancellation,
+    ) {
+        Ok(materialized) => materialized,
+        Err(error) => {
+            let baseline = StageExecution::blocked(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                Vec::new(),
+            );
+            diagnostics.baseline = baseline.diagnostics.clone();
+            return finish_task(
+                &prepared.plan.task_id,
+                trial,
+                baseline,
+                StageExecution::skipped(
+                    "agent stage skipped because trial workspace is unavailable",
+                ),
+                StageExecution::skipped(
+                    "public stage skipped because trial workspace is unavailable",
+                ),
+                StageExecution::skipped(
+                    "hidden stage skipped because trial workspace is unavailable",
+                ),
+                diagnostics,
+            );
+        }
+    };
+    diagnostics.agent_copy_ms = materialized.metric.duration_ms;
+    diagnostics.agent_observation = Some(materialized.metric);
+
+    let mut setup_diagnostics = Vec::new();
+    let setup_started = Instant::now();
+    let setup_result = run_setup_commands(
+        &agent_dir,
+        &prepared.plan.setup_commands,
         Arc::clone(prepared.sandbox_backend),
+        &mut setup_diagnostics,
     );
+    diagnostics.agent_setup_ms =
+        u64::try_from(setup_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let baseline_started = Instant::now();
+    let baseline = match setup_result {
+        Ok(()) => run_verification_after_setup(
+            &agent_dir,
+            prepared.plan.baseline.test_patch.as_ref(),
+            &prepared.plan.baseline.commands,
+            prepared.plan.baseline.expectation,
+            Arc::clone(prepared.sandbox_backend),
+            setup_diagnostics,
+        ),
+        Err(blocker) => StageExecution::blocked(blocker, setup_diagnostics),
+    };
     diagnostics.baseline_duration_ms =
         u64::try_from(baseline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     diagnostics.baseline = baseline.diagnostics.clone();
@@ -1455,10 +1658,12 @@ fn run_task_inner(
     let agent_execution = run_agent_stage(
         prepared,
         &task_dir,
+        &agent_dir,
         &prepared.plan.agent,
         trial,
         provider,
         trace,
+        &mut diagnostics,
     );
     diagnostics.agent = agent_execution.stage.diagnostics.clone();
     diagnostics.changed_files = agent_execution.changed_files.clone();
@@ -1502,11 +1707,28 @@ fn run_task_inner(
     diagnostics.prompt_fingerprint = agent_execution.prompt_fingerprint.clone();
     diagnostics.tool_schema_fingerprint = agent_execution.tool_schema_fingerprint.clone();
     diagnostics.provider_evidence = agent_execution.provider_evidence.clone();
+    diagnostics.agent_command_observations = agent_execution
+        .audit_events
+        .iter()
+        .filter_map(|event| event.get("workspace_observation_metrics").cloned())
+        .collect();
     diagnostics.local_process_fallback_count = agent_execution
         .audit_events
         .iter()
         .filter(|event| event.get("local_process_fallback").and_then(Value::as_bool) == Some(true))
         .count();
+
+    if agent_execution.stage.result.status == StageStatus::Blocked {
+        return finish_task(
+            &prepared.plan.task_id,
+            trial,
+            baseline,
+            agent_execution.stage,
+            StageExecution::skipped("public stage skipped because agent execution was blocked"),
+            StageExecution::skipped("hidden stage skipped because agent execution was blocked"),
+            diagnostics,
+        );
+    }
 
     let Some(agent_workspace) = agent_execution.workspace.as_deref() else {
         let public =
@@ -1536,15 +1758,11 @@ fn run_task_inner(
         );
     }
 
-    let public_dir = task_dir.join(PUBLIC_DIR);
-    let hidden_dir = task_dir.join(HIDDEN_DIR);
     let ((public, public_duration_ms), (hidden, hidden_duration_ms)) =
         run_post_agent_verification_stages(
-            prepared.source_dir,
             agent_workspace,
-            &agent_execution.changed_files,
-            (&public_dir, &prepared.plan.public),
-            (&hidden_dir, &prepared.plan.hidden),
+            &prepared.plan.public,
+            &prepared.plan.hidden,
             prepared.sandbox_backend,
         );
     diagnostics.public_duration_ms = public_duration_ms;
@@ -1563,58 +1781,51 @@ fn run_task_inner(
 }
 
 fn run_post_agent_verification_stages(
-    source_dir: &Path,
-    agent_dir: &Path,
-    changed_files: &[String],
-    public: (&Path, &VerificationStagePlan),
-    hidden: (&Path, &VerificationStagePlan),
+    workspace: &Path,
+    public_plan: &VerificationStagePlan,
+    hidden_plan: &VerificationStagePlan,
     sandbox_backend: &SharedSandboxBackend,
 ) -> ((StageExecution, u64), (StageExecution, u64)) {
-    let (public_dir, public_plan) = public;
-    let (hidden_dir, hidden_plan) = hidden;
-    std::thread::scope(|scope| {
-        let public_backend = Arc::clone(sandbox_backend);
-        let public = scope.spawn(|| {
-            let started = Instant::now();
-            let execution = run_verification_stage_with_agent_changes(
-                source_dir,
-                agent_dir,
-                changed_files,
-                public_dir,
-                public_plan,
-                public_backend,
-            );
+    let public_started = Instant::now();
+    let public = run_verification_after_setup(
+        workspace,
+        public_plan.test_patch.as_ref(),
+        &public_plan.commands,
+        public_plan.expectation,
+        Arc::clone(sandbox_backend),
+        Vec::new(),
+    );
+    let public_duration = u64::try_from(public_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    if public.result.status == StageStatus::Blocked {
+        return (
+            (public, public_duration),
             (
-                execution,
-                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            )
-        });
-        let hidden_backend = Arc::clone(sandbox_backend);
-        let hidden = scope.spawn(|| {
-            let started = Instant::now();
-            let execution = run_verification_stage_with_agent_changes(
-                source_dir,
-                agent_dir,
-                changed_files,
-                hidden_dir,
-                hidden_plan,
-                hidden_backend,
-            );
-            (
-                execution,
-                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            )
-        });
-        (
-            public.join().expect("public verification thread panicked"),
-            hidden.join().expect("hidden verification thread panicked"),
-        )
-    })
+                StageExecution::skipped(
+                    "hidden stage skipped because the shared trial workspace is unavailable",
+                ),
+                0,
+            ),
+        );
+    }
+
+    let hidden_started = Instant::now();
+    let hidden = run_verification_after_setup(
+        workspace,
+        hidden_plan.test_patch.as_ref(),
+        &hidden_plan.commands,
+        hidden_plan.expectation,
+        Arc::clone(sandbox_backend),
+        Vec::new(),
+    );
+    let hidden_duration = u64::try_from(hidden_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    ((public, public_duration), (hidden, hidden_duration))
 }
 
 fn source_provenance(
     source: &PlannedWorkspaceSource,
-    materialized_path: &Path,
+    tree_digest: Option<Result<String, String>>,
     manifest_dir: &Path,
 ) -> SourceProvenance {
     let (source_type, path, repository, commit) = match source {
@@ -1635,8 +1846,8 @@ fn source_provenance(
             Some(commit.as_str().to_string()),
         ),
     };
-    let (tree_digest, tree_digest_error) = if materialized_path.is_dir() {
-        match workspace_tree_digest(materialized_path) {
+    let (tree_digest, tree_digest_error) = if let Some(tree_digest) = tree_digest {
+        match tree_digest {
             Ok(digest) => (Some(digest), None),
             Err(_error) => (None, Some("source tree digest unavailable".to_string())),
         }
@@ -1794,28 +2005,54 @@ fn prepare_source(
     task_dir: &Path,
     source_dir: &Path,
     sandbox_backend: SharedSandboxBackend,
-) -> Result<Vec<CommandDiagnostic>, (EvaluationBlocker, Vec<CommandDiagnostic>)> {
+    sandbox_preflight: &SandboxPreflightReport,
+) -> Result<MaterializedSource, (EvaluationBlocker, Vec<CommandDiagnostic>)> {
     let mut commands = Vec::new();
+    let mut metrics = SourcePreparationMetrics::default();
     match source {
         PlannedWorkspaceSource::Local { path } => {
-            copy_tree_checked(path, source_dir).map_err(|error| {
+            let copy_started = Instant::now();
+            copy_tree_for_preparation(path, source_dir).map_err(|error| {
                 (
                     evaluation_blocker(BlockerKind::WorkspacePreparation, error),
                     commands.clone(),
                 )
             })?;
+            metrics.copy_ms = u64::try_from(copy_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         }
         PlannedWorkspaceSource::RemoteGit { repository, commit } => {
-            let clone = run_workspace_preparation_command(
+            let transaction_started = Instant::now();
+            let strategy = match probe_remote_git_preparation_strategy(
                 task_dir,
-                task_dir,
-                vec![
+                Arc::clone(&sandbox_backend),
+                &mut commands,
+            ) {
+                Ok(strategy) => strategy,
+                Err(blocker) => return Err((blocker, commands)),
+            };
+            let clone_argv = match strategy {
+                RemoteGitPreparationStrategy::RevisionBound => vec![
                     "git".to_string(),
                     "clone".to_string(),
                     "--quiet".to_string(),
+                    "--revision".to_string(),
+                    commit.as_str().to_string(),
                     repository.as_str().to_string(),
                     SOURCE_DIR.to_string(),
                 ],
+                RemoteGitPreparationStrategy::CloneThenCheckout => vec![
+                    "git".to_string(),
+                    "clone".to_string(),
+                    "--quiet".to_string(),
+                    "--no-checkout".to_string(),
+                    repository.as_str().to_string(),
+                    SOURCE_DIR.to_string(),
+                ],
+            };
+            let clone = run_workspace_preparation_command(
+                task_dir,
+                task_dir,
+                clone_argv,
                 GIT_TIMEOUT_SECONDS,
                 SandboxNetworkMode::Allowed,
                 Arc::clone(&sandbox_backend),
@@ -1831,202 +2068,296 @@ fn prepare_source(
                     commands,
                 ));
             }
-            let checkout = run_workspace_preparation_command(
-                task_dir,
-                task_dir,
-                vec![
-                    "git".to_string(),
-                    "-C".to_string(),
-                    SOURCE_DIR.to_string(),
-                    "checkout".to_string(),
-                    "--quiet".to_string(),
-                    "--detach".to_string(),
-                    commit.as_str().to_string(),
-                ],
-                GIT_TIMEOUT_SECONDS,
-                SandboxNetworkMode::Denied,
-                sandbox_backend,
-            );
-            commands.push(CommandDiagnostic::new("source.git_checkout", &checkout));
-            if !command_succeeded(&checkout) {
-                return Err((
-                    command_blocker(
-                        &checkout,
-                        BlockerKind::WorkspacePreparation,
-                        "git checkout failed",
-                    ),
-                    commands,
-                ));
+            if matches!(strategy, RemoteGitPreparationStrategy::CloneThenCheckout) {
+                let checkout = run_workspace_preparation_command(
+                    task_dir,
+                    task_dir,
+                    vec![
+                        "git".to_string(),
+                        "-C".to_string(),
+                        SOURCE_DIR.to_string(),
+                        "checkout".to_string(),
+                        "--quiet".to_string(),
+                        "--detach".to_string(),
+                        commit.as_str().to_string(),
+                    ],
+                    GIT_TIMEOUT_SECONDS,
+                    SandboxNetworkMode::Denied,
+                    Arc::clone(&sandbox_backend),
+                );
+                commands.push(CommandDiagnostic::new("source.git_checkout", &checkout));
+                if !command_succeeded(&checkout) {
+                    return Err((
+                        command_blocker(
+                            &checkout,
+                            BlockerKind::WorkspacePreparation,
+                            "git checkout failed",
+                        ),
+                        commands,
+                    ));
+                }
             }
-            validate_tree(source_dir).map_err(|error| {
+            if let Err(blocker) = verify_remote_git_checkout(
+                task_dir,
+                commit,
+                Arc::clone(&sandbox_backend),
+                &mut commands,
+            ) {
+                return Err((blocker, commands));
+            }
+            metrics.transaction_wall_ms =
+                u64::try_from(transaction_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        }
+    };
+    let snapshot_started = Instant::now();
+    let capture =
+        ObservedPreparedSource::capture(source_dir, sandbox_backend.as_ref(), sandbox_preflight)
+            .map_err(|error| {
                 (
                     evaluation_blocker(BlockerKind::WorkspacePreparation, error),
                     commands.clone(),
                 )
             })?;
-        }
-    }
-    Ok(commands)
-}
-fn run_verification_stage(
-    source_dir: &Path,
-    stage_dir: &Path,
-    setup_commands: &[CommandSpec],
-    test_patch: Option<&singularity_evaluation::EvaluatorTestPatch>,
-    commands: &[CommandSpec],
-    expectation: CommandExpectation,
-    sandbox_backend: SharedSandboxBackend,
-) -> StageExecution {
-    if let Err(error) = copy_tree_checked(source_dir, stage_dir) {
-        return StageExecution::blocked(
-            evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-            Vec::new(),
-        );
-    }
-    run_verification_in_workspace(
-        stage_dir,
-        setup_commands,
-        test_patch,
+    metrics.snapshot_ms = u64::try_from(snapshot_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    metrics.full_scans = capture.full_scans;
+    metrics.source_tree_entries_read = capture.work.source_tree_entries_read;
+    metrics.source_tree_content_reads = capture.work.source_tree_content_reads;
+    metrics.source_tree_content_bytes = capture.work.source_tree_content_bytes;
+    metrics.source_image_bytes = capture.work.image_bytes;
+    Ok(MaterializedSource {
         commands,
-        expectation,
-        sandbox_backend,
-    )
+        snapshot: capture.snapshot,
+        observed_prepared_source: capture.observed,
+        metrics,
+    })
 }
 
-fn run_verification_stage_with_agent_changes(
-    source_dir: &Path,
-    agent_dir: &Path,
-    changed_files: &[String],
-    stage_dir: &Path,
-    plan: &VerificationStagePlan,
+/// Probe the selected Git executable without relying on a clone failure to detect capability.
+fn probe_remote_git_preparation_strategy(
+    task_dir: &Path,
     sandbox_backend: SharedSandboxBackend,
-) -> StageExecution {
-    if let Err(error) = copy_tree_checked(source_dir, stage_dir) {
-        return StageExecution::blocked(
-            evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-            Vec::new(),
-        );
-    }
-    let mut setup_diagnostics = Vec::new();
-    if let Err(blocker) = run_setup_commands(
-        stage_dir,
-        &plan.setup_commands,
-        Arc::clone(&sandbox_backend),
-        &mut setup_diagnostics,
-    ) {
-        return StageExecution::blocked(blocker, setup_diagnostics);
-    }
-    if let Err(error) = apply_agent_changes(agent_dir, stage_dir, changed_files) {
-        return StageExecution::blocked(
-            evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-            setup_diagnostics,
-        );
-    }
-    run_verification_after_setup(
-        stage_dir,
-        plan.test_patch.as_ref(),
-        &plan.commands,
-        plan.expectation,
+    commands: &mut Vec<CommandDiagnostic>,
+) -> Result<RemoteGitPreparationStrategy, EvaluationBlocker> {
+    let result = run_workspace_preparation_read_only_command(
+        task_dir,
+        task_dir,
+        vec!["git".to_string(), "--version".to_string()],
+        GIT_TIMEOUT_SECONDS,
+        SandboxNetworkMode::Denied,
         sandbox_backend,
-        setup_diagnostics,
-    )
+    );
+    commands.push(CommandDiagnostic::new("source.git_version", &result));
+    if !remote_source_probe_succeeded(&result) {
+        return Err(evaluation_blocker(
+            BlockerKind::Environment,
+            format!(
+                "git capability probe failed: {}",
+                result.stderr_preview.trim()
+            ),
+        ));
+    }
+    let Some((major, minor)) = parse_git_version(&result.stdout_preview) else {
+        return Err(evaluation_blocker(
+            BlockerKind::Environment,
+            "git capability probe returned an unrecognized version",
+        ));
+    };
+    if major > 2 || (major == 2 && minor >= 49) {
+        Ok(RemoteGitPreparationStrategy::RevisionBound)
+    } else {
+        Ok(RemoteGitPreparationStrategy::CloneThenCheckout)
+    }
 }
 
-fn run_verification_in_workspace(
-    stage_dir: &Path,
-    setup_commands: &[CommandSpec],
-    test_patch: Option<&singularity_evaluation::EvaluatorTestPatch>,
-    commands: &[CommandSpec],
-    expectation: CommandExpectation,
+/// Parse the stable numeric prefix from `git --version` output.
+fn parse_git_version(output: &str) -> Option<(u32, u32)> {
+    output.split_whitespace().find_map(|token| {
+        let mut components = token.split('.');
+        let major = components.next()?.parse::<u32>().ok()?;
+        let minor = components.next()?.parse::<u32>().ok()?;
+        Some((major, minor))
+    })
+}
+
+/// Verify both the exact requested object and detached-HEAD state after source materialization.
+fn verify_remote_git_checkout(
+    task_dir: &Path,
+    commit: &crate::GitCommit,
     sandbox_backend: SharedSandboxBackend,
-) -> StageExecution {
-    let mut diagnostics = Vec::new();
-    if let Err(blocker) = run_setup_commands(
-        stage_dir,
-        setup_commands,
+    commands: &mut Vec<CommandDiagnostic>,
+) -> Result<(), EvaluationBlocker> {
+    let revision = run_workspace_preparation_read_only_command(
+        task_dir,
+        task_dir,
+        vec![
+            "git".to_string(),
+            "-C".to_string(),
+            SOURCE_DIR.to_string(),
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "HEAD".to_string(),
+        ],
+        GIT_TIMEOUT_SECONDS,
+        SandboxNetworkMode::Denied,
         Arc::clone(&sandbox_backend),
-        &mut diagnostics,
-    ) {
-        return StageExecution::blocked(blocker, diagnostics);
+    );
+    commands.push(CommandDiagnostic::new(
+        "source.git_verify_commit",
+        &revision,
+    ));
+    if !remote_source_probe_succeeded(&revision) {
+        return Err(command_blocker(
+            &revision,
+            BlockerKind::WorkspacePreparation,
+            "git commit verification failed",
+        ));
     }
-    run_verification_after_setup(
-        stage_dir,
-        test_patch,
-        commands,
-        expectation,
+    if revision.output_truncated || revision.stdout_preview.trim() != commit.as_str() {
+        return Err(evaluation_blocker(
+            BlockerKind::WorkspacePreparation,
+            "git checkout resolved an unexpected commit",
+        ));
+    }
+
+    let head = run_workspace_preparation_read_only_command(
+        task_dir,
+        task_dir,
+        vec![
+            "git".to_string(),
+            "-C".to_string(),
+            SOURCE_DIR.to_string(),
+            "symbolic-ref".to_string(),
+            "--quiet".to_string(),
+            "--short".to_string(),
+            "HEAD".to_string(),
+        ],
+        GIT_TIMEOUT_SECONDS,
+        SandboxNetworkMode::Denied,
         sandbox_backend,
-        diagnostics,
-    )
+    );
+    commands.push(CommandDiagnostic::new("source.git_verify_detached", &head));
+    if !detached_head_probe_succeeded(&head) {
+        return Err(command_blocker(
+            &head,
+            BlockerKind::WorkspacePreparation,
+            "git checkout did not leave a detached HEAD",
+        ));
+    }
+    Ok(())
 }
 
+/// The fixed symbolic-ref probe succeeds only when Git reports the expected detached state.
+fn detached_head_probe_succeeded(result: &CommandResult) -> bool {
+    result.execution_status == CommandExecutionStatus::Completed
+        && result.semantic_status == CommandSemanticStatus::ExitNonzero
+        && result.exit_code == Some(1)
+        && result.stderr_preview.trim().is_empty()
+        && matches!(
+            result.workspace_mutation,
+            WorkspaceMutation::Unknown | WorkspaceMutation::Unchanged
+        )
+        && !result.sandbox.local_process_fallback
+        && result.sandbox.enforcement == singularity_tools::SandboxBackendEnforcement::Strict
+}
 fn run_verification_after_setup(
-    stage_dir: &Path,
-    test_patch: Option<&singularity_evaluation::EvaluatorTestPatch>,
+    workspace: &Path,
+    test_patch: Option<&crate::EvaluatorTestPatch>,
     commands: &[CommandSpec],
     expectation: CommandExpectation,
     sandbox_backend: SharedSandboxBackend,
     mut diagnostics: Vec<CommandDiagnostic>,
 ) -> StageExecution {
-    if let Some(test_patch) = test_patch
-        && let Err(blocker) = apply_evaluator_patch(
-            stage_dir,
+    let patch_path = match test_patch {
+        Some(test_patch) => match apply_evaluator_patch(
+            workspace,
             test_patch,
             Arc::clone(&sandbox_backend),
             &mut diagnostics,
-        )
-    {
-        return StageExecution::blocked(blocker, diagnostics);
-    }
-
-    let mut successes = 0usize;
-    let mut failures = 0usize;
-    for (index, command) in commands.iter().enumerate() {
-        let result = match run_command_spec(
-            stage_dir,
-            command,
-            DEFAULT_COMMAND_TIMEOUT_SECONDS,
-            Arc::clone(&sandbox_backend),
         ) {
-            Ok(result) => result,
-            Err(error) => {
-                return StageExecution::blocked(
-                    evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-                    diagnostics,
-                );
+            Ok(path) => Some(path),
+            Err(blocker) => return StageExecution::blocked(blocker, diagnostics),
+        },
+        None => None,
+    };
+
+    let command_result = (|| -> Result<(usize, usize), EvaluationBlocker> {
+        let mut successes = 0usize;
+        let mut failures = 0usize;
+        for (index, command) in commands.iter().enumerate() {
+            let result = run_command_spec(
+                workspace,
+                command,
+                DEFAULT_COMMAND_TIMEOUT_SECONDS,
+                Arc::clone(&sandbox_backend),
+            )
+            .map_err(|error| evaluation_blocker(BlockerKind::WorkspacePreparation, error))?;
+            diagnostics.push(CommandDiagnostic::for_spec(
+                format!("verification.command.{index}"),
+                workspace,
+                command,
+                DEFAULT_COMMAND_TIMEOUT_SECONDS,
+                &result,
+            ));
+            if let Some(blocker) = infrastructure_blocker(&result, "verification command failed") {
+                return Err(blocker);
             }
-        };
-        diagnostics.push(CommandDiagnostic::for_spec(
-            format!("verification.command.{index}"),
-            stage_dir,
-            command,
-            DEFAULT_COMMAND_TIMEOUT_SECONDS,
-            &result,
-        ));
-        if let Some(blocker) = infrastructure_blocker(&result, "verification command failed") {
-            return StageExecution::blocked(blocker, diagnostics);
-        }
-        // A nonzero result is ordinary verification evidence when success was expected, but it
-        // becomes the baseline's accepted outcome when failure was expected.  Accepting that
-        // outcome still requires a proven workspace observation.
-        if expectation == CommandExpectation::Failure
-            && result.execution_status == CommandExecutionStatus::Completed
-            && result.semantic_status != CommandSemanticStatus::Succeeded
-            && result.workspace_mutation == WorkspaceMutation::Unknown
-        {
-            return StageExecution::blocked(
-                evaluation_blocker(
+            if result.workspace_mutation == WorkspaceMutation::Changed
+                && result
+                    .workspace_change_summary
+                    .as_ref()
+                    .is_none_or(|summary| !summary.is_trusted_artifact_only())
+            {
+                return Err(evaluation_blocker(
+                    BlockerKind::Sandbox,
+                    "verification command modified the revision-bound trial workspace",
+                ));
+            }
+            // A nonzero result is ordinary verification evidence when success was expected, but it
+            // becomes the baseline's accepted outcome when failure was expected. Accepting that
+            // outcome still requires a proven workspace observation.
+            if expectation == CommandExpectation::Failure
+                && result.execution_status == CommandExecutionStatus::Completed
+                && result.semantic_status != CommandSemanticStatus::Succeeded
+                && result.workspace_mutation == WorkspaceMutation::Unknown
+            {
+                return Err(evaluation_blocker(
                     BlockerKind::Sandbox,
                     "verification command failed: workspace mutation could not be verified",
+                ));
+            }
+            if command_succeeded(&result) {
+                successes += 1;
+            } else {
+                failures += 1;
+            }
+        }
+        Ok((successes, failures))
+    })();
+
+    let revert_result = match patch_path {
+        Some(path) => revert_evaluator_patch(
+            workspace,
+            &path,
+            Arc::clone(&sandbox_backend),
+            &mut diagnostics,
+        ),
+        None => Ok(()),
+    };
+    let (successes, failures) = match (command_result, revert_result) {
+        (Ok(counts), Ok(())) => counts,
+        (Err(blocker), Ok(())) | (Ok(_), Err(blocker)) => {
+            return StageExecution::blocked(blocker, diagnostics);
+        }
+        (Err(primary), Err(cleanup)) => {
+            return StageExecution::blocked(
+                evaluation_blocker(
+                    primary.kind,
+                    format!("{}; {}", primary.message, cleanup.message),
                 ),
                 diagnostics,
             );
         }
-        if command_succeeded(&result) {
-            successes += 1;
-        } else {
-            failures += 1;
-        }
-    }
+    };
 
     match expectation {
         CommandExpectation::Success if successes == commands.len() => {
@@ -2077,10 +2408,10 @@ fn run_setup_commands(
 
 fn apply_evaluator_patch(
     workspace: &Path,
-    patch: &singularity_evaluation::EvaluatorTestPatch,
+    patch: &crate::EvaluatorTestPatch,
     sandbox_backend: SharedSandboxBackend,
     diagnostics: &mut Vec<CommandDiagnostic>,
-) -> Result<(), EvaluationBlocker> {
+) -> Result<PathBuf, EvaluationBlocker> {
     if patch.format != PatchFormat::UnifiedDiff {
         return Err(evaluation_blocker(
             BlockerKind::WorkspacePreparation,
@@ -2113,71 +2444,14 @@ fn apply_evaluator_patch(
     })?;
     drop(file);
 
-    let git_dir = workspace.join(EVALUATOR_GIT_DIR);
-    if let Err(error) = fs::create_dir(&git_dir) {
-        let cleanup = fs::remove_file(&patch_path);
-        let message = match cleanup {
-            Ok(()) => format!("failed to create isolated evaluator git metadata: {error}"),
-            Err(cleanup_error) => format!(
-                "failed to create isolated evaluator git metadata: {error}; failed to remove evaluator patch file: {cleanup_error}"
-            ),
-        };
-        return Err(evaluation_blocker(
-            BlockerKind::WorkspacePreparation,
-            message,
-        ));
-    }
-
     let operation = (|| {
-        let init_result = run_workspace_preparation_command(
+        let result = run_raw_command(
             workspace,
             workspace,
-            evaluator_git_argv(&["init", "--quiet"]),
+            evaluator_apply_argv(&["--whitespace=nowarn", EVALUATOR_PATCH_FILE]),
             DEFAULT_COMMAND_TIMEOUT_SECONDS,
             SandboxNetworkMode::Denied,
-            Arc::clone(&sandbox_backend),
-        );
-        diagnostics.push(CommandDiagnostic::new("evaluator.git_init", &init_result));
-        if !command_succeeded(&init_result) {
-            return Err(command_blocker(
-                &init_result,
-                BlockerKind::WorkspacePreparation,
-                "failed to isolate evaluator patch workspace",
-            ));
-        }
-
-        let check_result = run_workspace_preparation_command(
-            workspace,
-            workspace,
-            evaluator_git_argv(&[
-                "apply",
-                "--check",
-                "--whitespace=nowarn",
-                EVALUATOR_PATCH_FILE,
-            ]),
-            DEFAULT_COMMAND_TIMEOUT_SECONDS,
-            SandboxNetworkMode::Denied,
-            Arc::clone(&sandbox_backend),
-        );
-        diagnostics.push(CommandDiagnostic::new(
-            "evaluator.apply_check",
-            &check_result,
-        ));
-        if !command_succeeded(&check_result) {
-            return Err(command_blocker(
-                &check_result,
-                BlockerKind::WorkspacePreparation,
-                "evaluator patch validation failed",
-            ));
-        }
-
-        let result = run_workspace_preparation_command(
-            workspace,
-            workspace,
-            evaluator_git_argv(&["apply", "--whitespace=nowarn", EVALUATOR_PATCH_FILE]),
-            DEFAULT_COMMAND_TIMEOUT_SECONDS,
-            SandboxNetworkMode::Denied,
-            Arc::clone(&sandbox_backend),
+            sandbox_backend,
         );
         diagnostics.push(CommandDiagnostic::new("evaluator.apply_patch", &result));
         if !command_succeeded(&result) {
@@ -2187,34 +2461,46 @@ fn apply_evaluator_patch(
                 "failed to apply evaluator patch",
             ));
         }
-        let reverse_check = run_workspace_preparation_command(
+        Ok(())
+    })();
+    match operation {
+        Ok(()) => Ok(patch_path),
+        Err(primary) => match cleanup_evaluator_patch(&patch_path) {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(evaluation_blocker(
+                primary.kind,
+                format!("{}; {}", primary.message, cleanup.message),
+            )),
+        },
+    }
+}
+
+fn revert_evaluator_patch(
+    workspace: &Path,
+    patch_path: &Path,
+    sandbox_backend: SharedSandboxBackend,
+    diagnostics: &mut Vec<CommandDiagnostic>,
+) -> Result<(), EvaluationBlocker> {
+    let operation = (|| {
+        let reverse = run_raw_command(
             workspace,
             workspace,
-            evaluator_git_argv(&[
-                "apply",
-                "--reverse",
-                "--check",
-                "--whitespace=nowarn",
-                EVALUATOR_PATCH_FILE,
-            ]),
+            evaluator_apply_argv(&["--reverse", "--whitespace=nowarn", EVALUATOR_PATCH_FILE]),
             DEFAULT_COMMAND_TIMEOUT_SECONDS,
             SandboxNetworkMode::Denied,
             sandbox_backend,
         );
-        diagnostics.push(CommandDiagnostic::new(
-            "evaluator.reverse_check",
-            &reverse_check,
-        ));
-        if !command_succeeded(&reverse_check) {
+        diagnostics.push(CommandDiagnostic::new("evaluator.revert_patch", &reverse));
+        if !command_succeeded(&reverse) {
             return Err(command_blocker(
-                &reverse_check,
+                &reverse,
                 BlockerKind::WorkspacePreparation,
-                "evaluator patch did not materialize in stage workspace",
+                "failed to revert evaluator patch",
             ));
         }
         Ok(())
     })();
-    let cleanup = cleanup_evaluator_control_files(&patch_path, &git_dir);
+    let cleanup = cleanup_evaluator_patch(patch_path);
     match (operation, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(blocker), Ok(())) => Err(blocker),
@@ -2226,82 +2512,342 @@ fn apply_evaluator_patch(
     }
 }
 
-fn evaluator_git_argv(arguments: &[&str]) -> Vec<String> {
+fn evaluator_apply_argv(arguments: &[&str]) -> Vec<String> {
     let mut argv = vec![
         "git".to_string(),
-        format!("--git-dir={EVALUATOR_GIT_DIR}"),
+        if cfg!(windows) {
+            "--git-dir=NUL".to_string()
+        } else {
+            "--git-dir=/dev/null".to_string()
+        },
         "--work-tree=.".to_string(),
+        "-c".to_string(),
+        "core.autocrlf=false".to_string(),
+        "apply".to_string(),
+        "--no-index".to_string(),
     ];
     argv.extend(arguments.iter().map(|argument| (*argument).to_string()));
     argv
 }
 
-fn cleanup_evaluator_control_files(
-    patch_path: &Path,
-    git_dir: &Path,
-) -> Result<(), EvaluationBlocker> {
-    let mut errors = Vec::new();
-    if let Err(error) = fs::remove_dir_all(git_dir)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        errors.push(format!("failed to remove evaluator git metadata: {error}"));
-    }
+fn cleanup_evaluator_patch(patch_path: &Path) -> Result<(), EvaluationBlocker> {
     if let Err(error) = fs::remove_file(patch_path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        errors.push(format!("failed to remove evaluator patch file: {error}"));
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(evaluation_blocker(
+        return Err(evaluation_blocker(
             BlockerKind::WorkspacePreparation,
-            errors.join("; "),
+            format!("failed to remove evaluator patch file: {error}"),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AgentSnapshotPlan {
+    Reused,
+    Incremental(Vec<String>),
+    Full,
+}
+
+/// Choose the smallest safe post-agent snapshot from the typed mutation/revision evidence.
+///
+/// A missing or incomplete write observation never becomes a cache hit.  The full snapshot is a
+/// conservative fallback for contract drift and evidence gaps; only a complete changed-path
+/// summary may select incremental reads.
+const OBSERVER_PATH_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+fn validate_observer_paths(paths: &[String]) -> Result<BTreeSet<String>, String> {
+    let summary = WorkspaceChangeSummary::new(paths.to_vec(), OBSERVER_PATH_DIGEST);
+    summary.validate().map_err(|error| {
+        format!("prepared workspace observer returned invalid changed paths: {error}")
+    })?;
+    Ok(paths.iter().cloned().collect())
+}
+
+fn workspace_paths_related(left: &str, right: &str) -> bool {
+    left == right
+        || left == "."
+        || right == "."
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn validate_observer_summary_closure(
+    observer_paths: &BTreeSet<String>,
+    summary_paths: &BTreeSet<String>,
+) -> Result<(), String> {
+    if observer_paths.is_empty() {
+        return Err("prepared workspace observer reported no changed paths".to_string());
+    }
+    if summary_paths.is_empty() {
+        return Err(
+            "prepared workspace observer changed paths without producer summary evidence"
+                .to_string(),
+        );
+    }
+    let observer_covered = observer_paths.iter().all(|observer_path| {
+        summary_paths
+            .iter()
+            .any(|summary_path| workspace_paths_related(observer_path, summary_path))
+    });
+    let summary_covered = summary_paths.iter().all(|summary_path| {
+        observer_paths
+            .iter()
+            .any(|observer_path| workspace_paths_related(observer_path, summary_path))
+    });
+    if !observer_covered || !summary_covered {
+        return Err(
+            "prepared workspace observer and producer summary paths do not describe the same change set"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn require_agent_baseline_unchanged(
+    observation: Result<PreparedWorkspaceObservation, String>,
+) -> Result<(), String> {
+    match observation {
+        Ok(PreparedWorkspaceObservation::Unchanged) => Ok(()),
+        Ok(PreparedWorkspaceObservation::Changed(_)) => {
+            Err("agent workspace changed before authoritative baseline snapshot".to_string())
+        }
+        Ok(PreparedWorkspaceObservation::Unknown) => Err(
+            "agent workspace observation was incomplete before authoritative baseline snapshot"
+                .to_string(),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+/// Require the observer to prove that no workspace mutation occurred after the authoritative
+/// after-snapshot completed. A later change cannot be represented by that snapshot and therefore
+/// blocks the agent stage instead of being folded into a second, unbounded scan.
+fn require_agent_final_snapshot_unchanged(
+    observation: Result<PreparedWorkspaceObservation, String>,
+) -> Result<(), String> {
+    match observation {
+        Ok(PreparedWorkspaceObservation::Unchanged) => Ok(()),
+        Ok(PreparedWorkspaceObservation::Changed(_)) => {
+            Err("agent workspace changed after authoritative final snapshot".to_string())
+        }
+        Ok(PreparedWorkspaceObservation::Unknown) => Err(
+            "agent workspace observation was incomplete after authoritative final snapshot"
+                .to_string(),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+/// Choose the smallest safe post-agent snapshot from producer and continuous observer evidence.
+///
+/// A backend without a continuous observer keeps the conservative full-tree path.  When an
+/// observer exists, physical paths must close over the producer summaries before incremental
+/// reads are allowed; an extra observer path is an out-of-band mutation and blocks evaluation.
+fn agent_snapshot_plan(
+    result: &AgentLoopResult,
+    observer: Option<&PreparedWorkspaceObservation>,
+) -> Result<AgentSnapshotPlan, String> {
+    let observer_paths = match observer {
+        None | Some(PreparedWorkspaceObservation::Unchanged) => None,
+        Some(PreparedWorkspaceObservation::Changed(paths)) => Some(validate_observer_paths(paths)?),
+        Some(PreparedWorkspaceObservation::Unknown) => {
+            return Err("prepared workspace observer ended with incomplete evidence".to_string());
+        }
+    };
+    let mut revision = 0u64;
+    let mut changed_paths = BTreeSet::new();
+    let mut observed_contract: Option<&str> = None;
+    let mut full = false;
+
+    for tool_result in &result.tool_results {
+        let summary = if let Some(summary) = tool_result.workspace_change_summary() {
+            summary.validate().map_err(|error| {
+                format!(
+                    "invalid workspace change summary from {}: {error}",
+                    tool_result.tool_name
+                )
+            })?;
+            changed_paths.extend(summary.changed_files.iter().cloned());
+            Some(summary)
+        } else {
+            None
+        };
+        if let Some(contract) = tool_result
+            .audit_metadata()
+            .and_then(|audit| audit.get("workspace_observation_metrics"))
+            .and_then(|metrics| metrics.get("contract"))
+            .and_then(Value::as_str)
+        {
+            if observed_contract.is_some_and(|previous| previous != contract) {
+                full = true;
+            }
+            observed_contract = Some(contract);
+        }
+
+        let is_write_tool = matches!(
+            tool_result.tool_name.as_str(),
+            TOOL_EDIT | TOOL_PATCH | TOOL_COMMAND
+        );
+        let Some(observation) = tool_result.workspace_observation() else {
+            if summary.is_some() {
+                return Err(format!(
+                    "workspace change summary from {} has no workspace observation",
+                    tool_result.tool_name
+                ));
+            }
+            if is_write_tool {
+                full = true;
+            }
+            continue;
+        };
+        let observed_revision = observation.revision().map(|value| value.value());
+        match observation.mutation() {
+            WorkspaceMutation::Unchanged => {
+                if summary.is_some_and(|summary| summary.verification_relevant) {
+                    return Err(format!(
+                        "verification-relevant workspace change summary from {} was projected as unchanged",
+                        tool_result.tool_name
+                    ));
+                }
+                if observed_revision != Some(revision) {
+                    full = true;
+                }
+            }
+            WorkspaceMutation::Changed => {
+                let Some(next_revision) = revision.checked_add(1) else {
+                    full = true;
+                    continue;
+                };
+                if observed_revision != Some(next_revision) {
+                    full = true;
+                }
+                revision = next_revision;
+                let Some(summary) = summary else {
+                    full = true;
+                    continue;
+                };
+                if !summary.verification_relevant {
+                    return Err(format!(
+                        "workspace revision advanced for verification-irrelevant summary from {}",
+                        tool_result.tool_name
+                    ));
+                }
+            }
+            WorkspaceMutation::Unknown => full = true,
+        }
+    }
+
+    match observer {
+        Some(PreparedWorkspaceObservation::Unchanged) => {
+            if !changed_paths.is_empty() {
+                return Err(
+                    "producer reported physical workspace changes while observer was unchanged"
+                        .to_string(),
+                );
+            }
+        }
+        Some(PreparedWorkspaceObservation::Changed(_)) => {
+            validate_observer_summary_closure(
+                observer_paths
+                    .as_ref()
+                    .expect("changed observer paths are validated above"),
+                &changed_paths,
+            )?;
+        }
+        Some(PreparedWorkspaceObservation::Unknown) => unreachable!("handled above"),
+        None => {}
+    }
+
+    if full {
+        Ok(AgentSnapshotPlan::Full)
+    } else if observer.is_none() {
+        Ok(AgentSnapshotPlan::Full)
+    } else if changed_paths.is_empty() {
+        Ok(AgentSnapshotPlan::Reused)
+    } else {
+        if let Some(observer_paths) = observer_paths {
+            changed_paths.extend(observer_paths);
+        }
+        Ok(AgentSnapshotPlan::Incremental(
+            changed_paths.into_iter().collect(),
         ))
     }
 }
+
+fn snapshot_agent_workspace_after(
+    agent_dir: &Path,
+    before: &WorkspaceSnapshot,
+    before_identity: &workspace::WorkspaceRootIdentity,
+    result: &AgentLoopResult,
+    observer: Option<&PreparedWorkspaceObservation>,
+) -> Result<
+    (
+        WorkspaceSnapshot,
+        workspace::SourceCaptureWork,
+        AgentSnapshotObservation,
+        u64,
+    ),
+    String,
+> {
+    let current_identity = workspace_root_identity(agent_dir)?;
+    if current_identity != *before_identity {
+        return Err("agent workspace root identity changed during execution".to_string());
+    }
+    let plan = agent_snapshot_plan(result, observer)?;
+    let (snapshot, work, observation, full_scans) = match plan {
+        AgentSnapshotPlan::Reused => (
+            before.clone(),
+            workspace::SourceCaptureWork::default(),
+            AgentSnapshotObservation::Reused,
+            0,
+        ),
+        AgentSnapshotPlan::Incremental(paths) => {
+            match snapshot_workspace_incremental(agent_dir, before, &paths) {
+                Ok((snapshot, work)) => (snapshot, work, AgentSnapshotObservation::Incremental, 0),
+                Err(_) => {
+                    let (snapshot, work) = snapshot_workspace_with_work(agent_dir)?;
+                    (snapshot, work, AgentSnapshotObservation::Full, 1)
+                }
+            }
+        }
+        AgentSnapshotPlan::Full => {
+            let (snapshot, work) = snapshot_workspace_with_work(agent_dir)?;
+            (snapshot, work, AgentSnapshotObservation::Full, 1)
+        }
+    };
+    let final_identity = workspace_root_identity(agent_dir)?;
+    if final_identity != *before_identity {
+        return Err("agent workspace root identity changed while snapshotting".to_string());
+    }
+    Ok((snapshot, work, observation, full_scans))
+}
+
 fn run_agent_stage(
     prepared: &PreparedTaskContext<'_>,
     task_dir: &Path,
+    agent_dir: &Path,
     plan: &AgentStagePlan,
     trial: u32,
     provider: OpenAiProvider,
     trace: &EvaluationTrialTrace<'_>,
+    diagnostics: &mut TaskDiagnostics,
 ) -> AgentStageExecution {
-    let agent_dir = task_dir.join(AGENT_DIR);
-    let projection = &plan.projection;
     if prepared.cancellation.is_cancelled() {
         return blocked_agent_stage(
             evaluation_blocker(BlockerKind::AgentRuntime, "evaluation cancelled"),
             Vec::new(),
         );
     }
-    let pristine_source = match snapshot_workspace(prepared.source_dir) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return blocked_agent_stage(
-                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-                Vec::new(),
-            );
-        }
-    };
-    if let Err(error) = copy_tree_checked(prepared.source_dir, &agent_dir) {
-        return blocked_agent_stage(
-            evaluation_blocker(BlockerKind::WorkspacePreparation, error),
-            Vec::new(),
-        );
-    }
-    let mut command_diagnostics = Vec::new();
-    if let Err(blocker) = run_setup_commands(
-        &agent_dir,
-        &plan.setup_commands,
-        Arc::clone(prepared.sandbox_backend),
-        &mut command_diagnostics,
-    ) {
-        return blocked_agent_stage(blocker, command_diagnostics);
-    }
-    let before = match snapshot_workspace(&agent_dir) {
-        Ok(snapshot) => snapshot,
+    let pristine_source = prepared.source_snapshot;
+    let command_diagnostics = Vec::new();
+    let projection = match project_agent_task(agent_dir, &plan.projection) {
+        Ok(projection) => projection,
         Err(error) => {
             return blocked_agent_stage(
                 evaluation_blocker(BlockerKind::WorkspacePreparation, error),
@@ -2309,7 +2855,75 @@ fn run_agent_stage(
             );
         }
     };
-    let project_instructions = match load_project_instructions(&agent_dir, &agent_dir) {
+    let projection = &projection;
+    let mut agent_observer = match prepared
+        .sandbox_backend
+        .observe_prepared_workspace(agent_dir)
+    {
+        Ok(observer) => observer,
+        Err(error) => {
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                command_diagnostics,
+            );
+        }
+    };
+    let before_identity = match workspace_root_identity(agent_dir) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                command_diagnostics,
+            );
+        }
+    };
+    let snapshot_before_started = Instant::now();
+    let before = match snapshot_workspace_with_work(agent_dir) {
+        Ok((snapshot, work)) => {
+            diagnostics.agent_snapshot_before_tree_entries_read = work.source_tree_entries_read;
+            diagnostics.agent_snapshot_before_tree_content_reads = work.source_tree_content_reads;
+            diagnostics.agent_snapshot_before_tree_content_bytes = work.source_tree_content_bytes;
+            diagnostics.agent_snapshot_full_scans = 1;
+            snapshot
+        }
+        Err(error) => {
+            diagnostics.agent_snapshot_before_ms =
+                u64::try_from(snapshot_before_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                command_diagnostics,
+            );
+        }
+    };
+    diagnostics.agent_snapshot_before_ms =
+        u64::try_from(snapshot_before_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match workspace_root_identity(agent_dir) {
+        Ok(identity) if identity == before_identity => {}
+        Ok(_) => {
+            return blocked_agent_stage(
+                evaluation_blocker(
+                    BlockerKind::WorkspacePreparation,
+                    "agent workspace root identity changed while capturing baseline",
+                ),
+                command_diagnostics,
+            );
+        }
+        Err(error) => {
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                command_diagnostics,
+            );
+        }
+    }
+    if let Some(observer) = agent_observer.as_mut() {
+        if let Err(error) = require_agent_baseline_unchanged(observer.checkpoint()) {
+            return blocked_agent_stage(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error),
+                command_diagnostics,
+            );
+        }
+    }
+    let project_instructions = match load_project_instructions(agent_dir, agent_dir) {
         Ok(instructions) => instructions,
         Err(error) => {
             return blocked_agent_stage(
@@ -2328,7 +2942,7 @@ fn run_agent_stage(
             );
         }
     };
-    let policy = evaluation_policy(&agent_dir, projection, &resolved_tools);
+    let policy = evaluation_policy(agent_dir, projection, &resolved_tools);
     let prompt = agent_prompt(projection, &resolved_tools.names);
     let project_instructions_fingerprint = project_instructions
         .as_ref()
@@ -2356,8 +2970,8 @@ fn run_agent_stage(
         "tool_schema_fingerprint": &tool_schema_fingerprint,
     }))
     .expect("evaluation prompt fingerprint inputs serialize canonically");
-    let verification_requirements = match agent_verification_requirements(&agent_dir, projection) {
-        Ok(requirements) => requirements,
+    let verification_commands = match agent_verification_commands(agent_dir, projection) {
+        Ok(commands) => commands,
         Err(error) => {
             return blocked_agent_stage(
                 evaluation_blocker(BlockerKind::WorkspacePreparation, error),
@@ -2375,7 +2989,7 @@ fn run_agent_stage(
         prompt,
     )
     .with_max_turns(DEFAULT_AGENT_MAX_TURNS)
-    .with_verification_requirements(verification_requirements);
+    .with_verification_commands(verification_commands);
     if let Some(instructions) = project_instructions {
         input = input.with_project_instructions(instructions);
     }
@@ -2386,7 +3000,7 @@ fn run_agent_stage(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    let workspace_tools = match WorkspaceTools::new(&agent_dir) {
+    let workspace_tools = match WorkspaceTools::new(agent_dir) {
         Ok(tools) => tools
             .with_shared_sandbox_backend(Arc::clone(prepared.sandbox_backend))
             .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated)
@@ -2419,6 +3033,7 @@ fn run_agent_stage(
         .with_cancellation_token(prepared.cancellation.clone())
         .run_with_events(&input, &mut on_event);
     let agent_duration_ms = u64::try_from(agent_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    diagnostics.agent_duration_ms = agent_duration_ms;
     let run_status = result.to_run_status();
     if let Err(error) = projector.project_result(&run_status) {
         record_trace_failure(
@@ -2527,11 +3142,38 @@ fn run_agent_stage(
         }
     };
 
-    let after = match snapshot_workspace(&agent_dir) {
-        Ok(snapshot) => snapshot,
+    let agent_observation = match agent_observer.as_mut() {
+        None => Ok(None),
+        Some(observer) => observer.checkpoint().map(Some),
+    };
+    let snapshot_after_started = Instant::now();
+    let after = match agent_observation.and_then(|observation| {
+        snapshot_agent_workspace_after(
+            agent_dir,
+            &before,
+            &before_identity,
+            &result,
+            observation.as_ref(),
+        )
+    }) {
+        Ok((snapshot, work, observation, full_scans)) => {
+            diagnostics.agent_snapshot_after_tree_entries_read = work.source_tree_entries_read;
+            diagnostics.agent_snapshot_after_tree_content_reads = work.source_tree_content_reads;
+            diagnostics.agent_snapshot_after_tree_content_bytes = work.source_tree_content_bytes;
+            diagnostics.agent_snapshot_after_observation = Some(observation);
+            diagnostics.agent_snapshot_full_scans = diagnostics
+                .agent_snapshot_full_scans
+                .saturating_add(full_scans);
+            snapshot
+        }
         Err(error) => {
+            diagnostics.agent_snapshot_after_ms =
+                u64::try_from(snapshot_after_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             return AgentStageExecution {
-                stage: StageExecution::failed(error.clone(), command_diagnostics),
+                stage: StageExecution::blocked(
+                    evaluation_blocker(BlockerKind::WorkspacePreparation, error.clone()),
+                    command_diagnostics,
+                ),
                 workspace: Some(agent_dir.to_path_buf()),
                 changed_files: Vec::new(),
                 patch_evidence: Vec::new(),
@@ -2567,10 +3209,59 @@ fn run_agent_stage(
             };
         }
     };
-    let changed_files = evaluation_changed_paths(&before, &after, &pristine_source);
+    if let Some(observer) = agent_observer.as_mut()
+        && let Err(error) = require_agent_final_snapshot_unchanged(observer.checkpoint())
+    {
+        diagnostics.agent_snapshot_after_ms =
+            u64::try_from(snapshot_after_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        return AgentStageExecution {
+            stage: StageExecution::blocked(
+                evaluation_blocker(BlockerKind::WorkspacePreparation, error.clone()),
+                command_diagnostics,
+            ),
+            workspace: Some(agent_dir.to_path_buf()),
+            changed_files: Vec::new(),
+            patch_evidence: Vec::new(),
+            patch_digest: None,
+            patch_evidence_path: None,
+            disallowed_changed_files: Vec::new(),
+            smoke_command_satisfied: false,
+            model_turns: result.model_turns,
+            tool_calls: result.tool_calls,
+            approval_count: result.approval_count,
+            plan_update_count: result.plan_update_count,
+            plan_completed: result.plan.as_ref().is_some_and(|plan| plan.is_completed()),
+            recovery_metrics: result.recovery_metrics.clone(),
+            compaction_count: result
+                .context_trace
+                .as_ref()
+                .map_or(0, |trace| trace.compaction_count),
+            verification_required_command_count: result.verification.required_command_count,
+            verification_satisfied_command_count: result.verification.satisfied_command_count,
+            model_usage: result.model_usage.clone(),
+            provider_attempts: result.provider_attempts.clone(),
+            agent_duration_ms,
+            audit_events: run_status.audit_events,
+            observed_smoke_scope_digests: observed_smoke_scope_digests.clone(),
+            local_process_fallback_unknown_count,
+            trace_path: trace_path_string,
+            error: Some(safe_text(error)),
+            provider_diagnostic: run_status.provider_diagnostic,
+            prompt_structure: Some(prompt_structure.clone()),
+            prompt_fingerprint: Some(prompt_fingerprint.clone()),
+            tool_schema_fingerprint: Some(tool_schema_fingerprint.clone()),
+            provider_evidence: Some(provider_evidence.clone()),
+        };
+    }
+    diagnostics.agent_snapshot_after_ms =
+        u64::try_from(snapshot_after_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let patch_digest_started = Instant::now();
+    let changed_files = evaluation_changed_paths(&before, &after, pristine_source);
     let patch_evidence =
-        workspace_change_evidence(&before, &after, &pristine_source, &projection.allowed_paths);
+        workspace_change_evidence(&before, &after, pristine_source, &projection.allowed_paths);
     let patch_digest = patch_evidence_digest(&patch_evidence);
+    diagnostics.agent_patch_digest_ms =
+        u64::try_from(patch_digest_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let patch_evidence_path = task_dir.join(PATCH_EVIDENCE_FILE);
     let patch_evidence_path = match write_json_atomic(&patch_evidence_path, &patch_evidence) {
         Ok(()) => Some(patch_evidence_path.to_string_lossy().into_owned()),
@@ -2620,7 +3311,7 @@ fn run_agent_stage(
         .filter(|path| !path_is_allowed(path, &projection.allowed_paths))
         .cloned()
         .collect::<Vec<_>>();
-    let smoke_command_satisfied = smoke_commands_satisfied(&agent_dir, projection, &result);
+    let smoke_command_satisfied = smoke_commands_satisfied(agent_dir, projection, &result);
     let loop_completed = result.completed && result.status == AgentStatus::Completed;
     let error = result.error.clone().map(safe_text);
     let sandbox_blocker = agent_sandbox_blocker(&run_status.audit_events);
@@ -2708,6 +3399,19 @@ fn run_agent_stage(
         tool_schema_fingerprint: Some(tool_schema_fingerprint),
         provider_evidence: Some(provider_evidence),
     }
+}
+
+fn project_agent_task(
+    workspace: &Path,
+    projection: &AgentTaskProjection,
+) -> Result<AgentTaskProjection, String> {
+    let mut projected = projection.clone();
+    projected.smoke_commands = projection
+        .smoke_commands
+        .iter()
+        .map(|command| project_command_spec(workspace, command))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(projected)
 }
 
 fn blocked_agent_stage(
@@ -3048,25 +3752,22 @@ fn evaluation_agent_trace(
     .map_err(|error| format!("failed to serialize evaluation SQLite trace: {error}"))
 }
 
-fn agent_verification_requirements(
+fn agent_verification_commands(
     workspace: &Path,
     projection: &AgentTaskProjection,
-) -> Result<Vec<AgentVerificationRequirement>, String> {
+) -> Result<Vec<AgentVerificationCommand>, String> {
     projection
         .smoke_commands
         .iter()
         .enumerate()
         .map(|(index, command)| {
-            let scope_digest = smoke_command_scope_digest(workspace, command).map_err(|_| {
+            let action = smoke_verification_action(workspace, command).map_err(|_| {
                 format!(
                     "evaluation smoke command {} cwd could not be resolved inside the prepared workspace",
                     index + 1
                 )
             })?;
-            Ok(AgentVerificationRequirement::new(
-                scope_digest,
-                1,
-            ))
+            Ok(AgentVerificationCommand::new(action, 1))
         })
         .collect()
 }
@@ -3102,17 +3803,32 @@ fn smoke_commands_satisfied(
 
 // 统一 Agent completion、post-agent smoke 和 evidence 使用的精确 command scope。
 fn smoke_command_scope_digest(workspace: &Path, command: &CommandSpec) -> Result<String, String> {
-    let cwd = resolved_smoke_cwd(workspace, command)
-        .ok_or_else(|| "evaluation smoke command cwd is unavailable".to_string())?;
+    let action = smoke_verification_action(workspace, command)?;
     Ok(command_script_scope_digest_with_policy(
-        &command_script_from_argv(command.argv.as_slice()),
-        &cwd,
-        command
+        &action.command,
+        &action.cwd,
+        action.timeout_seconds,
+        action.sandbox_mode,
+        action.network_access,
+    ))
+}
+
+fn smoke_verification_action(
+    workspace: &Path,
+    command: &CommandSpec,
+) -> Result<AgentVerificationAction, String> {
+    let command = project_command_spec(workspace, command)?;
+    let cwd = resolved_smoke_cwd(workspace, &command)
+        .ok_or_else(|| "evaluation smoke command cwd is unavailable".to_string())?;
+    Ok(AgentVerificationAction {
+        command: command_script_from_argv(command.argv.as_slice()),
+        cwd,
+        timeout_seconds: command
             .timeout_seconds
             .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
-        SandboxFilesystemMode::WorkspaceWrite,
-        sandbox_network_mode(command.network_access),
-    ))
+        sandbox_mode: SandboxFilesystemMode::WorkspaceWrite,
+        network_access: sandbox_network_mode(command.network_access),
+    })
 }
 
 fn resolved_smoke_cwd(workspace: &Path, command: &CommandSpec) -> Option<String> {
@@ -3361,12 +4077,8 @@ fn required_host_executables(plans: &[WorkspacePlan]) -> std::collections::BTree
     let mut executables = std::collections::BTreeSet::new();
     for plan in plans {
         let commands = plan
-            .agent
             .setup_commands
             .iter()
-            .chain(&plan.baseline.setup_commands)
-            .chain(&plan.public.setup_commands)
-            .chain(&plan.hidden.setup_commands)
             .chain(&plan.agent.projection.smoke_commands)
             .chain(&plan.baseline.commands)
             .chain(&plan.public.commands)
@@ -3439,6 +4151,26 @@ fn remote_source_probe_succeeded(result: &CommandResult) -> bool {
         && result.sandbox.enforcement == singularity_tools::SandboxBackendEnforcement::Strict
 }
 
+/// Create the sibling capability and task-like workspaces used by the runner preflight.
+///
+/// The capability workspace is intentionally separate because platform adapters may create
+/// protected metadata there while probing. The ordinary command must instead run from the same
+/// `task/trial-0001/agent` shape that a materialized Evaluation trial receives.
+fn create_preflight_task_layout(scratch: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let capability_workspace = scratch.join("capability");
+    let task_root = scratch.join("task");
+    let task_workspace = task_root.join("trial-0001").join(AGENT_DIR);
+
+    fs::create_dir(&capability_workspace).map_err(|error| error.to_string())?;
+    fs::create_dir_all(task_root.join(SOURCE_DIR)).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&task_workspace).map_err(|error| error.to_string())?;
+
+    let capability_workspace =
+        fs::canonicalize(&capability_workspace).map_err(|error| error.to_string())?;
+    let task_workspace = fs::canonicalize(&task_workspace).map_err(|error| error.to_string())?;
+    Ok((capability_workspace, task_workspace))
+}
+
 fn run_sandbox_preflight(
     run_dir: &Path,
     plans: &[WorkspacePlan],
@@ -3471,12 +4203,12 @@ fn run_sandbox_preflight(
             ),
         }));
     }
-    // The run-owned scratch directory is on the same filesystem as task roots. One probe
-    // therefore establishes the backend/profile contract for the entire task set without
-    // touching any task source or starting a provider trial.
+    // The run-owned scratch directory is on the same filesystem as task roots. The capability
+    // probe plus the ordinary task-layout no-op establish the backend/profile contract for the
+    // entire task set without touching any task source or starting a provider trial.
     let scratch_path = run_dir.join(".sandbox-preflight");
     #[cfg(windows)]
-    let (scratch, scratch_identity) = {
+    let (scratch, scratch_identity, capability_workspace, task_workspace) = {
         let mut lease = match TrustedWorkspaceLease::create(&scratch_path) {
             Ok(lease) => lease,
             Err(error) => {
@@ -3537,6 +4269,39 @@ fn run_sandbox_preflight(
                 }));
             }
         };
+        let (capability_workspace, task_workspace) = match create_preflight_task_layout(&scratch) {
+            Ok(layout) => layout,
+            Err(_) => {
+                let cleanup_error = lease.rollback().err();
+                let mut report =
+                    SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
+                report.outcome = SandboxPreflightOutcome::Unsupported;
+                let error_code = cleanup_error.as_ref().map_or(
+                    "sandbox_preflight_scratch_unavailable",
+                    |_| "sandbox_preflight_scratch_cleanup",
+                );
+                report.error_code = Some(error_code.to_string());
+                report.missing_capabilities.push(
+                    if cleanup_error.is_some() {
+                        "scratch_cleanup"
+                    } else {
+                        "scratch_workspace"
+                    }
+                    .to_string(),
+                );
+                return Err(Box::new(SandboxPreflightFailure {
+                    report,
+                    blocker: sandbox_preflight_blocker(
+                        error_code,
+                        if cleanup_error.is_some() {
+                            "sandbox preflight scratch cleanup failed"
+                        } else {
+                            "sandbox preflight scratch workspace unavailable"
+                        },
+                    ),
+                }));
+            }
+        };
         if let Err(error) = lease.commit() {
             let cleanup_error = lease.rollback().err();
             let mut report =
@@ -3573,10 +4338,15 @@ fn run_sandbox_preflight(
                 ),
             }));
         }
-        (scratch, scratch_identity)
+        (
+            scratch,
+            scratch_identity,
+            capability_workspace,
+            task_workspace,
+        )
     };
     #[cfg(not(windows))]
-    let scratch = {
+    let (scratch, capability_workspace, task_workspace) = {
         if let Err(error) = fs::create_dir_all(&scratch_path) {
             let mut report =
                 SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
@@ -3593,37 +4363,106 @@ fn run_sandbox_preflight(
                 ),
             }));
         }
-        match fs::canonicalize(&scratch_path) {
+        let scratch = match fs::canonicalize(&scratch_path) {
             Ok(scratch) => scratch,
-            Err(error) => {
+            Err(_error) => {
+                let cleanup_error = fs::remove_dir_all(&scratch_path).err();
                 let mut report =
                     SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
                 report.outcome = SandboxPreflightOutcome::Unsupported;
-                report.error_code = Some("sandbox_preflight_scratch_unavailable".to_string());
-                report
-                    .missing_capabilities
-                    .push("scratch_workspace".to_string());
+                let error_code = cleanup_error.as_ref().map_or(
+                    "sandbox_preflight_scratch_unavailable",
+                    |_| "sandbox_preflight_scratch_cleanup",
+                );
+                report.error_code = Some(error_code.to_string());
+                report.missing_capabilities.push(
+                    if cleanup_error.is_some() {
+                        "scratch_cleanup"
+                    } else {
+                        "scratch_workspace"
+                    }
+                    .to_string(),
+                );
                 return Err(Box::new(SandboxPreflightFailure {
                     report,
                     blocker: sandbox_preflight_blocker(
-                        "sandbox_preflight_scratch_unavailable",
-                        format!("sandbox preflight scratch workspace unavailable: {error}"),
+                        error_code,
+                        if cleanup_error.is_some() {
+                            "sandbox preflight scratch cleanup failed"
+                        } else {
+                            "sandbox preflight scratch workspace unavailable"
+                        },
                     ),
                 }));
             }
-        }
+        };
+        let (capability_workspace, task_workspace) = match create_preflight_task_layout(&scratch) {
+            Ok(layout) => layout,
+            Err(_) => {
+                let cleanup_error = fs::remove_dir_all(&scratch).err();
+                let mut report =
+                    SandboxPreflightReport::unverified_for_backend(sandbox_backend.as_ref());
+                report.outcome = SandboxPreflightOutcome::Unsupported;
+                let error_code = cleanup_error.as_ref().map_or(
+                    "sandbox_preflight_scratch_unavailable",
+                    |_| "sandbox_preflight_scratch_cleanup",
+                );
+                report.error_code = Some(error_code.to_string());
+                report.missing_capabilities.push(
+                    if cleanup_error.is_some() {
+                        "scratch_cleanup"
+                    } else {
+                        "scratch_workspace"
+                    }
+                    .to_string(),
+                );
+                return Err(Box::new(SandboxPreflightFailure {
+                    report,
+                    blocker: sandbox_preflight_blocker(
+                        error_code,
+                        if cleanup_error.is_some() {
+                            "sandbox preflight scratch cleanup failed"
+                        } else {
+                            "sandbox preflight scratch workspace unavailable"
+                        },
+                    ),
+                }));
+            }
+        };
+        (scratch, capability_workspace, task_workspace)
     };
-    let mut report = sandbox_backend.preflight(&scratch, cancellation);
+    let mut report = sandbox_backend.preflight(&capability_workspace, cancellation);
+    let mut primary_detail = None;
+    if report.outcome == SandboxPreflightOutcome::Supported {
+        let result =
+            run_task_workspace_preflight_command(&task_workspace, Arc::clone(sandbox_backend));
+        if !unchanged_command_succeeded(&result) {
+            primary_detail = Some(
+                command_blocker(
+                    &result,
+                    BlockerKind::Sandbox,
+                    "sandbox task workspace preflight failed",
+                )
+                .message,
+            );
+            report.outcome = SandboxPreflightOutcome::Unsupported;
+            report.error_code = Some("sandbox_preflight_task_workspace_unavailable".to_string());
+            report
+                .missing_capabilities
+                .push("strict_task_workspace".to_string());
+        }
+    }
     if report.outcome == SandboxPreflightOutcome::Supported
         && let Err((code, missing)) =
-            preflight_task_executables(&scratch, plans, sandbox_backend, cancellation)
+            preflight_task_executables(&capability_workspace, plans, sandbox_backend, cancellation)
     {
         report.outcome = SandboxPreflightOutcome::Unsupported;
         report.error_code = Some(code.to_string());
         report.missing_capabilities.extend(missing);
     }
     if report.outcome == SandboxPreflightOutcome::Supported {
-        match preflight_remote_sources(&scratch, plans, sandbox_backend, cancellation) {
+        match preflight_remote_sources(&capability_workspace, plans, sandbox_backend, cancellation)
+        {
             Ok(()) => {}
             Err(RemoteSourcePreflightFailure::Cancelled) => {
                 report.outcome = SandboxPreflightOutcome::Unsupported;
@@ -3647,8 +4486,8 @@ fn run_sandbox_preflight(
     });
     if report.outcome == SandboxPreflightOutcome::Supported && trusted_git_required {
         let preparation = run_workspace_preparation_command(
-            &scratch,
-            &scratch,
+            &capability_workspace,
+            &capability_workspace,
             vec![
                 "git".to_string(),
                 "init".to_string(),
@@ -3660,6 +4499,14 @@ fn run_sandbox_preflight(
             Arc::clone(sandbox_backend),
         );
         if !command_succeeded(&preparation) {
+            primary_detail = Some(
+                command_blocker(
+                    &preparation,
+                    BlockerKind::Sandbox,
+                    "sandbox trusted preparation preflight failed",
+                )
+                .message,
+            );
             report.outcome = SandboxPreflightOutcome::Unsupported;
             report.error_code =
                 Some("sandbox_preflight_trusted_preparation_unverified".to_string());
@@ -3667,6 +4514,24 @@ fn run_sandbox_preflight(
                 .missing_capabilities
                 .push("trusted_workspace_preparation".to_string());
         }
+    }
+    let mut cleanup_errors = Vec::new();
+    for (label, workspace) in [
+        ("task workspace", task_workspace.as_path()),
+        ("capability workspace", capability_workspace.as_path()),
+    ] {
+        if let Err(error) = sandbox_backend.release_workspace_observation(workspace) {
+            cleanup_errors.push(format!("{label} observation release failed: {error}"));
+        }
+    }
+    if !cleanup_errors.is_empty() {
+        if report.outcome == SandboxPreflightOutcome::Supported {
+            report.outcome = SandboxPreflightOutcome::Unsupported;
+            report.error_code = Some("sandbox_preflight_observation_release_failed".to_string());
+        }
+        report
+            .missing_capabilities
+            .push("workspace_observation_release".to_string());
     }
     #[cfg(windows)]
     let scratch_cleanup = (|| {
@@ -3685,18 +4550,14 @@ fn run_sandbox_preflight(
     #[cfg(not(windows))]
     let scratch_cleanup = fs::remove_dir_all(&scratch).map_err(|error| error.to_string());
     if let Err(error) = scratch_cleanup {
-        report.outcome = SandboxPreflightOutcome::Unsupported;
-        report.error_code = Some("sandbox_preflight_scratch_cleanup".to_string());
+        if report.outcome == SandboxPreflightOutcome::Supported {
+            report.outcome = SandboxPreflightOutcome::Unsupported;
+            report.error_code = Some("sandbox_preflight_scratch_cleanup".to_string());
+        }
         report
             .missing_capabilities
             .push("scratch_cleanup".to_string());
-        return Err(Box::new(SandboxPreflightFailure {
-            report,
-            blocker: sandbox_preflight_blocker(
-                "sandbox_preflight_scratch_cleanup",
-                format!("sandbox preflight scratch cleanup failed: {error}"),
-            ),
-        }));
+        cleanup_errors.push(format!("sandbox preflight scratch cleanup failed: {error}"));
     }
     if report.outcome == SandboxPreflightOutcome::Supported
         && !report.proves_supported_contract_for(sandbox_backend.name())
@@ -3712,12 +4573,18 @@ fn run_sandbox_preflight(
             .error_code
             .clone()
             .unwrap_or_else(|| "sandbox_preflight_unavailable".to_string());
+        let mut message = format!("sandbox preflight unsupported: {code}");
+        if let Some(detail) = primary_detail {
+            message.push_str("; ");
+            message.push_str(&detail);
+        }
+        if !cleanup_errors.is_empty() {
+            message.push_str("; cleanup/resource errors: ");
+            message.push_str(&cleanup_errors.join("; "));
+        }
         return Err(Box::new(SandboxPreflightFailure {
             report,
-            blocker: sandbox_preflight_blocker(
-                code.clone(),
-                format!("sandbox preflight unsupported: {code}"),
-            ),
+            blocker: sandbox_preflight_blocker(code, message),
         }));
     }
     Ok(report)
@@ -3728,10 +4595,19 @@ fn stage_result(status: StageStatus, blocker: Option<EvaluationBlocker>) -> Stag
 }
 
 fn evaluation_output_root(explicit: Option<&str>) -> PathBuf {
+    let configured = std::env::var(OUTPUT_ROOT_ENV).ok();
+    evaluation_output_root_for_sources(explicit, configured.as_deref(), &std::env::temp_dir())
+}
+
+fn evaluation_output_root_for_sources(
+    explicit: Option<&str>,
+    configured: Option<&str>,
+    system_temp: &Path,
+) -> PathBuf {
     explicit
         .map(PathBuf::from)
-        .or_else(|| std::env::var(OUTPUT_ROOT_ENV).ok().map(PathBuf::from))
-        .unwrap_or_else(|| DEFAULT_OUTPUT_ROOT.iter().collect())
+        .or_else(|| configured.map(PathBuf::from))
+        .unwrap_or_else(|| system_temp.join("singularity").join("evaluations"))
 }
 
 fn preflight_evaluation_path_budget(
@@ -3823,18 +4699,16 @@ fn preflight_evaluation_path_budget_with_limit(
             check_path_budget(context, &path, max_path_chars)?;
         }
 
-        for stage in [BASELINE_DIR, AGENT_DIR, PUBLIC_DIR, HIDDEN_DIR] {
-            let stage_dir = trial_dir.join(stage);
-            check_path_budget(
-                "Cargo target dependency artifact",
-                &stage_dir
-                    .join("target")
-                    .join("debug")
-                    .join("deps")
-                    .join(format!("singularity_evaluation-{CARGO_DEP_HEX}.rlib")),
-                max_path_chars,
-            )?;
-        }
+        check_path_budget(
+            "Cargo target dependency artifact",
+            &trial_dir
+                .join(AGENT_DIR)
+                .join("target")
+                .join("debug")
+                .join("deps")
+                .join(format!("singularity_evaluation-{CARGO_DEP_HEX}.rlib")),
+            max_path_chars,
+        )?;
     }
 
     Ok(())
@@ -4087,19 +4961,26 @@ fn safe_text(text: impl AsRef<str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        Argv, GitCommit, RelativePath, RemoteRepository, ToolCapabilityName,
+        ToolCapabilityRequirement,
+    };
+    #[cfg(windows)]
+    use crate::{EvaluationStage, WorkspaceSeed};
     use serde::Serializer;
     use singularity_agent::UPDATE_PLAN_TOOL;
-    use singularity_evaluation::{
-        Argv, EvaluationStage, GitCommit, RelativePath, RemoteRepository, ToolCapabilityName,
-        ToolCapabilityRequirement, WorkspaceSeed,
-    };
     use singularity_tools::{
         CommandExecutionStatus, CommandRequest, CommandResult, SandboxBackendEnforcement,
-        SandboxCapabilities, WorkspaceMutation, WorkspaceObservation, WorkspaceRevision,
+        SandboxCapabilities, WorkspaceChangeSummary, WorkspaceMutation, WorkspaceObservation,
+        WorkspaceRevision,
     };
-    use std::sync::Condvar;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+
+    fn unconfigured_provider_snapshot() -> ProviderConfigSnapshot {
+        ProviderConfigSnapshot::capture(|name| {
+            (name == "SINGULARITY_MODEL_PROVIDER").then(|| "openai_compatible".to_string())
+        })
+    }
 
     fn command(argv: &[&str]) -> CommandSpec {
         CommandSpec {
@@ -4261,6 +5142,298 @@ mod tests {
     }
 
     #[test]
+    fn agent_snapshot_plan_reuses_complete_unchanged_revision() {
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("read", TOOL_COMMAND, true, "ok")
+                .with_workspace_observation(WorkspaceObservation::unchanged(
+                    WorkspaceRevision::initial(),
+                )),
+        ]);
+        assert_eq!(
+            agent_snapshot_plan(&result, Some(&PreparedWorkspaceObservation::Unchanged)),
+            Ok(AgentSnapshotPlan::Reused)
+        );
+    }
+
+    #[test]
+    fn agent_snapshot_plan_reads_only_producer_reported_mutations() {
+        let revision = WorkspaceRevision::initial().next().expect("revision");
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision))
+                .with_workspace_change_summary(WorkspaceChangeSummary::new(
+                    vec!["src/lib.rs".to_string()],
+                    "sha256:0123456789012345678901234567890123456789012345678901234567890123",
+                )),
+        ]);
+        assert_eq!(
+            agent_snapshot_plan(
+                &result,
+                Some(&PreparedWorkspaceObservation::Changed(vec![
+                    "src/lib.rs".to_string(),
+                ]))
+            ),
+            Ok(AgentSnapshotPlan::Incremental(vec![
+                "src/lib.rs".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn agent_snapshot_plan_without_observer_keeps_full_scan_path() {
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("read", TOOL_COMMAND, true, "ok")
+                .with_workspace_observation(WorkspaceObservation::unchanged(
+                    WorkspaceRevision::initial(),
+                )),
+        ]);
+        assert_eq!(
+            agent_snapshot_plan(&result, None),
+            Ok(AgentSnapshotPlan::Full)
+        );
+    }
+
+    #[test]
+    fn agent_baseline_observer_rejects_changed_unknown_and_error() {
+        for observation in [
+            Ok(PreparedWorkspaceObservation::Changed(vec![
+                "src/lib.rs".to_string(),
+            ])),
+            Ok(PreparedWorkspaceObservation::Unknown),
+            Err("observer failed".to_string()),
+        ] {
+            assert!(require_agent_baseline_unchanged(observation).is_err());
+        }
+    }
+
+    #[test]
+    fn agent_final_snapshot_observer_rejects_changed_unknown_and_error() {
+        assert!(
+            require_agent_final_snapshot_unchanged(Ok(PreparedWorkspaceObservation::Unchanged,))
+                .is_ok()
+        );
+        for observation in [
+            Ok(PreparedWorkspaceObservation::Changed(vec![
+                "src/lib.rs".to_string(),
+            ])),
+            Ok(PreparedWorkspaceObservation::Unknown),
+            Err("observer failed".to_string()),
+        ] {
+            assert!(require_agent_final_snapshot_unchanged(observation).is_err());
+        }
+    }
+
+    #[test]
+    fn agent_snapshot_plan_rejects_out_of_band_observer_paths() {
+        let revision = WorkspaceRevision::initial().next().expect("revision");
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision))
+                .with_workspace_change_summary(WorkspaceChangeSummary::new(
+                    vec!["src/lib.rs".to_string()],
+                    OBSERVER_PATH_DIGEST,
+                )),
+        ]);
+        let observation = PreparedWorkspaceObservation::Changed(vec![
+            "src/lib.rs".to_string(),
+            "out-of-band.txt".to_string(),
+        ]);
+        assert!(agent_snapshot_plan(&result, Some(&observation)).is_err());
+    }
+
+    #[test]
+    fn agent_snapshot_plan_includes_artifact_only_paths_without_revision_advance() {
+        let artifact = WorkspaceChangeSummary {
+            changed_files: vec!["target/cache.bin".to_string()],
+            diff_digest: OBSERVER_PATH_DIGEST.to_string(),
+            verification_relevant: false,
+        };
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("artifact", TOOL_COMMAND, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::unchanged(
+                    WorkspaceRevision::initial(),
+                ))
+                .with_workspace_change_summary(artifact),
+        ]);
+        assert_eq!(
+            agent_snapshot_plan(
+                &result,
+                Some(&PreparedWorkspaceObservation::Changed(vec![
+                    "target/cache.bin".to_string(),
+                ])),
+            ),
+            Ok(AgentSnapshotPlan::Incremental(vec![
+                "target/cache.bin".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn agent_snapshot_plan_rejects_any_physical_change_with_unchanged_observer() {
+        let artifact = WorkspaceChangeSummary {
+            changed_files: vec!["target/cache.bin".to_string()],
+            diff_digest: OBSERVER_PATH_DIGEST.to_string(),
+            verification_relevant: false,
+        };
+        let artifact_result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("artifact", TOOL_COMMAND, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::unchanged(
+                    WorkspaceRevision::initial(),
+                ))
+                .with_workspace_change_summary(artifact),
+        ]);
+        assert!(
+            agent_snapshot_plan(
+                &artifact_result,
+                Some(&PreparedWorkspaceObservation::Unchanged)
+            )
+            .is_err()
+        );
+
+        let revision = WorkspaceRevision::initial().next().expect("revision");
+        let source_result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::changed(revision))
+                .with_workspace_change_summary(WorkspaceChangeSummary::new(
+                    vec!["src/lib.rs".to_string()],
+                    OBSERVER_PATH_DIGEST,
+                )),
+        ]);
+        assert!(
+            agent_snapshot_plan(
+                &source_result,
+                Some(&PreparedWorkspaceObservation::Unchanged)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_snapshot_plan_rejects_summary_without_matching_semantic_observation() {
+        let summary =
+            WorkspaceChangeSummary::new(vec!["src/lib.rs".to_string()], OBSERVER_PATH_DIGEST);
+        let missing_observation = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_change_summary(summary.clone()),
+        ]);
+        assert!(
+            agent_snapshot_plan(
+                &missing_observation,
+                Some(&PreparedWorkspaceObservation::Changed(vec![
+                    "src/lib.rs".to_string(),
+                ])),
+            )
+            .is_err()
+        );
+
+        let unchanged_observation = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::unchanged(
+                    WorkspaceRevision::initial(),
+                ))
+                .with_workspace_change_summary(summary),
+        ]);
+        assert!(
+            agent_snapshot_plan(
+                &unchanged_observation,
+                Some(&PreparedWorkspaceObservation::Changed(vec![
+                    "src/lib.rs".to_string(),
+                ])),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_snapshot_plan_rejects_invalid_summary_before_scanning() {
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("edit", TOOL_EDIT, true, "changed")
+                .with_workspace_observation(WorkspaceObservation::unchanged(
+                    WorkspaceRevision::initial(),
+                ))
+                .with_workspace_change_summary(WorkspaceChangeSummary::new(
+                    vec!["src/lib.rs".to_string()],
+                    "not-a-sha256",
+                )),
+        ]);
+        assert!(
+            agent_snapshot_plan(&result, Some(&PreparedWorkspaceObservation::Unchanged)).is_err()
+        );
+    }
+
+    #[test]
+    fn agent_snapshot_plan_revision_drift_cannot_reuse() {
+        let revision = WorkspaceRevision::initial().next().expect("revision");
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("read", TOOL_COMMAND, true, "ok")
+                .with_workspace_observation(WorkspaceObservation::unchanged(revision)),
+        ]);
+        assert_eq!(
+            agent_snapshot_plan(&result, Some(&PreparedWorkspaceObservation::Unchanged)),
+            Ok(AgentSnapshotPlan::Full)
+        );
+    }
+
+    #[test]
+    fn agent_snapshot_plan_falls_back_on_unknown_or_contract_drift() {
+        let unknown = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("command", TOOL_COMMAND, false, "unknown")
+                .with_workspace_observation(WorkspaceObservation::unknown()),
+        ]);
+        assert!(
+            agent_snapshot_plan(&unknown, Some(&PreparedWorkspaceObservation::Unknown)).is_err()
+        );
+
+        let first = singularity_tools::ToolResult::summary("first", TOOL_COMMAND, true, "ok")
+            .with_workspace_observation(WorkspaceObservation::unchanged(
+                WorkspaceRevision::initial(),
+            ))
+            .with_audit(json!({
+                "workspace_observation_metrics": {"contract": "backend/a"}
+            }));
+        let second = singularity_tools::ToolResult::summary("second", TOOL_COMMAND, true, "ok")
+            .with_workspace_observation(WorkspaceObservation::unchanged(
+                WorkspaceRevision::initial(),
+            ))
+            .with_audit(json!({
+                "workspace_observation_metrics": {"contract": "backend/b"}
+            }));
+        assert_eq!(
+            agent_snapshot_plan(
+                &completed_agent_result(vec![first, second]),
+                Some(&PreparedWorkspaceObservation::Unchanged),
+            ),
+            Ok(AgentSnapshotPlan::Full)
+        );
+    }
+
+    #[test]
+    fn post_agent_snapshot_reuses_baseline_without_tree_reads_when_unchanged() {
+        let temp = tempfile::tempdir().expect("workspace");
+        fs::write(temp.path().join("large.txt"), vec![b'x'; 1024]).expect("file");
+        let (before, _) = snapshot_workspace_with_work(temp.path()).expect("before snapshot");
+        let identity = workspace_root_identity(temp.path()).expect("root identity");
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("command", TOOL_COMMAND, true, "ok")
+                .with_workspace_observation(WorkspaceObservation::unchanged(
+                    WorkspaceRevision::initial(),
+                )),
+        ]);
+        let (after, work, observation, full_scans) = snapshot_agent_workspace_after(
+            temp.path(),
+            &before,
+            &identity,
+            &result,
+            Some(&PreparedWorkspaceObservation::Unchanged),
+        )
+        .expect("post-agent snapshot");
+        assert_eq!(after, before);
+        assert_eq!(work, workspace::SourceCaptureWork::default());
+        assert_eq!(observation, AgentSnapshotObservation::Reused);
+        assert_eq!(full_scans, 0);
+    }
+
+    #[test]
     fn agent_prompt_contains_only_projection_and_exact_smoke_input() {
         let projection = AgentTaskProjection {
             task_id: TaskId::new("task-1").expect("task id"),
@@ -4348,11 +5521,33 @@ mod tests {
     fn task_diagnostics_serializes_only_safe_provider_fields() {
         let diagnostics = TaskDiagnostics {
             source_preparation_duration_ms: 11,
+            copy_ms: 7,
+            transaction_wall_ms: 8,
+            snapshot_ms: 9,
+            digest_ms: 10,
+            source_full_scans: 1,
+            source_tree_entries_read: 3,
+            source_tree_content_reads: 2,
+            source_tree_content_bytes: 11,
+            source_image_bytes: 11,
             trial_duration_ms: 22,
             baseline_duration_ms: 3,
             agent_duration_ms: 4,
             public_duration_ms: 5,
             hidden_duration_ms: 6,
+            agent_copy_ms: 12,
+            agent_setup_ms: 13,
+            agent_snapshot_before_ms: 14,
+            agent_snapshot_before_tree_entries_read: 17,
+            agent_snapshot_before_tree_content_reads: 18,
+            agent_snapshot_before_tree_content_bytes: 19,
+            agent_snapshot_after_ms: 15,
+            agent_snapshot_after_tree_entries_read: 20,
+            agent_snapshot_after_tree_content_reads: 21,
+            agent_snapshot_after_tree_content_bytes: 22,
+            agent_snapshot_after_observation: Some(AgentSnapshotObservation::Incremental),
+            agent_snapshot_full_scans: 1,
+            agent_patch_digest_ms: 16,
             provider_diagnostic: Some(ProviderDiagnostic {
                 code: Some("provider_response_invalid".to_string()),
                 stage: Some(singularity_model::ProviderErrorStage::ResponseValidation),
@@ -4367,13 +5562,109 @@ mod tests {
         assert!(serialized.contains("missing_tool_call_id"));
         assert!(serialized.contains("\"timeout_seconds\":120"));
         assert!(serialized.contains("\"source_preparation_duration_ms\":11"));
+        assert!(serialized.contains("\"copy_ms\":7"));
+        assert!(serialized.contains("\"transaction_wall_ms\":8"));
+        assert!(serialized.contains("\"snapshot_ms\":9"));
+        assert!(serialized.contains("\"digest_ms\":10"));
+        assert!(serialized.contains("\"source_full_scans\":1"));
+        assert!(serialized.contains("\"source_tree_entries_read\":3"));
+        assert!(serialized.contains("\"source_tree_content_reads\":2"));
+        assert!(serialized.contains("\"source_tree_content_bytes\":11"));
+        assert!(serialized.contains("\"source_image_bytes\":11"));
         assert!(serialized.contains("\"trial_duration_ms\":22"));
         assert!(serialized.contains("\"baseline_duration_ms\":3"));
         assert!(serialized.contains("\"agent_duration_ms\":4"));
         assert!(serialized.contains("\"public_duration_ms\":5"));
         assert!(serialized.contains("\"hidden_duration_ms\":6"));
+        assert!(serialized.contains("\"agent_copy_ms\":12"));
+        assert!(serialized.contains("\"agent_setup_ms\":13"));
+        assert!(serialized.contains("\"agent_snapshot_before_ms\":14"));
+        assert!(serialized.contains("\"agent_snapshot_before_tree_entries_read\":17"));
+        assert!(serialized.contains("\"agent_snapshot_before_tree_content_reads\":18"));
+        assert!(serialized.contains("\"agent_snapshot_before_tree_content_bytes\":19"));
+        assert!(serialized.contains("\"agent_snapshot_after_ms\":15"));
+        assert!(serialized.contains("\"agent_snapshot_after_tree_entries_read\":20"));
+        assert!(serialized.contains("\"agent_snapshot_after_tree_content_reads\":21"));
+        assert!(serialized.contains("\"agent_snapshot_after_tree_content_bytes\":22"));
+        assert!(serialized.contains("\"agent_snapshot_after_observation\":\"incremental\""));
+        assert!(serialized.contains("\"agent_snapshot_full_scans\":1"));
+        assert!(serialized.contains("\"agent_patch_digest_ms\":16"));
         assert!(!serialized.contains("Authorization"));
         assert!(!serialized.contains("raw_response"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_projection_exposes_the_proven_windows_venv_command() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::create_dir_all(workspace.path().join(".venv").join("Scripts"))
+            .expect("venv scripts directory");
+        fs::write(
+            workspace.path().join(".venv").join("pyvenv.cfg"),
+            "home = C:\\Python",
+        )
+        .expect("venv marker");
+        fs::write(
+            workspace
+                .path()
+                .join(".venv")
+                .join("Scripts")
+                .join("python.exe"),
+            b"fixture",
+        )
+        .expect("venv executable");
+        let projection = AgentTaskProjection {
+            task_id: TaskId::new("python-task").expect("task id"),
+            description: "description".to_string(),
+            instructions: "fix".to_string(),
+            allowed_paths: vec![RelativePath::new("src").expect("path")],
+            required_tool_capabilities: vec![requirement(ToolCapability::CommandExecution)],
+            smoke_commands: vec![command(&[".venv/bin/python", "-m", "pytest"])],
+        };
+
+        let projected = project_agent_task(workspace.path(), &projection).expect("projection");
+        let executable = &projected.smoke_commands[0].argv.as_slice()[0];
+        assert_eq!(
+            Path::new(executable),
+            Path::new(".venv").join("Scripts").join("python.exe")
+        );
+        let prompt = agent_prompt(&projected, &[TOOL_COMMAND.to_string()]);
+        assert!(!prompt.contains(".venv/bin/python"));
+        let model_input = smoke_command_model_input(&projected.smoke_commands[0]);
+        assert_eq!(
+            model_input["command"],
+            command_script_from_argv(projected.smoke_commands[0].argv.as_slice())
+        );
+        assert!(prompt.contains(&serde_json::to_string(&model_input).expect("model input")));
+        let expected_scope =
+            smoke_command_scope_digest(workspace.path(), &projected.smoke_commands[0])
+                .expect("scope digest");
+        assert_eq!(
+            smoke_command_scope_digest(workspace.path(), &projection.smoke_commands[0])
+                .expect("original manifest scope digest"),
+            expected_scope
+        );
+        assert_eq!(
+            expected_scope,
+            command_script_scope_digest_with_policy(
+                &command_script_from_argv(projected.smoke_commands[0].argv.as_slice()),
+                ".",
+                projected.smoke_commands[0]
+                    .timeout_seconds
+                    .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECONDS),
+                SandboxFilesystemMode::WorkspaceWrite,
+                SandboxNetworkMode::Denied,
+            )
+        );
+        let verification_commands =
+            agent_verification_commands(workspace.path(), &projected).expect("commands");
+        assert_eq!(verification_commands.len(), 1);
+        assert_eq!(
+            verification_commands[0].action.command,
+            command_script_from_argv(projected.smoke_commands[0].argv.as_slice())
+        );
+        assert_eq!(verification_commands[0].action.cwd, ".");
+        assert_eq!(verification_commands[0].required_success_count, 1);
     }
 
     #[test]
@@ -4621,6 +5912,27 @@ mod tests {
     }
 
     #[test]
+    fn evaluation_output_root_preserves_explicit_and_environment_precedence() {
+        let system_temp = Path::new("C:/system-temp");
+        assert_eq!(
+            evaluation_output_root_for_sources(None, None, system_temp),
+            PathBuf::from("C:/system-temp/singularity/evaluations")
+        );
+        assert_eq!(
+            evaluation_output_root_for_sources(None, Some("C:/configured"), system_temp),
+            PathBuf::from("C:/configured")
+        );
+        assert_eq!(
+            evaluation_output_root_for_sources(
+                Some("C:/explicit"),
+                Some("C:/configured"),
+                system_temp
+            ),
+            PathBuf::from("C:/explicit")
+        );
+    }
+
+    #[test]
     fn workspace_copy_skips_git_metadata() {
         let temp = tempfile::tempdir().expect("temp");
         let source = temp.path().join("source");
@@ -4635,6 +5947,25 @@ mod tests {
         assert_eq!(
             fs::read_to_string(destination.join("README.md")).expect("readme"),
             "content"
+        );
+    }
+
+    #[test]
+    fn workspace_copy_snapshot_exposes_prepared_source_drift() {
+        let temp = tempfile::tempdir().expect("temp");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).expect("source");
+        fs::write(source.join("README.md"), "prepared").expect("prepared source");
+        let prepared = snapshot_workspace(&source).expect("prepared snapshot");
+        fs::write(source.join("README.md"), "drifted").expect("source drift");
+
+        let copied = copy_tree_checked(&source, &destination).expect("copy");
+
+        assert_ne!(copied, prepared);
+        assert_eq!(
+            copied,
+            snapshot_workspace(&destination).expect("copied workspace snapshot")
         );
     }
 
@@ -4759,13 +6090,13 @@ mod tests {
         cancellation.cancel();
         let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
         let error = run_evaluation(
-            &EvalRunParams {
+            &EvaluationRunParams {
                 manifest: "missing-manifest.json".to_string(),
                 run_id: "cancelled-run".to_string(),
                 output_root: None,
             },
             Arc::new(SourceSandboxBackend),
-            &ProviderConfigSnapshot::capture(|_| None),
+            &unconfigured_provider_snapshot(),
             &cancellation,
             &trace_store,
         )
@@ -4889,7 +6220,7 @@ mod tests {
         };
         let run_id = RunId::new("partial-safe").expect("run id");
         let partial = partial_evaluation_result(
-            &EvalRunParams {
+            &EvaluationRunParams {
                 manifest: "C:\\secret-workspace\\manifest.json".to_string(),
                 run_id: run_id.as_str().to_string(),
                 output_root: None,
@@ -4944,7 +6275,7 @@ mod tests {
         .expect("manifest");
         let output_root = temp.path().join("r".repeat(40));
         let run_dir = output_root.join(&run_id);
-        let params = EvalRunParams {
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id,
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -4954,7 +6285,7 @@ mod tests {
         let error = run_evaluation(
             &params,
             Arc::new(SourceSandboxBackend),
-            &ProviderConfigSnapshot::capture(|_| None),
+            &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
             &trace_store,
         )
@@ -5010,6 +6341,7 @@ mod tests {
         fs::write(temp.path().join("node_modules/.cache/bundle"), "cache").expect("node output");
         fs::create_dir_all(temp.path().join("generated")).expect("unknown output");
         fs::write(temp.path().join("generated/cache.bin"), "unknown").expect("unknown artifact");
+        fs::create_dir(temp.path().join("unknown-empty")).expect("unknown empty directory");
         fs::write(temp.path().join("target/tracked.rs"), "after")
             .expect("modify tracked target file");
         fs::remove_file(temp.path().join("coverage/tracked.txt"))
@@ -5032,6 +6364,7 @@ mod tests {
                 "generated/cache.bin",
                 "src/disallowed.rs",
                 "target/tracked.rs",
+                "unknown-empty",
             ]
         );
         assert_eq!(
@@ -5041,6 +6374,7 @@ mod tests {
                 "generated/cache.bin",
                 "src/disallowed.rs",
                 "target/tracked.rs",
+                "unknown-empty",
             ]
         );
         assert!(evidence.iter().all(|change| !change.allowed));
@@ -5120,12 +6454,51 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             if !request.is_trusted_workspace_preparation() {
-                return CommandResult::backend_error(
-                    &request.command_id,
-                    "source test backend does not execute evaluator commands",
-                )
-                .with_workspace_mutation(WorkspaceMutation::Unknown)
-                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+                assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
+                assert_eq!(
+                    request.filesystem.mode,
+                    SandboxFilesystemMode::WorkspaceWrite
+                );
+                assert_eq!(
+                    request.environment,
+                    CommandEnvironmentPolicy::EvaluationIsolated
+                );
+                #[cfg(windows)]
+                assert!(
+                    request.argv.as_slice() == ["cmd.exe", "/d", "/c", "exit", "1"]
+                        || request.argv.as_slice() == ["cmd.exe", "/d", "/c", "exit", "0"]
+                        || request.argv.as_slice() == ["cmd.exe", "/d", "/c", "rem", "hidden"]
+                );
+                #[cfg(not(windows))]
+                assert!(
+                    request.argv.as_slice() == ["false"]
+                        || request.argv.as_slice() == ["true"]
+                        || request.argv.as_slice() == ["printf", "hidden"]
+                );
+                #[cfg(windows)]
+                let is_baseline = request.argv.as_slice() == ["cmd.exe", "/d", "/c", "exit", "1"];
+                #[cfg(not(windows))]
+                let is_baseline = request.argv.as_slice() == ["false"];
+                let result = if is_baseline {
+                    CommandResult::executed(
+                        &request.command_id,
+                        1,
+                        0,
+                        "",
+                        "expected failure",
+                        false,
+                    )
+                } else {
+                    CommandResult::completed(&request.command_id, "ok")
+                };
+                return result
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
+            if request.argv.as_slice() == ["git", "--version"] {
+                return CommandResult::completed(&request.command_id, "git version 2.55.0")
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
             if request.argv.get(1).map(String::as_str) == Some("init") {
                 return CommandResult::completed(&request.command_id, "prepared")
@@ -5133,19 +6506,89 @@ mod tests {
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             }
             if request.argv.get(1).map(String::as_str) == Some("clone") {
+                assert_eq!(request.argv.get(2).map(String::as_str), Some("--quiet"));
+                assert_eq!(request.argv.get(3).map(String::as_str), Some("--revision"));
+                assert_eq!(
+                    request.argv.get(4).map(String::as_str),
+                    Some("0123456789abcdef0123456789abcdef01234567")
+                );
                 let source = Path::new(&request.cwd).join(SOURCE_DIR);
                 fs::create_dir(&source).expect("source directory");
                 fs::write(source.join("README.md"), "fixture").expect("source file");
+            } else if request.argv.get(3).map(String::as_str) == Some("rev-parse") {
+                return CommandResult::completed(
+                    &request.command_id,
+                    "0123456789abcdef0123456789abcdef01234567",
+                )
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            } else if request.argv.get(3).map(String::as_str) == Some("symbolic-ref") {
+                return CommandResult::executed(&request.command_id, 1, 0, "", "", false)
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
             } else {
-                assert_eq!(request.cwd, request.filesystem.workspace_root);
-                assert_eq!(
-                    request.argv.get(1..4),
-                    Some(["-C", SOURCE_DIR, "checkout"].map(String::from).as_slice())
-                );
+                panic!("unexpected source preparation command: {:?}", request.argv);
             }
             CommandResult::completed(&request.command_id, "ok")
                 .with_workspace_mutation(WorkspaceMutation::Changed)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    struct LegacyGitSourceSandboxBackend;
+
+    impl SandboxBackend for LegacyGitSourceSandboxBackend {
+        fn name(&self) -> &'static str {
+            "legacy_git_source_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            assert!(request.is_trusted_workspace_preparation());
+            if request.argv.as_slice() == ["git", "--version"] {
+                return CommandResult::completed(&request.command_id, "git version 2.43.0")
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
+            if request.argv.get(1).map(String::as_str) == Some("clone") {
+                assert_eq!(request.argv.get(2).map(String::as_str), Some("--quiet"));
+                assert_eq!(
+                    request.argv.get(3).map(String::as_str),
+                    Some("--no-checkout")
+                );
+                let source = Path::new(&request.cwd).join(SOURCE_DIR);
+                fs::create_dir(&source).expect("source directory");
+                fs::write(source.join("README.md"), "fixture").expect("source file");
+                return CommandResult::completed(&request.command_id, "ok")
+                    .with_workspace_mutation(WorkspaceMutation::Changed)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
+            if request.argv.get(3).map(String::as_str) == Some("checkout") {
+                assert_eq!(request.argv.get(5).map(String::as_str), Some("--detach"));
+                return CommandResult::completed(&request.command_id, "ok")
+                    .with_workspace_mutation(WorkspaceMutation::Changed)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
+            if request.argv.get(3).map(String::as_str) == Some("rev-parse") {
+                return CommandResult::completed(
+                    &request.command_id,
+                    "0123456789abcdef0123456789abcdef01234567",
+                )
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
+            if request.argv.get(3).map(String::as_str) == Some("symbolic-ref") {
+                return CommandResult::executed(&request.command_id, 1, 0, "", "", false)
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
+            panic!(
+                "unexpected legacy source preparation command: {:?}",
+                request.argv
+            );
         }
     }
 
@@ -5183,6 +6626,59 @@ mod tests {
             )
             .with_workspace_mutation(WorkspaceMutation::Unknown)
             .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    struct TaskWorkspaceUnavailableBackend {
+        executions: Arc<AtomicUsize>,
+        released_workspaces: Arc<Mutex<Vec<PathBuf>>>,
+        release_error: bool,
+    }
+
+    impl SandboxBackend for TaskWorkspaceUnavailableBackend {
+        fn name(&self) -> &'static str {
+            "task_workspace_unavailable_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict().with_change_detection()
+        }
+
+        fn preflight(
+            &self,
+            _workspace: &Path,
+            _cancellation: &CancellationToken,
+        ) -> SandboxPreflightReport {
+            supported_sandbox_preflight(self.name())
+        }
+
+        fn release_workspace_observation(&self, workspace: &Path) -> Result<(), String> {
+            self.released_workspaces
+                .lock()
+                .expect("release workspace tracking lock")
+                .push(workspace.to_path_buf());
+            if self.release_error {
+                Err("test observation release failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn probe_executable(
+            &self,
+            _workspace: &Path,
+            _executable: &str,
+            _environment: &CommandEnvironmentPolicy,
+        ) -> ExecutableAvailability {
+            ExecutableAvailability::Available
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            assert!(!request.is_trusted_workspace_preparation());
+            CommandResult::backend_error(&request.command_id, "task workspace rejected")
+                .with_workspace_mutation(WorkspaceMutation::Unknown)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
 
@@ -5260,6 +6756,20 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if !request.is_trusted_workspace_preparation() {
+                assert_eq!(request.network.mode, SandboxNetworkMode::Denied);
+                assert_eq!(
+                    request.filesystem.mode,
+                    SandboxFilesystemMode::WorkspaceWrite
+                );
+                assert_eq!(
+                    request.environment,
+                    CommandEnvironmentPolicy::EvaluationIsolated
+                );
+                return CommandResult::completed(&request.command_id, "task workspace available")
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
             if request.argv.get(1).map(String::as_str) == Some("ls-remote") {
                 assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
                 assert!(request.is_trusted_workspace_preparation());
@@ -5321,6 +6831,11 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             self.executions.fetch_add(1, Ordering::SeqCst);
+            if !request.is_trusted_workspace_preparation() {
+                return CommandResult::completed(&request.command_id, "task workspace available")
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                    .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
             if request.argv.get(1).map(String::as_str) == Some("ls-remote") {
                 assert_eq!(request.network.mode, SandboxNetworkMode::Allowed);
                 assert!(request.is_trusted_workspace_preparation());
@@ -5337,7 +6852,24 @@ mod tests {
         }
     }
 
-    struct AgentLoopReachBackend;
+    struct FixedPreparedWorkspaceObserver {
+        observation: PreparedWorkspaceObservation,
+        checkpoint_calls: Arc<AtomicUsize>,
+    }
+
+    impl singularity_sandbox::PreparedWorkspaceObserver for FixedPreparedWorkspaceObserver {
+        fn checkpoint(&mut self) -> Result<PreparedWorkspaceObservation, String> {
+            self.checkpoint_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.observation.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct AgentLoopReachBackend {
+        setup_calls: AtomicUsize,
+        observer_baseline: Mutex<Option<PreparedWorkspaceObservation>>,
+        observer_checkpoint_calls: Arc<AtomicUsize>,
+    }
 
     impl SandboxBackend for AgentLoopReachBackend {
         fn name(&self) -> &'static str {
@@ -5365,33 +6897,53 @@ mod tests {
             ExecutableAvailability::Available
         }
 
+        fn observe_prepared_workspace(
+            &self,
+            workspace: &Path,
+        ) -> Result<Option<Box<dyn singularity_sandbox::PreparedWorkspaceObserver>>, String>
+        {
+            if workspace.file_name().and_then(|name| name.to_str()) != Some(AGENT_DIR) {
+                return Ok(None);
+            }
+            let observation = self
+                .observer_baseline
+                .lock()
+                .map_err(|_| "agent observer fixture lock poisoned".to_string())?
+                .clone();
+            Ok(observation.map(|observation| {
+                Box::new(FixedPreparedWorkspaceObserver {
+                    observation,
+                    checkpoint_calls: Arc::clone(&self.observer_checkpoint_calls),
+                }) as Box<dyn singularity_sandbox::PreparedWorkspaceObserver>
+            }))
+        }
+
         fn execute(&self, request: &CommandRequest) -> CommandResult {
-            let result = if request.argv.first().map(String::as_str) == Some("verify-baseline") {
+            let result = if request.argv.first().map(String::as_str) == Some("prepare-once") {
+                self.setup_calls.fetch_add(1, Ordering::SeqCst);
+                CommandResult::completed(&request.command_id, "prepared")
+                    .with_workspace_mutation(WorkspaceMutation::Changed)
+            } else if request.argv.first().map(String::as_str) == Some("verify-baseline") {
                 CommandResult::executed(&request.command_id, 1, 0, "", "expected failure", false)
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
             } else {
                 CommandResult::completed(&request.command_id, "verified")
+                    .with_workspace_mutation(WorkspaceMutation::Unchanged)
             };
-            result
-                .with_workspace_mutation(WorkspaceMutation::Unchanged)
-                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+            result.with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
 
+    #[cfg(windows)]
     #[derive(Default)]
-    struct ConcurrentVerificationBackend {
-        active_and_peak: Mutex<(usize, usize)>,
-        rendezvous: Condvar,
+    struct ExclusiveVerificationBackend {
+        active: AtomicUsize,
     }
 
-    impl ConcurrentVerificationBackend {
-        fn peak(&self) -> usize {
-            self.active_and_peak.lock().expect("lock").1
-        }
-    }
-
-    impl SandboxBackend for ConcurrentVerificationBackend {
+    #[cfg(windows)]
+    impl SandboxBackend for ExclusiveVerificationBackend {
         fn name(&self) -> &'static str {
-            "concurrent_verification_test"
+            "exclusive_verification_test"
         }
 
         fn capabilities(&self) -> SandboxCapabilities {
@@ -5399,61 +6951,47 @@ mod tests {
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
-            let mut state = self.active_and_peak.lock().expect("lock");
-            state.0 += 1;
-            state.1 = state.1.max(state.0);
-            if state.0 == 2 {
-                self.rendezvous.notify_all();
-            } else {
-                let (next, timeout) = self
-                    .rendezvous
-                    .wait_timeout_while(state, Duration::from_secs(2), |state| state.1 < 2)
-                    .expect("wait");
-                state = next;
-                assert!(!timeout.timed_out(), "verification stages did not overlap");
+            if self.active.fetch_add(1, Ordering::SeqCst) != 0 {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                return CommandResult::backend_error(
+                    &request.command_id,
+                    "shared protected marker lease is already held",
+                )
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Unavailable);
             }
-            state.0 -= 1;
-            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            self.active.fetch_sub(1, Ordering::SeqCst);
             CommandResult::completed(&request.command_id, "verified")
                 .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
     }
 
+    #[cfg(windows)]
     #[test]
-    fn public_and_hidden_verification_run_concurrently_in_isolated_workspaces() {
+    fn public_and_hidden_verification_do_not_overlap_shared_sandbox_resources() {
         let temp = tempfile::tempdir().expect("temp");
-        let source = temp.path().join("source");
         let agent = temp.path().join("agent");
-        fs::create_dir(&source).expect("source");
         fs::create_dir(&agent).expect("agent");
-        fs::write(source.join("source.txt"), "source").expect("source file");
         fs::write(agent.join("source.txt"), "source").expect("agent file");
         let plan = |stage| VerificationStagePlan {
             stage,
             seed: WorkspaceSeed::AgentOutput,
             expectation: CommandExpectation::Success,
-            setup_commands: Vec::new(),
             test_patch: None,
             commands: vec![command(&["verify"])],
         };
         let public_plan = plan(EvaluationStage::Public);
         let hidden_plan = plan(EvaluationStage::Hidden);
-        let backend = Arc::new(ConcurrentVerificationBackend::default());
+        let backend = Arc::new(ExclusiveVerificationBackend::default());
         let shared: SharedSandboxBackend = backend.clone();
 
-        let ((public, _), (hidden, _)) = run_post_agent_verification_stages(
-            &source,
-            &agent,
-            &[],
-            (&temp.path().join("public"), &public_plan),
-            (&temp.path().join("hidden"), &hidden_plan),
-            &shared,
-        );
+        let ((public, _), (hidden, _)) =
+            run_post_agent_verification_stages(&agent, &public_plan, &hidden_plan, &shared);
 
         assert_eq!(public.result.status, StageStatus::Passed);
         assert_eq!(hidden.result.status, StageStatus::Passed);
-        assert_eq!(backend.peak(), 2);
+        assert_eq!(backend.active.load(Ordering::SeqCst), 0);
     }
 
     struct EvaluatorPatchSandboxBackend {
@@ -5470,29 +7008,69 @@ mod tests {
         }
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if request.is_trusted_workspace_preparation() {
+                panic!("evaluator patches must retain ordinary protected-path enforcement");
+            }
+            if request.argv.as_slice() == ["verify"] {
+                assert_eq!(request.argv.as_slice(), ["verify"]);
+                return CommandResult::executed(
+                    &request.command_id,
+                    1,
+                    0,
+                    "",
+                    "expected failure",
+                    false,
+                )
+                .with_workspace_mutation(WorkspaceMutation::Unchanged)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);
+            }
             assert_eq!(
                 request.argv.get(1).map(String::as_str),
-                Some("--git-dir=.singularity-evaluator-git")
+                Some(if cfg!(windows) {
+                    "--git-dir=NUL"
+                } else {
+                    "--git-dir=/dev/null"
+                })
             );
             assert_eq!(
                 request.argv.get(2).map(String::as_str),
                 Some("--work-tree=.")
             );
-            if call == 0 {
-                assert_eq!(
-                    request.argv.get(3).map(String::as_str),
-                    Some("init"),
-                    "the first evaluator patch command must create the isolated Git metadata"
-                );
-                assert!(request.is_trusted_workspace_preparation());
-            } else {
-                assert_eq!(request.argv.get(3).map(String::as_str), Some("apply"));
-                assert!(
-                    request.is_trusted_workspace_preparation(),
-                    "fixed evaluator Git operations share the internal workspace-preparation boundary"
-                );
-            }
+            assert_eq!(request.argv.get(3).map(String::as_str), Some("-c"));
+            assert_eq!(
+                request.argv.get(4).map(String::as_str),
+                Some("core.autocrlf=false")
+            );
+            assert_eq!(request.argv.get(5).map(String::as_str), Some("apply"));
+            assert_eq!(request.argv.get(6).map(String::as_str), Some("--no-index"));
+            assert!(
+                !request
+                    .argv
+                    .iter()
+                    .any(|argument| argument == "--check" || argument == "--reject"),
+                "Git's default whole-patch atomicity must not be replaced by a redundant check or partial application"
+            );
+            assert!(
+                matches!(
+                    request.argv.get(7..),
+                    Some([
+                        whitespace,
+                        patch_file
+                    ]) if whitespace == "--whitespace=nowarn"
+                        && patch_file == EVALUATOR_PATCH_FILE
+                ) || matches!(
+                    request.argv.get(7..),
+                    Some([
+                        reverse,
+                        whitespace,
+                        patch_file
+                    ]) if reverse == "--reverse"
+                        && whitespace == "--whitespace=nowarn"
+                        && patch_file == EVALUATOR_PATCH_FILE
+                ),
+                "only the fixed atomic apply and reverse operations are trusted"
+            );
             CommandResult::completed(&request.command_id, "ok")
                 .with_workspace_mutation(WorkspaceMutation::Changed)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
@@ -5500,68 +7078,219 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_patch_uses_only_fixed_trusted_git_operations() {
+    fn evaluator_patch_uses_only_fixed_strict_git_operations() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let patch: singularity_evaluation::EvaluatorTestPatch =
-            serde_json::from_value(serde_json::json!({
-                "format": "unified_diff",
-                "content": "--- a/example.txt\n+++ b/example.txt\n"
-            }))
-            .expect("test patch");
+        let patch: crate::EvaluatorTestPatch = serde_json::from_value(serde_json::json!({
+            "format": "unified_diff",
+            "content": "--- a/example.txt\n+++ b/example.txt\n"
+        }))
+        .expect("test patch");
         let backend = Arc::new(EvaluatorPatchSandboxBackend {
             calls: AtomicUsize::new(0),
         });
         let mut diagnostics = Vec::new();
 
-        apply_evaluator_patch(workspace.path(), &patch, backend.clone(), &mut diagnostics)
-            .expect("apply evaluator patch");
+        let patch_path =
+            apply_evaluator_patch(workspace.path(), &patch, backend.clone(), &mut diagnostics)
+                .expect("apply evaluator patch");
+        revert_evaluator_patch(
+            workspace.path(),
+            &patch_path,
+            backend.clone(),
+            &mut diagnostics,
+        )
+        .expect("revert evaluator patch");
 
-        assert_eq!(backend.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             diagnostics
                 .iter()
                 .map(|diagnostic| diagnostic.phase.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "evaluator.git_init",
-                "evaluator.apply_check",
-                "evaluator.apply_patch",
-                "evaluator.reverse_check",
-            ]
+            ["evaluator.apply_patch", "evaluator.revert_patch"]
         );
         assert!(!workspace.path().join(".git").exists());
-        assert!(!workspace.path().join(EVALUATOR_GIT_DIR).exists());
         assert!(!workspace.path().join(EVALUATOR_PATCH_FILE).exists());
     }
 
     #[test]
-    fn evaluator_patch_rejects_a_preexisting_control_git_directory() {
+    fn evaluator_patch_is_reverted_after_verification_failure() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let git_dir = workspace.path().join(EVALUATOR_GIT_DIR);
-        fs::create_dir(&git_dir).expect("preexisting control directory");
+        let patch: crate::EvaluatorTestPatch = serde_json::from_value(serde_json::json!({
+            "format": "unified_diff",
+            "content": "--- a/example.txt\n+++ b/example.txt\n"
+        }))
+        .expect("test patch");
+        let backend = Arc::new(EvaluatorPatchSandboxBackend {
+            calls: AtomicUsize::new(0),
+        });
+
+        let execution = run_verification_after_setup(
+            workspace.path(),
+            Some(&patch),
+            &[command(&["verify"])],
+            CommandExpectation::Success,
+            backend.clone(),
+            Vec::new(),
+        );
+
+        assert_eq!(execution.result.status, StageStatus::Failed);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            execution
+                .diagnostics
+                .commands
+                .iter()
+                .map(|diagnostic| diagnostic.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "evaluator.apply_patch",
+                "verification.command.0",
+                "evaluator.revert_patch",
+            ]
+        );
+        assert!(!workspace.path().join(EVALUATOR_PATCH_FILE).exists());
+    }
+
+    #[test]
+    fn evaluator_patch_leaves_an_unrelated_git_metadata_directory_untouched() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let git_dir = workspace.path().join(".singularity-evaluator-git");
+        fs::create_dir(&git_dir).expect("source directory");
         fs::write(git_dir.join("owned.txt"), "source content").expect("source content");
-        let patch: singularity_evaluation::EvaluatorTestPatch =
-            serde_json::from_value(serde_json::json!({
-                "format": "unified_diff",
-                "content": "--- a/example.txt\n+++ b/example.txt\n"
-            }))
-            .expect("test patch");
+        let patch: crate::EvaluatorTestPatch = serde_json::from_value(serde_json::json!({
+            "format": "unified_diff",
+            "content": "--- a/example.txt\n+++ b/example.txt\n"
+        }))
+        .expect("test patch");
         let backend = Arc::new(EvaluatorPatchSandboxBackend {
             calls: AtomicUsize::new(0),
         });
         let mut diagnostics = Vec::new();
 
-        let blocker =
+        let patch_path =
             apply_evaluator_patch(workspace.path(), &patch, backend.clone(), &mut diagnostics)
-                .expect_err("control path collision must fail closed");
+                .expect("unrelated source directory must not affect patch application");
+        revert_evaluator_patch(
+            workspace.path(),
+            &patch_path,
+            backend.clone(),
+            &mut diagnostics,
+        )
+        .expect("revert evaluator patch");
 
-        assert_eq!(blocker.kind, BlockerKind::WorkspacePreparation);
-        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             fs::read_to_string(git_dir.join("owned.txt")).expect("preserved source content"),
             "source content"
         );
         assert!(!workspace.path().join(EVALUATOR_PATCH_FILE).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the installed native Windows strict sandbox"]
+    fn native_windows_evaluator_patch_reverts_after_private_artifact_changes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("example.txt"), "before\n").expect("source file");
+        let patch: crate::EvaluatorTestPatch = serde_json::from_value(serde_json::json!({
+            "format": "unified_diff",
+            "content": "--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-before\n+after\n"
+        }))
+        .expect("test patch");
+        let backend: SharedSandboxBackend =
+            Arc::new(singularity_sandbox::PlatformSandboxBackend::new());
+        let execution = run_verification_after_setup(
+            workspace.path(),
+            Some(&patch),
+            &[command(&[
+                "python",
+                "-c",
+                "import os, pathlib, sys; os.mkdir('.pytest_cache', 0o700); [pathlib.Path(f'.pytest_cache/node-{i:03}.json').write_text('artifact') for i in range(65)]; sys.exit(1)",
+            ])],
+            CommandExpectation::Success,
+            backend.clone(),
+            Vec::new(),
+        );
+
+        assert_eq!(execution.result.status, StageStatus::Failed);
+        assert_eq!(
+            execution.diagnostics.message.as_deref(),
+            Some("1 verification command(s) failed")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("example.txt")).expect("restored file"),
+            "before\n"
+        );
+        let artifact = run_raw_command(
+            workspace.path(),
+            workspace.path(),
+            vec![
+                "python".to_string(),
+                "-c".to_string(),
+                "from pathlib import Path; print(Path('.pytest_cache/node-000.json').read_text())"
+                    .to_string(),
+            ],
+            30,
+            SandboxNetworkMode::Denied,
+            backend,
+        );
+        assert_eq!(
+            artifact.execution_status,
+            CommandExecutionStatus::Completed,
+            "{artifact:#?}"
+        );
+        assert_eq!(artifact.semantic_status, CommandSemanticStatus::Succeeded);
+        assert_eq!(
+            artifact.sandbox.enforcement,
+            singularity_tools::SandboxBackendEnforcement::Strict
+        );
+        assert!(!artifact.sandbox.local_process_fallback);
+        assert_eq!(artifact.stdout_preview.trim(), "artifact");
+        assert_eq!(
+            execution
+                .diagnostics
+                .commands
+                .iter()
+                .map(|diagnostic| diagnostic.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "evaluator.apply_patch",
+                "verification.command.0",
+                "evaluator.revert_patch",
+            ]
+        );
+        assert!(!workspace.path().join(EVALUATOR_PATCH_FILE).exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the installed native Windows strict sandbox"]
+    fn native_windows_evaluator_patch_rejects_paths_outside_the_workspace() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let outside = root.path().join("outside.txt");
+        fs::write(&outside, "protected\n").expect("outside file");
+        let patch: crate::EvaluatorTestPatch =
+            serde_json::from_value(serde_json::json!({
+                "format": "unified_diff",
+                "content": "--- a/../outside.txt\n+++ b/../outside.txt\n@@ -1 +1 @@\n-protected\n+changed\n"
+            }))
+            .expect("test patch");
+        let backend: SharedSandboxBackend =
+            Arc::new(singularity_sandbox::PlatformSandboxBackend::new());
+        let mut diagnostics = Vec::new();
+
+        let blocker = apply_evaluator_patch(&workspace, &patch, backend, &mut diagnostics)
+            .expect_err("workspace escape must be rejected");
+
+        assert_eq!(blocker.kind, BlockerKind::WorkspacePreparation);
+        assert_eq!(
+            fs::read_to_string(outside).expect("outside file"),
+            "protected\n"
+        );
+        assert!(!workspace.join(EVALUATOR_PATCH_FILE).exists());
     }
 
     struct PathBudgetSandboxBackend;
@@ -5580,6 +7309,43 @@ mod tests {
                 .with_workspace_mutation(WorkspaceMutation::Unknown)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
         }
+    }
+
+    struct MutatingVerificationBackend;
+
+    impl SandboxBackend for MutatingVerificationBackend {
+        fn name(&self) -> &'static str {
+            "mutating_verification_test"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities::strict()
+        }
+
+        fn execute(&self, request: &CommandRequest) -> CommandResult {
+            CommandResult::completed(&request.command_id, "changed")
+                .with_workspace_mutation(WorkspaceMutation::Changed)
+                .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
+        }
+    }
+
+    #[test]
+    fn verification_workspace_mutation_blocks_shared_workspace_reuse() {
+        let temp = tempfile::tempdir().expect("temp");
+        let execution = run_verification_after_setup(
+            temp.path(),
+            None,
+            &[command(&["verify"])],
+            CommandExpectation::Success,
+            Arc::new(MutatingVerificationBackend),
+            Vec::new(),
+        );
+
+        assert_eq!(execution.result.status, StageStatus::Blocked);
+        assert_eq!(
+            execution.result.blocker.expect("sandbox blocker").kind,
+            BlockerKind::Sandbox
+        );
     }
 
     #[test]
@@ -5620,7 +7386,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_remote_source_preserves_clone_and_checkout_diagnostics() {
+    fn remote_source_uses_capability_bound_revision_and_verifies_checkout() {
         let temp = tempfile::tempdir().expect("temp");
         let task_dir = temp.path().join("task");
         fs::create_dir(&task_dir).expect("task directory");
@@ -5630,19 +7396,82 @@ mod tests {
                 .expect("repository"),
             commit: GitCommit::new("0123456789abcdef0123456789abcdef01234567").expect("commit"),
         };
+        let backend = Arc::new(SourceSandboxBackend);
+        let preflight = supported_sandbox_preflight(backend.name());
 
-        let diagnostics = prepare_source(
-            &source,
-            &task_dir,
-            &source_dir,
-            Arc::new(SourceSandboxBackend),
-        )
-        .expect("prepare source");
+        let MaterializedSource {
+            commands: diagnostics,
+            snapshot,
+            metrics,
+            ..
+        } = prepare_source(&source, &task_dir, &source_dir, backend, &preflight)
+            .expect("prepare source");
 
-        assert_eq!(diagnostics.len(), 2);
-        assert_eq!(diagnostics[0].phase, "source.git_clone");
-        assert_eq!(diagnostics[1].phase, "source.git_checkout");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "source.git_version",
+                "source.git_clone",
+                "source.git_verify_commit",
+                "source.git_verify_detached",
+            ]
+        );
         assert!(source_dir.join("README.md").is_file());
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(metrics.full_scans, 1);
+    }
+
+    #[test]
+    fn remote_source_uses_explicit_legacy_checkout_when_revision_is_unsupported() {
+        let temp = tempfile::tempdir().expect("temp");
+        let task_dir = temp.path().join("task");
+        fs::create_dir(&task_dir).expect("task directory");
+        let source_dir = task_dir.join(SOURCE_DIR);
+        let source = PlannedWorkspaceSource::RemoteGit {
+            repository: RemoteRepository::new("https://github.com/example/example.git")
+                .expect("repository"),
+            commit: GitCommit::new("0123456789abcdef0123456789abcdef01234567").expect("commit"),
+        };
+        let backend = Arc::new(LegacyGitSourceSandboxBackend);
+        let preflight = supported_sandbox_preflight(backend.name());
+
+        let MaterializedSource {
+            commands,
+            snapshot,
+            metrics,
+            ..
+        } = prepare_source(&source, &task_dir, &source_dir, backend, &preflight)
+            .expect("prepare source through the legacy Git path");
+
+        assert_eq!(
+            commands
+                .iter()
+                .map(|diagnostic| diagnostic.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "source.git_version",
+                "source.git_clone",
+                "source.git_checkout",
+                "source.git_verify_commit",
+                "source.git_verify_detached",
+            ]
+        );
+        assert!(source_dir.join("README.md").is_file());
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(metrics.full_scans, 1);
+    }
+
+    #[test]
+    fn git_version_parser_accepts_platform_suffixes_and_rejects_unrelated_text() {
+        assert_eq!(
+            parse_git_version("git version 2.43.0.windows.1"),
+            Some((2, 43))
+        );
+        assert_eq!(parse_git_version("git version 2.49.0"), Some((2, 49)));
+        assert_eq!(parse_git_version("not a git version"), None);
     }
 
     #[test]
@@ -5653,6 +7482,18 @@ mod tests {
         fs::create_dir(&fixture).expect("fixture");
         fs::create_dir(&run_dir).expect("run directory");
         fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        #[cfg(windows)]
+        let baseline_argv = json!(["cmd.exe", "/d", "/c", "exit", "1"]);
+        #[cfg(windows)]
+        let public_verification_argv = json!(["cmd.exe", "/d", "/c", "exit", "0"]);
+        #[cfg(windows)]
+        let hidden_verification_argv = json!(["cmd.exe", "/d", "/c", "rem", "hidden"]);
+        #[cfg(not(windows))]
+        let baseline_argv = json!(["false"]);
+        #[cfg(not(windows))]
+        let public_verification_argv = json!(["true"]);
+        #[cfg(not(windows))]
+        let hidden_verification_argv = json!(["printf", "hidden"]);
         let manifest_json = json!({
             "schema_version": "evaluation.task_set/v5",
             "trial_count": 3,
@@ -5669,9 +7510,9 @@ mod tests {
                     ]
                 },
                 "evaluator": {
-                    "baseline": {"commands": [{"argv": ["cargo", "test"]}]},
-                    "public": {"commands": [{"argv": ["cargo", "test"]}]},
-                    "hidden": {"commands": [{"argv": ["cargo", "check"]}]}
+                    "baseline": {"commands": [{"argv": baseline_argv}]},
+                    "public": {"commands": [{"argv": public_verification_argv}]},
+                    "hidden": {"commands": [{"argv": hidden_verification_argv}]}
                 }
             }]
         });
@@ -5686,7 +7527,7 @@ mod tests {
 
         let run_id = RunId::new("source-reuse-run").expect("run id");
         let sandbox_backend: SharedSandboxBackend = Arc::new(SourceSandboxBackend);
-        let provider_snapshot = ProviderConfigSnapshot::capture(|_| None);
+        let provider_snapshot = unconfigured_provider_snapshot();
         let cancellation = CancellationToken::new();
         let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
         let sandbox_preflight = SandboxPreflightReport {
@@ -5737,7 +7578,29 @@ mod tests {
             assert!(!trial_dir.join(SOURCE_DIR).exists());
             assert_eq!(
                 evaluation.trials[trial - 1].result.status,
-                EvaluationStatus::Blocked
+                EvaluationStatus::Blocked,
+                "trial_result={:#?}\ndiagnostics={:#?}",
+                evaluation.trials[trial - 1].result,
+                evaluation.trials[trial - 1].diagnostics
+            );
+            assert_eq!(
+                evaluation.trials[trial - 1]
+                    .result
+                    .blocker
+                    .as_ref()
+                    .map(|blocker| blocker.kind),
+                Some(BlockerKind::ProviderConfiguration)
+            );
+            assert_eq!(
+                evaluation.trials[trial - 1]
+                    .result
+                    .evidence
+                    .provider_attempt_count,
+                0
+            );
+            assert_eq!(
+                evaluation.trials[trial - 1].diagnostics.source_full_scans,
+                1
             );
         }
     }
@@ -5966,7 +7829,17 @@ mod tests {
             1,
             json!({"type": "local", "path": "fixture"}),
         );
-        let params = EvalRunParams {
+        let mut manifest: Value = serde_json::from_slice(
+            &fs::read(&manifest_path).expect("read supported preflight manifest"),
+        )
+        .expect("supported preflight manifest JSON");
+        manifest["tasks"][0]["workspace"]["setup_commands"] = json!([{"argv": ["prepare-once"]}]);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("updated manifest JSON"),
+        )
+        .expect("updated manifest");
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "preflight-supported-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -5980,9 +7853,10 @@ mod tests {
         });
         let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
 
+        let backend = Arc::new(AgentLoopReachBackend::default());
         let response = run_evaluation(
             &params,
-            Arc::new(AgentLoopReachBackend),
+            backend.clone(),
             &provider_snapshot,
             &CancellationToken::new(),
             &trace_store,
@@ -6002,6 +7876,7 @@ mod tests {
         assert_eq!(result.summary.configured_trial_count, 1);
         assert_eq!(result.summary.sampled_trial_count, 1);
         assert_eq!(result.summary.trial_count, 1);
+        assert_eq!(backend.setup_calls.load(Ordering::SeqCst), 1);
         assert_eq!(result.tasks.len(), 1);
         assert_eq!(result.tasks[0].trials.len(), 1);
         let agent = &result.tasks[0].trials[0].stages.agent;
@@ -6013,13 +7888,108 @@ mod tests {
             )),
             "agent={agent:?}"
         );
-        assert!(
-            output_root
-                .join("preflight-supported-run")
-                .join("preflight-supported")
-                .join("trial-0001")
-                .is_dir()
+        let trial_dir = output_root
+            .join("preflight-supported-run")
+            .join("preflight-supported")
+            .join("trial-0001");
+        let workspace_dirs = fs::read_dir(&trial_dir)
+            .expect("trial directory")
+            .map(|entry| entry.expect("trial entry"))
+            .filter(|entry| entry.file_type().expect("trial entry type").is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(workspace_dirs, [AGENT_DIR]);
+    }
+
+    #[test]
+    fn agent_baseline_observer_blocks_before_provider_request() {
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking provider fixture");
+        let provider_address = listener.local_addr().expect("provider address");
+        let provider = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut requests = 0usize;
+            loop {
+                match listener.accept() {
+                    Ok((_stream, _)) => requests += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return requests;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("provider fixture accept failed: {error}"),
+                }
+            }
+        });
+
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let output_root = temp.path().join("output");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "agent-observer-baseline-blocked",
+            "baseline observer blocks before AgentLoop",
+            1,
+            json!({"type": "local", "path": "fixture"}),
         );
+        let params = EvaluationRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "agent-observer-baseline-blocked-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let base_url = format!("http://{provider_address}/v1");
+        let provider_snapshot = ProviderConfigSnapshot::capture(|name| match name {
+            "SINGULARITY_API_KEY" => Some("fixture-key".to_string()),
+            "SINGULARITY_BASE_URL" => Some(base_url.clone()),
+            "SINGULARITY_MODEL" => Some("fixture-model".to_string()),
+            _ => None,
+        });
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let backend = Arc::new(AgentLoopReachBackend {
+            observer_baseline: Mutex::new(Some(PreparedWorkspaceObservation::Changed(vec![
+                "README.md".to_string(),
+            ]))),
+            ..AgentLoopReachBackend::default()
+        });
+
+        let response = run_evaluation(
+            &params,
+            backend.clone(),
+            &provider_snapshot,
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("baseline observer blocker publishes result");
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result path"))
+                .expect("result artifact"),
+        )
+        .expect("result JSON");
+        let provider_calls = provider.join().expect("provider fixture join");
+
+        assert_eq!(provider_calls, 0, "provider must not receive a request");
+        assert_eq!(
+            backend.observer_checkpoint_calls.load(Ordering::SeqCst),
+            1,
+            "only the pre-AgentLoop baseline checkpoint should run"
+        );
+        let agent = &result.tasks[0].trials[0].stages.agent;
+        assert_eq!(agent.status, StageStatus::Blocked);
+        assert!(agent.blocker.as_ref().is_some_and(|blocker| {
+            blocker.kind == BlockerKind::WorkspacePreparation
+                && blocker
+                    .message
+                    .contains("before authoritative baseline snapshot")
+        }));
     }
 
     #[test]
@@ -6127,7 +8097,7 @@ mod tests {
             .expect("manifest JSON"),
         )
         .expect("manifest file");
-        let params = EvalRunParams {
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "source-batch-barrier-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -6143,7 +8113,7 @@ mod tests {
 
         let response = run_evaluation(
             &params,
-            Arc::new(AgentLoopReachBackend),
+            Arc::new(AgentLoopReachBackend::default()),
             &provider_snapshot,
             &CancellationToken::new(),
             &trace_store,
@@ -6205,7 +8175,7 @@ mod tests {
             1,
             json!({"type": "local", "path": "fixture"}),
         );
-        let params = EvalRunParams {
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "provider-config-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -6272,7 +8242,7 @@ mod tests {
             2,
             json!({"type": "local", "path": "fixture"}),
         );
-        let params = EvalRunParams {
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "preflight-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -6285,7 +8255,7 @@ mod tests {
             Arc::new(UnsupportedPreflightBackend {
                 executions: Arc::clone(&executions),
             }),
-            &ProviderConfigSnapshot::capture(|_| None),
+            &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
             &trace_store,
         )
@@ -6317,6 +8287,107 @@ mod tests {
     }
 
     #[test]
+    fn task_workspace_preflight_blocks_before_sampling_when_ordinary_command_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        let output_root = temp.path().join("output");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture file");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "task-workspace-blocked",
+            "ordinary task workspace must be strict",
+            2,
+            json!({"type": "local", "path": "fixture"}),
+        );
+        let params = EvaluationRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "task-workspace-blocked-run".to_string(),
+            output_root: Some(output_root.to_string_lossy().into_owned()),
+        };
+        let executions = Arc::new(AtomicUsize::new(0));
+        let released_workspaces = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+
+        let response = run_evaluation(
+            &params,
+            Arc::new(TaskWorkspaceUnavailableBackend {
+                executions: Arc::clone(&executions),
+                released_workspaces: Arc::clone(&released_workspaces),
+                release_error: true,
+            }),
+            &unconfigured_provider_snapshot(),
+            &CancellationToken::new(),
+            &trace_store,
+        )
+        .expect("task workspace blocker publishes typed artifacts");
+
+        assert_eq!(response.status, "blocked");
+        assert!(response.tasks.is_empty());
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let released_workspaces = released_workspaces
+            .lock()
+            .expect("released workspace tracking lock")
+            .clone();
+        assert_eq!(released_workspaces.len(), 2);
+        assert!(
+            released_workspaces
+                .iter()
+                .any(|workspace| workspace.ends_with(Path::new("capability")))
+        );
+        assert!(released_workspaces.iter().any(|workspace| {
+            workspace.ends_with(Path::new("task").join("trial-0001").join(AGENT_DIR))
+        }));
+        let result = EvaluationResult::from_json_str(
+            &fs::read_to_string(response.result_path.expect("result artifact"))
+                .expect("result artifact"),
+        )
+        .expect("result v8");
+        assert_eq!(result.summary.configured_trial_count, 2);
+        assert_eq!(result.summary.sampled_trial_count, 0);
+        assert_eq!(result.summary.trial_count, 0);
+        assert!(result.tasks.is_empty());
+        assert_eq!(
+            result
+                .blocker
+                .as_ref()
+                .and_then(|blocker| blocker.code.as_deref()),
+            Some("sandbox_preflight_task_workspace_unavailable")
+        );
+        let blocker_message = &result.blocker.as_ref().expect("run blocker").message;
+        assert!(blocker_message.contains("task workspace rejected"));
+        assert!(blocker_message.contains("test observation release failure"));
+        let missing_capabilities = &result
+            .sandbox_preflight
+            .as_ref()
+            .expect("sandbox preflight evidence")
+            .missing_capabilities;
+        assert!(missing_capabilities.contains(&"strict_task_workspace".to_string()));
+        assert!(missing_capabilities.contains(&"workspace_observation_release".to_string()));
+        assert!(
+            !output_root
+                .join("task-workspace-blocked-run/task-workspace-blocked")
+                .exists()
+        );
+        assert!(
+            output_root
+                .join("task-workspace-blocked-run")
+                .join(PUBLICATION_DIR)
+                .is_dir()
+        );
+        let provider_attempts = trace_store
+            .list_trace("task-workspace-blocked-run")
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| event.span_kind == Some(TraceSpanKind::ProviderAttempt))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(provider_attempts, 0);
+    }
+
+    #[test]
     fn unavailable_task_executable_blocks_before_trials_provider_or_commands() {
         let temp = tempfile::tempdir().expect("temp");
         let fixture = temp.path().join("fixture");
@@ -6330,7 +8401,7 @@ mod tests {
             2,
             json!({"type": "local", "path": "fixture"}),
         );
-        let params = EvalRunParams {
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "executable-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -6343,7 +8414,7 @@ mod tests {
             Arc::new(UnavailableExecutableBackend {
                 executions: Arc::clone(&executions),
             }),
-            &ProviderConfigSnapshot::capture(|_| None),
+            &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
             &trace_store,
         )
@@ -6438,7 +8509,7 @@ mod tests {
             .expect("reachable remote source must pass preflight");
 
         assert_eq!(report.outcome, SandboxPreflightOutcome::Supported);
-        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
         assert!(!run_dir.join(".sandbox-preflight").exists());
     }
 
@@ -6457,7 +8528,7 @@ mod tests {
                 "commit": "0000000000000000000000000000000000000000"
             }),
         );
-        let params = EvalRunParams {
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "remote-source-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -6470,7 +8541,7 @@ mod tests {
         let response = run_evaluation(
             &params,
             backend.clone(),
-            &ProviderConfigSnapshot::capture(|_| None),
+            &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
             &trace_store,
         )
@@ -6478,7 +8549,7 @@ mod tests {
 
         assert_eq!(response.status, "blocked");
         assert!(response.tasks.is_empty());
-        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
         let result = EvaluationResult::from_json_str(
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
@@ -6510,7 +8581,7 @@ mod tests {
                 "commit": "0000000000000000000000000000000000000000"
             }),
         );
-        let params = EvalRunParams {
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "preparation-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -6523,7 +8594,7 @@ mod tests {
             Arc::new(UnknownPreparationBackend {
                 executions: Arc::clone(&executions),
             }),
-            &ProviderConfigSnapshot::capture(|_| None),
+            &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
             &trace_store,
         )
@@ -6531,7 +8602,7 @@ mod tests {
 
         assert_eq!(response.status, "blocked");
         assert!(response.tasks.is_empty());
-        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
         let result = EvaluationResult::from_json_str(
             &fs::read_to_string(response.result_path.expect("result path"))
                 .expect("result artifact"),
@@ -6547,6 +8618,14 @@ mod tests {
                 .as_ref()
                 .and_then(|blocker| blocker.code.as_deref()),
             Some("sandbox_preflight_trusted_preparation_unverified")
+        );
+        assert!(
+            result
+                .blocker
+                .as_ref()
+                .expect("run blocker")
+                .message
+                .contains("workspace mutation could not be verified")
         );
         assert_eq!(
             result
@@ -6597,7 +8676,7 @@ mod tests {
             .expect("manifest JSON"),
         )
         .expect("manifest file");
-        let params = EvalRunParams {
+        let params = EvaluationRunParams {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "blocked-artifacts-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
@@ -6625,7 +8704,7 @@ mod tests {
             &fs::read_to_string(&result_path).expect("result artifact"),
         )
         .expect("result v8");
-        let evidence = singularity_evaluation::EvaluationEvidence::from_json_str(
+        let evidence = crate::EvaluationEvidence::from_json_str(
             &fs::read_to_string(&evidence_path).expect("evidence artifact"),
         )
         .expect("evidence v3");
@@ -6652,12 +8731,13 @@ mod tests {
         fs::create_dir_all(local_source.join(".git")).expect("local git marker");
         fs::write(local_source.join("README.md"), "fixture").expect("local fixture");
         copy_tree_checked(&local_source, &local_materialized).expect("materialize local source");
+        let snapshot = snapshot_workspace(&local_materialized).expect("source snapshot");
 
         let local = source_provenance(
             &PlannedWorkspaceSource::Local {
                 path: local_source.clone(),
             },
-            &local_materialized,
+            Some(workspace_snapshot_digest(&snapshot)),
             temp.path(),
         );
         assert_eq!(local.source_type, "local");
@@ -6680,7 +8760,7 @@ mod tests {
                 .expect("remote repository"),
                 commit: GitCommit::new("0123456789abcdef0123456789abcdef01234567").expect("commit"),
             },
-            &local_materialized,
+            Some(workspace_snapshot_digest(&snapshot)),
             temp.path(),
         );
         assert_eq!(remote.source_type, "remote_git");

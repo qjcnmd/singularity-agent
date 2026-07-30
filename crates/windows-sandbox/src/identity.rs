@@ -27,6 +27,21 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(target_os = "windows")]
+use std::ffi::c_void;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(target_os = "windows")]
+use std::panic::{self, AssertUnwindSafe};
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Security::{
+    ImpersonateLoggedOnUser, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
+    RevertToSelf,
+};
+
 #[derive(Debug, Clone)]
 struct SandboxIdentity {
     username: String,
@@ -37,6 +52,116 @@ struct SandboxIdentity {
 pub struct SandboxCreds {
     pub username: String,
     pub password: String,
+}
+
+/// Load the existing account selected by the requested network identity without reconciling ACLs.
+///
+/// This is used only for pre-execution observation. A missing or unusable identity remains
+/// explicit so the caller can perform the normal setup path without first clearing persisted
+/// protected-path state.
+#[cfg(target_os = "windows")]
+pub(crate) fn existing_sandbox_creds(
+    permissions: &ResolvedWindowsSandboxPermissions,
+    proxy_enforced: bool,
+    sandbox_home: &Path,
+) -> Result<Option<SandboxCreds>> {
+    let network_identity = SandboxNetworkIdentity::from_permissions(permissions, proxy_enforced);
+    let creds = select_identity(network_identity, sandbox_home)?.map(|identity| SandboxCreds {
+        username: identity.username,
+        password: identity.password,
+    });
+    let Some(creds) = creds else {
+        return Ok(None);
+    };
+    if logon_sandbox_user(&creds.username, &creds.password).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(creds))
+}
+
+/// Execute a non-model workspace observation under the account used by the completed runner.
+///
+/// The impersonation is confined to a scoped worker thread so a failed `RevertToSelf` cannot
+/// leave the caller's thread running as the sandbox account. The token is closed by RAII after
+/// the thread has reverted (or immediately when impersonation fails).
+#[cfg(target_os = "windows")]
+pub(crate) fn observe_as_sandbox_user<T, F>(creds: &SandboxCreds, observer: F) -> Result<T>
+where
+    F: FnOnce() -> std::result::Result<T, String> + Send,
+    T: Send,
+{
+    let username = creds.username.clone();
+    let password = creds.password.clone();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let token = logon_sandbox_user(&username, &password)?;
+            let token_handle = token.as_raw_handle() as HANDLE;
+            if unsafe { ImpersonateLoggedOnUser(token_handle) } == 0 {
+                return Err(anyhow!(
+                    "sandbox workspace observer impersonation failed: {}",
+                    unsafe { GetLastError() }
+                ));
+            }
+
+            let observed = panic::catch_unwind(AssertUnwindSafe(observer));
+            let reverted = unsafe { RevertToSelf() } != 0;
+            drop(token);
+            if !reverted {
+                return Err(anyhow!(
+                    "sandbox workspace observer revert failed: {}",
+                    unsafe { GetLastError() }
+                ));
+            }
+            match observed {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(error)) => Err(anyhow!(error)),
+                Err(_) => Err(anyhow!("sandbox workspace observer panicked")),
+            }
+        });
+        worker
+            .join()
+            .map_err(|_| anyhow!("sandbox workspace observer thread panicked"))?
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn logon_sandbox_user(username: &str, password: &str) -> Result<OwnedHandle> {
+    let username = username
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let domain = "."
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let password = password
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut token: HANDLE = 0;
+    let logged_on = unsafe {
+        LogonUserW(
+            username.as_ptr(),
+            domain.as_ptr(),
+            password.as_ptr(),
+            LOGON32_LOGON_INTERACTIVE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+    };
+    if logged_on == 0 {
+        return Err(anyhow!(
+            "sandbox workspace observer logon failed: {}",
+            unsafe { GetLastError() }
+        ));
+    }
+    if token == 0 {
+        return Err(anyhow!(
+            "sandbox workspace observer logon returned an invalid token"
+        ));
+    }
+    // SAFETY: LogonUserW returned a live token handle owned by this function.
+    Ok(unsafe { OwnedHandle::from_raw_handle(token as *mut c_void) })
 }
 
 /// Returns true when the on-disk setup artifacts exist and match the current

@@ -5,6 +5,7 @@
 //! 平台适配器实现 `SandboxBackend` 边界；本模块负责可移植的权限模式、能力检查、
 //! 取消语义和安全失败结果映射。
 
+use std::collections::BTreeSet;
 use std::path::Path;
 #[cfg(windows)]
 use std::path::{Component, PathBuf};
@@ -23,7 +24,14 @@ mod workspace_change;
 pub use workspace_change::is_toolchain_artifact_path;
 #[cfg(target_os = "windows")]
 use workspace_change::snapshot_trusted_workspace_from_handle;
-use workspace_change::{WorkspaceSnapshot, snapshot_trusted_workspace, snapshot_workspace};
+#[cfg(not(target_os = "windows"))]
+use workspace_change::snapshot_workspace;
+#[cfg(target_os = "windows")]
+use workspace_change::{
+    IncrementalSnapshot, snapshot_workspace_as_sandbox_user,
+    snapshot_workspace_as_sandbox_user_for_cached_root, update_workspace_snapshot_as_sandbox_user,
+};
+use workspace_change::{WorkspaceSnapshot, snapshot_trusted_workspace};
 
 /// command tool 未指定超时时使用的秒数。
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 30;
@@ -108,6 +116,23 @@ pub enum WorkspaceMutation {
     Unknown,
 }
 
+/// One complete checkpoint from a continuous observer spanning multiple execution stages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedWorkspaceObservation {
+    Unchanged,
+    Changed(Vec<String>),
+    Unknown,
+}
+
+/// Backend-owned continuous observation session for a controller-owned prepared workspace.
+///
+/// A checkpoint must cover every change since construction or the previous checkpoint. Buffer
+/// overflow, cancellation, root replacement and any other evidence gap return `Unknown` or an
+/// error; neither outcome may be treated as unchanged.
+pub trait PreparedWorkspaceObserver: Send {
+    fn checkpoint(&mut self) -> Result<PreparedWorkspaceObservation, String>;
+}
+
 /// Producer-owned summary of concrete workspace paths and published content diff digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -132,14 +157,58 @@ impl WorkspaceChangeSummary {
         }
     }
 
+    /// Validate the producer-owned path set and digest before a consumer projects this summary.
+    ///
+    /// The bounds and relative-path rules are shared with the Windows change producer so a
+    /// consumer cannot silently accept a second, weaker summary contract.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.changed_files.is_empty() {
+            return Err("workspace change summary has no changed paths".to_string());
+        }
+        if !workspace_change::changed_paths_are_bounded(&self.changed_files) {
+            return Err("workspace change summary exceeds its bounded path scope".to_string());
+        }
+        let mut seen = BTreeSet::new();
+        for path in &self.changed_files {
+            if path != "." {
+                workspace_change::validate_observed_relative_path(path)?;
+            }
+            if !seen.insert(path) {
+                return Err("workspace change summary contains duplicate paths".to_string());
+            }
+        }
+        if !is_sha256_digest(&self.diff_digest) {
+            return Err("workspace change summary digest is not a sha256 fingerprint".to_string());
+        }
+        Ok(())
+    }
+
     pub(crate) fn with_verification_relevant(mut self, verification_relevant: bool) -> Self {
         self.verification_relevant = verification_relevant;
         self
+    }
+
+    /// Return whether this complete producer summary proves only new closed-set toolchain output.
+    pub fn is_trusted_artifact_only(&self) -> bool {
+        if self.validate().is_err() || self.verification_relevant || self.changed_files.is_empty() {
+            return false;
+        }
+        let mut paths = BTreeSet::new();
+        self.changed_files
+            .iter()
+            .all(|path| paths.insert(path) && is_toolchain_artifact_path(path))
     }
 }
 
 fn verification_relevant_default() -> bool {
     true
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// 与命令请求使用的工作区根目录配对的文件系统策略。
@@ -388,6 +457,32 @@ impl SandboxExecutionMetadata {
     }
 }
 
+/// One workspace observation phase's scan mode and bounded filesystem work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceObservationMode {
+    Full,
+    Incremental,
+    Reused,
+}
+
+/// Filesystem work performed before or after one sandbox command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WorkspaceObservationPhaseMetrics {
+    pub mode: WorkspaceObservationMode,
+    pub duration_ms: u64,
+    pub entries_read: usize,
+    pub content_bytes_read: u64,
+}
+
+/// Internal workspace observation diagnostics bound to one backend contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkspaceObservationMetrics {
+    pub contract: String,
+    pub before: WorkspaceObservationPhaseMetrics,
+    pub after: WorkspaceObservationPhaseMetrics,
+}
+
 /// 带脱敏预览和 backend 强制执行元数据的有界命令结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CommandResult {
@@ -408,6 +503,9 @@ pub struct CommandResult {
     #[serde(skip)]
     #[schemars(skip)]
     pub workspace_change_summary: Option<WorkspaceChangeSummary>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub workspace_observation_metrics: Option<WorkspaceObservationMetrics>,
 }
 
 /// 输出限制辅助函数返回的有界文本预览。
@@ -442,6 +540,7 @@ impl CommandResult {
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
             workspace_mutation: WorkspaceMutation::Unknown,
             workspace_change_summary: None,
+            workspace_observation_metrics: None,
         }
     }
 
@@ -548,6 +647,7 @@ impl CommandResult {
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
             workspace_mutation: WorkspaceMutation::Unknown,
             workspace_change_summary: None,
+            workspace_observation_metrics: None,
         }
     }
 
@@ -573,6 +673,15 @@ impl CommandResult {
         self
     }
 
+    /// Bind internal observation work without exposing it to the command or model payload.
+    pub fn with_workspace_observation_metrics(
+        mut self,
+        metrics: WorkspaceObservationMetrics,
+    ) -> Self {
+        self.workspace_observation_metrics = Some(metrics);
+        self
+    }
+
     fn blocked(
         command_id: impl Into<String>,
         execution_status: CommandExecutionStatus,
@@ -594,6 +703,7 @@ impl CommandResult {
             sandbox: SandboxExecutionMetadata::unavailable("not_executed"),
             workspace_mutation: WorkspaceMutation::Unknown,
             workspace_change_summary: None,
+            workspace_observation_metrics: None,
         }
     }
 }
@@ -803,7 +913,12 @@ impl SandboxPreflightReport {
                     && self.no_new_privs == SandboxPreflightFact::Passed
                     && self.seccomp == SandboxPreflightFact::Passed
                     && self.landlock == SandboxPreflightFact::Passed))
-            && (self.os != "windows" || (self.kernel.is_some() && self.filesystem.is_some()))
+            && (self.os != "windows"
+                || (self.kernel.is_some()
+                    && self
+                        .filesystem
+                        .as_deref()
+                        .is_some_and(|filesystem| filesystem.eq_ignore_ascii_case("NTFS"))))
     }
 }
 
@@ -927,8 +1042,27 @@ pub trait SandboxBackend {
     ) -> ExecutableAvailability {
         ExecutableAvailability::Unknown
     }
+
+    /// Start a continuous observer before publishing a prepared source snapshot.
+    ///
+    /// `None` means this backend cannot prove changes across command/stage gaps. Callers must
+    /// retain full-tree verification instead of constructing a reusable observation token.
+    fn observe_prepared_workspace(
+        &self,
+        _workspace: &Path,
+    ) -> Result<Option<Box<dyn PreparedWorkspaceObserver>>, String> {
+        Ok(None)
+    }
     /// 执行一个请求；不可用或不支持的 backend 必须返回阻塞结果。
     fn execute(&self, request: &CommandRequest) -> CommandResult;
+
+    /// Release observation resources for one exact workspace root before its parent is removed.
+    ///
+    /// Backends that cache workspace monitors may override this lifecycle hook. The default is
+    /// a no-op for backends without persistent observation state.
+    fn release_workspace_observation(&self, _workspace: &Path) -> Result<(), String> {
+        Ok(())
+    }
 
     /// 执行模型提交的 shell script；不支持的平台必须返回 typed unsupported。
     ///
@@ -1118,15 +1252,22 @@ fn command_executable_name(value: &str) -> String {
 #[cfg(windows)]
 fn command_reference_tokens(request: &CommandRequest) -> Vec<String> {
     let mut tokens = Vec::new();
-    for part in request.argv.iter().skip(1) {
-        collect_command_tokens(part, &mut tokens);
-    }
     if request
         .argv
         .first()
         .is_some_and(|value| is_shell_executable(value))
+        && let Some(command_index) = request
+            .argv
+            .iter()
+            .position(|part| SHELL_COMMAND_FLAGS.contains(&part.to_ascii_lowercase().as_str()))
     {
-        collect_command_tokens(&command_permission_resource(&request.argv), &mut tokens);
+        for part in request.argv.iter().skip(command_index + 1) {
+            collect_command_tokens(part, &mut tokens);
+        }
+        return tokens;
+    }
+    for part in request.argv.iter().skip(1) {
+        collect_command_tokens(part, &mut tokens);
     }
     tokens
 }
@@ -1496,6 +1637,56 @@ fn path_has_sensitive_component(path: &Path) -> bool {
             _ => None,
         })
         .any(|component| is_protected_path(&component))
+}
+
+#[cfg(all(test, windows))]
+mod command_request_tests {
+    use super::*;
+
+    #[test]
+    fn cmd_bootstrap_options_are_not_projected_as_workspace_paths() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path().to_string_lossy().into_owned();
+        let request = CommandRequest::project_verification(
+            "cmd_noop",
+            vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                "exit".to_string(),
+                "0".to_string(),
+            ],
+            root.clone(),
+            root,
+        );
+
+        assert!(command_request_denial(&request).is_none());
+    }
+
+    #[test]
+    fn cmd_payload_paths_remain_bound_to_the_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path().to_string_lossy().into_owned();
+        let request = CommandRequest::project_verification(
+            "cmd_outside_path",
+            vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/c".to_string(),
+                "type".to_string(),
+                "C:\\Windows\\win.ini".to_string(),
+            ],
+            root.clone(),
+            root,
+        );
+
+        let denied = command_request_denial(&request).expect("outside payload path must be denied");
+        assert_eq!(
+            denied.execution_status,
+            CommandExecutionStatus::PolicyDenied
+        );
+        assert_eq!(denied.stderr_preview, COMMAND_PATH_OUTSIDE_WORKSPACE);
+    }
 }
 
 #[cfg(windows)]

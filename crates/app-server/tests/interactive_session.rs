@@ -177,6 +177,117 @@ fn pause_is_distinct_and_resume_consumes_queued_user_messages_without_synthetic_
 }
 
 #[test]
+fn resume_worker_keeps_stdin_live_and_streams_before_final_response() {
+    let provider = ControlledProvider::start();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = create_workspace(dir.path());
+    let db_path = dir.path().join("sessions.sqlite3");
+    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
+    process.initialize();
+    process.send_request(
+        100,
+        "event/subscribe",
+        json!({
+            "eventTypes": [
+                "turn/started",
+                "turn/completed",
+                "item/started",
+                "item/agentMessage/delta",
+                "item/completed"
+            ]
+        }),
+    );
+    process.expect_ok(100);
+    let thread_id = process.start_thread(&workspace, "read-only", "never", 2);
+    let turn_id = process.start_turn(&thread_id, ORIGINAL_INPUT, 3);
+    provider
+        .next_request()
+        .complete(replan_response("resume_initial_plan"));
+    let in_flight = provider.next_request();
+
+    process.send_request(4, "turn/pause", json!({"turnId": turn_id}));
+    process.expect_ok(4);
+    in_flight.complete(final_response("paused before resume"));
+    let paused = wait_for_turn_status(&mut process, &turn_id, "paused", 5);
+    assert_eq!(paused["result"]["turn"]["status"], "paused");
+    let _ = process.output.recv_id(3, Duration::from_secs(10));
+
+    process.send_request(8, "turn/resume", json!({"turnId": turn_id}));
+    let resumed_request = provider.next_request();
+
+    // The resume worker is blocked in the provider request, but stdin ownership remains
+    // available for durable input.
+    process.send_input(
+        "resume-follow-up",
+        &turn_id,
+        "follow_up",
+        "pause after this response",
+        9,
+    );
+    process.expect_ok(9);
+    // The first streamed assistant event is visible while the resume worker continues with a
+    // follow-up provider request, rather than being collected until resume returns.
+    resumed_request.complete(final_response("resume first response"));
+    let first_delta = process
+        .output
+        .recv_where(Duration::from_secs(5), |message| {
+            message["method"] == "item/agentMessage/delta"
+                && message["params"]["delta"] == "resume first response"
+        });
+    assert_eq!(first_delta["params"]["delta"], "resume first response");
+    let follow_up_request = provider.next_request();
+    assert_eq!(
+        user_texts(&follow_up_request.request),
+        vec![ORIGINAL_INPUT, "pause after this response"],
+        "resume worker must observe queued input at a safe model boundary"
+    );
+    follow_up_request.complete(replan_response("resume_replan"));
+    let final_request = provider.next_request();
+    final_request.complete(final_response("resume finished"));
+    let resumed = process.output.recv_id(8, Duration::from_secs(10));
+    assert_eq!(resumed["result"]["turn"]["turn_id"], turn_id);
+    assert_eq!(resumed["result"]["turn"]["status"], "completed");
+
+    process.shutdown(10);
+}
+
+#[test]
+fn interrupt_and_shutdown_remain_responsive_during_resume() {
+    let provider = ControlledProvider::start();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let workspace = create_workspace(dir.path());
+    let db_path = dir.path().join("sessions.sqlite3");
+    let mut process = Process::spawn(&db_path, &workspace, &provider.base_url);
+    process.initialize();
+    let thread_id = process.start_thread(&workspace, "read-only", "never", 2);
+    let turn_id = process.start_turn(&thread_id, ORIGINAL_INPUT, 3);
+    provider
+        .next_request()
+        .complete(replan_response("interrupt_initial_plan"));
+    let in_flight = provider.next_request();
+    process.send_request(4, "turn/pause", json!({"turnId": turn_id}));
+    process.expect_ok(4);
+    in_flight.complete(final_response("paused before interrupt"));
+    let paused = wait_for_turn_status(&mut process, &turn_id, "paused", 5);
+    assert_eq!(paused["result"]["turn"]["status"], "paused");
+    let _ = process.output.recv_id(3, Duration::from_secs(10));
+
+    process.send_request(8, "turn/resume", json!({"turnId": turn_id}));
+    let _blocked_resume = provider.next_request();
+    process.send_request(9, "turn/interrupt", json!({"turnId": turn_id}));
+    let interrupt = process.expect_ok(9);
+    assert!(
+        interrupt["result"]["status"] == "cancel_requested"
+            || interrupt["result"]["status"] == "interrupted",
+        "interrupt must be accepted while resume is running: {interrupt}"
+    );
+
+    // Shutdown must also reach the stdin owner and cancel the blocked resume worker instead of
+    // waiting for the provider response forever.
+    process.shutdown(10);
+}
+
+#[test]
 fn queued_steer_survives_process_restart_without_mutating_the_issued_model_request() {
     let provider = ControlledProvider::start();
     let dir = tempfile::tempdir().expect("temp dir");

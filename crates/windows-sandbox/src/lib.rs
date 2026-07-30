@@ -256,9 +256,17 @@ pub use deny_read_acl::ensure_directory_materialized;
 #[cfg(target_os = "windows")]
 pub use deny_read_acl::ensure_missing_protected_path_materialized;
 #[cfg(target_os = "windows")]
+pub use deny_read_acl::existing_public_certificate_only_pem;
+#[cfg(target_os = "windows")]
 pub use deny_read_acl::plan_deny_read_acl_paths;
 #[cfg(target_os = "windows")]
 pub use deny_read_resolver::resolve_windows_deny_read_paths;
+#[cfg(target_os = "windows")]
+pub use deny_read_resolver::resolve_windows_deny_read_paths_for_controller;
+#[cfg(target_os = "windows")]
+pub use deny_read_resolver::resolve_windows_deny_read_paths_for_controller_with_pinned_workspace_root;
+#[cfg(target_os = "windows")]
+pub use deny_read_resolver::resolve_windows_deny_read_paths_from_validated_workspace;
 #[cfg(target_os = "windows")]
 pub use deny_read_state::acquire_registered_runner_lease;
 #[cfg(target_os = "windows")]
@@ -275,6 +283,8 @@ pub use dpapi::unprotect as dpapi_unprotect;
 pub use elevated_impl::ElevatedSandboxProfileCaptureRequest;
 #[cfg(target_os = "windows")]
 pub use elevated_impl::run_windows_sandbox_capture_for_permission_profile as run_windows_sandbox_capture_for_permission_profile_elevated;
+#[cfg(target_os = "windows")]
+pub use elevated_impl::run_windows_sandbox_capture_for_permission_profile_with_observations as run_windows_sandbox_capture_for_permission_profile_with_observations_elevated;
 #[cfg(target_os = "windows")]
 pub use hide_users::hide_current_user_profile_dir;
 #[cfg(target_os = "windows")]
@@ -325,6 +335,8 @@ pub use logging::log_writer;
 pub use path_normalization::{canonicalize_path, expand_windows_path_alias};
 #[cfg(target_os = "windows")]
 pub use path_safety::ProtectedMetadataError;
+#[cfg(target_os = "windows")]
+pub use path_safety::WorkspaceRootLease;
 #[cfg(target_os = "windows")]
 pub use path_safety::ensure_case_insensitive_acl_path;
 #[cfg(target_os = "windows")]
@@ -445,7 +457,10 @@ pub use winutil::to_wide;
 #[cfg(target_os = "windows")]
 pub use workspace_acl::is_command_cwd_root;
 #[cfg(target_os = "windows")]
-pub use workspace_change::{WorkspaceChangeMonitor, WorkspaceChangeObservation};
+pub use workspace_change::{
+    WorkspaceChangeMonitor, WorkspaceChangeObservation, WorkspacePathChange,
+    WorkspacePathChangeKind,
+};
 
 #[cfg(not(target_os = "windows"))]
 pub use stub::CaptureResult;

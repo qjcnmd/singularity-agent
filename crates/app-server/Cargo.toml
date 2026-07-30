@@ -18,7 +18,6 @@ serde_json.workspace = true
 sha2.workspace = true
 singularity_agent = { path = "../agent" }
 singularity_core = { path = "../core" }
-singularity_evaluation = { path = "../evaluation" }
 singularity_model = { path = "../model" }
 singularity_policy = { path = "../policy" }
 singularity_protocol = { path = "../protocol" }

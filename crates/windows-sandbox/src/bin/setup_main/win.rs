@@ -27,6 +27,7 @@ use singularity_windows_sandbox::ensure_allow_write_aces;
 use singularity_windows_sandbox::ensure_allow_write_aces_to_handle;
 use singularity_windows_sandbox::ensure_case_insensitive_acl_path;
 use singularity_windows_sandbox::ensure_missing_protected_path_materialized;
+use singularity_windows_sandbox::existing_public_certificate_only_pem;
 use singularity_windows_sandbox::extract_setup_failure;
 use singularity_windows_sandbox::handle_mask_allows;
 use singularity_windows_sandbox::hide_newly_created_users;
@@ -108,6 +109,28 @@ fn retain_preferred_acl_error(retained: &mut Option<anyhow::Error>, candidate: a
     if acl_error_priority(&candidate) > retained.as_ref().map_or(0, acl_error_priority) {
         *retained = Some(candidate);
     }
+}
+
+fn acl_open_failure(error: anyhow::Error) -> anyhow::Error {
+    let Some(code) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+        .map(|code| code as u32)
+    else {
+        return error;
+    };
+    anyhow::Error::new(
+        SetupFailure::new(
+            SetupErrorCode::HelperAclRefreshFailed,
+            "trusted ACL target open failed",
+        )
+        .with_acl_error(WindowsAclError {
+            operation: AclOperation::OpenTarget,
+            code,
+        }),
+    )
+    .context(error)
 }
 
 mod sandbox_users;
@@ -624,23 +647,6 @@ fn real_main() -> Result<()> {
             ),
         )));
     }
-    let pinned_workspace_root = payload
-        .trusted_workspace_root
-        .as_ref()
-        .map(|pin| {
-            duplicate_setup_root_handle(pin).map(|handle| PinnedWorkspaceRoot {
-                path: pin.root_path.clone(),
-                handle,
-            })
-        })
-        .transpose()
-        .map_err(|error| {
-            anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperRequestArgsFailed,
-                format!("duplicate trusted workspace root handle failed: {error}"),
-            ))
-        })?;
-    validate_payload_acl_paths(&payload, pinned_workspace_root.as_ref())?;
     let sbx_dir = sandbox_dir(&payload.sandbox_home);
     std::fs::create_dir_all(&sbx_dir).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
@@ -654,13 +660,51 @@ fn real_main() -> Result<()> {
             format!("open log in {} failed", sbx_dir.display()),
         ))
     })?;
-    let result = run_setup(&payload, &mut log, &sbx_dir, pinned_workspace_root.as_ref());
+    let result = (|| {
+        let pinned_workspace_root = payload
+            .trusted_workspace_root
+            .as_ref()
+            .map(|pin| {
+                duplicate_setup_root_handle(pin).map(|handle| PinnedWorkspaceRoot {
+                    path: pin.root_path.clone(),
+                    handle,
+                })
+            })
+            .transpose()
+            .map_err(|error| {
+                anyhow::Error::new(SetupFailure::new(
+                    SetupErrorCode::HelperRequestArgsFailed,
+                    format!("duplicate trusted workspace root handle failed: {error}"),
+                ))
+            })?;
+        validate_payload_acl_paths(&payload, pinned_workspace_root.as_ref()).map_err(|error| {
+            let native_code = error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    .map(|code| code as u32)
+            });
+            match native_code {
+                Some(code) => anyhow::Error::new(
+                    SetupFailure::new(
+                        SetupErrorCode::HelperAclRefreshFailed,
+                        "ACL path validation failed",
+                    )
+                    .with_acl_error(WindowsAclError {
+                        operation: AclOperation::OpenTarget,
+                        code,
+                    }),
+                )
+                .context(error),
+                None => error,
+            }
+        })?;
+        run_setup(&payload, &mut log, &sbx_dir, pinned_workspace_root.as_ref())
+    })();
     if let Err(err) = &result {
         let _ = log_line(&mut log, &format!("setup error: {err:?}"));
         log_note(&format!("setup error: {err:?}"), Some(sbx_dir.as_path()));
-        let failure = extract_setup_failure(err).cloned().unwrap_or_else(|| {
-            SetupFailure::new(SetupErrorCode::HelperUnknownError, err.to_string())
-        });
+        let failure = classify_setup_failure(err);
         let report = SetupErrorReport {
             code: failure.code,
             message: failure.message,
@@ -679,6 +723,30 @@ fn real_main() -> Result<()> {
         }
     }
     result
+}
+
+fn classify_setup_failure(error: &anyhow::Error) -> SetupFailure {
+    if let Some(failure) = extract_setup_failure(error) {
+        return failure.clone();
+    }
+    if let Some(acl_error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WindowsAclError>())
+        .copied()
+    {
+        return SetupFailure::new(
+            SetupErrorCode::HelperAclRefreshFailed,
+            "ACL path validation failed",
+        )
+        .with_acl_error(acl_error);
+    }
+    let mut failure = SetupFailure::new(SetupErrorCode::HelperUnknownError, error.to_string());
+    failure.windows_error_code = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .and_then(std::io::Error::raw_os_error)
+        .map(|code| code as u32);
+    failure
 }
 
 fn run_setup(
@@ -853,7 +921,8 @@ fn revoke_deny_write_paths(
             path,
             windows_sys::Win32::Storage::FileSystem::READ_CONTROL
                 | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
-        )?
+        )
+        .map_err(acl_open_failure)?
         .ok_or_else(|| anyhow::anyhow!("trusted deny-write path escaped pinned workspace"))?;
         for deny_sid_str in deny_sid_strs {
             let deny_psid = unsafe {
@@ -1340,6 +1409,9 @@ fn run_setup_full(
         if !seen_deny_paths.insert(path.clone()) {
             continue;
         }
+        if existing_public_certificate_only_pem(path)? {
+            continue;
+        }
         // Deny ACEs attach to filesystem objects. Materialize only missing carveouts without
         // following a reparse point in any ancestor so a child cannot create the path later.
         let mut materialized = match std::fs::symlink_metadata(path) {
@@ -1449,6 +1521,8 @@ mod tests {
     use super::PinnedWorkspaceRoot;
     use super::SETUP_VERSION;
     use super::WRITE_ROOT_ALLOW_MASK;
+    use super::acl_open_failure;
+    use super::classify_setup_failure;
     use super::convert_string_sid_to_sid;
     use super::validate_payload_acl_path;
     use super::workspace_write_cap_sids_for_path;
@@ -1465,6 +1539,38 @@ mod tests {
     use windows_sys::Win32::Foundation::HLOCAL;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
+
+    #[test]
+    fn trusted_acl_open_access_denied_requests_elevated_authority() {
+        let error = acl_open_failure(anyhow::Error::new(std::io::Error::from_raw_os_error(5)));
+        let failure = singularity_windows_sandbox::extract_setup_failure(&error)
+            .expect("typed setup failure");
+
+        assert_eq!(
+            failure.code,
+            singularity_windows_sandbox::SetupErrorCode::HelperAclRefreshFailed
+        );
+        assert_eq!(
+            failure.acl_operation,
+            Some(singularity_windows_sandbox::AclOperation::OpenTarget)
+        );
+        assert_eq!(failure.windows_error_code, Some(5));
+    }
+
+    #[test]
+    fn unknown_setup_failure_preserves_the_win32_error_code() {
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(5))
+            .context("open pinned workspace component");
+
+        let failure = classify_setup_failure(&error);
+
+        assert_eq!(
+            failure.code,
+            singularity_windows_sandbox::SetupErrorCode::HelperUnknownError
+        );
+        assert_eq!(failure.windows_error_code, Some(5));
+        assert_eq!(failure.message, "open pinned workspace component");
+    }
 
     fn payload_json() -> serde_json::Value {
         json!({

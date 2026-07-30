@@ -379,6 +379,19 @@ fn validate_model_response_with_protocol_context(
         None => errors.push("missing_assistant_message".to_string()),
     }
 
+    if tool_calls
+        .iter()
+        .chain(
+            assistant_message
+                .iter()
+                .flat_map(|message| message.tool_calls.iter()),
+        )
+        .map(|call| call.tool_name.as_str())
+        .any(|name| !name.trim().is_empty() && !is_portable_tool_name(name))
+    {
+        errors.push("tool_name_not_provider_portable".to_string());
+    }
+
     match tool_choice.mode {
         ToolChoiceMode::None if !tool_calls.is_empty() => {
             errors.push("tool_choice_none".to_string());
