@@ -14,16 +14,16 @@ fn junction_name_for_path(path: &Path) -> String {
     format!("{:x}", hasher.finish())
 }
 
-fn junction_root_for_userprofile(userprofile: &str) -> PathBuf {
-    PathBuf::from(userprofile)
-        .join(".singularity")
-        .join(".sandbox")
-        .join("cwd")
+fn junction_root_for_sandbox_home(sandbox_home: &Path) -> PathBuf {
+    sandbox_home.join("cwd")
 }
 
-pub fn create_cwd_junction(requested_cwd: &Path, log_dir: Option<&Path>) -> Option<PathBuf> {
-    let userprofile = std::env::var("USERPROFILE").ok()?;
-    let junction_root = junction_root_for_userprofile(&userprofile);
+pub fn create_cwd_junction(
+    requested_cwd: &Path,
+    sandbox_home: &Path,
+    log_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    let junction_root = junction_root_for_sandbox_home(sandbox_home);
     if let Err(err) = std::fs::create_dir_all(&junction_root) {
         log_note(
             &format!(
@@ -137,4 +137,20 @@ pub fn create_cwd_junction(requested_cwd: &Path, log_dir: Option<&Path>) -> Opti
         log_dir,
     );
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::junction_root_for_sandbox_home;
+    use std::path::Path;
+
+    #[test]
+    fn junction_root_uses_explicit_sandbox_home() {
+        let sandbox_home = Path::new(r"C:\controller\.singularity\.sandbox");
+
+        assert_eq!(
+            junction_root_for_sandbox_home(sandbox_home),
+            sandbox_home.join("cwd")
+        );
+    }
 }

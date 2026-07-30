@@ -218,13 +218,14 @@ fn read_spawn_request(reader: &mut File) -> Result<SpawnRequest> {
 }
 
 /// Pick an effective CWD, using a junction if the ACL helper is active.
-fn effective_cwd(req_cwd: &Path, log_dir: Option<&Path>) -> Result<PathBuf> {
+fn effective_cwd(req_cwd: &Path, sandbox_home: &Path, log_dir: Option<&Path>) -> Result<PathBuf> {
     match probe_read_acl_mutex()? {
         ReadAclMutexState::Absent => Ok(req_cwd.to_path_buf()),
-        ReadAclMutexState::Present => cwd_junction::create_cwd_junction(req_cwd, log_dir)
-            .ok_or_else(|| {
+        ReadAclMutexState::Present => {
+            cwd_junction::create_cwd_junction(req_cwd, sandbox_home, log_dir).ok_or_else(|| {
                 anyhow::anyhow!("read ACL mutex is active but cwd junction creation failed")
-            }),
+            })
+        }
     }
 }
 
@@ -273,7 +274,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         }
     }
 
-    let effective_cwd = effective_cwd(&req.cwd, Some(log_dir.as_path()))?;
+    let effective_cwd = effective_cwd(&req.cwd, &req.sandbox_home, Some(log_dir.as_path()))?;
 
     let spawned_pipes: PipeSpawnHandles = spawn_process_with_pipes(
         h_token.raw(),
