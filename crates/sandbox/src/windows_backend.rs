@@ -1182,6 +1182,22 @@ fn reconcile_workspace_change(
     }
 }
 
+/// Reconcile setup notifications against the complete workspace snapshot.
+///
+/// Security-descriptor churn from protected ACL setup is allowed only when the snapshot proves
+/// that content, structure, and object identity stayed unchanged.
+fn reconcile_protected_setup_change(
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+) -> Result<(), String> {
+    let (changed, _) = before.observed_change(after)?;
+    if changed {
+        Err("workspace changed during protected setup".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 /// 将 core 的 protected path 规则投影为 resolver 可展开的 workspace glob。
 fn resolve_existing_protected_paths(
     workspace_root: &AbsolutePathBuf,
@@ -1601,155 +1617,165 @@ fn execute_windows_sandbox(
         let cancellation = cancellation.clone();
         move || cancellation.is_cancelled()
     });
-    let elevated = if observe_final_snapshot {
-        let workspace_for_observer = workspace.clone();
-        let before_snapshot = Arc::new(Mutex::new(None::<WorkspaceSnapshot>));
-        let before_snapshot_for_observer = Arc::clone(&before_snapshot);
-        let before_snapshot_for_after = Arc::clone(&before_snapshot);
-        let observation_protected_paths = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
-        let protected_paths_for_resolver = Arc::clone(&observation_protected_paths);
-        let protected_paths_for_before = Arc::clone(&observation_protected_paths);
-        let protected_paths_for_after = Arc::clone(&observation_protected_paths);
-        let mut accumulated_after_metrics = None;
-        run_windows_sandbox_capture_for_permission_profile_with_observations_elevated(
-            elevated_capture_request(
+    let elevated =
+        if observe_final_snapshot {
+            let workspace_for_observer = workspace.clone();
+            let setup_before = resolve_before_workspace_snapshot(
+                &workspace,
+                before_seed.clone(),
+                &prepared
+                    .protected_deny_read_paths
+                    .iter()
+                    .map(|path| path.as_path().to_path_buf())
+                    .collect::<Vec<_>>(),
+            )?;
+            let before_snapshot = Arc::new(Mutex::new(None::<WorkspaceSnapshot>));
+            let before_snapshot_for_observer = Arc::clone(&before_snapshot);
+            let before_snapshot_for_after = Arc::clone(&before_snapshot);
+            let observation_protected_paths = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+            let protected_paths_for_resolver = Arc::clone(&observation_protected_paths);
+            let protected_paths_for_after = Arc::clone(&observation_protected_paths);
+            let mut accumulated_after_metrics = None;
+            run_windows_sandbox_capture_for_permission_profile_with_observations_elevated(
+                elevated_capture_request(
+                    &prepared,
+                    windows_cancellation.clone(),
+                    trusted_workspace,
+                    workspace_change_monitor,
+                ),
+                {
+                    let workspace = prepared.workspace_roots[0].clone();
+                    // The controller resolved these objects before sandbox setup. Seed the
+                    // sandbox-side bounded scans with that same protected set so a later command
+                    // does not try to enumerate a directory that an earlier command already made
+                    // unreadable to the sandbox principal. The setup transaction still pins and
+                    // revalidates every returned object before the child can start.
+                    let mut previously_protected = prepared.protected_deny_read_paths.clone();
+                    let cached_protected_paths = cached_protected_paths.clone();
+                    move || {
+                        let protected = if let Some(cached) = cached_protected_paths.as_ref() {
+                            cached.clone()
+                        } else {
+                            let entries = protected_path_glob_entries(&workspace);
+                            let policy = FileSystemSandboxPolicy::restricted(entries);
+                            resolve_windows_deny_read_paths_from_validated_workspace(
+                                &policy,
+                                &workspace,
+                                &previously_protected,
+                            )?
+                        }
+                        .into_iter()
+                        .filter_map(|path| match std::fs::symlink_metadata(path.as_path()) {
+                            Ok(_) => Some(Ok(path)),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                                Some(Ok(path))
+                            }
+                            Err(error) => Some(Err(format!(
+                                "protected workspace path revalidation failed: {error}"
+                            ))),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                        previously_protected = protected.clone();
+                        *protected_paths_for_resolver.lock().map_err(|_| {
+                            "protected workspace observation path lock poisoned".to_string()
+                        })? = protected
+                            .iter()
+                            .map(|path| path.as_path().to_path_buf())
+                            .collect();
+                        Ok((protected.clone(), protected))
+                    }
+                },
+                {
+                    let mut setup_before = Some(setup_before);
+                    move || {
+                        let observed = setup_before.take().ok_or_else(|| {
+                            "workspace before snapshot already captured".to_string()
+                        })?;
+                        *before_snapshot_for_observer.lock().map_err(|_| {
+                            "workspace snapshot handoff lock poisoned".to_string()
+                        })? = Some(observed.snapshot.clone());
+                        Ok(observed)
+                    }
+                },
+                {
+                    let mut setup_reconciliation_pending = true;
+                    move |observation| {
+                        let before = before_snapshot_for_after
+                            .lock()
+                            .map_err(|_| "workspace snapshot handoff lock poisoned".to_string())?
+                            .as_ref()
+                            .cloned()
+                            .ok_or_else(|| "workspace before snapshot unavailable".to_string())?;
+                        let protected_paths = protected_paths_for_after
+                            .lock()
+                            .map_err(|_| {
+                                "protected workspace observation path lock poisoned".to_string()
+                            })?
+                            .clone();
+                        let mut observed = resolve_after_workspace_snapshot(
+                            &workspace_for_observer,
+                            &before,
+                            &observation,
+                            &protected_paths,
+                        )?;
+                        if setup_reconciliation_pending {
+                            reconcile_protected_setup_change(&before, &observed.snapshot)?;
+                            setup_reconciliation_pending = false;
+                        }
+                        *before_snapshot_for_after.lock().map_err(|_| {
+                            "workspace snapshot handoff lock poisoned".to_string()
+                        })? = Some(observed.snapshot.clone());
+                        observed.metrics = match accumulated_after_metrics {
+                            Some(previous) => {
+                                merge_observation_phase_metrics(previous, observed.metrics)
+                            }
+                            None => observed.metrics,
+                        };
+                        accumulated_after_metrics = Some(observed.metrics);
+                        Ok(observed)
+                    }
+                },
+            )
+            .and_then(|(capture, before, after, observation)| {
+                let protected_paths = observation_protected_paths
+                    .lock()
+                    .map_err(|_| {
+                        std::io::Error::other("protected workspace observation path lock poisoned")
+                    })?
+                    .iter()
+                    .map(|path| {
+                        AbsolutePathBuf::from_absolute_path_checked(path).map_err(|error| {
+                            std::io::Error::other(format!(
+                                "protected workspace path is invalid: {error}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, std::io::Error>>()?;
+                Ok((
+                    capture,
+                    Some(WorkspaceSnapshots {
+                        before: before.snapshot,
+                        after: after.snapshot,
+                        observation,
+                        protected_paths,
+                        metrics: WorkspaceObservationMetrics {
+                            contract: WORKSPACE_OBSERVATION_CONTRACT.to_string(),
+                            before: before.metrics,
+                            after: after.metrics,
+                        },
+                    }),
+                ))
+            })
+        } else {
+            run_windows_sandbox_capture_for_permission_profile_elevated(elevated_capture_request(
                 &prepared,
                 windows_cancellation.clone(),
                 trusted_workspace,
                 workspace_change_monitor,
-            ),
-            {
-                let workspace = prepared.workspace_roots[0].clone();
-                // The controller resolved these objects before sandbox setup. Seed the
-                // sandbox-side bounded scans with that same protected set so a later command
-                // does not try to enumerate a directory that an earlier command already made
-                // unreadable to the sandbox principal. The setup transaction still pins and
-                // revalidates every returned object before the child can start.
-                let mut previously_protected = prepared.protected_deny_read_paths.clone();
-                let cached_protected_paths = cached_protected_paths.clone();
-                move || {
-                    let protected = if let Some(cached) = cached_protected_paths.as_ref() {
-                        cached.clone()
-                    } else {
-                        let entries = protected_path_glob_entries(&workspace);
-                        let policy = FileSystemSandboxPolicy::restricted(entries);
-                        resolve_windows_deny_read_paths_from_validated_workspace(
-                            &policy,
-                            &workspace,
-                            &previously_protected,
-                        )?
-                    }
-                    .into_iter()
-                    .filter_map(|path| match std::fs::symlink_metadata(path.as_path()) {
-                        Ok(_) => Some(Ok(path)),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                            Some(Ok(path))
-                        }
-                        Err(error) => Some(Err(format!(
-                            "protected workspace path revalidation failed: {error}"
-                        ))),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                    previously_protected = protected.clone();
-                    *protected_paths_for_resolver.lock().map_err(|_| {
-                        "protected workspace observation path lock poisoned".to_string()
-                    })? = protected
-                        .iter()
-                        .map(|path| path.as_path().to_path_buf())
-                        .collect();
-                    Ok((protected.clone(), protected))
-                }
-            },
-            {
-                let workspace = workspace_for_observer.clone();
-                move || {
-                    let protected_paths = protected_paths_for_before
-                        .lock()
-                        .map_err(|_| {
-                            "protected workspace observation path lock poisoned".to_string()
-                        })?
-                        .clone();
-                    let observed = resolve_before_workspace_snapshot(
-                        &workspace,
-                        before_seed,
-                        &protected_paths,
-                    )?;
-                    *before_snapshot_for_observer
-                        .lock()
-                        .map_err(|_| "workspace snapshot handoff lock poisoned".to_string())? =
-                        Some(observed.snapshot.clone());
-                    Ok(observed)
-                }
-            },
-            move |observation| {
-                let before = before_snapshot_for_after
-                    .lock()
-                    .map_err(|_| "workspace snapshot handoff lock poisoned".to_string())?
-                    .as_ref()
-                    .cloned()
-                    .ok_or_else(|| "workspace before snapshot unavailable".to_string())?;
-                let protected_paths = protected_paths_for_after
-                    .lock()
-                    .map_err(|_| "protected workspace observation path lock poisoned".to_string())?
-                    .clone();
-                let mut observed = resolve_after_workspace_snapshot(
-                    &workspace_for_observer,
-                    &before,
-                    &observation,
-                    &protected_paths,
-                )?;
-                *before_snapshot_for_after
-                    .lock()
-                    .map_err(|_| "workspace snapshot handoff lock poisoned".to_string())? =
-                    Some(observed.snapshot.clone());
-                observed.metrics = match accumulated_after_metrics {
-                    Some(previous) => merge_observation_phase_metrics(previous, observed.metrics),
-                    None => observed.metrics,
-                };
-                accumulated_after_metrics = Some(observed.metrics);
-                Ok(observed)
-            },
-        )
-        .and_then(|(capture, before, after, observation)| {
-            let protected_paths = observation_protected_paths
-                .lock()
-                .map_err(|_| {
-                    std::io::Error::other("protected workspace observation path lock poisoned")
-                })?
-                .iter()
-                .map(|path| {
-                    AbsolutePathBuf::from_absolute_path_checked(path).map_err(|error| {
-                        std::io::Error::other(format!(
-                            "protected workspace path is invalid: {error}"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, std::io::Error>>()?;
-            Ok((
-                capture,
-                Some(WorkspaceSnapshots {
-                    before: before.snapshot,
-                    after: after.snapshot,
-                    observation,
-                    protected_paths,
-                    metrics: WorkspaceObservationMetrics {
-                        contract: WORKSPACE_OBSERVATION_CONTRACT.to_string(),
-                        before: before.metrics,
-                        after: after.metrics,
-                    },
-                }),
             ))
-        })
-    } else {
-        run_windows_sandbox_capture_for_permission_profile_elevated(elevated_capture_request(
-            &prepared,
-            windows_cancellation.clone(),
-            trusted_workspace,
-            workspace_change_monitor,
-        ))
-        .map(|capture| (capture, None))
-    };
+            .map(|capture| (capture, None))
+        };
     match elevated {
         Ok((capture, after)) => Ok((
             command_result_from_capture(command_id, capture, started)
@@ -2367,6 +2393,7 @@ mod tests {
     use super::*;
     use crate::CommandExecutionStatus;
     use crate::SandboxPreflightOutcome;
+    use singularity_windows_sandbox::WorkspacePathChange;
     use std::fs;
     use std::io::Write;
 
@@ -2511,6 +2538,59 @@ mod tests {
 
         assert_eq!(mutation, WorkspaceMutation::Unknown);
         assert!(summary.is_none());
+    }
+
+    #[test]
+    fn protected_setup_security_notification_requires_unchanged_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let value = workspace.path().join("value.txt");
+        create_test_file(&value, "stable");
+        let before = snapshot_workspace_as_sandbox_user(workspace.path(), &[]).expect("snapshot");
+        let after = resolve_after_workspace_snapshot(
+            workspace.path(),
+            &before,
+            &WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
+                path: "value.txt".to_string(),
+                kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
+            }]),
+            &[],
+        )
+        .expect("security notification refresh");
+
+        reconcile_protected_setup_change(&before, &after.snapshot)
+            .expect("ACL-only notification with unchanged snapshot must be accepted");
+
+        std::fs::write(&value, b"changed").expect("external setup write");
+        let changed = resolve_after_workspace_snapshot(
+            workspace.path(),
+            &before,
+            &WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
+                path: "value.txt".to_string(),
+                kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
+            }]),
+            &[],
+        )
+        .expect("changed setup refresh");
+        assert!(reconcile_protected_setup_change(&before, &changed.snapshot).is_err());
+    }
+
+    #[test]
+    fn protected_setup_structure_notification_is_rejected() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let before = snapshot_workspace_as_sandbox_user(workspace.path(), &[]).expect("snapshot");
+        std::fs::create_dir(workspace.path().join("created")).expect("external setup directory");
+        let changed = resolve_after_workspace_snapshot(
+            workspace.path(),
+            &before,
+            &WorkspaceChangeObservation::Changed(vec![WorkspacePathChange {
+                path: "created".to_string(),
+                kind: singularity_windows_sandbox::WorkspacePathChangeKind::Added,
+            }]),
+            &[],
+        )
+        .expect("structure setup refresh");
+
+        assert!(reconcile_protected_setup_change(&before, &changed.snapshot).is_err());
     }
 
     #[test]

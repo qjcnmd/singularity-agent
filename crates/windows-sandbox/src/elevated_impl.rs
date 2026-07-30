@@ -546,10 +546,26 @@ mod windows_impl {
                     deny_write_paths_override,
                 );
                 observer_creds = Some(scan_creds);
-                (Some(resolved), Some((resolver, before, after)))
+                (Some(resolved), Some((resolver, Some(before), after)))
             }
             None => (None, None),
         };
+        // Capture the command baseline before any protected setup can mutate ACLs. The setup
+        // checkpoint below may report security-descriptor notifications caused by that setup;
+        // the callback reconciles them against this authoritative snapshot rather than treating
+        // every notification as a workspace content change.
+        let mut before_observation = None;
+        if let Some((_, before_observer, _)) = observers.as_mut() {
+            let before_observer = before_observer.take().ok_or_else(|| {
+                anyhow::anyhow!("sandbox workspace observer baseline already consumed")
+            })?;
+            before_observation = Some(observe_as_sandbox_user(
+                observer_creds.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("sandbox observer credentials are unavailable")
+                })?,
+                before_observer,
+            )?);
+        }
         let mut current_resolved = resolved_by_sandbox.unwrap_or_else(|| {
             (
                 deny_read_paths_override.to_vec(),
@@ -706,15 +722,26 @@ mod windows_impl {
         }
 
         if let Some(slot) = workspace_change_monitor.as_deref_mut() {
-            // Rollover the cache checkpoint guard before the child starts. Setup notifications
-            // are not silently classified as harmless; any incomplete or changed guard fails
-            // closed before spawning the command.
+            // Rollover the cache checkpoint guard before the child starts. Start the command
+            // monitor first so there is no finish-to-spawn observation gap. Security-only setup
+            // notifications are reconciled by the authoritative before/after snapshot callback;
+            // incomplete observations still fail closed.
             let next = crate::WorkspaceChangeMonitor::start(workspace.as_path())?;
-            if let Some(setup_guard) = slot.take() {
-                let setup_observation = setup_guard.finish()?;
-                if setup_observation != crate::WorkspaceChangeObservation::Unchanged {
-                    anyhow::bail!("workspace changed during protected setup");
-                }
+            let setup_observation = match slot.take() {
+                Some(setup_guard) => setup_guard.finish()?,
+                None => crate::WorkspaceChangeObservation::Unchanged,
+            };
+            if setup_observation == crate::WorkspaceChangeObservation::Unknown {
+                anyhow::bail!("workspace observation was incomplete during protected setup");
+            }
+            if let Some((_, _, after_observer)) = observers.as_mut() {
+                let setup_observation = setup_observation.clone();
+                let creds = observer_creds.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "sandbox observer credentials are unavailable during protected setup"
+                    )
+                })?;
+                observe_as_sandbox_user(creds, || after_observer(setup_observation))?;
             }
             *slot = Some(next);
         }
@@ -737,12 +764,14 @@ mod windows_impl {
         // Keep the no-follow deny-set pins alive through runner spawn, IPC, and Job cleanup.
         // Public certificate-only PEM targets are intentionally skipped by deny-read ACL
         // mutation, but remain pinned so their admitted identity cannot be replaced meanwhile.
-        let (before_observation, after_observer) = match observers {
-            Some((_resolver, before_observer, after_observer)) => (
-                Some(observe_as_sandbox_user(&sandbox_creds, before_observer)?),
-                Some(after_observer),
-            ),
-            None => (None, None),
+        let after_observer = match observers {
+            Some((_resolver, before_observer, after_observer)) => {
+                if before_observer.is_some() {
+                    anyhow::bail!("sandbox workspace observer baseline was not captured");
+                }
+                Some(after_observer)
+            }
+            None => None,
         };
 
         let capture_result = (|| -> Result<CaptureResult> {
