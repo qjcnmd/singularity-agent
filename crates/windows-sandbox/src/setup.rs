@@ -2252,10 +2252,6 @@ mod tests {
         assert_eq!(
             [
                 canonicalize_path_allow_missing(&command_git),
-                command_cwd.join(".agents"),
-                command_cwd.join(".singularity"),
-                extra_write_root.join(".git"),
-                extra_write_root.join(".agents"),
                 extra_singularity,
                 explicit_deny,
             ]

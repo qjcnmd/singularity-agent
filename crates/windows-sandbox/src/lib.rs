@@ -8,10 +8,10 @@ mod string_utils;
 
 pub use absolute_path::AbsolutePathBuf;
 pub use permissions::{
-    FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxKind,
-    FileSystemSandboxPolicy, FileSystemSpecialPath, ManagedFileSystemPermissions,
-    NetworkSandboxPolicy, PermissionProfile, ReadDenyMatcher, WritableRoot,
-    project_roots_glob_pattern,
+    FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+    FileSystemSandboxEntryMissingPathBehavior, FileSystemSandboxKind, FileSystemSandboxPolicy,
+    FileSystemSpecialPath, ManagedFileSystemPermissions, NetworkSandboxPolicy, PermissionProfile,
+    ReadDenyMatcher, WritableRoot, project_roots_glob_pattern,
 };
 
 #[cfg(any(target_os = "windows", test))]
@@ -232,7 +232,11 @@ pub use acl::fetch_dacl_handle;
 #[cfg(target_os = "windows")]
 pub use acl::handle_mask_allows;
 #[cfg(target_os = "windows")]
+pub use acl::handle_write_aces_need_refresh;
+#[cfg(target_os = "windows")]
 pub use acl::path_mask_allows;
+#[cfg(target_os = "windows")]
+pub use acl::path_write_aces_need_refresh;
 #[cfg(target_os = "windows")]
 pub use acl::set_dacl_for_path;
 #[cfg(target_os = "windows")]

@@ -1,6 +1,5 @@
 use crate::path_normalization::canonicalize_path_allow_missing;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
-use singularity_core::PROTECTED_METADATA_PATH_NAMES;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -30,20 +29,9 @@ pub(crate) fn compute_allow_paths_for_permissions(
         add_allow_path(canonical);
         for read_only_subpath in writable_root.read_only_subpaths {
             let read_only_subpath = canonicalize_path_allow_missing(&read_only_subpath);
-            let missing_metadata_sentinel = read_only_subpath
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    PROTECTED_METADATA_PATH_NAMES
-                        .iter()
-                        .any(|marker| marker.eq_ignore_ascii_case(name))
-                });
-            if missing_metadata_sentinel || read_only_subpath.exists() {
-                // All protected metadata names are reserved before the child starts. The
-                // Windows materialization helper preserves Git ancestor discovery by rejecting
-                // a missing nested `.git` under an existing ancestor repository.
-                deny.insert(read_only_subpath);
-            }
+            // Existing generated metadata paths are protected; explicit missing deny entries
+            // remain in the plan so the ACL setup can materialize them fail-closed.
+            deny.insert(read_only_subpath);
         }
     }
 
@@ -56,6 +44,7 @@ mod tests {
     use crate::absolute_path::AbsolutePathBuf;
     use crate::permissions::NetworkSandboxPolicy;
     use crate::permissions::PermissionProfile;
+    use singularity_core::PROTECTED_METADATA_PATH_NAMES;
     use std::fs;
     use tempfile::TempDir;
 
@@ -91,7 +80,7 @@ mod tests {
         compute_allow_paths_for_permissions(&permissions, command_cwd, env_map)
     }
 
-    fn expected_protected_paths(roots: &[&Path]) -> HashSet<PathBuf> {
+    fn expected_existing_protected_paths(roots: &[&Path]) -> HashSet<PathBuf> {
         roots
             .iter()
             .flat_map(|root| {
@@ -99,7 +88,16 @@ mod tests {
                 PROTECTED_METADATA_PATH_NAMES
                     .iter()
                     .map(move |name| canonical.join(name))
+                    .filter(|path| fs::symlink_metadata(path).is_ok())
             })
+            .collect()
+    }
+
+    fn expected_all_protected_paths(root: &Path) -> HashSet<PathBuf> {
+        let canonical = dunce::canonicalize(root).expect("canonical protected root");
+        PROTECTED_METADATA_PATH_NAMES
+            .iter()
+            .map(|name| canonical.join(name))
             .collect()
     }
 
@@ -136,7 +134,7 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&extra_root).unwrap())
         );
-        let expected_deny = expected_protected_paths(&[&command_cwd, &extra_root]);
+        let expected_deny = expected_existing_protected_paths(&[&command_cwd, &extra_root]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -171,7 +169,7 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&command_cwd).unwrap())
         );
-        let expected_deny = expected_protected_paths(&[&workspace_root]);
+        let expected_deny = expected_existing_protected_paths(&[&workspace_root]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -210,7 +208,7 @@ mod tests {
                 .allow
                 .contains(&dunce::canonicalize(&temp_dir).unwrap())
         );
-        let expected_deny = expected_protected_paths(&[&command_cwd]);
+        let expected_deny = expected_existing_protected_paths(&[&command_cwd]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -247,7 +245,8 @@ mod tests {
         .collect();
 
         assert_eq!(expected_allow, paths.allow);
-        let expected_deny = expected_protected_paths(&[&command_cwd, &temp_dir]);
+        let mut expected_deny = expected_existing_protected_paths(&[&command_cwd]);
+        expected_deny.extend(expected_all_protected_paths(&temp_dir));
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -275,7 +274,7 @@ mod tests {
             .collect();
 
         assert_eq!(expected_allow, paths.allow);
-        let expected_deny = expected_protected_paths(&[&command_cwd]);
+        let expected_deny = expected_existing_protected_paths(&[&command_cwd]);
         assert_eq!(expected_deny, paths.deny);
     }
 
@@ -302,7 +301,7 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
-        let expected_deny = expected_protected_paths(&[&command_cwd]);
+        let expected_deny = expected_existing_protected_paths(&[&command_cwd]);
 
         assert_eq!(expected_allow, paths.allow);
         assert_eq!(expected_deny, paths.deny);
@@ -332,7 +331,7 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
-        let expected_deny = expected_protected_paths(&[&command_cwd]);
+        let expected_deny = expected_existing_protected_paths(&[&command_cwd]);
 
         assert_eq!(expected_allow, paths.allow);
         assert_eq!(expected_deny, paths.deny);
@@ -363,14 +362,14 @@ mod tests {
         let expected_allow: HashSet<PathBuf> = [dunce::canonicalize(&command_cwd).unwrap()]
             .into_iter()
             .collect();
-        let expected_deny = expected_protected_paths(&[&command_cwd]);
+        let expected_deny = expected_existing_protected_paths(&[&command_cwd]);
 
         assert_eq!(expected_allow, paths.allow);
         assert_eq!(expected_deny, paths.deny);
     }
 
     #[test]
-    fn reserves_runtime_metadata_dirs_when_missing() {
+    fn skips_missing_default_metadata_dirs() {
         let tmp = TempDir::new().expect("tempdir");
         let command_cwd = tmp.path().join("workspace");
         let _ = fs::create_dir_all(&command_cwd);
@@ -389,12 +388,50 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(paths.allow.len(), 1);
-        let expected_deny = expected_protected_paths(&[&command_cwd]);
-        assert_eq!(expected_deny, paths.deny);
-        assert!(
-            paths
-                .deny
-                .contains(&dunce::canonicalize(&command_cwd).unwrap().join(".git"))
+        assert!(paths.deny.is_empty());
+        for name in PROTECTED_METADATA_PATH_NAMES {
+            assert!(!command_cwd.join(name).exists());
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_missing_deny_paths() {
+        let tmp = TempDir::new().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let explicit_deny = command_cwd.join("blocked");
+        fs::create_dir_all(&command_cwd).expect("create workspace");
+        let workspace_root =
+            AbsolutePathBuf::from_absolute_path(&command_cwd).expect("absolute workspace root");
+        let explicit_deny =
+            AbsolutePathBuf::from_absolute_path(&explicit_deny).expect("absolute explicit deny");
+        let profile = PermissionProfile::Managed {
+            file_system: crate::permissions::ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    crate::permissions::FileSystemSandboxEntry::new(
+                        crate::permissions::FileSystemPath::Path {
+                            path: workspace_root,
+                        },
+                        crate::permissions::FileSystemAccessMode::Write,
+                    ),
+                    crate::permissions::FileSystemSandboxEntry::new(
+                        crate::permissions::FileSystemPath::Path {
+                            path: explicit_deny.clone(),
+                        },
+                        crate::permissions::FileSystemAccessMode::Deny,
+                    ),
+                ],
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+        let paths = compute_allow_paths(
+            &profile,
+            &workspace_roots_for(&command_cwd),
+            &command_cwd,
+            &HashMap::new(),
         );
+
+        assert!(!explicit_deny.as_path().exists());
+        assert!(paths.deny.contains(explicit_deny.as_path()));
     }
 }

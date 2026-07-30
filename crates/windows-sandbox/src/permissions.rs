@@ -75,6 +75,36 @@ pub enum FileSystemPath<PathType = AbsolutePathBuf> {
 pub struct FileSystemSandboxEntry<PathType = AbsolutePathBuf> {
     pub path: FileSystemPath<PathType>,
     pub access: FileSystemAccessMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_path_behavior: Option<FileSystemSandboxEntryMissingPathBehavior>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSystemSandboxEntryMissingPathBehavior {
+    Skip,
+}
+
+impl<PathType> FileSystemSandboxEntry<PathType> {
+    pub fn new(path: FileSystemPath<PathType>, access: FileSystemAccessMode) -> Self {
+        Self {
+            path,
+            access,
+            missing_path_behavior: None,
+        }
+    }
+
+    pub fn skip_missing_path(path: FileSystemPath<PathType>, access: FileSystemAccessMode) -> Self {
+        Self {
+            path,
+            access,
+            missing_path_behavior: Some(FileSystemSandboxEntryMissingPathBehavior::Skip),
+        }
+    }
+
+    pub fn skips_missing_path(&self) -> bool {
+        self.missing_path_behavior == Some(FileSystemSandboxEntryMissingPathBehavior::Skip)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -203,12 +233,12 @@ impl Default for FileSystemSandboxPolicy {
 
 impl FileSystemSandboxPolicy {
     pub fn read_only() -> Self {
-        Self::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Special {
+        Self::restricted(vec![FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
                 value: FileSystemSpecialPath::Root,
             },
-            access: FileSystemAccessMode::Read,
-        }])
+            FileSystemAccessMode::Read,
+        )])
     }
 
     pub fn unrestricted() -> Self {
@@ -235,42 +265,59 @@ impl FileSystemSandboxPolicy {
         }
     }
 
+    /// Removes default entries that must not become newly-created ACL targets.
+    pub fn remove_skip_missing_path_entries(&mut self) {
+        self.entries.retain(|entry| !entry.skips_missing_path());
+    }
+
     pub fn workspace_write(
         writable_roots: &[AbsolutePathBuf],
         exclude_tmpdir_env_var: bool,
         exclude_slash_tmp: bool,
     ) -> Self {
         let mut entries = Self::read_only().entries;
-        entries.push(FileSystemSandboxEntry {
-            path: FileSystemPath::Special {
+        entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(None),
             },
-            access: FileSystemAccessMode::Write,
-        });
-        entries.extend(
-            writable_roots
-                .iter()
-                .cloned()
-                .map(|path| FileSystemSandboxEntry {
-                    path: FileSystemPath::Path { path },
-                    access: FileSystemAccessMode::Write,
-                }),
-        );
+            FileSystemAccessMode::Write,
+        ));
+        entries.extend(writable_roots.iter().cloned().map(|path| {
+            FileSystemSandboxEntry::new(FileSystemPath::Path { path }, FileSystemAccessMode::Write)
+        }));
         if !exclude_tmpdir_env_var {
-            entries.push(FileSystemSandboxEntry {
-                path: FileSystemPath::Special {
+            entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
                     value: FileSystemSpecialPath::Tmpdir,
                 },
-                access: FileSystemAccessMode::Write,
-            });
+                FileSystemAccessMode::Write,
+            ));
         }
         if !exclude_slash_tmp {
-            entries.push(FileSystemSandboxEntry {
-                path: FileSystemPath::Special {
+            entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
                     value: FileSystemSpecialPath::SlashTmp,
                 },
-                access: FileSystemAccessMode::Write,
-            });
+                FileSystemAccessMode::Write,
+            ));
+        }
+        for name in PROTECTED_METADATA_PATH_NAMES {
+            entries.push(FileSystemSandboxEntry::skip_missing_path(
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(Some(name.into())),
+                },
+                FileSystemAccessMode::Read,
+            ));
+        }
+        for root in writable_roots {
+            for name in PROTECTED_METADATA_PATH_NAMES {
+                entries.push(FileSystemSandboxEntry::skip_missing_path(
+                    FileSystemPath::Path {
+                        path: root.join(name),
+                    },
+                    FileSystemAccessMode::Read,
+                ));
+            }
         }
         Self::restricted(entries)
     }
@@ -322,6 +369,7 @@ impl FileSystemSandboxPolicy {
                                     .map_or_else(|| root.clone(), |subpath| root.join(subpath)),
                             },
                             access: entry.access,
+                            missing_path_behavior: entry.missing_path_behavior,
                         }
                     }));
                 }
@@ -337,12 +385,14 @@ impl FileSystemSandboxPolicy {
                                     .into_owned(),
                             },
                             access: entry.access,
+                            missing_path_behavior: entry.missing_path_behavior,
                         }
                     }));
                 }
                 path => materialized.push(FileSystemSandboxEntry {
                     path,
                     access: entry.access,
+                    missing_path_behavior: entry.missing_path_behavior,
                 }),
             }
         }
@@ -389,11 +439,12 @@ impl FileSystemSandboxPolicy {
                     .cloned()
                     .collect::<Vec<_>>();
                 if protect_workspace_metadata {
-                    read_only_subpaths.extend(
-                        PROTECTED_METADATA_PATH_NAMES
-                            .iter()
-                            .map(|name| root.join(name)),
-                    );
+                    read_only_subpaths.extend(PROTECTED_METADATA_PATH_NAMES.iter().filter_map(
+                        |name| {
+                            let path = root.join(name);
+                            std::fs::symlink_metadata(&path).is_ok().then_some(path)
+                        },
+                    ));
                 }
                 WritableRoot {
                     root,

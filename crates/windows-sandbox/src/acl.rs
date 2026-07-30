@@ -438,6 +438,30 @@ pub unsafe fn dacl_mask_allows(
     desired_mask: u32,
     require_all_bits: bool,
 ) -> bool {
+    unsafe {
+        dacl_mask_allows_with_scope(
+            p_dacl,
+            psids,
+            desired_mask,
+            require_all_bits,
+            AceScope::Effective,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AceScope {
+    Effective,
+    Explicit,
+}
+
+unsafe fn dacl_mask_allows_with_scope(
+    p_dacl: *mut ACL,
+    psids: &[*mut c_void],
+    desired_mask: u32,
+    require_all_bits: bool,
+    scope: AceScope,
+) -> bool {
     if p_dacl.is_null() {
         return false;
     }
@@ -470,6 +494,9 @@ pub unsafe fn dacl_mask_allows(
                 continue; // not ACCESS_ALLOWED
             }
             if (hdr.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                continue;
+            }
+            if matches!(scope, AceScope::Explicit) && (hdr.AceFlags & INHERITED_ACE) != 0 {
                 continue;
             }
             let base = p_ace as usize;
@@ -512,6 +539,24 @@ pub fn path_mask_allows(
             LocalFree(sd as HLOCAL);
         }
         Ok(has)
+    }
+}
+
+unsafe fn dacl_allow_mask_needs_refresh(
+    p_dacl: *mut ACL,
+    psid: *mut c_void,
+    allow_mask: u32,
+    disallow_mask: u32,
+) -> bool {
+    unsafe {
+        !dacl_mask_allows(p_dacl, &[psid], allow_mask, /*require_all_bits*/ true)
+            || dacl_mask_allows_with_scope(
+                p_dacl,
+                &[psid],
+                disallow_mask,
+                /*require_all_bits*/ false,
+                AceScope::Explicit,
+            )
     }
 }
 
@@ -716,23 +761,8 @@ unsafe fn ensure_allow_mask_aces_for_target(
 ) -> Result<bool> {
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
     for sid in sids {
-        let allows = unsafe {
-            dacl_mask_allows(
-                target.p_dacl,
-                &[*sid],
-                allow_mask,
-                /*require_all_bits*/ true,
-            )
-        };
-        let disallowed = unsafe {
-            dacl_mask_allows(
-                target.p_dacl,
-                &[*sid],
-                disallow_mask,
-                /*require_all_bits*/ false,
-            )
-        };
-        if allows && !disallowed {
+        if unsafe { !dacl_allow_mask_needs_refresh(target.p_dacl, *sid, allow_mask, disallow_mask) }
+        {
             continue;
         }
         entries.push(EXPLICIT_ACCESS_W {
@@ -863,6 +893,31 @@ pub unsafe fn ensure_allow_write_aces(path: &Path, sids: &[*mut c_void]) -> Resu
             CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
         )
     }
+}
+
+unsafe fn target_write_aces_need_refresh(target: &AclTarget, sids: &[*mut c_void]) -> bool {
+    sids.iter().any(|sid| unsafe {
+        dacl_allow_mask_needs_refresh(target.p_dacl, *sid, WRITE_ALLOW_MASK, FILE_DELETE_CHILD)
+    })
+}
+
+/// Checks all writable-root principals against one pinned target DACL snapshot.
+///
+/// # Safety
+/// Caller must pass a valid existing non-reparse target handle and valid SID pointers. The handle
+/// must grant `READ_CONTROL`.
+pub unsafe fn handle_write_aces_need_refresh(handle: HANDLE, sids: &[*mut c_void]) -> Result<bool> {
+    let target = unsafe { borrow_acl_target(handle) }?;
+    Ok(unsafe { target_write_aces_need_refresh(&target, sids) })
+}
+
+/// Checks all writable-root principals through one path-opened DACL snapshot.
+///
+/// # Safety
+/// Caller must pass valid SID pointers and an existing non-reparse path.
+pub unsafe fn path_write_aces_need_refresh(path: &Path, sids: &[*mut c_void]) -> Result<bool> {
+    let target = unsafe { open_acl_target(path, READ_CONTROL, 1) }?;
+    Ok(unsafe { target_write_aces_need_refresh(&target, sids) })
 }
 
 /// Ensures write-capable allow ACEs through an already pinned file handle.

@@ -1250,6 +1250,7 @@ fn protected_path_glob_entries(workspace_root: &AbsolutePathBuf) -> Vec<FileSyst
         .map(|pattern| FileSystemSandboxEntry {
             path: FileSystemPath::GlobPattern { pattern },
             access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         })
         .collect()
 }
