@@ -12,6 +12,7 @@ use std::path::{Component, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use singularity_core::is_protected_path;
 use singularity_core::{CancellationToken, contains_sensitive_text};
@@ -209,6 +210,31 @@ fn is_sha256_digest(value: &str) -> bool {
         return false;
     };
     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Derive a stable, non-semantic partition key from a canonical workspace path.
+///
+/// The key only names an external tool-artifact directory; it is not a cache state or
+/// authorization handle. Callers must canonicalize the workspace before invoking this helper.
+pub(crate) fn workspace_tool_cache_digest(workspace: &Path) -> String {
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        hasher.update(workspace.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        for unit in workspace.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(workspace.to_string_lossy().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// 与命令请求使用的工作区根目录配对的文件系统策略。

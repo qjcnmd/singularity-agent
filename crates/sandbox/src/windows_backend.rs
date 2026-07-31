@@ -683,7 +683,9 @@ impl SandboxBackend for WindowsSandboxBackend {
         let Ok(cwd) = canonical_directory(workspace) else {
             return ExecutableAvailability::Unknown;
         };
-        let env = child_environment(environment);
+        let Ok(env) = child_environment(environment, &cwd) else {
+            return ExecutableAvailability::Unknown;
+        };
         match resolve_executable(&[executable.to_string()], &cwd, &env) {
             Ok(_) => ExecutableAvailability::Available,
             Err(ExecutableResolutionError::Unavailable(_)) => ExecutableAvailability::Unavailable,
@@ -1410,7 +1412,8 @@ impl PreparedCommand {
         } else {
             None
         };
-        let env_map = child_environment(&request.environment);
+        let env_map = child_environment(&request.environment, &workspace_root)
+            .map_err(PrepareCommandError::Backend)?;
         let resolved = resolve_executable(&request.argv, &cwd, &env_map)
             .map_err(PrepareCommandError::Executable)?;
         let workspace_root =
@@ -1554,7 +1557,8 @@ impl PreparedCommand {
         let before = None;
         let cwd =
             canonical_directory(Path::new(&request.cwd)).map_err(PrepareCommandError::Backend)?;
-        let env_map = child_environment(&request.environment);
+        let env_map = child_environment(&request.environment, &workspace_root)
+            .map_err(PrepareCommandError::Backend)?;
         let powershell = system_powershell(&env_map).ok_or_else(|| {
             PrepareCommandError::Executable(ExecutableResolutionError::Unavailable(
                 "required Windows PowerShell executable was not found".to_string(),
@@ -2405,14 +2409,18 @@ fn sandbox_home() -> Result<PathBuf, String> {
     Ok(home)
 }
 
-fn child_environment(policy: &CommandEnvironmentPolicy) -> HashMap<String, String> {
-    child_environment_from(std::env::vars(), policy)
+fn child_environment(
+    policy: &CommandEnvironmentPolicy,
+    workspace: &Path,
+) -> Result<HashMap<String, String>, String> {
+    child_environment_from(std::env::vars(), policy, workspace)
 }
 
 fn child_environment_from(
     environment: impl IntoIterator<Item = (String, String)>,
     policy: &CommandEnvironmentPolicy,
-) -> HashMap<String, String> {
+    workspace: &Path,
+) -> Result<HashMap<String, String>, String> {
     let mut env_map = filtered_child_environment(environment, policy);
     let temp = env_value(&env_map, "TEMP")
         .map(PathBuf::from)
@@ -2421,7 +2429,7 @@ fn child_environment_from(
             let temp = std::env::temp_dir();
             temp.is_absolute().then_some(temp)
         });
-    if let Some(temp) = temp {
+    if let Some(temp) = temp.as_ref() {
         let cache = temp.join("singularity-tool-cache");
         set_environment_value(
             &mut env_map,
@@ -2448,7 +2456,29 @@ fn child_environment_from(
             &format!("{pytest_addopts}-o \"cache_dir={pytest_cache}\""),
         );
     }
-    env_map
+    if policy == &CommandEnvironmentPolicy::Isolated {
+        let temp = temp.ok_or_else(|| {
+            "isolated command environment has no absolute TEMP cache root".to_string()
+        })?;
+        let temp = dunce::canonicalize(&temp)
+            .map_err(|error| format!("isolated TEMP cache root is unavailable: {error}"))?;
+        if !temp.is_absolute() {
+            return Err("isolated TEMP cache root is not absolute".to_string());
+        }
+        let workspace = dunce::canonicalize(workspace)
+            .map_err(|error| format!("isolated workspace root is unavailable: {error}"))?;
+        let target = temp
+            .join("singularity-tool-cache")
+            .join("cargo")
+            .join(super::workspace_tool_cache_digest(&workspace));
+        if target.starts_with(&workspace) {
+            return Err(
+                "isolated Cargo target directory would be inside the workspace".to_string(),
+            );
+        }
+        set_environment_value(&mut env_map, "CARGO_TARGET_DIR", &target.to_string_lossy());
+    }
+    Ok(env_map)
 }
 
 fn set_environment_value(env_map: &mut HashMap<String, String>, name: &str, value: &str) {
@@ -3294,10 +3324,23 @@ mod tests {
 
     #[test]
     fn command_environment_keeps_pytest_options_and_externalizes_tool_caches() {
+        let temp_root = tempfile::tempdir().expect("temp root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let temp_path = temp_root.path().to_string_lossy().into_owned();
+        let canonical_temp = dunce::canonicalize(temp_root.path()).expect("canonical temp root");
+        let cache_root = temp_root.path().join("singularity-tool-cache");
+        let pip_cache = cache_root.join("pip").to_string_lossy().into_owned();
+        let npm_cache = cache_root.join("npm").to_string_lossy().into_owned();
+        let python_cache = cache_root.join("python").to_string_lossy().into_owned();
+        let pytest_cache = cache_root
+            .join("pytest")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let expected_pytest = format!("--maxfail=1 -o \"cache_dir={pytest_cache}\"");
         let environment = [
             ("Path".to_string(), "C:\\tools".to_string()),
-            ("TEMP".to_string(), "C:\\Temp".to_string()),
-            ("temp".to_string(), "C:\\Temp".to_string()),
+            ("TEMP".to_string(), temp_path.clone()),
+            ("temp".to_string(), temp_path),
             ("PYTEST_ADDOPTS".to_string(), "--maxfail=1".to_string()),
             (
                 "CARGO_TARGET_DIR".to_string(),
@@ -3310,23 +3353,24 @@ mod tests {
             CommandEnvironmentPolicy::HostSanitized,
             CommandEnvironmentPolicy::Isolated,
         ] {
-            let values = child_environment_from(environment.clone(), &policy);
+            let values = child_environment_from(environment.clone(), &policy, workspace.path())
+                .expect("child environment");
             assert_eq!(env_value(&values, "PATH"), Some("C:\\tools"));
             assert_eq!(
                 env_value(&values, "PIP_CACHE_DIR"),
-                Some("C:\\Temp\\singularity-tool-cache\\pip")
+                Some(pip_cache.as_str())
             );
             assert_eq!(
                 env_value(&values, "NPM_CONFIG_CACHE"),
-                Some("C:\\Temp\\singularity-tool-cache\\npm")
+                Some(npm_cache.as_str())
             );
             assert_eq!(
                 env_value(&values, "PYTHONPYCACHEPREFIX"),
-                Some("C:\\Temp\\singularity-tool-cache\\python")
+                Some(python_cache.as_str())
             );
             assert_eq!(
                 env_value(&values, "PYTEST_ADDOPTS"),
-                Some("--maxfail=1 -o \"cache_dir=C:/Temp/singularity-tool-cache/pytest\"")
+                Some(expected_pytest.as_str())
             );
             assert_eq!(
                 values
@@ -3336,7 +3380,21 @@ mod tests {
                 1
             );
             if policy == CommandEnvironmentPolicy::Isolated {
-                assert!(env_value(&values, "CARGO_TARGET_DIR").is_none());
+                let target = PathBuf::from(
+                    env_value(&values, "CARGO_TARGET_DIR").expect("isolated Cargo target"),
+                );
+                assert!(target.is_absolute());
+                assert!(target.starts_with(&canonical_temp));
+                assert!(!target.starts_with(workspace.path()));
+                assert_eq!(
+                    target,
+                    canonical_temp
+                        .join("singularity-tool-cache")
+                        .join("cargo")
+                        .join(super::super::workspace_tool_cache_digest(
+                            &dunce::canonicalize(workspace.path()).expect("canonical workspace")
+                        ))
+                );
                 assert!(env_value(&values, "SINGULARITY_MODEL").is_none());
             } else {
                 assert_eq!(
@@ -3346,6 +3404,35 @@ mod tests {
                 assert_eq!(env_value(&values, "SINGULARITY_MODEL"), Some("host-model"));
             }
         }
+    }
+
+    #[test]
+    fn isolated_command_environment_fails_closed_for_unusable_cache_roots() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let inside_workspace = workspace.path().to_string_lossy().into_owned();
+        let error = child_environment_from(
+            [("TEMP".to_string(), inside_workspace)],
+            &CommandEnvironmentPolicy::Isolated,
+            workspace.path(),
+        )
+        .expect_err("workspace TEMP must be rejected");
+        assert_eq!(
+            error,
+            "isolated Cargo target directory would be inside the workspace"
+        );
+
+        let external = tempfile::tempdir().expect("external root");
+        let missing = external.path().join("missing");
+        let error = child_environment_from(
+            [("TEMP".to_string(), missing.to_string_lossy().into_owned())],
+            &CommandEnvironmentPolicy::Isolated,
+            workspace.path(),
+        )
+        .expect_err("missing TEMP must be rejected");
+        assert!(
+            error.starts_with("isolated TEMP cache root is unavailable:"),
+            "{error}"
+        );
     }
 
     #[test]

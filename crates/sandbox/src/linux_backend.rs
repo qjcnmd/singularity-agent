@@ -38,6 +38,7 @@ use super::{
     SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities, SandboxFilesystemMode,
     SandboxNetworkMode, SandboxPreflightFact, SandboxPreflightReport, WorkspaceChangeSummary,
     WorkspaceMutation, WorkspaceSnapshot, snapshot_trusted_workspace, snapshot_workspace,
+    workspace_tool_cache_digest,
 };
 
 const BACKEND_NAME: &str = "linux";
@@ -53,6 +54,7 @@ const SANDBOX_CHILD_CANCELLED: &str = "linux sandbox command cancelled";
 const SANDBOX_CHILD_TIMED_OUT: &str = "linux sandbox command timed out";
 const SANDBOX_HOME: &str = "/run/singularity-home";
 const TOOL_CACHE_ROOT: &str = "/run/singularity-tool-cache";
+const CARGO_TARGET_ROOT: &str = "/run/singularity-tool-cache/cargo";
 const MAX_PUBLIC_CERTIFICATE_PEM_BYTES: u64 = 1024 * 1024;
 
 /// Read-only system roots needed by dynamically dispatched executables.
@@ -772,7 +774,9 @@ impl SandboxBackend for LinuxSandboxBackend {
         let Ok(cwd) = canonical_directory(workspace) else {
             return ExecutableAvailability::Unknown;
         };
-        let env = sanitized_environment(environment);
+        let Ok(env) = sanitized_environment_for_workspace(environment, &cwd) else {
+            return ExecutableAvailability::Unknown;
+        };
         match resolve_executable(executable, &cwd, &env) {
             Ok(_) => ExecutableAvailability::Available,
             Err(LinuxSandboxError::ExecutableUnavailable) => ExecutableAvailability::Unavailable,
@@ -968,6 +972,7 @@ struct PreparedCommand {
     runtime_read_paths: Vec<PathBuf>,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    environment_policy: CommandEnvironmentPolicy,
     timeout: Duration,
     network: SandboxNetworkMode,
     filesystem: SandboxFilesystemMode,
@@ -1001,7 +1006,8 @@ impl PreparedCommand {
                 SANDBOX_PROTECTED_PATH_DENIED,
             ));
         }
-        let mut env = sanitized_environment(&environment);
+        let mut env = sanitized_environment_for_workspace(&environment, &workspace)
+            .map_err(|_| LinuxSandboxError::Unavailable)?;
         let resolved = resolve_executable(&argv[0], &cwd_path, &env)?;
         let mut runtime_read_paths = resolved.runtime_read_paths;
         let mut runtime_environment = resolved.environment;
@@ -1090,6 +1096,7 @@ impl PreparedCommand {
             runtime_read_paths,
             argv,
             env,
+            environment_policy: environment,
             timeout: Duration::from_secs(timeout_seconds),
             network,
             filesystem: filesystem.mode,
@@ -1474,8 +1481,27 @@ fn resolve_cwd(workspace: &Path, requested: &Path) -> Result<PathBuf, LinuxSandb
     }
 }
 
-fn sanitized_environment(policy: &CommandEnvironmentPolicy) -> Vec<(String, String)> {
-    sanitized_environment_from(std::env::vars(), policy)
+fn sanitized_environment_for_workspace(
+    policy: &CommandEnvironmentPolicy,
+    workspace: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    sanitized_environment_from_workspace(std::env::vars(), policy, workspace)
+}
+
+fn sanitized_environment_from_workspace(
+    environment: impl IntoIterator<Item = (String, String)>,
+    policy: &CommandEnvironmentPolicy,
+    workspace: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let mut values = sanitized_environment_from(environment, policy);
+    if policy == &CommandEnvironmentPolicy::Isolated {
+        let target = Path::new(CARGO_TARGET_ROOT).join(workspace_tool_cache_digest(workspace));
+        if !target.is_absolute() || target.starts_with(workspace) {
+            return Err("isolated Cargo target directory is not external".to_string());
+        }
+        set_environment_value(&mut values, "CARGO_TARGET_DIR", &target.to_string_lossy());
+    }
+    Ok(values)
 }
 
 fn sanitized_environment_from(
@@ -5230,6 +5256,24 @@ fn prepare_child_filesystem(
         Some("size=64m,mode=1777"),
         CHILD_SETUP_CAPABILITY,
     )?);
+    if prepared.environment_policy == CommandEnvironmentPolicy::Isolated {
+        for path in [TOOL_CACHE_ROOT, CARGO_TARGET_ROOT] {
+            operations.push(ChildFilesystemOperation::CreateDirectory {
+                path: CString::new(path).map_err(|_| LinuxSandboxError::Unavailable)?,
+                mode: 0o700,
+                allow_existing: false,
+                error: CHILD_SETUP_CAPABILITY,
+            });
+        }
+        operations.push(mount_operation(
+            Some("tmpfs"),
+            Path::new(CARGO_TARGET_ROOT),
+            Some("tmpfs"),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some("size=256m,mode=700"),
+            CHILD_SETUP_CAPABILITY,
+        )?);
+    }
     if prepared.filesystem == SandboxFilesystemMode::WorkspaceWrite {
         let overlay_error =
             || LinuxSandboxError::CapabilityNotSupported(LinuxCapability::OverlayFilesystem);
@@ -5423,6 +5467,14 @@ fn prepare_landlock_rules(
                 allowed_access: LANDLOCK_ACCESS_FS_READ | LANDLOCK_ACCESS_FS_WRITE,
             });
         }
+    }
+    if prepared.environment_policy == CommandEnvironmentPolicy::Isolated {
+        rules.push(LandlockRule {
+            path: CString::new(CARGO_TARGET_ROOT).map_err(|_| LinuxSandboxError::Unavailable)?,
+            allowed_access: LANDLOCK_ACCESS_FS_READ
+                | LANDLOCK_ACCESS_FS_WRITE
+                | LANDLOCK_ACCESS_FS_EXECUTE,
+        });
     }
     Ok(rules)
 }
@@ -5775,6 +5827,7 @@ mod tests {
 
     #[test]
     fn command_environment_keeps_pytest_options_and_externalizes_tool_caches() {
+        let workspace = tempfile::tempdir().expect("workspace");
         let environment = [
             ("PATH".to_string(), "/usr/bin".to_string()),
             ("PYTEST_ADDOPTS".to_string(), "--maxfail=1".to_string()),
@@ -5789,7 +5842,12 @@ mod tests {
             CommandEnvironmentPolicy::HostSanitized,
             CommandEnvironmentPolicy::Isolated,
         ] {
-            let values = sanitized_environment_from(environment.clone(), &policy);
+            let values = sanitized_environment_from_workspace(
+                environment.clone(),
+                &policy,
+                workspace.path(),
+            )
+            .expect("command environment");
             assert_eq!(env_value(&values, "PATH"), Some("/usr/bin"));
             assert_eq!(
                 env_value(&values, "PIP_CACHE_DIR"),
@@ -5808,7 +5866,18 @@ mod tests {
                 Some("--maxfail=1 -o \"cache_dir=/run/singularity-tool-cache/pytest\"")
             );
             if policy == CommandEnvironmentPolicy::Isolated {
-                assert!(env_value(&values, "CARGO_TARGET_DIR").is_none());
+                let target = PathBuf::from(
+                    env_value(&values, "CARGO_TARGET_DIR").expect("isolated Cargo target"),
+                );
+                assert!(target.is_absolute());
+                assert!(target.starts_with(Path::new(TOOL_CACHE_ROOT)));
+                assert!(!target.starts_with(workspace.path()));
+                assert_eq!(
+                    target,
+                    Path::new(CARGO_TARGET_ROOT).join(workspace_tool_cache_digest(
+                        &std::fs::canonicalize(workspace.path()).expect("canonical workspace")
+                    ))
+                );
                 assert!(env_value(&values, "SINGULARITY_MODEL").is_none());
             } else {
                 assert_eq!(

@@ -2,15 +2,16 @@
 
 use schemars::schema_for;
 use singularity_core::CancellationToken;
+use singularity_sandbox::CommandEnvironmentPolicy;
 #[cfg(windows)]
 use singularity_sandbox::WorkspaceMutation;
-#[cfg(windows)]
-use singularity_sandbox::{CommandEnvironmentPolicy, SandboxNetworkMode, WorkspaceObservationMode};
 use singularity_sandbox::{
     CommandExecutionStatus, CommandRequest, CommandResult, CommandScriptRequest,
     CommandSemanticStatus, SandboxBackend, SandboxBackendEnforcement, SandboxCapabilities,
     WindowsSandboxBackend, bound_command_output,
 };
+#[cfg(windows)]
+use singularity_sandbox::{SandboxNetworkMode, WorkspaceObservationMode};
 use std::path::Path;
 
 const SANDBOX_SRC: &str = include_str!("../src/lib.rs");
@@ -371,6 +372,74 @@ fn windows_backend_reports_missing_host_tool_as_executable_unavailable() {
         "sandbox command executable unavailable: required executable 'singularity-tool-that-does-not-exist' was not found on host PATH"
     );
     assert!(!result.sandbox.local_process_fallback);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_elevated_isolated_cargo_keeps_target_outside_workspace() {
+    let workspace = if let Some(root) =
+        std::env::var_os("SINGULARITY_WINDOWS_SANDBOX_TEST_ROOT").map(std::path::PathBuf::from)
+    {
+        std::fs::create_dir_all(&root).expect("create live sandbox test root");
+        tempfile::Builder::new()
+            .prefix("singularity-live-cargo-")
+            .tempdir_in(root)
+            .expect("workspace")
+    } else {
+        tempfile::tempdir().expect("workspace")
+    };
+    std::fs::create_dir(workspace.path().join("src")).expect("source directory");
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"sandbox-cargo-isolated\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("Cargo.toml");
+    std::fs::write(
+        workspace.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"sandbox-cargo-isolated\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("Cargo.lock");
+    std::fs::write(
+        workspace.path().join("src/lib.rs"),
+        "pub fn answer() -> u8 { 42 }\n",
+    )
+    .expect("lib.rs");
+
+    let mut request = CommandRequest::project_verification(
+        "command_elevated_isolated_cargo",
+        vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--offline".to_string(),
+            "--locked".to_string(),
+            "--quiet".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Denied;
+    request.environment = CommandEnvironmentPolicy::Isolated;
+
+    let result = WindowsSandboxBackend::new().execute(&request);
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result:#?}"
+    );
+    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
+    assert_eq!(result.sandbox.backend, "windows_elevated");
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result.sandbox.local_process_fallback);
+    assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
+    assert!(
+        !workspace.path().join("target").exists(),
+        "isolated Cargo must not write a workspace target directory"
+    );
 }
 
 #[cfg(windows)]
@@ -1807,17 +1876,22 @@ time.sleep(30)
         )
         .expect("Cargo.toml");
         fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
-        let result = strict_backend().execute(&request(
+        let mut command = request(
             "linux_rustup_cargo",
             &["cargo", "test", "--offline", "--quiet"],
             workspace.path(),
             SandboxFilesystemMode::WorkspaceWrite,
             SandboxNetworkMode::Denied,
-        ));
+        );
+        command.environment = CommandEnvironmentPolicy::Isolated;
+        let result = strict_backend().execute(&command);
 
         assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
         assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
-        assert!(workspace.path().join("target/debug").is_dir());
+        assert!(
+            !workspace.path().join("target").exists(),
+            "isolated Cargo must not write a workspace target directory"
+        );
     }
 
     #[test]
@@ -1872,17 +1946,22 @@ time.sleep(30)
         let _rustup_home = EnvironmentGuard::set("RUSTUP_HOME", path_str(&rustup_home));
         let _target_dir = EnvironmentGuard::remove("CARGO_TARGET_DIR");
 
-        let result = strict_backend().execute(&request(
+        let mut command = request(
             "linux_custom_rustup_homes",
             &["cargo", "check", "--offline", "--quiet"],
             workspace.path(),
             SandboxFilesystemMode::WorkspaceWrite,
             SandboxNetworkMode::Denied,
-        ));
+        );
+        command.environment = CommandEnvironmentPolicy::Isolated;
+        let result = strict_backend().execute(&command);
 
         assert_eq!(result.execution_status, CommandExecutionStatus::Completed);
         assert_eq!(result.exit_code, Some(0), "{}", result.stderr_preview);
-        assert!(workspace.path().join("target/debug").is_dir());
+        assert!(
+            !workspace.path().join("target").exists(),
+            "isolated Cargo must not write a workspace target directory"
+        );
     }
 
     #[test]
