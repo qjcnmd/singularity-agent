@@ -2646,9 +2646,10 @@ fn require_agent_final_snapshot_unchanged(
 
 /// Choose the smallest safe post-agent snapshot from producer and continuous observer evidence.
 ///
-/// A backend without a continuous observer keeps the conservative full-tree path.  When an
-/// observer exists, physical paths must close over the producer summaries before incremental
-/// reads are allowed; an extra observer path is an out-of-band mutation and blocks evaluation.
+/// A backend without a continuous observer, or an observer that lost event detail, keeps the
+/// conservative full-tree path. When complete observer paths exist, they must close over the
+/// producer summaries before incremental reads are allowed; an extra observer path is an
+/// out-of-band mutation and blocks evaluation.
 fn agent_snapshot_plan(
     result: &AgentLoopResult,
     observer: Option<&PreparedWorkspaceObservation>,
@@ -2656,10 +2657,10 @@ fn agent_snapshot_plan(
     let observer_paths = match observer {
         None | Some(PreparedWorkspaceObservation::Unchanged) => None,
         Some(PreparedWorkspaceObservation::Changed(paths)) => Some(validate_observer_paths(paths)?),
-        Some(PreparedWorkspaceObservation::Unknown) => {
-            return Err("prepared workspace observer ended with incomplete evidence".to_string());
-        }
+        Some(PreparedWorkspaceObservation::Unknown) => None,
     };
+    let observer_requires_full_snapshot =
+        matches!(observer, None | Some(PreparedWorkspaceObservation::Unknown));
     let mut revision = 0u64;
     let mut changed_paths = BTreeSet::new();
     let mut observed_contract: Option<&str> = None;
@@ -2760,13 +2761,10 @@ fn agent_snapshot_plan(
                 &changed_paths,
             )?;
         }
-        Some(PreparedWorkspaceObservation::Unknown) => unreachable!("handled above"),
-        None => {}
+        Some(PreparedWorkspaceObservation::Unknown) | None => {}
     }
 
-    if full {
-        Ok(AgentSnapshotPlan::Full)
-    } else if observer.is_none() {
+    if full || observer_requires_full_snapshot {
         Ok(AgentSnapshotPlan::Full)
     } else if changed_paths.is_empty() {
         Ok(AgentSnapshotPlan::Reused)
@@ -5356,9 +5354,12 @@ mod tests {
                     "not-a-sha256",
                 )),
         ]);
-        assert!(
-            agent_snapshot_plan(&result, Some(&PreparedWorkspaceObservation::Unchanged)).is_err()
-        );
+        for observation in [
+            PreparedWorkspaceObservation::Unchanged,
+            PreparedWorkspaceObservation::Unknown,
+        ] {
+            assert!(agent_snapshot_plan(&result, Some(&observation)).is_err());
+        }
     }
 
     #[test]
@@ -5380,8 +5381,9 @@ mod tests {
             singularity_tools::ToolResult::summary("command", TOOL_COMMAND, false, "unknown")
                 .with_workspace_observation(WorkspaceObservation::unknown()),
         ]);
-        assert!(
-            agent_snapshot_plan(&unknown, Some(&PreparedWorkspaceObservation::Unknown)).is_err()
+        assert_eq!(
+            agent_snapshot_plan(&unknown, Some(&PreparedWorkspaceObservation::Unknown)),
+            Ok(AgentSnapshotPlan::Full)
         );
 
         let first = singularity_tools::ToolResult::summary("first", TOOL_COMMAND, true, "ok")
@@ -5431,6 +5433,39 @@ mod tests {
         assert_eq!(work, workspace::SourceCaptureWork::default());
         assert_eq!(observation, AgentSnapshotObservation::Reused);
         assert_eq!(full_scans, 0);
+    }
+
+    #[test]
+    fn post_agent_snapshot_full_rescans_when_observer_is_unknown() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let value_path = temp.path().join("value.txt");
+        fs::write(&value_path, b"before").expect("initial file");
+        let (before, _) = snapshot_workspace_with_work(temp.path()).expect("before snapshot");
+        let identity = workspace_root_identity(temp.path()).expect("root identity");
+        fs::write(&value_path, b"after!").expect("updated file");
+        let result = completed_agent_result(vec![
+            singularity_tools::ToolResult::summary("command", TOOL_COMMAND, false, "unknown")
+                .with_workspace_observation(WorkspaceObservation::unknown()),
+        ]);
+
+        let (after, work, observation, full_scans) = snapshot_agent_workspace_after(
+            temp.path(),
+            &before,
+            &identity,
+            &result,
+            Some(&PreparedWorkspaceObservation::Unknown),
+        )
+        .expect("post-agent full snapshot");
+
+        assert_ne!(after, before);
+        assert_eq!(
+            after,
+            snapshot_workspace(temp.path()).expect("current snapshot")
+        );
+        assert_eq!(work.source_tree_content_reads, 1);
+        assert_eq!(work.source_tree_content_bytes, 6);
+        assert_eq!(observation, AgentSnapshotObservation::Full);
+        assert_eq!(full_scans, 1);
     }
 
     #[test]
