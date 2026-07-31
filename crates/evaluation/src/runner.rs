@@ -3003,7 +3003,7 @@ fn run_agent_stage(
     let workspace_tools = match WorkspaceTools::new(agent_dir) {
         Ok(tools) => tools
             .with_shared_sandbox_backend(Arc::clone(prepared.sandbox_backend))
-            .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated)
+            .with_command_environment(CommandEnvironmentPolicy::Isolated)
             .with_command_runtime_executables(command_runtime_executables),
         Err(error) => {
             return blocked_agent_stage(
@@ -4114,7 +4114,7 @@ fn preflight_task_executables(
         match sandbox_backend.probe_executable(
             scratch,
             &executable,
-            &CommandEnvironmentPolicy::EvaluationIsolated,
+            &CommandEnvironmentPolicy::Isolated,
         ) {
             ExecutableAvailability::Available => {}
             ExecutableAvailability::Unavailable => {
@@ -6459,10 +6459,7 @@ mod tests {
                     request.filesystem.mode,
                     SandboxFilesystemMode::WorkspaceWrite
                 );
-                assert_eq!(
-                    request.environment,
-                    CommandEnvironmentPolicy::EvaluationIsolated
-                );
+                assert_eq!(request.environment, CommandEnvironmentPolicy::Isolated);
                 #[cfg(windows)]
                 assert!(
                     request.argv.as_slice() == ["cmd.exe", "/d", "/c", "exit", "1"]
@@ -6762,10 +6759,7 @@ mod tests {
                     request.filesystem.mode,
                     SandboxFilesystemMode::WorkspaceWrite
                 );
-                assert_eq!(
-                    request.environment,
-                    CommandEnvironmentPolicy::EvaluationIsolated
-                );
+                assert_eq!(request.environment, CommandEnvironmentPolicy::Isolated);
                 return CommandResult::completed(&request.command_id, "task workspace available")
                     .with_workspace_mutation(WorkspaceMutation::Unchanged)
                     .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict);

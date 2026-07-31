@@ -264,9 +264,11 @@ pub enum ExecutableAvailability {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandEnvironmentPolicy {
+    /// Keeps non-secret host tool configuration available to ordinary product commands.
     #[default]
     HostSanitized,
-    EvaluationIsolated,
+    /// Also removes product and build overrides while retaining host tool discovery.
+    Isolated,
 }
 
 /// 交给沙箱 backend 的完整可移植命令请求。
@@ -1134,7 +1136,7 @@ pub(crate) fn preflight_command(
     );
     request.timeout_seconds = 15;
     request.network.mode = network;
-    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    request.environment = CommandEnvironmentPolicy::Isolated;
     backend.execute_cancellable(&request, cancellation)
 }
 

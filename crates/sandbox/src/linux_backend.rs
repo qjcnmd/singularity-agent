@@ -52,6 +52,7 @@ const WORKSPACE_CHANGE_SUMMARY_UNAVAILABLE: &str =
 const SANDBOX_CHILD_CANCELLED: &str = "linux sandbox command cancelled";
 const SANDBOX_CHILD_TIMED_OUT: &str = "linux sandbox command timed out";
 const SANDBOX_HOME: &str = "/run/singularity-home";
+const TOOL_CACHE_ROOT: &str = "/run/singularity-tool-cache";
 const MAX_PUBLIC_CERTIFICATE_PEM_BYTES: u64 = 1024 * 1024;
 
 /// Read-only system roots needed by dynamically dispatched executables.
@@ -1474,16 +1475,46 @@ fn resolve_cwd(workspace: &Path, requested: &Path) -> Result<PathBuf, LinuxSandb
 }
 
 fn sanitized_environment(policy: &CommandEnvironmentPolicy) -> Vec<(String, String)> {
-    let mut values = std::env::vars()
+    sanitized_environment_from(std::env::vars(), policy)
+}
+
+fn sanitized_environment_from(
+    environment: impl IntoIterator<Item = (String, String)>,
+    policy: &CommandEnvironmentPolicy,
+) -> Vec<(String, String)> {
+    let mut values = environment
+        .into_iter()
         .filter(|(name, _)| !is_secret_env_name(name) && !is_unsafe_env_name(name))
         .filter(|(name, _)| {
-            policy != &CommandEnvironmentPolicy::EvaluationIsolated
-                || !is_evaluation_host_environment(name)
+            policy != &CommandEnvironmentPolicy::Isolated || !is_isolated_host_environment(name)
         })
         .collect::<Vec<_>>();
     values.retain(|(name, _)| name != "HOME" && name != "TMPDIR" && name != "PWD");
-    values.push(("HOME".to_string(), SANDBOX_HOME.to_string()));
-    values.push(("TMPDIR".to_string(), "/run".to_string()));
+    let pytest_addopts = env_value(&values, "PYTEST_ADDOPTS")
+        .map(|value| format!("{value} "))
+        .unwrap_or_default();
+    set_environment_value(&mut values, "HOME", SANDBOX_HOME);
+    set_environment_value(&mut values, "TMPDIR", "/run");
+    set_environment_value(
+        &mut values,
+        "PIP_CACHE_DIR",
+        &format!("{TOOL_CACHE_ROOT}/pip"),
+    );
+    set_environment_value(
+        &mut values,
+        "NPM_CONFIG_CACHE",
+        &format!("{TOOL_CACHE_ROOT}/npm"),
+    );
+    set_environment_value(
+        &mut values,
+        "PYTHONPYCACHEPREFIX",
+        &format!("{TOOL_CACHE_ROOT}/python"),
+    );
+    set_environment_value(
+        &mut values,
+        "PYTEST_ADDOPTS",
+        &format!("{pytest_addopts}-o \"cache_dir={TOOL_CACHE_ROOT}/pytest\""),
+    );
     values
 }
 
@@ -1521,7 +1552,7 @@ fn is_unsafe_env_name(name: &str) -> bool {
     )
 }
 
-fn is_evaluation_host_environment(name: &str) -> bool {
+fn is_isolated_host_environment(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     name.starts_with("SINGULARITY_")
         || matches!(
@@ -5728,7 +5759,7 @@ mod tests {
             backend.probe_executable(
                 workspace.path(),
                 "/bin/sh",
-                &CommandEnvironmentPolicy::EvaluationIsolated,
+                &CommandEnvironmentPolicy::Isolated,
             ),
             ExecutableAvailability::Available
         );
@@ -5736,10 +5767,57 @@ mod tests {
             backend.probe_executable(
                 workspace.path(),
                 "/definitely-missing/singularity-evaluation-executable",
-                &CommandEnvironmentPolicy::EvaluationIsolated,
+                &CommandEnvironmentPolicy::Isolated,
             ),
             ExecutableAvailability::Unavailable
         );
+    }
+
+    #[test]
+    fn command_environment_keeps_pytest_options_and_externalizes_tool_caches() {
+        let environment = [
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("PYTEST_ADDOPTS".to_string(), "--maxfail=1".to_string()),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                "/workspace/target".to_string(),
+            ),
+            ("SINGULARITY_MODEL".to_string(), "host-model".to_string()),
+        ];
+
+        for policy in [
+            CommandEnvironmentPolicy::HostSanitized,
+            CommandEnvironmentPolicy::Isolated,
+        ] {
+            let values = sanitized_environment_from(environment.clone(), &policy);
+            assert_eq!(env_value(&values, "PATH"), Some("/usr/bin"));
+            assert_eq!(
+                env_value(&values, "PIP_CACHE_DIR"),
+                Some("/run/singularity-tool-cache/pip")
+            );
+            assert_eq!(
+                env_value(&values, "NPM_CONFIG_CACHE"),
+                Some("/run/singularity-tool-cache/npm")
+            );
+            assert_eq!(
+                env_value(&values, "PYTHONPYCACHEPREFIX"),
+                Some("/run/singularity-tool-cache/python")
+            );
+            assert_eq!(
+                env_value(&values, "PYTEST_ADDOPTS"),
+                Some("--maxfail=1 -o \"cache_dir=/run/singularity-tool-cache/pytest\"")
+            );
+            if policy == CommandEnvironmentPolicy::Isolated {
+                assert!(env_value(&values, "CARGO_TARGET_DIR").is_none());
+                assert!(env_value(&values, "SINGULARITY_MODEL").is_none());
+            } else {
+                assert_eq!(
+                    env_value(&values, "CARGO_TARGET_DIR"),
+                    Some("/workspace/target")
+                );
+                assert_eq!(env_value(&values, "SINGULARITY_MODEL"), Some("host-model"));
+            }
+        }
     }
 
     #[test]
@@ -5749,7 +5827,7 @@ mod tests {
         if backend.probe_executable(
             workspace.path(),
             "node",
-            &CommandEnvironmentPolicy::EvaluationIsolated,
+            &CommandEnvironmentPolicy::Isolated,
         ) != ExecutableAvailability::Available
         {
             return;
@@ -5772,7 +5850,7 @@ mod tests {
             workspace.path().to_string_lossy(),
             workspace.path().to_string_lossy(),
         );
-        request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+        request.environment = CommandEnvironmentPolicy::Isolated;
         request.runtime_executables = vec!["node".to_string()];
 
         let result = backend.execute_script(&request);
@@ -5802,7 +5880,7 @@ mod tests {
         if backend.probe_executable(
             workspace.path(),
             "cargo",
-            &CommandEnvironmentPolicy::EvaluationIsolated,
+            &CommandEnvironmentPolicy::Isolated,
         ) != ExecutableAvailability::Available
         {
             return;
@@ -5813,7 +5891,7 @@ mod tests {
             workspace.path().to_string_lossy(),
             workspace.path().to_string_lossy(),
         );
-        request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+        request.environment = CommandEnvironmentPolicy::Isolated;
         request.runtime_executables = vec!["cargo".to_string()];
 
         let result = backend.execute_script(&request);

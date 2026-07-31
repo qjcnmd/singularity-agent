@@ -2660,12 +2660,12 @@ fn tool_result_payload_preserves_safe_structured_content() {
 }
 
 #[test]
-fn workspace_command_tool_propagates_evaluation_environment_policy() {
+fn workspace_command_tool_propagates_isolated_environment_policy() {
     let workspace = test_workspace("command-evaluation-environment");
     let tools = WorkspaceTools::new(&workspace)
         .expect("bind workspace tools")
-        .with_sandbox_backend(EvaluationEnvironmentBackend)
-        .with_command_environment(CommandEnvironmentPolicy::EvaluationIsolated)
+        .with_sandbox_backend(IsolatedEnvironmentBackend)
+        .with_command_environment(CommandEnvironmentPolicy::Isolated)
         .with_command_runtime_executables(vec!["node".to_string()]);
 
     let result = tools
@@ -3431,11 +3431,11 @@ impl SandboxBackend for RecordingSandboxBackend {
     }
 }
 
-struct EvaluationEnvironmentBackend;
+struct IsolatedEnvironmentBackend;
 
-impl SandboxBackend for EvaluationEnvironmentBackend {
+impl SandboxBackend for IsolatedEnvironmentBackend {
     fn name(&self) -> &'static str {
-        "evaluation_environment"
+        "isolated_environment"
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
@@ -3443,10 +3443,7 @@ impl SandboxBackend for EvaluationEnvironmentBackend {
     }
 
     fn execute(&self, request: &CommandRequest) -> CommandResult {
-        assert_eq!(
-            request.environment,
-            CommandEnvironmentPolicy::EvaluationIsolated
-        );
+        assert_eq!(request.environment, CommandEnvironmentPolicy::Isolated);
         CommandResult::completed(&request.command_id, "command ok")
             .with_workspace_mutation(WorkspaceMutation::Unchanged)
             .with_sandbox_execution(
@@ -3456,10 +3453,7 @@ impl SandboxBackend for EvaluationEnvironmentBackend {
     }
 
     fn execute_script(&self, request: &CommandScriptRequest) -> CommandResult {
-        assert_eq!(
-            request.environment,
-            CommandEnvironmentPolicy::EvaluationIsolated
-        );
+        assert_eq!(request.environment, CommandEnvironmentPolicy::Isolated);
         assert_eq!(request.runtime_executables, ["node"]);
         CommandResult::completed(&request.command_id, "command ok")
             .with_workspace_mutation(WorkspaceMutation::Unchanged)

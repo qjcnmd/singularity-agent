@@ -678,7 +678,7 @@ fn windows_elevated_preflight_verifies_full_contract() {
         path_str(workspace.path()),
     );
     request.network.mode = SandboxNetworkMode::Denied;
-    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    request.environment = CommandEnvironmentPolicy::Isolated;
     let result = backend.execute(&request);
     assert_eq!(
         result.execution_status,
@@ -712,7 +712,7 @@ fn windows_elevated_preflight_verifies_full_contract() {
         path_str(workspace.path()),
     );
     bulk_request.network.mode = SandboxNetworkMode::Denied;
-    bulk_request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    bulk_request.environment = CommandEnvironmentPolicy::Isolated;
     let bulk_result = backend.execute(&bulk_request);
     assert_eq!(
         bulk_result.execution_status,
@@ -766,7 +766,7 @@ fn windows_complete_snapshot_proves_large_ordinary_command_change() {
         path_str(workspace.path()),
     );
     request.network.mode = SandboxNetworkMode::Denied;
-    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    request.environment = CommandEnvironmentPolicy::Isolated;
 
     let result = backend.execute(&request);
 
@@ -812,7 +812,7 @@ fn windows_snapshot_observes_private_python_directory() {
         path_str(workspace.path()),
     );
     request.network.mode = SandboxNetworkMode::Denied;
-    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    request.environment = CommandEnvironmentPolicy::Isolated;
 
     let result = backend.execute(&request);
 
@@ -850,6 +850,47 @@ fn windows_snapshot_observes_private_python_directory() {
 #[cfg(windows)]
 #[test]
 #[ignore = "requires first-run Windows UAC sandbox setup"]
+fn windows_python_cache_does_not_mutate_the_workspace() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(
+        workspace.path().join("sample.py"),
+        "def answer():\n    return 42\n",
+    )
+    .expect("write module");
+    let backend = WindowsSandboxBackend::new();
+    let mut request = CommandRequest::project_verification(
+        "python_external_cache",
+        vec![
+            "python".to_string(),
+            "-c".to_string(),
+            "import sample; assert sample.answer() == 42".to_string(),
+        ],
+        path_str(workspace.path()),
+        path_str(workspace.path()),
+    );
+    request.network.mode = SandboxNetworkMode::Denied;
+    request.environment = CommandEnvironmentPolicy::HostSanitized;
+
+    let result = backend.execute(&request);
+
+    assert_eq!(
+        result.execution_status,
+        CommandExecutionStatus::Completed,
+        "{result:#?}"
+    );
+    assert_eq!(result.semantic_status, CommandSemanticStatus::Succeeded);
+    assert_eq!(result.workspace_mutation, WorkspaceMutation::Unchanged);
+    assert_eq!(
+        result.sandbox.enforcement,
+        SandboxBackendEnforcement::Strict
+    );
+    assert!(!result.sandbox.local_process_fallback);
+    assert!(!workspace.path().join("__pycache__").exists());
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires first-run Windows UAC sandbox setup"]
 fn windows_trusted_git_dir_can_initialize_host_created_metadata_directory() {
     let work_root = std::env::current_dir()
         .expect("current directory")
@@ -875,7 +916,7 @@ fn windows_trusted_git_dir_can_initialize_host_created_metadata_directory() {
         path_str(workspace.path()),
     );
     request.network.mode = SandboxNetworkMode::Denied;
-    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    request.environment = CommandEnvironmentPolicy::Isolated;
 
     let result = backend.execute(&request);
     assert_eq!(
@@ -1016,7 +1057,7 @@ fn windows_public_certificate_replacement_is_rejected_after_protected_setup_boun
         path_str(workspace.path()),
     );
     create.network.mode = SandboxNetworkMode::Denied;
-    create.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    create.environment = CommandEnvironmentPolicy::Isolated;
     let create_result = backend.execute(&create);
     assert_eq!(
         create_result.execution_status,
@@ -1051,7 +1092,7 @@ fn windows_public_certificate_replacement_is_rejected_after_protected_setup_boun
         path_str(workspace.path()),
     );
     replace.network.mode = SandboxNetworkMode::Denied;
-    replace.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    replace.environment = CommandEnvironmentPolicy::Isolated;
     let replace_result = backend.execute(&replace);
     assert_eq!(
         replace_result.execution_status,

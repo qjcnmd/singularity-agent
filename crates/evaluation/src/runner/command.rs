@@ -353,7 +353,7 @@ fn execute_command_request(
     request.timeout_seconds = timeout_seconds;
     request.network.mode = network;
     request.filesystem.mode = filesystem;
-    request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+    request.environment = CommandEnvironmentPolicy::Isolated;
     sandbox_backend.execute(&request)
 }
 
@@ -494,10 +494,7 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             assert!(!request.is_trusted_workspace_preparation());
-            assert_eq!(
-                request.environment,
-                CommandEnvironmentPolicy::EvaluationIsolated
-            );
+            assert_eq!(request.environment, CommandEnvironmentPolicy::Isolated);
             CommandResult::completed(&request.command_id, "ok")
                 .with_workspace_mutation(WorkspaceMutation::Unchanged)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)
@@ -543,10 +540,7 @@ mod tests {
 
         fn execute(&self, request: &CommandRequest) -> CommandResult {
             assert!(request.is_trusted_workspace_preparation());
-            assert_eq!(
-                request.environment,
-                CommandEnvironmentPolicy::EvaluationIsolated
-            );
+            assert_eq!(request.environment, CommandEnvironmentPolicy::Isolated);
             CommandResult::completed(&request.command_id, "ok")
                 .with_workspace_mutation(WorkspaceMutation::Changed)
                 .with_sandbox_execution(self.name(), SandboxBackendEnforcement::Strict)

@@ -10,8 +10,9 @@ use std::time::Instant;
 use std::os::windows::ffi::OsStrExt;
 
 use super::workspace_change::{
-    CachedProtectedPath, capture_cached_protected_paths, validate_cached_protected_paths,
-    validate_cached_workspace_root,
+    CachedProtectedPath, capture_cached_protected_paths, changed_paths_are_bounded,
+    validate_cached_protected_paths, validate_cached_workspace_root,
+    validate_observed_relative_path,
 };
 use super::{
     COMMAND_CANCELLED, COMMAND_TIMED_OUT, CancellationToken, CommandEnvironmentPolicy,
@@ -247,10 +248,80 @@ fn prepared_workspace_observation(
     match observation {
         WorkspaceChangeObservation::Unchanged => PreparedWorkspaceObservation::Unchanged,
         WorkspaceChangeObservation::Unknown => PreparedWorkspaceObservation::Unknown,
-        WorkspaceChangeObservation::Changed(changes) => PreparedWorkspaceObservation::Changed(
-            changes.into_iter().map(|change| change.path).collect(),
-        ),
+        WorkspaceChangeObservation::Changed(changes) => {
+            let Some(paths) = normalize_prepared_changed_paths(changes) else {
+                return PreparedWorkspaceObservation::Unknown;
+            };
+            PreparedWorkspaceObservation::Changed(paths)
+        }
     }
+}
+
+/// Project typed Win32 actions to the path-only prepared-workspace contract.
+///
+/// The monitor keeps action kinds so incremental snapshots can remain conservative.  This
+/// adapter accepts only the one lossless coalescing case (Added + Modified) and rejects every
+/// action whose path-only projection could hide a removal, rename, or conflicting mutation.
+fn normalize_prepared_changed_paths(
+    changes: Vec<singularity_windows_sandbox::WorkspacePathChange>,
+) -> Option<Vec<String>> {
+    let mut by_path = std::collections::BTreeMap::<
+        String,
+        singularity_windows_sandbox::WorkspacePathChangeKind,
+    >::new();
+    for change in changes {
+        if change.path == "." || validate_observed_relative_path(&change.path).is_err() {
+            return None;
+        }
+        use singularity_windows_sandbox::WorkspacePathChangeKind as Kind;
+        match by_path.entry(change.path) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(change.kind);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let merged = match (*entry.get(), change.kind) {
+                    (Kind::Added, Kind::Modified) | (Kind::Modified, Kind::Added) => Kind::Added,
+                    (left, right) if left == right => left,
+                    _ => return None,
+                };
+                entry.insert(merged);
+            }
+        }
+    }
+
+    if by_path.is_empty()
+        || by_path.values().any(|kind| {
+            matches!(
+                kind,
+                singularity_windows_sandbox::WorkspacePathChangeKind::Removed
+                    | singularity_windows_sandbox::WorkspacePathChangeKind::RenamedOld
+                    | singularity_windows_sandbox::WorkspacePathChangeKind::RenamedNew
+            )
+        })
+    {
+        return None;
+    }
+
+    let added_ancestors = by_path
+        .iter()
+        .filter_map(|(path, kind)| {
+            matches!(
+                kind,
+                singularity_windows_sandbox::WorkspacePathChangeKind::Added
+            )
+            .then_some(path.clone())
+        })
+        .collect::<Vec<_>>();
+    let paths = by_path
+        .into_keys()
+        .filter_map(|path| {
+            (!added_ancestors
+                .iter()
+                .any(|ancestor| path.starts_with(&format!("{ancestor}/"))))
+            .then_some(path)
+        })
+        .collect::<Vec<_>>();
+    changed_paths_are_bounded(&paths).then_some(paths)
 }
 
 impl PreparedWorkspaceObserver for WindowsPreparedWorkspaceObserver {
@@ -508,7 +579,7 @@ impl WindowsSandboxBackend {
         );
         request.timeout_seconds = 30;
         request.network.mode = SandboxNetworkMode::Denied;
-        request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+        request.environment = CommandEnvironmentPolicy::Isolated;
         let result = self.execute_cancellable(&request, cancellation);
         if cancellation.is_cancelled() {
             return Err("sandbox_preflight_cancelled");
@@ -540,7 +611,7 @@ impl WindowsSandboxBackend {
             filesystem,
             network,
         );
-        request.environment = CommandEnvironmentPolicy::EvaluationIsolated;
+        request.environment = CommandEnvironmentPolicy::Isolated;
         self.execute_script_cancellable(&request, cancellation)
     }
 }
@@ -2335,39 +2406,81 @@ fn sandbox_home() -> Result<PathBuf, String> {
 }
 
 fn child_environment(policy: &CommandEnvironmentPolicy) -> HashMap<String, String> {
-    let mut env_map = filtered_child_environment(std::env::vars(), policy);
-    if let Some(temp) = env_value(&env_map, "TEMP")
+    child_environment_from(std::env::vars(), policy)
+}
+
+fn child_environment_from(
+    environment: impl IntoIterator<Item = (String, String)>,
+    policy: &CommandEnvironmentPolicy,
+) -> HashMap<String, String> {
+    let mut env_map = filtered_child_environment(environment, policy);
+    let temp = env_value(&env_map, "TEMP")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
-    {
+        .or_else(|| {
+            let temp = std::env::temp_dir();
+            temp.is_absolute().then_some(temp)
+        });
+    if let Some(temp) = temp {
         let cache = temp.join("singularity-tool-cache");
-        env_map.insert(
-            "PIP_CACHE_DIR".to_string(),
-            cache.join("pip").to_string_lossy().into_owned(),
+        set_environment_value(
+            &mut env_map,
+            "PIP_CACHE_DIR",
+            &cache.join("pip").to_string_lossy(),
         );
-        env_map.insert(
-            "NPM_CONFIG_CACHE".to_string(),
-            cache.join("npm").to_string_lossy().into_owned(),
+        set_environment_value(
+            &mut env_map,
+            "NPM_CONFIG_CACHE",
+            &cache.join("npm").to_string_lossy(),
+        );
+        set_environment_value(
+            &mut env_map,
+            "PYTHONPYCACHEPREFIX",
+            &cache.join("python").to_string_lossy(),
+        );
+        let pytest_cache = cache.join("pytest").to_string_lossy().replace('\\', "/");
+        let pytest_addopts = env_value(&env_map, "PYTEST_ADDOPTS")
+            .map(|value| format!("{value} "))
+            .unwrap_or_default();
+        set_environment_value(
+            &mut env_map,
+            "PYTEST_ADDOPTS",
+            &format!("{pytest_addopts}-o \"cache_dir={pytest_cache}\""),
         );
     }
     env_map
+}
+
+fn set_environment_value(env_map: &mut HashMap<String, String>, name: &str, value: &str) {
+    let matching_keys = env_map
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in matching_keys {
+        env_map.remove(&key);
+    }
+    env_map.insert(name.to_string(), value.to_string());
 }
 
 fn filtered_child_environment(
     environment: impl IntoIterator<Item = (String, String)>,
     policy: &CommandEnvironmentPolicy,
 ) -> HashMap<String, String> {
-    environment
-        .into_iter()
-        .filter(|(name, _)| !is_secret_env_name(name))
-        .filter(|(name, _)| {
-            policy != &CommandEnvironmentPolicy::EvaluationIsolated
-                || !is_evaluation_host_environment(name)
-        })
-        .collect()
+    let mut filtered = HashMap::new();
+    for (name, value) in environment {
+        if is_secret_env_name(&name)
+            || (policy == &CommandEnvironmentPolicy::Isolated
+                && is_isolated_host_environment(&name))
+        {
+            continue;
+        }
+        set_environment_value(&mut filtered, &name, &value);
+    }
+    filtered
 }
 
-fn is_evaluation_host_environment(name: &str) -> bool {
+fn is_isolated_host_environment(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     name.starts_with("SINGULARITY_")
         || matches!(
@@ -2432,6 +2545,10 @@ mod tests {
                 path: "nested/value.txt".to_string(),
                 kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
             },
+            singularity_windows_sandbox::WorkspacePathChange {
+                path: "nested/value.txt".to_string(),
+                kind: singularity_windows_sandbox::WorkspacePathChangeKind::Modified,
+            },
         ]));
         assert_eq!(
             changed,
@@ -2445,6 +2562,104 @@ mod tests {
         }));
         assert_eq!(
             prepared_workspace_observation(WorkspaceChangeObservation::Unknown),
+            PreparedWorkspaceObservation::Unknown
+        );
+    }
+
+    #[test]
+    fn prepared_observation_coalesces_added_and_modified_in_either_order() {
+        use singularity_windows_sandbox::WorkspacePathChangeKind::{Added, Modified};
+        for kinds in [[Added, Modified], [Modified, Added]] {
+            let changed = prepared_workspace_observation(WorkspaceChangeObservation::Changed(
+                kinds
+                    .into_iter()
+                    .map(|kind| singularity_windows_sandbox::WorkspacePathChange {
+                        path: "generated/value.txt".to_string(),
+                        kind,
+                    })
+                    .collect(),
+            ));
+            assert_eq!(
+                changed,
+                PreparedWorkspaceObservation::Changed(vec!["generated/value.txt".to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_observation_coalesces_descendant_added_after_ancestor() {
+        use singularity_windows_sandbox::WorkspacePathChangeKind::Added;
+        let changed = prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
+            singularity_windows_sandbox::WorkspacePathChange {
+                path: "generated/value.txt".to_string(),
+                kind: Added,
+            },
+            singularity_windows_sandbox::WorkspacePathChange {
+                path: "generated".to_string(),
+                kind: Added,
+            },
+        ]));
+        assert_eq!(
+            changed,
+            PreparedWorkspaceObservation::Changed(vec!["generated".to_string()])
+        );
+    }
+
+    #[test]
+    fn prepared_observation_rejects_removes_renames_and_conflicts() {
+        use singularity_windows_sandbox::WorkspacePathChangeKind::{
+            Added, Modified, Removed, RenamedNew, RenamedOld,
+        };
+        for kind in [Removed, RenamedOld, RenamedNew] {
+            assert_eq!(
+                prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
+                    singularity_windows_sandbox::WorkspacePathChange {
+                        path: "generated/value.txt".to_string(),
+                        kind,
+                    },
+                ])),
+                PreparedWorkspaceObservation::Unknown
+            );
+        }
+        assert_eq!(
+            prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
+                singularity_windows_sandbox::WorkspacePathChange {
+                    path: "generated/value.txt".to_string(),
+                    kind: Added,
+                },
+                singularity_windows_sandbox::WorkspacePathChange {
+                    path: "generated/value.txt".to_string(),
+                    kind: Removed,
+                },
+            ])),
+            PreparedWorkspaceObservation::Unknown
+        );
+        assert_eq!(
+            prepared_workspace_observation(WorkspaceChangeObservation::Changed(vec![
+                singularity_windows_sandbox::WorkspacePathChange {
+                    path: "generated/value.txt".to_string(),
+                    kind: Modified,
+                },
+                singularity_windows_sandbox::WorkspacePathChange {
+                    path: "generated/value.txt".to_string(),
+                    kind: Removed,
+                },
+            ])),
+            PreparedWorkspaceObservation::Unknown
+        );
+    }
+
+    #[test]
+    fn prepared_observation_does_not_truncate_paths_past_the_existing_bound() {
+        use singularity_windows_sandbox::WorkspacePathChangeKind::Modified;
+        let changes = (0..=64)
+            .map(|index| singularity_windows_sandbox::WorkspacePathChange {
+                path: format!("generated/value-{index}.txt"),
+                kind: Modified,
+            })
+            .collect();
+        assert_eq!(
+            prepared_workspace_observation(WorkspaceChangeObservation::Changed(changes)),
             PreparedWorkspaceObservation::Unknown
         );
     }
@@ -2785,14 +3000,14 @@ mod tests {
             &root,
             &SandboxFilesystemMode::WorkspaceWrite,
             &SandboxNetworkMode::Denied,
-            &CommandEnvironmentPolicy::EvaluationIsolated,
+            &CommandEnvironmentPolicy::Isolated,
         )
         .expect("first key");
         let second_key = observation_session_key(
             &root,
             &SandboxFilesystemMode::WorkspaceWrite,
             &SandboxNetworkMode::Allowed,
-            &CommandEnvironmentPolicy::EvaluationIsolated,
+            &CommandEnvironmentPolicy::Isolated,
         )
         .expect("second key");
         assert_ne!(first_key, second_key);
@@ -2825,7 +3040,7 @@ mod tests {
                 &root,
                 &SandboxFilesystemMode::WorkspaceWrite,
                 &SandboxNetworkMode::Denied,
-                &CommandEnvironmentPolicy::EvaluationIsolated,
+                &CommandEnvironmentPolicy::Isolated,
             )
             .expect("observation session key")
         };
@@ -2846,7 +3061,7 @@ mod tests {
                 &root,
                 &SandboxFilesystemMode::WorkspaceWrite,
                 &SandboxNetworkMode::Allowed,
-                &CommandEnvironmentPolicy::EvaluationIsolated,
+                &CommandEnvironmentPolicy::Isolated,
             )
             .expect("second first-root observation session key")
         };
@@ -3029,7 +3244,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluation_environment_removes_host_build_overrides_but_keeps_tool_discovery() {
+    fn isolated_environment_removes_host_build_overrides_but_keeps_tool_discovery() {
         let environment = [
             ("PATH".to_string(), "C:\\tools".to_string()),
             ("Pathext".to_string(), ".EXE;.CMD".to_string()),
@@ -3048,10 +3263,8 @@ mod tests {
             ("SERVICE_API_KEY".to_string(), "secret".to_string()),
         ];
 
-        let isolated = filtered_child_environment(
-            environment.clone(),
-            &CommandEnvironmentPolicy::EvaluationIsolated,
-        );
+        let isolated =
+            filtered_child_environment(environment.clone(), &CommandEnvironmentPolicy::Isolated);
         assert_eq!(env_value(&isolated, "PATH"), Some("C:\\tools"));
         assert_eq!(env_value(&isolated, "PATHEXT"), Some(".EXE;.CMD"));
         for removed in [
@@ -3080,6 +3293,62 @@ mod tests {
     }
 
     #[test]
+    fn command_environment_keeps_pytest_options_and_externalizes_tool_caches() {
+        let environment = [
+            ("Path".to_string(), "C:\\tools".to_string()),
+            ("TEMP".to_string(), "C:\\Temp".to_string()),
+            ("temp".to_string(), "C:\\Temp".to_string()),
+            ("PYTEST_ADDOPTS".to_string(), "--maxfail=1".to_string()),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                "D:\\host-target".to_string(),
+            ),
+            ("SINGULARITY_MODEL".to_string(), "host-model".to_string()),
+        ];
+
+        for policy in [
+            CommandEnvironmentPolicy::HostSanitized,
+            CommandEnvironmentPolicy::Isolated,
+        ] {
+            let values = child_environment_from(environment.clone(), &policy);
+            assert_eq!(env_value(&values, "PATH"), Some("C:\\tools"));
+            assert_eq!(
+                env_value(&values, "PIP_CACHE_DIR"),
+                Some("C:\\Temp\\singularity-tool-cache\\pip")
+            );
+            assert_eq!(
+                env_value(&values, "NPM_CONFIG_CACHE"),
+                Some("C:\\Temp\\singularity-tool-cache\\npm")
+            );
+            assert_eq!(
+                env_value(&values, "PYTHONPYCACHEPREFIX"),
+                Some("C:\\Temp\\singularity-tool-cache\\python")
+            );
+            assert_eq!(
+                env_value(&values, "PYTEST_ADDOPTS"),
+                Some("--maxfail=1 -o \"cache_dir=C:/Temp/singularity-tool-cache/pytest\"")
+            );
+            assert_eq!(
+                values
+                    .keys()
+                    .filter(|key| key.eq_ignore_ascii_case("TEMP"))
+                    .count(),
+                1
+            );
+            if policy == CommandEnvironmentPolicy::Isolated {
+                assert!(env_value(&values, "CARGO_TARGET_DIR").is_none());
+                assert!(env_value(&values, "SINGULARITY_MODEL").is_none());
+            } else {
+                assert_eq!(
+                    env_value(&values, "CARGO_TARGET_DIR"),
+                    Some("D:\\host-target")
+                );
+                assert_eq!(env_value(&values, "SINGULARITY_MODEL"), Some("host-model"));
+            }
+        }
+    }
+
+    #[test]
     fn executable_probe_uses_windows_command_resolution() {
         let workspace = tempfile::tempdir().expect("workspace");
         let executable = std::env::current_exe().expect("current executable");
@@ -3090,7 +3359,7 @@ mod tests {
             backend.probe_executable(
                 workspace.path(),
                 &executable.to_string_lossy(),
-                &CommandEnvironmentPolicy::EvaluationIsolated,
+                &CommandEnvironmentPolicy::Isolated,
             ),
             ExecutableAvailability::Available
         );
@@ -3098,7 +3367,7 @@ mod tests {
             backend.probe_executable(
                 workspace.path(),
                 &missing.to_string_lossy(),
-                &CommandEnvironmentPolicy::EvaluationIsolated,
+                &CommandEnvironmentPolicy::Isolated,
             ),
             ExecutableAvailability::Unavailable
         );
