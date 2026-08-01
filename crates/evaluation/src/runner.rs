@@ -7,8 +7,9 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
 use crate::{
@@ -108,6 +109,8 @@ pub struct EvaluationRunParams {
     pub manifest: String,
     pub run_id: String,
     pub output_root: Option<String>,
+    /// Number of independent tasks that may execute at once.
+    pub max_workers: usize,
 }
 
 /// 一次开发期 Evaluation 运行的有限结果摘要。
@@ -116,6 +119,7 @@ pub struct EvaluationRunResult {
     pub run_id: String,
     pub manifest: String,
     pub runner: String,
+    pub max_workers: usize,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocker: Option<String>,
@@ -442,6 +446,12 @@ struct MaterializedSource {
     metrics: SourcePreparationMetrics,
 }
 
+/// The one Evaluation trace Store is shared by task workers only for short SQLite operations.
+///
+/// `SessionStore` owns a rusqlite connection (`Send` but not `Sync`), so workers never hold this
+/// guard while running a provider, sandbox command, or workspace operation.
+type SharedEvaluationTraceStore<'a> = Arc<Mutex<&'a mut singularity_store::SessionStore>>;
+
 /// Materialized source state prepared before any provider trial in the run.
 struct PreparedTaskSource {
     task_root: PathBuf,
@@ -456,35 +466,35 @@ struct PreparedTaskSource {
 }
 
 /// 同一 prepared source 派生全部隔离 trial 时共享的只读任务上下文。
-struct PreparedTaskContext<'a> {
-    run_id: &'a RunId,
-    task_root: &'a Path,
-    source_dir: &'a Path,
-    source: &'a SourceProvenance,
-    source_snapshot: &'a WorkspaceSnapshot,
-    observed_prepared_source: Option<&'a ObservedPreparedSource>,
-    source_metrics: &'a SourcePreparationMetrics,
-    source_commands: &'a [CommandDiagnostic],
+struct PreparedTaskContext<'store, 'ctx> {
+    run_id: &'ctx RunId,
+    task_root: &'ctx Path,
+    source_dir: &'ctx Path,
+    source: &'ctx SourceProvenance,
+    source_snapshot: &'ctx WorkspaceSnapshot,
+    observed_prepared_source: Option<&'ctx ObservedPreparedSource>,
+    source_metrics: &'ctx SourcePreparationMetrics,
+    source_commands: &'ctx [CommandDiagnostic],
     source_preparation_duration_ms: u64,
-    plan: &'a WorkspacePlan,
-    sandbox_backend: &'a SharedSandboxBackend,
-    provider_snapshot: &'a ProviderConfigSnapshot,
-    cancellation: &'a CancellationToken,
-    trace_store: &'a singularity_store::SessionStore,
-    trace_failures: &'a Arc<Mutex<Vec<String>>>,
+    plan: &'ctx WorkspacePlan,
+    sandbox_backend: &'ctx SharedSandboxBackend,
+    provider_snapshot: &'ctx ProviderConfigSnapshot,
+    cancellation: &'ctx CancellationToken,
+    trace_store: SharedEvaluationTraceStore<'store>,
+    trace_failures: &'ctx Arc<Mutex<Vec<String>>>,
 }
 
 /// 一个 Evaluation run 内所有 task trial 共享的只读执行上下文。
-struct EvaluationRunContext<'a> {
-    run_id: &'a RunId,
-    run_dir: &'a Path,
-    manifest_dir: &'a Path,
-    sandbox_backend: &'a SharedSandboxBackend,
-    provider_snapshot: &'a ProviderConfigSnapshot,
-    cancellation: &'a CancellationToken,
-    trace_store: &'a singularity_store::SessionStore,
+struct EvaluationRunContext<'store, 'ctx> {
+    run_id: &'ctx RunId,
+    run_dir: &'ctx Path,
+    manifest_dir: &'ctx Path,
+    sandbox_backend: &'ctx SharedSandboxBackend,
+    provider_snapshot: &'ctx ProviderConfigSnapshot,
+    cancellation: &'ctx CancellationToken,
+    trace_store: SharedEvaluationTraceStore<'store>,
     trace_failures: Arc<Mutex<Vec<String>>>,
-    sandbox_preflight: &'a SandboxPreflightReport,
+    sandbox_preflight: &'ctx SandboxPreflightReport,
 }
 
 #[derive(Debug)]
@@ -496,6 +506,180 @@ struct SandboxPreflightFailure {
 fn record_trace_failure(failures: &Arc<Mutex<Vec<String>>>, error: impl Into<String>) {
     if let Ok(mut failures) = failures.lock() {
         failures.push(error.into());
+    }
+}
+
+fn ensure_trace_failures_empty(failures: &Arc<Mutex<Vec<String>>>) -> Result<(), String> {
+    let failures = failures
+        .lock()
+        .map_err(|_| "evaluation trace failure mutex poisoned".to_string())?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "evaluation SQLite trace projection failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+enum TaskWorkerError {
+    Cancelled(Vec<TaskEvaluation>),
+    Failed(String),
+}
+
+#[derive(Debug)]
+enum IndexedWorkerError<T> {
+    Cancelled(Vec<T>),
+    Failed(String),
+}
+
+/// Run independent tasks with a bounded dynamic worker set while preserving manifest order.
+///
+/// A cancellation only exposes the completed manifest prefix in its in-memory partial result;
+/// later completed tasks remain on disk but are intentionally not presented as a resumable prefix.
+fn run_bounded_indexed_workers<T, F>(
+    item_count: usize,
+    max_workers: usize,
+    cancellation: &CancellationToken,
+    worker: F,
+) -> Result<Vec<T>, IndexedWorkerError<T>>
+where
+    T: Send,
+    F: Fn(usize) -> T + Send + Sync,
+{
+    debug_assert!((1..=2).contains(&max_workers));
+    if max_workers == 1 {
+        let mut results = Vec::with_capacity(item_count);
+        for index in 0..item_count {
+            if cancellation.is_cancelled() {
+                return Err(IndexedWorkerError::Cancelled(results));
+            }
+            let result =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(index))) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        cancellation.cancel();
+                        return Err(IndexedWorkerError::Failed(
+                            "evaluation task worker panicked".to_string(),
+                        ));
+                    }
+                };
+            results.push(result);
+        }
+        if cancellation.is_cancelled() {
+            return Err(IndexedWorkerError::Cancelled(results));
+        }
+        return Ok(results);
+    }
+
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let slots = Arc::new(Mutex::new(
+        (0..item_count).map(|_| None::<T>).collect::<Vec<_>>(),
+    ));
+    let worker_count = max_workers.min(item_count);
+    let mut worker_panicked = false;
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let next_index = Arc::clone(&next_index);
+            let slots = Arc::clone(&slots);
+            let worker = &worker;
+            handles.push(scope.spawn(move || {
+                let mut panicked = false;
+                loop {
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= item_count {
+                        break;
+                    }
+                    let result =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            worker(index)
+                        })) {
+                            Ok(result) => result,
+                            Err(_) => {
+                                panicked = true;
+                                cancellation.cancel();
+                                break;
+                            }
+                        };
+                    let Ok(mut slots) = slots.lock() else {
+                        break;
+                    };
+                    slots[index] = Some(result);
+                }
+                panicked
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(panicked) => worker_panicked |= panicked,
+                Err(_) => worker_panicked = true,
+            }
+        }
+    });
+
+    let slots = match Arc::try_unwrap(slots) {
+        Ok(slots) => match slots.into_inner() {
+            Ok(slots) => slots,
+            Err(_) => {
+                return Err(IndexedWorkerError::Failed(
+                    "evaluation task result mutex poisoned".to_string(),
+                ));
+            }
+        },
+        Err(_) => {
+            return Err(IndexedWorkerError::Failed(
+                "evaluation task workers did not join".to_string(),
+            ));
+        }
+    };
+    if worker_panicked {
+        return Err(IndexedWorkerError::Failed(
+            "evaluation task worker panicked".to_string(),
+        ));
+    }
+    let mut results = Vec::with_capacity(slots.len());
+    let mut complete_prefix = true;
+    for slot in slots {
+        match slot {
+            Some(result) if complete_prefix => results.push(result),
+            Some(_) => {}
+            None => complete_prefix = false,
+        }
+    }
+    if cancellation.is_cancelled() {
+        return Err(IndexedWorkerError::Cancelled(results));
+    }
+    if !complete_prefix {
+        return Err(IndexedWorkerError::Failed(
+            "evaluation task worker stopped before all tasks completed".to_string(),
+        ));
+    }
+    Ok(results)
+}
+
+fn run_task_workers(
+    context: &EvaluationRunContext<'_, '_>,
+    plans: &[WorkspacePlan],
+    prepared_sources: &[PreparedTaskSource],
+    trials_per_task: u32,
+    max_workers: usize,
+) -> Result<Vec<TaskEvaluation>, TaskWorkerError> {
+    match run_bounded_indexed_workers(plans.len(), max_workers, context.cancellation, |index| {
+        run_task_trials_with_prepared_source(
+            context,
+            &plans[index],
+            trials_per_task,
+            &prepared_sources[index],
+        )
+    }) {
+        Ok(results) => Ok(results),
+        Err(IndexedWorkerError::Cancelled(results)) => Err(TaskWorkerError::Cancelled(results)),
+        Err(IndexedWorkerError::Failed(message)) => Err(TaskWorkerError::Failed(message)),
     }
 }
 
@@ -514,13 +698,25 @@ fn evaluation_span_id(run_id: &RunId, scope: &str, kind: TraceSpanKind) -> Strin
     )
 }
 
-struct EvaluationTraceSink<'a> {
-    store: &'a singularity_store::SessionStore,
-    run_id: &'a RunId,
-    failures: &'a Arc<Mutex<Vec<String>>>,
+struct EvaluationTraceSink<'store> {
+    store: SharedEvaluationTraceStore<'store>,
+    run_id: String,
+    failures: Arc<Mutex<Vec<String>>>,
 }
 
-impl<'a> EvaluationTraceSink<'a> {
+impl<'store> EvaluationTraceSink<'store> {
+    fn new(
+        store: SharedEvaluationTraceStore<'store>,
+        run_id: &RunId,
+        failures: &Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        Self {
+            store,
+            run_id: run_id.as_str().to_string(),
+            failures: Arc::clone(failures),
+        }
+    }
+
     fn start(
         &self,
         session_id: &str,
@@ -531,7 +727,7 @@ impl<'a> EvaluationTraceSink<'a> {
     ) {
         let mut event = TraceEvent::new(
             format!("{span_id}:start"),
-            self.run_id.as_str(),
+            &self.run_id,
             session_id,
             "evaluation",
             summary,
@@ -543,8 +739,16 @@ impl<'a> EvaluationTraceSink<'a> {
         event.span_phase = Some(TraceSpanPhase::Start);
         event.span_projection = Some(TraceSpanProjection::default());
         event.payload = json!({"evaluation_span": kind.as_storage_text()});
-        if let Err(error) = self.store.append_trace_idempotent(&event) {
-            record_trace_failure(self.failures, format!("{summary} start: {error}"));
+        match self.store.lock() {
+            Ok(store) => {
+                if let Err(error) = store.append_trace_idempotent(&event) {
+                    record_trace_failure(&self.failures, format!("{summary} start: {error}"));
+                }
+            }
+            Err(_) => record_trace_failure(
+                &self.failures,
+                format!("{summary} start: evaluation trace store mutex poisoned"),
+            ),
         }
     }
 
@@ -559,7 +763,7 @@ impl<'a> EvaluationTraceSink<'a> {
     ) {
         let mut event = TraceEvent::new(
             format!("{span_id}:end"),
-            self.run_id.as_str(),
+            &self.run_id,
             session_id,
             "evaluation",
             match kind {
@@ -577,34 +781,49 @@ impl<'a> EvaluationTraceSink<'a> {
         event.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         event.span_projection = Some(TraceSpanProjection::default());
         event.payload = json!({"evaluation_span": kind.as_storage_text()});
-        if let Err(error) = self.store.append_trace(&event) {
-            record_trace_failure(
-                self.failures,
+        match self.store.lock() {
+            Ok(store) => {
+                if let Err(error) = store.append_trace(&event) {
+                    record_trace_failure(
+                        &self.failures,
+                        format!(
+                            "{} end: {error}",
+                            match kind {
+                                TraceSpanKind::Task => "evaluation task",
+                                TraceSpanKind::Turn => "evaluation trial",
+                                _ => "evaluation span",
+                            }
+                        ),
+                    );
+                }
+            }
+            Err(_) => record_trace_failure(
+                &self.failures,
                 format!(
-                    "{} end: {error}",
+                    "{} end: evaluation trace store mutex poisoned",
                     match kind {
                         TraceSpanKind::Task => "evaluation task",
                         TraceSpanKind::Turn => "evaluation trial",
                         _ => "evaluation span",
                     }
                 ),
-            );
+            ),
         }
     }
 }
 
-struct EvaluationTrialTrace<'a> {
-    sink: EvaluationTraceSink<'a>,
+struct EvaluationTrialTrace<'store> {
+    sink: EvaluationTraceSink<'store>,
     session_id: String,
     turn_span_id: String,
     task_span_id: String,
 }
 
-impl<'a> EvaluationTrialTrace<'a> {
+impl<'store> EvaluationTrialTrace<'store> {
     fn new(
-        store: &'a singularity_store::SessionStore,
-        run_id: &'a RunId,
-        failures: &'a Arc<Mutex<Vec<String>>>,
+        store: SharedEvaluationTraceStore<'store>,
+        run_id: &RunId,
+        failures: &Arc<Mutex<Vec<String>>>,
         session_id: String,
         turn_span_id: String,
         task_span_id: String,
@@ -612,8 +831,8 @@ impl<'a> EvaluationTrialTrace<'a> {
         Self {
             sink: EvaluationTraceSink {
                 store,
-                run_id,
-                failures,
+                run_id: run_id.as_str().to_string(),
+                failures: Arc::clone(failures),
             },
             session_id,
             turn_span_id,
@@ -749,8 +968,13 @@ pub fn run_evaluation(
     sandbox_backend: SharedSandboxBackend,
     provider_snapshot: &ProviderConfigSnapshot,
     cancellation: &CancellationToken,
-    trace_store: &singularity_store::SessionStore,
+    trace_store: &mut singularity_store::SessionStore,
 ) -> Result<EvaluationRunResult, EvaluationRunError> {
+    if !(1..=2).contains(&params.max_workers) {
+        return Err(EvaluationRunError::input(
+            "evaluation max_workers must be between 1 and 2",
+        ));
+    }
     if cancellation.is_cancelled() {
         let partial = RunId::new(params.run_id.clone())
             .ok()
@@ -836,6 +1060,7 @@ pub fn run_evaluation(
                 );
             }
         };
+    let shared_trace_store = Arc::new(Mutex::new(trace_store));
     let run_context = EvaluationRunContext {
         run_id: &run_id,
         run_dir: &run_dir,
@@ -843,7 +1068,7 @@ pub fn run_evaluation(
         sandbox_backend: &cancellable_sandbox_backend,
         provider_snapshot,
         cancellation,
-        trace_store,
+        trace_store: Arc::clone(&shared_trace_store),
         trace_failures: Arc::new(Mutex::new(Vec::new())),
         sandbox_preflight: &preflight,
     };
@@ -908,47 +1133,39 @@ pub fn run_evaluation(
             sandbox_preflight_evidence(&preflight),
         );
     }
-    let mut task_executions = Vec::new();
-    for (plan, prepared_source) in plans.iter().zip(&prepared_sources) {
-        if cancellation.is_cancelled() {
+    let task_executions = match run_task_workers(
+        &run_context,
+        &plans,
+        &prepared_sources,
+        trials_per_task,
+        params.max_workers,
+    ) {
+        Ok(task_executions) => task_executions,
+        Err(TaskWorkerError::Cancelled(task_executions)) => {
+            if let Err(error) = ensure_trace_failures_empty(&run_context.trace_failures) {
+                return Err(preserve_incomplete_run(
+                    &run_dir,
+                    EvaluationRunError::infrastructure(error),
+                ));
+            }
             let partial = partial_evaluation_result(params, &run_id, &task_executions);
             return Err(preserve_incomplete_run(
                 &run_dir,
                 EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
             ));
         }
-        task_executions.push(run_task_trials_with_prepared_source(
-            &run_context,
-            plan,
-            trials_per_task,
-            prepared_source,
-        ));
-        if cancellation.is_cancelled() {
-            let partial = partial_evaluation_result(params, &run_id, &task_executions);
+        Err(TaskWorkerError::Failed(message)) => {
             return Err(preserve_incomplete_run(
                 &run_dir,
-                EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
+                EvaluationRunError::infrastructure(message),
             ));
         }
-    }
+    };
 
-    if cancellation.is_cancelled() {
-        let partial = partial_evaluation_result(params, &run_id, &task_executions);
+    if let Err(error) = ensure_trace_failures_empty(&run_context.trace_failures) {
         return Err(preserve_incomplete_run(
             &run_dir,
-            EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
-        ));
-    }
-
-    if let Ok(failures) = run_context.trace_failures.lock()
-        && !failures.is_empty()
-    {
-        return Err(preserve_incomplete_run(
-            &run_dir,
-            EvaluationRunError::infrastructure(format!(
-                "evaluation SQLite trace projection failed: {}",
-                failures.join("; ")
-            )),
+            EvaluationRunError::infrastructure(error),
         ));
     }
 
@@ -1015,6 +1232,7 @@ pub fn run_evaluation(
     let report = json!({
         "manifest": params.manifest,
         "runner": RUNNER_NAME,
+        "max_workers": params.max_workers,
         "tasks": task_reports,
         "summary": result.summary,
         "sandbox_preflight": sandbox_preflight_evidence(&preflight),
@@ -1037,6 +1255,7 @@ pub fn run_evaluation(
         run_id: run_id.as_str().to_string(),
         manifest: params.manifest.clone(),
         runner: RUNNER_NAME.to_string(),
+        max_workers: params.max_workers,
         status: status_string,
         blocker,
         tasks: task_reports,
@@ -1064,6 +1283,7 @@ fn partial_evaluation_result(
         run_id: run_id.as_str().to_string(),
         manifest: safe_text(&params.manifest),
         runner: RUNNER_NAME.to_string(),
+        max_workers: params.max_workers,
         status: status.to_string(),
         blocker: Some("evaluation_cancelled".to_string()),
         tasks: task_executions
@@ -1117,7 +1337,7 @@ fn task_report(execution: &TaskEvaluation) -> Value {
 
 #[cfg(test)]
 fn run_task_trials(
-    context: &EvaluationRunContext<'_>,
+    context: &EvaluationRunContext<'_, '_>,
     plan: &WorkspacePlan,
     trials_per_task: u32,
 ) -> TaskEvaluation {
@@ -1125,11 +1345,11 @@ fn run_task_trials(
     let session_id = scope.clone();
     let span_id = evaluation_span_id(context.run_id, &scope, TraceSpanKind::Task);
     let started = Instant::now();
-    let trace = EvaluationTraceSink {
-        store: context.trace_store,
-        run_id: context.run_id,
-        failures: &context.trace_failures,
-    };
+    let trace = EvaluationTraceSink::new(
+        Arc::clone(&context.trace_store),
+        context.run_id,
+        &context.trace_failures,
+    );
     trace.start(
         &session_id,
         &span_id,
@@ -1210,6 +1430,7 @@ fn publish_zero_sampling_blocked_run(
     let report = json!({
         "manifest": params.manifest,
         "runner": RUNNER_NAME,
+        "max_workers": params.max_workers,
         "tasks": [],
         "summary": result.summary,
         "sandbox_preflight": preflight,
@@ -1225,6 +1446,7 @@ fn publish_zero_sampling_blocked_run(
         run_id: run_id.as_str().to_string(),
         manifest: params.manifest.clone(),
         runner: RUNNER_NAME.to_string(),
+        max_workers: params.max_workers,
         status,
         blocker,
         tasks: Vec::new(),
@@ -1236,7 +1458,7 @@ fn publish_zero_sampling_blocked_run(
 }
 
 fn run_task_trials_with_prepared_source(
-    context: &EvaluationRunContext<'_>,
+    context: &EvaluationRunContext<'_, '_>,
     plan: &WorkspacePlan,
     trials_per_task: u32,
     prepared_source: &PreparedTaskSource,
@@ -1245,11 +1467,11 @@ fn run_task_trials_with_prepared_source(
     let session_id = scope.clone();
     let span_id = evaluation_span_id(context.run_id, &scope, TraceSpanKind::Task);
     let started = Instant::now();
-    let trace = EvaluationTraceSink {
-        store: context.trace_store,
-        run_id: context.run_id,
-        failures: &context.trace_failures,
-    };
+    let trace = EvaluationTraceSink::new(
+        Arc::clone(&context.trace_store),
+        context.run_id,
+        &context.trace_failures,
+    );
     trace.start(
         &session_id,
         &span_id,
@@ -1270,7 +1492,7 @@ fn run_task_trials_with_prepared_source(
 }
 
 fn prepare_task_source(
-    context: &EvaluationRunContext<'_>,
+    context: &EvaluationRunContext<'_, '_>,
     plan: &WorkspacePlan,
 ) -> PreparedTaskSource {
     let started = Instant::now();
@@ -1353,7 +1575,7 @@ fn prepare_task_source(
 }
 
 fn run_task_trials_inner(
-    context: &EvaluationRunContext<'_>,
+    context: &EvaluationRunContext<'_, '_>,
     plan: &WorkspacePlan,
     trials_per_task: u32,
     prepared_source: &PreparedTaskSource,
@@ -1408,7 +1630,7 @@ fn run_task_trials_inner(
         sandbox_backend: context.sandbox_backend,
         provider_snapshot: context.provider_snapshot,
         cancellation: context.cancellation,
-        trace_store: context.trace_store,
+        trace_store: Arc::clone(&context.trace_store),
         trace_failures: &context.trace_failures,
     };
     let trials = (1..=trials_per_task)
@@ -1469,7 +1691,7 @@ fn task_evaluation_from_trials(plan: &WorkspacePlan, trials: Vec<TaskExecution>)
     TaskEvaluation { result, trials }
 }
 
-fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
+fn run_task(prepared: &PreparedTaskContext<'_, '_>, trial: u32) -> TaskExecution {
     let scope = format!("trial:{}:{}", prepared.plan.task_id.as_str(), trial);
     let session_id = scope.clone();
     let span_id = evaluation_span_id(prepared.run_id, &scope, TraceSpanKind::Turn);
@@ -1480,7 +1702,7 @@ fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
     );
     let started = Instant::now();
     let trace = EvaluationTrialTrace::new(
-        prepared.trace_store,
+        Arc::clone(&prepared.trace_store),
         prepared.run_id,
         prepared.trace_failures,
         session_id,
@@ -1509,7 +1731,7 @@ fn run_task(prepared: &PreparedTaskContext<'_>, trial: u32) -> TaskExecution {
 }
 
 fn run_task_inner(
-    prepared: &PreparedTaskContext<'_>,
+    prepared: &PreparedTaskContext<'_, '_>,
     trial: u32,
     trace: &EvaluationTrialTrace<'_>,
 ) -> TaskExecution {
@@ -1910,9 +2132,9 @@ fn finish_task(
     let functional_task_success = stages.baseline.status == StageStatus::Passed
         && !diagnostics.patch_evidence.is_empty()
         && tests_passed;
-    let agent_protocol_success = agent_completed
-        && diagnostics.error.is_none()
-        && diagnostics.completion_rejection_count == 0;
+    // A rejected completion is a recoverable AgentLoop repair episode. The protocol gate is
+    // decided by the final terminal Agent state; the rejection count remains diagnostic output.
+    let agent_protocol_success = agent_completed && diagnostics.error.is_none();
     let sandbox_security_success = agent_command_count > 0
         && strict_sandbox_command_count > 0
         && diagnostics.local_process_fallback_count == 0
@@ -2808,7 +3030,7 @@ fn snapshot_agent_workspace_after(
 }
 
 fn run_agent_stage(
-    prepared: &PreparedTaskContext<'_>,
+    prepared: &PreparedTaskContext<'_, '_>,
     task_dir: &Path,
     agent_dir: &Path,
     plan: &AgentStagePlan,
@@ -2964,18 +3186,34 @@ fn run_agent_stage(
     };
     let agent_started = Instant::now();
     let provider_identity = provider.clone();
-    let mut projector = TraceProjector::new_external(
-        prepared.trace_store,
-        prepared.run_id.as_str(),
-        &trace.session_id,
-        &trace.turn_span_id,
-    );
+    let trace_store = Arc::clone(&prepared.trace_store);
+    let trace_run_id = prepared.run_id.as_str().to_string();
+    let trace_session_id = trace.session_id.clone();
+    let trace_turn_span_id = trace.turn_span_id.clone();
     let trace_failures = Arc::clone(prepared.trace_failures);
-    let mut on_event = |event| match projector.project_event(event) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            record_trace_failure(&trace_failures, format!("agent event projection: {error}"));
-            Err(AgentLoopEventSinkError)
+    let mut on_event = |event| {
+        let store = match trace_store.lock() {
+            Ok(store) => store,
+            Err(_) => {
+                record_trace_failure(
+                    &trace_failures,
+                    "agent event projection: evaluation trace store mutex poisoned",
+                );
+                return Err(AgentLoopEventSinkError);
+            }
+        };
+        let mut projector = TraceProjector::new_external(
+            &**store,
+            &trace_run_id,
+            &trace_session_id,
+            &trace_turn_span_id,
+        );
+        match projector.project_event(event) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                record_trace_failure(&trace_failures, format!("agent event projection: {error}"));
+                Err(AgentLoopEventSinkError)
+            }
         }
     };
     let result = AgentLoop::new(provider, ToolBroker::new(resolved_tools.registry), policy)
@@ -2987,11 +3225,25 @@ fn run_agent_stage(
     let run_status = result.to_run_status();
     let agent_command_projection = agent_command_projection(&result);
     command_diagnostics = agent_command_projection.diagnostics.clone();
-    if let Err(error) = projector.project_result(&run_status) {
-        record_trace_failure(
+    match trace_store.lock() {
+        Ok(store) => {
+            let mut projector = TraceProjector::new_external(
+                &**store,
+                &trace_run_id,
+                &trace_session_id,
+                &trace_turn_span_id,
+            );
+            if let Err(error) = projector.project_result(&run_status) {
+                record_trace_failure(
+                    prepared.trace_failures,
+                    format!("agent result projection: {error}"),
+                );
+            }
+        }
+        Err(_) => record_trace_failure(
             prepared.trace_failures,
-            format!("agent result projection: {error}"),
-        );
+            "agent result projection: evaluation trace store mutex poisoned",
+        ),
     }
     let provider_evidence = provider_evidence(
         &provider_identity,
@@ -3000,8 +3252,8 @@ fn run_agent_stage(
     );
     let local_process_fallback_unknown_count = agent_command_projection.unknown_count;
     let trace_path = task_dir.join(AGENT_TRACE_FILE);
-    let trace = match evaluation_agent_trace(
-        prepared.trace_store,
+    let trace = match evaluation_agent_trace_shared(
+        &prepared.trace_store,
         prepared.run_id.as_str(),
         &trace.session_id,
         &trace.task_span_id,
@@ -3406,12 +3658,23 @@ fn agent_prompt(projection: &AgentTaskProjection, resolved_tools: &[String]) -> 
     sections.join("\n\n")
 }
 
+#[cfg(test)]
 fn evaluation_agent_trace(
     store: &singularity_store::SessionStore,
     run_id: &str,
     session_id: &str,
     task_span_id: &str,
 ) -> Result<Value, String> {
+    let events = evaluation_agent_trace_events(store, run_id, session_id, task_span_id)?;
+    evaluation_agent_trace_value(run_id, session_id, events)
+}
+
+fn evaluation_agent_trace_events(
+    store: &singularity_store::SessionStore,
+    run_id: &str,
+    session_id: &str,
+    task_span_id: &str,
+) -> Result<Vec<TraceEvent>, String> {
     let events = store
         .list_trace(run_id)
         .map_err(|error| format!("failed to query evaluation SQLite trace: {error}"))?
@@ -3423,6 +3686,14 @@ fn evaluation_agent_trace(
     if events.is_empty() {
         return Err("evaluation SQLite trace contains no events for the trial".to_string());
     }
+    Ok(events)
+}
+
+fn evaluation_agent_trace_value(
+    run_id: &str,
+    session_id: &str,
+    events: Vec<TraceEvent>,
+) -> Result<Value, String> {
     serde_json::to_value(json!({
         "schema": "evaluation.agent-trace/v2",
         "run_id": run_id,
@@ -3430,6 +3701,20 @@ fn evaluation_agent_trace(
         "events": events,
     }))
     .map_err(|error| format!("failed to serialize evaluation SQLite trace: {error}"))
+}
+
+fn evaluation_agent_trace_shared(
+    store: &SharedEvaluationTraceStore<'_>,
+    run_id: &str,
+    session_id: &str,
+    task_span_id: &str,
+) -> Result<Value, String> {
+    let store = store
+        .lock()
+        .map_err(|_| "evaluation trace store mutex poisoned while querying trace".to_string())?;
+    let events = evaluation_agent_trace_events(&**store, run_id, session_id, task_span_id)?;
+    drop(store);
+    evaluation_agent_trace_value(run_id, session_id, events)
 }
 
 fn agent_sandbox_blocker(
@@ -5370,17 +5655,19 @@ mod tests {
     fn pre_cancelled_evaluation_returns_a_typed_cancelled_error() {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
         let error = run_evaluation(
             &EvaluationRunParams {
                 manifest: "missing-manifest.json".to_string(),
                 run_id: "cancelled-run".to_string(),
                 output_root: None,
+                max_workers: 1,
             },
             Arc::new(SourceSandboxBackend),
             &unconfigured_provider_snapshot(),
             &cancellation,
-            &trace_store,
+            &mut trace_store,
         )
         .expect_err("cancelled evaluation must not start");
 
@@ -5389,6 +5676,29 @@ mod tests {
         assert_eq!(partial.status, "blocked");
         assert_eq!(partial.blocker.as_deref(), Some("evaluation_cancelled"));
         assert!(partial.tasks.is_empty());
+    }
+
+    #[test]
+    fn run_evaluation_rejects_out_of_range_max_workers_before_manifest_access() {
+        for max_workers in [0, 3] {
+            let mut trace_store =
+                singularity_store::SessionStore::open(":memory:").expect("trace store");
+            let error = run_evaluation(
+                &EvaluationRunParams {
+                    manifest: "missing-manifest.json".to_string(),
+                    run_id: format!("invalid-workers-{max_workers}"),
+                    output_root: None,
+                    max_workers,
+                },
+                Arc::new(SourceSandboxBackend),
+                &unconfigured_provider_snapshot(),
+                &CancellationToken::new(),
+                &mut trace_store,
+            )
+            .expect_err("out-of-range max-workers must be rejected");
+            assert_eq!(error.kind(), EvaluationRunErrorKind::Input);
+            assert!(error.to_string().contains("max_workers"));
+        }
     }
 
     #[test]
@@ -5502,6 +5812,7 @@ mod tests {
                 manifest: "C:\\secret-workspace\\manifest.json".to_string(),
                 run_id: run_id.as_str().to_string(),
                 output_root: None,
+                max_workers: 1,
             },
             &run_id,
             std::slice::from_ref(&execution),
@@ -5553,15 +5864,17 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id,
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let error = run_evaluation(
             &params,
             Arc::new(SourceSandboxBackend),
             &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect_err("long evaluation paths must fail before execution");
 
@@ -6758,7 +7071,9 @@ mod tests {
         let sandbox_backend: SharedSandboxBackend = Arc::new(SourceSandboxBackend);
         let provider_snapshot = unconfigured_provider_snapshot();
         let cancellation = CancellationToken::new();
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let shared_trace_store = Arc::new(Mutex::new(&mut trace_store));
         let sandbox_preflight = SandboxPreflightReport {
             outcome: SandboxPreflightOutcome::Supported,
             error_code: None,
@@ -6788,7 +7103,7 @@ mod tests {
             sandbox_backend: &sandbox_backend,
             provider_snapshot: &provider_snapshot,
             cancellation: &cancellation,
-            trace_store: &trace_store,
+            trace_store: shared_trace_store,
             trace_failures: Arc::new(Mutex::new(Vec::new())),
             sandbox_preflight: &sandbox_preflight,
         };
@@ -7068,6 +7383,7 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "preflight-supported-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
         let base_url = format!("http://{provider_address}/v1");
         let provider_snapshot = ProviderConfigSnapshot::capture(|name| match name {
@@ -7076,7 +7392,8 @@ mod tests {
             "SINGULARITY_MODEL" => Some("fixture-model".to_string()),
             _ => None,
         });
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let backend = Arc::new(AgentLoopReachBackend::default());
         let response = run_evaluation(
@@ -7084,7 +7401,7 @@ mod tests {
             backend.clone(),
             &provider_snapshot,
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("provider rejection still publishes evaluation artifacts");
         let result = EvaluationResult::from_json_str(
@@ -7170,6 +7487,7 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "agent-observer-baseline-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
         let base_url = format!("http://{provider_address}/v1");
         let provider_snapshot = ProviderConfigSnapshot::capture(|name| match name {
@@ -7178,7 +7496,8 @@ mod tests {
             "SINGULARITY_MODEL" => Some("fixture-model".to_string()),
             _ => None,
         });
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
         let backend = Arc::new(AgentLoopReachBackend {
             observer_baseline: Mutex::new(Some(PreparedWorkspaceObservation::Changed(vec![
                 "README.md".to_string(),
@@ -7191,7 +7510,7 @@ mod tests {
             backend.clone(),
             &provider_snapshot,
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("baseline observer blocker publishes result");
         let result = EvaluationResult::from_json_str(
@@ -7322,6 +7641,7 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "source-batch-barrier-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
         let base_url = format!("http://{provider_address}/v1");
         let provider_snapshot = ProviderConfigSnapshot::capture(|name| match name {
@@ -7330,14 +7650,15 @@ mod tests {
             "SINGULARITY_MODEL" => Some("fixture-model".to_string()),
             _ => None,
         });
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let response = run_evaluation(
             &params,
             Arc::new(AgentLoopReachBackend::default()),
             &provider_snapshot,
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("source blocker publishes a zero-sampling run");
         let requests = provider.join().expect("provider fixture join");
@@ -7400,8 +7721,10 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "provider-config-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
         let provider_snapshot = ProviderConfigSnapshot::capture(|name| match name {
             "SINGULARITY_API_KEY" => Some("fixture-key".to_string()),
             _ => None,
@@ -7412,7 +7735,7 @@ mod tests {
             Arc::new(SourceSandboxBackend),
             &provider_snapshot,
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("provider configuration blocker publishes a run-level result");
         assert_eq!(response.status, "blocked");
@@ -7467,9 +7790,11 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "preflight-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
         let executions = Arc::new(AtomicUsize::new(0));
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let response = run_evaluation(
             &params,
@@ -7478,7 +7803,7 @@ mod tests {
             }),
             &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("preflight blocker publishes typed artifacts");
 
@@ -7525,10 +7850,12 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "task-workspace-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
         let executions = Arc::new(AtomicUsize::new(0));
         let released_workspaces = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let response = run_evaluation(
             &params,
@@ -7539,7 +7866,7 @@ mod tests {
             }),
             &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("task workspace blocker publishes typed artifacts");
 
@@ -7626,9 +7953,11 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "executable-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
         let executions = Arc::new(AtomicUsize::new(0));
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let response = run_evaluation(
             &params,
@@ -7637,7 +7966,7 @@ mod tests {
             }),
             &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("executable blocker publishes typed artifacts");
 
@@ -7757,18 +8086,20 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "remote-source-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
         let backend = Arc::new(RemoteSourceProbeBackend {
             calls: AtomicUsize::new(0),
             fail_probe: true,
         });
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
         let response = run_evaluation(
             &params,
             backend.clone(),
             &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("remote source blocker publishes typed artifacts");
 
@@ -7810,9 +8141,11 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "preparation-blocked-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
         let executions = Arc::new(AtomicUsize::new(0));
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let response = run_evaluation(
             &params,
@@ -7821,7 +8154,7 @@ mod tests {
             }),
             &unconfigured_provider_snapshot(),
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("trusted preparation blocker publishes typed artifacts");
 
@@ -7913,8 +8246,10 @@ mod tests {
             manifest: manifest_path.to_string_lossy().into_owned(),
             run_id: "blocked-artifacts-run".to_string(),
             output_root: Some(output_root.to_string_lossy().into_owned()),
+            max_workers: 1,
         };
-        let trace_store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let mut trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("trace store");
 
         let response = run_evaluation(
             &params,
@@ -7926,7 +8261,7 @@ mod tests {
                 _ => None,
             }),
             &CancellationToken::new(),
-            &trace_store,
+            &mut trace_store,
         )
         .expect("blocked run still publishes typed artifacts");
 
@@ -8177,6 +8512,80 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_trace_projection_keeps_unique_ids_and_parent_links() {
+        let run_id = RunId::new("trace-concurrent").expect("run id");
+        let mut store = singularity_store::SessionStore::open(":memory:").expect("trace store");
+        let shared_store = Arc::new(Mutex::new(&mut store));
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        thread::scope(|scope| {
+            for task in ["task-a", "task-b"] {
+                let shared_store = Arc::clone(&shared_store);
+                let failures = Arc::clone(&failures);
+                let run_id = run_id.clone();
+                scope.spawn(move || {
+                    let task_span =
+                        evaluation_span_id(&run_id, &format!("task:{task}"), TraceSpanKind::Task);
+                    let task_trace =
+                        EvaluationTraceSink::new(Arc::clone(&shared_store), &run_id, &failures);
+                    task_trace.start(
+                        task,
+                        &task_span,
+                        None,
+                        TraceSpanKind::Task,
+                        "evaluation task",
+                    );
+                    let trial_span = evaluation_span_id(
+                        &run_id,
+                        &format!("trial:{task}:1"),
+                        TraceSpanKind::Turn,
+                    );
+                    let trial_trace =
+                        EvaluationTraceSink::new(Arc::clone(&shared_store), &run_id, &failures);
+                    trial_trace.start(
+                        &format!("trial:{task}:1"),
+                        &trial_span,
+                        Some(&task_span),
+                        TraceSpanKind::Turn,
+                        "evaluation trial",
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    trial_trace.end(
+                        &format!("trial:{task}:1"),
+                        &trial_span,
+                        Some(&task_span),
+                        TraceSpanKind::Turn,
+                        TraceSpanStatus::Ok,
+                        Instant::now(),
+                    );
+                    task_trace.end(
+                        task,
+                        &task_span,
+                        None,
+                        TraceSpanKind::Task,
+                        TraceSpanStatus::Ok,
+                        Instant::now(),
+                    );
+                });
+            }
+        });
+        assert!(failures.lock().expect("trace failures").is_empty());
+        let events = store.list_trace(run_id.as_str()).expect("trace events");
+        assert_eq!(events.len(), 8);
+        let ids = events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), events.len(), "trace event IDs must not collide");
+        for event in events {
+            match event.span_kind {
+                Some(TraceSpanKind::Task) => assert!(event.parent_span_id.is_none()),
+                Some(TraceSpanKind::Turn) => assert!(event.parent_span_id.is_some()),
+                _ => panic!("unexpected evaluation trace kind"),
+            }
+        }
+    }
+
+    #[test]
     fn task_fallback_count_includes_agent_setup_commands() {
         let mut result = CommandResult::completed("command", "ok");
         result.sandbox.local_process_fallback = true;
@@ -8200,5 +8609,183 @@ mod tests {
         assert_eq!(execution.diagnostics.local_process_fallback_count, 1);
         assert_eq!(execution.result.status, EvaluationStatus::Failed);
         assert!(!execution.result.evaluation_passed);
+    }
+
+    #[test]
+    fn recovered_completion_rejection_counts_as_protocol_success() {
+        let task_id = TaskId::new("protocol-recovery").expect("task id");
+        let strict_command = || {
+            let result = CommandResult::completed("command", "ok")
+                .with_sandbox_execution("test", SandboxBackendEnforcement::Strict);
+            CommandDiagnostic::new("agent.command", &result)
+        };
+        let mut diagnostics = TaskDiagnostics::default();
+        diagnostics.completion_rejection_count = 1;
+        diagnostics.agent.commands.push(strict_command());
+        let recovered = finish_task(
+            &task_id,
+            1,
+            StageExecution::passed(Vec::new()),
+            StageExecution::passed(diagnostics.agent.commands.clone()),
+            StageExecution::passed(Vec::new()),
+            StageExecution::passed(Vec::new()),
+            diagnostics.clone(),
+        );
+        assert!(recovered.result.agent_protocol_success);
+        assert_eq!(
+            recovered.result.evidence.completion_rejection_count, 1,
+            "recovery history remains a diagnostic metric"
+        );
+
+        diagnostics.error = Some("terminal agent error".to_string());
+        let terminal_error = finish_task(
+            &task_id,
+            1,
+            StageExecution::passed(Vec::new()),
+            StageExecution::passed(diagnostics.agent.commands.clone()),
+            StageExecution::passed(Vec::new()),
+            StageExecution::passed(Vec::new()),
+            diagnostics,
+        );
+        assert!(!terminal_error.result.agent_protocol_success);
+
+        let unfinished = finish_task(
+            &task_id,
+            1,
+            StageExecution::passed(Vec::new()),
+            StageExecution::skipped("agent unfinished"),
+            StageExecution::passed(Vec::new()),
+            StageExecution::passed(Vec::new()),
+            TaskDiagnostics {
+                completion_rejection_count: 1,
+                ..TaskDiagnostics::default()
+            },
+        );
+        assert!(!unfinished.result.agent_protocol_success);
+    }
+
+    #[test]
+    fn bounded_task_workers_balance_work_and_restore_manifest_order() {
+        let cancellation = CancellationToken::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        let release_first = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let active_for_worker = Arc::clone(&active);
+        let maximum_for_worker = Arc::clone(&maximum);
+        let completion_for_worker = Arc::clone(&completion_order);
+        let release_for_worker = Arc::clone(&release_first);
+        let results = run_bounded_indexed_workers(4, 2, &cancellation, move |index| {
+            let now = active_for_worker.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum_for_worker.fetch_max(now, Ordering::SeqCst);
+            if index == 0 {
+                let (released, wake) = &*release_for_worker;
+                let mut released = released.lock().expect("release state");
+                while !*released {
+                    released = wake.wait(released).expect("release wait");
+                }
+                completion_for_worker
+                    .lock()
+                    .expect("completion order")
+                    .push(index);
+            } else {
+                completion_for_worker
+                    .lock()
+                    .expect("completion order")
+                    .push(index);
+                if index == 1 {
+                    let (released, wake) = &*release_for_worker;
+                    *released.lock().expect("release state") = true;
+                    wake.notify_one();
+                }
+            }
+            active_for_worker.fetch_sub(1, Ordering::SeqCst);
+            index
+        })
+        .expect("workers complete");
+        assert_eq!(results, vec![0, 1, 2, 3], "results use manifest order");
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        assert_ne!(
+            *completion_order.lock().expect("completion order"),
+            vec![0, 1, 2, 3],
+            "different durations must produce observable completion reordering"
+        );
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let active_for_worker = Arc::clone(&active);
+        let maximum_for_worker = Arc::clone(&maximum);
+        let results = run_bounded_indexed_workers(3, 1, &cancellation, move |index| {
+            let now = active_for_worker.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum_for_worker.fetch_max(now, Ordering::SeqCst);
+            active_for_worker.fetch_sub(1, Ordering::SeqCst);
+            index
+        })
+        .expect("serial worker completes");
+        assert_eq!(results, vec![0, 1, 2]);
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bounded_task_workers_fail_closed_after_panic_and_join_workers() {
+        let serial_cancellation = CancellationToken::new();
+        let serial_result = run_bounded_indexed_workers(1, 1, &serial_cancellation, |_| -> usize {
+            panic!("serial worker failure");
+        });
+        assert!(matches!(
+            serial_result,
+            Err(IndexedWorkerError::Failed(message)) if message.contains("worker panicked")
+        ));
+        assert!(serial_cancellation.is_cancelled());
+
+        let cancellation = CancellationToken::new();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let other_worker_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered_for_worker = Arc::clone(&entered);
+        let finished_for_worker = Arc::clone(&other_worker_finished);
+        let result = run_bounded_indexed_workers(2, 2, &cancellation, move |index| {
+            entered_for_worker.wait();
+            if index == 0 {
+                panic!("worker failure");
+            }
+            finished_for_worker.store(true, Ordering::SeqCst);
+            index
+        });
+        match result {
+            Err(IndexedWorkerError::Failed(message)) => {
+                assert!(message.contains("worker panicked"));
+            }
+            _ => panic!("worker panic must fail closed"),
+        }
+        assert!(cancellation.is_cancelled());
+        assert!(other_worker_finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn bounded_task_workers_cancel_after_join_with_only_a_manifest_prefix() {
+        let cancellation = CancellationToken::new();
+        let canceller = cancellation.clone();
+        let workers_started = Arc::new(std::sync::Barrier::new(3));
+        let cancellation_published = Arc::new(std::sync::Barrier::new(3));
+        let started_for_canceller = Arc::clone(&workers_started);
+        let published_for_canceller = Arc::clone(&cancellation_published);
+        let cancel_thread = std::thread::spawn(move || {
+            started_for_canceller.wait();
+            canceller.cancel();
+            published_for_canceller.wait();
+        });
+        let started_for_worker = Arc::clone(&workers_started);
+        let published_for_worker = Arc::clone(&cancellation_published);
+        let result = run_bounded_indexed_workers(4, 2, &cancellation, move |index| {
+            assert!(index < 2, "cancellation must stop new task claims");
+            started_for_worker.wait();
+            published_for_worker.wait();
+            index
+        });
+        cancel_thread.join().expect("cancellation thread");
+        let Err(IndexedWorkerError::Cancelled(partial)) = result else {
+            panic!("cancellation must fail closed");
+        };
+        assert_eq!(partial, vec![0, 1]);
     }
 }
