@@ -143,6 +143,36 @@ impl SessionStore {
         }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let turn = self.turn_in_transaction(&transaction, &first.turn_id)?;
+        if turn.thread_id != first.thread_id {
+            return Err(StoreError::InvalidState(
+                "tool execution turn thread binding mismatch".to_string(),
+            ));
+        }
+        match turn.status {
+            TurnStatus::Running => {}
+            TurnStatus::Blocked => {
+                let has_executing_pending_tool_call: bool = transaction.query_row(
+                    "select exists(
+                        select 1 from pending_tool_calls
+                        where thread_id = ?1 and turn_id = ?2 and execution_state = 'executing'
+                    )",
+                    params![first.thread_id, first.turn_id],
+                    |row| row.get(0),
+                )?;
+                if !has_executing_pending_tool_call {
+                    return Err(StoreError::InvalidState(
+                        "blocked turn has no executing pending tool call".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(StoreError::InvalidState(
+                    "tool execution batch requires a running turn or an approval-executing blocked turn"
+                        .to_string(),
+                ));
+            }
+        }
         let boundary_pending: bool = transaction.query_row(
             "select pause_requested = 1 or exists(
                 select 1 from turn_inputs

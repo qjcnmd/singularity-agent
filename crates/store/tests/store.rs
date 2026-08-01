@@ -3355,6 +3355,298 @@ fn tool_result_checkpoint_rejects_an_incomplete_or_invalid_batch_without_writes(
 }
 
 #[test]
+fn terminal_turn_rejects_late_tool_execution_begin_without_writes() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let terminal_statuses = [
+        (TurnStatus::Completed, "completed"),
+        (TurnStatus::Failed, "failed"),
+        (TurnStatus::Interrupted, "interrupted"),
+        (TurnStatus::Paused, "paused"),
+        (TurnStatus::Suspended, "suspended"),
+    ];
+
+    for (status, agent_loop_status) in terminal_statuses {
+        let thread = store.create_thread(None, None).expect("thread");
+        let turn = store
+            .create_turn(&thread.thread_id, "running")
+            .expect("turn");
+        store
+            .update_turn_state(&turn.turn_id, status.clone(), agent_loop_status)
+            .expect("terminalize turn");
+        let checkpoint = serde_json::json!({
+            "checkpoint_version": 1,
+            "boundary": "tool_calls_ready"
+        });
+        let execution = ToolExecution {
+            execution_id: format!("turn:{}:tool:late", turn.turn_id),
+            thread_id: thread.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            tool_call_id: "call_late".to_string(),
+            state: ToolExecutionState::Running,
+            payload: serde_json::json!({"kind": "tool_call", "tool_name": "read"}),
+        };
+
+        assert!(matches!(
+            store.begin_tool_executions_at_checkpoint(
+                std::slice::from_ref(&execution),
+                &checkpoint,
+                1,
+            ),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(
+            store
+                .get_turn_checkpoint(&turn.turn_id)
+                .expect("checkpoint lookup")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_tool_execution(&execution.execution_id)
+                .expect("execution lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store.get_turn(&turn.turn_id).expect("turn lookup").status,
+            status
+        );
+    }
+}
+
+#[test]
+fn blocked_begin_rejects_cross_thread_executing_pending_tool_call_without_writes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("sessions.sqlite3");
+    let store = SessionStore::open(&db_path).expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let other_thread = store.create_thread(None, None).expect("other thread");
+    let turn = store
+        .create_turn(&thread.thread_id, "running")
+        .expect("turn");
+    let request = ApprovalRequest::new(
+        "approval_cross_thread_pending",
+        thread.thread_id.clone(),
+        turn.turn_id.clone(),
+        tool_id("edit"),
+    )
+    .with_tool_call_id("call_cross_thread");
+    store.create_approval(&request).expect("approval");
+    store
+        .update_turn_state(&turn.turn_id, TurnStatus::Blocked, "blocked")
+        .expect("blocked turn");
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open sqlite");
+    connection
+        .execute(
+            "insert into pending_tool_calls(
+                 request_id, thread_id, turn_id, tool_call_id, payload, execution_state
+             ) values(?1, ?2, ?3, ?4, ?5, 'executing')",
+            rusqlite::params![
+                request.request_id,
+                other_thread.thread_id,
+                turn.turn_id,
+                "call_cross_thread",
+                "{}"
+            ],
+        )
+        .expect("cross-thread pending execution");
+    drop(connection);
+
+    let checkpoint = serde_json::json!({
+        "checkpoint_version": 1,
+        "boundary": "tool_calls_ready"
+    });
+    let execution = ToolExecution {
+        execution_id: format!("turn:{}:tool:cross_thread", turn.turn_id),
+        thread_id: thread.thread_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        tool_call_id: "call_cross_thread".to_string(),
+        state: ToolExecutionState::Running,
+        payload: serde_json::json!({"kind": "tool_call", "tool_name": "edit"}),
+    };
+
+    assert!(matches!(
+        store
+            .begin_tool_executions_at_checkpoint(std::slice::from_ref(&execution), &checkpoint, 1,),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert!(
+        store
+            .get_turn_checkpoint(&turn.turn_id)
+            .expect("checkpoint lookup")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_tool_execution(&execution.execution_id)
+            .expect("execution lookup")
+            .is_none()
+    );
+    assert_eq!(
+        store.get_turn(&turn.turn_id).expect("turn lookup").status,
+        TurnStatus::Blocked
+    );
+}
+
+#[test]
+fn terminal_outcomes_reconcile_running_tool_executions() {
+    let store = SessionStore::open(":memory:").expect("open store");
+    let thread = store.create_thread(None, None).expect("thread");
+    let prepare = |tool_call_id: &str| {
+        let (turn, _, _) = store
+            .create_turn_with_input_and_trace(
+                &thread.thread_id,
+                "running",
+                serde_json::json!([{"type": "text", "text": "run"}]),
+                "app_server",
+                "turn started",
+            )
+            .expect("started turn");
+        let checkpoint = serde_json::json!({
+            "checkpoint_version": 1,
+            "boundary": "tool_calls_ready",
+            "pending_tool_calls": [{"tool_call_id": tool_call_id}]
+        });
+        let execution = ToolExecution {
+            execution_id: format!("turn:{}:tool:{tool_call_id}", turn.turn_id),
+            thread_id: thread.thread_id.clone(),
+            turn_id: turn.turn_id.clone(),
+            tool_call_id: tool_call_id.to_string(),
+            state: ToolExecutionState::Running,
+            payload: serde_json::json!({"kind": "tool_call", "tool_name": "command"}),
+        };
+        assert!(
+            store
+                .begin_tool_executions_at_checkpoint(
+                    std::slice::from_ref(&execution),
+                    &checkpoint,
+                    1,
+                )
+                .expect("running execution")
+        );
+        (turn, execution, checkpoint)
+    };
+
+    let (failed_turn, failed_execution, failed_checkpoint) = prepare("call_failed");
+    let failed = store
+        .commit_turn_outcome(
+            &failed_turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Failed,
+                agent_loop_status: "failed",
+                assistant_item_id: None,
+                assistant_delta: None,
+                trace: &TraceEvent::for_turn(
+                    "trace_failed_with_execution",
+                    &thread.thread_id,
+                    &failed_turn.turn_id,
+                    "agent_loop",
+                    "tool execution failed",
+                ),
+            },
+        )
+        .expect("failed outcome");
+    assert_eq!(failed.turn.status, TurnStatus::Failed);
+    assert_eq!(
+        store
+            .get_tool_execution(&failed_execution.execution_id)
+            .expect("failed execution lookup")
+            .expect("failed execution")
+            .state,
+        ToolExecutionState::Unknown
+    );
+    assert_eq!(
+        store
+            .get_turn_checkpoint(&failed_turn.turn_id)
+            .expect("failed checkpoint lookup")
+            .expect("failed checkpoint"),
+        failed_checkpoint
+    );
+
+    let (interrupted_turn, interrupted_execution, interrupted_checkpoint) =
+        prepare("call_cancelled");
+    let interrupted = store
+        .commit_turn_outcome(
+            &interrupted_turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Interrupted,
+                agent_loop_status: "cancelled",
+                assistant_item_id: None,
+                assistant_delta: None,
+                trace: &TraceEvent::for_turn(
+                    "trace_interrupted_with_execution",
+                    &thread.thread_id,
+                    &interrupted_turn.turn_id,
+                    "agent_loop",
+                    "tool execution cancelled",
+                ),
+            },
+        )
+        .expect("interrupted outcome");
+    assert_eq!(interrupted.turn.status, TurnStatus::Interrupted);
+    assert_eq!(
+        store
+            .get_tool_execution(&interrupted_execution.execution_id)
+            .expect("interrupted execution lookup")
+            .expect("interrupted execution")
+            .state,
+        ToolExecutionState::Unknown
+    );
+    assert_eq!(
+        store
+            .get_turn_checkpoint(&interrupted_turn.turn_id)
+            .expect("interrupted checkpoint lookup")
+            .expect("interrupted checkpoint"),
+        interrupted_checkpoint
+    );
+
+    let (completed_turn, completed_execution, completed_checkpoint) = prepare("call_completed");
+    let assistant_item_id = SessionStore::allocate_assistant_item_id();
+    assert!(matches!(
+        store.commit_turn_outcome(
+            &completed_turn.turn_id,
+            CommitTurnOutcomeParams {
+                status: TurnStatus::Completed,
+                agent_loop_status: "completed",
+                assistant_item_id: Some(&assistant_item_id),
+                assistant_delta: Some("done"),
+                trace: &TraceEvent::for_turn(
+                    "trace_completed_with_execution",
+                    &thread.thread_id,
+                    &completed_turn.turn_id,
+                    "agent_loop",
+                    "completion attempted",
+                ),
+            },
+        ),
+        Err(StoreError::InvalidState(message))
+            if message == "completed turn outcome cannot commit with running tool execution"
+    ));
+    assert_eq!(
+        store
+            .get_turn(&completed_turn.turn_id)
+            .expect("completed turn lookup")
+            .status,
+        TurnStatus::Running
+    );
+    assert_eq!(
+        store
+            .get_tool_execution(&completed_execution.execution_id)
+            .expect("completed execution lookup")
+            .expect("completed execution")
+            .state,
+        ToolExecutionState::Running
+    );
+    assert_eq!(
+        store
+            .get_turn_checkpoint(&completed_turn.turn_id)
+            .expect("completed checkpoint lookup")
+            .expect("completed checkpoint"),
+        completed_checkpoint
+    );
+}
+
+#[test]
 fn turn_checkpoint_commit_is_atomic_and_unknown_execution_blocks_resume() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("sessions.sqlite3");

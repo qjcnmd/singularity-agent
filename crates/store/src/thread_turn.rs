@@ -595,6 +595,26 @@ impl SessionStore {
                     turn_id: turn_id.to_string(),
                 });
             }
+
+            let running_execution_count: i64 = transaction.query_row(
+                "select count(*) from tool_executions
+                 where turn_id = ?1 and execution_state = 'running'",
+                params![turn_id],
+                |row| row.get(0),
+            )?;
+            if running_execution_count != 0 {
+                if status == TurnStatus::Completed {
+                    return Err(StoreError::InvalidState(
+                        "completed turn outcome cannot commit with running tool execution"
+                            .to_string(),
+                    ));
+                }
+                transaction.execute(
+                    "update tool_executions set execution_state = 'unknown'
+                     where turn_id = ?1 and execution_state = 'running'",
+                    params![turn_id],
+                )?;
+            }
         }
         match (&status, assistant_item_id, assistant_delta) {
             (TurnStatus::Completed, Some(item_id), Some(delta))
