@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use singularity_core::CancellationToken;
-use singularity_evaluation::runner::{EvaluationRunParams, EvaluationRunResult, run_evaluation};
+use singularity_evaluation::runner::{
+    EvaluationRunParams, EvaluationRunResult, run_evaluation_with_selection,
+};
+use singularity_evaluation::{EvaluationSelection, TaskId};
 use singularity_model::ProviderConfigSnapshot;
 use singularity_sandbox::PlatformSandboxBackend;
 use singularity_store::SessionStore;
@@ -30,6 +33,12 @@ enum Command {
         /// Maximum number of independent tasks to execute concurrently (1-2).
         #[arg(long, default_value_t = 1, value_parser = parse_max_workers)]
         max_workers: usize,
+        /// Select one task for an Evaluation-only diagnostic run (must be paired with --trial).
+        #[arg(long, value_parser = parse_task_id, requires = "trial")]
+        task_id: Option<TaskId>,
+        /// Select the manifest's one-based trial ordinal (must be paired with --task-id).
+        #[arg(long, requires = "task_id")]
+        trial: Option<u32>,
     },
 }
 
@@ -42,6 +51,10 @@ fn parse_max_workers(value: &str) -> Result<usize, String> {
     } else {
         Err("max-workers must be between 1 and 2".to_string())
     }
+}
+
+fn parse_task_id(value: &str) -> Result<TaskId, String> {
+    TaskId::new(value.to_string())
 }
 
 fn main() {
@@ -58,7 +71,9 @@ fn run(cli: Cli) -> Result<(), String> {
             run_id,
             json,
             max_workers,
-        } => run_manifest(manifest, run_id, json, max_workers),
+            task_id,
+            trial,
+        } => run_manifest(manifest, run_id, json, max_workers, task_id, trial),
     }
 }
 
@@ -67,7 +82,19 @@ fn run_manifest(
     run_id: String,
     json_output: bool,
     max_workers: usize,
+    task_id: Option<TaskId>,
+    trial: Option<u32>,
 ) -> Result<(), String> {
+    let selection = match (task_id, trial) {
+        (Some(task_id), Some(trial)) => Some(
+            EvaluationSelection::new(task_id, trial)
+                .map_err(|error| format!("invalid diagnostic selection: {error}"))?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err("--task-id and --trial must be provided together".to_string());
+        }
+    };
     if !manifest.is_file() {
         return Err(format!(
             "evaluation manifest not found: {}",
@@ -84,7 +111,7 @@ fn run_manifest(
     );
     let mut trace_store = SessionStore::open(":memory:")
         .map_err(|error| format!("failed to open evaluation trace store: {error}"))?;
-    let result = run_evaluation(
+    let result = run_evaluation_with_selection(
         &EvaluationRunParams {
             manifest: manifest.to_string_lossy().into_owned(),
             run_id,
@@ -95,6 +122,7 @@ fn run_manifest(
         &provider_snapshot,
         &CancellationToken::new(),
         &mut trace_store,
+        selection,
     )
     .map_err(|error| {
         if let Some(partial) = error.partial_result() {
@@ -103,7 +131,7 @@ fn run_manifest(
         error.to_string()
     })?;
     print_result(&result, json_output)?;
-    if result.evaluation_passed {
+    if result.diagnostic_passed.unwrap_or(result.evaluation_passed) {
         Ok(())
     } else {
         Err(result
@@ -119,12 +147,29 @@ fn print_result(result: &EvaluationRunResult, json_output: bool) -> Result<(), S
             serde_json::to_string(result).map_err(|error| error.to_string())?
         );
     } else {
-        println!(
-            "evaluation {} {} runner={} max_workers={}",
-            result.run_id, result.status, result.runner, result.max_workers
-        );
+        println!("{}", result_text(result));
     }
     Ok(())
+}
+
+fn result_text(result: &EvaluationRunResult) -> String {
+    if let Some(selection) = &result.selection {
+        format!(
+            "evaluation diagnostic {} {} task={} trial={} gate_applicable=false diagnostic_passed={} evaluation_passed=false runner={} max_workers={}",
+            result.run_id,
+            result.status,
+            selection.task_id,
+            selection.trial,
+            result.diagnostic_passed.unwrap_or(false),
+            result.runner,
+            result.max_workers
+        )
+    } else {
+        format!(
+            "evaluation {} {} runner={} max_workers={}",
+            result.run_id, result.status, result.runner, result.max_workers
+        )
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +218,78 @@ mod tests {
             .expect_err("invalid max-workers must be rejected");
             assert!(error.to_string().contains("max-workers"));
         }
+    }
+
+    #[test]
+    fn diagnostic_selector_flags_are_typed_and_must_be_paired() {
+        let cli = Cli::try_parse_from([
+            "singularity-evaluation",
+            "run",
+            "manifest.json",
+            "--run-id",
+            "run",
+            "--task-id",
+            "task-a",
+            "--trial",
+            "2",
+        ])
+        .expect("paired diagnostic selector parses");
+        let Command::Run { task_id, trial, .. } = cli.command;
+        assert_eq!(task_id.expect("task id").as_str(), "task-a");
+        assert_eq!(trial, Some(2));
+
+        let cases: &[&[&str]] = &[
+            &[
+                "singularity-evaluation",
+                "run",
+                "manifest.json",
+                "--run-id",
+                "run",
+                "--task-id",
+                "task-a",
+            ],
+            &[
+                "singularity-evaluation",
+                "run",
+                "manifest.json",
+                "--run-id",
+                "run",
+                "--trial",
+                "2",
+            ],
+        ];
+        for args in cases {
+            assert!(Cli::try_parse_from(*args).is_err());
+        }
+    }
+
+    #[test]
+    fn diagnostic_text_result_is_explicitly_non_gating() {
+        let result = EvaluationRunResult {
+            run_id: "run".to_string(),
+            manifest: "manifest.json".to_string(),
+            runner: "agent_loop".to_string(),
+            max_workers: 1,
+            status: "completed".to_string(),
+            blocker: None,
+            tasks: Vec::new(),
+            result_path: None,
+            report_path: None,
+            evidence_path: None,
+            evaluation_passed: false,
+            gate_applicable: Some(false),
+            selection: Some(
+                EvaluationSelection::new(TaskId::new("task-a").expect("task id"), 2)
+                    .expect("selection"),
+            ),
+            diagnostic_passed: Some(true),
+        };
+        let text = result_text(&result);
+        assert!(text.contains("evaluation diagnostic"));
+        assert!(text.contains("task=task-a trial=2"));
+        assert!(text.contains("gate_applicable=false"));
+        assert!(text.contains("diagnostic_passed=true"));
+        assert!(text.contains("evaluation_passed=false"));
+        assert_eq!(result.gate_applicable, Some(false));
     }
 }

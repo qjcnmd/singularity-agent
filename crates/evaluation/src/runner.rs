@@ -16,10 +16,10 @@ use crate::{
     AgentStagePlan, AgentTaskProjection, BlockerKind, CommandExpectation, CommandSpec,
     EvaluationBlocker, EvaluationEvidenceSummary, EvaluationManifest, EvaluationPromptStructure,
     EvaluationProviderEvidence, EvaluationResult, EvaluationSandboxPreflight,
-    EvaluationSandboxPreflightFact, EvaluationSandboxPreflightOutcome, EvaluationStageResults,
-    EvaluationStatus, EvaluationTaskResult, EvaluationTrialResult, PatchFormat,
-    PlannedWorkspaceSource, RunId, StageResult, StageStatus, TaskId, VerificationStagePlan,
-    WorkspacePlan,
+    EvaluationSandboxPreflightFact, EvaluationSandboxPreflightOutcome, EvaluationSelection,
+    EvaluationStageResults, EvaluationStatus, EvaluationTaskResult, EvaluationTrialResult,
+    PatchFormat, PlannedWorkspaceSource, RunId, StageResult, StageStatus, TaskId,
+    VerificationStagePlan, WorkspacePlan,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -131,6 +131,15 @@ pub struct EvaluationRunResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_path: Option<String>,
     pub evaluation_passed: bool,
+    /// Present only for diagnostics; `false` prevents the wrapper from being treated as a gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_applicable: Option<bool>,
+    /// Present only for the one-task/one-trial development diagnostic run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<EvaluationSelection>,
+    /// Diagnostic dimension conjunction; full Evaluation results leave this absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_passed: Option<bool>,
 }
 
 /// Evaluation runner 绑定的严格 sandbox backend。
@@ -668,6 +677,7 @@ fn run_task_workers(
     prepared_sources: &[PreparedTaskSource],
     trials_per_task: u32,
     max_workers: usize,
+    selected_trial: Option<u32>,
 ) -> Result<Vec<TaskEvaluation>, TaskWorkerError> {
     match run_bounded_indexed_workers(plans.len(), max_workers, context.cancellation, |index| {
         run_task_trials_with_prepared_source(
@@ -675,6 +685,7 @@ fn run_task_workers(
             &plans[index],
             trials_per_task,
             &prepared_sources[index],
+            selected_trial,
         )
     }) {
         Ok(results) => Ok(results),
@@ -963,6 +974,7 @@ struct EvaluationFailureEvidence<'a> {
     message: &'a str,
 }
 
+/// Run the complete manifest evaluation (the stable v9/v4 path).
 pub fn run_evaluation(
     params: &EvaluationRunParams,
     sandbox_backend: SharedSandboxBackend,
@@ -970,15 +982,38 @@ pub fn run_evaluation(
     cancellation: &CancellationToken,
     trace_store: &mut singularity_store::SessionStore,
 ) -> Result<EvaluationRunResult, EvaluationRunError> {
+    run_evaluation_with_selection(
+        params,
+        sandbox_backend,
+        provider_snapshot,
+        cancellation,
+        trace_store,
+        None,
+    )
+}
+
+/// Run either the complete manifest or one validated task/trial diagnostic selection.
+pub fn run_evaluation_with_selection(
+    params: &EvaluationRunParams,
+    sandbox_backend: SharedSandboxBackend,
+    provider_snapshot: &ProviderConfigSnapshot,
+    cancellation: &CancellationToken,
+    trace_store: &mut singularity_store::SessionStore,
+    selection: Option<EvaluationSelection>,
+) -> Result<EvaluationRunResult, EvaluationRunError> {
     if !(1..=2).contains(&params.max_workers) {
         return Err(EvaluationRunError::input(
             "evaluation max_workers must be between 1 and 2",
         ));
     }
     if cancellation.is_cancelled() {
-        let partial = RunId::new(params.run_id.clone())
-            .ok()
-            .map(|run_id| partial_evaluation_result(params, &run_id, &[]));
+        let partial = if selection.is_none() {
+            RunId::new(params.run_id.clone())
+                .ok()
+                .map(|run_id| partial_evaluation_result(params, &run_id, &[], None))
+        } else {
+            None
+        };
         return Err(EvaluationRunError::cancelled(
             "evaluation cancelled",
             partial,
@@ -1003,7 +1038,7 @@ pub fn run_evaluation(
     let run_id = RunId::new(params.run_id.clone())
         .map_err(|error| EvaluationRunError::input(format!("invalid eval run id: {error}")))?;
     let output_root = evaluation_output_root(params.output_root.as_deref());
-    let plans = manifest
+    let all_plans = manifest
         .task_set()
         .tasks
         .iter()
@@ -1014,12 +1049,44 @@ pub fn run_evaluation(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(EvaluationRunError::input)?;
+    let manifest_trial_count = manifest.task_set().trial_count;
+    let selection = selection
+        .map(|selection| {
+            if selection.trial == 0 || selection.trial > manifest_trial_count {
+                return Err(EvaluationRunError::input(format!(
+                    "evaluation diagnostic trial {} is outside manifest trial_count {}",
+                    selection.trial, manifest_trial_count
+                )));
+            }
+            if !all_plans
+                .iter()
+                .any(|plan| plan.task_id == selection.task_id)
+            {
+                return Err(EvaluationRunError::input(format!(
+                    "evaluation diagnostic task not found: {}",
+                    selection.task_id
+                )));
+            }
+            Ok(selection)
+        })
+        .transpose()?;
+    let plans = if let Some(selection) = &selection {
+        all_plans
+            .into_iter()
+            .filter(|plan| plan.task_id == selection.task_id)
+            .collect::<Vec<_>>()
+    } else {
+        all_plans
+    };
     let task_ids = plans
         .iter()
         .map(|plan| plan.task_id.clone())
         .collect::<Vec<_>>();
-    let trials_per_task = manifest.task_set().trial_count;
-    preflight_evaluation_path_budget(&output_root, &run_id, &task_ids, trials_per_task)
+    let trials_per_task = manifest_trial_count;
+    let path_trial_count = selection
+        .as_ref()
+        .map_or(trials_per_task, |selection| selection.trial);
+    preflight_evaluation_path_budget(&output_root, &run_id, &task_ids, path_trial_count)
         .map_err(EvaluationRunError::input)?;
     fs::create_dir_all(&output_root).map_err(|error| {
         EvaluationRunError::infrastructure(format!(
@@ -1042,6 +1109,14 @@ pub fn run_evaluation(
             Ok(report) => report,
             Err(failure) => {
                 let preflight = sandbox_preflight_evidence(&failure.report);
+                if let Some(selection) = selection.as_ref() {
+                    return diagnostic_blocked_run_result(
+                        params,
+                        &run_id,
+                        selection,
+                        failure.blocker,
+                    );
+                }
                 let result = EvaluationResult::blocked_by_sandbox_preflight(
                     run_id.clone(),
                     u32::try_from(plans.len()).unwrap_or(u32::MAX),
@@ -1073,7 +1148,7 @@ pub fn run_evaluation(
         sandbox_preflight: &preflight,
     };
     if cancellation.is_cancelled() {
-        let partial = partial_evaluation_result(params, &run_id, &[]);
+        let partial = partial_evaluation_result(params, &run_id, &[], selection.as_ref());
         return Err(preserve_incomplete_run(
             &run_dir,
             EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
@@ -1081,6 +1156,9 @@ pub fn run_evaluation(
     }
     if let Err(error) = provider_snapshot.provider() {
         let blocker = run_level_blocker(provider_configuration_blocker(&error));
+        if let Some(selection) = selection.as_ref() {
+            return diagnostic_blocked_run_result(params, &run_id, selection, blocker);
+        }
         let result = EvaluationResult::blocked_before_sampling(
             run_id.clone(),
             u32::try_from(plans.len()).unwrap_or(u32::MAX),
@@ -1106,7 +1184,7 @@ pub fn run_evaluation(
         .map(|plan| prepare_task_source(&run_context, plan))
         .collect::<Vec<_>>();
     if cancellation.is_cancelled() {
-        let partial = partial_evaluation_result(params, &run_id, &[]);
+        let partial = partial_evaluation_result(params, &run_id, &[], selection.as_ref());
         return Err(preserve_incomplete_run(
             &run_dir,
             EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
@@ -1116,6 +1194,14 @@ pub fn run_evaluation(
         .iter()
         .find_map(|prepared_source| prepared_source.blocker.clone())
     {
+        if let Some(selection) = selection.as_ref() {
+            return diagnostic_blocked_run_result(
+                params,
+                &run_id,
+                selection,
+                run_level_blocker(blocker),
+            );
+        }
         let result = EvaluationResult::blocked_before_sampling(
             run_id.clone(),
             u32::try_from(plans.len()).unwrap_or(u32::MAX),
@@ -1139,6 +1225,7 @@ pub fn run_evaluation(
         &prepared_sources,
         trials_per_task,
         params.max_workers,
+        selection.as_ref().map(|selection| selection.trial),
     ) {
         Ok(task_executions) => task_executions,
         Err(TaskWorkerError::Cancelled(task_executions)) => {
@@ -1148,7 +1235,8 @@ pub fn run_evaluation(
                     EvaluationRunError::infrastructure(error),
                 ));
             }
-            let partial = partial_evaluation_result(params, &run_id, &task_executions);
+            let partial =
+                partial_evaluation_result(params, &run_id, &task_executions, selection.as_ref());
             return Err(preserve_incomplete_run(
                 &run_dir,
                 EvaluationRunError::cancelled("evaluation cancelled", Some(partial)),
@@ -1167,6 +1255,16 @@ pub fn run_evaluation(
             &run_dir,
             EvaluationRunError::infrastructure(error),
         ));
+    }
+
+    if let Some(selection) = selection.as_ref() {
+        return diagnostic_sampled_run_result(
+            params,
+            &run_dir,
+            &run_id,
+            selection,
+            &task_executions,
+        );
     }
 
     let tasks = task_executions
@@ -1263,6 +1361,9 @@ pub fn run_evaluation(
         report_path: Some(published.report_path.to_string_lossy().into_owned()),
         evidence_path: Some(published.evidence_path.to_string_lossy().into_owned()),
         evaluation_passed: result.evaluation_passed,
+        gate_applicable: None,
+        selection: None,
+        diagnostic_passed: None,
     })
 }
 
@@ -1270,6 +1371,7 @@ fn partial_evaluation_result(
     params: &EvaluationRunParams,
     run_id: &RunId,
     task_executions: &[TaskEvaluation],
+    selection: Option<&EvaluationSelection>,
 ) -> EvaluationRunResult {
     let status = if task_executions
         .iter()
@@ -1296,6 +1398,9 @@ fn partial_evaluation_result(
         report_path: None,
         evidence_path: None,
         evaluation_passed: false,
+        gate_applicable: selection.map(|_| false),
+        selection: selection.cloned(),
+        diagnostic_passed: selection.map(|_| false),
     }
 }
 
@@ -1358,7 +1463,7 @@ fn run_task_trials(
         "evaluation task",
     );
     let prepared_source = prepare_task_source(context, plan);
-    let evaluation = run_task_trials_inner(context, plan, trials_per_task, &prepared_source);
+    let evaluation = run_task_trials_inner(context, plan, trials_per_task, &prepared_source, None);
     trace.end(
         &session_id,
         &span_id,
@@ -1454,6 +1559,9 @@ fn publish_zero_sampling_blocked_run(
         report_path: Some(published.report_path.to_string_lossy().into_owned()),
         evidence_path: Some(published.evidence_path.to_string_lossy().into_owned()),
         evaluation_passed: false,
+        gate_applicable: None,
+        selection: None,
+        diagnostic_passed: None,
     })
 }
 
@@ -1462,6 +1570,7 @@ fn run_task_trials_with_prepared_source(
     plan: &WorkspacePlan,
     trials_per_task: u32,
     prepared_source: &PreparedTaskSource,
+    selected_trial: Option<u32>,
 ) -> TaskEvaluation {
     let scope = format!("task:{}", plan.task_id.as_str());
     let session_id = scope.clone();
@@ -1479,7 +1588,13 @@ fn run_task_trials_with_prepared_source(
         TraceSpanKind::Task,
         "evaluation task",
     );
-    let evaluation = run_task_trials_inner(context, plan, trials_per_task, prepared_source);
+    let evaluation = run_task_trials_inner(
+        context,
+        plan,
+        trials_per_task,
+        prepared_source,
+        selected_trial,
+    );
     trace.end(
         &session_id,
         &span_id,
@@ -1579,6 +1694,7 @@ fn run_task_trials_inner(
     plan: &WorkspacePlan,
     trials_per_task: u32,
     prepared_source: &PreparedTaskSource,
+    selected_trial: Option<u32>,
 ) -> TaskEvaluation {
     if let Some(blocker) = &prepared_source.blocker {
         return blocked_task_trials(
@@ -1589,6 +1705,7 @@ fn run_task_trials_inner(
             prepared_source.source_commands.clone(),
             prepared_source.duration_ms,
             matches!(blocker.kind, BlockerKind::WorkspacePreparation),
+            selected_trial,
         );
     }
     if context.cancellation.is_cancelled() {
@@ -1600,6 +1717,7 @@ fn run_task_trials_inner(
             prepared_source.source_commands.clone(),
             prepared_source.duration_ms,
             false,
+            selected_trial,
         );
     }
     let Some(source_snapshot) = prepared_source.source_snapshot.as_ref() else {
@@ -1614,6 +1732,7 @@ fn run_task_trials_inner(
             prepared_source.source_commands.clone(),
             prepared_source.duration_ms,
             true,
+            selected_trial,
         );
     };
     let prepared = PreparedTaskContext {
@@ -1633,9 +1752,13 @@ fn run_task_trials_inner(
         trace_store: Arc::clone(&context.trace_store),
         trace_failures: &context.trace_failures,
     };
-    let trials = (1..=trials_per_task)
-        .map(|trial| run_task(&prepared, trial))
-        .collect::<Vec<_>>();
+    let trials = selected_trial
+        .map(|trial| vec![run_task(&prepared, trial)])
+        .unwrap_or_else(|| {
+            (1..=trials_per_task)
+                .map(|trial| run_task(&prepared, trial))
+                .collect()
+        });
     task_evaluation_from_trials(plan, trials)
 }
 
@@ -1647,8 +1770,13 @@ fn blocked_task_trials(
     source_commands: Vec<CommandDiagnostic>,
     source_preparation_duration_ms: u64,
     source_preparation_failed: bool,
+    selected_trial: Option<u32>,
 ) -> TaskEvaluation {
-    let trials = (1..=trials_per_task)
+    let trial_ordinals = selected_trial
+        .map(|trial| vec![trial])
+        .unwrap_or_else(|| (1..=trials_per_task).collect());
+    let trials = trial_ordinals
+        .into_iter()
         .map(|trial| {
             let mut diagnostics = TaskDiagnostics {
                 source: Some(source.clone()),
@@ -4823,6 +4951,102 @@ fn safe_text(text: impl AsRef<str>) -> String {
     }
 }
 
+/// Return the selected trial as an in-memory, non-gating CLI result.
+///
+/// Diagnostic runs deliberately stop at the run-owned workspace/trace boundary.  They do not
+/// create the formal `publication/` result/report/evidence artifact set consumed by the full
+/// Evaluation gate.
+fn diagnostic_sampled_run_result(
+    params: &EvaluationRunParams,
+    run_dir: &Path,
+    run_id: &RunId,
+    selection: &EvaluationSelection,
+    task_executions: &[TaskEvaluation],
+) -> Result<EvaluationRunResult, EvaluationRunError> {
+    let Some(execution) = task_executions.first() else {
+        return Err(preserve_incomplete_run(
+            run_dir,
+            EvaluationRunError::infrastructure(
+                "diagnostic run completed without a selected task result",
+            ),
+        ));
+    };
+    if task_executions.len() != 1
+        || execution.result.task_id != selection.task_id
+        || execution.trials.len() != 1
+        || execution.trials[0].result.trial != selection.trial
+    {
+        return Err(preserve_incomplete_run(
+            run_dir,
+            EvaluationRunError::infrastructure(
+                "diagnostic run task/trial execution does not match the selection",
+            ),
+        ));
+    }
+    let trial = execution.trials[0].result.clone();
+    let diagnostic_passed = trial.functional_task_success
+        && trial.agent_protocol_success
+        && trial.sandbox_security_success;
+    let status = enum_string(trial.status).map_err(|error| {
+        preserve_incomplete_run(run_dir, EvaluationRunError::infrastructure(error))
+    })?;
+    let blocker = trial
+        .blocker
+        .as_ref()
+        .map(blocker_code)
+        .transpose()
+        .map_err(|error| {
+            preserve_incomplete_run(run_dir, EvaluationRunError::infrastructure(error))
+        })?;
+    let task_report = task_report(execution);
+    Ok(EvaluationRunResult {
+        run_id: run_id.as_str().to_string(),
+        manifest: params.manifest.clone(),
+        runner: RUNNER_NAME.to_string(),
+        max_workers: params.max_workers,
+        status,
+        blocker,
+        tasks: vec![task_report],
+        result_path: None,
+        report_path: None,
+        evidence_path: None,
+        evaluation_passed: false,
+        gate_applicable: Some(false),
+        selection: Some(selection.clone()),
+        diagnostic_passed: Some(diagnostic_passed),
+    })
+}
+
+/// Return a pre-sampling diagnostic blocker without writing formal Evaluation artifacts.
+fn diagnostic_blocked_run_result(
+    params: &EvaluationRunParams,
+    run_id: &RunId,
+    selection: &EvaluationSelection,
+    blocker: EvaluationBlocker,
+) -> Result<EvaluationRunResult, EvaluationRunError> {
+    let blocker = Some(blocker)
+        .as_ref()
+        .map(blocker_code)
+        .transpose()
+        .map_err(|error| EvaluationRunError::infrastructure(error))?;
+    Ok(EvaluationRunResult {
+        run_id: run_id.as_str().to_string(),
+        manifest: params.manifest.clone(),
+        runner: RUNNER_NAME.to_string(),
+        max_workers: params.max_workers,
+        status: "blocked".to_string(),
+        blocker,
+        tasks: Vec::new(),
+        result_path: None,
+        report_path: None,
+        evidence_path: None,
+        evaluation_passed: false,
+        gate_applicable: Some(false),
+        selection: Some(selection.clone()),
+        diagnostic_passed: Some(false),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5702,6 +5926,48 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_selection_rejects_missing_task_and_out_of_range_trial_before_provider() {
+        let temp = tempfile::tempdir().expect("temp");
+        let fixture = temp.path().join("fixture");
+        fs::create_dir(&fixture).expect("fixture");
+        fs::write(fixture.join("README.md"), "seed").expect("fixture README");
+        let manifest_path = write_preflight_manifest(
+            temp.path(),
+            "diagnostic-selection",
+            "diagnostic selector validation",
+            3,
+            json!({"type": "local", "path": "fixture"}),
+        );
+        let params = EvaluationRunParams {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            run_id: "diagnostic-selection-run".to_string(),
+            output_root: Some(temp.path().join("output").to_string_lossy().into_owned()),
+            max_workers: 1,
+        };
+        let provider_snapshot = unconfigured_provider_snapshot();
+        for selection in [
+            EvaluationSelection::new(TaskId::new("missing-task").expect("task id"), 2)
+                .expect("selection"),
+            EvaluationSelection::new(TaskId::new("diagnostic-selection").expect("task id"), 4)
+                .expect("selection"),
+        ] {
+            let mut trace_store =
+                singularity_store::SessionStore::open(":memory:").expect("trace store");
+            let error = run_evaluation_with_selection(
+                &params,
+                Arc::new(SourceSandboxBackend),
+                &provider_snapshot,
+                &CancellationToken::new(),
+                &mut trace_store,
+                Some(selection),
+            )
+            .expect_err("invalid diagnostic selection must stop before provider sampling");
+            assert_eq!(error.kind(), EvaluationRunErrorKind::Input);
+            assert!(!temp.path().join("output").exists());
+        }
+    }
+
+    #[test]
     fn incomplete_run_preserves_trial_artifacts_and_bounded_failure_evidence() {
         let temp = tempfile::tempdir().expect("temp");
         let run_dir = temp.path().join("failed-run");
@@ -5816,6 +6082,7 @@ mod tests {
             },
             &run_id,
             std::slice::from_ref(&execution),
+            None,
         );
         let serialized = serde_json::to_string(&partial).expect("partial result serializes");
 
@@ -5824,6 +6091,28 @@ mod tests {
         assert!(!serialized.contains("secret-workspace"));
         assert!(!serialized.contains("agent-trace.json"));
         assert!(!serialized.contains("patch-evidence.json"));
+        assert!(partial.selection.is_none());
+        assert!(partial.gate_applicable.is_none());
+        assert!(partial.diagnostic_passed.is_none());
+    }
+
+    #[test]
+    fn cancelled_diagnostic_partial_remains_explicitly_non_gating() {
+        let params = EvaluationRunParams {
+            manifest: "manifest.json".to_string(),
+            run_id: "diagnostic-partial".to_string(),
+            output_root: None,
+            max_workers: 1,
+        };
+        let run_id = RunId::new(&params.run_id).expect("run id");
+        let selection = EvaluationSelection::new(TaskId::new("task-a").expect("task id"), 2)
+            .expect("selection");
+        let partial = partial_evaluation_result(&params, &run_id, &[], Some(&selection));
+
+        assert_eq!(partial.selection, Some(selection));
+        assert_eq!(partial.gate_applicable, Some(false));
+        assert_eq!(partial.diagnostic_passed, Some(false));
+        assert!(!partial.evaluation_passed);
     }
 
     #[cfg(windows)]
@@ -7147,6 +7436,34 @@ mod tests {
                 1
             );
         }
+
+        let selected_run_dir = temp.path().join("selected-run");
+        fs::create_dir(&selected_run_dir).expect("selected run directory");
+        let mut selected_trace_store =
+            singularity_store::SessionStore::open(":memory:").expect("selected trace store");
+        let selected_shared_trace_store = Arc::new(Mutex::new(&mut selected_trace_store));
+        let selected_context = EvaluationRunContext {
+            run_id: &run_id,
+            run_dir: &selected_run_dir,
+            manifest_dir: temp.path(),
+            sandbox_backend: &sandbox_backend,
+            provider_snapshot: &provider_snapshot,
+            cancellation: &cancellation,
+            trace_store: selected_shared_trace_store,
+            trace_failures: Arc::new(Mutex::new(Vec::new())),
+            sandbox_preflight: &sandbox_preflight,
+        };
+        let selected_source = prepare_task_source(&selected_context, &plan);
+        let selected =
+            run_task_trials_inner(&selected_context, &plan, 3, &selected_source, Some(2));
+        assert_eq!(selected.trials.len(), 1);
+        assert_eq!(selected.trials[0].result.trial, 2);
+        assert!(
+            selected_run_dir
+                .join("source-reuse")
+                .join("trial-0002")
+                .is_dir()
+        );
     }
 
     fn write_preflight_manifest(
@@ -8441,6 +8758,77 @@ mod tests {
         assert!(!temp.path().join(RESULT_FILE).exists());
         assert!(!temp.path().join(REPORT_FILE).exists());
         assert!(!temp.path().join(EVIDENCE_FILE).exists());
+    }
+
+    #[test]
+    fn diagnostic_blocker_wrapper_is_non_gating_and_has_no_publication() {
+        let temp = tempfile::tempdir().expect("temp");
+        let params = EvaluationRunParams {
+            manifest: "manifest.json".to_string(),
+            run_id: "diagnostic-blocked".to_string(),
+            output_root: Some(temp.path().to_string_lossy().into_owned()),
+            max_workers: 1,
+        };
+        let run_id = RunId::new(&params.run_id).expect("run id");
+        let selection = EvaluationSelection::new(TaskId::new("task-a").expect("task id"), 2)
+            .expect("selection");
+        let wrapper = diagnostic_blocked_run_result(
+            &params,
+            &run_id,
+            &selection,
+            evaluation_blocker(BlockerKind::ProviderConfiguration, "provider unavailable"),
+        )
+        .expect("diagnostic blocker wrapper");
+
+        assert_eq!(wrapper.selection, Some(selection));
+        assert_eq!(wrapper.diagnostic_passed, Some(false));
+        assert!(!wrapper.evaluation_passed);
+        assert!(wrapper.result_path.is_none());
+        assert!(wrapper.report_path.is_none());
+        assert!(wrapper.evidence_path.is_none());
+        assert!(!temp.path().join(PUBLICATION_DIR).exists());
+    }
+
+    #[test]
+    fn diagnostic_sampled_wrapper_keeps_selected_task_report_without_publication() {
+        let temp = tempfile::tempdir().expect("temp");
+        let params = EvaluationRunParams {
+            manifest: "manifest.json".to_string(),
+            run_id: "diagnostic-sampled".to_string(),
+            output_root: Some(temp.path().to_string_lossy().into_owned()),
+            max_workers: 1,
+        };
+        let run_id = RunId::new(&params.run_id).expect("run id");
+        let task_id = TaskId::new("task-a").expect("task id");
+        let selection = EvaluationSelection::new(task_id.clone(), 2).expect("selection");
+        let execution = finish_task(
+            &task_id,
+            2,
+            StageExecution::passed(Vec::new()),
+            StageExecution::passed(Vec::new()),
+            StageExecution::passed(Vec::new()),
+            StageExecution::passed(Vec::new()),
+            TaskDiagnostics::default(),
+        );
+        let task = TaskEvaluation {
+            result: EvaluationTaskResult::from_trials(
+                task_id,
+                Vec::new(),
+                vec![execution.result.clone()],
+            ),
+            trials: vec![execution],
+        };
+
+        let wrapper =
+            diagnostic_sampled_run_result(&params, temp.path(), &run_id, &selection, &[task])
+                .expect("diagnostic sampled wrapper");
+        assert_eq!(wrapper.selection, Some(selection));
+        assert_eq!(wrapper.diagnostic_passed, Some(false));
+        assert_eq!(wrapper.tasks.len(), 1);
+        assert!(wrapper.result_path.is_none());
+        assert!(wrapper.report_path.is_none());
+        assert!(wrapper.evidence_path.is_none());
+        assert!(!temp.path().join(PUBLICATION_DIR).exists());
     }
 
     #[test]

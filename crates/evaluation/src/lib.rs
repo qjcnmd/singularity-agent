@@ -10,6 +10,8 @@ mod value;
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 pub use evidence::{
     EvaluationEvidence, EvaluationEvidenceSchemaVersion, EvaluationPromptStructure,
     EvaluationProviderEvidence, EvaluationScopeEvidence, EvaluationTaskEvidence,
@@ -39,6 +41,29 @@ pub const RESULT_SCHEMA_VERSION: &str = "evaluation.result/v9";
 pub const EVIDENCE_SCHEMA_VERSION: &str = "evaluation.evidence/v4";
 /// 核心任务成功率门禁的 basis points 阈值。
 pub const TASK_DIMENSION_SUCCESS_THRESHOLD_BASIS_POINTS: u32 = 8_000;
+
+/// One immutable task/trial selector for the development-only diagnostic runner.
+///
+/// The task id and the trial ordinal are resolved against the validated manifest.  The
+/// ordinal remains the manifest's real one-based value; it is never remapped to a sparse
+/// diagnostic sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationSelection {
+    pub task_id: TaskId,
+    pub trial: u32,
+}
+
+impl EvaluationSelection {
+    pub fn new(task_id: TaskId, trial: u32) -> Result<Self> {
+        if trial == 0 {
+            return Err(validation_error(
+                "evaluation diagnostic trial must be positive",
+            ));
+        }
+        Ok(Self { task_id, trial })
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 /// Evaluation 输入、执行和结果校验错误。
