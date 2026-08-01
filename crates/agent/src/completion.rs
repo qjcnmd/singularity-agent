@@ -257,10 +257,6 @@ pub fn successful_command_scope_digest(tool_result: &ToolResult) -> Option<&str>
 }
 
 impl CompletionTracker {
-    pub(super) fn workspace_mutated(&self) -> bool {
-        self.workspace_mutated
-    }
-
     pub(super) fn observe(&mut self, tool_result: &ToolResult) {
         self.observe_with_window(tool_result, None);
     }

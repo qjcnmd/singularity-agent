@@ -213,9 +213,10 @@ use singularity_tools::{ToolCallRequest, WorkspaceObservation};
 
 const DEFAULT_MAX_AGENT_LOOP_TURNS: u32 = 16;
 const MAX_PARALLEL_READ_TOOL_CALLS: u32 = 8;
-const APPROVAL_CHECKPOINT_VERSION: u32 = 4;
-/// Version for ordinary turn checkpoints after retiring update-plan/edit pending calls.
-const TURN_CHECKPOINT_VERSION: u32 = 3;
+/// Approval checkpoints after removing the latest-only mutation summary.
+const APPROVAL_CHECKPOINT_VERSION: u32 = 5;
+/// Ordinary turn checkpoints after removing the latest-only mutation summary.
+const TURN_CHECKPOINT_VERSION: u32 = 4;
 const AGENT_DEVELOPER_INSTRUCTIONS: &str = "You are a coding agent working in the current workspace. Inspect real files before making claims. Use tools for changes, write only inside the workspace, and run verification after the last mutation. Report only completed work and verification. Read-only questions need no changes or verification. For multi-step work, keep a concise private checklist; update it when evidence or failure changes the approach, and complete the requested work before the final answer. Tools can be submitted only through native structured tool calls; ordinary text is never executed. Match registered tool schemas exactly and use typed tool results to correct parameters.";
 const USER_MESSAGE_ROLE: &str = "user";
 const ASSISTANT_MESSAGE_ROLE: &str = "assistant";
@@ -241,11 +242,8 @@ const REPAIRABLE_TOOL_ERROR_CODES: [&str; 8] = [
 const TOOL_SELECTION_FAILURE_GROUP: &str = "tool_selection";
 const TOOL_SELECTION_FAILURE_PREFIX: &str = "tool_selection:";
 const MAX_REVIEW_TEXT_CHARS: usize = 512;
-const MAX_WORKSPACE_CHANGE_PATHS: usize = 64;
 const MAX_REPAIR_ATTEMPTS: u32 = 3;
 const MAX_REPAIR_CONTEXT_CHARS: usize = 512;
-const MAX_REPAIR_CONTEXT_PATHS: usize = 8;
-const MAX_REPAIR_CONTEXT_PATH_CHARS: usize = 160;
 const MAX_REPAIR_CONTEXT_SERIALIZED_CHARS: usize = 65_536;
 const REPEATED_FAILURE_RECOVERY_INSTRUCTIONS: &str = "The same repairable tool failure recurred. Read the registered tool schema and the previous tool result, then choose a different next action. Do not repeat the same call.";
 const REPAIR_STATE_INSTRUCTIONS: &str = "Follow the bounded repair guidance. Use the latest typed tool result and trusted workspace revision evidence to choose the next valid action. When a repair strategy change is required, make a materially different workspace mutation that addresses the reported failure before retrying verification. Do not claim success without new verification evidence.";
@@ -671,7 +669,6 @@ struct AgentLoopState {
     used_approval_grants: BTreeSet<String>,
     prior_approval_count: u32,
     completion: CompletionTracker,
-    verification_change: Option<VerificationChangeSummary>,
     repair_state: Option<RepairState>,
     /// Monotonic repair-attempt ledger for the current episode. The active state may be cleared
     /// after real progress, but this counter survives that transition and approval checkpoints.
@@ -688,14 +685,6 @@ struct AgentLoopState {
     context_trace: Option<AgentContextTrace>,
     provider_protocol_contract: Option<ProviderProtocolContract>,
     provider_capability_metadata: Option<ProviderCapabilityMetadata>,
-}
-
-/// Internal summary of the mutation boundary used by completion and repair evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct VerificationChangeSummary {
-    revision: WorkspaceRevision,
-    changed_paths: Vec<String>,
-    diff_digest: String,
 }
 
 /// Internal repair state. The signature is a hash-only identity used to bound repeated repair;
@@ -728,7 +717,6 @@ struct RepairCycleRecord {
 struct FinalReviewResponse {
     verdict: FinalReviewVerdict,
     workspace_revision: Option<WorkspaceRevision>,
-    change_digest: Option<String>,
     verification_digests: Vec<String>,
     #[serde(default)]
     final_answer: String,
@@ -749,7 +737,6 @@ impl AgentLoopState {
             used_approval_grants: BTreeSet::new(),
             prior_approval_count: 0,
             completion: CompletionTracker::default(),
-            verification_change: None,
             repair_state: None,
             repair_attempts: 0,
             repair_cycles: Vec::new(),
@@ -1032,7 +1019,6 @@ impl AgentLoopState {
             model_turns,
             resume_attempt: input.resume_attempt,
             completion: self.completion.clone(),
-            verification_change: self.verification_change.clone(),
             repair_state: self.repair_state.clone(),
             repair_attempts: self.repair_attempts,
             repair_cycles: self.repair_cycles.clone(),
@@ -1101,8 +1087,6 @@ impl AgentLoopState {
             json!({
                 "failed_requirement": "bounded repair context exceeded its safe limit",
                 "evidence": "bounded repair evidence unavailable",
-                "affected_path": "unavailable",
-                "affected_symbol": "unavailable",
                 "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
                 "previous_action": "bounded repair action unavailable",
                 "previous_result": "bounded repair result unavailable",
@@ -1118,23 +1102,11 @@ impl AgentLoopState {
             .workspace_revision
             .map(|revision| revision.value().to_string())
             .unwrap_or_else(|| "null".to_string());
-        let change_digest = self
-            .verification_change
-            .as_ref()
-            .map(|change| format!("\"{}\"", change.diff_digest))
-            .unwrap_or_else(|| "null".to_string());
-        let change_paths = self
-            .verification_change
-            .as_ref()
-            .map(|change| change.changed_paths.clone())
-            .unwrap_or_default();
         let verification_digests =
             serde_json::to_string(&self.completion.terminal_command_scope_digests())
                 .unwrap_or_else(|_| "[]".to_string());
-        let change_paths =
-            serde_json::to_string(&change_paths).unwrap_or_else(|_| "[]".to_string());
         format!(
-            "Review the trusted current evidence before deciding. changed_paths={change_paths}; change_digest={change_digest}; passed_verification_digests={verification_digests}. Return exactly one JSON object for the terminal review, with no markdown: {{\"verdict\":\"accept|reject|repair\",\"workspace_revision\":{revision},\"change_digest\":{change_digest},\"verification_digests\":{verification_digests},\"final_answer\":\"...\",\"reason\":\"...\"}}. The revision, change_digest, and verification_digests must exactly match this trusted evidence. Use accept only when all evidence is semantically valid; use reject or repair with a bounded reason when another repair cycle is required."
+            "Review the trusted current workspace revision and verification evidence together with the available conversation and tool history before deciding. workspace_revision={revision}; passed_verification_digests={verification_digests}. Return exactly one JSON object for the terminal review, with no markdown: {{\"verdict\":\"accept|reject|repair\",\"workspace_revision\":{revision},\"verification_digests\":{verification_digests},\"final_answer\":\"...\",\"reason\":\"...\"}}. The workspace_revision and verification_digests must exactly match this trusted evidence. Use accept only when all evidence is semantically valid; use reject or repair with a bounded reason when another repair cycle is required."
         )
     }
 
@@ -1249,28 +1221,8 @@ impl AgentLoopState {
             .or_else(|| summary.unresolved_failures.first().cloned())
             .or_else(|| self.last_completion_error.clone())
             .unwrap_or_else(|| repair_reason_text(reason).to_string());
-        let (affected_path, affected_symbol) = self
-            .verification_change
-            .as_ref()
-            .and_then(|change| {
-                change.changed_paths.first().cloned().map(|path| {
-                    let symbol = self
-                        .previous_repair_symbol(&path)
-                        .unwrap_or_else(|| "unavailable".to_string());
-                    (path, symbol)
-                })
-            })
-            .or_else(|| {
-                self.verification_change.as_ref().and_then(|change| {
-                    change.changed_paths.first().cloned().map(|path| {
-                        let symbol = self
-                            .previous_repair_symbol(&path)
-                            .unwrap_or_else(|| "unavailable".to_string());
-                        (path, symbol)
-                    })
-                })
-            })
-            .unwrap_or_else(|| ("unavailable".to_string(), "unavailable".to_string()));
+        // Mutation scope and digests remain in the trusted tool history. They are intentionally not
+        // copied into a latest-only repair state or compared against a later model response.
         let previous_result = requires_strategy_change
             .then(|| {
                 self.last_completion_error
@@ -1290,34 +1242,13 @@ impl AgentLoopState {
                     .map(|error| json!(bounded_repair_text(error)))
             })
             .unwrap_or_else(|| json!("repair decision pending execution"));
-        // Prefer the last trusted mutation summary over the terminal command name.  This lets the
-        // model distinguish what it changed from why the corresponding verification still failed;
-        // the summary contains only bounded paths, a digest and the workspace revision.
+        // Keep the repair context tied to the latest typed result without duplicating mutation
+        // scope or digest state outside the complete tool history.
         let previous_action = self
-            .verification_change
-            .as_ref()
-            .map(|change| {
-                json!({
-                    "changed_paths": change
-                        .changed_paths
-                        .iter()
-                        .take(MAX_REPAIR_CONTEXT_PATHS)
-                        .map(|path| {
-                            path.chars()
-                                .take(MAX_REPAIR_CONTEXT_PATH_CHARS)
-                                .collect::<String>()
-                        })
-                        .collect::<Vec<_>>(),
-                    "diff_digest": bounded_repair_text(&change.diff_digest),
-                    "workspace_revision": change.revision.value(),
-                })
-            })
+            .tool_result_occurrences
+            .last()
+            .map(|occurrence| json!(safe_repair_tool_name(occurrence.result())))
             .or_else(|| failure.map(|result| json!(safe_repair_tool_name(result))))
-            .or_else(|| {
-                self.tool_result_occurrences
-                    .last()
-                    .map(|occurrence| json!(safe_repair_tool_name(occurrence.result())))
-            })
             .unwrap_or_else(|| json!(repair_reason_text(reason)));
         json!({
             "failed_requirement": bounded_repair_text(&failed_requirement),
@@ -1329,17 +1260,11 @@ impl AgentLoopState {
                         .map(bounded_repair_text)
                         .unwrap_or_else(|| bounded_repair_text(&previous_result.to_string()))
                 }),
-            "affected_path": bounded_repair_text(&affected_path),
-            "affected_symbol": bounded_repair_text(&affected_symbol),
             "workspace_revision": self.completion.workspace_revision.map(|revision| revision.value()),
             "previous_action": previous_action,
             "previous_result": previous_result,
             "repair_strategy_change_required": requires_strategy_change,
         })
-    }
-
-    fn previous_repair_symbol(&self, _path: &str) -> Option<String> {
-        None
     }
 
     fn note_repair_mutation(&mut self, revision: WorkspaceRevision) {
@@ -4351,6 +4276,9 @@ where
                 observation.mutation() == singularity_tools::WorkspaceMutation::Changed
             });
             if changed {
+                // A new workspace revision invalidates any earlier terminal review verdict. The
+                // next verdict must be earned from this revision's completion evidence.
+                state.final_review_verdict = None;
                 let Some(revision) = result
                     .workspace_observation()
                     .and_then(|observation| observation.revision())
@@ -4362,8 +4290,8 @@ where
                         "workspace mutation revision is missing".to_string(),
                     );
                 };
-                match verification_change_summary(&prepared.call, &result, revision) {
-                    Ok(summary) => state.verification_change = Some(summary),
+                match validate_workspace_change_summary(&prepared.call, &result) {
+                    Ok(()) => {}
                     Err(error) => {
                         state
                             .completion
@@ -5308,7 +5236,6 @@ fn restore_checkpoint(
     state.used_approval_grants = used_approval_grants;
     state.prior_approval_count = checkpoint_state.approval_count;
     state.completion = derived_completion;
-    state.verification_change = checkpoint_state.verification_change;
     state.repair_state = checkpoint_state.repair_state;
     state.repair_attempts = checkpoint_state.repair_attempts;
     state.repair_cycles = checkpoint_state.repair_cycles;
@@ -5439,7 +5366,6 @@ fn restore_turn_checkpoint(
     state.used_approval_grants = checkpoint_state.used_approval_grants.into_iter().collect();
     state.prior_approval_count = checkpoint_state.approval_count;
     state.completion = derived_completion;
-    state.verification_change = checkpoint_state.verification_change;
     state.repair_state = checkpoint_state.repair_state;
     state.repair_attempts = checkpoint_state.repair_attempts;
     state.repair_cycles = checkpoint_state.repair_cycles;
@@ -5953,13 +5879,6 @@ fn parse_final_review_response(
     if review.workspace_revision != state.completion.workspace_revision {
         return Err("final review workspace revision does not match current evidence".to_string());
     }
-    let expected_change_digest = state
-        .verification_change
-        .as_ref()
-        .map(|change| change.diff_digest.as_str());
-    if review.change_digest.as_deref() != expected_change_digest {
-        return Err("final review change digest does not match current evidence".to_string());
-    }
     let expected_verification_digests = state.completion.terminal_command_scope_digests();
     if review.verification_digests != expected_verification_digests {
         return Err(
@@ -5987,15 +5906,17 @@ fn parse_final_review_response(
     }
 }
 
-fn verification_change_summary(
+fn validate_workspace_change_summary(
     call: &ModelToolCall,
     result: &ToolResult,
-    revision: WorkspaceRevision,
-) -> Result<VerificationChangeSummary, String> {
+) -> Result<(), String> {
     let producer_summary = result.workspace_change_summary().ok_or_else(|| {
         "workspace mutation did not provide a trusted changed-files and diff digest summary"
             .to_string()
     })?;
+    producer_summary
+        .validate()
+        .map_err(|error| format!("workspace mutation change summary is invalid: {error}"))?;
     if !is_sha256_fingerprint(&producer_summary.diff_digest) {
         return Err("workspace mutation diff digest is invalid".to_string());
     }
@@ -6011,9 +5932,8 @@ fn verification_change_summary(
             );
         }
     }
-    let changed_paths = observed_paths;
     let mut normalized = BTreeSet::new();
-    for path in changed_paths {
+    for path in observed_paths {
         if !is_bounded_workspace_relative_path(&path) {
             return Err(
                 "workspace mutation changed path is outside the bounded relative scope".to_string(),
@@ -6024,11 +5944,7 @@ fn verification_change_summary(
     if normalized.is_empty() {
         return Err("workspace mutation did not provide a changed path summary".to_string());
     }
-    Ok(VerificationChangeSummary {
-        revision,
-        changed_paths: normalized.into_iter().collect(),
-        diff_digest: producer_summary.diff_digest.clone(),
-    })
+    Ok(())
 }
 
 fn is_bounded_workspace_relative_path(path: &str) -> bool {

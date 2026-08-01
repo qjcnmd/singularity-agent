@@ -151,7 +151,11 @@ fn typed_fixture_final_review(
     let Some(template) = instruction
         .content
         .split_once("with no markdown: ")
-        .and_then(|(_, value)| value.split_once(". The revision").map(|(value, _)| value))
+        .and_then(|(_, value)| {
+            value
+                .split_once(". The workspace_revision")
+                .map(|(value, _)| value)
+        })
     else {
         return response;
     };
@@ -1814,8 +1818,7 @@ fn agent_loop_withholds_unvalidated_final_review_text_when_terminal_validation_f
         "response_final",
         serde_json::json!({
             "verdict": "accept",
-            "workspace_revision": 0,
-            "change_digest": null,
+            "workspace_revision": 1,
             "verification_digests": [verification_digest],
             "final_answer": "terminal",
             "reason": ""
@@ -3449,7 +3452,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
         "approval_turn_1_call_1"
     );
     let checkpoint = pending.encode_checkpoint().expect("approval checkpoint");
-    assert_eq!(checkpoint["checkpoint_version"], 4);
+    assert_eq!(checkpoint["checkpoint_version"], 5);
     assert_eq!(checkpoint["thread_id"], "thread_1");
     assert_eq!(checkpoint["turn_id"], "turn_1");
     assert_eq!(checkpoint["request_id"], "approval_turn_1_call_1");
@@ -3458,6 +3461,7 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     assert_eq!(checkpoint["model_turns"], 1);
     assert_eq!(checkpoint["used_approval_grants"], serde_json::json!([]));
     assert_eq!(checkpoint["tool_result_occurrences"], serde_json::json!([]));
+    assert!(checkpoint.get("verification_change").is_none());
     assert!(checkpoint.get("tool_result_context_bindings").is_none());
     let messages = checkpoint["messages"]
         .as_array()
@@ -3488,6 +3492,16 @@ fn agent_loop_checkpoint_is_bound_and_not_serialized_as_public_result() {
     );
     assert_eq!(
         future.expect_err("future checkpoint must fail"),
+        "unsupported approval checkpoint version"
+    );
+    let mut previous_checkpoint = checkpoint.clone();
+    previous_checkpoint["checkpoint_version"] = serde_json::json!(4);
+    let previous = PendingApprovalOccurrence::from_checkpoint_payload(
+        pending.request().clone(),
+        &previous_checkpoint,
+    );
+    assert_eq!(
+        previous.expect_err("checkpoint from the removed verification state must fail"),
         "unsupported approval checkpoint version"
     );
 
@@ -6043,6 +6057,7 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
         ));
         response
     };
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
     let result = agent_loop_with_responses_and_requests(
         vec![
             patch_response("model_request_turn_1_0", "patch_1", "before", "after"),
@@ -6065,7 +6080,7 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
             )
             .for_operation(PermissionOperation::Write),
         ),
-        Arc::new(Mutex::new(Vec::new())),
+        Arc::clone(&seen_requests),
     )
     .with_workspace_tools(
         WorkspaceTools::new(dir.path())
@@ -6128,6 +6143,119 @@ fn workspace_write_command_mutation_invalidates_stale_verification_evidence() {
             .value(),
         3
     );
+    let requests = seen_requests.lock().expect("seen requests");
+    let final_review = requests
+        .iter()
+        .rev()
+        .find(|request| request.tool_choice.mode == ToolChoiceMode::None)
+        .expect("final review request");
+    let instruction = final_review
+        .messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == ModelRole::Developer
+                && message
+                    .content
+                    .contains("Return exactly one JSON object for the terminal review")
+        })
+        .expect("final review instruction");
+    assert!(instruction.content.contains("workspace_revision=3"));
+    assert!(instruction.content.contains("passed_verification_digests"));
+    assert!(!instruction.content.contains("changed_paths"));
+    assert!(!instruction.content.contains("change_digest"));
+    assert_eq!(
+        result.verification.final_review_verdict,
+        Some(singularity_agent::FinalReviewVerdict::Accept)
+    );
+}
+
+#[test]
+fn final_review_rejection_requires_new_mutation_and_verification_before_accept() {
+    let dir = tempfile::tempdir().expect("workspace");
+    let file_path = dir.path().join("README.md");
+    std::fs::write(&file_path, "before").expect("write file");
+    let patch_response = |request: &str, call_id: &str, expected: &str, replacement: &str| {
+        let mut response = ModelTurnResponse::completed(request, call_id, "");
+        response.tool_calls.push(tool_call(
+            call_id,
+            "patch",
+            serde_json::json!({
+                "changes": [{
+                    "path": "README.md",
+                    "expected": expected,
+                    "replacement": replacement
+                }]
+            }),
+        ));
+        response
+    };
+    let command_response = |request: &str, call_id: &str| {
+        let mut response = ModelTurnResponse::completed(request, call_id, "");
+        response.tool_calls.push(tool_call(
+            call_id,
+            "command",
+            serde_json::json!({
+                "command": test_command_script("success"),
+                "cwd": ".",
+                "timeout_seconds": 5
+            }),
+        ));
+        response
+    };
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let result = agent_loop_with_responses_and_requests(
+        vec![
+            patch_response("model_request_turn_1_0", "patch_1", "before", "after"),
+            command_response("model_request_turn_1_1", "command_1"),
+            ModelTurnResponse::completed(
+                "model_request_turn_1_2",
+                "review_reject",
+                "__fixture_review_reject__",
+            ),
+            patch_response("model_request_turn_1_3", "patch_2", "after", "final"),
+            command_response("model_request_turn_1_4", "command_2"),
+            ModelTurnResponse::completed("model_request_turn_1_5", "review_accept", "done"),
+        ],
+        allow_read_execute_policy().with_rule(
+            PermissionRule::new(
+                "allow_write",
+                SettingsScope::Project,
+                PermissionDecisionOutcome::Allow,
+            )
+            .for_operation(PermissionOperation::Write),
+        ),
+        Arc::clone(&seen_requests),
+    )
+    .with_workspace_tools(
+        WorkspaceTools::new(dir.path())
+            .expect("bind workspace tools")
+            .with_sandbox_backend(AgentStrictBackend),
+    )
+    .run(&AgentLoopInput::new("thread_1", "turn_1", "patch and verify").with_max_turns(6));
+
+    assert_eq!(result.status, AgentStatus::Completed, "result={result:?}");
+    assert_eq!(result.final_answer.as_deref(), Some("done"));
+    assert_eq!(result.tool_results.len(), 4);
+    assert_eq!(result.recovery_metrics.completion_rejection_count, 1);
+    assert_eq!(result.recovery_metrics.repair_attempt_count, 1);
+    assert_eq!(
+        result.final_review_verdict(),
+        Some(singularity_agent::FinalReviewVerdict::Accept)
+    );
+    assert_eq!(
+        std::fs::read_to_string(file_path).expect("read file"),
+        "final"
+    );
+    let requests = seen_requests.lock().expect("seen requests");
+    assert_eq!(requests.len(), 6);
+    assert!(requests[2].messages.iter().any(|message| {
+        message.role == ModelRole::Developer
+            && message.content.contains("passed_verification_digests")
+    }));
+    assert!(requests[5].messages.iter().any(|message| {
+        message.role == ModelRole::Developer && message.content.contains("workspace_revision=2")
+    }));
 }
 
 #[test]

@@ -199,7 +199,7 @@ fn approval_checkpoint(request: &ApprovalRequest, tool_call_id: &str) -> serde_j
         "tool_name": &request.action,
         "raw_arguments": r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,
         "resources": &request.resources,
-        "checkpoint_version": 4,
+        "checkpoint_version": 5,
         "project_instructions_digest": null,
         "messages": [{"role":"assistant","content":"","tool_calls":[{"tool_call_id":tool_call_id,"tool_name":&request.action,"arguments":{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]},"raw_arguments":r#"{"changes":[{"path":"README.md","expected":"before","replacement":"after"}]}"#,"parse_status":"valid","validation_errors":[]}]}],
         "tool_result_occurrences": [],
@@ -250,7 +250,7 @@ fn typed_final_review_fixture(
         .rev()
         .find(|message| message.role == singularity_model::ModelRole::Developer)
         .and_then(|message| message.content.split_once("with no markdown: "))
-        .and_then(|(_, value)| value.split_once(". The revision"))
+        .and_then(|(_, value)| value.split_once(". The workspace_revision"))
         .map(|(value, _)| value)
     else {
         return response;

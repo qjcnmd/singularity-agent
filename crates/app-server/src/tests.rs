@@ -44,7 +44,7 @@ fn pending_approval_for_test(
         "tool_name": &request.action,
         "raw_arguments": &raw_arguments,
         "resources": &request.resources,
-        "checkpoint_version": 4,
+        "checkpoint_version": 5,
         "project_instructions_digest": null,
         "messages": [{
             "role": "assistant",
@@ -1238,7 +1238,7 @@ fn typed_final_review_fixture(
         .rev()
         .find(|message| message.role == ModelRole::Developer)
         .and_then(|message| message.content.split_once("with no markdown: "))
-        .and_then(|(_, value)| value.split_once(". The revision"))
+        .and_then(|(_, value)| value.split_once(". The workspace_revision"))
         .map(|(value, _)| value)
     else {
         return response;

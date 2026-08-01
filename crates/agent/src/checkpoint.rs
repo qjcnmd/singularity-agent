@@ -177,8 +177,6 @@ pub(super) struct CheckpointState {
     pub(super) resume_attempt: u32,
     pub(super) completion: CompletionTracker,
     #[serde(default)]
-    pub(super) verification_change: Option<super::VerificationChangeSummary>,
-    #[serde(default)]
     pub(super) repair_state: Option<super::RepairState>,
     pub(super) repair_attempts: u32,
     #[serde(default)]
@@ -446,61 +444,17 @@ impl CheckpointState {
         if !self.completion.is_consistent() {
             return Err("approval checkpoint workspace revision state is invalid".to_string());
         }
-        if let Some(change) = &self.verification_change
-            && (!super::is_sha256_fingerprint(&change.diff_digest)
-                || change.changed_paths.is_empty()
-                || change.changed_paths.len() > super::MAX_WORKSPACE_CHANGE_PATHS
-                || Some(change.revision) != self.completion.workspace_revision
-                || change
-                    .changed_paths
-                    .iter()
-                    .any(|path| !super::is_bounded_workspace_relative_path(path)))
-        {
-            return Err("approval checkpoint verification change summary is invalid".to_string());
-        }
-        if self.completion.workspace_mutated() && self.verification_change.is_none() {
-            return Err("approval checkpoint workspace change summary is missing".to_string());
-        }
-        if self.completion.workspace_mutated() {
-            let producer = self
-                .tool_result_occurrences
-                .iter()
-                .rev()
-                .find(|occurrence| {
-                    occurrence
-                        .result()
-                        .workspace_observation()
-                        .is_some_and(|observation| {
-                            observation.mutation() == singularity_tools::WorkspaceMutation::Changed
-                        })
-                })
-                .and_then(|occurrence| {
-                    let result = occurrence.result();
-                    Some((
-                        result.workspace_observation()?.revision()?,
-                        result.workspace_change_summary()?,
-                    ))
-                })
-                .ok_or_else(|| {
-                    "approval checkpoint mutation evidence is missing from its tool occurrence"
-                        .to_string()
+        for occurrence in &self.tool_result_occurrences {
+            let result = occurrence.result();
+            if result.workspace_observation().is_some_and(|observation| {
+                observation.mutation() == singularity_tools::WorkspaceMutation::Changed
+            }) {
+                let summary = result.workspace_change_summary().ok_or_else(|| {
+                    "approval checkpoint mutation change summary is missing".to_string()
                 })?;
-            let producer_paths = producer
-                .1
-                .changed_files
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            let change = self.verification_change.as_ref().expect("checked above");
-            if producer.0 != change.revision
-                || producer.1.diff_digest != change.diff_digest
-                || producer_paths.len() != producer.1.changed_files.len()
-                || producer_paths.into_iter().collect::<Vec<_>>() != change.changed_paths
-            {
-                return Err(
-                    "approval checkpoint verification change summary is not bound to its tool occurrence"
-                        .to_string(),
-                );
+                summary.validate().map_err(|error| {
+                    format!("approval checkpoint mutation change summary is invalid: {error}")
+                })?;
             }
         }
         if let Some(repair) = &self.repair_state {
